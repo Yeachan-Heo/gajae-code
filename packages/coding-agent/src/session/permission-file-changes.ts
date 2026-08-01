@@ -11,7 +11,7 @@ import { resolveToCwd } from "../tools/path-utils";
 export type PermissionFileChange =
 	| { type: "add"; content: string }
 	| { type: "delete"; content: string }
-	| { type: "update"; unified_diff: string; move_path?: string };
+	| { type: "update"; unified_diff: string; move_path: string | null };
 
 export type PermissionFileChangeMap = Record<string, PermissionFileChange>;
 
@@ -56,9 +56,11 @@ function updateChange(oldContent: string, newContent: string, movePath?: string)
 	return {
 		type: "update",
 		unified_diff: generateUnifiedDiffString(normalizedContent(oldContent), normalizedContent(newContent)).diff,
-		...(movePath === undefined ? {} : { move_path: movePath }),
+		move_path: movePath ?? null,
 	};
 }
+
+// `move_path` is required by the vendored Codex FileChange union, including for ordinary updates.
 
 async function planWrite(args: unknown, cwd: string): Promise<PermissionFileChangeMap | undefined> {
 	if (!isRecord(args)) return undefined;
@@ -92,16 +94,50 @@ async function planMove(args: unknown, cwd: string): Promise<PermissionFileChang
 
 async function planEdit(args: unknown, cwd: string): Promise<PermissionFileChangeMap | undefined> {
 	if (!isRecord(args)) return undefined;
+	if (typeof args.input === "string") return planApplyPatch(args, cwd);
 	const displayPath = stringProperty(args, "path");
-	const path = resolvePath(displayPath, cwd);
-	if (!displayPath || !path || !Array.isArray(args.edits) || args.edits.length === 0) return undefined;
+	if (!displayPath || !Array.isArray(args.edits) || args.edits.length === 0) return undefined;
 
+	const edits = args.edits;
+	const hasPatchShape = edits.some(
+		edit =>
+			isRecord(edit) && (Object.hasOwn(edit, "op") || Object.hasOwn(edit, "diff") || Object.hasOwn(edit, "rename")),
+	);
+	if (hasPatchShape) {
+		// Patch-mode edit calls are executed entry-by-entry, but a destructive permission
+		// intent is only representable here when the complete call is one patch operation.
+		// Refuse mixed or multi-entry requests rather than showing incomplete evidence.
+		if (edits.length !== 1 || !isRecord(edits[0])) return undefined;
+		const entry = edits[0];
+		const rawOp = entry.op;
+		let op: ApplyPatchEntry["op"];
+		if (rawOp === undefined) op = "update";
+		else if (rawOp === "create" || rawOp === "delete" || rawOp === "update") op = rawOp;
+		else return undefined;
+		const rename = entry.rename;
+		if (rename !== undefined && typeof rename !== "string") return undefined;
+		const diff = entry.diff;
+		if (diff !== undefined && typeof diff !== "string") return undefined;
+		if (op === "delete" && rename !== undefined) return undefined;
+		return planApplyPatchEntry(
+			{
+				path: displayPath,
+				op,
+				diff,
+				rename,
+			},
+			cwd,
+		);
+	}
+
+	const path = resolvePath(displayPath, cwd);
+	if (!path) return undefined;
 	const preimage = await readFile(path, displayPath);
 	if (!preimage.exists) return undefined;
 
 	const original = normalizedContent(preimage.content);
 	let current = original;
-	for (const edit of args.edits) {
+	for (const edit of edits) {
 		if (!isRecord(edit)) return undefined;
 		const oldText = edit.old_text;
 		const newText = edit.new_text;
@@ -138,7 +174,8 @@ async function planApplyPatchEntry(entry: ApplyPatchEntry, cwd: string): Promise
 		return { [path]: updateChange(preimage.content, newContent) };
 	}
 
-	if (entry.op !== "update" || typeof entry.diff !== "string") return undefined;
+	if (entry.op !== undefined && entry.op !== "update") return undefined;
+	if (typeof entry.diff !== "string") return undefined;
 	const preimage = await readFile(path, entry.path);
 	if (!preimage.exists) return undefined;
 	const preview = await previewPatch(
@@ -179,6 +216,10 @@ async function planApplyPatch(args: unknown, cwd: string): Promise<PermissionFil
  * Build a faithful pinned FileChange map for a mutation tool call, or undefined when
  * no honest representation is available (the caller then omits the field and the
  * app-server adapter fails closed).
+ *
+ * `ast_edit` is intentionally not projected: its AST mutation payload has no pinned
+ * Codex FileChange equivalent. The reverse-provider permission seam gates that tool
+ * and the adapter rejects the missing projection instead of allowing the mutation.
  */
 export async function planPermissionFileChanges(
 	toolName: string,

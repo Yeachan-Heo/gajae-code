@@ -7,13 +7,32 @@ export const api = "gjc-app-server-stub-api";
 
 let toolCallEmitted = false;
 
+function configuredToolCall(): { name: string; arguments: Record<string, unknown> } | undefined {
+	const name = process.env.GJC_TEST_MODEL_TOOL_NAME;
+	const rawArguments = process.env.GJC_TEST_MODEL_TOOL_ARGS;
+	if (name && rawArguments) {
+		const parsed: unknown = JSON.parse(rawArguments);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			throw new Error("GJC_TEST_MODEL_TOOL_ARGS must encode a JSON object");
+		}
+		return { name, arguments: parsed as Record<string, unknown> };
+	}
+	const command = process.env.GJC_TEST_MODEL_TOOL_COMMAND;
+	return command ? { name: "bash", arguments: { command } } : undefined;
+}
+
 export function streamSimple(model: Model) {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
-		const command = process.env.GJC_TEST_MODEL_TOOL_COMMAND;
-		if (command && !toolCallEmitted) {
+		const configured = !toolCallEmitted ? configuredToolCall() : undefined;
+		if (configured) {
 			toolCallEmitted = true;
-			const toolCall = { type: "toolCall" as const, id: "stub-tool-call", name: "bash", arguments: { command } };
+			const toolCall = {
+				type: "toolCall" as const,
+				id: "stub-tool-call",
+				name: configured.name,
+				arguments: configured.arguments,
+			};
 			const message: AssistantMessage = {
 				role: "assistant" as const,
 				content: [toolCall],

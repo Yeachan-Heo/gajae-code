@@ -328,9 +328,9 @@ function turnPolicyOverride(params: Readonly<Record<string, unknown>>): TurnPoli
 		reasoningEffort?: string;
 	} = {};
 	if (hasNonNullProperty(params, "approvalPolicy")) {
-		if (params.approvalPolicy !== "never")
+		if (params.approvalPolicy !== "never" && params.approvalPolicy !== "on-request")
 			throw new TurnControllerError("turn_policy", "Turn approvalPolicy is unsupported by the child runtime.");
-		policy.approvalPolicy = "never";
+		if (params.approvalPolicy === "never") policy.approvalPolicy = "never";
 	}
 	if (hasNonNullProperty(params, "sandboxPolicy")) {
 		const sandboxPolicy = params.sandboxPolicy;

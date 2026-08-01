@@ -1247,7 +1247,9 @@ async function discardPreparedNewSessionAfterFailure(
 // ============================================================================
 
 /** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move"]);
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "write", "delete", "move", "ast_edit"]);
+// ast_edit has no pinned FileChange projection; a live reverse provider must still gate it, then fail closed.
+const REVERSE_FILE_APPROVAL_TOOLS = new Set(["edit", "write", "delete", "move", "ast_edit"]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
 	return toolName === "bash" || toolName === "monitor";
@@ -1318,6 +1320,7 @@ function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; pat
 function getPermissionIntent(
 	toolName: string,
 	args: unknown,
+	options: { requireReverseFileApproval?: boolean } = {},
 ): { toolName: string; title: string; paths?: string[]; cacheKey: string } | undefined {
 	const a = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
 	if (isShellExecutionPermissionTool(toolName)) {
@@ -1336,6 +1339,28 @@ function getPermissionIntent(
 			cacheKey: toolName,
 		};
 	}
+	if (toolName === "write") {
+		if (!options.requireReverseFileApproval) return undefined;
+		const p = getStringProperty(a, "path");
+		return {
+			toolName,
+			title: p ? `Write ${p}` : toolName,
+			paths: p ? [p] : undefined,
+			cacheKey: "write:file-change",
+		};
+	}
+
+	if (toolName === "ast_edit") {
+		if (!options.requireReverseFileApproval) return undefined;
+		const p = getStringProperty(a, "path") ?? getStringProperty(a, "file_path");
+		return {
+			toolName,
+			title: p ? `AST edit ${p}` : toolName,
+			paths: p ? [p] : undefined,
+			cacheKey: "ast_edit:file-change",
+		};
+	}
+
 	if (toolName === "delete") {
 		const p = getStringProperty(a, "path");
 		return { toolName, title: p ? `Delete ${p}` : toolName, paths: p ? [p] : undefined, cacheKey: toolName };
@@ -1353,7 +1378,16 @@ function getPermissionIntent(
 	}
 	if (toolName === "edit") {
 		const intent = getEditDestructiveIntent(args);
-		if (!intent) return undefined;
+		if (!intent) {
+			if (!options.requireReverseFileApproval) return undefined;
+			const p = getStringProperty(a, "path");
+			return {
+				toolName,
+				title: p ? `Edit ${p}` : toolName,
+				paths: p ? [p] : undefined,
+				cacheKey: "edit:file-change",
+			};
+		}
 		if (intent.kind === "delete") {
 			return {
 				toolName,
@@ -6740,8 +6774,14 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
-					const permissionIntent = getPermissionIntent(target.name, args);
+					const requireReverseFileApproval = this.#sdkPermissionProvider !== undefined;
+					const permissionIntent = getPermissionIntent(target.name, args, { requireReverseFileApproval });
 					if (!permissionIntent) {
+						if (requireReverseFileApproval && REVERSE_FILE_APPROVAL_TOOLS.has(target.name)) {
+							throw new ToolError(
+								`Tool call rejected because ${target.name} could not be represented for approval`,
+							);
+						}
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					const isShellExecutionTool = isShellExecutionPermissionTool(target.name);

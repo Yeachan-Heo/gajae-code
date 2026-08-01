@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { stableValidators } from "../protocol-source/schema-validators.generated";
 
 type JsonObject = Record<string, unknown>;
 type Reader = {
@@ -71,17 +72,40 @@ async function sendRequest(
 
 async function runScenario(
 	decision: JsonObject | undefined,
-	approvalPolicy?: "never",
-): Promise<{ approvalMethod: string | undefined; markerContent: string | undefined }> {
+	approvalPolicy?: "never" | "on-request",
+	mode: "bash" | "patchRename" | "editUpdate" | "write" = "bash",
+): Promise<{
+	approvalMethod: string | undefined;
+	approvalRequestCount: number;
+	approvalParams: JsonObject | undefined;
+	markerContent: string | undefined;
+	patchSourceContent: string | undefined;
+	patchDestinationContent: string | undefined;
+}> {
 	const tempRoot = mkdtempSync(path.join(tmpdir(), "gjc-permission-bridge-e2e-"));
 	const agentDir = path.join(tempRoot, "agent");
 	const cwd = repoRoot;
 	const marker = path.join(tempRoot, "tool-ran.txt");
+	const patchSource = path.join(tempRoot, "patch-target.txt");
+	const patchDestination = path.join(tempRoot, "patch-target-renamed.txt");
 	const provider = path.join(
 		repoRoot,
 		"packages/coding-agent/src/app-server/__tests__/fixtures/stub-model-provider.ts",
 	);
 	const command = `printf approved > ${marker}`;
+	const toolName = mode === "bash" ? "bash" : mode === "write" ? "write" : "edit";
+	const toolArguments: JsonObject =
+		mode === "patchRename"
+			? {
+					path: patchSource,
+					edits: [{ op: "update", rename: patchDestination, diff: "@@ -1 +1 @@\n-before\n+after\n" }],
+				}
+			: mode === "editUpdate"
+				? { path: patchSource, edits: [{ old_text: "before", new_text: "after" }] }
+				: mode === "write"
+					? { path: patchSource, content: "after\n" }
+					: { command };
+	if (mode !== "bash") await Bun.write(patchSource, "before\n");
 	mkdirSync(agentDir);
 	const child = Bun.spawn([process.execPath, "packages/coding-agent/src/cli.ts", "app-server", "--stdio"], {
 		cwd: repoRoot,
@@ -92,7 +116,14 @@ async function runScenario(
 			PI_CODING_AGENT_DIR: agentDir,
 			GJC_TEST_MODEL_PROVIDER: provider,
 			GJC_TEST_MODEL_PROVIDER_AUTHORITY: "1",
+			GJC_TEST_MODEL_TOOL_NAME: toolName,
+			GJC_TEST_MODEL_TOOL_ARGS: JSON.stringify(toolArguments),
 			GJC_TEST_MODEL_TOOL_COMMAND: command,
+			...(mode === "patchRename"
+				? { GJC_EDIT_VARIANT: "patch" }
+				: mode === "editUpdate"
+					? { GJC_EDIT_VARIANT: "replace" }
+					: {}),
 		},
 		stdin: "pipe",
 		stdout: "pipe",
@@ -105,10 +136,19 @@ async function runScenario(
 		buffer: "",
 	};
 	let approvalMethod: string | undefined;
+	let approvalRequestCount = 0;
+	let approvalParams: JsonObject | undefined;
 	const onFrame = async (frame: JsonObject): Promise<void> => {
 		if (frame.method !== "execCommandApproval" && frame.method !== "applyPatchApproval") return;
+		approvalRequestCount++;
+		if (approvalRequestCount > 1) throw new Error(`approval request was emitted more than once: ${frame.method}`);
 		if (!decision) throw new Error(`approval request was unexpected under approvalPolicy=never: ${frame.method}`);
 		approvalMethod = frame.method;
+		if (frame.method === "applyPatchApproval") {
+			expect(stableValidators.serverRequestParams.applyPatchApproval(frame.params)).toBe(true);
+		}
+		if (!isRecord(frame.params)) throw new Error(`approval request omitted params: ${frame.method}`);
+		approvalParams = frame.params;
 		await sendFrame(child, { jsonrpc: "2.0", id: frame.id as string, result: decision });
 	};
 	try {
@@ -156,7 +196,7 @@ async function runScenario(
 			},
 			onFrame,
 		);
-		expect(isRecord(turnStart.result)).toBe(true);
+		if (!isRecord(turnStart.result)) throw new Error(`turn/start failed: ${JSON.stringify(turnStart)}`);
 		let completed = false;
 		while (!completed) {
 			const frame = await readFrame(state);
@@ -167,10 +207,17 @@ async function runScenario(
 		await child.exited;
 		const errorOutput = await stderr;
 		if (child.exitCode !== 0) throw new Error(`app-server exited ${child.exitCode}: ${errorOutput}`);
-		expect(approvalMethod).toBe(decision ? "execCommandApproval" : undefined);
+		expect(approvalMethod).toBe(
+			decision ? (mode === "bash" ? "execCommandApproval" : "applyPatchApproval") : undefined,
+		);
+		expect(approvalRequestCount).toBe(decision ? 1 : 0);
 		return {
 			approvalMethod,
+			approvalRequestCount,
+			approvalParams,
 			markerContent: existsSync(marker) ? readFileSync(marker, "utf8") : undefined,
+			patchSourceContent: existsSync(patchSource) ? readFileSync(patchSource, "utf8") : undefined,
+			patchDestinationContent: existsSync(patchDestination) ? readFileSync(patchDestination, "utf8") : undefined,
 		};
 	} finally {
 		if (child.exitCode === null) child.kill();
@@ -188,3 +235,54 @@ test("real guarded child tool routes approval to the subscribed app-server clien
 	const never = await runScenario(undefined, "never");
 	expect(never.markerContent).toBe("approved");
 }, 120_000);
+
+test("real patch-mode edit routes a schema-shaped applyPatchApproval exactly once", async () => {
+	const approved = await runScenario({ decision: "approved" }, undefined, "patchRename");
+	expect(approved.approvalMethod).toBe("applyPatchApproval");
+	expect(approved.approvalRequestCount).toBe(1);
+	expect(approved.patchSourceContent).toBeUndefined();
+	expect(approved.patchDestinationContent).toBe("after\n");
+	const approvedFileChanges = approved.approvalParams?.fileChanges;
+	expect(isRecord(approvedFileChanges)).toBe(true);
+	if (!isRecord(approvedFileChanges)) return;
+	const approvedChange = Object.values(approvedFileChanges)[0];
+	expect(isRecord(approvedChange)).toBe(true);
+	if (!isRecord(approvedChange)) return;
+	expect(approvedChange.type).toBe("update");
+	expect(approvedChange.unified_diff).toEqual(expect.stringContaining("+1|after"));
+	expect(approvedChange.move_path).toEqual(expect.stringContaining("patch-target-renamed.txt"));
+
+	const denied = await runScenario({ decision: { denied: { rejection: "not allowed" } } }, undefined, "patchRename");
+	expect(denied.approvalMethod).toBe("applyPatchApproval");
+	expect(denied.approvalRequestCount).toBe(1);
+	expect(denied.patchSourceContent).toBe("before\n");
+	expect(denied.patchDestinationContent).toBeUndefined();
+}, 120_000);
+
+test("real ordinary edit and write mutations require applyPatchApproval and honor approve or deny", async () => {
+	for (const approvalPolicy of [undefined, "on-request"] as const) {
+		for (const mode of ["editUpdate", "write"] as const) {
+			const label = `${approvalPolicy ?? "default"}:${mode}`;
+			const approved = await runScenario({ decision: "approved" }, approvalPolicy, mode);
+			expect(approved.approvalMethod, label).toBe("applyPatchApproval");
+			expect(approved.approvalRequestCount, label).toBe(1);
+			expect(approved.patchSourceContent, label).toBe("after\n");
+			expect(approved.patchDestinationContent, label).toBeUndefined();
+			const approvedFileChanges = approved.approvalParams?.fileChanges;
+			expect(isRecord(approvedFileChanges), label).toBe(true);
+			if (!isRecord(approvedFileChanges)) continue;
+			const approvedChange = Object.values(approvedFileChanges)[0];
+			expect(isRecord(approvedChange), label).toBe(true);
+			if (!isRecord(approvedChange)) continue;
+			expect(approvedChange.type, label).toBe("update");
+			expect(approvedChange.unified_diff, label).toEqual(expect.stringContaining("+1|after"));
+			expect(approvedChange.move_path, label).toBeNull();
+
+			const denied = await runScenario({ decision: { denied: { rejection: "not allowed" } } }, approvalPolicy, mode);
+			expect(denied.approvalMethod, label).toBe("applyPatchApproval");
+			expect(denied.approvalRequestCount, label).toBe(1);
+			expect(denied.patchSourceContent, label).toBe("before\n");
+			expect(denied.patchDestinationContent, label).toBeUndefined();
+		}
+	}
+}, 180_000);

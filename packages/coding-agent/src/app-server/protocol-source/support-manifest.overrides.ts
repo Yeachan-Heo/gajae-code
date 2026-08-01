@@ -97,7 +97,9 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		gjcSeam: "TurnController.start + SessionClient.setModelForTurn",
 		gjcBackendPath:
 			"packages/coding-agent/src/app-server/thread-runtime/turn-controller.ts; packages/coding-agent/src/app-server/thread-runtime/production-child.ts",
-		semanticGaps: [],
+		semanticGaps: [
+			"ast_edit child mutations are gated by the live reverse permission provider but have no pinned FileChange projection and fail closed.",
+		],
 		translationNotes: [
 			"Only nonempty text UserInput entries are admitted; an optional model override is resolved by the retained child and restored after the turn.",
 			"Per-turn reasoning effort is admitted only when the retained child reports the selected model as supporting that level; unsupported efforts fail before prompting.",

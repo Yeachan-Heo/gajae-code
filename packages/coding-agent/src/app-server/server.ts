@@ -182,7 +182,12 @@ function supportsTurnCollaborationMode(params: Record<string, unknown>): boolean
 }
 
 function supportsTurnStartDefaults(params: Record<string, unknown>): boolean {
-	if (hasNonNullProperty(params, "approvalPolicy") && params.approvalPolicy !== "never") return false;
+	if (
+		hasNonNullProperty(params, "approvalPolicy") &&
+		params.approvalPolicy !== "never" &&
+		params.approvalPolicy !== "on-request"
+	)
+		return false;
 	if (hasNonNullProperty(params, "sandboxPolicy")) {
 		const policy = params.sandboxPolicy;
 		if (!isRecord(policy) || policy.type !== "dangerFullAccess") return false;

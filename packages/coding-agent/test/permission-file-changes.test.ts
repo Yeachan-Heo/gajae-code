@@ -35,6 +35,7 @@ describe("planPermissionFileChanges", () => {
 		const change = result?.[path.join(cwd, "existing.txt")];
 		expect(change?.type).toBe("update");
 		if (change?.type !== "update") return;
+
 		expect(change.unified_diff).toContain("-1|old line");
 		expect(change.unified_diff).toContain("+1|new line");
 	});
@@ -62,6 +63,35 @@ describe("planPermissionFileChanges", () => {
 		});
 	});
 
+	test("edit patch mode projects a destructive delete with the real preimage", async () => {
+		await Bun.write(path.join(cwd, "patch-delete.txt"), "delete me\n");
+
+		expect(
+			await planPermissionFileChanges("edit", { path: "patch-delete.txt", edits: [{ op: "delete" }] }, cwd),
+		).toEqual({
+			[path.join(cwd, "patch-delete.txt")]: { type: "delete", content: "delete me\n" },
+		});
+	});
+
+	test("edit patch mode projects a destructive rename with a real diff", async () => {
+		await Bun.write(path.join(cwd, "patch-rename.txt"), "before\n");
+
+		const result = await planPermissionFileChanges(
+			"edit",
+			{
+				path: "patch-rename.txt",
+				edits: [{ op: "update", rename: "patch-renamed.txt", diff: "@@ -1 +1 @@\n-before\n+after\n" }],
+			},
+			cwd,
+		);
+		const change = result?.[path.join(cwd, "patch-rename.txt")];
+		expect(change).toEqual({
+			type: "update",
+			unified_diff: expect.stringContaining("+1|after"),
+			move_path: path.join(cwd, "patch-renamed.txt"),
+		});
+	});
+
 	test("edit applies a matching old_text and emits a real diff", async () => {
 		await Bun.write(path.join(cwd, "edit.txt"), "before\nafter\n");
 
@@ -76,6 +106,7 @@ describe("planPermissionFileChanges", () => {
 		if (change?.type !== "update") return;
 		expect(change.unified_diff).toContain("-1|before");
 		expect(change.unified_diff).toContain("+1|changed");
+		expect(change.move_path).toBeNull();
 	});
 
 	test("edit refuses a non-matching old_text", async () => {
