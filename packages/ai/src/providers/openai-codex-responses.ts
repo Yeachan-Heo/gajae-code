@@ -2823,7 +2823,7 @@ export function convertOpenAICodexResponsesTools(
 	model: Model<"openai-codex-responses">,
 ): CodexToolPayload[] {
 	const allowFreeform = supportsFreeformApplyPatchCodex(model);
-	return tools.map((tool): CodexToolPayload => {
+	const payloads = tools.map((tool): CodexToolPayload => {
 		if (allowFreeform && tool.customFormat) {
 			return {
 				type: "custom",
@@ -2847,6 +2847,10 @@ export function convertOpenAICodexResponsesTools(
 			...(effectiveStrict && { strict: true }),
 		};
 	});
+	// Tool definitions bypass the `input`/`instructions` sanitizers, so a
+	// leaked Harmony marker in an MCP/skill tool description or schema string
+	// makes the gate reject every request (bare `Request blocked`).
+	return neutralizeResponsesInputControlTokens(payloads);
 }
 
 function getString(value: unknown): string | undefined {

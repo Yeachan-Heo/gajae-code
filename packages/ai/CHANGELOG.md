@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Closed the two remaining ingress holes behind bare `Request Blocked` failures on OpenAI codex models. (1) The chatgpt.com/backend-api pre-model gate rejects with an HTTP 400 bare-`detail` body (`{"detail": "Request blocked."}`) carrying no `error.*` envelope and no `code=invalid_prompt`, so `parseCodexError` surfaced an unexplained message, `isInvalidPromptError` and the codex non-retryable classification missed it, and the session-level `invalid_prompt` circuit breaker never attempted a repaired resend. `parseCodexError` now reads top-level `detail` (string or `{message}`) bodies and classifies a leading `Request blocked` message without an explicit provider code as `invalid_prompt`, surfacing `Request blocked (code=invalid_prompt)` so every existing invalid_prompt contract engages. (2) Outgoing tool definitions (descriptions and JSON-schema strings) bypassed every request-boundary sanitizer on both the OpenAI Responses and OpenAI-codex-responses transports, so a `<|channel|>`-quoting MCP/skill tool description poisoned every request on the session in a way no history repair could fix. Both `convertTools` paths now neutralize reserved control tokens across the whole tool payload via the shared idempotent zero-width-space insertion (ref openai/codex#35838).
+
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31

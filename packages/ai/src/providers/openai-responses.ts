@@ -764,7 +764,7 @@ function isForcedOpenAIResponsesToolChoice(choice: unknown): boolean {
 /** @internal Exported for tests. */
 export function convertTools(tools: Tool[], strictMode: boolean, model: Model<"openai-responses">): OpenAITool[] {
 	const allowFreeform = supportsFreeformApplyPatch(model);
-	return tools.map(tool => {
+	const payloads = tools.map(tool => {
 		if (allowFreeform && tool.customFormat) {
 			return {
 				type: "custom",
@@ -792,4 +792,8 @@ export function convertTools(tools: Tool[], strictMode: boolean, model: Model<"o
 			...(effectiveStrict && { strict: true }),
 		} as OpenAITool;
 	});
+	// Tool definitions bypass the `input`/`instructions` sanitizers, so a
+	// leaked Harmony marker in an MCP/skill tool description or schema string
+	// rejects every gpt-5.x request (`Request blocked`).
+	return neutralizeResponsesInputControlTokens(payloads);
 }

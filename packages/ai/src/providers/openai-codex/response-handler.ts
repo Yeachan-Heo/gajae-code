@@ -19,6 +19,9 @@ export type CodexErrorInfo = {
 	rateLimits?: CodexRateLimits;
 	raw?: string;
 };
+// Matches the gate's bare rejection body ("Request blocked." / "Request
+// blocked (…)") but never messages that merely mention blocking mid-text.
+const REQUEST_BLOCKED_MESSAGE_RE = /^\s*request blocked\b/i;
 
 export async function parseCodexError(response: Response): Promise<CodexErrorInfo> {
 	const raw = await response.text();
@@ -28,7 +31,7 @@ export async function parseCodexError(response: Response): Promise<CodexErrorInf
 	let code: string | undefined;
 
 	try {
-		const parsed = JSON.parse(raw) as { error?: Record<string, unknown> };
+		const parsed = JSON.parse(raw) as { error?: Record<string, unknown>; detail?: unknown };
 		const err = parsed?.error ?? {};
 
 		const headers = response.headers;
@@ -67,9 +70,28 @@ export async function parseCodexError(response: Response): Promise<CodexErrorInf
 		}
 
 		const errMessage = (err as { message?: string }).message;
-		message = errMessage || friendlyMessage || message;
+		// The chatgpt.com/backend-api gate rejects with a bare-`detail` body
+		// (`{"detail": "Request blocked."}`) that carries no `error.*` envelope.
+		const detail =
+			typeof parsed?.detail === "string"
+				? parsed.detail
+				: typeof (parsed?.detail as { message?: unknown } | undefined)?.message === "string"
+					? (parsed.detail as { message: string }).message
+					: undefined;
+		message = errMessage || detail || friendlyMessage || message;
 	} catch {
 		// raw body not JSON
+	}
+
+	// A bare "Request blocked" body (detail-shaped JSON or plain text) is the
+	// pre-model gate's form of the deterministic `invalid_prompt` content
+	// rejection. It never carries a structured code, so classify it explicitly
+	// here; otherwise `isInvalidPromptError`, the codex non-retryable event set,
+	// and the session-level circuit breaker all miss it and the failure surfaces
+	// as an unexplained, unrepairable "Request Blocked".
+	if (!code && REQUEST_BLOCKED_MESSAGE_RE.test(message)) {
+		code = "invalid_prompt";
+		friendlyMessage = `${message.trim().replace(/\.+$/, "")} (code=invalid_prompt)`;
 	}
 
 	return {
