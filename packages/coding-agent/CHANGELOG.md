@@ -9,6 +9,7 @@
 - Prompt-template positional arguments now preserve literal `$@` and `$ARGUMENTS` text instead of recursively expanding it during placeholder substitution.
 - Native Windows session and GC commands now report the searched `psmux` / `pmux` / `tmux` provider set when no compatible multiplexer is available instead of leaking a literal `tmux` spawn error (#3688).
 - Managed-session recovery now preserves committed mutation state and the actual Linux fallback primitive in native publish receipts, preventing unsafe retry classification after a post-link staging unlink failure (#3746).
+- The system prompt now requires non-ASCII tool-input text to be written as literal UTF-8 rather than hand-spelled `\uXXXX` escapes, including JSON serialized into a string field, while leaving escapes that are intended source syntax alone. Models that hand-spell hex codepoints for CJK mis-type them, and each mis-typed escape decodes to a valid-but-wrong syllable, so Korean text in tool parameters silently arrives corrupted (anthropics/claude-code#83033).
 
 ## [0.12.8] - 2026-08-02
 ### Added
@@ -29,6 +30,7 @@
 - The issue-1979 Korean prose wrap test now cleans up inherited multiplexer env vars (`TMUX`, `TMUX_PANE`, etc.) so it deterministically exercises the plain-terminal render path regardless of the CI runner's terminal session (#1979).
 - The model selector's assignment menu now shows the model each role currently resolves to (`Set as EXECUTOR (Executor) — now: anthropic/claude-haiku-4-5`), distinguishing an unset default, a role that inherits the default, and a configured-but-unresolvable selector. Previously the role rows were unlabeled, so the only way to learn a role's model was to scan the whole 800+ entry model list for role badges.
 - Standalone `AGENTS.md` ancestor discovery now bounds directory traversal, per-file reads, and aggregate instruction bytes while surfacing content-free omission warnings (#3722).
+
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31

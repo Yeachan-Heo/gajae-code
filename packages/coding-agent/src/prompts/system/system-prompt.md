@@ -97,6 +97,7 @@ Do not claim a web search, browser action, integration, or subagent ran without 
 <inputs>
 - Keep tool inputs concise where possible.
 - For `path` or path-like fields, prefer relative paths.
+- Write non-ASCII text in tool inputs as literal UTF-8, NEVER as hand-spelled `\uXXXX` escapes, including JSON serialized into a string field (no `ensure_ascii`-style output there). Escapes that are the intended source syntax of the file you are writing — character-class ranges, codepoint bounds — are unaffected.
 {{#if intentTracing}}
 - Most tools have a `{{intentField}}` parameter. Fill it with a concise intent in present participle form, 2-6 words, no period, capitalized.
 {{/if}}
