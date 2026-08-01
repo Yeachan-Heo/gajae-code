@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { planPermissionFileChanges } from "../src/session/permission-file-changes";
+import { planPermissionFileChanges, planPermissionFileChangesWithGuard } from "../src/session/permission-file-changes";
 
 let cwd: string;
 
@@ -145,6 +145,34 @@ describe("planPermissionFileChanges", () => {
 			),
 		).toBeUndefined();
 		expect(await Bun.file(path.join(cwd, "mixed.txt")).text()).toBe("before\n");
+	});
+
+	test("reverse planning refuses an existing symlink target", async () => {
+		const one = path.join(cwd, "one.txt");
+		const two = path.join(cwd, "two.txt");
+		const link = path.join(cwd, "link.txt");
+		await Bun.write(one, "one\n");
+		await Bun.write(two, "two\n");
+		await symlink(one, link);
+		expect(
+			await planPermissionFileChangesWithGuard("write", { path: link, content: "changed\n" }, cwd),
+		).toBeUndefined();
+		expect(await Bun.file(two).text()).toBe("two\n");
+	});
+
+	test("guard rejects a regular target replaced by a symlink before execution", async () => {
+		const target = path.join(cwd, "target.txt");
+		const outside = path.join(cwd, "outside.txt");
+		await Bun.write(target, "before\n");
+		await Bun.write(outside, "outside\n");
+		const planned = await planPermissionFileChangesWithGuard("write", { path: target, content: "after\n" }, cwd);
+		expect(planned).toBeDefined();
+		if (!planned) return;
+		await rm(target);
+		await symlink(outside, target);
+		await expect(planned.guard.validate()).rejects.toThrow("Approved mutation target changed before execution");
+		expect(await Bun.file(outside).text()).toBe("outside\n");
+		expect(await Bun.file(target).text()).toBe("outside\n");
 	});
 
 	test("unrelated tools have no file-change representation", async () => {

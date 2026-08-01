@@ -404,7 +404,7 @@ import {
 	SILENT_ABORT_MARKER,
 	SKILL_PROMPT_MESSAGE_TYPE,
 } from "./messages";
-import { planPermissionFileChanges } from "./permission-file-changes";
+import { planPermissionFileChangesWithGuard } from "./permission-file-changes";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
@@ -6776,10 +6776,14 @@ export class AgentSession {
 				) => {
 					const requireReverseFileApproval = this.#sdkPermissionProvider !== undefined;
 					const isReverseFileMutation = requireReverseFileApproval && REVERSE_FILE_APPROVAL_TOOLS.has(target.name);
-					let fileChanges: Awaited<ReturnType<typeof planPermissionFileChanges>>;
+					let fileChanges: Awaited<ReturnType<typeof planPermissionFileChangesWithGuard>>;
 					if (isReverseFileMutation) {
 						try {
-							fileChanges = await planPermissionFileChanges(target.name, args, this.sessionManager.getCwd());
+							fileChanges = await planPermissionFileChangesWithGuard(
+								target.name,
+								args,
+								this.sessionManager.getCwd(),
+							);
 						} catch {
 							fileChanges = undefined;
 						}
@@ -6808,6 +6812,7 @@ export class AgentSession {
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
 						: undefined;
 					if (this.#sdkPermissionMode === "allow") {
+						if (fileChanges) await fileChanges.guard.validate();
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (this.#sdkPermissionMode === "deny") {
@@ -6821,6 +6826,7 @@ export class AgentSession {
 					// Short-circuit on persisted decisions only after this call's file-change evidence is valid.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {
+						if (fileChanges) await fileChanges.guard.validate();
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (persisted === "reject_always") {
@@ -6845,7 +6851,7 @@ export class AgentSession {
 								...(isExecutionTool ? { kind: "execute" } : {}),
 								status: "pending",
 								rawInput: args,
-								...(fileChanges ? { fileChanges } : {}),
+								...(fileChanges ? { fileChanges: fileChanges.fileChanges } : {}),
 								...(commandContent ? { content: commandContent } : {}),
 								locations: extractPermissionLocations(
 									args,
@@ -6879,6 +6885,7 @@ export class AgentSession {
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (${target.name})`);
 					}
+					if (fileChanges) await fileChanges.guard.validate();
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
 			},

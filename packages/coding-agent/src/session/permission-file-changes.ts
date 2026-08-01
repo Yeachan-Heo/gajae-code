@@ -1,3 +1,6 @@
+import { lstat, realpath } from "node:fs/promises";
+import * as nodePath from "node:path";
+
 /** Faithful Codex file-change evidence for permission requests. */
 
 import { generateUnifiedDiffString, replaceText } from "../edit/diff";
@@ -35,6 +38,24 @@ function resolvePath(value: unknown, cwd: string): string | undefined {
 	}
 }
 
+/** Reverse-provider mutations refuse symlinked targets; parent links are bound by realpath identity. */
+async function hasNoSymlinkPath(path: string): Promise<boolean> {
+	try {
+		const parentRealPath = await realpath(nodePath.dirname(path));
+		const targetRealPath = await realpath(path);
+		return targetRealPath === nodePath.join(parentRealPath, nodePath.basename(path));
+	} catch (error) {
+		return error instanceof Error && "code" in error && error.code === "ENOENT";
+	}
+}
+
+async function canonicalMissingPath(path: string): Promise<string | undefined> {
+	try {
+		return nodePath.join(await realpath(nodePath.dirname(path)), nodePath.basename(path));
+	} catch {
+		return undefined;
+	}
+}
 function isMissingFileError(error: unknown): boolean {
 	return error instanceof Error && error.message.startsWith("File not found:");
 }
@@ -89,6 +110,7 @@ async function planMove(args: unknown, cwd: string): Promise<PermissionFileChang
 	const oldPath = resolvePath(args.oldPath, cwd);
 	const newPath = resolvePath(args.newPath, cwd);
 	if (!oldPath || !newPath) return undefined;
+
 	return { [oldPath]: { type: "update", unified_diff: "", move_path: newPath } };
 }
 
@@ -96,7 +118,8 @@ async function planEdit(args: unknown, cwd: string): Promise<PermissionFileChang
 	if (!isRecord(args)) return undefined;
 	if (typeof args.input === "string") return planApplyPatch(args, cwd);
 	const displayPath = stringProperty(args, "path");
-	if (!displayPath || !Array.isArray(args.edits) || args.edits.length === 0) return undefined;
+	const path = resolvePath(displayPath, cwd);
+	if (!displayPath || !path || !Array.isArray(args.edits) || args.edits.length === 0) return undefined;
 
 	const edits = args.edits;
 	const hasPatchShape = edits.some(
@@ -130,8 +153,6 @@ async function planEdit(args: unknown, cwd: string): Promise<PermissionFileChang
 		);
 	}
 
-	const path = resolvePath(displayPath, cwd);
-	if (!path) return undefined;
 	const preimage = await readFile(path, displayPath);
 	if (!preimage.exists) return undefined;
 
@@ -210,6 +231,106 @@ async function planApplyPatch(args: unknown, cwd: string): Promise<PermissionFil
 		}
 	}
 	return Object.keys(changes).length > 0 ? changes : undefined;
+}
+
+export type PermissionFileChangeGuard = { validate(): Promise<void> };
+
+type PathIdentity = { path: string; exists: boolean; realPath: string; deviceAndInode?: string };
+
+function identityKey(value: { dev: number | bigint; ino: number | bigint }): string {
+	return `${String(value.dev)}:${String(value.ino)}`;
+}
+
+async function capturePathIdentity(path: string): Promise<PathIdentity | undefined> {
+	if (!(await hasNoSymlinkPath(path))) return undefined;
+	try {
+		const info = await lstat(path);
+		return { path, exists: true, realPath: await realpath(path), deviceAndInode: identityKey(info) };
+	} catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return undefined;
+		const missingPath = await canonicalMissingPath(path);
+		return missingPath === undefined ? undefined : { path, exists: false, realPath: missingPath };
+	}
+}
+
+function mutationPaths(toolName: string, args: unknown, cwd: string): string[] | undefined {
+	if (!isRecord(args)) return undefined;
+	const paths: string[] = [];
+	const push = (value: unknown): boolean => {
+		const path = resolvePath(value, cwd);
+		if (!path) return false;
+		if (!paths.includes(path)) paths.push(path);
+		return true;
+	};
+	if (toolName === "write" || toolName === "delete") return push(args.path) ? paths : undefined;
+	if (toolName === "move") return push(args.oldPath) && push(args.newPath) ? paths : undefined;
+	if (toolName !== "edit" && toolName !== "apply_patch") return undefined;
+	if (typeof args.input === "string") {
+		let entries: ApplyPatchEntry[];
+		try {
+			entries = expandApplyPatchToEntries({ input: args.input } as ApplyPatchParams);
+		} catch {
+			return undefined;
+		}
+		for (const entry of entries) {
+			if (!push(entry.path)) return undefined;
+			if (entry.rename !== undefined && !push(entry.rename)) return undefined;
+		}
+		return paths.length > 0 ? paths : undefined;
+	}
+	if (!push(args.path)) return undefined;
+	if (Array.isArray(args.edits)) {
+		for (const edit of args.edits) {
+			if (isRecord(edit) && edit.rename !== undefined && !push(edit.rename)) return undefined;
+		}
+	}
+	return paths;
+}
+
+export async function planPermissionFileChangesWithGuard(
+	toolName: string,
+	args: unknown,
+	cwd: string,
+): Promise<{ fileChanges: PermissionFileChangeMap; guard: PermissionFileChangeGuard } | undefined> {
+	const fileChanges = await planPermissionFileChanges(toolName, args, cwd);
+	if (!fileChanges) return undefined;
+	const paths = mutationPaths(toolName, args, cwd);
+	if (!paths || paths.length === 0) return undefined;
+	const identities: PathIdentity[] = [];
+	for (const path of paths) {
+		const identity = await capturePathIdentity(path);
+		if (!identity) return undefined;
+		identities.push(identity);
+	}
+	const identityByPath = new Map(identities.map(identity => [identity.path, identity]));
+	const resolvedFileChanges: PermissionFileChangeMap = {};
+	for (const [path, change] of Object.entries(fileChanges)) {
+		const identity = identityByPath.get(path);
+		const resolvedPath = identity?.realPath ?? path;
+		if (change.type === "update" && change.move_path !== null) {
+			const moveIdentity = identityByPath.get(change.move_path);
+			resolvedFileChanges[resolvedPath] = { ...change, move_path: moveIdentity?.realPath ?? change.move_path };
+		} else {
+			resolvedFileChanges[resolvedPath] = change;
+		}
+	}
+	return {
+		fileChanges: resolvedFileChanges,
+		guard: {
+			async validate() {
+				for (const expected of identities) {
+					const current = await capturePathIdentity(expected.path);
+					if (
+						!current ||
+						current.exists !== expected.exists ||
+						current.realPath !== expected.realPath ||
+						current.deviceAndInode !== expected.deviceAndInode
+					)
+						throw new Error(`Approved mutation target changed before execution: ${expected.path}`);
+				}
+			},
+		},
+	};
 }
 
 /**
