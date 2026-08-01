@@ -8,11 +8,11 @@
 	],
 	"cwd": ".",
 	"exitCode": 0,
-	"treeHash": "7854f4f5dea2803899cdd9e7f7bd60a8f368a92fcbd57234d4e2fba3bca19743",
+	"treeHash": "0258351c4a9b76e67b2478ee46685d4bca9571c4b9ddc1439c5780ecbc4efd55",
 	"artifacts": [
 		{
 			"path": "obligations.artifacts/real-t3/stdout.txt",
-			"sha256": "d1443ceca03176d8f2f0fd514cacf238a41b1c790af09ba37c5e45d93783c098"
+			"sha256": "70dedc83d485aac5d5e1e56cde0f72a06df5a8829536aa759301ab9774509327"
 		}
 	]
 }
