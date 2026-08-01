@@ -189,6 +189,18 @@ async function runQuietCleanupLateRegistration(resultPath: string | undefined): 
 	await runBrokenPipeStdoutWrite();
 }
 
+async function runLateRegistrationAsyncRejection(resultPath: string | undefined): Promise<void> {
+	if (!resultPath) throw new Error("late registration fixture requires a result path");
+	postmortem.register("fixture-late-registration-early", () => {});
+	await postmortem.cleanup();
+	postmortem.register("fixture-late-registration-async-rejection", async () => {
+		await Bun.sleep(20);
+		throw new Error("fixture: late registration async rejection");
+	});
+	await Bun.sleep(200);
+	await Bun.write(resultPath, JSON.stringify({ count: 1 }));
+}
+
 async function runOrdinaryFatalThenBrokenPipe(resultPath: string | undefined): Promise<void> {
 	if (!resultPath) throw new Error("ordinary fatal fixture requires a result path");
 
@@ -340,6 +352,9 @@ switch (scenario) {
 		break;
 	case "quiet-cleanup-late-registration":
 		await runQuietCleanupLateRegistration(process.argv[3]);
+		break;
+	case "late-registration-async-rejection":
+		await runLateRegistrationAsyncRejection(process.argv[3]);
 		break;
 	case "ordinary-fatal-then-broken-pipe":
 		await runOrdinaryFatalThenBrokenPipe(process.argv[3]);

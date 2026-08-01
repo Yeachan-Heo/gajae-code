@@ -433,12 +433,12 @@ export function register(id: string, callback: (reason: Reason) => void | Promis
 		}
 		// If cleanup is already running/completed, warn and run on microtask.
 		logger.warn("Cleanup invoked recursively", { id });
-		try {
-			callback(Reason.MANUAL);
-		} catch (error) {
-			const err = error instanceof Error ? error : new Error(String(error));
-			logger.error("Cleanup callback failed", { err, id, stack: err.stack });
-		}
+		queueMicrotask(() => {
+			void Promise.try(() => exec(Reason.MANUAL)).catch(error => {
+				const err = error instanceof Error ? error : new Error(String(error));
+				logger.error("Cleanup callback failed", { err, id, stack: err.stack });
+			});
+		});
 		return () => {};
 	}
 

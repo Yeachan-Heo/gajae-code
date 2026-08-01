@@ -5,6 +5,7 @@
 ### Fixed
 
 - macOS executable discovery now honors explicit `PATH` and `cwd` lookup overrides instead of silently searching the process environment.
+- Postmortem callbacks registered after a completed plain cleanup now run through the handled `Promise.try(...).catch(log)` path instead of a bare synchronous call that dropped the returned promise, so rejecting async late registrations are logged instead of surfacing as unhandled rejections that fail unrelated in-flight work.
 
 ## [0.12.7] - 2026-07-31
 

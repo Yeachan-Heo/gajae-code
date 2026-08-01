@@ -33,8 +33,8 @@ async function captureProcess(command: string[], cwd: string): Promise<ScenarioR
 	return { stdout, stderr, exitCode };
 }
 
-async function runScenario(scenario: string): Promise<ScenarioResult> {
-	return captureProcess([process.execPath, fixturePath, scenario], utilsDirectory);
+async function runScenario(scenario: string, extraArgs: readonly string[] = []): Promise<ScenarioResult> {
+	return captureProcess([process.execPath, fixturePath, scenario, ...extraArgs], utilsDirectory);
 }
 
 async function runPipelineCommand(command: readonly string[]): Promise<ScenarioResult> {
@@ -200,6 +200,21 @@ describe("postmortem process stdout EPIPE policy", () => {
 			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 2 });
 			expect(result.stderr).not.toContain("Cleanup callback failed");
 			expect(result.stderr).not.toContain("Cleanup invoked recursively");
+		} finally {
+			await fs.rm(temporaryDirectory, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("handles a rejecting async callback registered after plain cleanup without an unhandled rejection", async () => {
+		const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "postmortem-late-registration-"));
+		const resultPath = path.join(temporaryDirectory, "result.json");
+		try {
+			const result = await runScenario("late-registration-async-rejection", [resultPath]);
+
+			expect(result.exitCode).toBe(0);
+			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 1 });
+			expect(combinedOutput(result)).toContain("Cleanup callback failed");
+			expect(combinedOutput(result)).not.toContain("[Unhandled Rejection]");
 		} finally {
 			await fs.rm(temporaryDirectory, { recursive: true, force: true });
 		}
