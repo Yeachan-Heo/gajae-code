@@ -34,7 +34,7 @@ describe("OpenCodex discovery", () => {
 					const url = String(input);
 					calls.push(url);
 					if (url.endsWith("/healthz"))
-						return new Response(JSON.stringify({ ok: true, version: "opencodex" }), { status: 200 });
+						return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
 					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
 				},
 				{ preconnect: originalFetch.preconnect },
@@ -50,13 +50,74 @@ describe("OpenCodex discovery", () => {
 			provider: "opencodex",
 		});
 	});
+	test("ignores runtime endpoints on foreign hosts", async () => {
+		await Bun.write(
+			path.join(tempHome, "runtime-port.json"),
+			JSON.stringify({ hostname: "192.0.2.10", port: 10201 }),
+		);
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					calls.push(String(input));
+					return new Response(JSON.stringify({ ok: false }), { status: 200 });
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
+		expect(calls).toEqual(["http://127.0.0.1:10100/healthz"]);
+	});
+
+	test("rejects a mismatched health identity", async () => {
+		await Bun.write(path.join(tempHome, "runtime-port.json"), JSON.stringify({ hostname: "127.0.0.1", port: 10201 }));
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					const url = String(input);
+					calls.push(url);
+					if (url.includes(":10201/"))
+						return new Response(JSON.stringify({ ok: true, version: "other", port: 10201 }));
+					return new Response(JSON.stringify({ ok: false }), { status: 200 });
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
+		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10100/healthz"]);
+	});
+
+	test("rejects a mismatched health port binding", async () => {
+		await Bun.write(path.join(tempHome, "runtime-port.json"), JSON.stringify({ hostname: "127.0.0.1", port: 10201 }));
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL) => {
+					const url = String(input);
+					calls.push(url);
+					if (url.includes(":10201/"))
+						return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10100 }));
+					return new Response(JSON.stringify({ ok: false }), { status: 200 });
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
+		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10100/healthz"]);
+	});
 
 	test("falls back to port 10100 when runtime metadata is absent", async () => {
 		spyOn(globalThis, "fetch").mockImplementation(
 			Object.assign(
 				async (input: string | Request | URL) => {
 					expect(String(input)).toBe("http://127.0.0.1:10100/healthz");
-					return new Response(JSON.stringify({ ok: true, pid: 42, port: 10100 }), { status: 200 });
+					return new Response(JSON.stringify({ ok: true, version: "opencodex", pid: 42, port: 10100 }), {
+						status: 200,
+					});
 				},
 				{ preconnect: originalFetch.preconnect },
 			),
@@ -74,7 +135,7 @@ describe("OpenCodex discovery", () => {
 			Object.assign(
 				async (input: string | Request | URL) => {
 					if (String(input).endsWith("/healthz"))
-						return new Response(JSON.stringify({ ok: true, version: "opencodex" }));
+						return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }));
 					return new Response("unavailable", { status: 503 });
 				},
 				{ preconnect: originalFetch.preconnect },

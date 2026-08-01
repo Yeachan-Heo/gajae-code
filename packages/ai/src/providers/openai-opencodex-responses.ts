@@ -1,6 +1,8 @@
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+
 import type { Model } from "../types";
 
 export const OPENCODEX_DEFAULT_PORT = 10100;
@@ -43,9 +45,24 @@ function timeoutSignal(signal?: AbortSignal): AbortSignal {
 
 function normalizeEndpoint(hostname: string, port: number): string | undefined {
 	if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
-	const host = hostname.trim();
-	if (!host || host.includes("/") || host.includes("://")) return undefined;
-	return `http://${host}:${port}`;
+	const host = normalizeLoopbackHost(hostname);
+	if (!host) return undefined;
+	return `http://${formatEndpointHost(host)}:${port}`;
+}
+
+function normalizeLoopbackHost(hostname: string): string | undefined {
+	const host = hostname.trim().toLowerCase();
+	if (net.isIP(host) === 4 && host.startsWith("127.")) return host;
+	if (host === "::1") return host;
+	return undefined;
+}
+
+function formatEndpointHost(host: string): string {
+	return host.includes(":") ? `[${host}]` : host;
+}
+
+function healthPort(endpoint: string): number {
+	return Number(new URL(endpoint).port);
 }
 
 async function readRuntimeEndpoint(): Promise<string | undefined> {
@@ -77,15 +94,10 @@ async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
 	return response.json();
 }
 
-function isOpenCodexHealth(payload: unknown): boolean {
+function isOpenCodexHealth(payload: unknown, expectedPort: number): boolean {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
 	const health = payload as HealthPayload;
-	if (health.ok !== true) return false;
-	return (
-		typeof health.version === "string" ||
-		(typeof health.pid === "number" && Number.isFinite(health.pid)) ||
-		(typeof health.port === "number" && Number.isFinite(health.port))
-	);
+	return health.ok === true && health.version === "opencodex" && health.port === expectedPort;
 }
 
 export async function resolveOpenCodexEndpoint(signal?: AbortSignal): Promise<OpenCodexEndpoint | undefined> {
@@ -93,7 +105,7 @@ export async function resolveOpenCodexEndpoint(signal?: AbortSignal): Promise<Op
 	for (const candidate of candidateEndpoints(runtimeEndpoint)) {
 		try {
 			const health = await fetchJson(`${candidate}/healthz`, signal);
-			if (isOpenCodexHealth(health)) return { baseUrl: candidate };
+			if (isOpenCodexHealth(health, healthPort(candidate))) return { baseUrl: candidate };
 		} catch {
 			// An unavailable or foreign listener is a normal provider absence.
 		}
