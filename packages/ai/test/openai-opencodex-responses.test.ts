@@ -109,6 +109,52 @@ describe("OpenCodex discovery", () => {
 		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
 		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10100/healthz"]);
 	});
+	test("does not follow foreign redirects during health probing", async () => {
+		await Bun.write(path.join(tempHome, "runtime-port.json"), JSON.stringify({ hostname: "127.0.0.1", port: 10201 }));
+		const redirects: RequestInit["redirect"][] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (_input: string | Request | URL, init?: RequestInit) => {
+					redirects.push(init?.redirect ?? "follow");
+					return new Response(null, {
+						status: 302,
+						headers: { location: "http://192.0.2.10:10201/healthz" },
+					});
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await resolveOpenCodexEndpoint()).toBeUndefined();
+		expect(redirects).toEqual(["error", "error"]);
+	});
+
+	test("does not follow foreign redirects during catalog fetch", async () => {
+		await Bun.write(path.join(tempHome, "runtime-port.json"), JSON.stringify({ hostname: "127.0.0.1", port: 10201 }));
+		const calls: string[] = [];
+		const redirects: RequestInit["redirect"][] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL, init?: RequestInit) => {
+					const url = String(input);
+					calls.push(url);
+					redirects.push(init?.redirect ?? "follow");
+					if (url.endsWith("/healthz")) {
+						return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
+					}
+					return new Response(null, {
+						status: 302,
+						headers: { location: "http://192.0.2.10:10201/api/models" },
+					});
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+
+		expect(await fetchOpenCodexModels()).toBeNull();
+		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10201/api/models"]);
+		expect(redirects).toEqual(["error", "error"]);
+	});
 
 	test("falls back to port 10100 when runtime metadata is absent", async () => {
 		spyOn(globalThis, "fetch").mockImplementation(

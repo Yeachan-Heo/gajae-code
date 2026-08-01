@@ -88,6 +88,7 @@ function candidateEndpoints(runtimeEndpoint: string | undefined): string[] {
 async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
 	const response = await fetch(url, {
 		headers: { Accept: "application/json" },
+		redirect: "error",
 		signal: timeoutSignal(signal),
 	});
 	if (!response.ok) return undefined;
