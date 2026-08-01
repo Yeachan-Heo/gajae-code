@@ -860,7 +860,8 @@ async function stageConversion(
 		type: "session",
 		version: 5,
 		id: targetSessionId,
-		title: sanitizeImportedString(`Imported Codex ${conversion.source.id.slice(0, 12)}`).value,
+		title:
+			conversion.source.title ?? sanitizeImportedString(`Imported Codex ${conversion.source.id.slice(0, 12)}`).value,
 		titleSource: "user",
 		timestamp,
 		cwd: conversion.source.cwd,

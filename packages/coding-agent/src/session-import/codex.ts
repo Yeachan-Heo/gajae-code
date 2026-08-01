@@ -13,12 +13,15 @@ import {
 export const CODEX_PROVIDER_ID = "openai-codex";
 export const CODEX_CONVERTER_VERSION = 1;
 export const CODEX_SANITIZER_VERSION = 1;
-export const CODEX_MAPPING_VERSION = 1;
+export const CODEX_MAPPING_VERSION = 3;
 
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024 * 1024;
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
 const MAX_QUARANTINE_BYTES = 8 * 1024 * 1024;
 const MAX_DISCOVERY_ENTRIES = 100_000;
+const MAX_SESSION_INDEX_BYTES = 16 * 1024 * 1024;
+const MAX_SESSION_INDEX_LINE_BYTES = 64 * 1024;
+const MAX_SESSION_TITLE_CHARACTERS = 200;
 const SENSITIVE_KEY = /(?:api[-_]?key|authorization|cookie|credential|password|secret|token)/iu;
 const CODEX_SESSION_ID = /^[A-Za-z0-9-]{1,128}$/u;
 const SECRET_VALUE =
@@ -43,6 +46,7 @@ export interface CodexSessionSource {
 	path: string;
 	cwd: string;
 	timestamp: string;
+	title?: string;
 	cliVersion?: string;
 	modelProvider?: string;
 	identity?: RecoveryFsIdentity;
@@ -271,6 +275,81 @@ function sameRetainedIdentity(left: RecoveryFsIdentity, right: RecoveryFsIdentit
 	);
 }
 
+function boundedSessionTitle(value: string): string | undefined {
+	const sanitized = sanitizeImportedString(value).value.trim();
+	if (!sanitized) return undefined;
+	return Array.from(sanitized).slice(0, MAX_SESSION_TITLE_CHARACTERS).join("");
+}
+
+function inferredSessionTitle(text: string): string | undefined {
+	const trimmed = text.trim();
+	if (
+		!trimmed ||
+		trimmed.startsWith("# AGENTS.md instructions") ||
+		trimmed.startsWith("<environment_context>") ||
+		trimmed.startsWith("<INSTRUCTIONS>")
+	)
+		return undefined;
+	const firstLine = trimmed
+		.split(/\r?\n/u)
+		.map(line => line.trim())
+		.find(Boolean)
+		?.replace(/^#{1,6}\s+/u, "");
+	return firstLine ? boundedSessionTitle(firstLine) : undefined;
+}
+
+function readCodexSessionTitles(codexHome: string): Map<string, string> {
+	let root: RecoveryFsRoot | undefined;
+	let file: RecoveryFsFile | undefined;
+	try {
+		root = openRecoveryFsRoot(codexHome);
+		file = root.openFile("session_index.jsonl");
+		const initial = file.identity();
+		if (!initial.ok || !initial.identity || initial.identity.nlink !== "1") return new Map();
+		if (BigInt(initial.identity.size) > BigInt(MAX_SESSION_INDEX_BYTES)) return new Map();
+		const chunks: Buffer[] = [];
+		let offset = 0;
+		for (;;) {
+			const chunk = file.readChunk(offset, 1024 * 1024);
+			if (!chunk.ok || !chunk.data || !chunk.identity || !sameSourceIdentity(initial.identity, chunk.identity))
+				return new Map();
+			if (chunk.data.byteLength === 0) break;
+			offset += chunk.data.byteLength;
+			if (offset > MAX_SESSION_INDEX_BYTES) return new Map();
+			chunks.push(Buffer.from(chunk.data));
+		}
+		const terminal = file.identity();
+		if (!terminal.ok || !terminal.identity || !sameSourceIdentity(initial.identity, terminal.identity))
+			return new Map();
+		const titles = new Map<string, string>();
+		for (const line of Buffer.concat(chunks).toString("utf8").split("\n")) {
+			if (!line.trim() || Buffer.byteLength(line, "utf8") > MAX_SESSION_INDEX_LINE_BYTES) continue;
+			let row: unknown;
+			try {
+				row = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+			const record = row as Record<string, unknown>;
+			if (
+				typeof record.id !== "string" ||
+				!CODEX_SESSION_ID.test(record.id) ||
+				typeof record.thread_name !== "string"
+			)
+				continue;
+			const title = boundedSessionTitle(record.thread_name);
+			if (title) titles.set(record.id, title);
+		}
+		return titles;
+	} catch {
+		return new Map();
+	} finally {
+		file?.close();
+		if (root) closeRetainedRoot(root);
+	}
+}
+
 async function workspaceIdentity(directory: string): Promise<CodexWorkspaceIdentity | null> {
 	const stat = await fs.lstat(directory, { bigint: true }).catch(() => null);
 	if (!stat?.isDirectory() || stat.isSymbolicLink()) return null;
@@ -435,6 +514,7 @@ export async function discoverCodexSessions(
 				"discovery",
 				"The canonical workspace path contains secret-shaped or control content.",
 			);
+		const sessionTitles = readCodexSessionTitles(codexHome);
 		const requested = new Set(requestedIds);
 		const found = new Map<string, CodexSessionSource>();
 		let relativePaths: string[];
@@ -488,6 +568,7 @@ export async function discoverCodexSessions(
 			const canonicalMetadataWorkspace = await fs.realpath(meta.cwd).catch(() => null);
 			if (!canonicalMetadataWorkspace || !sameWorkspace(canonicalMetadataWorkspace, canonicalWorkspace)) continue;
 			meta.cwd = canonicalMetadataWorkspace;
+			meta.title = sessionTitles.get(meta.id);
 			meta.workspaceIdentity = discoveredWorkspaceIdentity;
 			if (rootAuthority) meta.authority = { root: rootAuthority, relativePath: relative };
 			if (requested.size > 0 && !requested.has(meta.id)) continue;
@@ -773,6 +854,7 @@ export async function convertCodexSession(
 				counts.quarantined++;
 				continue;
 			}
+			if (result.kind === "user" && !source.title) source.title = inferredSessionTitle(result.text);
 			const sanitized = sanitizeImportedValue(result);
 			counts.redacted += sanitized.redacted;
 			if (mappedEventSink) await mappedEventSink(sanitized.value as CodexMappedEvent);

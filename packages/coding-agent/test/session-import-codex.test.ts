@@ -44,6 +44,11 @@ async function source(id: string, cwd: string, events: string[]): Promise<void> 
 	const dir = path.join(codexHome, "sessions", "2026");
 	await fs.mkdir(dir, { recursive: true });
 	await fs.writeFile(path.join(dir, `${id}.jsonl`), `${meta(id, cwd)}${events.join("")}`, { mode: 0o600 });
+	await fs.appendFile(
+		path.join(codexHome, "session_index.jsonl"),
+		line({ id, thread_name: `Codex ${id}`, updated_at: stamp }),
+		{ mode: 0o600 },
+	);
 }
 
 beforeEach(async () => {
@@ -90,6 +95,38 @@ describe("Codex session import", () => {
 		} as unknown as SlashCommandRuntime);
 		expect(result).toEqual({ consumed: true, exitCode: 1 });
 		expect(output.join("\n")).toContain("source_not_found");
+	});
+
+	it("uses the latest sanitized Codex session index title", async () => {
+		await source("named-session", workspace, [message("user", "hello")]);
+		await fs.appendFile(
+			path.join(codexHome, "session_index.jsonl"),
+			line({ id: "named-session", thread_name: "실제 Codex 세션 이름\u001b[31m", updated_at: stamp }),
+		);
+		const discovered = await discoverCodexSessions(workspace, ["named-session"], codexHome, true);
+		try {
+			expect(discovered[0]?.title).toBe("실제 Codex 세션 이름[control-sequence]");
+		} finally {
+			await closeCodexSessionAuthorities(discovered);
+		}
+		const batch = await importCodexSessions(workspace, ["named-session"]);
+		const result = batch.results[0];
+		if (!result || result.status === "failed") throw new Error("Expected named import success");
+		const [header] = (await fs.readFile(result.targetPath, "utf8")).split("\n");
+		expect(JSON.parse(header!).title).toBe("실제 Codex 세션 이름[control-sequence]");
+	});
+
+	it("infers a sanitized title when the Codex index has no entry", async () => {
+		await source("unindexed-session", workspace, [
+			message("user", "# AGENTS.md instructions for a workspace"),
+			message("user", "세션 가져오기 오류 해결\n상세 내용"),
+		]);
+		await fs.writeFile(path.join(codexHome, "session_index.jsonl"), "");
+		const batch = await importCodexSessions(workspace, ["unindexed-session"]);
+		const result = batch.results[0];
+		if (!result || result.status === "failed") throw new Error("Expected inferred-title import success");
+		const [header] = (await fs.readFile(result.targetPath, "utf8")).split("\n");
+		expect(JSON.parse(header!).title).toBe("세션 가져오기 오류 해결");
 	});
 	it("discovers exact-workspace sessions and explicit IDs", async () => {
 		await source("same-a", workspace, [message("user", "one")]);
