@@ -55,8 +55,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * ownership, settlement, and descendant cleanup authority. Generation 38 also
  * adds durable provider-intent admission without changing owner, reclaim,
  * signal, or spawn authority.
+ * Generation 41 applies first-class provider-settings admission to Telegram
+ * lifecycle controls.
  */
-export const DAEMON_GENERATION = 40;
+export const DAEMON_GENERATION = 41;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
