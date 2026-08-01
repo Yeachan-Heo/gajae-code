@@ -60,6 +60,7 @@ export type OAuthProvider =
 	| "xiaomi-token-plan-ams"
 	| "xiaomi-token-plan-cn"
 	| "zenmux"
+	| "opencodex"
 	| "zai";
 
 export type OAuthProviderId = OAuthProvider | (string & {});

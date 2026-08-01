@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added read-only OpenCodex provider discovery with runtime-port resolution, identity-checked health probing, cached `/api/models` catalogs, raw wire model ids, and `/login opencodex` status reprobes without credential persistence.
+
 
 ### Fixed
 

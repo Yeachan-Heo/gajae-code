@@ -11,6 +11,7 @@ import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
+import { checkOpenCodexStatus } from "./providers/openai-opencodex-responses";
 import { getEnvApiKey } from "./stream";
 import type { Provider } from "./types";
 import type {
@@ -1726,7 +1727,12 @@ export class AuthStorage {
 			await this.set(provider, newCredential);
 		};
 		const manualCodeInput = () => ctrl.onPrompt({ message: "Paste the authorization code (or full redirect URL):" });
+
 		switch (provider) {
+			case "opencodex": {
+				await checkOpenCodexStatus(ctrl.onProgress);
+				return;
+			}
 			case "anthropic": {
 				const { loginAnthropic } = await import("./utils/oauth/anthropic");
 				credentials = await loginAnthropic({

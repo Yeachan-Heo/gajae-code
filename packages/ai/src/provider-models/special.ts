@@ -1,6 +1,14 @@
 import { once } from "@gajae-code/utils";
 import type { ModelManagerOptions } from "../model-manager";
+import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
 import { fetchCodexModels } from "../utils/discovery/codex";
+export function openCodexModelManagerOptions(): ModelManagerOptions<"openai-responses"> {
+	return {
+		providerId: "opencodex",
+		cacheTtlMs: OPENCODEX_MODEL_CACHE_TTL_MS,
+		fetchDynamicModels: fetchOpenCodexModels,
+	};
+}
 
 // ---------------------------------------------------------------------------
 // OpenAI code provider

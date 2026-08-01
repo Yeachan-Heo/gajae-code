@@ -124,6 +124,7 @@ export type KnownProvider =
 	| "google-vertex"
 	| "openai"
 	| "openai-codex"
+	| "opencodex"
 	| "kimi-code"
 	| "minimax-code"
 	| "minimax-code-cn"

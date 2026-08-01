@@ -326,7 +326,7 @@ export function stream<TApi extends Api>(
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
 	}
 
-	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	const apiKey = options?.apiKey || (model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider));
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}

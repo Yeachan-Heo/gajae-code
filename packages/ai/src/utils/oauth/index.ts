@@ -26,6 +26,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "opencodex",
+		name: "OpenCodex (local proxy status)",
+		available: true,
+	},
+	{
 		id: "openai-codex-device",
 		name: "ChatGPT Plus/Pro (Codex, headless/device)",
 		available: true,

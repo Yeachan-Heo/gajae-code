@@ -2949,6 +2949,9 @@ export class SelectorController {
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
 		const useManualInput = CALLBACK_SERVER_PROVIDERS.has(providerId as OAuthProvider);
+		if (providerId === "opencodex") {
+			this.ctx.showStatus("Checking the local OpenCodex proxy…");
+		}
 		try {
 			await this.ctx.session.modelRegistry.authStorage.login(providerId as OAuthProvider, {
 				onAuth: (info: { url: string; instructions?: string }) => {
@@ -2997,11 +3000,17 @@ export class SelectorController {
 			});
 			await this.ctx.session.modelRegistry.refresh();
 			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("success", `${theme.status.success} Successfully logged in to ${providerId}`), 1, 0),
-			);
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
-			await this.#handlePostLoginModelProfileRecommendation(providerId);
+			const successMessage =
+				providerId === "opencodex"
+					? `${theme.status.success} OpenCodex proxy status checked`
+					: `${theme.status.success} Successfully logged in to ${providerId}`;
+			this.ctx.chatContainer.addChild(new Text(theme.fg("success", successMessage), 1, 0));
+			if (providerId !== "opencodex") {
+				this.ctx.chatContainer.addChild(
+					new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0),
+				);
+				await this.#handlePostLoginModelProfileRecommendation(providerId);
+			}
 			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
 			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
