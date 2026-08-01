@@ -359,7 +359,17 @@ test("obligations verifier rejects unknown CLI arguments with usage exit status 
 	]);
 	expect(exitCode).toBe(2);
 	expect(stdout).toBe("");
-	expect(stderr).toBe("Usage: verify-app-server-obligations.ts [--root <package-root>]\n");
+	expect(stderr).toBe("Usage: verify-app-server-obligations.ts [--self-test --root <package-root>]\n");
+});
+
+test("obligations verifier refuses a bare --root without the explicit self-test opt-in", async () => {
+	// `--root` re-points manifest, receipt, and approved-argv resolution, so the shipped CLI must
+	// not accept it as an ordinary flag.
+	const { root } = await fixture();
+	const process = Bun.spawn(["bun", verifierPath, "--root", root], { stdout: "pipe", stderr: "pipe" });
+	const [stderr, exitCode] = await Promise.all([new Response(process.stderr).text(), process.exited]);
+	expect(exitCode).toBe(2);
+	expect(stderr).toBe("Usage: verify-app-server-obligations.ts [--self-test --root <package-root>]\n");
 });
 
 test("obligations verifier fails closed explicitly in a compiled artifact", async () => {
@@ -371,6 +381,26 @@ test("obligations verifier fails closed explicitly in a compiled artifact", asyn
 		if (previous === undefined) delete process.env.PI_COMPILED;
 		else process.env.PI_COMPILED = previous;
 	}
+});
+
+test("a compiled artifact cannot route around the refusal with a caller-supplied root", async () => {
+	const { root } = await fixture();
+	const previous = process.env.PI_COMPILED;
+	process.env.PI_COMPILED = "1";
+	try {
+		expect(await verifyObligations(root)).toEqual({ verified: [], blocked: ["compiled-artifact"] });
+	} finally {
+		if (previous === undefined) delete process.env.PI_COMPILED;
+		else process.env.PI_COMPILED = previous;
+	}
+});
+
+test("obligations verifier blocks on tree-snapshot outside a Git worktree instead of throwing", async () => {
+	// The snapshot algorithm is Git-backed, so a package that is not inside a worktree cannot
+	// produce a tree hash at all. That must be its own blocked reason, not an exception.
+	const { root, repositoryRoot } = await fixture();
+	await fs.rm(path.join(repositoryRoot, ".git"), { recursive: true, force: true });
+	expect(await verifyObligations(root)).toEqual({ verified: [], blocked: ["tree-snapshot"] });
 });
 
 test("a coordinated manifest and digest edit remains an explicit residual limitation", async () => {

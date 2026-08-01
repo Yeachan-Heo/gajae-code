@@ -92,6 +92,8 @@
 		"bin",
 		"scripts",
 		"examples",
+		"obligations.receipts",
+		"obligations.artifacts",
 		"README.md",
 		"CHANGELOG.md",
 		"vendor",

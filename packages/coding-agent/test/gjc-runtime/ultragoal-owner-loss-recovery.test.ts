@@ -75,86 +75,86 @@ async function setup(cwd: string): Promise<string> {
 
 describe("Ultragoal owner-loss recovery", () => {
 	// Reading a transcript goes through a retained native root descriptor that only exists on
-	// Linux; everywhere else `readRecoveryFile` fails closed, so any case that needs a transcript
-	// to be readable can only assert its real disposition on Linux.
-	const itLinux = process.platform === "linux" ? it : it.skip;
+	// Linux; everywhere else `readRecoveryFile` fails closed and the whole path must hand off with
+	// `transcript_path_untrusted`. Assert that platform's real disposition instead of skipping.
+	const transcriptReadable = process.platform === "linux";
+	const untrusted = { disposition: "handoff", reason: "transcript_path_untrusted" };
 
-	itLinux(
-		"resumes only from exact durable terminal JSONL, preserving dirty product files despite live sidecars",
-		async () => {
-			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-loss-"));
-			try {
-				const transcriptPath = await setup(cwd);
-				const product = path.join(cwd, "product.ts");
-				await fs.writeFile(product, "export const dirtyProductFile = true;\n");
-				await fs.mkdir(path.join(cwd, ".gjc", "projection"), { recursive: true });
-				await fs.writeFile(
-					path.join(cwd, ".gjc", "projection", "runtime.json"),
-					'{"state":"running","owner":"live"}\n',
-				);
+	it("resumes only from exact durable terminal JSONL, preserving dirty product files despite live sidecars", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-loss-"));
+		try {
+			const transcriptPath = await setup(cwd);
+			const product = path.join(cwd, "product.ts");
+			await fs.writeFile(product, "export const dirtyProductFile = true;\n");
+			await fs.mkdir(path.join(cwd, ".gjc", "projection"), { recursive: true });
+			await fs.writeFile(
+				path.join(cwd, ".gjc", "projection", "runtime.json"),
+				'{"state":"running","owner":"live"}\n',
+			);
+			const decision = await planUltragoalOwnerLossRecovery({
+				binding: { ...binding, cwd },
+				receipt: receipt(),
+				admission: admission(),
+				transcriptPath,
+			});
+			expect(decision).toMatchObject(
+				transcriptReadable
+					? {
+							disposition: "resume",
+							reason: "terminal_transcript_authoritative",
+							terminal: { yieldId: "two", result: { status: "success" } },
+						}
+					: untrusted,
+			);
+			expect(await fs.readFile(product, "utf8")).toBe("export const dirtyProductFile = true;\n");
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed for stale identity, unrelated sessions, missing terminal output, corrupt rows, and conflicting yields", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-loss-"));
+		try {
+			const transcriptPath = await setup(cwd);
+			for (const [badReceipt, badAdmission] of [
+				[receipt({ generation: "stale-generation" }), admission()],
+				[receipt({ session_id: "unrelated" }), admission()],
+				[receipt(), admission({ endpoint_incarnation: "stale-incarnation" })],
+				[receipt(), admission({ owner_generation: "stale-generation" })],
+			] as const) {
+				const decision = await planUltragoalOwnerLossRecovery({
+					binding: { ...binding, cwd },
+					receipt: badReceipt,
+					admission: badAdmission,
+					transcriptPath,
+				});
+				expect(decision.disposition).toBe("handoff");
+			}
+			for (const content of [
+				"",
+				'{"id":"one","parentId":null,"type":"yield","result":{"status":"aborted"}}',
+				"{bad}\n",
+				'{"id":"one","parentId":null,"type":"yield","result":{}}\n{"id":"two","parentId":"one","type":"yield","result":{}}\n',
+			]) {
+				await fs.writeFile(transcriptPath, content);
 				const decision = await planUltragoalOwnerLossRecovery({
 					binding: { ...binding, cwd },
 					receipt: receipt(),
 					admission: admission(),
 					transcriptPath,
 				});
-				expect(decision).toMatchObject({
-					disposition: "resume",
-					reason: "terminal_transcript_authoritative",
-					terminal: { yieldId: "two", result: { status: "success" } },
-				});
-				expect(await fs.readFile(product, "utf8")).toBe("export const dirtyProductFile = true;\n");
-			} finally {
-				await fs.rm(cwd, { recursive: true, force: true });
+				expect(decision).toMatchObject(
+					transcriptReadable
+						? { disposition: "handoff", reason: "terminal_transcript_missing_or_invalid" }
+						: untrusted,
+				);
 			}
-		},
-	);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 
-	itLinux(
-		"fails closed for stale identity, unrelated sessions, missing terminal output, corrupt rows, and conflicting yields",
-		async () => {
-			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-loss-"));
-			try {
-				const transcriptPath = await setup(cwd);
-				for (const [badReceipt, badAdmission] of [
-					[receipt({ generation: "stale-generation" }), admission()],
-					[receipt({ session_id: "unrelated" }), admission()],
-					[receipt(), admission({ endpoint_incarnation: "stale-incarnation" })],
-					[receipt(), admission({ owner_generation: "stale-generation" })],
-				] as const) {
-					const decision = await planUltragoalOwnerLossRecovery({
-						binding: { ...binding, cwd },
-						receipt: badReceipt,
-						admission: badAdmission,
-						transcriptPath,
-					});
-					expect(decision.disposition).toBe("handoff");
-				}
-				for (const content of [
-					"",
-					'{"id":"one","parentId":null,"type":"yield","result":{"status":"aborted"}}',
-					"{bad}\n",
-					'{"id":"one","parentId":null,"type":"yield","result":{}}\n{"id":"two","parentId":"one","type":"yield","result":{}}\n',
-				]) {
-					await fs.writeFile(transcriptPath, content);
-					const decision = await planUltragoalOwnerLossRecovery({
-						binding: { ...binding, cwd },
-						receipt: receipt(),
-						admission: admission(),
-						transcriptPath,
-					});
-					expect(decision).toMatchObject({
-						disposition: "handoff",
-						reason: "terminal_transcript_missing_or_invalid",
-					});
-				}
-			} finally {
-				await fs.rm(cwd, { recursive: true, force: true });
-			}
-		},
-	);
-
-	itLinux("never resumes aborted, errored, unknown, or malformed terminal results", async () => {
+	it("never resumes aborted, errored, unknown, or malformed terminal results", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-loss-"));
 		try {
 			const transcriptPath = await setup(cwd);
@@ -170,7 +170,9 @@ describe("Ultragoal owner-loss recovery", () => {
 						admission: admission(),
 						transcriptPath,
 					}),
-				).toMatchObject({ disposition: "handoff", reason: "terminal_aborted_errored" });
+				).toMatchObject(
+					transcriptReadable ? { disposition: "handoff", reason: "terminal_aborted_errored" } : untrusted,
+				);
 			}
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });

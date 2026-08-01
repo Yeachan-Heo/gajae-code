@@ -404,8 +404,17 @@ async function reexecuteGate(root: string, gate: Gate, receipt: Receipt): Promis
 		return `live output does not match recorded artifact: ${outputArtifact.path}`;
 }
 
+/**
+ * Re-execute the frozen obligations.
+ *
+ * `root` exists only for the fixture/self-test surface. The protected completion path calls this
+ * with no argument so the manifest, receipts, and approved argv always resolve from the GJC package
+ * that is running, never from a caller-supplied tree.
+ */
 export async function verifyObligations(root = packageRoot): Promise<{ verified: string[]; blocked: string[] }> {
-	if (isCompiledBinary() && root === packageRoot) {
+	// Unconditional: a compiled artifact cannot re-execute the frozen obligations at all, so no
+	// caller-supplied root may route around the refusal.
+	if (isCompiledBinary()) {
 		process.stderr.write(
 			"VERIFIER UNAVAILABLE: frozen obligations re-execution is unavailable in a compiled GJC artifact.\n",
 		);
@@ -446,7 +455,15 @@ export async function verifyObligations(root = packageRoot): Promise<{ verified:
 		process.stderr.write(`MANIFEST BLOCKED: ${error instanceof Error ? error.message : String(error)}\n`);
 		return { verified: [], blocked: ["manifest"] };
 	}
-	const treeHash = await currentTreeHash(realRoot, manifest.receiptDirectory);
+	// The snapshot algorithm is Git-backed, so a package that is not inside a Git worktree cannot
+	// produce a tree hash. Report that as its own blocked reason instead of throwing.
+	let treeHash: string;
+	try {
+		treeHash = await currentTreeHash(realRoot, manifest.receiptDirectory);
+	} catch (error) {
+		process.stderr.write(`TREE SNAPSHOT BLOCKED: ${error instanceof Error ? error.message : String(error)}\n`);
+		return { verified: [], blocked: ["tree-snapshot"] };
+	}
 	const verified: string[] = [];
 	const blocked: string[] = [];
 	for (const gate of manifest.gates.filter(gate => gate.required)) {
@@ -484,8 +501,11 @@ export async function verifyObligations(root = packageRoot): Promise<{ verified:
 
 function parseRootArgument(argv: string[]): string | undefined {
 	if (argv.length === 0) return undefined;
-	if (argv.length === 2 && argv[0] === "--root" && argv[1] && !argv[1].startsWith("--")) return path.resolve(argv[1]);
-	throw new Error("Usage: verify-app-server-obligations.ts [--root <package-root>]");
+	// `--root` re-points manifest, receipt, and approved-argv resolution, so it is a fixture
+	// self-test surface only and must be requested explicitly.
+	if (argv.length === 3 && argv[0] === "--self-test" && argv[1] === "--root" && argv[2] && !argv[2].startsWith("--"))
+		return path.resolve(argv[2]);
+	throw new Error("Usage: verify-app-server-obligations.ts [--self-test --root <package-root>]");
 }
 
 export async function main(): Promise<void> {
