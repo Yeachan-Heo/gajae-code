@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import "../src/providers/openai-codex-responses";
 import "../src/providers/openai-completions";
 import "../src/providers/openai-responses";
 import { getBundledModel } from "../src/models";
@@ -24,6 +25,14 @@ function createModel(): Model<"bedrock-converse-stream"> {
 		contextWindow: 8192,
 		maxTokens: 2048,
 	};
+}
+
+function createCodexTestToken(accountId = "acc_test"): string {
+	const payload = Buffer.from(
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
+		"utf8",
+	).toBase64();
+	return `aaa.${payload}.bbb`;
 }
 
 function createAssistantMessage(
@@ -261,6 +270,26 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		);
 	}
 
+	function createStagedSseResponse(stages: ReadonlyArray<{ delayMs: number; events: unknown[] }>): Response {
+		const encoder = new TextEncoder();
+		return new Response(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					stages.forEach((stage, index) => {
+						setTimeout(() => {
+							const payload = `${stage.events
+								.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`)
+								.join("\n\n")}\n\n`;
+							controller.enqueue(encoder.encode(payload));
+							if (index === stages.length - 1) controller.close();
+						}, stage.delayMs);
+					});
+				},
+			}),
+			{ status: 200, headers: { "content-type": "text/event-stream" } },
+		);
+	}
+
 	it("alibaba-token-plan survives past the previous 300s outer watchdog", async () => {
 		vi.useFakeTimers();
 		// Source emits its first real token at 310s — past the previous Alibaba
@@ -366,6 +395,54 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider stream timed out while waiting for the first event");
 	});
+
+	it("keeps tool-capability negotiation inside the first-event window", async () => {
+		vi.useFakeTimers();
+		const source = {
+			async *[Symbol.asyncIterator]() {
+				yield {
+					type: "toolChoiceIncapability",
+					api: "bedrock-converse-stream",
+					provider: "amazon-bedrock",
+					model: "mock-bedrock",
+					requestedLevel: "required",
+					resolvedLevel: "auto",
+					reason: "tool choice unsupported",
+					registryKey: "tool-choice/required",
+				} as const;
+				await new Promise<never>(() => {});
+			},
+		} as unknown as AssistantMessageEventStream;
+
+		setBedrockProviderModule({
+			streamBedrock: () => source,
+		});
+
+		const stream = streamBedrock(createModel(), baseContext, {
+			streamIdleTimeoutMs: 10,
+			streamFirstEventTimeoutMs: 100,
+		});
+		await flush();
+
+		let settled = false;
+		void stream.result().then(() => {
+			settled = true;
+		});
+		vi.advanceTimersByTime(20);
+		await flush();
+		expect(settled).toBe(false);
+
+		vi.advanceTimersByTime(80);
+		await flush();
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Provider stream timed out while waiting for the first event");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+		});
+	});
+
 	it("keeps the exported OpenAI Completions lazy path alive past 300s for Alibaba", async () => {
 		vi.useFakeTimers();
 		const model = getBundledModel("alibaba-token-plan", "glm-5.2") as Model<"openai-completions">;
@@ -469,5 +546,90 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		const result = await lazyStream.result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.content[0]).toMatchObject({ type: "text", text: "Hello delayed" });
+	});
+
+	it("does not let the lazy wrapper time out an active OpenAI Codex transport", async () => {
+		vi.useFakeTimers();
+		const model = {
+			...getBundledModel("openai-codex", "gpt-5.5"),
+			preferWebsockets: false,
+		} as Model<"openai-codex-responses">;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async () =>
+			createStagedSseResponse([
+				{
+					delayMs: 80_000,
+					events: [{ type: "response.created", response: { id: "resp-progress" } }],
+				},
+				{
+					delayMs: 150_000,
+					events: [
+						{
+							type: "response.output_item.added",
+							item: {
+								type: "message",
+								id: "msg-progress",
+								role: "assistant",
+								status: "in_progress",
+								content: [],
+							},
+						},
+						{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+						{ type: "response.output_text.delta", delta: "Still alive" },
+						{
+							type: "response.output_item.done",
+							item: {
+								type: "message",
+								id: "msg-progress",
+								role: "assistant",
+								status: "completed",
+								content: [{ type: "output_text", text: "Still alive" }],
+							},
+						},
+						{
+							type: "response.completed",
+							response: {
+								id: "resp-progress",
+								status: "completed",
+								usage: {
+									input_tokens: 5,
+									output_tokens: 2,
+									total_tokens: 7,
+									input_tokens_details: { cached_tokens: 0 },
+								},
+							},
+						},
+					],
+				},
+			])) as unknown as typeof fetch);
+
+		const lazyStream = streamModel(model, baseContext, {
+			apiKey: createCodexTestToken(),
+			preferWebsockets: false,
+			streamFirstEventTimeoutMs: 100_000,
+			streamIdleTimeoutMs: 100_000,
+		});
+		const iterator = lazyStream[Symbol.asyncIterator]();
+		const firstEvent = await iterator.next();
+		expect(firstEvent.value?.type).toBe("start");
+		await flush();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		vi.advanceTimersByTime(80_000);
+		await flush();
+		vi.advanceTimersByTime(30_000);
+		await flush();
+
+		let settled = false;
+		void lazyStream.result().then(() => {
+			settled = true;
+		});
+		await flush();
+		expect(settled).toBe(false);
+
+		vi.advanceTimersByTime(40_000);
+		await flush();
+		const result = await lazyStream.result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content[0]).toMatchObject({ type: "text", text: "Still alive" });
 	});
 });
