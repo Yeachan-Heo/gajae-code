@@ -4,6 +4,7 @@
 ### Fixed
 
 - Temporary TUI restarts now retain their native-scrollback admission frontier when the following viewport repaint fails, preventing newly appended rows from being duplicated on retry.
+- Apple Terminal no longer enables the xterm `modifyOtherKeys` fallback after an unanswered Kitty keyboard query, so pressing Return after Korean/Hangul composition submits on the first press instead of only committing the final syllable and requiring a second Return.
 
 ## [0.12.7] - 2026-07-31
 

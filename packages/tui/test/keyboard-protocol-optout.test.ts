@@ -6,6 +6,7 @@ const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "i
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 const originalKeyboardProtocolEnv = Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+const originalTermProgram = Bun.env.TERM_PROGRAM;
 
 function setPlatform(platform: NodeJS.Platform): void {
 	Object.defineProperty(process, "platform", { value: platform, configurable: true });
@@ -36,6 +37,7 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
 		Object.defineProperty(process.stdin, "setRawMode", { value: vi.fn(), configurable: true });
+		delete Bun.env.TERM_PROGRAM;
 	});
 
 	afterEach(() => {
@@ -45,6 +47,7 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
 		restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);
 		restoreEnv("GJC_TUI_KEYBOARD_PROTOCOL", originalKeyboardProtocolEnv);
+		restoreEnv("TERM_PROGRAM", originalTermProgram);
 		restoreProperty(process, "platform", platformDescriptor);
 	});
 
@@ -111,6 +114,25 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 
 		// The Kitty query is still emitted (harmless where unsupported), but the
 		// modifyOtherKeys fallback that breaks Windows Hangul/CJK IME is skipped.
+		expect(writes).toContain(KITTY_QUERY);
+
+		vi.advanceTimersByTime(150);
+		expect(writes).not.toContain(MODIFY_OTHER_KEYS);
+
+		terminal.stop();
+	});
+
+	it("skips only the modifyOtherKeys fallback in Apple Terminal to preserve Hangul IME submission", () => {
+		vi.useFakeTimers();
+		setPlatform("darwin");
+		delete Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+		Bun.env.TERM_PROGRAM = "Apple_Terminal";
+		expect(keyboardEnhancementEnabled()).toBe(true);
+
+		const { terminal, writes } = setupTerminal();
+
+		// Apple Terminal does not answer the Kitty query. Its modifyOtherKeys mode
+		// makes the first Return commit Hangul without delivering the submit key.
 		expect(writes).toContain(KITTY_QUERY);
 
 		vi.advanceTimersByTime(150);
