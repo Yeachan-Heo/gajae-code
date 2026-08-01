@@ -88,30 +88,28 @@ export function extractFailures(rawLog: string): ExtractionResult {
 			continue;
 		}
 
-		if (reportedFailCount === undefined) {
-			const summary = BUN_SUMMARY.exec(line);
-			if (summary?.[1]) {
-				reportedFailCount = Number(summary[1]);
-				continue;
-			}
+		const summary = BUN_SUMMARY.exec(line);
+		if (summary?.[1]) {
+			reportedFailCount = (reportedFailCount ?? 0) + Number(summary[1]);
 		}
 
-		if (reportedErrorCount === undefined) {
-			const errors = BUN_ERROR_SUMMARY.exec(line);
-			if (errors?.[1]) reportedErrorCount = Number(errors[1]);
+		const errors = BUN_ERROR_SUMMARY.exec(line);
+		if (errors?.[1]) {
+			reportedErrorCount = (reportedErrorCount ?? 0) + Number(errors[1]);
 		}
 	}
 
 	const identities = [...new Set(failures.map(f => f.identity))].sort();
 
-	// Compare against distinct identities: a single test failing in several
-	// shards of one log is one identity but several `(fail)` lines.
+	// Compare against extracted failure lines. Identities are deduplicated for
+	// reporting, but repeated failures across invocations still account for each
+	// invocation's summary count.
 	//
 	// Suite-level errors are counted by the runner as failures but never print a
 	// `(fail) <name>` line — there is no test to name when an import throws or an
 	// exception escapes between tests. Allowing for them keeps the guard pointed
 	// at genuine pattern gaps instead of firing on a shape it cannot ever match.
-	const unexplained = (reportedFailCount ?? 0) - identities.length - (reportedErrorCount ?? 0);
+	const unexplained = (reportedFailCount ?? 0) - failures.length - (reportedErrorCount ?? 0);
 	const underCounted = reportedFailCount !== undefined && unexplained > 0;
 
 	return { failures, identities, reportedFailCount, reportedErrorCount, underCounted };
