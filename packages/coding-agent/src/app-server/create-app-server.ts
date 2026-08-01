@@ -292,7 +292,10 @@ class Runtime implements AppServerRuntime {
 		const onAbort = (): void => {
 			this.broker.cancel(id, "approval request aborted");
 		};
-		if (signal) signal.addEventListener("abort", onAbort, { once: true });
+		if (signal) {
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) onAbort();
+		}
 		try {
 			const settlement = await pending.settled;
 			if (settlement.kind === "resolved" || settlement.kind === "denied") return settlement.result;

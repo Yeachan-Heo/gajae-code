@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { stableValidators } from "../../protocol-source/schema-validators.generated";
 import type { SessionClient, SessionRequestOptions, TurnPolicyOverride } from "../../thread-runtime/child-bridge";
-import { ThreadRuntimeManager } from "../../thread-runtime/thread-runtime-manager";
+import { type ThreadEffectiveSettings, ThreadRuntimeManager } from "../../thread-runtime/thread-runtime-manager";
 import { TurnController, type TurnControllerNotification } from "../../thread-runtime/turn-controller";
 import type { ProjectionEnvelope, ProjectionRecord } from "../../thread-runtime/turn-projection";
 
@@ -93,9 +93,9 @@ class FakeSessionClient implements SessionClient {
 	async close(): Promise<void> {}
 }
 
-function managerWithClient(client: SessionClient): ThreadRuntimeManager {
+function managerWithClient(client: SessionClient, effectiveSettings?: ThreadEffectiveSettings): ThreadRuntimeManager {
 	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
-	manager.register(THREAD_ID, "attached", undefined, undefined, { client });
+	manager.register(THREAD_ID, "attached", undefined, undefined, { client, effectiveSettings });
 	return manager;
 }
 
@@ -253,7 +253,7 @@ test("aggregate override restore attempts policy and model restoration when the 
 	const client = new FakeSessionClient();
 	client.policyRestoreError = new Error("policy restore failed");
 	client.modelRestoreError = new Error("model restore failed");
-	const manager = managerWithClient(client);
+	const manager = managerWithClient(client, { sandbox: { type: "dangerFullAccess" } } as ThreadEffectiveSettings);
 	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => "app-turn-restore-both" });
 	const handle = await controller.start({
 		threadId: THREAD_ID,
@@ -271,6 +271,18 @@ test("aggregate override restore attempts policy and model restoration when the 
 	expect(client.calls.map(call => call.operation)).toContain("turn.modelOverride.restore");
 	expect(controller.getState(THREAD_ID)).toBe("recovery_required");
 	expect(manager.get(THREAD_ID)?.activeTurn).toBe(true);
+});
+test("sandbox override rejects when the child exposes no effective sandbox evidence", async () => {
+	const client = new FakeSessionClient();
+	const manager = managerWithClient(client);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => "app-turn-sandbox-evidence" });
+	await expect(
+		controller.start({
+			threadId: THREAD_ID,
+			params: { text: "sandbox", sandboxPolicy: { type: "dangerFullAccess" } },
+		}),
+	).rejects.toMatchObject({ code: "turn_policy" });
+	expect(client.calls.map(call => call.operation)).not.toContain("turn.policyOverride");
 });
 
 test("synchronous child terminal is buffered until the response is delivered", async () => {

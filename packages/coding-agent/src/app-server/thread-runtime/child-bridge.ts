@@ -1,9 +1,8 @@
 // app-server child bridge: transactional lifecycle boundary for one loaded thread.
 //
-// The real broker child is intentionally supplied by an injected adapter. This keeps the
-// component contract deterministic while the sandbox-blocked broker spawn remains a separate
-// G2 acceptance concern. A successful load retains its session client in the manager until the
-// thread is evicted, terminated, or detached.
+// Production app-server wiring supplies the broker-backed adapter by default. The in-process
+// lifecycle adapter remains an explicit seam for focused unit tests. A successful load retains
+// its session client in the manager until the thread is evicted, terminated, or detached.
 
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";

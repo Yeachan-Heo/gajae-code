@@ -222,15 +222,15 @@ export default class AppServer extends Command {
 				},
 			});
 			process.stderr.write(`app-server: ws:// listening on ${host}:${port}\n`);
-			return new Promise(resolve => {
+			return new Promise<void>((resolve, reject) => {
 				let shuttingDown = false;
 				const shutdown = (): void => {
 					if (shuttingDown) return;
 					shuttingDown = true;
 					wsServer.stop();
-					void serverRuntime.close().then(resolve, reject => {
+					void serverRuntime.close().then(resolve, error => {
 						process.exitCode = 1;
-						reject(reject);
+						reject(error);
 					});
 				};
 				process.on("SIGTERM", shutdown);
@@ -300,15 +300,15 @@ export default class AppServer extends Command {
 				},
 			});
 			process.stderr.write(`app-server: unix:// listening on ${socketPath}\n`);
-			return new Promise(resolve => {
+			return new Promise<void>((resolve, reject) => {
 				let shuttingDown = false;
 				const shutdown = (): void => {
 					if (shuttingDown) return;
 					shuttingDown = true;
 					wsServer.stop();
-					void serverRuntime.close().then(resolve, reject => {
+					void serverRuntime.close().then(resolve, error => {
 						process.exitCode = 1;
-						reject(reject);
+						reject(error);
 					});
 				};
 				process.on("SIGTERM", shutdown);

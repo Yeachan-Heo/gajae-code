@@ -1835,9 +1835,11 @@ export class AgentSession {
 	#allowAcpAgentInitiatedTurns = false;
 	/** Per-session memory of allow_always / reject_always decisions for gated tools. */
 	#acpPermissionDecisions: Map<string, "allow_always" | "reject_always"> = new Map();
-	/** SDK-controlled permission policy applied before ACP client prompting. Defaults to `allow` so callers
-	 * without a reverse permission provider (TUI, print/headless) run guarded tools; ACP/SDK set this explicitly. */
+	/** SDK-controlled permission policy applied before ACP client prompting. Defaults to `allow` for callers
+	 * without a reverse permission provider; installing a live provider derives `prompt` automatically. */
 	#sdkPermissionMode: "prompt" | "allow" | "deny" = "allow";
+	/** Permission mode that was active before a reverse SDK permission provider took ownership. */
+	#sdkPermissionModeBeforeProvider: "prompt" | "allow" | "deny" | undefined;
 	/** Permission provider registered by a live SDK reverse lease. */
 	#sdkPermissionProvider:
 		| ((
@@ -6513,7 +6515,18 @@ export class AgentSession {
 			  ) => Promise<ClientBridgePermissionOutcome>)
 			| undefined,
 	): void {
-		this.#sdkPermissionProvider = provider;
+		if (provider !== undefined) {
+			if (this.#sdkPermissionProvider === undefined) this.#sdkPermissionModeBeforeProvider = this.#sdkPermissionMode;
+			this.#sdkPermissionProvider = provider;
+			// A live reverse provider owns the normal guarded-tool policy. The only temporary
+			// allow path is the explicit per-turn approvalPolicy=never override.
+			this.#sdkPermissionMode = "prompt";
+		} else {
+			this.#sdkPermissionProvider = undefined;
+			if (this.#sdkPermissionMode === "prompt" && this.#sdkPermissionModeBeforeProvider !== undefined)
+				this.#sdkPermissionMode = this.#sdkPermissionModeBeforeProvider;
+			this.#sdkPermissionModeBeforeProvider = undefined;
+		}
 		this.#acpPermissionDecisions.clear();
 		this.#acpPermissionWrapperVersion++;
 		const activeTools = this.getActiveToolNames()

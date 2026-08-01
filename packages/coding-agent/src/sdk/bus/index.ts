@@ -45,7 +45,12 @@ import {
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { AppServerProjectionCapability } from "../../session/app-server-projection";
-import type { ClientBridge } from "../../session/client-bridge";
+import type {
+	ClientBridge,
+	ClientBridgePermissionOption,
+	ClientBridgePermissionOutcome,
+	ClientBridgePermissionToolCall,
+} from "../../session/client-bridge";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -2007,6 +2012,8 @@ function sdkQuerySurface(
 		name: ctx.sessionManager.getSessionName(),
 		cwd: ctx.cwd,
 		kind: ctx.sessionMetadata?.kind ?? "main",
+		// GJC child sessions execute tools directly in the child host; no sandbox isolation is installed.
+		sandbox: { type: "dangerFullAccess" as const },
 	});
 	const lastAssistantText = () => {
 		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
@@ -3690,7 +3697,11 @@ export function createNotificationsExtension(
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
+				const provider = async (
+					toolCall: ClientBridgePermissionToolCall,
+					permissionOptions: ClientBridgePermissionOption[],
+					signal?: AbortSignal,
+				): Promise<ClientBridgePermissionOutcome> => {
 					const result = await host!.reverse.request(
 						"permission",
 						"request",
@@ -3713,7 +3724,9 @@ export function createNotificationsExtension(
 								: {}),
 						};
 					throw new Error("permission provider returned an invalid response");
-				});
+				};
+				// AgentSession derives the normal policy from this live provider and switches to prompt.
+				ctx.setSdkPermissionProvider?.(provider);
 				return;
 			}
 			if (capability === "ui") {

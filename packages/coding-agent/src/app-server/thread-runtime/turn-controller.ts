@@ -678,16 +678,14 @@ export class TurnController {
 					);
 				}
 			}
-			if (
-				requestedPolicy?.sandboxPolicy !== undefined &&
-				managed.effectiveSettings !== undefined &&
-				(!isRecord(managed.effectiveSettings.sandbox) ||
-					managed.effectiveSettings.sandbox.type !== "dangerFullAccess")
-			)
-				throw new TurnControllerError(
-					"turn_policy",
-					"Turn sandboxPolicy dangerFullAccess does not match the child runtime's effective sandbox.",
-				);
+			if (requestedPolicy?.sandboxPolicy !== undefined) {
+				const effectiveSandbox = managed.effectiveSettings?.sandbox;
+				if (!isRecord(effectiveSandbox) || effectiveSandbox.type !== "dangerFullAccess")
+					throw new TurnControllerError(
+						"turn_policy",
+						"Turn sandboxPolicy dangerFullAccess does not match the child runtime's reported sandbox evidence.",
+					);
+			}
 			if (requestedPolicy !== undefined) {
 				if (!managed.client.setTurnPolicyForTurn)
 					throw new TurnControllerError(

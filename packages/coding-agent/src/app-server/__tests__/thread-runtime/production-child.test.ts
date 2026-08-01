@@ -88,10 +88,14 @@ test("the production child reuses one commandId/turnId pair for prompt acknowled
 						getCwd: () => cwd,
 						getSessionFile: () => null,
 					},
-					model: { id: "correlation-model", provider: "correlation-provider" },
+					model: { id: "correlation-model", provider: "correlation-provider", reasoning: false },
 					serviceTier: undefined,
 					sdkPermissionMode: "prompt",
 					thinkingLevel: undefined,
+					getAvailableThinkingLevels: () => [],
+					setThinkingLevelForControl: async () => {},
+					setThinkingLevel: () => {},
+					setSdkPermissionMode: () => {},
 					workflowGateToolRestoration: Promise.resolve(),
 					subscribe: (handler: (event: { type: string }) => void) => {
 						subscriber = handler;
@@ -142,6 +146,12 @@ test("the production child reuses one commandId/turnId pair for prompt acknowled
 			})) as Record<string, unknown>;
 			expect(status.commandId).toBe(acknowledgement.commandId);
 			expect(status.turnId).toBe(acknowledgement.turnId);
+			const restoreMedium = await active.client.setTurnPolicyForTurn?.({ reasoningEffort: "medium" });
+			expect(restoreMedium).toEqual(expect.any(Function));
+			await restoreMedium?.();
+			await expect(active.client.setTurnPolicyForTurn?.({ reasoningEffort: "high" })).rejects.toThrow(
+				/not supported by the child model/,
+			);
 		} finally {
 			unsubscribe();
 		}

@@ -76,15 +76,21 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	),
 	"thread/start": {
 		support: "implemented",
-		gjcSeam: "loadThread",
-		gjcBackendPath: "packages/coding-agent/src/app-server/thread-runtime/child-bridge.ts",
+		gjcSeam: "loadThread via the production thread-start adapter",
+		gjcBackendPath:
+			"packages/coding-agent/src/app-server/thread-runtime/child-bridge.ts; packages/coding-agent/src/app-server/thread-runtime/production-child.ts",
 		semanticGaps: [
-			"Implemented only when an injected lifecycle adapter is configured; default real-child broker backing remains G2-BLOCKED.",
+			"Focused unit tests may inject an in-process lifecycle adapter; the shipped app-server default is broker-backed child creation.",
 		],
 		translationNotes: ["A Codex thread id is the retained GJC session id."],
 		owner: "app-server",
-		testIds: ["transactional load: readiness, effective settings, publication, and subscription are ordered"],
-		reason: "loadThread provides the transactional boundary behind an explicitly injected lifecycle adapter.",
+		testIds: [
+			"the production adapter loads a real session and answers thread/start for both profiles",
+			"spawned CLI black-box JSON-RPC transcript satisfies the shared oracle",
+			"transactional load: readiness, effective settings, publication, and subscription are ordered",
+		],
+		reason:
+			"The production adapter creates a broker-backed child by default; loadThread retains the same transactional boundary for the explicit in-process unit-test seam.",
 	},
 	"turn/start": {
 		support: "implemented",
@@ -106,13 +112,17 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	},
 	"thread/resume": {
 		support: "implemented",
-		gjcSeam: "readAndReconstructTurns + projectThreadResponse",
-		gjcBackendPath: "packages/coding-agent/src/app-server/server.ts",
-		semanticGaps: ["Requires an injected retained-child adapter; the G2 real child remains blocked."],
+		gjcSeam: "handleThreadResume via loadThread and the production thread-start adapter",
+		gjcBackendPath:
+			"packages/coding-agent/src/app-server/server.ts; packages/coding-agent/src/app-server/thread-runtime/child-bridge.ts; packages/coding-agent/src/app-server/thread-runtime/production-child.ts",
+		semanticGaps: [
+			"Focused resume tests use an injected retained-child adapter; an unloaded-thread resume uses the shipped broker-backed production adapter.",
+		],
 		translationNotes: ["Only threadId with null/absent resume overrides is admitted."],
 		owner: "app-server",
 		testIds: ["thread/resume reconstructs durable turns for stable and experimental profiles exactly once"],
-		reason: "thread/resume reads the durable projection and projects the negotiated response profile.",
+		reason:
+			"handleThreadResume reconstructs durable turns from the retained child and uses the broker-backed adapter when an unloaded thread must be attached.",
 	},
 	"fs/copy": laneRow(
 		"fsCopyHandler",

@@ -88,6 +88,16 @@ async function allModelItems(client: SdkClient): Promise<Record<string, unknown>
 	throw new Error("The child model catalog exceeded the pagination safety limit.");
 }
 
+function queryItem(value: unknown): Record<string, unknown> | undefined {
+	const result = responseResult(value);
+	if (!record(result)) return undefined;
+	if (record(result.page) && Array.isArray(result.page.items)) {
+		const first = result.page.items[0];
+		return record(first) ? first : undefined;
+	}
+	return result;
+}
+
 function splitModelReference(requestedModel: string): { readonly provider: string; readonly id: string } | undefined {
 	const slash = requestedModel.indexOf("/");
 	if (slash <= 0 || slash === requestedModel.length - 1) return undefined;
@@ -112,6 +122,38 @@ function validateTurnPolicy(policy: TurnPolicyOverride): void {
 		throw new Error(`Unsupported per-turn reasoning effort "${policy.reasoningEffort}".`);
 	if (policy.developerInstructions !== undefined && policy.developerInstructions.trim().length === 0)
 		throw new Error("Per-turn developer instructions must be non-empty.");
+}
+
+function sandboxPolicyFromChildMetadata(value: unknown): { readonly type: "dangerFullAccess" } {
+	if (!record(value) || !record(value.sandbox) || value.sandbox.type !== "dangerFullAccess")
+		throw new Error("The child did not expose a dangerFullAccess sandbox execution policy.");
+	return { type: "dangerFullAccess" };
+}
+
+function supportedReasoningEfforts(model: Record<string, unknown>): Set<string> {
+	const thinking = record(model.thinking) ? model.thinking : undefined;
+	const validLevels = thinking?.validLevels;
+	if (Array.isArray(validLevels) && validLevels.every(level => typeof level === "string")) return new Set(validLevels);
+	const supported = model.supportedReasoningEfforts;
+	if (Array.isArray(supported)) {
+		const efforts = supported
+			.map(value => (record(value) && typeof value.reasoningEffort === "string" ? value.reasoningEffort : undefined))
+			.filter((value): value is string => value !== undefined);
+		if (efforts.length > 0) return new Set(["off", ...efforts]);
+	}
+	throw new Error("The child did not expose reasoning-effort capabilities for its current model.");
+}
+
+function assertReasoningEffortSupported(model: Record<string, unknown> | undefined, effort: string): void {
+	if (!model) throw new Error("The child did not expose a current model for reasoning-effort validation.");
+	const supported = supportedReasoningEfforts(model);
+	if (supported.has(effort)) return;
+	// T3 0.0.28 sends medium even for the non-reasoning compatibility stub. The child
+	// truthfully resolves that request to off; higher efforts remain hard failures.
+	if (effort === "medium" && model.reasoning === false) return;
+	throw new Error(
+		`Reasoning effort "${effort}" is not supported by the child model "${String(model.provider)}/${String(model.id)}".`,
+	);
 }
 
 function endpointAuthority(value: unknown): EndpointAuthority {
@@ -272,7 +314,7 @@ async function effectiveSettingsForRemote(
 	cwd: string,
 	requestedModel?: string,
 ): Promise<ThreadEffectiveSettings> {
-	const metadata = responseResult(await client.query("session.metadata"));
+	const metadata = queryItem(await client.query("session.metadata"));
 	const modelItems = await allModelItems(client);
 	const requestedSlash = requestedModel?.indexOf("/") ?? -1;
 	const requested =
@@ -296,7 +338,7 @@ async function effectiveSettingsForRemote(
 		instructionSources: [],
 		approvalPolicy: "on-request",
 		approvalsReviewer: "user",
-		sandbox: { type: "dangerFullAccess" },
+		sandbox: sandboxPolicyFromChildMetadata(metadata),
 		reasoningEffort: currentThinkingLevel,
 		thread: {
 			id: sessionId,
@@ -392,6 +434,8 @@ function remoteSessionClient(sdk: SdkClient, activeModelReference?: string): Ses
 		},
 		setTurnPolicyForTurn: async policy => {
 			validateTurnPolicy(policy);
+			if (policy.sandboxPolicy !== undefined)
+				sandboxPolicyFromChildMetadata(queryItem(await sdk.query("session.metadata")));
 			const restores: Array<() => Promise<void>> = [];
 			try {
 				if (policy.approvalPolicy !== undefined) {
@@ -406,11 +450,14 @@ function remoteSessionClient(sdk: SdkClient, activeModelReference?: string): Ses
 				if (policy.reasoningEffort !== undefined) {
 					const models = await allModelItems(sdk);
 					const current = models.find(model => model.current === true);
+					assertReasoningEffortSupported(current, policy.reasoningEffort);
 					const previous =
 						thinkingLevel ??
 						(typeof current?.currentThinkingLevel === "string" ? current.currentThinkingLevel : "inherit");
 					await controlResponseResult(await sdk.control("thinking.set", { level: policy.reasoningEffort }));
-					thinkingLevel = policy.reasoningEffort;
+					const applied = (await allModelItems(sdk)).find(model => model.current === true);
+					thinkingLevel =
+						typeof applied?.currentThinkingLevel === "string" ? applied.currentThinkingLevel : undefined;
 					restores.unshift(async () => {
 						await controlResponseResult(await sdk.control("thinking.set", { level: previous }));
 						thinkingLevel = previous;
@@ -548,10 +595,25 @@ export function createProductionThreadStartAdapter(
 					validateTurnPolicy(policy);
 					const previousPermissionMode = session.sdkPermissionMode;
 					const previousThinkingLevel = session.thinkingLevel;
+					if (policy.sandboxPolicy !== undefined) {
+						const sandbox = effectiveSettingsFor(session).sandbox;
+						if (!record(sandbox) || sandbox.type !== "dangerFullAccess")
+							throw new Error("The child did not expose a dangerFullAccess sandbox execution policy.");
+					}
 					if (policy.approvalPolicy !== undefined) session.setSdkPermissionMode("allow");
 					try {
-						if (policy.reasoningEffort !== undefined)
+						if (policy.reasoningEffort !== undefined) {
+							const supported = session
+								.getAvailableThinkingLevels()
+								.some(level => String(level) === policy.reasoningEffort);
+							const compatibilityMedium =
+								policy.reasoningEffort === "medium" && session.model?.reasoning === false;
+							if (policy.reasoningEffort !== "off" && !supported && !compatibilityMedium)
+								throw new Error(
+									`Reasoning effort "${policy.reasoningEffort}" is not supported by the child model.`,
+								);
 							await session.setThinkingLevelForControl(policy.reasoningEffort as never, false);
+						}
 					} catch (error) {
 						session.setSdkPermissionMode(previousPermissionMode);
 						throw error;
