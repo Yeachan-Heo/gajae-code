@@ -201,7 +201,7 @@ function formatBashFailureMessage(
 	const bodyText = removeTrailingFailureCause(text, statusCause);
 	const suffixParts: string[] = [];
 	const reference = artifactReferenceForResult(result);
-	if (reference) suffixParts.push(reference);
+	if (reference && !artifactReferenceIsReachable(text, result)) suffixParts.push(reference);
 	const writerNotice = artifactWriterFailureNotice(result);
 	if (writerNotice) suffixParts.push(writerNotice);
 	if (statusCause) suffixParts.push(statusCause);

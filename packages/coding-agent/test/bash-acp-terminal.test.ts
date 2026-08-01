@@ -178,6 +178,38 @@ describe("BashTool ACP terminal routing", () => {
 		expect(result.details?.meta?.truncation?.artifactTruncatedBytes).toBeUndefined();
 	});
 
+	it("does not duplicate an artifact reference on failed truncated output", async () => {
+		const stubText = `HEAD\n${"middle\n".repeat(800)}TAIL\n`;
+		const saveArtifact = mock(async () => "acp-failed-output");
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-failed-truncated",
+			waitForExit: async () => ({ exitCode: 7, signal: null }),
+			currentOutput: async () => ({ output: stubText, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		let caught: unknown;
+		try {
+			await new BashTool(makeSession(bridge, { tailKiB: 1, saveArtifact })).execute("call-failed-truncated", {
+				command: "wide-output && exit 7",
+			});
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		const message = caught instanceof Error ? caught.message : "";
+		expect(message).toContain("Command exited with code 7");
+		expect(message).toContain("[raw output: artifact://acp-failed-output]");
+		expect(message.match(/artifact:\/\/acp-failed-output/gu)).toHaveLength(1);
+		expect(saveArtifact).toHaveBeenCalledWith(stubText, "bash-original");
+	});
+
 	it("uses UTF-8-safe byte windows for explicit ACP head and tail on one line", async () => {
 		const stubText = "界".repeat(2_000);
 		const handle: ClientBridgeTerminalHandle = {
