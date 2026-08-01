@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI Responses-compatible relay providers now receive `session_id` and `x-client-request-id` when prompt caching is enabled and a session ID is present, preserving session affinity instead of falling back to body-only cache routing (#3689).
+
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31

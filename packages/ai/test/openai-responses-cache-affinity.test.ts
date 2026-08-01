@@ -105,13 +105,24 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.body?.prompt_cache_key).toBe("session-123");
 	});
 
-	it("keeps prompt_cache_key when cache retention is disabled", async () => {
+	it("omits session routing headers when cache retention is disabled", async () => {
 		const captured = await captureOpenAIResponseHeaders({ cacheRetention: "none", sessionId: "session-123" });
+
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+		expect(captured.body?.prompt_cache_retention).toBeUndefined();
+	});
+
+	it("sets session routing headers for custom OpenAI Responses base URLs", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{ ...model, baseUrl: "https://codex-pooler.example/v1" },
+		);
 
 		expect(captured.sessionId).toBe("session-123");
 		expect(captured.clientRequestId).toBe("session-123");
 		expect(captured.body?.prompt_cache_key).toBe("session-123");
-		expect(captured.body?.prompt_cache_retention).toBeUndefined();
 	});
 
 	it("uses model cacheRetention for OpenAI Responses retention when request omits cacheRetention", async () => {
