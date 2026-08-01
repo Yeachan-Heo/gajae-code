@@ -6811,9 +6811,16 @@ export class AgentSession {
 					const commandContent = command
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
 						: undefined;
+					const executeWithBoundArgs = async () => {
+						const bound = fileChanges ? await fileChanges.guard.bind(args) : { args, release: async () => {} };
+						try {
+							return await target.execute(toolCallId, bound.args as never, signal, onUpdate, ctx);
+						} finally {
+							await bound.release();
+						}
+					};
 					if (this.#sdkPermissionMode === "allow") {
-						if (fileChanges) await fileChanges.guard.validate();
-						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+						return await executeWithBoundArgs();
 					}
 					if (this.#sdkPermissionMode === "deny") {
 						throw new ToolError(`Tool call rejected by session permission policy (${target.name})`);
@@ -6826,8 +6833,7 @@ export class AgentSession {
 					// Short-circuit on persisted decisions only after this call's file-change evidence is valid.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {
-						if (fileChanges) await fileChanges.guard.validate();
-						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+						return await executeWithBoundArgs();
 					}
 					if (persisted === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (preference)`);
@@ -6885,8 +6891,7 @@ export class AgentSession {
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (${target.name})`);
 					}
-					if (fileChanges) await fileChanges.guard.validate();
-					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+					return await executeWithBoundArgs();
 				};
 			},
 		}) as T;
