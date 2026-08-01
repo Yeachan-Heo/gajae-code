@@ -300,7 +300,7 @@
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "8fd40d586b1f3f60cfd2285844e08cc3f5235bf83672d268bd698512ec31edd6",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "74c0a7c475325313453a4295479fd4cb2fcb3af6137426b8262b768d5bc276d0",
-    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.discord": "dc6518881e3fe9cd8d47e883302a4561f5eb79a29d00c908c3f0d87befa3179c",
+    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.discord": "f9b81cf39d5776cd78d6332c35208c68211bb423297486d042e2bde5a7efb7e1",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonAction": "d8acaf90439e410595b5cd56fd187001393ea943517a5563a4a2ea3c88d155ef",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonController": "476aad2ea908df7fb0cb72be8cea82007b245cd8228d2c7846fd31b3b6d1fb99",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonKind": "b1c2906c4eb04e120c9ce42f8b549a68cfc834d29d4d745335712a7f61bf09f2",
@@ -555,7 +555,7 @@
   "nativeAuthoritySha256": {
     "crates/pi-natives/src/path_identity.rs": "9ac16a3c5be7e2a793c9d759887a16041f411a9a34e00c0978960ca1442f4865",
     "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
-    "crates/pi-shell/src/process.rs": "8647fbf7c3200be3359bf3d82ba39e56ca24d14bd294662026d373c438517952",
+    "crates/pi-shell/src/process.rs": "45b222432a70eb056807507f8b4d28cf5fb73a7441ee9a0e28349ec85ef9b177",
     "crates/pi-shell/src/shell.rs": "66cacfe63d495b23156d023f2f34f354b657534ee3cdaf01e30d6694af253982",
     "crates/brush-core-vendored/src/commands.rs": "55e9dceffad7d829051547e91592ca8e392a9073e2d4ee2f7546e3b6c1b75a9d",
     "packages/natives/native/index.d.ts": "c61e02fd4712c822d30fb4b1496f064097a38718c9443bef526711f828165c50",
