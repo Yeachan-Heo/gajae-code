@@ -333,7 +333,7 @@ describe("test manifest runner", () => {
 		expect(result.exitCode, output(result)).toBe(0);
 		expect(output(result)).toContain(`manifest command receipts complete: ${manifest.commands.length}`);
 		expect(output(result)).toContain(
-			"manifest row receipts complete: 570 (telegram=95, discord=95, slack=95, mcp=95, acp=95, daemonCli=95)",
+			"manifest row receipts complete: 576 (telegram=96, discord=96, slack=96, mcp=96, acp=96, daemonCli=96)",
 		);
 		const invocations = (await Bun.file(fake.log).text()).trim().split("\n");
 		expect(invocations).toHaveLength(manifest.commands.length + manifest.rows.length);

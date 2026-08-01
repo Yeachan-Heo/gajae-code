@@ -294,16 +294,6 @@ fn bridge_chunks(
 			// marks dropped output at the N-API callback boundary instead of silently
 			// losing it, so truncation is always observable to the caller.
 			while let Some(chunk) = rx.recv().await {
-				if dropped_chunks > 0 {
-					match bounded_tx.try_send(shell_loss_marker(dropped_chunks, dropped_bytes)) {
-						Ok(()) => {
-							dropped_chunks = 0;
-							dropped_bytes = 0;
-						},
-						Err(mpsc::error::TrySendError::Full(_)) => {},
-						Err(mpsc::error::TrySendError::Closed(_)) => break,
-					}
-				}
 				let chunk_len = chunk.len();
 				match bounded_tx.try_send(chunk) {
 					Ok(()) => {},
