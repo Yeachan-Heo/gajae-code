@@ -1,6 +1,6 @@
 # computer
 
-> Explicitly enabled macOS desktop screenshot and input control through the native supervisor-gated computer controller.
+> Supervisor-gated macOS desktop screenshot and input control through the native computer controller.
 
 ## Source
 
@@ -11,12 +11,9 @@
 
 ## Availability
 
-`computer` is first-class in the product catalog and documentation, but it is not a callable tool by default.
+`computer` is callable by default on supported Apple Silicon macOS (`process.platform === "darwin"` and `process.arch === "arm64"`).
 
-Callable activation requires all of:
-
-1. macOS (`process.platform === "darwin"`), and
-2. `computer.enabled` or `computer.alwaysOn` set to `true`.
+An explicit `computer.enabled=false` disables it. When `computer.enabled` is unset, `computer.alwaysOn=false` also disables it; `computer.enabled=true` explicitly enables it on a supported host.
 
 When disabled, every action including `screenshot` returns `COMPUTER_DISABLED`. Disabled catalog/listing paths do not construct `ComputerController`, start hotkeys, probe Screen Recording, probe Accessibility, capture screenshots, or expose the callable schema to `search_tool_bm25`.
 
@@ -51,6 +48,15 @@ The model action object uses an exact snake_case discriminated schema. CamelCase
 ## Coordinate contract
 
 `x`, `y`, `to_x`, and `to_y` are screenshot pixels in the latest screenshot coordinate frame. They are not CSS pixels and not normalized fractions. The screenshot result records dimensions, scale, origin, display epoch, and capture id when supplied by native code. Coordinate actions must not clamp invalid coordinates; native code returns `COMPUTER_COORD_INVALID` or `COMPUTER_DISPLAY_STALE` before input when the coordinate/display contract cannot be satisfied.
+
+## Scope and limitations
+
+- Capture and coordinates cover only the primary display. The tool has no PID or window target.
+- Click, move, drag, scroll, type, and keypress are global, unscoped input; the current focus and macOS determine where they go.
+- Coordinate actions warp the hardware cursor and do not restore its prior position.
+- Do not use the desktop manually while a side-effecting action or batch runs; concurrent use is unsafe.
+- `screenshot` is read-only, and `wait` posts no input.
+- The kill switch gates future input, but it does not isolate the desktop or restore cursor position or focus.
 
 ## Errors
 
