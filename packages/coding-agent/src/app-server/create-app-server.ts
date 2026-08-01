@@ -35,6 +35,8 @@ export interface AppServerRuntime {
 	readonly registry: HandlerRegistry;
 	readonly subscriptions: ThreadSubscriptionIndex;
 	readonly broker: ServerRequestBroker;
+	/** Issue an approval request to subscribed clients and await its broker settlement. */
+	requestApproval(threadId: string, method: string, params: unknown, signal?: AbortSignal): Promise<unknown>;
 	close(): Promise<void>;
 	createConnection(
 		writer: AppServerWriter,
@@ -129,10 +131,36 @@ class Runtime implements AppServerRuntime {
 	}
 
 	async #close(): Promise<void> {
-		this.manager.shutdown();
-		await this.manager.waitForClosures();
-		await this.#threadStartAdapter?.shutdown?.();
-		this.broker.shutdown();
+		const failures: unknown[] = [];
+		const captureFailure = (error: unknown): void => {
+			if (error instanceof AggregateError) failures.push(...error.errors);
+			else failures.push(error);
+		};
+		try {
+			this.manager.shutdown();
+		} catch (error) {
+			captureFailure(error);
+		}
+		try {
+			await this.manager.waitForClosures();
+		} catch (error) {
+			captureFailure(error);
+		}
+		try {
+			await this.#threadStartAdapter?.shutdown?.();
+		} catch (error) {
+			captureFailure(error);
+		}
+		try {
+			this.broker.shutdown();
+		} catch (error) {
+			captureFailure(error);
+		}
+		if (failures.length > 0)
+			throw new AggregateError(
+				failures,
+				`Unverified app-server cleanup: ${failures.length} shutdown operation(s) failed.`,
+			);
 	}
 
 	createConnection(
@@ -170,6 +198,111 @@ class Runtime implements AppServerRuntime {
 		};
 	}
 
+	/** Create a broker-backed request and publish it to every active thread subscriber. */
+	#requestClient(
+		threadId: string,
+		method: string,
+		params: unknown,
+		active: () => boolean,
+		deferred?: Array<() => Promise<void>>,
+		originatingConnectionId?: string,
+	): string | undefined {
+		if (!active()) return undefined;
+		const eligible = new Set(
+			[...this.subscriptions.getSubscribers(threadId)].filter(id => this.#connections.get(id)?.active),
+		);
+		// A server request is atomic across eligible clients. Reject it before creating a broker
+		// entry when its params are invalid for any recipient's negotiated profile.
+		for (const connectionId of eligible) {
+			const target = this.#connections.get(connectionId)!;
+			const validators = target.state.capabilities?.experimentalApi ? experimentalValidators : stableValidators;
+			if (!validators.serverRequestParams[method]?.(params)) {
+				logger.warn("Dropping invalid app-server server request", { connectionId, method });
+				return undefined;
+			}
+		}
+		const id = `server-${this.#nextRequestId++}`;
+		// Start with NO eligible responder. A connection becomes eligible only once its request
+		// frame has actually been enqueued, so a second subscriber cannot answer the predictable
+		// `server-N` id before (or instead of) receiving it.
+		const recipients = [...eligible];
+		const request = this.broker.create(id, method, params, threadId, new Set(recipients));
+		if (!request) return undefined;
+		request.eligibleConnections.clear();
+		// A pending approval must protect its thread from idle eviction, so the counter moves up
+		// only after the broker accepted the request and back down exactly once from that settlement.
+		this.manager.adjustPendingApprovals(threadId, 1);
+		void request.settled.then(() => {
+			this.manager.adjustPendingApprovals(threadId, -1);
+		});
+		let published = false;
+		const finalizeUnpublished = (): void => {
+			if (published) return;
+			published = true;
+			this.broker.cancel(id, "request publication was abandoned");
+		};
+		const unregister = originatingConnectionId
+			? this.#registerUnpublished(originatingConnectionId, finalizeUnpublished)
+			: () => {};
+		void request.settled.then(unregister, unregister);
+		const publish = async (): Promise<void> => {
+			unregister();
+			if (published) return;
+			published = true;
+			// Publishing a request that already settled would send a ghost approval frame the client
+			// can never answer, so skip it once the broker no longer holds the request.
+			if (!this.broker.getPending(id)) return;
+			for (const connectionId of recipients) {
+				const target = active() ? this.#connections.get(connectionId) : undefined;
+				try {
+					if (!target) throw new Error("connection is gone");
+					if (
+						!(await target.enqueueMessage({ id, method, params }, () => this.broker.getPending(id) !== undefined))
+					)
+						throw new Error("request was settled before delivery");
+					// Recheck after the await: a recipient can close from inside its writer while this
+					// enqueue is pending, and must not become an eligible responder after departure.
+					if (this.#connections.get(connectionId) !== target || !target.active)
+						throw new Error("connection closed during publication");
+					request.eligibleConnections.add(connectionId);
+				} catch (error) {
+					logger.warn("Dropping unreachable app-server server-request recipient", {
+						connectionId,
+						id,
+						method,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			if (request.eligibleConnections.size === 0)
+				this.broker.cancel(id, "no eligible connection received the request");
+		};
+		if (deferred) deferred.push(publish);
+		else void publish();
+		return id;
+	}
+
+	/** Issue a server request outside an inbound connection and await broker settlement. */
+	async requestApproval(threadId: string, method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
+		if (signal?.aborted) throw new Error("approval request aborted");
+		const id = this.#requestClient(threadId, method, params, () => this.#closePromise === undefined);
+		if (!id) throw new Error("No active app-server client is subscribed to the approval thread.");
+		const pending = this.broker.getPending(id);
+		if (!pending) throw new Error("Approval request was settled before it could be awaited.");
+		const onAbort = (): void => {
+			this.broker.cancel(id, "approval request aborted");
+		};
+		if (signal) signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			const settlement = await pending.settled;
+			if (settlement.kind === "resolved" || settlement.kind === "denied") return settlement.result;
+			throw new Error(
+				settlement.kind === "timedOut" ? "approval request timed out" : `approval request ${settlement.reason}`,
+			);
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+	}
 	contextFor(connection: Connection, deferred: Array<() => Promise<void>>): InboundContext {
 		const active = (): boolean => this.#connections.get(connection.id) === connection && connection.active;
 		const queueMessage = (connectionId: string, message: Record<string, unknown>): void => {
@@ -227,96 +360,8 @@ class Runtime implements AppServerRuntime {
 						queueMessage(connectionId, { method, params });
 				}
 			},
-			requestClient: (threadId, method, params) => {
-				if (!active()) return undefined;
-				const eligible = new Set(
-					[...this.subscriptions.getSubscribers(threadId)].filter(id => this.#connections.get(id)?.active),
-				);
-				// A server request is atomic across eligible clients. Reject it before creating a
-				// broker entry when its params are invalid for any recipient's negotiated profile.
-				for (const connectionId of eligible) {
-					const target = this.#connections.get(connectionId)!;
-					const validators = target.state.capabilities?.experimentalApi
-						? experimentalValidators
-						: stableValidators;
-					if (!validators.serverRequestParams[method]?.(params)) {
-						logger.warn("Dropping invalid app-server server request", { connectionId, method });
-						return undefined;
-					}
-				}
-				const id = `server-${this.#nextRequestId++}`;
-				// Start with NO eligible responder. A connection becomes eligible only once its request
-				// frame has actually been enqueued, so a second subscriber cannot answer the predictable
-				// `server-N` id before (or instead of) receiving it. Pruning a pre-filled set cannot
-				// achieve this: the early answer would already have settled the request.
-				const recipients = [...eligible];
-				const request = this.broker.create(id, method, params, threadId, new Set(recipients));
-				if (!request) return undefined;
-				request.eligibleConnections.clear();
-				// A pending approval must protect its thread from idle eviction, so the counter moves up
-				// only after the broker accepted the request and back down exactly once from that
-				// handle's settlement. Without this the manager evicts a child mid-approval.
-				this.manager.adjustPendingApprovals(threadId, 1);
-				void request.settled.then(() => {
-					this.manager.adjustPendingApprovals(threadId, -1);
-				});
-				// The publisher may never run at all (the originating connection closes before the
-				// deferred queue drains), so a finalizer guarantees the request is settled either way.
-				let published = false;
-				const finalizeUnpublished = (): void => {
-					if (published) return;
-					published = true;
-					this.broker.cancel(id, "request publication was abandoned");
-				};
-				const unregister = this.#registerUnpublished(connection.id, finalizeUnpublished);
-				// A settled request needs no abandonment finalizer. This is a MEMORY-LEAK guard, not a
-				// correctness fence: a stale finalizer would only call `broker.cancel` on an already
-				// settled id, which is a no-op. It therefore has no behavioural mutation test.
-				void request.settled.then(unregister, unregister);
-				deferred.push(async () => {
-					unregister();
-					if (published) return;
-					published = true;
-					// Publishing a request that already settled would send a ghost approval frame the
-					// client can never answer, so skip it once the broker no longer holds the request.
-					if (!this.broker.getPending(id)) return;
-					for (const connectionId of recipients) {
-						const target = active() ? this.#connections.get(connectionId) : undefined;
-						try {
-							if (!target) throw new Error("connection is gone");
-							// The predicate is re-checked immediately before the write, so a request settled by
-							// shutdown/eviction while this frame waited in the queue is dropped rather than
-							// delivered as an unanswerable ghost.
-							if (
-								!(await target.enqueueMessage(
-									{ id, method, params },
-									() => this.broker.getPending(id) !== undefined,
-								))
-							)
-								throw new Error("request was settled before delivery");
-							// Recheck AFTER the await. A recipient can close from inside its own writer while
-							// this enqueue is pending: `handleDisconnect` then runs while the eligible set is
-							// still empty, and the queue deliberately lets the accepted frame finish, so
-							// adding it here would make an already-departed peer an eligible responder.
-							if (this.#connections.get(connectionId) !== target || !target.active)
-								throw new Error("connection closed during publication");
-							request.eligibleConnections.add(connectionId);
-						} catch (error) {
-							logger.warn("Dropping unreachable app-server server-request recipient", {
-								connectionId,
-								id,
-								method,
-								error: error instanceof Error ? error.message : String(error),
-							});
-						}
-					}
-					// Nobody received it, so settle now rather than holding the thread and its
-					// pendingApprovals until the request times out.
-					if (request.eligibleConnections.size === 0)
-						this.broker.cancel(id, "no eligible connection received the request");
-				});
-				return id;
-			},
+			requestClient: (threadId, method, params) =>
+				this.#requestClient(threadId, method, params, active, deferred, connection.id),
 		};
 	}
 }

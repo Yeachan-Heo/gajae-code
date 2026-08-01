@@ -194,6 +194,19 @@ test("shutdown: waits for async child closures and remains idempotent", async ()
 	await m.waitForClosures();
 	expect(closeCalls).toBe(1);
 });
+test("waitForClosures reports unverified cleanup after every close attempt settles", async () => {
+	const attempted: string[] = [];
+	const m = new ThreadRuntimeManager();
+	m.onCloseOwned(async id => {
+		attempted.push(id);
+		if (id === "bad") throw new Error("authority fence rejected close");
+	});
+	m.register("bad", "spawned", authority(1));
+	m.register("good", "spawned", authority(2));
+	m.shutdown();
+	await expect(m.waitForClosures()).rejects.toThrow(/Unverified owned-thread cleanup/);
+	expect(attempted).toEqual(["bad", "good"]);
+});
 test("attached threads are never evicted by LRU (only owned)", () => {
 	const m = new ThreadRuntimeManager({ maxLoadedThreads: 1, idleTtlMs: 0 });
 	m.register("t1", "attached", undefined);

@@ -47,7 +47,14 @@ export interface HandlerContext {
 }
 
 export type HandlerResult =
-	| { ok: true; result: unknown }
+	| {
+			ok: true;
+			result: unknown;
+			/** Deferred until the serialized response has crossed the transport boundary. */
+			responseDelivered?: () => Promise<void>;
+			/** Roll back an accepted side effect when the response cannot be delivered. */
+			rollbackUndeliveredResponse?: () => Promise<void>;
+	  }
 	| { ok: false; errorKey: import("../transport/errors").AppServerErrorKey };
 
 export type MethodHandler = (params: unknown, context?: HandlerContext) => HandlerResult | Promise<HandlerResult>;

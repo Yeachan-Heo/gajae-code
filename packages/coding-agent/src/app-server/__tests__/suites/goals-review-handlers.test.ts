@@ -13,6 +13,10 @@ import {
 	threadGoalSetHandler,
 } from "../../suites/goals-review-handlers";
 import type { HandlerContext } from "../../suites/handlers";
+import type { LoadedThreadRuntime, SessionClient } from "../../thread-runtime/child-bridge";
+import { loadThread } from "../../thread-runtime/child-bridge";
+import { createProductionThreadStartAdapter } from "../../thread-runtime/production-child";
+import { ThreadRuntimeManager } from "../../thread-runtime/thread-runtime-manager";
 
 type Notification = { method: string; params: Record<string, unknown> };
 
@@ -150,6 +154,7 @@ test("review/start translates targets into a native turn.prompt and returns inli
 		durationMs: null,
 	};
 	let delivered = false;
+	let rolledBack = false;
 	const context = {
 		connectionId: "review-connection",
 		turnController: {
@@ -161,6 +166,9 @@ test("review/start translates targets into a native turn.prompt and returns inli
 					responseDelivered: async () => {
 						delivered = true;
 					},
+					rollbackUndelivered: async () => {
+						rolledBack = true;
+					},
 				};
 			},
 		},
@@ -168,9 +176,14 @@ test("review/start translates targets into a native turn.prompt and returns inli
 	const params = { threadId, target: { type: "baseBranch", branch: "main" }, delivery: "inline" };
 	expect(stableValidators.clientRequestParams["review/start"]?.(params)).toBe(true);
 	const result = await reviewStartHandler(params, context);
-	expect(result).toEqual({ ok: true, result: { turn, reviewThreadId: threadId } });
+	expect(result).toMatchObject({ ok: true, result: { turn, reviewThreadId: threadId } });
+	expect(delivered).toBe(false);
+	if (!result.ok) throw new Error(result.errorKey);
+	await result.responseDelivered?.();
 	expect(delivered).toBe(true);
-	expect(stableValidators.clientRequestResults["review/start"]?.(result.ok ? result.result : undefined)).toBe(true);
+	await result.rollbackUndeliveredResponse?.();
+	expect(rolledBack).toBe(true);
+	expect(stableValidators.clientRequestResults["review/start"]?.(result.result)).toBe(true);
 });
 
 test("review/start rejects detached delivery because GJC has no detached review runner", async () => {
@@ -181,7 +194,7 @@ test("review/start rejects detached delivery because GJC has no detached review 
 	expect(result).toEqual({ ok: false, errorKey: "notSupported" });
 });
 
-test("feedback/upload persists a real GJC session custom entry and returns thread id", async () => {
+test("feedback/upload persists metadata through the retained child projection writer and returns thread id", async () => {
 	const params = {
 		classification: "bug",
 		reason: "The review panel lost its findings.",
@@ -189,20 +202,88 @@ test("feedback/upload persists a real GJC session custom entry and returns threa
 		includeLogs: false,
 		tags: { surface: "review" },
 	};
+	const envelopes: Record<string, unknown>[] = [];
+	const client = {
+		onFrame: () => () => {},
+		onReconnect: () => () => {},
+		onReconnectFailed: () => () => {},
+		request: async (frame: Record<string, unknown>) => frame,
+		query: async () => ({ records: [], revision: 0 }),
+		control: async () => ({}),
+		appendProjection: async (envelope: Record<string, unknown>) => {
+			envelopes.push(envelope);
+			return { revision: 1 };
+		},
+		close: async () => {},
+	} as SessionClient;
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	manager.register(threadId, "attached", undefined, "review-connection", { client });
+	const context = { ...contextFor(), manager };
 	expect(stableValidators.clientRequestParams["feedback/upload"]?.(params)).toBe(true);
-	const result = await feedbackUploadHandler(params, contextFor());
+	const result = await feedbackUploadHandler(params, context);
 	expect(result).toEqual({ ok: true, result: { threadId } });
 	expect(stableValidators.clientRequestResults["feedback/upload"]?.(result.ok ? result.result : undefined)).toBe(true);
-	const persisted = await loadEntriesFromFile(sessionFile);
-	const feedback = persisted.find(
-		entry => entry.type === "custom" && entry.customType === "app-server:feedback/upload",
-	);
-	expect(feedback).toMatchObject({
-		type: "custom",
-		customType: "app-server:feedback/upload",
-		data: { threadId, classification: "bug", reason: params.reason, includeLogs: false, tags: params.tags },
+	expect(envelopes).toHaveLength(1);
+	expect(envelopes[0]).toMatchObject({
+		schemaVersion: 1,
+		recordKind: "app-server.feedback.upload",
+		payload: { threadId, classification: "bug", reason: params.reason, includeLogs: false, tags: params.tags },
 	});
 });
+
+test("feedback/upload persists through a real spawned child without a sessionFile seam", async () => {
+	const agentDir = mkdtempSync(join(tmpdir(), "gjc-feedback-agent-"));
+	const cwd = mkdtempSync(join(tmpdir(), "gjc-feedback-cwd-"));
+	const manager = new ThreadRuntimeManager({ maxLoadedThreads: 2 });
+	const adapter = { manager, ...createProductionThreadStartAdapter({ agentDir }) };
+	let runtime: LoadedThreadRuntime | undefined;
+	try {
+		runtime = await loadThread(adapter, { connectionId: "feedback-real", params: { cwd } });
+		if (!runtime) throw new Error("real spawned child did not load");
+		expect(runtime.ownership).toBe("spawned");
+		expect(runtime.effectiveSettings.thread.path).toBeNull();
+		const appendProjection = runtime.client.appendProjection;
+		if (!appendProjection) throw new Error("real spawned child omitted appendProjection");
+		let persistedEnvelope: Record<string, unknown> | undefined;
+		runtime.client.appendProjection = async (envelope, options) => {
+			persistedEnvelope = envelope;
+			return await appendProjection(envelope, options);
+		};
+		const result = await feedbackUploadHandler(
+			{
+				threadId: runtime.threadId,
+				classification: "bug",
+				reason: "real child feedback",
+				includeLogs: false,
+			},
+			{ connectionId: "feedback-real", manager },
+		);
+		expect(result).toEqual({ ok: true, result: { threadId: runtime.threadId } });
+		if (!persistedEnvelope) throw new Error("feedback envelope was not sent to child projection append");
+		const receipt = (await appendProjection(persistedEnvelope, {
+			confirm: true,
+			idempotencyKey: persistedEnvelope.sourceKey as string,
+		})) as Record<string, unknown>;
+		expect(receipt.reused).toBe(true);
+		expect(receipt.revision).toBe(1);
+		expect(persistedEnvelope).toMatchObject({
+			schemaVersion: 1,
+			recordKind: "app-server.feedback.upload",
+			payload: {
+				threadId: runtime.threadId,
+				classification: "bug",
+				reason: "real child feedback",
+				includeLogs: false,
+			},
+		});
+	} finally {
+		if (runtime) manager.remove(runtime.threadId);
+		await manager.waitForClosures();
+		await adapter.shutdown?.();
+		rmSync(agentDir, { recursive: true, force: true });
+		rmSync(cwd, { recursive: true, force: true });
+	}
+}, 120_000);
 
 test("feedback/upload refuses log upload without a GJC sink", async () => {
 	const result = await feedbackUploadHandler({ classification: "bug", threadId, includeLogs: true }, contextFor());

@@ -214,7 +214,18 @@ export class ThreadRuntimeManager {
 	}
 	/** Wait until every asynchronous owned-thread close callback has settled. */
 	async waitForClosures(): Promise<void> {
-		while (this.#closing.size > 0) await Promise.allSettled([...this.#closing]);
+		const failures: unknown[] = [];
+		while (this.#closing.size > 0) {
+			const settled = await Promise.allSettled([...this.#closing]);
+			for (const result of settled) {
+				if (result.status === "rejected") failures.push(result.reason);
+			}
+		}
+		if (failures.length > 0)
+			throw new AggregateError(
+				failures,
+				`Unverified owned-thread cleanup: ${failures.length} close operation(s) failed.`,
+			);
 	}
 
 	/**

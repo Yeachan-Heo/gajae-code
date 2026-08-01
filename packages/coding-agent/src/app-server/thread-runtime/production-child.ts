@@ -13,7 +13,14 @@ import type { AgentSession } from "../../session/agent-session";
 import { appendAppServerProjection, readAppServerProjections } from "../../session/app-server-projection";
 import { createReverseLeaseController, type ReverseLeaseController } from "../reverse-lease-controller";
 import { type CodexApprovalRequester, createPermissionAdapter } from "../server-requests/permission-adapter";
-import type { ChildBridgeOptions, ChildCreateRequest, ChildCreateResult, SessionClient } from "./child-bridge";
+import type {
+	ChildBridgeOptions,
+	ChildCreateRequest,
+	ChildCreateResult,
+	SessionClient,
+	SessionRequestOptions,
+	TurnPolicyOverride,
+} from "./child-bridge";
 import type { EndpointAuthority, ThreadEffectiveSettings } from "./thread-runtime-manager";
 
 type Correlation = { commandId: string; turnId: string };
@@ -93,6 +100,20 @@ function modelOverrideError(requestedModel: string): Error {
 	return new Error(`Model override "${requestedModel}" could not be resolved.`);
 }
 
+function validateTurnPolicy(policy: TurnPolicyOverride): void {
+	if (policy.approvalPolicy !== undefined && policy.approvalPolicy !== "never")
+		throw new Error("The child only supports approvalPolicy=never for per-turn policy overrides.");
+	if (policy.sandboxPolicy !== undefined && policy.sandboxPolicy.type !== "dangerFullAccess")
+		throw new Error("The child only supports sandboxPolicy=dangerFullAccess for per-turn policy overrides.");
+	if (
+		policy.reasoningEffort !== undefined &&
+		!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(policy.reasoningEffort)
+	)
+		throw new Error(`Unsupported per-turn reasoning effort "${policy.reasoningEffort}".`);
+	if (policy.developerInstructions !== undefined && policy.developerInstructions.trim().length === 0)
+		throw new Error("Per-turn developer instructions must be non-empty.");
+}
+
 function endpointAuthority(value: unknown): EndpointAuthority {
 	if (!record(value)) throw new Error("SDK broker session.create returned no endpoint authority.");
 	const endpointGeneration = value.endpointGeneration;
@@ -137,11 +158,12 @@ function buildSurface(
 	correlation: CorrelationState,
 ): ControlSurface {
 	const surface = {
-		prompt: async (text: string, images?: unknown, clientRef?: string) => {
+		prompt: async (text: string, images?: unknown, clientRef?: string, developerInstructions?: string) => {
 			if (!correlation.current) correlation.current = { commandId: randomUUID(), turnId: randomUUID() };
 			const pair = correlation.current;
 			await session.prompt(text, {
 				images: Array.isArray(images) ? (images as never) : undefined,
+				...(developerInstructions ? { developerInstructions } : {}),
 				attribution: "user",
 			});
 			return { accepted: true, ...pair, ...(clientRef ? { clientRef } : {}) };
@@ -155,11 +177,19 @@ function buildSurface(
 			return surface.prompt(text);
 		},
 		runCompaction: () => session.compact(),
+		setThinking: (level: unknown) => session.setThinkingLevel(level as never),
+		setPermissionMode: (mode: unknown) => {
+			if (mode !== "prompt" && mode !== "allow" && mode !== "deny") throw new Error("Invalid permission mode.");
+			session.setSdkPermissionMode(mode);
+			return { changed: true, mode };
+		},
 		appendProjection: (envelope: unknown) => projections.append(envelope as Record<string, unknown>),
 		readProjection: (afterRevision?: number) => projections.read(afterRevision),
 		installedOperations: new Set([
 			"turn.prompt",
 			"turn.steer",
+			"thinking.set",
+			"permission_mode.set",
 			"turn.follow_up",
 			"turn.abort",
 			"turn.abort_and_prompt",
@@ -309,6 +339,8 @@ function assistantMessageFromRemoteFrame(frame: Record<string, unknown>): Record
 }
 function remoteSessionClient(sdk: SdkClient, activeModelReference?: string): SessionClient {
 	const unwrap = (value: unknown): unknown => responseResult(value);
+	let permissionMode: "prompt" | "allow" | "deny" = "prompt";
+	let thinkingLevel: string | undefined;
 	return {
 		connectionId: sdk.connectionId,
 		onFrame: handler => {
@@ -333,6 +365,8 @@ function remoteSessionClient(sdk: SdkClient, activeModelReference?: string): Ses
 		request: (frame, timeout) => sdk.request(frame, timeout as never),
 		query: async (query, input = {}) => unwrap(await sdk.query(query, input)),
 		control: async (operation, input = {}, options) => unwrap(await sdk.control(operation, input, options)),
+		appendProjection: async (envelope: Record<string, unknown>, options?: SessionRequestOptions) =>
+			unwrap(await sdk.control("projection.append", { envelope }, options)),
 		setModelForTurn: async requestedModel => {
 			const reference = splitModelReference(requestedModel);
 			if (activeModelReference === requestedModel) return async () => {};
@@ -355,6 +389,54 @@ function remoteSessionClient(sdk: SdkClient, activeModelReference?: string): Ses
 			return async () => {
 				if (currentId !== undefined) await controlResponseResult(await sdk.control("model.set", { id: currentId }));
 			};
+		},
+		setTurnPolicyForTurn: async policy => {
+			validateTurnPolicy(policy);
+			const restores: Array<() => Promise<void>> = [];
+			try {
+				if (policy.approvalPolicy !== undefined) {
+					const previous = permissionMode;
+					await controlResponseResult(await sdk.control("permission_mode.set", { mode: "allow" }));
+					permissionMode = "allow";
+					restores.unshift(async () => {
+						await controlResponseResult(await sdk.control("permission_mode.set", { mode: previous }));
+						permissionMode = previous;
+					});
+				}
+				if (policy.reasoningEffort !== undefined) {
+					const models = await allModelItems(sdk);
+					const current = models.find(model => model.current === true);
+					const previous =
+						thinkingLevel ??
+						(typeof current?.currentThinkingLevel === "string" ? current.currentThinkingLevel : "inherit");
+					await controlResponseResult(await sdk.control("thinking.set", { level: policy.reasoningEffort }));
+					thinkingLevel = policy.reasoningEffort;
+					restores.unshift(async () => {
+						await controlResponseResult(await sdk.control("thinking.set", { level: previous }));
+						thinkingLevel = previous;
+					});
+				}
+				return async () => {
+					let failure: unknown;
+					for (const restore of restores) {
+						try {
+							await restore();
+						} catch (error) {
+							failure ??= error;
+						}
+					}
+					if (failure !== undefined) throw failure;
+				};
+			} catch (error) {
+				for (const restore of restores) {
+					try {
+						await restore();
+					} catch {
+						// Preserve the original policy application failure; the turn controller fences restoration failures.
+					}
+				}
+				throw error;
+			}
 		},
 		close: () => sdk.close(),
 	};
@@ -430,6 +512,20 @@ export function createProductionThreadStartAdapter(
 					);
 					return controlResponseResult(response);
 				},
+				appendProjection: async (envelope: Record<string, unknown>, controlOptions?: SessionRequestOptions) => {
+					const response = await dispatchControl(
+						surface,
+						OPERATIONS.find(row => row.kind === "control" && row.sdkId === "projection.append"),
+						{
+							id: randomUUID(),
+							operation: "projection.append",
+							input: { envelope },
+							confirm: controlOptions?.confirm,
+							idempotencyKey: controlOptions?.idempotencyKey,
+						},
+					);
+					return controlResponseResult(response);
+				},
 				setModelForTurn: async requestedModel => {
 					const reference = splitModelReference(requestedModel);
 					const target = reference ? session.modelRegistry.find(reference.provider, reference.id) : undefined;
@@ -446,6 +542,33 @@ export function createProductionThreadStartAdapter(
 					return async () => {
 						if (scope !== undefined && !session.restoreTemporaryProviderSessionScope(scope))
 							throw new Error(`Model override "${requestedModel}" could not restore the previous model.`);
+					};
+				},
+				setTurnPolicyForTurn: async policy => {
+					validateTurnPolicy(policy);
+					const previousPermissionMode = session.sdkPermissionMode;
+					const previousThinkingLevel = session.thinkingLevel;
+					if (policy.approvalPolicy !== undefined) session.setSdkPermissionMode("allow");
+					try {
+						if (policy.reasoningEffort !== undefined)
+							await session.setThinkingLevelForControl(policy.reasoningEffort as never, false);
+					} catch (error) {
+						session.setSdkPermissionMode(previousPermissionMode);
+						throw error;
+					}
+					return async () => {
+						let failure: unknown;
+						try {
+							if (policy.reasoningEffort !== undefined) session.setThinkingLevel(previousThinkingLevel);
+						} catch (error) {
+							failure = error;
+						}
+						try {
+							if (policy.approvalPolicy !== undefined) session.setSdkPermissionMode(previousPermissionMode);
+						} catch (error) {
+							failure ??= error;
+						}
+						if (failure !== undefined) throw failure;
 					};
 				},
 				query: async (query, input = {}) => queryResult(query, input, projections, () => promptState),
@@ -546,12 +669,12 @@ export function createProductionThreadStartAdapter(
 	return {
 		create,
 		ownership: options.createSession ? "attached" : "spawned",
-		attachReverseLeaseController: async client => {
+		attachReverseLeaseController: async (client, validatedChild) => {
 			const sdk = rawClients.get(client);
 			if (!sdk) return undefined;
 			const permission = createPermissionAdapter({
-				conversationId: client.connectionId,
-				cwd: undefined,
+				conversationId: validatedChild.sessionId,
+				cwd: validatedChild.cwd,
 				requestApproval: options.requestApproval,
 			});
 			const controller = createReverseLeaseController({ client: sdk, providers: [permission.provider()] });

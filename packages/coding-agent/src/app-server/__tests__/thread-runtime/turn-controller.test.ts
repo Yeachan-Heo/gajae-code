@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { stableValidators } from "../../protocol-source/schema-validators.generated";
-import type { SessionClient, SessionRequestOptions } from "../../thread-runtime/child-bridge";
+import type { SessionClient, SessionRequestOptions, TurnPolicyOverride } from "../../thread-runtime/child-bridge";
 import { ThreadRuntimeManager } from "../../thread-runtime/thread-runtime-manager";
 import { TurnController, type TurnControllerNotification } from "../../thread-runtime/turn-controller";
 import type { ProjectionEnvelope, ProjectionRecord } from "../../thread-runtime/turn-projection";
@@ -17,6 +17,8 @@ class FakeSessionClient implements SessionClient {
 	promptError: unknown;
 	promptStatusResult: unknown = { status: "unknown" };
 	failProjection = false;
+	modelRestoreError: unknown;
+	policyRestoreError: unknown;
 	beforePrompt?: () => void;
 	private revision = 0;
 
@@ -78,6 +80,14 @@ class FakeSessionClient implements SessionClient {
 		this.calls.push({ operation: "turn.modelOverride", input: { model: requestedModel } });
 		return async () => {
 			this.calls.push({ operation: "turn.modelOverride.restore", input: { model: requestedModel } });
+			if (this.modelRestoreError !== undefined) throw this.modelRestoreError;
+		};
+	}
+	async setTurnPolicyForTurn(policy: TurnPolicyOverride): Promise<() => Promise<void>> {
+		this.calls.push({ operation: "turn.policyOverride", input: { ...policy } });
+		return async () => {
+			this.calls.push({ operation: "turn.policyOverride.restore", input: { ...policy } });
+			if (this.policyRestoreError !== undefined) throw this.policyRestoreError;
 		};
 	}
 	async close(): Promise<void> {}
@@ -220,6 +230,49 @@ test("per-turn model override is restored after the child terminalizes", async (
 	]);
 });
 
+test("terminal model-override restore failure fences the thread and refuses the next turn", async () => {
+	const client = new FakeSessionClient();
+	client.modelRestoreError = new Error("restore failed");
+	const manager = managerWithClient(client);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => "app-turn-restore-terminal" });
+	const handle = await controller.start({
+		threadId: THREAD_ID,
+		params: { text: "restore", model: "provider/turn-model" },
+	});
+	await handle.responseDelivered();
+	controller.acceptFrame(THREAD_ID, lifecycleFrame("agent_end", { messages: [], stopReason: "completed" }));
+	await flush();
+	expect(controller.getState(THREAD_ID)).toBe("recovery_required");
+	expect(manager.get(THREAD_ID)?.activeTurn).toBe(true);
+	await expect(controller.start({ threadId: THREAD_ID, params: { text: "blocked" } })).rejects.toMatchObject({
+		code: "recovery_required",
+	});
+});
+
+test("aggregate override restore attempts policy and model restoration when the first restore fails", async () => {
+	const client = new FakeSessionClient();
+	client.policyRestoreError = new Error("policy restore failed");
+	client.modelRestoreError = new Error("model restore failed");
+	const manager = managerWithClient(client);
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => "app-turn-restore-both" });
+	const handle = await controller.start({
+		threadId: THREAD_ID,
+		params: {
+			text: "restore",
+			model: "provider/turn-model",
+			approvalPolicy: "never",
+			sandboxPolicy: { type: "dangerFullAccess" },
+		},
+	});
+	await handle.responseDelivered();
+	controller.acceptFrame(THREAD_ID, lifecycleFrame("agent_end", { messages: [], stopReason: "completed" }));
+	await flush();
+	expect(client.calls.map(call => call.operation)).toContain("turn.policyOverride.restore");
+	expect(client.calls.map(call => call.operation)).toContain("turn.modelOverride.restore");
+	expect(controller.getState(THREAD_ID)).toBe("recovery_required");
+	expect(manager.get(THREAD_ID)?.activeTurn).toBe(true);
+});
+
 test("synchronous child terminal is buffered until the response is delivered", async () => {
 	const client = new FakeSessionClient();
 	const manager = managerWithClient(client);
@@ -257,6 +310,23 @@ test("busy preflight rejection does not create durable turn state", async () => 
 	expect(client.projectionRecords).toHaveLength(0);
 	expect(notifications).toHaveLength(0);
 	expect(manager.get(THREAD_ID)?.activeTurn).toBe(false);
+});
+
+test("pre-acceptance model-override restore failure fences the thread", async () => {
+	const client = new FakeSessionClient();
+	client.promptError = new Error("prompt rejected");
+	client.modelRestoreError = new Error("restore failed");
+	const manager = managerWithClient(client);
+	const controller = new TurnController({
+		manager,
+		emit: () => {},
+		idFactory: () => "app-turn-restore-preacceptance",
+	});
+	await expect(
+		controller.start({ threadId: THREAD_ID, params: { text: "restore", model: "provider/turn-model" } }),
+	).rejects.toMatchObject({ code: "recovery_required" });
+	expect(controller.getState(THREAD_ID)).toBe("recovery_required");
+	expect(manager.get(THREAD_ID)?.activeTurn).toBe(true);
 });
 
 test("projection append failure after acceptance fails closed without a false response", async () => {

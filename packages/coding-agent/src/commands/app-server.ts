@@ -6,7 +6,11 @@ import {
 	resolveAppServerArgs,
 	runStdioServer,
 } from "../app-server/cli/runtime";
-import { type AppServerConnection, createAppServerRuntime } from "../app-server/create-app-server";
+import {
+	type AppServerConnection,
+	type AppServerRuntime,
+	createAppServerRuntime,
+} from "../app-server/create-app-server";
 import { createProductionThreadStartAdapter } from "../app-server/thread-runtime/production-child";
 import { checkWsAuth, type WsAuthConfig } from "../app-server/transport/auth";
 
@@ -155,11 +159,20 @@ export default class AppServer extends Command {
 		// ws:// and unix:// listeners: bind a Bun WebSocket server.
 		if (config.mode.kind === "ws") {
 			const { host, port } = config.mode;
-			const runtime = createAppServerRuntime(
+			let runtime: AppServerRuntime | undefined;
+			const threadStartAdapter = createProductionThreadStartAdapter({
+				requestApproval: (method, params, signal) => {
+					const owner = runtime;
+					if (!owner) return Promise.reject(new Error("App-server runtime is not ready for approval requests."));
+					return owner.requestApproval(params.conversationId, method, params, signal);
+				},
+			});
+			const serverRuntime = createAppServerRuntime(
 				{ maxLoadedThreads: config.maxLoadedThreads },
 				{ maxFrameBytes: config.maxFrameBytes },
-				{ threadStartAdapter: createProductionThreadStartAdapter() },
+				{ threadStartAdapter },
 			);
+			runtime = serverRuntime;
 
 			const wsServer = Bun.serve({
 				port,
@@ -184,7 +197,7 @@ export default class AppServer extends Command {
 							writer;
 						(
 							ws as unknown as { _connection: AppServerConnection; _writer: AppServerWebSocketWriter }
-						)._connection = runtime.createConnection(writer.writer, "websocket", reason =>
+						)._connection = serverRuntime.createConnection(writer.writer, "websocket", reason =>
 							closeRejectedWebSocket(ws, reason),
 						);
 					},
@@ -215,7 +228,10 @@ export default class AppServer extends Command {
 					if (shuttingDown) return;
 					shuttingDown = true;
 					wsServer.stop();
-					void runtime.close().then(resolve, resolve);
+					void serverRuntime.close().then(resolve, reject => {
+						process.exitCode = 1;
+						reject(reject);
+					});
 				};
 				process.on("SIGTERM", shutdown);
 				process.on("SIGINT", shutdown);
@@ -224,11 +240,20 @@ export default class AppServer extends Command {
 		// unix:// — same WebSocket-over-Unix semantics.
 		if (config.mode.kind === "unix" && config.mode.path) {
 			const socketPath = config.mode.path;
-			const runtime = createAppServerRuntime(
+			let runtime: AppServerRuntime | undefined;
+			const threadStartAdapter = createProductionThreadStartAdapter({
+				requestApproval: (method, params, signal) => {
+					const owner = runtime;
+					if (!owner) return Promise.reject(new Error("App-server runtime is not ready for approval requests."));
+					return owner.requestApproval(params.conversationId, method, params, signal);
+				},
+			});
+			const serverRuntime = createAppServerRuntime(
 				{ maxLoadedThreads: config.maxLoadedThreads },
 				{ maxFrameBytes: config.maxFrameBytes },
-				{ threadStartAdapter: createProductionThreadStartAdapter() },
+				{ threadStartAdapter },
 			);
+			runtime = serverRuntime;
 			const wsServer = Bun.serve({
 				unix: socketPath,
 				fetch(req, server) {
@@ -250,7 +275,7 @@ export default class AppServer extends Command {
 							writer;
 						(
 							ws as unknown as { _connection: AppServerConnection; _writer: AppServerWebSocketWriter }
-						)._connection = runtime.createConnection(writer.writer, "unix", reason =>
+						)._connection = serverRuntime.createConnection(writer.writer, "unix", reason =>
 							closeRejectedWebSocket(ws, reason),
 						);
 					},
@@ -281,7 +306,10 @@ export default class AppServer extends Command {
 					if (shuttingDown) return;
 					shuttingDown = true;
 					wsServer.stop();
-					void runtime.close().then(resolve, resolve);
+					void serverRuntime.close().then(resolve, reject => {
+						process.exitCode = 1;
+						reject(reject);
+					});
 				};
 				process.on("SIGTERM", shutdown);
 				process.on("SIGINT", shutdown);

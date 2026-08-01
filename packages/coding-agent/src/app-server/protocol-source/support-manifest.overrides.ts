@@ -309,13 +309,14 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		"Review starts a native GJC turn.prompt with target-specific instructions; detached review threads remain honestly unsupported.",
 	),
 	"feedback/upload": laneRow(
-		"feedbackUploadHandler",
+		"feedbackUploadHandler + retained child projection.append",
 		"suites/goals-review-handlers.ts",
 		[
-			"feedback/upload persists a real GJC session custom entry and returns thread id",
+			"feedback/upload persists metadata through the retained child projection writer and returns thread id",
+			"feedback/upload persists through a real spawned child without a sessionFile seam",
 			"feedback/upload refuses log upload without a GJC sink",
 		],
-		"Feedback metadata is durably recorded through SessionManager.appendCustomEntry; remote log uploads fail honestly without a GJC sink.",
+		"Feedback metadata is durably recorded through the owning child’s flush-backed projection writer; remote log uploads fail honestly without a GJC sink.",
 	),
 	"thread/list": laneRow(
 		"threadListHandler",
@@ -708,7 +709,10 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	"account/read": laneRow(
 		"accountReadHandler",
 		"suites/account-handlers.ts",
-		["account/read: returns truthful schema-valid API-key and absent responses"],
+		[
+			"account/read: returns truthful schema-valid API-key, absent, and unknown-provider responses",
+			"account/read: accepts an injected auth-state source for deterministic probes",
+		],
 		"Projects GJC auth storage and model-registry state into the vendored account/read shape without inventing ChatGPT identity.",
 	),
 	"account/usage/read": unsupported,

@@ -18,7 +18,7 @@ import {
 import type { ThreadRuntimeManager } from "./thread-runtime/thread-runtime-manager";
 import { type TurnController, TurnControllerError } from "./thread-runtime/turn-controller";
 import { readAndReconstructTurns } from "./thread-runtime/turn-projection";
-import { serializeError, serializeResult } from "./transport/errors";
+import { serializeError, serializeModelOverrideError, serializeResult } from "./transport/errors";
 import { decodeLine, encodeMessage, type FrameCodecOptions } from "./transport/framing";
 import type { ListenMode } from "./transport/listen";
 
@@ -143,11 +143,50 @@ function hasNonNullProperty(record: Record<string, unknown>, key: string): boole
 	return Object.hasOwn(record, key) && record[key] !== undefined && record[key] !== null;
 }
 
+const supportedTurnReasoningEfforts = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function supportsTurnCollaborationMode(params: Record<string, unknown>): boolean {
+	if (!hasNonNullProperty(params, "collaborationMode")) return true;
+	const collaborationMode = params.collaborationMode;
+	if (!isRecord(collaborationMode)) return false;
+	if (
+		Object.keys(collaborationMode).some(key => key !== "mode" && key !== "settings") ||
+		(hasNonNullProperty(collaborationMode, "mode") && collaborationMode.mode !== "default")
+	)
+		return false;
+	if (!hasNonNullProperty(collaborationMode, "settings")) return true;
+	const settings = collaborationMode.settings;
+	if (!isRecord(settings)) return false;
+	if (
+		Object.keys(settings).some(
+			key => key !== "model" && key !== "reasoning_effort" && key !== "developer_instructions",
+		)
+	)
+		return false;
+	if (
+		hasNonNullProperty(settings, "model") &&
+		(typeof settings.model !== "string" || settings.model.trim().length === 0)
+	)
+		return false;
+	if (
+		hasNonNullProperty(settings, "developer_instructions") &&
+		(typeof settings.developer_instructions !== "string" || settings.developer_instructions.trim().length === 0)
+	)
+		return false;
+	if (
+		hasNonNullProperty(settings, "reasoning_effort") &&
+		(typeof settings.reasoning_effort !== "string" || !supportedTurnReasoningEfforts.has(settings.reasoning_effort))
+	)
+		return false;
+	return true;
+}
+
 function supportsTurnStartDefaults(params: Record<string, unknown>): boolean {
 	if (hasNonNullProperty(params, "approvalPolicy") && params.approvalPolicy !== "never") return false;
 	if (hasNonNullProperty(params, "sandboxPolicy")) {
 		const policy = params.sandboxPolicy;
 		if (!isRecord(policy) || policy.type !== "dangerFullAccess") return false;
+		if (Object.keys(policy).some(key => key !== "type")) return false;
 	}
 	return true;
 }
@@ -155,6 +194,7 @@ function supportsTurnStartDefaults(params: Record<string, unknown>): boolean {
 function supportsTurnStart(params: Record<string, unknown>): boolean {
 	if (turnStartUnsupportedOverrides.some(key => hasNonNullProperty(params, key))) return false;
 	if (!supportsTurnStartDefaults(params)) return false;
+	if (!supportsTurnCollaborationMode(params)) return false;
 	if (!Array.isArray(params.input) || params.input.length === 0) return false;
 	return params.input.every(item => {
 		if (!isRecord(item) || item.type !== "text") return false;
@@ -251,8 +291,10 @@ async function handleTurnStart(
 		}
 		if (turnControllerCode(error) === "model_override") {
 			const message = error instanceof Error ? error.message : "Turn model override could not be honoured.";
-			return { response: serializeError(id, "invalidParams", transport, message) ?? undefined };
+			return { response: serializeModelOverrideError(id, message, transport) ?? undefined };
 		}
+		if (turnControllerCode(error) === "turn_policy")
+			return { response: serializeError(id, "notSupported", transport) ?? undefined };
 		return { response: serializeError(id, turnControllerErrorKey(error), transport) ?? undefined };
 	}
 }
@@ -487,18 +529,30 @@ export async function processInbound(
 			}
 			const handler = handlerRegistry?.get(classification.method);
 			if (!handler) return { response: serializeError(verdict.id, "notSupported", transport) ?? undefined };
+			let rollbackUndeliveredResponse: (() => Promise<void>) | undefined;
 			try {
 				const handlerResult = await handler(decoded.raw.params, { ...context, manager });
 				if (!handlerResult.ok)
 					return { response: serializeError(verdict.id, handlerResult.errorKey, transport) ?? undefined };
+				rollbackUndeliveredResponse = handlerResult.rollbackUndeliveredResponse;
 				// A handler response must conform to the profile negotiated by initialize. Fail
 				// closed with -32603 rather than emitting a result that clients cannot decode.
 				const validators = state.capabilities?.experimentalApi ? experimentalValidators : stableValidators;
 				const validate = validators.clientRequestResults[classification.method];
-				if (!validate?.(handlerResult.result))
-					return { response: serializeError(verdict.id, "internalError", transport) ?? undefined };
-				return { response: serializeResult(verdict.id, handlerResult.result, transport) ?? undefined };
+				if (!validate?.(handlerResult.result)) throw new Error("Handler returned an invalid response.");
+				const response = serializeResult(verdict.id, handlerResult.result, transport);
+				if (!response) throw new Error("Handler response could not be serialized.");
+				return {
+					response,
+					responseDelivered: handlerResult.responseDelivered,
+					rollbackUndeliveredResponse,
+				};
 			} catch {
+				try {
+					await rollbackUndeliveredResponse?.();
+				} catch {
+					// Preserve the original handler or serialization failure.
+				}
 				return { response: serializeError(verdict.id, "internalError", transport) ?? undefined };
 			}
 		}

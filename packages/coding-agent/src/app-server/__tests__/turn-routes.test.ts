@@ -5,7 +5,14 @@ import type { Turn } from "../../../vendor/codex-app-server-schema/stable/typesc
 import { experimentalValidators, stableValidators } from "../protocol-source/schema-validators.generated";
 import { ConnectionState } from "../router/connection-state";
 import { type InboundContext, processInbound } from "../server";
-import type { ChildBridgeOptions, SessionClient, SessionRequestOptions } from "../thread-runtime/child-bridge";
+import { reviewStartHandler } from "../suites/goals-review-handlers";
+import { HandlerRegistry } from "../suites/handlers";
+import type {
+	ChildBridgeOptions,
+	SessionClient,
+	SessionRequestOptions,
+	TurnPolicyOverride,
+} from "../thread-runtime/child-bridge";
 import {
 	type EndpointAuthority,
 	type ThreadEffectiveSettings,
@@ -126,6 +133,10 @@ interface FakeClientOptions {
 class FakeClient implements SessionClient {
 	readonly calls: Array<{ operation: string; input: Record<string, unknown> }> = [];
 	closeCount = 0;
+	activeApprovalPolicy = "on-request";
+	activeSandboxPolicy: unknown = { type: "dangerFullAccess" };
+	activeReasoningEffort: string | null = null;
+	activeDeveloperInstructions: string | null = null;
 
 	constructor(private readonly options: FakeClientOptions = {}) {}
 
@@ -173,6 +184,26 @@ class FakeClient implements SessionClient {
 			this.calls.push({ operation: "turn.modelOverride.restore", input: { model: requestedModel } });
 		};
 	}
+	async setTurnPolicyForTurn(policy: TurnPolicyOverride): Promise<() => Promise<void>> {
+		this.calls.push({ operation: "turn.policyOverride", input: { ...policy } });
+		const previous = {
+			approvalPolicy: this.activeApprovalPolicy,
+			sandboxPolicy: this.activeSandboxPolicy,
+			reasoningEffort: this.activeReasoningEffort,
+			developerInstructions: this.activeDeveloperInstructions,
+		};
+		if (policy.approvalPolicy !== undefined) this.activeApprovalPolicy = policy.approvalPolicy;
+		if (policy.sandboxPolicy !== undefined) this.activeSandboxPolicy = policy.sandboxPolicy;
+		if (policy.reasoningEffort !== undefined) this.activeReasoningEffort = policy.reasoningEffort;
+		if (policy.developerInstructions !== undefined) this.activeDeveloperInstructions = policy.developerInstructions;
+		return async () => {
+			this.calls.push({ operation: "turn.policyOverride.restore", input: { ...policy } });
+			this.activeApprovalPolicy = previous.approvalPolicy;
+			this.activeSandboxPolicy = previous.sandboxPolicy;
+			this.activeReasoningEffort = previous.reasoningEffort;
+			this.activeDeveloperInstructions = previous.developerInstructions;
+		};
+	}
 
 	async close(): Promise<void> {
 		this.closeCount += 1;
@@ -206,6 +237,9 @@ function loadedManager(client: SessionClient, cwd: string): ThreadRuntimeManager
 
 const turnStartFrame = (input: string) => enc(`{"id":2,"method":"turn/start","params":${input}}`);
 const resumeFrame = (params: string) => enc(`{"id":3,"method":"thread/resume","params":${params}}`);
+const reviewStartFrame = enc(
+	`{"id":4,"method":"review/start","params":{"threadId":"${THREAD_ID}","target":{"type":"uncommittedChanges"},"delivery":"inline"}}`,
+);
 
 test("turn/start returns a validated response plus both delivery hooks and defers notifications", async () => {
 	const state = await initialized();
@@ -243,6 +277,55 @@ test("turn/start returns a validated response plus both delivery hooks and defer
 	expect(client.calls.filter(call => call.operation === "turn.modelOverride")).toHaveLength(0);
 });
 
+test("review/start serializes its response before releasing turn notifications", async () => {
+	const state = await initialized();
+	const client = new FakeClient();
+	const manager = loadedManager(client, path.resolve("review-start-ordering"));
+	const wire: string[] = [];
+	const controller = new TurnController({
+		manager,
+		emit: notification => {
+			wire.push(notification.method);
+		},
+		idFactory: () => APP_TURN_ID,
+	});
+	const registry = new HandlerRegistry();
+	registry.register("review/start", reviewStartHandler);
+	const result = await processInbound(state, manager, reviewStartFrame, undefined, "websocket", registry, {
+		connectionId: "conn-a",
+		turnController: controller,
+	});
+	const response = dec(result.response);
+	if (!result.response) throw new Error("review/start did not serialize a response");
+	wire.unshift("response");
+	expect(response?.error).toBeUndefined();
+	expect(stableValidators.clientRequestResults["review/start"]?.(response?.result)).toBe(true);
+	// The wire response is queued before the controller barrier opens.
+	expect(wire).toEqual(["response"]);
+	expect(typeof result.responseDelivered).toBe("function");
+	expect(typeof result.rollbackUndeliveredResponse).toBe("function");
+	await result.responseDelivered?.();
+	expect(wire).toEqual(["response", "turn/started"]);
+});
+
+test("review/start rolls back an accepted turn when response delivery fails", async () => {
+	const state = await initialized();
+	const client = new FakeClient();
+	const manager = loadedManager(client, path.resolve("review-start-rollback"));
+	const controller = new TurnController({ manager, emit: () => {}, idFactory: () => APP_TURN_ID });
+	const registry = new HandlerRegistry();
+	registry.register("review/start", reviewStartHandler);
+	const result = await processInbound(state, manager, reviewStartFrame, undefined, "websocket", registry, {
+		connectionId: "conn-a",
+		turnController: controller,
+	});
+	if (!result.response) throw new Error("review/start did not serialize a response");
+	const enqueueResponse = async (): Promise<boolean> => false;
+	if (!(await enqueueResponse())) await result.rollbackUndeliveredResponse?.();
+	expect(controller.getState(THREAD_ID)).toBe("recovery_required");
+	expect(manager.get(THREAD_ID)?.activeTurn).toBe(true);
+});
+
 test("turn/start rejects unsupported input variants and overrides before any child control", async () => {
 	const state = await initialized();
 	const cwd = path.resolve("turn-start-unsupported");
@@ -250,6 +333,7 @@ test("turn/start rejects unsupported input variants and overrides before any chi
 		`{"threadId":"${THREAD_ID}","input":[{"type":"localImage","path":"/tmp/a.png"}]}`,
 		`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"ok","text_elements":[]}],"outputSchema":{"type":"object"}}`,
 		`{"threadId":"${THREAD_ID}","input":[]}`,
+		`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"ok"}],"collaborationMode":{"mode":"default","settings":{"unhandled":"ignored"}}}`,
 	]) {
 		const client = new FakeClient();
 		const manager = loadedManager(client, cwd);
@@ -274,7 +358,7 @@ test("turn/start honours a resolved per-turn model override before prompting the
 		state,
 		manager,
 		turnStartFrame(
-			`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"hello","text_elements":[]}],"model":"provider/turn-model","approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"},"collaborationMode":{"mode":"default","settings":{"model":"provider/turn-model","reasoning_effort":"medium"}}}`,
+			`{"threadId":"${THREAD_ID}","input":[{"type":"text","text":"hello","text_elements":[]}],"model":"provider/turn-model","approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"},"collaborationMode":{"mode":"default","settings":{"model":"provider/turn-model","reasoning_effort":"medium","developer_instructions":"<collaboration_mode>Follow the selected mode.</collaboration_mode>"}}}`,
 		),
 		undefined,
 		"websocket",
@@ -283,10 +367,33 @@ test("turn/start honours a resolved per-turn model override before prompting the
 	);
 	const response = dec(result.response);
 	expect(response?.error).toBeUndefined();
-	expect(client.calls.slice(0, 2)).toEqual([
+	expect(client.calls.slice(0, 3)).toEqual([
 		{ operation: "turn.modelOverride", input: { model: "provider/turn-model" } },
-		{ operation: "turn.prompt", input: { text: "hello", clientRef: APP_TURN_ID } },
+		{
+			operation: "turn.policyOverride",
+			input: {
+				approvalPolicy: "never",
+				sandboxPolicy: { type: "dangerFullAccess" },
+				reasoningEffort: "medium",
+				developerInstructions: "<collaboration_mode>Follow the selected mode.</collaboration_mode>",
+			},
+		},
+		{
+			operation: "turn.prompt",
+			input: {
+				text: "hello",
+				clientRef: APP_TURN_ID,
+				developerInstructions: "<collaboration_mode>Follow the selected mode.</collaboration_mode>",
+			},
+		},
 	]);
+	// These are the child-owned effective values while the turn is admitted, not merely accepted fields.
+	expect(client.activeApprovalPolicy).toBe("never");
+	expect(client.activeSandboxPolicy).toEqual({ type: "dangerFullAccess" });
+	expect(client.activeReasoningEffort).toBe("medium");
+	expect(client.activeDeveloperInstructions).toBe(
+		"<collaboration_mode>Follow the selected mode.</collaboration_mode>",
+	);
 });
 
 test("turn/start rejects an unknown model override with the requested model named in the error", async () => {

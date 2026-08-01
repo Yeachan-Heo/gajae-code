@@ -155,25 +155,40 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(model?.api).toBe("azure-openai-responses");
 		expect(model?.provider).toBe("azure-openai");
 	});
-	test("validates provider config before mutating custom API state", () => {
+	test("registers streamSimple providers without baseUrl while validating custom API state", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		const beforeAnthropicCount = registry.getAll().filter(model => model.provider === "anthropic").length;
-
-		const invalidConfig: ProviderConfigInput = {
+		const config: ProviderConfigInput = {
 			api: "custom-atomic-api",
 			apiKey: "RUNTIME_KEY",
 			streamSimple,
-			models: [{ ...baseModel, id: "broken" }],
-			// baseUrl intentionally missing to force validation failure
+			models: [{ ...baseModel, id: "stream-simple-model" }],
+			// streamSimple supplies its own transport, so baseUrl is intentionally omitted.
 		};
 
-		expect(() => registry.registerProvider("atomic-provider", invalidConfig, "ext://atomic")).toThrow(
+		expect(() => registry.registerProvider("atomic-provider", config, "ext://atomic")).not.toThrow();
+		expect(getCustomApi("custom-atomic-api")).toBeDefined();
+		expect(registry.find("atomic-provider", "stream-simple-model")).toBeDefined();
+	});
+
+	test("requires baseUrl and credentials for custom models without streamSimple", () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const missingBaseUrl: ProviderConfigInput = {
+			api: "custom-atomic-api",
+			apiKey: "RUNTIME_KEY",
+			models: [{ ...baseModel, id: "missing-base-url" }],
+		};
+		expect(() => registry.registerProvider("atomic-provider", missingBaseUrl, "ext://atomic")).toThrow(
 			'Provider atomic-provider: "baseUrl" is required when defining custom models.',
 		);
-		expect(getCustomApi("custom-atomic-api")).toBeUndefined();
 
-		const afterAnthropicCount = registry.getAll().filter(model => model.provider === "anthropic").length;
-		expect(afterAnthropicCount).toBe(beforeAnthropicCount);
+		const missingCredentials: ProviderConfigInput = {
+			api: "custom-atomic-api",
+			baseUrl: "https://runtime.example.com/v1",
+			models: [{ ...baseModel, id: "missing-credentials" }],
+		};
+		expect(() => registry.registerProvider("credential-provider", missingCredentials, "ext://atomic")).toThrow(
+			'Provider credential-provider: "apiKey" or "oauth" is required when defining models.',
+		);
 	});
 
 	test("registerProvider applies headers-only overrides to existing provider models across refresh", async () => {

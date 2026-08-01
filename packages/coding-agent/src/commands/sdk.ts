@@ -583,7 +583,8 @@ export async function runSessionHost(
 				throw new Error(`Requested model "${parsed.model}" was not found after provider registration.`);
 			await beforeCutoff(
 				session.setModelTemporary(requested as never, undefined, {
-					persistAsSessionDefault: true,
+					persistAsSessionDefault:
+						session.getSessionDefaultModelSelector() !== `${requested.provider}/${requested.id}`,
 					cause: "startup-override",
 				}),
 			);

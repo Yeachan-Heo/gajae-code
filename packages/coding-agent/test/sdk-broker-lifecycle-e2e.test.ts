@@ -637,6 +637,90 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 	}
 });
 
+test("session host does not persist a duplicate post-profile model selection", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-model-selection-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "model-selection-guard";
+	const effectMarker = "model-selection-guard-effect";
+	const receivedAt = Date.now();
+	const deadlines = deriveLifecycleDeadlines(receivedAt, 20_000);
+	const envNames = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SESSION_ID",
+		"GJC_TEST_MODEL_PROVIDER",
+		"GJC_TEST_MODEL_PROVIDER_AUTHORITY",
+		"GJC_SDK_TEST_FAIL_AFTER_REGISTRATION",
+	] as const;
+	const previousEnv = envNames.map(name => process.env[name]);
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		const request = {
+			operation: "session.create" as const,
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+			modelId: "gjc-app-server-stub/gjc-app-server-stub-model",
+		};
+		Object.assign(process.env, {
+			GJC_AGENT_DIR: agentDir,
+			GJC_STATE_ROOT: stateRoot,
+			GJC_LIFECYCLE_REQUEST_ID: effectMarker,
+			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+			GJC_SESSION_ID: sessionId,
+			GJC_TEST_MODEL_PROVIDER: path.resolve(
+				import.meta.dir,
+				"../src/app-server/__tests__/fixtures/stub-model-provider.ts",
+			),
+			GJC_TEST_MODEL_PROVIDER_AUTHORITY: "1",
+			GJC_SDK_TEST_FAIL_AFTER_REGISTRATION: root,
+		});
+		await expect(
+			runSessionHost({
+				now: () => receivedAt,
+				sleep: async () => new Promise<void>(() => {}),
+				cwd: root,
+				processIncarnation: () => "test-incarnation",
+			}),
+		).rejects.toThrow("Lifecycle test failure after SDK host registration.");
+
+		const sessionDir = SessionManager.getDefaultSessionDir(root, agentDir);
+		const sessionFiles = (await fs.readdir(sessionDir)).filter(name => name.endsWith(".jsonl"));
+		expect(sessionFiles).toHaveLength(1);
+		const entries = (await fs.readFile(path.join(sessionDir, sessionFiles[0]!), "utf8"))
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { type?: string; role?: string; model?: string });
+		const defaults = entries.filter(entry => entry.type === "model_change" && entry.role === "default");
+		expect(defaults).toHaveLength(2);
+		expect(defaults.map(entry => entry.model)).toEqual([
+			"gjc-app-server-stub/gjc-app-server-stub-model",
+			"gjc-app-server-stub/gjc-app-server-stub-model",
+		]);
+		const modelChanges = entries.filter(entry => entry.type === "model_change");
+		expect(modelChanges.at(-1)).toMatchObject({
+			model: "gjc-app-server-stub/gjc-app-server-stub-model",
+			role: "temporary",
+		});
+	} finally {
+		envNames.forEach((name, index) => {
+			const value = previousEnv[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("session host fails closed when its lifecycle effect marker is corrupt", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-corrupt-marker-"));
 	const agentDir = path.join(root, "agent");

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createAppServerRuntime } from "../create-app-server";
+import { PermissionAdapter } from "../server-requests/permission-adapter";
 import type { ChildCreateResult, SessionClient } from "../thread-runtime/child-bridge";
 import { DEFAULT_OUTBOUND_QUEUE_CAPACITY } from "../transport/connection";
 
@@ -576,6 +577,49 @@ test("runtime close: waits for every loaded child and process-wide adapter shutd
 	expect(childClose).toBe(1);
 	expect(adapterShutdown).toBe(1);
 });
+test("runtime close reports unverified child cleanup while still finishing shared shutdown", async () => {
+	const child = injectedChild("runtime-close-failure-session");
+	let clientClose = 0;
+	let adapterShutdown = 0;
+	const created = {
+		...child.child,
+		client: {
+			...child.child.client,
+			close: async () => {
+				clientClose += 1;
+			},
+		},
+		closeChild: async () => {
+			throw new Error("authority fence rejected close");
+		},
+	};
+	const runtime = createAppServerRuntime({}, undefined, {
+		threadStartAdapter: {
+			create: async () => created,
+			shutdown: async () => {
+				adapterShutdown += 1;
+			},
+		},
+	});
+	const connection = runtime.createConnection(() => {}, "stdio");
+	await initialize(connection);
+	await connection.process(
+		enc(
+			'{"id":2,"method":"thread/start","params":{"cwd":"/tmp","allowProviderModelFallback":false,"experimentalRawEvents":false}}',
+		),
+	);
+	runtime.broker.create(
+		"pending-shutdown-request",
+		"execCommandApproval",
+		{},
+		"runtime-close-failure-session",
+		new Set([connection.id]),
+	);
+	await expect(runtime.close()).rejects.toThrow(/Unverified app-server cleanup/);
+	expect(clientClose).toBe(1);
+	expect(adapterShutdown).toBe(1);
+	expect(runtime.broker.pendingCount).toBe(0);
+});
 
 test("runtime close: fences a turn in flight and closes its child without waiting for terminal frames", async () => {
 	const child = injectedChild("runtime-close-in-flight-session");
@@ -1082,6 +1126,70 @@ test("runtime connection: an approval accept and a deny each settle the awaiting
 			connectionId: connection.id,
 		});
 		expect(runtime.broker.pendingCount, scenario.name).toBe(0);
+	}
+});
+
+test("runtime-owned permission bridge round-trips approve and deny with child identity and cwd fallback", async () => {
+	for (const scenario of [
+		{ name: "approve", response: { decision: "approved" }, expected: { outcome: "selected", kind: "allow_once" } },
+		{
+			name: "deny",
+			response: { decision: { denied: { rejection: "not allowed" } } },
+			expected: { outcome: "selected", kind: "reject_once" },
+		},
+	] as const) {
+		const runtime = createAppServerRuntime();
+		const frames: Record<string, unknown>[] = [];
+		let responsePromise: Promise<void> | undefined;
+		let connection!: ReturnType<typeof runtime.createConnection>;
+		connection = runtime.createConnection(frame => {
+			const message = dec(frame);
+			frames.push(message);
+			if (message.method === "execCommandApproval") {
+				responsePromise = Bun.sleep(0).then(() =>
+					connection.process(enc(JSON.stringify({ id: message.id, result: scenario.response }))),
+				);
+			}
+		});
+		try {
+			await initialize(connection);
+			runtime.subscriptions.subscribe(connection.id, "child-session");
+			const adapter = new PermissionAdapter({
+				conversationId: "child-session",
+				cwd: "/child/workspace",
+				requestApproval: (method, params, signal) =>
+					runtime.requestApproval(params.conversationId, method, params, signal),
+			});
+			const outcome = await adapter.handle({
+				toolCall: {
+					toolCallId: `call-${scenario.name}`,
+					toolName: "bash",
+					title: "echo child",
+					rawInput: { command: "echo child" },
+				},
+				options: [
+					{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+					{ optionId: "allow_always", name: "Always allow", kind: "allow_always" },
+					{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+					{ optionId: "reject_always", name: "Always reject", kind: "reject_always" },
+				],
+			});
+			expect(outcome).toMatchObject(scenario.expected);
+			const approval = frames.find(frame => frame.method === "execCommandApproval");
+			expect(approval).toMatchObject({
+				method: "execCommandApproval",
+				params: expect.objectContaining({ conversationId: "child-session", cwd: "/child/workspace" }),
+			});
+			expect(responsePromise).toBeDefined();
+			await responsePromise;
+			const requestId = approval?.id;
+			expect(typeof requestId).toBe("string");
+			// The broker fences every response after the adapter has settled exactly once.
+			expect(runtime.broker.resolve(requestId as string, connection.id, scenario.response)).toBe(false);
+			expect(runtime.broker.pendingCount).toBe(0);
+		} finally {
+			await runtime.close();
+		}
 	}
 });
 

@@ -9,8 +9,8 @@ import {
 	loadEntriesFromFile,
 	type ModeChangeEntry,
 	type SessionEntry,
-	SessionManager,
 } from "../../session/session-manager";
+import { appendChildProjection } from "../thread-runtime/child-bridge";
 import type { HandlerContext, HandlerResult, MethodHandler } from "./handlers";
 
 type RecordValue = Record<string, unknown>;
@@ -572,14 +572,16 @@ export const reviewStartHandler: MethodHandler = async (params, context) => {
 	if (!controller) return notSupported();
 	try {
 		const handle = await controller.start({ threadId: p.threadId, params: { text } });
-		await handle.responseDelivered();
-		return { ok: true, result: { turn: handle.response.turn, reviewThreadId: p.threadId } };
+		return {
+			ok: true,
+			result: { turn: handle.response.turn, reviewThreadId: p.threadId },
+			responseDelivered: handle.responseDelivered,
+			rollbackUndeliveredResponse: handle.rollbackUndelivered,
+		};
 	} catch (error) {
 		return errorCode(error) === "busy" ? { ok: false, errorKey: "busy" } : { ok: false, errorKey: "internalError" };
 	}
 };
-
-type FeedbackContext = HandlerContext & { sessionFile?: unknown };
 
 function feedbackThreadId(params: RecordValue, context?: HandlerContext): string | undefined {
 	if (Object.hasOwn(params, "threadId")) {
@@ -594,12 +596,8 @@ function feedbackThreadId(params: RecordValue, context?: HandlerContext): string
 	return candidates.length === 1 ? candidates[0]?.threadId : undefined;
 }
 
-function feedbackSessionFile(threadId: string, context?: HandlerContext): string | undefined {
-	const candidate = (context ?? {}) as FeedbackContext;
-	if (typeof candidate.sessionFile === "string" && candidate.sessionFile.length > 0) return candidate.sessionFile;
-	const managed = context?.manager?.get(threadId);
-	const path = managed?.effectiveSettings?.thread.path;
-	return typeof path === "string" && path.length > 0 ? path : undefined;
+function feedbackClient(threadId: string, context?: HandlerContext) {
+	return context?.manager?.get(threadId)?.client;
 }
 
 function stringMap(value: unknown): Record<string, string> | undefined {
@@ -613,7 +611,7 @@ function stringMap(value: unknown): Record<string, string> | undefined {
 	return output;
 }
 
-/** Persist feedback in the native GJC session journal; remote log uploads are not emulated. */
+/** Persist feedback through the retained child projection writer; remote log uploads are not emulated. */
 export const feedbackUploadHandler: MethodHandler = async (params, context) => {
 	const p = record(params);
 	const classification = p?.classification;
@@ -625,34 +623,35 @@ export const feedbackUploadHandler: MethodHandler = async (params, context) => {
 	if (p.tags !== undefined && p.tags !== null && !tags) return invalidParams();
 	const threadId = feedbackThreadId(p, context);
 	if (!threadId) return invalidParams();
-	const sessionFile = feedbackSessionFile(threadId, context);
-	if (!sessionFile) return notFound();
-	return await withPersistedFileLock(sessionFile, async () => {
-		let entries: FileEntry[];
-		try {
-			entries = await loadEntriesFromFile(sessionFile);
-		} catch {
-			return notFound();
-		}
-		const header = entries.find(entry => entry.type === "session");
-		if (!header || header.id !== threadId) return notFound();
-		let session: SessionManager | undefined;
-		try {
-			session = await SessionManager.open(sessionFile);
-			session.appendCustomEntry("app-server:feedback/upload", {
-				threadId,
-				classification: classification.trim(),
-				...(typeof p.reason === "string" && p.reason.trim().length > 0 ? { reason: p.reason.trim() } : {}),
-				includeLogs: false,
-				...(tags ? { tags } : {}),
-			});
-			return { ok: true, result: { threadId } };
-		} catch {
+	const client = feedbackClient(threadId, context);
+	if (!client) return notFound();
+	const sourceKey = `feedback:${threadId}:${randomUUID()}`;
+	const envelope = {
+		schemaVersion: 1,
+		recordKind: "app-server.feedback.upload",
+		sourceKey,
+		payload: {
+			threadId,
+			classification: classification.trim(),
+			...(typeof p.reason === "string" && p.reason.trim().length > 0 ? { reason: p.reason.trim() } : {}),
+			includeLogs: false,
+			...(tags ? { tags } : {}),
+		},
+	};
+	try {
+		const receipt = await appendChildProjection(client, envelope, { confirm: true, idempotencyKey: sourceKey });
+		const receiptRecord = record(receipt);
+		if (
+			!receiptRecord ||
+			typeof receiptRecord.revision !== "number" ||
+			!Number.isSafeInteger(receiptRecord.revision) ||
+			receiptRecord.revision <= 0
+		)
 			return { ok: false, errorKey: "internalError" };
-		} finally {
-			await session?.close().catch(() => undefined);
-		}
-	});
+		return { ok: true, result: { threadId } };
+	} catch {
+		return { ok: false, errorKey: "internalError" };
+	}
 };
 
 export const goalsReviewHandlers: Record<string, MethodHandler> = {

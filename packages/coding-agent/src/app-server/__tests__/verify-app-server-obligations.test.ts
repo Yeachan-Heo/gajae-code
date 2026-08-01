@@ -182,6 +182,28 @@ test("obligations verifier reports a live exit-code mismatch", async () => {
 	await writeReceipt(root, {}, "");
 	expect((await verifyObligations(root)).blocked).toContain("oracle-stable");
 });
+test("obligations verifier retains bounded live stdout and stderr for a failing gate re-execution", async () => {
+	const { root, repositoryRoot } = await fixture();
+	await fs.writeFile(
+		path.join(repositoryRoot, "scripts/verify-codex-app-server-oracle.ts"),
+		"process.stdout.write('live stdout\\n'); process.stderr.write('live stderr\\n'); process.exitCode = 1;\n",
+	);
+	await writeReceipt(root);
+	const verifier = Bun.spawn(["bun", verifierPath, "--self-test", "--root", root], {
+		cwd: appServerRoot,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(verifier.stdout).text(),
+		new Response(verifier.stderr).text(),
+		verifier.exited,
+	]);
+	expect(exitCode).toBe(1);
+	expect(stdout).toBe("");
+	expect(stderr).toContain("live stdout:\nlive stdout\n");
+	expect(stderr).toContain("live stderr:\nlive stderr\n");
+});
 
 test("obligations verifier reports a live output mismatch", async () => {
 	const { root } = await fixture();

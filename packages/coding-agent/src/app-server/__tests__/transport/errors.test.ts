@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { appServerError, goldenEnvelope, serializeError, serializeResult } from "../../transport/errors";
+import {
+	appServerError,
+	goldenEnvelope,
+	serializeError,
+	serializeModelOverrideError,
+	serializeResult,
+} from "../../transport/errors";
 
 const dec = (b: Uint8Array) => JSON.parse(new TextDecoder().decode(b));
 
@@ -32,8 +38,23 @@ test("serializeError: omits the data key, echoes the decoded id verbatim, append
 	expect((parsed.error as Record<string, unknown>).code).toBe(-32601);
 });
 
+test("serializeModelOverrideError: emits only the diagnostic invalid-params envelope", () => {
+	const parsed = dec(
+		serializeModelOverrideError("override-1", 'Model override "missing/model" could not be resolved.')!,
+	) as Record<string, unknown>;
+	expect(parsed).toEqual({
+		id: "override-1",
+		error: { code: -32602, message: 'Model override "missing/model" could not be resolved.' },
+	});
+	expect("data" in (parsed.error as Record<string, unknown>)).toBe(false);
+	expect("jsonrpc" in parsed).toBe(false);
+});
+
 test("serializeError: an undecoded stdio oversize frame echoes id null (data still omitted)", () => {
-	const parsed = JSON.parse(new TextDecoder().decode(serializeError(null, "invalidRequest", "stdio")!)) as Record<string, unknown>;
+	const parsed = JSON.parse(new TextDecoder().decode(serializeError(null, "invalidRequest", "stdio")!)) as Record<
+		string,
+		unknown
+	>;
 	expect(parsed.id).toBe(null);
 	expect((parsed.error as Record<string, unknown>).code).toBe(-32600);
 	expect("data" in (parsed.error as Record<string, unknown>)).toBe(false);

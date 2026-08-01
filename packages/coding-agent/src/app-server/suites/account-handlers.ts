@@ -24,10 +24,11 @@ function hasApiKeyCredential(value: unknown): boolean {
 	return isRecord(value) && value.type === "api_key";
 }
 
-function hasStoredApiKey(authStorage: AuthStorage): boolean {
-	return Object.values(authStorage.getAll()).some(value =>
-		Array.isArray(value) ? value.some(hasApiKeyCredential) : hasApiKeyCredential(value),
-	);
+function hasStoredApiKey(authStorage: AuthStorage, providers: ReadonlySet<string>): boolean {
+	return Object.entries(authStorage.getAll()).some(([provider, value]) => {
+		if (!providers.has(provider) || authStorage.hasOAuth(provider)) return false;
+		return Array.isArray(value) ? value.some(hasApiKeyCredential) : hasApiKeyCredential(value);
+	});
 }
 
 /**
@@ -38,9 +39,9 @@ function hasStoredApiKey(authStorage: AuthStorage): boolean {
  * must not be presented as a ChatGPT-linked account.
  */
 function hasConfiguredApiKey(authStorage: AuthStorage, modelRegistry: ModelRegistry): boolean {
-	if (hasStoredApiKey(authStorage)) return true;
-
 	const providers = new Set(modelRegistry.getAll().map(model => model.provider));
+	if (hasStoredApiKey(authStorage, providers)) return true;
+
 	for (const provider of providers) {
 		if (!modelRegistry.hasConfiguredProviderAuth(provider)) continue;
 		if (authStorage.hasOAuth(provider)) continue;

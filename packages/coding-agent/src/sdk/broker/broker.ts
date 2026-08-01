@@ -24,8 +24,8 @@ import {
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 } from "./discovery";
-import { deriveIdempotencyIdentity } from "./identity";
 import { deriveEndpointIncarnation } from "./endpoint-authority";
+import { deriveIdempotencyIdentity } from "./identity";
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
 import {
@@ -372,6 +372,7 @@ type BrokerLockSnapshot = {
 };
 
 const BROKER_PUBLICATION_CADENCE_MS = 5_000;
+const BROKER_OWNER_WATCH_CADENCE_MS = 100;
 const BROKER_PUBLICATION_GRACE_MS = 15_000;
 // A broker that cannot observe its own publication is not provably the root, but
 // ambiguity is also not proof of replacement, so it must not be treated as a
@@ -410,6 +411,11 @@ export class Broker {
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	#ownerPid = process.ppid;
+	// This process is detached from its launcher, but its broker authority is not.
+	// Bind that authority to the launcher's PID and incarnation before entering the daemon loop.
+	#ownerIncarnation = brokerProcessIncarnation(this.#ownerPid);
+	#ownerWatchTimer: NodeJS.Timeout | null = null;
 	#completionTask: Promise<void> | null = null;
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
@@ -541,6 +547,27 @@ export class Broker {
 		}
 	}
 
+	#ownerIsAlive(): boolean {
+		if (process.ppid === this.#ownerPid) return true;
+		if (this.#ownerIncarnation === undefined) return isPidAlive(this.#ownerPid);
+		const currentIncarnation = brokerProcessIncarnation(this.#ownerPid);
+		return (
+			currentIncarnation === this.#ownerIncarnation ||
+			(currentIncarnation === undefined && isPidAlive(this.#ownerPid))
+		);
+	}
+	#watchOwner(): void {
+		const tick = (): void => {
+			this.#ownerWatchTimer = null;
+			if (this.#stopping) return;
+			if (!this.#ownerIsAlive()) {
+				void this.#complete("owned-root");
+				return;
+			}
+			this.#ownerWatchTimer = setTimeout(tick, BROKER_OWNER_WATCH_CADENCE_MS);
+		};
+		this.#ownerWatchTimer = setTimeout(tick, BROKER_OWNER_WATCH_CADENCE_MS);
+	}
 	async start(): Promise<BrokerDiscovery> {
 		if (this.#completionTask) {
 			await this.#completionTask;
@@ -614,6 +641,7 @@ export class Broker {
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
 			this.#heartbeatTimer = setInterval(() => void this.#watchPublication(), cadenceMs);
+			this.#watchOwner();
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
@@ -709,6 +737,8 @@ export class Broker {
 		this.#publicationState = "stopping";
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
+		if (this.#ownerWatchTimer) clearInterval(this.#ownerWatchTimer);
+		this.#ownerWatchTimer = null;
 		this.#completionTask = (async () => {
 			await this.#transport?.stop();
 			this.#transport = null;

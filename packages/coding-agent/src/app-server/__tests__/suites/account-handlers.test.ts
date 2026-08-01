@@ -15,7 +15,9 @@ function resultOf(value: HandlerResult): Record<string, unknown> {
 	return value.result as Record<string, unknown>;
 }
 
-async function runIsolatedAccountProbe(agentDir: string): Promise<{ absent: HandlerResult; present: HandlerResult }> {
+async function runIsolatedAccountProbe(
+	agentDir: string,
+): Promise<{ absent: HandlerResult; unknown: HandlerResult; present: HandlerResult }> {
 	const accountHandlersUrl = pathToFileURL(path.resolve(import.meta.dir, "../../suites/account-handlers.ts")).href;
 	const authStorageUrl = pathToFileURL(path.resolve(import.meta.dir, "../../../session/auth-storage.ts")).href;
 	const script = `
@@ -25,10 +27,14 @@ const agentDir = process.env.GJC_AGENT_DIR;
 if (!agentDir) throw new Error("GJC_AGENT_DIR missing");
 const absent = await accountReadHandler({});
 const authStorage = await AuthStorage.create(agentDir + "/auth.db");
-await authStorage.set("openai", { type: "api_key", key: "fixture-api-key" });
+await authStorage.set("unknown-provider", { type: "api_key", key: "stale-api-key" });
 authStorage.close();
+const unknown = await accountReadHandler({ refreshToken: true });
+const knownAuthStorage = await AuthStorage.create(agentDir + "/auth.db");
+await knownAuthStorage.set("openai", { type: "api_key", key: "fixture-api-key" });
+knownAuthStorage.close();
 const present = await accountReadHandler({ refreshToken: true });
-console.log(JSON.stringify({ absent, present }));
+console.log(JSON.stringify({ absent, unknown, present }));
 `;
 	const isolatedHome = mkdtempSync(path.join(tmpdir(), "gjc-account-home-"));
 	try {
@@ -51,7 +57,7 @@ console.log(JSON.stringify({ absent, present }));
 		]);
 		const exitCode = await child.exited;
 		expect(exitCode, stderr).toBe(0);
-		return JSON.parse(stdout.trim()) as { absent: HandlerResult; present: HandlerResult };
+		return JSON.parse(stdout.trim()) as { absent: HandlerResult; unknown: HandlerResult; present: HandlerResult };
 	} finally {
 		rmSync(isolatedHome, { recursive: true, force: true });
 	}
@@ -66,13 +72,18 @@ test("account/read: accepts an injected auth-state source for deterministic prob
 	expect(present).toEqual({ account: { type: "apiKey" }, requiresOpenaiAuth: false });
 	expect(experimentalValidators.clientRequestResults["account/read"]?.(present)).toBe(true);
 });
-test("account/read: returns truthful schema-valid API-key and absent responses", async () => {
+
+test("account/read: returns truthful schema-valid API-key, absent, and unknown-provider responses", async () => {
 	const agentDir = mkdtempSync(path.join(tmpdir(), "gjc-account-suite-"));
 	try {
-		const { absent, present } = await runIsolatedAccountProbe(agentDir);
+		const { absent, unknown, present } = await runIsolatedAccountProbe(agentDir);
 		const absentResult = resultOf(absent);
 		expect(absentResult).toEqual({ account: null, requiresOpenaiAuth: false });
 		expect(experimentalValidators.clientRequestResults["account/read"]?.(absentResult)).toBe(true);
+
+		const unknownResult = resultOf(unknown);
+		expect(unknownResult).toEqual({ account: null, requiresOpenaiAuth: false });
+		expect(experimentalValidators.clientRequestResults["account/read"]?.(unknownResult)).toBe(true);
 
 		const presentResult = resultOf(present);
 		expect(presentResult).toEqual({ account: { type: "apiKey" }, requiresOpenaiAuth: false });

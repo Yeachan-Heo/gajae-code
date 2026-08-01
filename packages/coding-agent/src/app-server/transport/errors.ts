@@ -91,18 +91,35 @@ export type WireId = JsonRpcId | null | undefined;
  * Notifications (id undefined) cannot receive an error response per JSON-RPC; callers must
  * not invoke this for a notification. We guard by returning `undefined` in that case.
  */
+function encodeError(
+	id: WireId,
+	key: AppServerErrorKey,
+	transport: "stdio" | "websocket" | "unix",
+	message: string,
+): Uint8Array | undefined {
+	if (id === undefined) return undefined;
+	const { code } = goldenEnvelope(key);
+	const envelope: Record<string, unknown> = { id, error: { code, message } };
+	const body = JSON.stringify(envelope);
+	if (transport === "stdio") return new TextEncoder().encode(`${body}\n`);
+	return new TextEncoder().encode(body);
+}
+
 export function serializeError(
 	id: WireId,
 	key: AppServerErrorKey,
 	transport: "stdio" | "websocket" | "unix" = "websocket",
-	messageOverride?: string,
 ): Uint8Array | undefined {
-	if (id === undefined) return undefined;
-	const { code, message } = goldenEnvelope(key);
-	const envelope: Record<string, unknown> = { id, error: { code, message: messageOverride ?? message } };
-	const body = JSON.stringify(envelope);
-	if (transport === "stdio") return new TextEncoder().encode(`${body}\n`);
-	return new TextEncoder().encode(body);
+	return encodeError(id, key, transport, goldenEnvelope(key).message);
+}
+
+/** Serialize the diagnostic invalid-params envelope for a model override failure. */
+export function serializeModelOverrideError(
+	id: WireId,
+	message: string,
+	transport: "stdio" | "websocket" | "unix" = "websocket",
+): Uint8Array | undefined {
+	return encodeError(id, "invalidParams", transport, message);
 }
 
 /** Serialize a successful response frame (result present, no error). */

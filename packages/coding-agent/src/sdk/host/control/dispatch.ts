@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import {
+	validateAppServerProjectionAfterRevision,
+	validateAppServerProjectionEnvelope,
+} from "../../../session/app-server-projection";
+import {
 	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
-import { validateAppServerProjectionAfterRevision, validateAppServerProjectionEnvelope } from "../../../session/app-server-projection";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
 
@@ -148,7 +151,12 @@ function invoke(
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
-			return surface.prompt(text(input), input.images, input.clientRef as string | undefined);
+			return surface.prompt(
+				text(input),
+				input.images,
+				input.clientRef as string | undefined,
+				typeof input.developerInstructions === "string" ? input.developerInstructions : undefined,
+			);
 		case "turn.steer":
 			return surface.steer(text(input));
 		case "turn.follow_up":

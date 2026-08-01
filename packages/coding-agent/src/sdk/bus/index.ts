@@ -2284,6 +2284,7 @@ function sdkControlSurface(
 		clientRef?: string,
 		trackReconciliation = false,
 		deliveryReservation?: () => void,
+		developerInstructions?: string,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
@@ -2394,9 +2395,10 @@ function sdkControlSurface(
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
+					...(developerInstructions ? { developerInstructions } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
-				}),
+				} as never),
 			);
 		} catch (error) {
 			if (accepted) onPromptFailed(correlation, error);
@@ -2435,8 +2437,19 @@ function sdkControlSurface(
 		cancelPendingPreflights(): void;
 		cancelPendingPreflightsForConnection(connectionId: string): void;
 	} = {
-		prompt: (text, images, clientRef) =>
-			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
+		prompt: (text, images, clientRef, developerInstructions) =>
+			submitPrompt(
+				text,
+				images,
+				false,
+				undefined,
+				true,
+				controlRequesterContext.getStore(),
+				clientRef,
+				true,
+				undefined,
+				developerInstructions,
+			),
 		steer: text => sendSteer(text),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {

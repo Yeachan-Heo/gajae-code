@@ -20,7 +20,7 @@
 //   --ws-token-file | --ws-token-sha256 (mutually exclusive)
 //   --ws-shared-secret-file --ws-issuer --ws-audience --ws-max-clock-skew-seconds
 
-import { createAppServerRuntime } from "../create-app-server";
+import { type AppServerRuntime, createAppServerRuntime } from "../create-app-server";
 import { createProductionThreadStartAdapter } from "../thread-runtime/production-child";
 import { parseWsAuthFlags, type WsAuthConfig } from "../transport/auth";
 import { isLoopback, type ListenMode, parseListenUrl } from "../transport/listen";
@@ -120,14 +120,23 @@ export function writeStdioFrame(writer: StdioWriter, frame: Uint8Array): Promise
  * production stdio entry point.
  */
 export async function runStdioServer(config: ResolvedAppServerConfig): Promise<void> {
-	const runtime = createAppServerRuntime(
+	let runtime: AppServerRuntime | undefined;
+	const threadStartAdapter = createProductionThreadStartAdapter({
+		requestApproval: (method, params, signal) => {
+			const owner = runtime;
+			if (!owner) return Promise.reject(new Error("App-server runtime is not ready for approval requests."));
+			return owner.requestApproval(params.conversationId, method, params, signal);
+		},
+	});
+	const serverRuntime = createAppServerRuntime(
 		{ maxLoadedThreads: config.maxLoadedThreads },
 		{ maxFrameBytes: config.maxFrameBytes },
-		{ threadStartAdapter: createProductionThreadStartAdapter() },
+		{ threadStartAdapter },
 	);
+	runtime = serverRuntime;
 	const readline = require("node:readline");
 	const rl = readline.createInterface({ input: process.stdin, terminal: false });
-	const connection = runtime.createConnection(
+	const connection = serverRuntime.createConnection(
 		frame => writeStdioFrame(process.stdout, frame),
 		"stdio",
 		() => rl.close(),

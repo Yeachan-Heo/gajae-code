@@ -4,7 +4,7 @@ import type { Turn } from "../../../vendor/codex-app-server-schema/stable/typesc
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { AgentMessageReducer, type WireNotification } from "../items/agent-message-reducer";
 import { stableValidators } from "../protocol-source/schema-validators.generated";
-import type { SessionClient } from "./child-bridge";
+import type { SessionClient, TurnPolicyOverride } from "./child-bridge";
 import type { ManagedThread, ThreadRuntimeManager } from "./thread-runtime-manager";
 import {
 	appendProjectionRecord,
@@ -31,7 +31,8 @@ export type TurnControllerErrorCode =
 	| "internal"
 	| "projection_corrupt"
 	| "recovery_required"
-	| "model_override";
+	| "model_override"
+	| "turn_policy";
 
 export class TurnControllerError extends Error {
 	readonly code: TurnControllerErrorCode;
@@ -254,15 +255,8 @@ function turnModelOverride(params: Readonly<Record<string, unknown>>): string | 
 							"Turn model override must be a non-empty model reference.",
 						);
 					})();
-	const collaborationMode = params.collaborationMode;
-	if (collaborationMode === undefined || collaborationMode === null) return topLevelModel;
-	if (!isRecord(collaborationMode))
-		throw new TurnControllerError("model_override", "Turn collaborationMode must be an object.");
-	const settings = collaborationMode.settings;
-	if (settings === undefined || settings === null) return topLevelModel;
-	if (!isRecord(settings))
-		throw new TurnControllerError("model_override", "Turn collaborationMode.settings must be an object.");
-	const nestedModel = settings.model;
+	const settings = collaborationSettings(params);
+	const nestedModel = settings?.model;
 	const nestedModelValue =
 		nestedModel === undefined || nestedModel === null
 			? undefined
@@ -277,6 +271,83 @@ function turnModelOverride(params: Readonly<Record<string, unknown>>): string | 
 	if (topLevelModel !== undefined && nestedModelValue !== undefined && topLevelModel !== nestedModelValue)
 		throw new TurnControllerError("model_override", "Turn model and collaborationMode model overrides must match.");
 	return topLevelModel ?? nestedModelValue;
+}
+
+function hasNonNullProperty(record: Record<string, unknown>, key: string): boolean {
+	return Object.hasOwn(record, key) && record[key] !== undefined && record[key] !== null;
+}
+
+const supportedTurnReasoningEfforts = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function collaborationSettings(params: Readonly<Record<string, unknown>>): Record<string, unknown> | undefined {
+	const collaborationMode = params.collaborationMode;
+	if (collaborationMode === undefined || collaborationMode === null) return undefined;
+	if (!isRecord(collaborationMode))
+		throw new TurnControllerError("turn_policy", "Turn collaborationMode must be an object.");
+	if (
+		Object.keys(collaborationMode).some(key => key !== "mode" && key !== "settings") ||
+		(hasNonNullProperty(collaborationMode, "mode") && collaborationMode.mode !== "default")
+	)
+		throw new TurnControllerError("turn_policy", "Turn collaborationMode.mode is unsupported.");
+	const settings = collaborationMode.settings;
+	if (settings === undefined || settings === null) return undefined;
+	if (!isRecord(settings))
+		throw new TurnControllerError("turn_policy", "Turn collaborationMode.settings must be an object.");
+	if (
+		Object.keys(settings).some(
+			key => key !== "model" && key !== "reasoning_effort" && key !== "developer_instructions",
+		)
+	)
+		throw new TurnControllerError("turn_policy", "Turn collaborationMode.settings contains an unsupported field.");
+	if (hasNonNullProperty(settings, "model") && !nonEmptyString(settings.model))
+		throw new TurnControllerError(
+			"model_override",
+			"Turn collaborationMode.settings.model must be a non-empty model reference.",
+		);
+	if (
+		hasNonNullProperty(settings, "developer_instructions") &&
+		(typeof settings.developer_instructions !== "string" || settings.developer_instructions.trim().length === 0)
+	)
+		throw new TurnControllerError(
+			"turn_policy",
+			"Turn collaborationMode.settings.developer_instructions is unsupported.",
+		);
+	if (
+		hasNonNullProperty(settings, "reasoning_effort") &&
+		(typeof settings.reasoning_effort !== "string" || !supportedTurnReasoningEfforts.has(settings.reasoning_effort))
+	)
+		throw new TurnControllerError("turn_policy", "Turn collaborationMode.settings.reasoning_effort is unsupported.");
+	return settings;
+}
+
+function turnPolicyOverride(params: Readonly<Record<string, unknown>>): TurnPolicyOverride | undefined {
+	const policy: {
+		approvalPolicy?: "never";
+		sandboxPolicy?: { type: "dangerFullAccess" };
+		developerInstructions?: string;
+		reasoningEffort?: string;
+	} = {};
+	if (hasNonNullProperty(params, "approvalPolicy")) {
+		if (params.approvalPolicy !== "never")
+			throw new TurnControllerError("turn_policy", "Turn approvalPolicy is unsupported by the child runtime.");
+		policy.approvalPolicy = "never";
+	}
+	if (hasNonNullProperty(params, "sandboxPolicy")) {
+		const sandboxPolicy = params.sandboxPolicy;
+		if (
+			!isRecord(sandboxPolicy) ||
+			Object.keys(sandboxPolicy).some(key => key !== "type") ||
+			sandboxPolicy.type !== "dangerFullAccess"
+		)
+			throw new TurnControllerError("turn_policy", "Turn sandboxPolicy is unsupported by the child runtime.");
+		policy.sandboxPolicy = { type: "dangerFullAccess" };
+	}
+	const settings = collaborationSettings(params);
+	if (settings && hasNonNullProperty(settings, "developer_instructions"))
+		policy.developerInstructions = settings.developer_instructions as string;
+	if (settings && hasNonNullProperty(settings, "reasoning_effort"))
+		policy.reasoningEffort = settings.reasoning_effort as string;
+	return Object.keys(policy).length > 0 ? policy : undefined;
 }
 
 function identityFrom(record: Record<string, unknown>, field: "commandId" | "turnId"): string | undefined {
@@ -572,31 +643,90 @@ export class TurnController {
 		const managed = this.#manager.get(input.threadId);
 		if (!managed?.client || managed.lifecycle !== "active")
 			throw new TurnControllerError("internal", `Thread ${input.threadId} is not loaded.`);
-		if (managed.activeTurn || this.#active.has(input.threadId))
+		if (managed.activeTurn || this.#active.has(input.threadId)) {
+			const active = this.#active.get(input.threadId);
+			if (active?.state === "recovery_required")
+				throw (
+					active.failure ??
+					new TurnControllerError("recovery_required", `Thread ${input.threadId} requires recovery.`)
+				);
 			throw new TurnControllerError("busy", `Thread ${input.threadId} already has an active turn.`);
+		}
 		const text = textFromInput(input.params);
 		if (text === undefined) throw new TurnControllerError("internal", "Turn input must contain text-capable input.");
 		const turnId = this.#idFactory();
 		// Persist the app-server turn id alongside the child identities for recovery.
 		if (!nonEmptyString(turnId)) throw new TurnControllerError("internal", "Turn id factory returned an empty id.");
 		const requestedModel = turnModelOverride(input.params);
+		const requestedPolicy = turnPolicyOverride(input.params);
 		let modelOverrideRestore: (() => Promise<void>) | undefined;
-		if (requestedModel !== undefined) {
-			if (!managed.client.setModelForTurn)
+		try {
+			if (requestedModel !== undefined) {
+				if (!managed.client.setModelForTurn)
+					throw new TurnControllerError(
+						"model_override",
+						`Model override "${requestedModel}" cannot be honoured by this child runtime.`,
+					);
+				try {
+					modelOverrideRestore = await managed.client.setModelForTurn(requestedModel);
+				} catch (error) {
+					if (error instanceof TurnControllerError) throw error;
+					throw new TurnControllerError(
+						"model_override",
+						errorMessage(error, `Model override "${requestedModel}" could not be resolved.`),
+						error,
+					);
+				}
+			}
+			if (
+				requestedPolicy?.sandboxPolicy !== undefined &&
+				managed.effectiveSettings !== undefined &&
+				(!isRecord(managed.effectiveSettings.sandbox) ||
+					managed.effectiveSettings.sandbox.type !== "dangerFullAccess")
+			)
 				throw new TurnControllerError(
-					"model_override",
-					`Model override "${requestedModel}" cannot be honoured by this child runtime.`,
+					"turn_policy",
+					"Turn sandboxPolicy dangerFullAccess does not match the child runtime's effective sandbox.",
 				);
+			if (requestedPolicy !== undefined) {
+				if (!managed.client.setTurnPolicyForTurn)
+					throw new TurnControllerError(
+						"turn_policy",
+						"Turn policy overrides cannot be honoured by this child runtime.",
+					);
+				const policyRestore = await managed.client.setTurnPolicyForTurn(requestedPolicy);
+				const previousRestore = modelOverrideRestore;
+				modelOverrideRestore = async () => {
+					let failure: unknown;
+					try {
+						await policyRestore();
+					} catch (error) {
+						failure = error;
+					}
+					try {
+						if (previousRestore) await previousRestore();
+					} catch (error) {
+						failure ??= error;
+					}
+					if (failure !== undefined) throw failure;
+				};
+			}
+		} catch (error) {
 			try {
-				modelOverrideRestore = await managed.client.setModelForTurn(requestedModel);
-			} catch (error) {
-				if (error instanceof TurnControllerError) throw error;
+				await modelOverrideRestore?.();
+			} catch (restoreError) {
 				throw new TurnControllerError(
-					"model_override",
-					errorMessage(error, `Model override "${requestedModel}" could not be resolved.`),
-					error,
+					"recovery_required",
+					errorMessage(restoreError, "A turn override could not be restored after setup failed."),
+					restoreError,
 				);
 			}
+			if (error instanceof TurnControllerError) throw error;
+			throw new TurnControllerError(
+				"turn_policy",
+				errorMessage(error, "Turn policy overrides could not be applied."),
+				error,
+			);
 		}
 		const startedAtMs = this.#clock();
 		const turn = initialTurn(turnId, startedAtMs);
@@ -626,7 +756,13 @@ export class TurnController {
 		try {
 			const response = await managed.client.control(
 				"turn.prompt",
-				{ text, clientRef: active.clientRef },
+				{
+					text,
+					clientRef: active.clientRef,
+					...(requestedPolicy?.developerInstructions
+						? { developerInstructions: requestedPolicy.developerInstructions }
+						: {}),
+				},
 				{ idempotencyKey: active.clientRef, confirm: true },
 			);
 			const preflightCode = classifyPreflightCode(response);
@@ -892,7 +1028,7 @@ export class TurnController {
 			try {
 				await this.#restoreModelOverride(active);
 			} finally {
-				this.#disposeActive(active);
+				if ((active.state as string) !== "recovery_required") this.#disposeActive(active);
 			}
 		}
 	}
@@ -992,26 +1128,39 @@ export class TurnController {
 	async #restoreModelOverride(active: ActiveTurn): Promise<void> {
 		const restore = active.modelOverrideRestore;
 		if (!restore) return;
-		active.modelOverrideRestore = undefined;
 		try {
 			await restore();
+			active.modelOverrideRestore = undefined;
 		} catch (error) {
-			throw new TurnControllerError(
+			const failure = new TurnControllerError(
 				"recovery_required",
-				errorMessage(error, "The per-turn model override could not be restored."),
+				errorMessage(error, "The per-turn override could not be restored."),
 				error,
 			);
+			active.state = "recovery_required";
+			active.failure ??= failure;
+			active.bufferedFrames.length = 0;
+			this.#lastStates.set(active.threadId, "recovery_required");
+			this.#manager.setActiveTurn(active.threadId, true);
+			throw failure;
 		}
 	}
 
 	async #discardBeforeAcceptance(active: ActiveTurn): Promise<void> {
 		try {
 			await this.#restoreModelOverride(active);
-		} finally {
-			active.rolledBack = true;
-			active.state = "rolled_back";
-			this.#disposeActive(active);
+		} catch (error) {
+			throw error instanceof TurnControllerError
+				? error
+				: new TurnControllerError(
+						"recovery_required",
+						errorMessage(error, "Turn override restoration failed."),
+						error,
+					);
 		}
+		active.rolledBack = true;
+		active.state = "rolled_back";
+		this.#disposeActive(active);
 	}
 
 	#disposeActive(active: ActiveTurn): void {

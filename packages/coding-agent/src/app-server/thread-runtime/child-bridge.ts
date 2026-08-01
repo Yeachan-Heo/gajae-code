@@ -24,6 +24,13 @@ export interface SessionRequestOptions {
 	readonly confirm?: boolean;
 }
 
+export interface TurnPolicyOverride {
+	readonly approvalPolicy?: "never";
+	readonly sandboxPolicy?: { readonly type: "dangerFullAccess" };
+	readonly developerInstructions?: string;
+	readonly reasoningEffort?: string;
+}
+
 /** Narrow retained-client surface shared with the public SdkClient. */
 export interface SessionClient {
 	readonly connectionId?: string;
@@ -38,12 +45,26 @@ export interface SessionClient {
 		options?: SessionRequestOptions,
 	): Promise<unknown>;
 	control(operation: string, input?: Record<string, unknown>, options?: SessionRequestOptions): Promise<unknown>;
+	/** Child-owned durable projection append; implementations must flush before resolving. */
+	appendProjection?: (envelope: Record<string, unknown>, options?: SessionRequestOptions) => Promise<unknown>;
 	/**
 	 * Resolve and activate a model override for one turn. The returned disposer MUST restore the
 	 * previous model before another turn is admitted; adapters must reject unresolved models.
 	 */
 	setModelForTurn?: (requestedModel: string) => Promise<() => Promise<void>>;
+	/** Apply only values that the child can enforce for the lifetime of one turn. */
+	setTurnPolicyForTurn?: (policy: TurnPolicyOverride) => Promise<() => Promise<void>>;
 	close(): Promise<void>;
+}
+
+/** Route a durable projection append through the owning child, never a parent-side session writer. */
+export async function appendChildProjection(
+	client: SessionClient,
+	envelope: Record<string, unknown>,
+	options?: SessionRequestOptions,
+): Promise<unknown> {
+	if (client.appendProjection) return await client.appendProjection(envelope, options);
+	return await client.control("projection.append", { envelope }, options);
 }
 
 export interface ThreadLoadRequest {

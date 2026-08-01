@@ -53,6 +53,17 @@ const digestRelativePath = "src/app-server/obligations.digest";
 const snapshotAlgorithm = "git-ls-files-content-sha256-v1";
 const sha256Pattern = /^[a-f0-9]{64}$/u;
 const gateCommandTimeoutMs = 120_000;
+const liveOutputLimit = 8 * 1024;
+
+function boundLiveOutput(output: string): string {
+	if (output.length <= liveOutputLimit) return output || "<empty>";
+	return `${output.slice(0, liveOutputLimit)}\n[truncated after ${liveOutputLimit} characters]`;
+}
+
+function liveOutputDiagnostic(stdout: ArrayBuffer, stderr: ArrayBuffer): string {
+	const decoder = new TextDecoder();
+	return `\nlive stdout:\n${boundLiveOutput(decoder.decode(stdout))}\nlive stderr:\n${boundLiveOutput(decoder.decode(stderr))}`;
+}
 
 function sha256(value: string | Uint8Array): string {
 	return crypto.createHash("sha256").update(value).digest("hex");
@@ -377,31 +388,40 @@ async function reexecuteGate(root: string, gate: Gate, receipt: Receipt): Promis
 	} catch (error) {
 		return `gate command is not executable: ${error instanceof Error ? error.message : String(error)}`;
 	}
-	const timedOut = await Promise.race([
-		subprocess.exited.then(() => false),
-		Bun.sleep(gateCommandTimeoutMs).then(() => true),
-	]);
+	const readOutput = async (): Promise<{ stdout: ArrayBuffer; stderr: ArrayBuffer }> => {
+		const [stdout, stderr] = await Promise.all([
+			new Response(subprocess.stdout as ReadableStream<Uint8Array>).arrayBuffer(),
+			new Response(subprocess.stderr as ReadableStream<Uint8Array>).arrayBuffer(),
+		]);
+		return { stdout, stderr };
+	};
+	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<boolean>(resolve => {
+		timeoutHandle = setTimeout(() => resolve(true), gateCommandTimeoutMs);
+	});
+	const timedOut = await Promise.race([subprocess.exited.then(() => false), timeout]);
+	if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
 	if (timedOut) {
 		subprocess.kill();
 		await subprocess.exited;
-		return `gate command timed out after ${gateCommandTimeoutMs}ms`;
+		const { stdout, stderr } = await readOutput();
+		return `gate command timed out after ${gateCommandTimeoutMs}ms${liveOutputDiagnostic(stdout, stderr)}`;
 	}
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(subprocess.stdout as ReadableStream<Uint8Array>).arrayBuffer(),
-		new Response(subprocess.stderr as ReadableStream<Uint8Array>).arrayBuffer(),
-		subprocess.exited,
-	]);
+	const [{ stdout, stderr }, exitCode] = await Promise.all([readOutput(), subprocess.exited]);
+	const diagnostic = liveOutputDiagnostic(stdout, stderr);
 	const postRunTreeHash = await currentTreeHash(root, "obligations.receipts");
-	if (postRunTreeHash !== preRunTreeHash) return "gate command changed the repository snapshot during re-execution";
+	if (postRunTreeHash !== preRunTreeHash)
+		return `gate command changed the repository snapshot during re-execution${diagnostic}`;
 	if (exitCode !== receipt.exitCode)
-		return `live exit code ${exitCode} does not match receipt exit code ${receipt.exitCode}`;
+		return `live exit code ${exitCode} does not match receipt exit code ${receipt.exitCode}${diagnostic}`;
 	const output = new Uint8Array(stdout.byteLength + stderr.byteLength);
 	output.set(new Uint8Array(stdout));
 	output.set(new Uint8Array(stderr), stdout.byteLength);
 	const normalizedLiveOutput = normalizeCapturedOutput(new TextDecoder().decode(output));
-	if (!hasExpectedOutputMarker(normalizedLiveOutput, gate)) return "live gate output is missing expected marker";
+	if (!hasExpectedOutputMarker(normalizedLiveOutput, gate))
+		return `live gate output is missing expected marker${diagnostic}`;
 	if (sha256(normalizedLiveOutput) !== outputArtifact.sha256)
-		return `live output does not match recorded artifact: ${outputArtifact.path}`;
+		return `live output does not match recorded artifact: ${outputArtifact.path}${diagnostic}`;
 }
 
 /**

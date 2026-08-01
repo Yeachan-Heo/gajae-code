@@ -18,6 +18,7 @@ import {
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
+import { deriveEndpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	brokerOwnerForTest,
 	brokerSpawnEnvironmentForTest,
@@ -26,7 +27,6 @@ import {
 	registerBrokerOwnerForTest,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
-import { deriveEndpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
@@ -1096,6 +1096,46 @@ describe("SDK broker identity and discovery", () => {
 		} finally {
 			for (const child of children) if (child.exitCode === null) child.kill("SIGTERM");
 			await Promise.all(children.map(child => child.exited));
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 20_000);
+	it("self-reaps a broker when its owning client is SIGKILLed", async () => {
+		const dir = await temp();
+		const ownerSource = [
+			`import { ensureBroker } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/ensure.ts"))};`,
+			`await ensureBroker({ agentDir: process.env.GJC_BROKER_AGENT_DIR! });`,
+			"await new Promise(() => {});",
+		].join("\n");
+		const owner = Bun.spawn([process.execPath, "-e", ownerSource], {
+			env: { ...process.env, GJC_BROKER_AGENT_DIR: dir },
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		try {
+			let discovery: BrokerDiscovery | null = null;
+			const startupDeadline = Date.now() + BROKER_PROCESS_STARTUP_TIMEOUT_MS;
+			while (Date.now() < startupDeadline) {
+				discovery = await readBrokerDiscovery(dir);
+				if (discovery) break;
+				if (owner.exitCode !== null) throw new Error(`Owner exited before discovery (code=${owner.exitCode}).`);
+				await sleep(25);
+			}
+			expect(discovery).not.toBeNull();
+			const brokerPid = discovery!.pid;
+			await sleep(300);
+			expect(brokerDiscovery.isPidAlive(brokerPid)).toBe(true);
+			const killedAt = Date.now();
+			owner.kill("SIGKILL");
+			await owner.exited;
+			while (brokerDiscovery.isPidAlive(brokerPid) && Date.now() - killedAt < 5_000) await sleep(25);
+			const reapElapsedMs = Date.now() - killedAt;
+			expect(brokerDiscovery.isPidAlive(brokerPid)).toBe(false);
+			expect(reapElapsedMs).toBeLessThan(2_000);
+			await expect(fs.stat(brokerDiscoveryPath(dir))).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(fs.stat(path.join(dir, "sdk", "broker.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			if (owner.exitCode === null) owner.kill("SIGKILL");
+			await owner.exited;
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 20_000);
