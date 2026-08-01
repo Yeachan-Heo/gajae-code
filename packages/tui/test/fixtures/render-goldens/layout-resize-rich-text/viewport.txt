@@ -1,4 +1,3 @@
- Golden rich text                                                                   
                                                                                     
  │ Deterministic quote with link (https://example.test/golden).                     
                                                                                     
@@ -9,7 +8,7 @@
  | Glyph  | Value      |                                                            
  +--------+------------+                                                            
  | family | 👨‍👩‍👧‍👦         |                                                          
-                                  ``ts                                              
+  
  +--------+------------+                                                            
  | wide   | コンニチハ |                                                            
  +--------+------------+                                                            
@@ -17,4 +16,5 @@
  ```ts                                                                              
    const width = 'stable';                                                          
    console.log(width);                                                              
+ ```                                                                                
  OSC8 link end                                                                      

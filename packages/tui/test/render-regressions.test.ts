@@ -416,6 +416,7 @@ describe("TUI terminal-state regressions", () => {
 		"ZELLIJ",
 		"GJC_TMUX_LAUNCHED",
 		"TERMUX_VERSION",
+		"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
 		"PI_TUI_VIRTUAL_VIEWPORT",
 	] as const;
 	let previousHostEnv = new Map<string, string | undefined>();
@@ -1393,7 +1394,7 @@ describe("TUI terminal-state regressions", () => {
 
 	describe("resize + viewport behavior", () => {
 		it("preserves preexisting shell rows without startup clear", async () => {
-			const term = new VirtualTerminal(50, 5);
+			const term = new VirtualTerminal(50, 5, { isProcessTerminal: true });
 			term.write("shell-0\r\nshell-1\r\nshell-2\r\nshell-3\r\nshell-4\r\n");
 			await settle(term);
 			term.clearWriteLog();
@@ -1666,7 +1667,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 		it("repaints width reflow without appending existing rows to scrollback", async () => {
-			const term = new VirtualTerminal(24, 5);
+			const term = new VirtualTerminal(24, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(rows("existing-", 8));
 			tui.addChild(component);
@@ -1688,7 +1689,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 		it("repaints width reflow that increases row count without re-emitting historic rows", async () => {
-			const term = new VirtualTerminal(24, 5);
+			const term = new VirtualTerminal(24, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			tui.addChild(new WidthSensitiveComponent());
 
@@ -1712,7 +1713,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 		it("repaints an offscreen same-length mutation after width reflow growth without replaying history", async () => {
-			const term = new VirtualTerminal(24, 5);
+			const term = new VirtualTerminal(24, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const component = new ReflowableHeaderComponent();
 			tui.addChild(component);
@@ -1804,7 +1805,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 		it("repaints newly exposed rows after transient width reflow before a height-only resize", async () => {
-			const term = new VirtualTerminal(24, 10);
+			const term = new VirtualTerminal(24, 10, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const component = new WidthSensitiveComponent();
 			tui.addChild(component);
@@ -2053,7 +2054,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 		it("repaints an ambiguous final-row mutation instead of committing its reflow continuation", async () => {
-			const term = new VirtualTerminal(24, 4);
+			const term = new VirtualTerminal(24, 4, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const component = new FinalWrappingStatusComponent();
 			tui.addChild(component);
@@ -2077,7 +2078,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 		it("repaints a prefix-extending final-row mutation instead of committing its reflow continuation", async () => {
-			const term = new VirtualTerminal(24, 4);
+			const term = new VirtualTerminal(24, 4, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const component = new FinalWrappingStatusComponent();
 			tui.addChild(component);
@@ -2667,6 +2668,7 @@ describe("TUI terminal-state regressions", () => {
 
 	describe("scrollback integrity", () => {
 		it("repaints only the visible viewport for offscreen changes in tmux", async () => {
+			const previousTmux = Bun.env.TMUX;
 			Bun.env.TMUX = "1";
 
 			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
@@ -2695,6 +2697,8 @@ describe("TUI terminal-state regressions", () => {
 				expect(writes).toContain("line-79");
 			} finally {
 				tui.stop();
+				if (previousTmux === undefined) delete Bun.env.TMUX;
+				else Bun.env.TMUX = previousTmux;
 			}
 		});
 

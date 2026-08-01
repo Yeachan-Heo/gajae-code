@@ -4,6 +4,9 @@
 ### Fixed
 
 - Temporary TUI restarts now retain their native-scrollback admission frontier when the following viewport repaint fails, preventing newly appended rows from being duplicated on retry.
+- Restored the `isProcessTerminal`/`shouldUseViewportRepaintForHost` gate on the width-change viewport-repaint intercept so plain terminals (non-multiplexer, non-process-terminal) use `fullRender` for width changes instead of an unconditional viewport repaint. The #3684 chain removed this gate, causing lossless Korean/CJK prose wrapping to break at narrow widths because the viewport repaint only painted the visible rows without committing the full transcript to scrollback (#1979).
+- Restored the `fullRender` fallback for the `firstChanged < viewportTop` branch on non-viewport-repaint hosts, so above-viewport mutations replay the full frame instead of silently viewport-repainting.
+- Propagated IME cursor write failure from `#writeRenderBufferAndReanchorImeCursor` so callers detect terminal detach when the deferred cursor write fails after the shared frame commits.
 
 ## [0.12.7] - 2026-07-31
 

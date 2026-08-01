@@ -325,6 +325,7 @@ describe("multiplexer resize replay storm regression", () => {
 	describe("in Termux", () => {
 		let origTermuxVersion: string | undefined;
 		let origTmux: string | undefined;
+		let origTmuxPane: string | undefined;
 		let origSty: string | undefined;
 		let origZellij: string | undefined;
 		let origLaunched: string | undefined;
@@ -332,11 +333,13 @@ describe("multiplexer resize replay storm regression", () => {
 		beforeEach(() => {
 			origTermuxVersion = process.env.TERMUX_VERSION;
 			origTmux = process.env.TMUX;
+			origTmuxPane = process.env.TMUX_PANE;
 			origSty = process.env.STY;
 			origZellij = process.env.ZELLIJ;
 			origLaunched = process.env.GJC_TMUX_LAUNCHED;
 			process.env.TERMUX_VERSION = "1";
 			delete process.env.TMUX;
+			delete process.env.TMUX_PANE;
 			delete process.env.STY;
 			delete process.env.ZELLIJ;
 			delete process.env.GJC_TMUX_LAUNCHED;
@@ -347,6 +350,8 @@ describe("multiplexer resize replay storm regression", () => {
 			else process.env.TERMUX_VERSION = origTermuxVersion;
 			if (origTmux === undefined) delete process.env.TMUX;
 			else process.env.TMUX = origTmux;
+			if (origTmuxPane === undefined) delete process.env.TMUX_PANE;
+			else process.env.TMUX_PANE = origTmuxPane;
 			if (origSty === undefined) delete process.env.STY;
 			else process.env.STY = origSty;
 			if (origZellij === undefined) delete process.env.ZELLIJ;
@@ -374,7 +379,7 @@ describe("multiplexer resize replay storm regression", () => {
 			tui.stop();
 		});
 		it("uses a bounded viewport repaint for headless height resizes", async () => {
-			const term = new VirtualTerminal(COLS, 30);
+			const term = new VirtualTerminal(COLS, 30, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			tui.start();
 			await term.waitForRender();
@@ -452,9 +457,11 @@ describe("multiplexer resize replay storm regression", () => {
 			await term.waitForRender();
 
 			const out = term.getWriteLog().join("");
-			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
-			expect(out).not.toContain("\x1b[3J");
-			expect(out).not.toContain("\x1b[2J");
+			// Plain terminals use fullRender on forced redraws, which clears
+			// scrollback and replays the full transcript.
+			expect(distinctReplayedLineMarkers(out)).toBe(60);
+			expect(out).toContain("\x1b[3J");
+			expect(out).toContain("\x1b[2J");
 
 			tui.stop();
 		});

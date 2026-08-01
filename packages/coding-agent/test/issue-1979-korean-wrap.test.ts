@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/components/assistant-message";
@@ -13,13 +13,26 @@ const WIDTH = 20;
 const CONTENT_WIDTH = WIDTH - 2; // Assistant Markdown's left and right padding.
 const SUFFIX = "끝-ISSUE-1979-SUFFIX";
 const OPTION_LABELS = ["계속 진행", "다른 선택지를 입력"];
-
+const MULTIPLEXER_ENV_KEYS = ["TMUX", "TMUX_PANE", "STY", "ZELLIJ", "GJC_TMUX_LAUNCHED"] as const;
+let previousMultiplexerEnv: Map<string, string | undefined>;
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
 	const themeInstance = await getThemeByName("red-claw");
 	if (!themeInstance) throw new Error("Failed to load test theme");
 	setThemeInstance(themeInstance);
+});
+beforeEach(() => {
+	previousMultiplexerEnv = new Map(MULTIPLEXER_ENV_KEYS.map(key => [key, Bun.env[key]]));
+	for (const key of MULTIPLEXER_ENV_KEYS) delete Bun.env[key];
+});
+
+afterEach(() => {
+	if (!previousMultiplexerEnv) return;
+	for (const [key, value] of previousMultiplexerEnv) {
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
+	}
 });
 
 function assistantMessage(text: string): AssistantMessage {

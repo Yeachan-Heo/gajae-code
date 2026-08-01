@@ -3763,6 +3763,14 @@ export class TUI extends Container {
 			fullRender(true, "width settled", true);
 			return;
 		}
+		const useViewportRepaintPath = shouldUseViewportRepaintForHost(Bun.env, process.platform, {
+			includeProcessTerminal: this.terminal.isProcessTerminal === true,
+		});
+		const widthReflowRequired =
+			this.#previousWidth > 0 &&
+			rawLines.some(
+				line => !TERMINAL.isImageLine(line) && visibleWidth(line) > Math.min(this.#previousWidth, width),
+			);
 		if (
 			widthChanged &&
 			!this.#legacyMultiplexerFullRender &&
@@ -3771,10 +3779,13 @@ export class TUI extends Container {
 				!durableAppend ||
 				!logicalAppend ||
 				retainedLength < 0 ||
-				retainedLength >= newLines.length)
+				retainedLength >= newLines.length) &&
+			useViewportRepaintPath
 		) {
 			// Resize-only frames, and frames without a proven append suffix, repaint
-			// the live viewport without replaying durable history.
+			// the live viewport without replaying durable history. Only on viewport-
+			// repaint hosts (multiplexers, Windows Terminal, process terminals); plain
+			// terminals fall through to fullRender so the whole frame is replayed.
 			if (forcedRenderQueued) this.#fullRedrawCount += 1;
 			viewportRepaint(`terminal width changed (${this.#previousWidth} -> ${width})`, true, true);
 			return;
@@ -3782,8 +3793,6 @@ export class TUI extends Container {
 		if (widthChanged && !initialRender && resizeRenderMutationQueued) {
 			this.#latestRenderedLines = newLines.slice(0, retainedLength);
 			if (this.#virtualViewport) this.#latestRaw = rawLines.slice(0, retainedLength);
-			// Preserve the pre-append physical baseline; the normal append path must
-			// account for the rows that overflow the old viewport exactly once.
 			coalescedWidthAppend = true;
 		}
 
@@ -3793,14 +3802,6 @@ export class TUI extends Container {
 			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (new=${newLines.length}, height=${height})\n`;
 			this.#appendDebugRedrawLog(msg);
 		};
-		const useViewportRepaintPath = shouldUseViewportRepaintForHost(Bun.env, process.platform, {
-			includeProcessTerminal: this.terminal.isProcessTerminal === true,
-		});
-		const widthReflowRequired =
-			this.#previousWidth > 0 &&
-			rawLines.some(
-				line => !TERMINAL.isImageLine(line) && visibleWidth(line) > Math.min(this.#previousWidth, width),
-			);
 
 		if (restartViewportRepaintPending && initialRender) {
 			const restartAppendProven =
@@ -4167,7 +4168,11 @@ export class TUI extends Container {
 
 		if (firstChanged < prevViewportTop && !durableAppend) {
 			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
-			viewportRepaint(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
+			if (useViewportRepaintPath) {
+				viewportRepaint(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
+			} else {
+				fullRender(true, "firstChanged < viewportTop");
+			}
 			return;
 		}
 		// Render from first changed line to end
@@ -4449,9 +4454,11 @@ export class TUI extends Container {
 		}
 		if (!this.#imeCursorActive) return true;
 		// Cursor positioning is outside shared transcript ownership. A failure still
-		// makes the terminal unavailable, but cannot uncommit the shared frame.
-		this.#writeCursorPosition(cursorPos, totalLines, true);
-		return true;
+		// makes the terminal unavailable, but cannot uncommit the shared frame. The
+		// onBufferWritten callback has already run; the return value propagates
+		// terminal availability so callers can detect the detach.
+		const cursorWritten = this.#writeCursorPosition(cursorPos, totalLines, true);
+		return cursorWritten;
 	}
 
 	/**
