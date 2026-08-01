@@ -7,6 +7,7 @@ This document describes operator-visible behavior for session export/share/fork/
 - [`../src/modes/controllers/command-controller.ts`](../packages/coding-agent/src/modes/controllers/command-controller.ts)
 - [`../src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts)
 - [`../src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts)
+- [`../src/session-import/`](../packages/coding-agent/src/session-import/)
 - [`../src/export/html/index.ts`](../packages/coding-agent/src/export/html/index.ts)
 - [`../src/export/custom-share.ts`](../packages/coding-agent/src/export/custom-share.ts)
 - [`../src/main.ts`](../packages/coding-agent/src/main.ts)
@@ -21,11 +22,22 @@ This document describes operator-visible behavior for session export/share/fork/
 | `/share`                                | Interactive slash command | No                                    | No                                                                                 | Temp HTML + share URL/gist                                                       |
 | `/fork`                                 | Interactive slash command | Yes (active session identity changes) | Creates new session file and switches current session to it (persistent mode only) | Copies artifact directory to new session namespace when present                  |
 | `--fork <id                             | path>`                    | CLI startup                           | Yes after session creation                                                         | Creates a new session fork from the selected source into current cwd/session dir | None |
+| `/import-session codex [session-id ...]` | Interactive or trusted local startup command | No active-session mutation | Creates independently resumable native v5 session files | Bounded quarantine and provenance manifest |
 | `/resume`                               | Interactive slash command | Yes (active in-memory state replaced) | Switches to selected existing session file                                         | None                                                                             |
 | `--resume`                              | CLI startup (picker)      | Yes after session creation            | Opens selected existing session file                                               | None                                                                             |
 | `--resume <id                           | path>`                    | CLI startup                           | Yes after session creation                                                         | Opens existing session; cross-project case can fork into current project         | None |
 | `--continue`                            | CLI startup               | Yes after session creation            | Opens terminal breadcrumb or most-recent session; creates new one if none exists   | None                                                                             |
 
+## Import Codex sessions
+
+`/import-session codex <session-id>...` imports the named Codex CLI sessions that belong to the current workspace. With no IDs, it imports every discovered Codex session whose recorded canonical working directory exactly matches the current workspace.
+
+The importer converts user, assistant, function/custom-tool call, and tool-result records into native v5 history. Unsupported records are sanitized and written to a bounded `codex-quarantine.jsonl` attachment; the source provider/session ID, source digest, byte counts, converter versions, mapping counts, and quarantine binding are retained in the transcript provenance and managed manifest. Raw Codex archives are never copied into the session store.
+
+Each source is independently staged, validated, fsynced, and published without replacement. Repeating the command verifies provenance and returns the existing imported session, including after that session has been resumed and continued. Imported sessions do not replace the active session automatically; select them with `/resume`.
+
+The command is available only in the interactive TUI and trusted local startup command path. It is neither advertised nor dispatched over ACP or remote-control transports. Source files must be regular, single-link, non-symlink files beneath the selected Codex sessions directory. Secret-bearing fields, credential-shaped values, terminal escape sequences, bidi/zero-width controls, and provider control tokens are redacted before persistence.
+Trusted source import currently requires Linux descriptor-relative filesystem authority and fails closed on platforms where that authority is unavailable.
 ## Export and dump
 
 ### `/export [outputPath]` (interactive)

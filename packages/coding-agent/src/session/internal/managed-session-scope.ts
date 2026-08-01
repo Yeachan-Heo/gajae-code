@@ -168,6 +168,7 @@ export type ManagedScopeErrorCode =
 	| "atomic_unavailable"
 	| "invalid_request"
 	| "durability_failed"
+	| "artifact_capacity_exceeded"
 	| "durability_not_provable";
 
 export type ManagedScopeResolution =
@@ -180,6 +181,8 @@ export type ManagedScopeResolution =
 	  };
 
 function managedScopeFailureCause(error: unknown): { readonly classification: string } {
+	if (error instanceof Error && error.message === "content_too_large")
+		return { classification: "artifact_capacity_exceeded" };
 	return { classification: managedSecurityFailureClassification(error) ?? "binding_invalid" };
 }
 
@@ -189,11 +192,13 @@ const managedScopeFailureCodes = new Set([
 	"durability_failed",
 	"durability_not_provable",
 	"migration_busy",
+	"artifact_capacity_exceeded",
 ]);
 
 function managedScopeFailureMessage(error: unknown, fallback: string): string {
 	const classification = managedSecurityFailureClassification(error);
 	if (classification) return classification;
+	if (error instanceof Error && error.message === "content_too_large") return "artifact_capacity_exceeded";
 	return error instanceof Error && managedScopeFailureCodes.has(error.message) ? error.message : fallback;
 }
 
@@ -1061,7 +1066,8 @@ export function prepareManagedSessionScopeForWriteSync(
 			message === "atomic_unavailable" ||
 			message === "invalid_request" ||
 			message === "durability_failed" ||
-			message === "durability_not_provable"
+			message === "durability_not_provable" ||
+			message === "artifact_capacity_exceeded"
 				? message
 				: "binding_invalid";
 

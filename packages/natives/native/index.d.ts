@@ -364,6 +364,16 @@ export declare class PtySession {
   kill(): void
 }
 
+/** Retained descriptor-relative regular-file authority for streamed imports. */
+export declare class RecoveryFsFile {
+  /** Return the current identity of the retained regular file. */
+  identity(): RecoveryFsResult
+  /** Read one bounded chunk from the retained file descriptor. */
+  readChunk(offset: number, maxBytes: number): RecoveryFsResult
+  /** Close the retained regular-file descriptor. */
+  close(): RecoveryFsResult
+}
+
 /** Retained trusted-root authority for Linux recovery artifacts. */
 export declare class RecoveryFsRoot {
   /** Return the stable identity of the retained root descriptor. */
@@ -373,6 +383,16 @@ export declare class RecoveryFsRoot {
    * identity evidence.
    */
   retainManagedDirectory(relativePath: string, expectedDev: string, expectedIno: string): RecoveryFsRoot
+  /**
+   * Open one regular, single-linked descendant through retained no-follow
+   * traversal.
+   */
+  openFile(relativePath: string): RecoveryFsFile
+  /**
+   * Enumerate regular, single-linked descendants through retained directory
+   * descriptors. The returned data is a JSON array of relative paths.
+   */
+  listFiles(maxEntries: number): RecoveryFsResult
   /** Stat one existing regular, single-linked file without following links. */
   stat(relativePath: string): RecoveryFsResult
   /** Read one existing regular, single-linked file without following links. */

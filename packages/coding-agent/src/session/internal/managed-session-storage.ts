@@ -29,7 +29,7 @@ import {
 
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
-export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 64 * 1024 * 1024;
+export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 128 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
 const LOCK_LEASE_MS = 60_000;
@@ -46,12 +46,14 @@ export class ManagedPublishError extends Error {
 		| "io_error"
 		| "durability_failed";
 	readonly diagnostic: string;
+	readonly stagingCleanupSafe: boolean;
 
 	constructor(classification: ManagedPublishError["classification"], outcome: NativePublishOutcome) {
 		super(classification);
 		this.name = "ManagedPublishError";
 		this.classification = classification;
 		this.diagnostic = formatNativePublishDiagnostic(outcome);
+		this.stagingCleanupSafe = mayCleanCurrentStaging(outcome);
 	}
 }
 
@@ -100,7 +102,7 @@ function sameDirectoryTreeSnapshotAfterRename(
 	);
 }
 
-class ManagedTreeMoveOutcomeError extends Error {
+export class ManagedTreeMoveOutcomeError extends Error {
 	constructor(
 		message: string,
 		readonly stagingCleanupSafe: boolean,
@@ -814,6 +816,72 @@ export class ManagedSessionDescendantStore {
 		}
 		this.#assertBound();
 		this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
+		this.#assertBound();
+	}
+	/**
+	 * Atomically publishes an already-written managed staging file without
+	 * materializing its contents. The staging file and destination must be
+	 * descendants of this retained store.
+	 */
+	publishStagedFileNoReplace(
+		sourceRelativePath: string,
+		destinationRelativePath: string,
+		expected: { bytes: number; sha256: string },
+	): void {
+		this.#beforeMutation();
+		this.#assertBound();
+		const source = this.#resolve(sourceRelativePath);
+		const destination = this.#resolve(destinationRelativePath);
+		const fd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		let sourceIdentity: ManagedFileSnapshot["identity"] | undefined;
+		try {
+			const descriptorStat = fs.fstatSync(fd, { bigint: true });
+			const before = identity(descriptorStat);
+			const named = identity(fs.lstatSync(source, { bigint: true }));
+			if (
+				!descriptorStat.isFile() ||
+				before.nlink !== 1n ||
+				!sameIdentity(before, named) ||
+				before.size !== expected.bytes
+			)
+				throw new Error("managed_publish_identity_mismatch");
+			const digest = createHash("sha256");
+			const chunk = Buffer.allocUnsafe(1024 * 1024);
+			let offset = 0;
+			for (;;) {
+				const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, offset);
+				if (bytesRead === 0) break;
+				digest.update(chunk.subarray(0, bytesRead));
+				offset += bytesRead;
+			}
+			if (digest.digest("hex") !== expected.sha256) throw new Error("managed_publish_identity_mismatch");
+			fs.fsyncSync(fd);
+			const after = identity(fs.fstatSync(fd, { bigint: true }));
+			const namedAfter = identity(fs.lstatSync(source, { bigint: true }));
+			if (!sameIdentity(before, after) || !sameIdentity(after, namedAfter))
+				throw new Error("managed_publish_identity_mismatch");
+			sourceIdentity = after;
+		} finally {
+			fs.closeSync(fd);
+		}
+		if (!sourceIdentity) throw new Error("managed_publish_identity_unavailable");
+		const relativeSource = this.#relative(source);
+		const relativeDestination = this.#relative(destination);
+		const published = this.#authority
+			? this.#authority.renameManagedFileNoReplace(
+					relativeSource,
+					relativeDestination,
+					sourceIdentity.dev.toString(),
+					sourceIdentity.ino.toString(),
+					sourceIdentity.size.toString(),
+					sourceIdentity.mtimeNs.toString(),
+					sourceIdentity.ctimeNs.toString(),
+					expected.sha256,
+				)
+			: renameNoReplacePath(source, destination);
+		const outcome = classifyNativePublishOutcome(published, this.#authority ? "retained_file" : "direct_rename");
+		if (!outcome.ok) throw publishFailure(outcome);
+		if (!this.#authority) fsyncDirectory(this.#baseDir);
 		this.#assertBound();
 	}
 

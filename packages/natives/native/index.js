@@ -25,6 +25,7 @@ export const NotificationControlServer = nativeBindings.NotificationControlServe
 export const NotificationServer = nativeBindings.NotificationServer;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
+export const RecoveryFsFile = nativeBindings.RecoveryFsFile;
 export const RecoveryFsRoot = nativeBindings.RecoveryFsRoot;
 export const Shell = nativeBindings.Shell;
 

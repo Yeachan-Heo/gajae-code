@@ -155,6 +155,29 @@ describe("Print mode", () => {
 		process.exitCode = previousExitCode ?? 0;
 	});
 
+	it("dispatches trusted local headless commands without prompting and keeps JSON output valid", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+		const stdoutOutput: string[] = [];
+		installImmediateStdoutMock(stdoutOutput);
+		const tracking = createPrintModeTrackingSession();
+
+		await runPrintMode(tracking.session, {
+			mode: "json",
+			initialMessage: "/import-session unsupported",
+		});
+
+		expect(tracking.prompt).not.toHaveBeenCalled();
+		const rows = stdoutOutput
+			.join("")
+			.trim()
+			.split("\n")
+			.map(row => JSON.parse(row));
+		expect(rows).toContainEqual({
+			type: "local_command_output",
+			command: "/import-session",
+			output: "Usage: /import-session codex [session-id ...]",
+		});
+	});
 	it("does not render a silent-abort marker or overwrite a caller status", async () => {
 		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];

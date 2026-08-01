@@ -43,6 +43,7 @@ import {
 } from "../sdk/bus/notification-service";
 import { TelegramDaemonController } from "../sdk/bus/telegram-daemon-control";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
+import { formatSessionImportBatch, importCodexSessions } from "../session-import";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
@@ -550,6 +551,34 @@ const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashComma
 };
 
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
+	{
+		name: "import-session",
+		priority: 29,
+		description: "Import Codex sessions into native GJC history",
+		inlineHint: "codex [session-id ...]",
+		allowArgs: true,
+		acp: false,
+		localHeadless: true,
+		handle: async (command, runtime) => {
+			const tokens = command.args.trim().split(/\s+/u).filter(Boolean);
+			if (tokens[0] !== "codex") {
+				return usage("Usage: /import-session codex [session-id ...]", runtime);
+			}
+			const ids = [...new Set(tokens.slice(1))];
+			if (ids.length > 256 || ids.some(id => id.length < 8 || id.length > 128 || !/^[A-Za-z0-9-]+$/u.test(id))) {
+				return usage(
+					"Usage: /import-session codex [session-id ...]\nSession IDs must be 8-128 letters, digits, or hyphens; maximum 256 IDs.",
+					runtime,
+				);
+			}
+			const result = await importCodexSessions(runtime.cwd, ids);
+			await runtime.output(formatSessionImportBatch(result));
+			return {
+				consumed: true,
+				...(result.status === "failed" || result.status === "partial" ? { exitCode: 1 } : {}),
+			};
+		},
+	},
 	{
 		name: "notify",
 		priority: 30,
@@ -1859,6 +1888,18 @@ export async function executeBuiltinSlashCommand(
 	return false;
 }
 
+/** Dispatch a command explicitly authorized for trusted local non-interactive mode. */
+export async function executeLocalHeadlessBuiltinSlashCommand(
+	text: string,
+	runtime: SlashCommandRuntime,
+): Promise<false | Exclude<SlashCommandResult, undefined>> {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return false;
+	const command = BUILTIN_SLASH_COMMAND_LOOKUP.get(parsed.name);
+	if (!command?.handle || command.localHeadless !== true) return false;
+	if (parsed.args.length > 0 && !command.allowArgs) return false;
+	return (await command.handle(parsed, runtime)) ?? { consumed: true };
+}
 /** Look up a unified spec by name or alias. Used by the ACP dispatcher. */
 export function lookupBuiltinSlashCommand(name: string): SlashCommandSpec | undefined {
 	return BUILTIN_SLASH_COMMAND_LOOKUP.get(name);

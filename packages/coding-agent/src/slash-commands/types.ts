@@ -34,11 +34,12 @@ export interface ParsedSlashCommand {
  * Result returned by a slash-command handler.
  *
  * - `void` / `undefined` — command was handled and consumed; no further input.
- * - `{ consumed: true }` — explicit equivalent of the above (ACP shape).
+ * - `{ consumed: true, exitCode?: number }` — explicit equivalent of the above;
+ *   trusted local headless mode applies an optional non-zero process status.
  * - `{ prompt: string }` — command handled, pass `prompt` through as the new
  *   user input (e.g. `/force <tool> <prompt>` keeps `<prompt>` as the message).
  */
-export type SlashCommandResult = undefined | { consumed: true } | { prompt: string };
+export type SlashCommandResult = undefined | { consumed: true; exitCode?: number } | { prompt: string };
 
 /**
  * Runtime visible to slash-command handlers that run in text/ACP mode.
@@ -98,6 +99,10 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 	 * not silently drop it from `available_commands_update`.
 	 */
 	acpInputHint?: string;
+	/** Set false for trusted local commands that must never be advertised or dispatched through ACP. */
+	acp?: boolean;
+	/** Explicitly authorizes this handler in trusted local non-interactive print mode. */
+	localHeadless?: boolean;
 	/**
 	 * Text/ACP-mode handler. The same body is invoked from the ACP dispatcher
 	 * and, via the TUI adapter, when no `handleTui` override is provided.

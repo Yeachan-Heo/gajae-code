@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- Managed session files may now be up to 128 MiB, keeping retained-tree validation aligned with large resumable session transcripts and checkpoints.
+- Recovery filesystem roots can now open descriptor-retained regular-file streams with no-follow component traversal for bounded external-session ingestion.
+
 ### Fixed
 
 - POSIX exact directory-tree cleanup now operates only on the caller-authorized retained root, revalidates the root and each direct child against their descriptors before mutation, rejects initial and late hard-link aliases, and scrubs regular-file payloads through verified descriptors. Canonical root detachment remains the separate exact-unlink phase; replayable retained namespaces are never renamed again, and substituted successors are never renamed, unlinked, or truncated.

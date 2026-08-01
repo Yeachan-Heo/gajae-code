@@ -691,7 +691,7 @@ async function writeOwnerOnlyFileNoReplace(filePath: string, content: Uint8Array
 	await fsyncDirectoryPath(path.dirname(filePath));
 }
 
-const MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES = 64 * 1024 * 1024;
+const MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES = 128 * 1024 * 1024;
 const MEMORY_GUARD_CHECKPOINT_BLOB_MAX_ENTRIES = 4096;
 const MEMORY_GUARD_CHECKPOINT_BLOB_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
 

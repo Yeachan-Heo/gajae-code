@@ -75,6 +75,41 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 		});
 		expect(authority.close()).toMatchObject({ ok: true });
 	});
+	it("streams one retained leaf and rejects intermediate symlink traversal", async () => {
+		const root = await temporaryDirectory();
+		const original = path.join(root, "nested");
+		const moved = path.join(root, "moved");
+		await fs.mkdir(path.join(original, "child"), { recursive: true });
+		await fs.writeFile(path.join(original, "child", "source.jsonl"), "abcdefgh");
+		await fs.symlink("nested", path.join(root, "redirect"));
+		const authority = openRecoveryFsRoot(root);
+		expect(() => authority.openFile("redirect/child/source.jsonl")).toThrow();
+		const retained = authority.openFile("nested/child/source.jsonl");
+		expect(Buffer.from(retained.readChunk(0, 4).data ?? []).toString()).toBe("abcd");
+		await fs.rename(original, moved);
+		await fs.mkdir(path.join(original, "child"), { recursive: true });
+		await fs.writeFile(path.join(original, "child", "source.jsonl"), "replacement");
+		expect(Buffer.from(retained.readChunk(4, 4).data ?? []).toString()).toBe("efgh");
+		expect(retained.close()).toMatchObject({ ok: true });
+		expect(authority.close()).toMatchObject({ ok: true });
+	});
+
+	it("enumerates from the retained root after its pathname is replaced", async () => {
+		const parent = await temporaryDirectory();
+		const sessions = path.join(parent, "sessions");
+		const retainedPath = path.join(parent, "retained-sessions");
+		await fs.mkdir(path.join(sessions, "2026"), { recursive: true });
+		await fs.writeFile(path.join(sessions, "2026", "trusted.jsonl"), "trusted");
+		const authority = openRecoveryFsRoot(sessions);
+		await fs.rename(sessions, retainedPath);
+		await fs.mkdir(path.join(sessions, "2026"), { recursive: true });
+		await fs.writeFile(path.join(sessions, "2026", "replacement.jsonl"), "replacement");
+
+		const listed = authority.listFiles(100);
+		expect(listed.ok).toBe(true);
+		expect(JSON.parse(Buffer.from(listed.data ?? []).toString("utf8"))).toEqual(["2026/trusted.jsonl"]);
+		expect(authority.close()).toMatchObject({ ok: true });
+	});
 
 	it("supports managed-size content and identity-bound fsync", async () => {
 		const root = await temporaryDirectory();
@@ -96,6 +131,29 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 			),
 		).toMatchObject({ ok: true, identity: created.identity });
 		expect(authority.verifyOwnerOnlyDirectory()).toMatchObject({ ok: true });
+		expect(authority.close()).toMatchObject({ ok: true });
+	});
+
+	it("reports managed append overflow with the shared content capacity code", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "at-limit");
+		await fs.writeFile(file, "");
+		await fs.truncate(file, 128 * 1024 * 1024);
+		const authority = openRecoveryFsRoot(root);
+		const observed = authority.stat("at-limit");
+		if (!observed.identity) throw new Error("Expected managed identity");
+		expect(
+			authority.appendManaged(
+				"at-limit",
+				Buffer.from("x"),
+				observed.identity.dev,
+				observed.identity.ino,
+				observed.identity.size,
+				observed.identity.mtimeNs,
+				observed.identity.ctimeNs,
+				"0".repeat(64),
+			),
+		).toMatchObject({ ok: false, code: "content_too_large" });
 		expect(authority.close()).toMatchObject({ ok: true });
 	});
 

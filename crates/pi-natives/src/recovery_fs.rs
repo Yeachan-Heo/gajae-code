@@ -11,7 +11,10 @@ use std::{
 	ffi::CString,
 	fs::File,
 	io::{Read, Seek, SeekFrom, Write},
-	os::fd::{AsRawFd, FromRawFd},
+	os::{
+		fd::{AsRawFd, FromRawFd},
+		unix::ffi::OsStrExt,
+	},
 	path::{Component, Path},
 	sync::atomic::{AtomicU64, Ordering},
 };
@@ -26,7 +29,7 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 const MAX_CONTENT_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "linux")]
-const MAX_MANAGED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MANAGED_CONTENT_BYTES: u64 = 128 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_MANAGED_TREE_DEPTH: usize = 32;
 #[cfg(target_os = "linux")]
@@ -507,6 +510,85 @@ fn publish_unknown_failure(code: &'static str, phase: &str) -> RecoveryFsPublish
 	RecoveryFsPublishResult::failure("unknown", "not_provable", "unknown", phase, code, None)
 }
 
+/// Retained descriptor-relative regular-file authority for streamed imports.
+#[napi]
+pub struct RecoveryFsFile {
+	#[cfg(target_os = "linux")]
+	file: Mutex<Option<File>>,
+}
+
+#[napi]
+impl RecoveryFsFile {
+	/// Return the current identity of the retained regular file.
+	#[napi]
+	pub fn identity(&self) -> RecoveryFsResult {
+		#[cfg(target_os = "linux")]
+		{
+			self.file.lock().as_ref().map_or_else(
+				|| RecoveryFsResult::failure("closed"),
+				|file| {
+					regular_identity(file)
+						.map_or_else(RecoveryFsResult::failure, RecoveryFsResult::success)
+				},
+			)
+		}
+		#[cfg(not(target_os = "linux"))]
+		RecoveryFsResult::failure("unsupported_platform")
+	}
+
+	/// Read one bounded chunk from the retained file descriptor.
+	#[napi]
+	pub fn read_chunk(&self, offset: f64, max_bytes: u32) -> RecoveryFsResult {
+		#[cfg(target_os = "linux")]
+		{
+			if !offset.is_finite()
+				|| offset < 0.0
+				|| offset.fract() != 0.0
+				|| offset > 9_007_199_254_740_991.0
+			{
+				return RecoveryFsResult::failure("invalid_offset");
+			}
+			let mut guard = self.file.lock();
+			let Some(file) = guard.as_mut() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+				return RecoveryFsResult::failure("io_error");
+			}
+			let mut data =
+				vec![0_u8; usize::try_from(max_bytes.min(1024 * 1024)).unwrap_or(1024 * 1024)];
+			let Ok(bytes_read) = file.read(&mut data) else {
+				return RecoveryFsResult::failure("io_error");
+			};
+			data.truncate(bytes_read);
+			regular_identity(file).map_or_else(RecoveryFsResult::failure, |identity| {
+				RecoveryFsResult::data(identity, data)
+			})
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			let _ = (offset, max_bytes);
+			RecoveryFsResult::failure("unsupported_platform")
+		}
+	}
+
+	/// Close the retained regular-file descriptor.
+	#[napi]
+	pub fn close(&self) -> RecoveryFsResult {
+		#[cfg(target_os = "linux")]
+		{
+			let mut file = self.file.lock();
+			let Some(retained) = file.take() else {
+				return RecoveryFsResult::failure("closed");
+			};
+			regular_identity(&retained)
+				.map_or_else(RecoveryFsResult::failure, RecoveryFsResult::success)
+		}
+		#[cfg(not(target_os = "linux"))]
+		RecoveryFsResult::failure("unsupported_platform")
+	}
+}
+
 /// Retained trusted-root authority for Linux recovery artifacts.
 #[napi]
 pub struct RecoveryFsRoot {
@@ -577,6 +659,56 @@ impl RecoveryFsRoot {
 		{
 			let _ = (relative_path, expected_dev, expected_ino);
 			Err(napi::Error::from_reason("unsupported_platform"))
+		}
+	}
+
+	/// Open one regular, single-linked descendant through retained no-follow
+	/// traversal.
+	#[napi]
+	pub fn open_file(&self, relative_path: String) -> napi::Result<RecoveryFsFile> {
+		#[cfg(target_os = "linux")]
+		{
+			let guard = self.root.lock();
+			let root = guard
+				.as_ref()
+				.ok_or_else(|| napi::Error::from_reason("closed"))?;
+			let file = open_existing(root, &relative_path, false).map_err(napi::Error::from_reason)?;
+			regular_identity(&file).map_err(napi::Error::from_reason)?;
+			Ok(RecoveryFsFile { file: Mutex::new(Some(file)) })
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			let _ = relative_path;
+			Err(napi::Error::from_reason("unsupported_platform"))
+		}
+	}
+
+	/// Enumerate regular, single-linked descendants through retained directory
+	/// descriptors. The returned data is a JSON array of relative paths.
+	#[napi]
+	pub fn list_files(&self, max_entries: u32) -> RecoveryFsResult {
+		#[cfg(target_os = "linux")]
+		{
+			if max_entries == 0 || max_entries > 100_000 {
+				return RecoveryFsResult::failure("invalid_limit");
+			}
+			with_root(&self.root, |root| {
+				let initial = identity(root)?;
+				let mut paths = Vec::new();
+				let mut entries = 0_u32;
+				list_regular_descendants(root, "", 0, max_entries, &mut entries, &mut paths)?;
+				let terminal = identity(root)?;
+				if initial != terminal {
+					return Err("identity_mismatch");
+				}
+				let data = serde_json::to_vec(&paths).map_err(|_| "io_error")?;
+				Ok(RecoveryFsResult::data(initial, data))
+			})
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			let _ = max_entries;
+			RecoveryFsResult::failure("unsupported_platform")
 		}
 	}
 
@@ -1584,6 +1716,68 @@ fn open_existing_directory(root: &File, relative_path: &str) -> Result<File, &'s
 }
 
 #[cfg(target_os = "linux")]
+fn list_regular_descendants(
+	directory: &File,
+	prefix: &str,
+	depth: usize,
+	max_entries: u32,
+	entries: &mut u32,
+	paths: &mut Vec<String>,
+) -> Result<(), &'static str> {
+	if depth > MAX_MANAGED_TREE_DEPTH {
+		return Err("tree_too_deep");
+	}
+	let initial = identity(directory)?;
+	let proc_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+	let mut names = std::fs::read_dir(proc_path)
+		.map_err(|_| "io_error")?
+		.map(|entry| entry.map_err(|_| "io_error").map(|entry| entry.file_name()))
+		.collect::<Result<Vec<_>, _>>()?;
+	names.sort();
+	for name in names {
+		*entries = entries.checked_add(1).ok_or("entry_limit_exceeded")?;
+		if *entries > max_entries {
+			return Err("entry_limit_exceeded");
+		}
+		let bytes = name.as_os_str().as_bytes();
+		let name_text = std::str::from_utf8(bytes).map_err(|_| "invalid_path")?;
+		let component = CString::new(bytes).map_err(|_| "invalid_path")?;
+		let metadata = statat(directory, &component)?;
+		let relative_path = if prefix.is_empty() {
+			name_text.to_owned()
+		} else {
+			format!("{prefix}/{name_text}")
+		};
+		match metadata.st_mode & libc::S_IFMT {
+			libc::S_IFDIR => {
+				let child = open_existing_directory(directory, name_text)?;
+				list_regular_descendants(
+					&child,
+					&relative_path,
+					depth + 1,
+					max_entries,
+					entries,
+					paths,
+				)?;
+			},
+			libc::S_IFREG => {
+				if metadata.st_nlink != 1 {
+					return Err("hard_link");
+				}
+				paths.push(relative_path);
+			},
+			libc::S_IFLNK => return Err("reparse_point"),
+			_ => {},
+		}
+	}
+	let terminal = identity(directory)?;
+	if initial != terminal {
+		return Err("identity_mismatch");
+	}
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn create(
 	root: &File,
 	relative_path: &str,
@@ -2010,10 +2204,10 @@ fn append_managed(
 		.parse::<u64>()
 		.map_err(|_| "identity_mismatch")?;
 	let Some(appended_size) = expected_size_value.checked_add(data.len() as u64) else {
-		return Err("too_large");
+		return Err("content_too_large");
 	};
 	if appended_size > MAX_MANAGED_CONTENT_BYTES {
-		return Err("too_large");
+		return Err("content_too_large");
 	}
 	let (parent, name) = open_parent(root, relative_path)?;
 	// SAFETY: the retained parent fd and validated leaf name remain live for
