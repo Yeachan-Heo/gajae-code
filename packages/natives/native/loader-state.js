@@ -418,6 +418,18 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}
+	if (ctx.platformTag.startsWith("darwin-")) {
+		const darwinCapabilities = [
+			["DarwinReplacementAuth", bindings.DarwinReplacementAuth],
+			["openDarwinReplacementAuth", bindings.openDarwinReplacementAuth],
+			["exchangeDarwinManagedFile", bindings.exchangeDarwinManagedFile],
+		];
+		for (const [name, capability] of darwinCapabilities) {
+			if (typeof capability !== "function") {
+				throw new Error(`Loaded ${candidate} but it lacks required Darwin replacement capability \`${name}\`.`);
+			}
+		}
+	}
 	if (typeof bindings.probeWindowsJobMemory !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required memory probe capability \`probeWindowsJobMemory\`.`);
 	}

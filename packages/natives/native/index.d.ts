@@ -21,6 +21,15 @@ export declare class ComputerController {
 }
 
 /**
+ * Darwin-only persistent kernel replacement admission. The descriptor is opaque
+ * to JavaScript and remains held until `close` or process teardown.
+ */
+export declare class DarwinReplacementAuth {
+  close(): void
+  isHeld(): boolean
+}
+
+/**
  * Long-lived macOS appearance observer.
  *
  * Subscribes to `AppleInterfaceThemeChangedNotification` via
@@ -870,6 +879,12 @@ export declare function exactRestore(detachedPath: string, originalPath: string,
 export declare function exactUnlink(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
+ * Execute one authenticated Darwin exact exchange. The native side owns the
+ * final admission check and invokes `renameatx_np` exactly once.
+ */
+export declare function exchangeDarwinManagedFile(auth: DarwinReplacementAuth, parentPath: string, parentDev: bigint, parentIno: bigint, sourceName: string, destinationName: string, expectedSource: NativeDarwinReplacementIdentity, expectedDestination: NativeDarwinReplacementIdentity, operationId: string): NativeDarwinReplacementResult
+
+/**
  * Execute a brush shell command.
  *
  * Creates a fresh session for each call. The `on_chunk` callback receives
@@ -1685,6 +1700,30 @@ export type NativeCanonicalDirectoryIdentity =
 			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
 
+/** Full regular-file identity used by the Darwin managed replacement exchange. */
+export interface NativeDarwinReplacementIdentity {
+  dev: bigint
+  ino: bigint
+  nlink: bigint
+  size: bigint
+  mtimeNs: bigint
+  ctimeNs: bigint
+  sha256: string
+}
+
+/** Closed result returned by the Darwin descriptor-bound replacement exchange. */
+export interface NativeDarwinReplacementResult {
+  ok: boolean
+  state: string
+  code?: string
+  phase: string
+  reason: string
+  parentFsync: boolean
+  source?: NativeDarwinReplacementIdentity
+  destination?: NativeDarwinReplacementIdentity
+  operationId: string
+}
+
 export interface NativeDirectoryParentIdentity {
   dev: bigint
   ino: bigint
@@ -1895,6 +1934,12 @@ export interface NotificationEndpoint {
   /** The session id this endpoint serves. */
   sessionId: string
 }
+
+/**
+ * Open the fixed owner-only Darwin replacement lock and retain its kernel
+ * authorization until the returned opaque object is closed or dropped.
+ */
+export declare function openDarwinReplacementAuth(parentPath: string, lockName: string): DarwinReplacementAuth
 
 /**
  * Acquire an immutable trusted-root descriptor. Linux is required; every

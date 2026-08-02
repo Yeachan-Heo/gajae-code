@@ -18,6 +18,7 @@ nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
 export const ComputerController = nativeBindings.ComputerController;
+export const DarwinReplacementAuth = nativeBindings.DarwinReplacementAuth;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
@@ -46,6 +47,7 @@ export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
 export const exactReplacePath = nativeBindings.exactReplacePath;
 export const exactRestore = nativeBindings.exactRestore;
 export const exactUnlink = nativeBindings.exactUnlink;
+export const exchangeDarwinManagedFile = nativeBindings.exchangeDarwinManagedFile;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;
@@ -74,6 +76,7 @@ export const matchesKey = nativeBindings.matchesKey;
 export const matchesKittySequence = nativeBindings.matchesKittySequence;
 export const matchesLegacySequence = nativeBindings.matchesLegacySequence;
 export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
+export const openDarwinReplacementAuth = nativeBindings.openDarwinReplacementAuth;
 export const openRecoveryFsRoot = nativeBindings.openRecoveryFsRoot;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
