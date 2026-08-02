@@ -2335,6 +2335,7 @@ function runGitResult(cwd: string, args: string[]): GitResult {
 		cwd,
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 	});
 	return {
 		ok: result.exitCode === 0,
@@ -2343,7 +2344,7 @@ function runGitResult(cwd: string, args: string[]): GitResult {
 	};
 }
 async function runGitResultAsync(cwd: string, args: string[], signal?: AbortSignal): Promise<GitResult> {
-	const result = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", windowsHide: true });
 	const kill = () => {
 		try {
 			result.kill("SIGKILL");
@@ -2422,6 +2423,7 @@ function branchExists(repoRoot: string, branchName: string): boolean {
 			cwd: repoRoot,
 			stdout: "ignore",
 			stderr: "ignore",
+			windowsHide: true,
 		}).exitCode === 0
 	);
 }
@@ -3184,6 +3186,7 @@ async function rollbackCreatedWorktrees(workers: GjcTeamWorker[]): Promise<void>
 				cwd: worker.worktree_repo_root,
 				stdout: "ignore",
 				stderr: "ignore",
+				windowsHide: true,
 			});
 }
 async function removeCleanCreatedWorktrees(workers: GjcTeamWorker[]): Promise<void> {
@@ -3193,6 +3196,7 @@ async function removeCleanCreatedWorktrees(workers: GjcTeamWorker[]): Promise<vo
 				cwd: worker.worktree_repo_root,
 				stdout: "ignore",
 				stderr: "ignore",
+				windowsHide: true,
 			});
 }
 

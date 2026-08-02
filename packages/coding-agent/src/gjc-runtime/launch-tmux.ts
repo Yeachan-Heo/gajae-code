@@ -689,6 +689,7 @@ function readCurrentBranch(cwd: string): string | null {
 			cwd,
 			stdout: "pipe",
 			stderr: "ignore",
+			windowsHide: true,
 		});
 		if (result.exitCode !== 0) return null;
 		const branch = result.stdout.toString().trim();

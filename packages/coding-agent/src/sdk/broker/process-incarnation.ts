@@ -40,7 +40,18 @@ export interface ProcessIncarnationOptions {
 
 function runProcessIncarnationCommand(command: string, args: readonly string[]): ProcessIncarnationCommandResult {
 	try {
-		const result = Bun.spawnSync([command, ...args], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+		// windowsHide: Windows 에서 이 경로는 PowerShell(콘솔 애플리케이션)을 스폰한다.
+		// 이 옵션이 없으면 CREATE_NO_WINDOW 가 빠져서 호출마다 콘솔 창이 실제로 뜬다.
+		// notification-service / telegram-daemon / lifecycle-control-runtime 이 PID 생사를
+		// 주기적으로 확인하므로, 세션이 여러 개면 몇 초에 한 번씩 화면에 창이 튄다
+		// (2026-08-02 실측: 세션 8개 · 30초에 콘솔 46개). Bun 의 windowsHide 는 손자에게
+		// 전파되지 않으므로 스폰 지점마다 개별로 걸어야 한다.
+		const result = Bun.spawnSync([command, ...args], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+			windowsHide: true,
+		});
 		return { exitCode: result.exitCode, stdout: Buffer.from(result.stdout).toString("utf8") };
 	} catch {
 		return undefined;

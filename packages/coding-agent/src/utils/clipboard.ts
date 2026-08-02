@@ -99,6 +99,7 @@ async function readImageViaPowerShell(): Promise<ClipboardImage | null> {
 			stdout: "pipe",
 			stderr: "ignore",
 			stdin: "ignore",
+			windowsHide: true,
 		});
 		const timer = setTimeout(() => proc.kill(), POWERSHELL_TIMEOUT_MS);
 		let stdout = "";

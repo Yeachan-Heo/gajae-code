@@ -221,6 +221,7 @@ async function startPowerShellRecording(outputPath: string): Promise<RecordingHa
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "ignore",
+		windowsHide: true,
 	});
 
 	proc.exited.then(() => {

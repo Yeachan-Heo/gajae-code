@@ -39,14 +39,14 @@ interface GitWorktreeEntry {
 const BRANCH_IN_USE_PATTERN = /already checked out|already used by worktree|is already checked out/i;
 
 function runGit(cwd: string, args: string[]): string {
-	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", windowsHide: true });
 	if (result.exitCode === 0) return result.stdout.toString().trim();
 	const stderr = result.stderr.toString().trim();
 	throw new Error(stderr || `git ${args.join(" ")} failed`);
 }
 
 function tryRunGit(cwd: string, args: string[]): string | null {
-	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", windowsHide: true });
 	return result.exitCode === 0 ? result.stdout.toString().trim() : null;
 }
 
@@ -72,6 +72,7 @@ function branchExists(repoRoot: string, branchName: string): boolean {
 		cwd: repoRoot,
 		stdout: "ignore",
 		stderr: "ignore",
+		windowsHide: true,
 	});
 	return result.exitCode === 0;
 }
@@ -81,6 +82,7 @@ function validateBranchName(repoRoot: string, branchName: string): void {
 		cwd: repoRoot,
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 	});
 	if (result.exitCode === 0) return;
 	const stderr = result.stderr.toString().trim();
@@ -376,7 +378,7 @@ export function ensureLaunchWorktree(
 	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
 	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
 
-	const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe", windowsHide: true });
 	if (result.exitCode !== 0) {
 		const stderr = result.stderr.toString().trim();
 		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);

@@ -240,6 +240,7 @@ export class CommandController {
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
+				windowsHide: true,
 			});
 			if ((await authProcess.exited) !== 0) {
 				this.ctx.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
@@ -271,6 +272,7 @@ export class CommandController {
 				stdout: "pipe",
 				stderr: "pipe",
 				signal: loader.signal,
+				windowsHide: true,
 			});
 			loader.onAbort = () => {
 				cancellationRequested = gistProcess.exitCode === null;
