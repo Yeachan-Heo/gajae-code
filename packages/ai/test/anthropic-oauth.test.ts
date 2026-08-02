@@ -328,6 +328,22 @@ describe("anthropic paste-a-code login", () => {
 		expect(new AnthropicOAuthFlow({}, { manualCode: true }).skipCallbackServer).toBe(true);
 	});
 
+	it("settles when the controller signal aborted before the wait started", async () => {
+		global.fetch = tokenResponseFetch(() => {}) as unknown as typeof fetch;
+		const controller = new AbortController();
+		controller.abort(new Error("user cancelled"));
+		const neverPasted = Promise.withResolvers<string>();
+
+		// An already-aborted signal never fires `abort`, and with no local listener
+		// nothing else could settle the login.
+		await expect(
+			new AnthropicOAuthFlow(
+				{ signal: controller.signal, onManualCodeInput: () => neverPasted.promise },
+				{ manualCode: true },
+			).login(),
+		).rejects.toThrow(/OAuth callback cancelled/);
+	});
+
 	it("pins the hosted redirect to a constant that no environment can rewrite", async () => {
 		global.fetch = tokenResponseFetch(() => {}) as unknown as typeof fetch;
 		let authorizeUrl = "";

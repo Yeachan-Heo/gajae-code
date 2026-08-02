@@ -48,7 +48,7 @@ export abstract class OAuthCallbackFlow {
 	callbackHostname: string;
 	callbackBindHostname: string;
 	redirectUri?: string;
-	skipCallbackServer: boolean;
+	readonly skipCallbackServer: boolean;
 	#callbackResolve?: (result: CallbackResult) => void;
 	#callbackReject?: (error: string) => void;
 
@@ -246,11 +246,19 @@ export abstract class OAuthCallbackFlow {
 			this.#callbackResolve = resolve;
 			this.#callbackReject = reject;
 
-			signal.addEventListener("abort", () => {
+			const cancel = () => {
 				this.#callbackResolve = undefined;
 				this.#callbackReject = undefined;
 				reject(new Error(`OAuth callback cancelled: ${signal.reason}`));
-			});
+			};
+			// A signal that already aborted never fires the event. With no local
+			// listener there would be nothing left to settle this promise, so the
+			// current state has to be checked too.
+			if (signal.aborted) {
+				cancel();
+				return;
+			}
+			signal.addEventListener("abort", cancel);
 		});
 
 		// Manual input race (if supported)
@@ -270,6 +278,10 @@ export abstract class OAuthCallbackFlow {
 							.catch((): CallbackResult | null => null),
 					]);
 					if (result) return result;
+					// Yield to the macrotask queue between attempts: a controller whose
+					// handler settles unusable values immediately must not starve the
+					// abort/timeout timer in a microtask loop.
+					await Bun.sleep(0);
 				}
 			})();
 
