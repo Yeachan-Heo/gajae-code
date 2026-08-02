@@ -8,7 +8,13 @@ import { loadMCPJsonFile } from "../../src/discovery/mcp-json";
 import * as mcpClient from "../../src/runtime-mcp/client";
 import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from "../../src/runtime-mcp/manager";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
-import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
+import type {
+	JsonRpcMessage,
+	MCPServerConfig,
+	MCPServerConnection,
+	MCPToolDefinition,
+	MCPTransport,
+} from "../../src/runtime-mcp/types";
 import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
 
 async function mkdtempExact(prefix: string): Promise<string> {
@@ -78,6 +84,38 @@ setInterval(() => {}, 1000);
 }
 
 describe("MCP manager lifecycle cleanup", () => {
+	test("does not republish cached deferred tools after shutdown during initial connect", async () => {
+		const cacheStarted = Promise.withResolvers<void>();
+		const releaseCache = Promise.withResolvers<void>();
+		const cachedTool: MCPToolDefinition = { name: "cached-tool", inputSchema: { type: "object" } };
+		const cache = {
+			get: async () => {
+				cacheStarted.resolve();
+				await releaseCache.promise;
+				return [cachedTool];
+			},
+			set: async () => {},
+		} as unknown as import("../../src/runtime-mcp/tool-cache").MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache);
+		const connectSpy = vi
+			.spyOn(mcpClient, "connectToServer")
+			.mockImplementation(async () => new Promise<MCPServerConnection>(() => {}));
+		let load: Promise<unknown> | undefined;
+		try {
+			load = manager.connectServers({ held: { type: "http", url: "http://127.0.0.1:1" } }, {}, undefined);
+			await cacheStarted.promise;
+			manager.shutdown();
+			releaseCache.resolve();
+			await load;
+			expect(connectSpy).toHaveBeenCalledTimes(1);
+			expect(manager.getTools()).toEqual([]);
+		} finally {
+			releaseCache.resolve();
+			if (load) await load.catch(() => undefined);
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
 	test("initial listTools failure closes transport and does not register server", async () => {
 		const manager = new MCPManager(process.cwd());
 		const result = await manager.connectServers(

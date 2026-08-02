@@ -572,7 +572,25 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 		expect(initializeResponse).toBeDefined();
 		expect(initializeResponse?.error).toBeUndefined();
 		expect(isRecord(initializeResponse?.result)).toBe(true);
-		expect(selected.outbound.some(frame => frame.method === "initialized")).toBe(true);
+		try {
+			await waitUntil(
+				() => {
+					records = parseTranscript(readFileSync(transcriptPath, "utf8"));
+					const current = selectedClientProcess(records);
+					if (!current) return false;
+					selected = current;
+					return current.outbound.some(frame => frame.method === "initialized");
+				},
+				frameTimeoutMs,
+				"the pinned T3 initialized notification",
+			);
+		} catch (error) {
+			if (!(error instanceof GateBlocked)) throw error;
+			throw new GateBlocked(error.message, {
+				...error.evidence,
+				...transcriptEvidence(transcriptPath, records, selected),
+			});
+		}
 		try {
 			await waitUntil(
 				() => {

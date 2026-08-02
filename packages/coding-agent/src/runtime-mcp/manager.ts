@@ -498,6 +498,7 @@ export class MCPManager {
 	): Promise<MCPLoadResult> {
 		const errors = new Map<string, string>();
 		const connectedServers = new Set<string>();
+		const publicationEpoch = this.#epoch;
 		const allTools: CustomTool<TSchema, MCPToolDetails>[] = [];
 		const reportedErrors = new Set<string>();
 		let allowBackgroundLogging = false;
@@ -847,7 +848,7 @@ export class MCPManager {
 		}
 
 		// Update cached tools
-		if (shouldPublishToolSnapshot) this.#tools = allTools;
+		if (shouldPublishToolSnapshot && !this.#shuttingDown && this.#epoch === publicationEpoch) this.#tools = allTools;
 		allowBackgroundLogging = true;
 
 		return {
