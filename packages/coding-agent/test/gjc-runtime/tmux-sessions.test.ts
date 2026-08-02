@@ -172,10 +172,25 @@ describe("GJC tmux session management", () => {
 
 	it("returns an empty list when tmux has no server", () => {
 		spyOn(Bun, "spawnSync").mockReturnValue(spawnResult(1, "", "no server running on /tmp/tmux"));
-		__setBinaryResolverForTests(() => null);
+		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? "C:\\tools\\tmux.exe" : null));
+		spyOn(Bun, "which").mockReturnValue("C:\\tools\\tmux.exe");
 		clearPsmuxDetectionCache();
 
 		expect(listGjcTmuxSessions()).toEqual([]);
+	});
+
+	it("reports provider-aware diagnostics before spawning when Windows has no multiplexer", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-sessions-test-"));
+		fixtureDirectories.push(stateDir);
+		__setTmuxProviderAuthorityPlatformForTests("win32");
+		__setBinaryResolverForTests(() => null);
+		spyOn(Bun, "which").mockReturnValue(null);
+		const spawnSyncSpy = spyOn(Bun, "spawnSync");
+
+		expect(() => listGjcTmuxSessions({ GJC_TMUX_OWNER_STATE_DIR: stateDir })).toThrow(
+			"gjc_tmux_provider_unavailable — GJC searched for psmux, pmux, and tmux on PATH.",
+		);
+		expect(spawnSyncSpy).not.toHaveBeenCalled();
 	});
 
 	it("guards status and remove to GJC-managed sessions", () => {
