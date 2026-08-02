@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import {
+	__stdinErrorDispatcherInstalledForTests,
+	__stdinErrorSubscriberCountForTests,
 	__stdoutErrorDispatcherInstalledForTests,
 	__stdoutErrorSubscriberCountForTests,
 	ProcessTerminal,
@@ -279,6 +281,77 @@ describe("terminal detach handling", () => {
 			writeSpy.mockRestore();
 			resumeSpy.mockRestore();
 			pauseSpy.mockRestore();
+		}
+	});
+	it("marks ProcessTerminal unavailable when stdin emits an async EIO", () => {
+		// A vanished PTY (tmux pane killed, SSH dropped) fails the in-flight stdin
+		// read with EIO. Without a listener the EventEmitter rethrows it as an
+		// uncaught exception that kills the whole agent process.
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				expect(terminal.available).toBe(true);
+				expect(() => {
+					process.stdin.emit("error", Object.assign(new Error("pty is gone"), { code: "EIO" }));
+				}).not.toThrow();
+				expect(terminal.available).toBe(false);
+				expect(() => terminal.write("after async error")).not.toThrow();
+			});
+		} finally {
+			expect(() => terminal.stop()).not.toThrow();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+		}
+	});
+	it("keeps stdin error listener armed briefly after stop and releases it afterwards", async () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const ambientListener = (): void => {};
+		process.stdin.on("error", ambientListener);
+		await Bun.sleep(300);
+		const listenersBeforeStart = new Set(process.stdin.listeners("error"));
+		const subscribersBeforeStart = __stdinErrorSubscriberCountForTests();
+		const dispatcherWasInstalled = __stdinErrorDispatcherInstalledForTests();
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				const listenersAfterStart = process.stdin.listeners("error");
+				const listenersAddedByStart = listenersAfterStart.filter(listener => !listenersBeforeStart.has(listener));
+				expect(listenersAddedByStart).toHaveLength(dispatcherWasInstalled ? 0 : 1);
+				expect(__stdinErrorDispatcherInstalledForTests()).toBe(true);
+				expect(__stdinErrorSubscriberCountForTests()).toBe(subscribersBeforeStart + 1);
+				terminal.stop();
+				expect(process.stdin.listeners("error")).toEqual(listenersAfterStart);
+				expect(() => {
+					process.stdin.emit("error", Object.assign(new Error("pty vanished after stop"), { code: "EIO" }));
+				}).not.toThrow();
+				expect(terminal.available).toBe(false);
+			});
+			await Bun.sleep(300);
+			expect(__stdinErrorSubscriberCountForTests()).toBe(subscribersBeforeStart);
+			expect(process.stdin.listeners("error")).toContain(ambientListener);
+			expect(__stdinErrorDispatcherInstalledForTests()).toBe(dispatcherWasInstalled);
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			process.stdin.removeListener("error", ambientListener);
 		}
 	});
 	it("keeps stdout error listener armed briefly after stop restore writes", async () => {
