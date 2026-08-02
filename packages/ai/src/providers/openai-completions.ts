@@ -1238,18 +1238,20 @@ async function createClient(
 	// in the IIFE.
 	// A caller may raise `StreamOptions.streamFirstEventTimeoutMs` for a slow-
 	// before-headers provider; respect it so the SDK doesn't give up before the
-	// wrapping watchdog arms. An explicit `0` disables the first-event watchdog,
+	// wrapping watchdog arms. Provider-specific fallbacks apply only when the
+	// caller does not pin a value, so an explicit nonzero override must beat that
+	// fallback even when it is shorter. An explicit `0` disables the watchdog,
 	// and the SDK treats `timeout: 0` as an immediate timeout, so do not pass a
 	// request timeout in that case.
-	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(
-		getOpenAIStreamIdleTimeoutMs(),
-		getProviderFirstEventTimeoutFallbackMs(model.provider),
-	);
+	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
+	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(getOpenAIStreamIdleTimeoutMs(), providerFirstEventFallbackMs);
 	const sdkTimeoutMs =
 		streamFirstEventTimeoutOverride === 0
 			? undefined
 			: streamFirstEventTimeoutOverride !== undefined
-				? Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride)
+				? providerFirstEventFallbackMs !== undefined
+					? streamFirstEventTimeoutOverride
+					: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride)
 				: envSdkTimeoutMs;
 	return {
 		client: new OpenAI({

@@ -443,6 +443,38 @@ describe("OpenAI-family first-event timeouts", () => {
 		});
 	});
 
+	it("honors a shorter Alibaba completions caller timeout before response headers", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: undefined }, async () => {
+			let fetchAttempts = 0;
+			const delayedFetch = createDelayedFetch(60_000, () =>
+				createOpenAICompletionsSuccessResponse(alibabaOpenAICompletionsModel.id),
+			);
+			global.fetch = Object.assign(
+				async (input: string | URL | Request, init?: RequestInit) => {
+					fetchAttempts++;
+					return delayedFetch(input, init);
+				},
+				{ preconnect: originalFetch.preconnect },
+			);
+
+			const pending = streamOpenAICompletions(alibabaOpenAICompletionsModel, baseContext(), {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+				streamFirstEventTimeoutMs: 5_000,
+			}).result();
+			await flushMicrotasks();
+			vi.advanceTimersByTime(5_000);
+			await flushMicrotasks(100);
+			const result = await pending;
+
+			expect(fetchAttempts).toBe(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("OpenAI completions stream timed out while waiting for the first event");
+			expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		});
+	});
+
 	it("normalizes an Alibaba completions SDK setup timeout as a typed first-event timeout", async () => {
 		vi.useFakeTimers();
 		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: "5000" }, async () => {
