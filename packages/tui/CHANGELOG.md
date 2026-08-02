@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `Ctrl+J` now inserts a newline when multiplexers such as Herdr forward it through Kitty CSI-u or xterm `modifyOtherKeys`, matching the existing legacy line-feed behavior and displayed shortcut.
+
 ## [0.12.8] - 2026-08-02
 ### Fixed
 

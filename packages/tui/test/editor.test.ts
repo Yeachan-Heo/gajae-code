@@ -707,6 +707,20 @@ describe("Editor component", () => {
 			}
 		});
 
+		it("inserts a newline for Ctrl+J enhanced keyboard protocol variants", () => {
+			const variants = ["\x1b[106;5u", "\x1b[106;5:1u", "\x1b[106;5:2u", "\x1b[27;5;106~"];
+
+			for (const variant of variants) {
+				const editor = new Editor(defaultEditorTheme);
+
+				editor.handleInput("a");
+				editor.handleInput(variant);
+				editor.handleInput("b");
+
+				expect(editor.getText()).toBe("a\nb");
+			}
+		});
+
 		it("inserts a newline for Ctrl+Shift+Enter terminal protocol variants", () => {
 			const variants = ["\x1b[13;6u", "\x1b[27;6;13~", "\x1b[13;6~", "\x1b[13;2~", "\x1b[13;2u"];
 

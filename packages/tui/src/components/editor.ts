@@ -1366,6 +1366,7 @@ export class Editor implements Component, Focusable {
 		}
 		// New line
 		else if (
+			matchesKey(data, "ctrl+j") || // Ctrl+J (Kitty/modifyOtherKeys)
 			(data.charCodeAt(0) === 10 && data.length > 1) || // Ctrl+Enter with modifiers
 			matchesKey(data, "ctrl+enter") || // Ctrl+Enter (Kitty/modifyOtherKeys, including lock bits/keypad Enter)
 			matchesKey(data, "ctrl+shift+enter") || // Ctrl+Shift+Enter (Kitty/modifyOtherKeys combined modifier)
