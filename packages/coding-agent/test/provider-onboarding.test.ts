@@ -351,6 +351,7 @@ describe("provider onboarding setup core", () => {
 
 	it("stores literal keys in AuthStorage instead of models.yml", async () => {
 		const modelsPath = await tempModelsPath();
+		setAgentDir(tempRoot!);
 		await addApiCompatibleProvider({
 			compatibility: "openai",
 			providerId: "literal-key-provider",
@@ -361,14 +362,20 @@ describe("provider onboarding setup core", () => {
 		});
 		const text = await Bun.file(modelsPath).text();
 		expect(text).not.toContain("literal-secret");
-		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+		const parsed = YAML.parse(text) as { providers: Record<string, { apiKeyStored?: true }> };
+		expect(parsed.providers["literal-key-provider"]?.apiKeyStored).toBe(true);
+		const authStorage = await AuthStorage.create(getAgentDbPath());
 		try {
-			expect(store.listAuthCredentials("literal-key-provider")[0]?.credential).toEqual({
+			expect(authStorage.get("literal-key-provider")).toEqual({
 				type: "api_key",
 				key: "literal-secret",
 			});
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.find("literal-key-provider", "example-model")).toBeDefined();
+			expect(await registry.getApiKeyForProvider("literal-key-provider")).toBe("literal-secret");
 		} finally {
-			store.close();
+			authStorage.close();
 		}
 	});
 

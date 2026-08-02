@@ -331,6 +331,7 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		} finally {
 			authStorage.close();
 		}
+		provider.apiKeyStored = true;
 	}
 	const next: ModelsConfig = {
 		...existing,
