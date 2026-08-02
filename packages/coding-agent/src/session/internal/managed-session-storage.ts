@@ -9,6 +9,7 @@ import {
 	exactReplacePath,
 	exactRestore,
 	exactUnlink,
+	linkNoReplacePath,
 	type NativeDirectoryTreeSnapshot,
 	type NativeOwnerOnlySecurityResult,
 	openRecoveryFsRoot,
@@ -112,6 +113,21 @@ class ManagedTreeMoveOutcomeError extends Error {
 /** Cleanup is safe only when the native move reports that it did not commit. */
 export function mayCleanManagedTreeStaging(error: unknown): boolean {
 	return !(error instanceof ManagedTreeMoveOutcomeError) || error.stagingCleanupSafe;
+}
+
+/**
+ * A filesystem that implements no `renameat2` rename flag at all rejects the no-replace publish
+ * before mutating anything: NFS answers `EINVAL` (`invalid_request`) and kernels older than 3.15
+ * answer `ENOSYS` (`atomic_unavailable`). Only those two pre-mutation outcomes authorize the
+ * `linkat` stand-in; every other failure describes a publish that was actually attempted, and
+ * retrying it under a different primitive could publish twice.
+ */
+export function renameFlagsUnsupported(outcome: NativePublishOutcome): boolean {
+	return (
+		!outcome.ok &&
+		mayCleanCurrentStaging(outcome) &&
+		(outcome.reason === "atomic_unavailable" || outcome.reason === "invalid_request")
+	);
 }
 
 export type ManagedSessionSecurityPolicy = "default" | "windows-existing-verify-first";
@@ -1580,6 +1596,7 @@ export async function publishManagedFileNoReplace(
 	let failure: unknown;
 	let outcome: NativePublishOutcome | undefined;
 	let renameAttempted = false;
+	let linkPublished = false;
 
 	try {
 		assertOwned?.();
@@ -1599,6 +1616,16 @@ export async function publishManagedFileNoReplace(
 
 		renameAttempted = true;
 		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
+		if (renameFlagsUnsupported(outcome)) {
+			// linkat publishes the destination without consuming the staging name, so the
+			// secured staging descriptor stays authoritative across publication exactly as
+			// it does across a rename. The staging link is removed in the finally block
+			// below, after that descriptor is closed: unlinking a still-open name on NFS
+			// silly-renames it instead of removing it, which would leave a second link on
+			// the published inode.
+			outcome = classifyNativePublishOutcome(linkNoReplacePath(staging, destination));
+			linkPublished = outcome.ok;
+		}
 
 		if (!outcome.ok) throw publishFailure(outcome);
 
@@ -1621,7 +1648,7 @@ export async function publishManagedFileNoReplace(
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 
-		if (stagingIdentity && (!renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
+		if (stagingIdentity && (linkPublished || !renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 			await fsp
 				.lstat(staging, { bigint: true })
 				.then(stat => {
@@ -1649,6 +1676,7 @@ export function publishManagedFileNoReplaceSync(
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
 	let failure: unknown;
 	let outcome: NativePublishOutcome | undefined;
+	let linkPublished = false;
 
 	try {
 		fd = fs.openSync(
@@ -1665,6 +1693,12 @@ export function publishManagedFileNoReplaceSync(
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 
 		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
+		if (renameFlagsUnsupported(outcome)) {
+			// See publishManagedFileNoReplace: the staging link outlives this publication
+			// and is removed only after the secured descriptor is closed.
+			outcome = classifyNativePublishOutcome(linkNoReplacePath(staging, destination));
+			linkPublished = outcome.ok;
+		}
 		if (!outcome.ok) throw publishFailure(outcome);
 
 		const named = fs.lstatSync(destination, { bigint: true });
@@ -1680,7 +1714,7 @@ export function publishManagedFileNoReplaceSync(
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 	}
-	if (stagingIdentity && outcome && mayCleanCurrentStaging(outcome)) {
+	if (stagingIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome)))) {
 		try {
 			const named = fs.lstatSync(staging, { bigint: true });
 			if (named.dev !== stagingIdentity.dev || named.ino !== stagingIdentity.ino) {

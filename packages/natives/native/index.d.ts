@@ -1465,6 +1465,20 @@ export interface LineDiffPart {
 }
 
 /**
+ * Publish a staged regular file under a destination name that must not already
+ * exist, using `linkat(2)` instead of a rename flag. This is the stand-in for
+ * `rename_no_replace_path` on filesystems that implement no rename flag at all
+ * (NFS answers `EINVAL`, pre-3.15 kernels `ENOSYS`), and it carries the same
+ * no-overwrite guarantee because `linkat` fails with `EEXIST`.
+ *
+ * The source name survives the call. Callers holding a descriptor on the
+ * staged object must keep it across this publication and unlink the staging
+ * name only after releasing it: NFS silly-renames a still-open name instead of
+ * removing it, leaving a second link on the published inode.
+ */
+export declare function linkNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
+
+/**
  * Walk the workspace once and return tree entries plus AGENTS.md candidates.
  *
  * File-level ignore rules for AGENTS.md are bypassed by checking each

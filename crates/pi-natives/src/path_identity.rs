@@ -946,6 +946,33 @@ pub fn rename_no_replace_path(
 	))
 }
 
+/// Publish a staged regular file under a destination name that must not already
+#[cfg_attr(clippy, doc = "")]
+/// exist, using `linkat(2)` instead of a rename flag. This is the stand-in for
+/// `rename_no_replace_path` on filesystems that implement no rename flag at all
+/// (NFS answers `EINVAL`, pre-3.15 kernels `ENOSYS`), and it carries the same
+/// no-overwrite guarantee because `linkat` fails with `EEXIST`.
+///
+/// The source name survives the call. Callers holding a descriptor on the
+/// staged object must keep it across this publication and unlink the staging
+/// name only after releasing it: NFS silly-renames a still-open name instead of
+/// removing it, leaving a second link on the published inode.
+#[napi]
+pub fn link_no_replace_path(
+	source_path: String,
+	destination_path: String,
+) -> NativeNoReplaceResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure(
+			"invalid_request",
+		));
+	}
+	NativeNoReplaceResult::from_exact(platform::link_path_no_replace(
+		Path::new(&source_path),
+		Path::new(&destination_path),
+	))
+}
+
 /// Capture a deterministic, descriptor-relative snapshot of a regular-file and
 /// directory-only tree. Symlinks, special files, non-UTF-8 names, and topology
 /// changes are rejected rather than followed.
@@ -3530,6 +3557,110 @@ pub(crate) mod platform {
 		}
 	}
 
+	/// No-overwrite publish of a regular file for filesystems that implement no
+	/// `renameat2`/`renameatx_np` rename flag at all. NFS rejects every flag
+	/// with `EINVAL` and kernels older than 3.15 answer `ENOSYS`;
+	/// `rename_path_no_replace` reports those as `invalid_request` and
+	/// `atomic_unavailable`, and this is the stand-in the caller may then use.
+	/// `linkat(2)` fails with `EEXIST` when the destination name already
+	/// exists, so the no-overwrite guarantee is identical on every POSIX
+	/// filesystem: the fallback preserves — never weakens — no-replace
+	/// authority.
+	///
+	/// Unlike a rename this leaves the source name in place, and that asymmetry
+	/// is deliberate. The caller keeps whatever descriptor authority it holds
+	/// over the staged object across publication and removes the staging link
+	/// itself once that authority has been released. Unlinking a still-open
+	/// name on NFS silly-renames it to `.nfsXXXX` rather than removing it,
+	/// which would leave a second link on the published inode, so only the
+	/// caller can order the two steps correctly.
+	///
+	/// Directories are rejected before the syscall: `linkat` cannot hard-link a
+	/// directory, and reporting that as an identity violation keeps a directory
+	/// publish from silently degrading into a partial one.
+	pub(super) fn link_path_no_replace(
+		source_path: &Path,
+		destination_path: &Path,
+	) -> NativeExactUnlinkResult {
+		let (source_parent, source_name) = match open_parent_no_follow(source_path) {
+			Ok(value) => value,
+			Err(result) => return *result,
+		};
+		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
+			Ok(value) => value,
+			Err(result) => {
+				// SAFETY: open_parent_no_follow returned this owned, live descriptor; this
+				// error branch transfers it nowhere and closes it exactly once before
+				// returning.
+				unsafe { libc::close(source_parent) };
+				return *result;
+			},
+		};
+		let result = link_no_replace(
+			source_parent,
+			source_name.as_c_str(),
+			destination_parent,
+			&destination_name,
+		);
+		// SAFETY: both descriptors are owned by this function, remained live through
+		// the fstatat/linkat calls, and are each closed exactly once after them.
+		unsafe {
+			libc::close(source_parent);
+			libc::close(destination_parent);
+		}
+		match result {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			Err(code) => NativeExactUnlinkResult::failure(code),
+		}
+	}
+
+	fn link_no_replace(
+		source_parent_fd: libc::c_int,
+		source: &std::ffi::CStr,
+		destination_parent_fd: libc::c_int,
+		destination: &CString,
+	) -> Result<(), &'static str> {
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut staged: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the descriptor and CStr are live; the initialized output struct is
+		// writable.
+		if unsafe {
+			libc::fstatat(source_parent_fd, source.as_ptr(), &mut staged, libc::AT_SYMLINK_NOFOLLOW)
+		} != 0
+		{
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		if staged.st_mode & libc::S_IFMT != libc::S_IFREG {
+			return Err("identity_mismatch");
+		}
+		// SAFETY: both parents own valid fds and both names are live NUL-terminated
+		// strings for this syscall; flags are 0, so the source is linked as-is and
+		// never resolved through a symlink.
+		if unsafe {
+			libc::linkat(
+				source_parent_fd,
+				source.as_ptr(),
+				destination_parent_fd,
+				destination.as_ptr(),
+				0,
+			)
+		} == 0
+		{
+			return Ok(());
+		}
+		Err(match std::io::Error::last_os_error().raw_os_error() {
+			Some(libc::EEXIST) => "already_exists",
+			Some(libc::EXDEV) => "cross_device",
+			// A filesystem without hard links reports EPERM for a valid request, which
+			// is indistinguishable here from a denied one; both leave the destination
+			// unpublished.
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::ENOENT) => "not_found",
+			Some(libc::EINTR) => "interrupted",
+			_ => "io_error",
+		})
+	}
+
 	pub(super) fn exact_restore(
 		detached_path: &Path,
 		original_path: &Path,
@@ -5513,6 +5644,13 @@ mod platform {
 		}
 	}
 
+	/// Windows implements no-replace renames natively, so the POSIX hard-link
+	/// stand-in is never requested here and is reported as unavailable rather
+	/// than emulated.
+	pub(super) fn link_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("atomic_unavailable")
+	}
+
 	pub(super) fn rename_path_no_replace(
 		source_path: &Path,
 		destination_path: &Path,
@@ -7037,6 +7175,9 @@ mod platform {
 	pub(super) fn rename_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
 	}
+	pub(super) fn link_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("atomic_unavailable")
+	}
 	pub(super) fn exact_unlink(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
@@ -8464,6 +8605,120 @@ mod exact_unlink_placeholder_tests {
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 }
+/// The `linkat` stand-in for `renameat2(RENAME_NOREPLACE)` used on filesystems
+/// that implement no rename flag at all. These run on any POSIX filesystem: the
+/// point is that the fallback's no-overwrite guarantee and its refusal to touch
+/// a directory hold everywhere, not only on the NFS mount that needs it.
+#[cfg(all(test, unix))]
+mod link_no_replace_tests {
+	use std::{
+		fs,
+		os::unix::fs::MetadataExt,
+		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{link_no_replace_path, rename_no_replace_path};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-link-no-replace-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			fs::create_dir(&path).expect("create link no-replace temp directory");
+			Self(path)
+		}
+
+		fn join(&self, name: &str) -> String {
+			self.0.join(name).to_string_lossy().into_owned()
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	/// The staging name deliberately survives publication. That asymmetry with
+	/// `renameat2` is what lets a caller holding a descriptor on the staged
+	/// object keep it across publication and unlink the staging name only after
+	/// releasing it — the ordering NFS silly-renaming makes mandatory.
+	#[test]
+	fn link_no_replace_publishes_the_destination_and_keeps_the_staging_name() {
+		let temporary = TempDir::new();
+		fs::write(temporary.0.join("staging"), b"payload").expect("seed staging");
+
+		let published = link_no_replace_path(temporary.join("staging"), temporary.join("published"));
+
+		assert!(published.ok, "publish must commit: {:?}", published.code);
+		assert_eq!(published.reason, "none");
+		assert_eq!(published.mutation_state, "committed");
+		assert_eq!(
+			fs::read(temporary.0.join("published")).expect("read published"),
+			b"payload",
+			"the destination must carry the staged bytes"
+		);
+		let staged = fs::metadata(temporary.0.join("staging")).expect("staging survives publication");
+		let destination = fs::metadata(temporary.0.join("published")).expect("stat published");
+		assert_eq!(
+			(staged.dev(), staged.ino()),
+			(destination.dev(), destination.ino()),
+			"the destination must be a link to the staged inode, not a copy"
+		);
+	}
+
+	/// The guarantee the fallback exists to preserve: `linkat` reports `EEXIST`
+	/// exactly where `renameat2(RENAME_NOREPLACE)` reports it, so standing in
+	/// for the missing primitive never authorizes an overwrite.
+	#[test]
+	fn link_no_replace_refuses_an_occupied_destination_exactly_as_rename_does() {
+		let temporary = TempDir::new();
+		fs::write(temporary.0.join("staging"), b"payload").expect("seed staging");
+		fs::write(temporary.0.join("occupied"), b"existing").expect("seed destination");
+
+		let linked = link_no_replace_path(temporary.join("staging"), temporary.join("occupied"));
+		let renamed = rename_no_replace_path(temporary.join("staging"), temporary.join("occupied"));
+
+		assert!(!linked.ok, "an occupied destination must never be published over");
+		assert_eq!(linked.reason, "destination_exists");
+		assert_eq!(linked.mutation_state, "not_committed");
+		assert_eq!(
+			linked.reason, renamed.reason,
+			"the fallback must classify an occupied destination exactly as the primitive it replaces"
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("occupied")).expect("read destination"),
+			b"existing",
+			"the occupying file must be left untouched"
+		);
+	}
+
+	/// `linkat` cannot hard-link a directory. Rejecting one before the syscall
+	/// keeps a directory publish from silently degrading into a partial one.
+	#[test]
+	fn link_no_replace_refuses_a_directory_source() {
+		let temporary = TempDir::new();
+		fs::create_dir(temporary.0.join("tree")).expect("seed directory source");
+
+		let linked = link_no_replace_path(temporary.join("tree"), temporary.join("published"));
+
+		assert!(!linked.ok, "a directory source must never be published through linkat");
+		assert_eq!(linked.reason, "identity_violation");
+		assert_eq!(linked.mutation_state, "not_committed");
+		assert!(
+			!temporary.0.join("published").exists(),
+			"a rejected directory publish must leave no destination behind"
+		);
+	}
+}
+
 #[cfg(test)]
 mod sha256_tests {
 	use std::io::{self, Read};

@@ -9,6 +9,7 @@ import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
+	renameFlagsUnsupported,
 	retainManagedDirectoryAuthority,
 	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
@@ -51,6 +52,63 @@ describe("native publish outcome classification", () => {
 					...preMutation,
 					mutationState: "committed",
 					durabilityState: "not_provable",
+				}),
+			),
+		).toBe(false);
+	});
+
+	// A filesystem that implements no renameat2 rename flag rejects the publish
+	// before mutating anything, and only then may the caller retry under linkat.
+	// Retrying any other failure could publish the same staged object twice, so
+	// this gate is the whole safety argument for the fallback.
+	it("authorizes the linkat fallback only for pre-mutation missing-primitive envelopes", () => {
+		for (const reason of ["atomic_unavailable", "invalid_request"] as const) {
+			expect(
+				renameFlagsUnsupported(
+					classifyNativePublishOutcome({
+						...preMutation,
+						reason,
+						code: reason,
+						phase: reason === "invalid_request" ? "preflight" : "rename",
+					}),
+				),
+			).toBe(true);
+		}
+
+		// Every other pre-mutation reason is a real answer from a working
+		// primitive, not evidence that the primitive is missing. Retrying those
+		// under linkat would re-ask a question already answered, and for reasons
+		// whose namespace effect is not provable it could publish twice.
+		for (const [reason, code] of [
+			["destination_exists", "already_exists"],
+			["cross_device", "cross_device"],
+			["permission_denied", "permission_denied"],
+			["io_failure", "io_error"],
+			["interrupted", "interrupted"],
+		] as const) {
+			expect(renameFlagsUnsupported(classifyNativePublishOutcome({ ...preMutation, reason, code }))).toBe(false);
+		}
+
+		// An envelope this build cannot validate is never a fallback candidate.
+		expect(
+			renameFlagsUnsupported(
+				classifyNativePublishOutcome({
+					...preMutation,
+					diagnostic: { schemaVersion: 1, collectionState: "complete", path: "/secret" },
+				}),
+			),
+		).toBe(false);
+
+		// A publish that already succeeded is not a candidate for any fallback.
+		expect(
+			renameFlagsUnsupported(
+				classifyNativePublishOutcome({
+					...preMutation,
+					ok: true,
+					code: undefined,
+					reason: "none",
+					mutationState: "committed",
+					phase: "complete",
 				}),
 			),
 		).toBe(false);

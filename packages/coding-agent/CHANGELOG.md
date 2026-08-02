@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Managed session publication now works on filesystems that implement no `renameat2` rename flags at all. NFS rejects both `RENAME_NOREPLACE` and `RENAME_EXCHANGE` with `EINVAL`, so publishing a migration receipt failed the whole resume with `Could not open managed session: invalid_request`. The no-replace publish now falls back to `linkat(2)`, which fails with `EEXIST` on an occupied destination and therefore carries the identical no-overwrite guarantee; the fallback is authorized only by a pre-mutation missing-primitive outcome, so a publish that may have committed is never retried under a second primitive. The staged descriptor is retained across publication and the staging link is removed only after it is released, because unlinking a still-open name on NFS silly-renames it and would leave a second link on the published inode.
 - Settings now requests a repaint after asynchronous GJC bundle and plugin views rebuild, so loaded content and mutation results appear without an extra keypress (#3643).
 - `todo_write` now rejects unsupported operation keys and treats a bare `done` or `drop` as an error instead of completing or abandoning every task (#3640).
 - Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
