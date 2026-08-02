@@ -1554,6 +1554,53 @@ test("CLI setup reports atomic persistence failure without an enabled success me
 	});
 });
 
+test("CLI setup reports a save when the durable identity landed before the failure", async () => {
+	// Regression for the field failure in #3761: the commit applies the new identity and then
+	// throws, so the code path never reaches its `settingsCommitted` flag while `notify status`
+	// already reports the new bot. The wording must follow the durable state, not the flag.
+	const settings = setupSettings({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "prior-token",
+		"notifications.telegram.chatId": "prior-chat",
+	});
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
+			for (const patch of patches) {
+				if (patch.op === "set") settings.set(patch.path, patch.value as never);
+				else settings.unset(patch.path);
+			}
+			throw new Error("Telegram daemon provisional ownership could not be retired safely");
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{ action: "setup", rawArgs: [] },
+			{
+				settings,
+				fetchImpl,
+				setupToken: token,
+				setupChatId: "999",
+				setupInteractive: false,
+				setupPreflight: {},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("settings were saved, but activation or recovery failed");
+	expect(stderr).not.toContain("Unable to persist");
+	expect(`${stdout}\n${stderr}`).not.toContain(token);
+	expect(stdout).not.toContain("Notifications enabled.");
+	// The reported wording matches what a follow-up `notify status` would show.
+	expect(getNotificationConfig(settings)).toMatchObject({ enabled: true, botToken: token, chatId: "999" });
+});
+
 describe("notify daemon-internal lightweight startup", () => {
 	function tempAgentDir(): string {
 		return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-daemon-agent-"));

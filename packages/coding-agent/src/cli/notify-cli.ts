@@ -534,8 +534,13 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		receipt.discard();
 	} catch (error) {
 		const detail = sanitizeDiagnostic(error instanceof Error ? error.message : "unknown persistence failure", token);
+		// The wording must describe what a follow-up `notify status` will show. A failure
+		// raised after the durable write landed — including one raised from inside the
+		// commit itself — must not claim the settings were not persisted, or the operator
+		// walks away believing Telegram is off while the daemon is armed for that token.
+		const persisted = settingsCommitted || telegramIdentityIsPersisted(settings, token.trim(), result.chatId);
 		throw new Error(
-			settingsCommitted
+			persisted
 				? `Telegram notification settings were saved, but activation or recovery failed: ${detail}`
 				: `Unable to persist and activate Telegram notification settings: ${detail}`,
 		);
@@ -543,6 +548,20 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 	process.stdout.write(
 		`Notifications enabled. botToken=${maskToken(token)} chatId=${result.chatId} threaded=${result.threadedLabel}\n`,
 	);
+}
+
+/**
+ * Whether the durable settings already carry the Telegram identity this setup run
+ * attempted to write. Used to describe a setup failure by observed state instead of by
+ * how far the code path got, so the reported wording can never contradict `notify status`.
+ */
+function telegramIdentityIsPersisted(settings: Settings, botToken: string, chatId: string): boolean {
+	try {
+		const cfg = getNotificationConfig(settings);
+		return cfg.botToken === botToken && cfg.chatId === chatId;
+	} catch {
+		return false;
+	}
 }
 
 function proposedIdentityFromSetupPreflight(
