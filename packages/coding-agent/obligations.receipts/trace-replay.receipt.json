@@ -8,7 +8,7 @@
 	],
 	"cwd": ".",
 	"exitCode": 0,
-	"treeHash": "4a3460865aa1ce5d34ca6649222b28dffb4d8397b8edf22a8630bce0d5043a95",
+	"treeHash": "e3c5c3b45bb07a177d866893f6a958fa1f63513e59c87bb4951956edc25043dc",
 	"artifacts": [
 		{
 			"path": "obligations.artifacts/trace-replay/stdout.txt",
