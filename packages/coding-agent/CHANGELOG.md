@@ -8,15 +8,12 @@
 ### Added
 
 - Notification settings now expose first-class Telegram, Discord, and Slack configuration, desired-intent toggles, provider-local quarantine and repair guidance, explicit `keep | replace | remove` secret actions, provider-specific health/test diagnostics, and truthful saved-but-runtime-degraded outcomes. The global master preserves provider credentials and intent, `GJC_NOTIFICATIONS=0` suppresses only automatic generic-session admission, and blocked Telegram ownership uses an isolated chat-only endpoint so verified Discord or Slack siblings can continue without exposing the shared endpoint.
-- `/import-session codex [session-id ...]` imports selected Codex histories, or every Codex history bound to the current workspace when IDs are omitted, into resumable native v5 sessions. Imports stream through bounded sanitization and quarantine, preserve source provenance, publish atomically and idempotently, support transcripts above 64 MiB through memory-guard checkpointing, and remain unavailable to ACP/remote clients.
 
 ### Fixed
 
 - Ordinary `ask` selectors now bound long question premises and page through every premise row without skipping rows hidden by overflow indicators (#3675).
 - First-event timeout retries now require a typed, content-free failure from the current clean attempt scope, preventing prior or stale extension activity from suppressing or admitting a later request (#3553).
-- Managed session preparation now preserves native `content_too_large` storage failures as `artifact_capacity_exceeded` instead of misreporting `binding_invalid: prepare:store`.
 - The issue-1979 Korean prose wrap test now cleans up inherited multiplexer env vars (`TMUX`, `TMUX_PANE`, etc.) so it deterministically exercises the plain-terminal render path regardless of the CI runner's terminal session (#1979).
-- The SDK operation inventory now classifies the local-only `/import-session` seam as a locked exclusion and regenerates the committed matrix, fixing the shard-5 `accepts the committed generated matrix` gate failure introduced by the Codex import command (#3714).
 - The model selector's assignment menu now shows the model each role currently resolves to (`Set as EXECUTOR (Executor) — now: anthropic/claude-haiku-4-5`), distinguishing an unset default, a role that inherits the default, and a configured-but-unresolvable selector. Previously the role rows were unlabeled, so the only way to learn a role's model was to scan the whole 800+ entry model list for role badges.
 ## [0.12.7] - 2026-07-31
 

@@ -43,7 +43,6 @@ export type ResolveManagedSessionScopeResult =
 				| "atomic_unavailable"
 				| "durability_not_provable"
 				| "durability_failed"
-				| "artifact_capacity_exceeded"
 				| "invalid_request";
 			message: string;
 	  };

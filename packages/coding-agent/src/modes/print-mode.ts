@@ -9,7 +9,6 @@ import { type AssistantMessage, type ImageContent, isContextOverflow } from "@ga
 import { isKnownSinkPeerClosedError, logger, sanitizeText } from "@gajae-code/utils";
 import type { AgentSession } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
-import { executeLocalHeadlessBuiltinSlashCommand } from "../slash-commands/builtin-registry";
 import { initializeExtensions } from "./runtime-init";
 
 /**
@@ -197,8 +196,6 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	const stdout = createPrintStdoutOwner();
 	const failures: unknown[] = [];
 	let unsubscribe: (() => void) | undefined;
-	let submittedPrompt = false;
-	let consumedCommand = false;
 
 	try {
 		// Emit session header for JSON mode.
@@ -226,45 +223,19 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				stdout.write(`${JSON.stringify(event)}\n`);
 			});
 		}
-		const submitInput = async (text: string, images?: ImageContent[]): Promise<void> => {
-			if (text.startsWith("/")) {
-				const command = await executeLocalHeadlessBuiltinSlashCommand(text, {
-					session,
-					sessionManager: session.sessionManager,
-					settings: session.settings,
-					cwd:
-						typeof session.sessionManager.getCwd === "function" ? session.sessionManager.getCwd() : process.cwd(),
-					output: value =>
-						stdout.write(
-							mode === "json"
-								? `${JSON.stringify({ type: "local_command_output", command: text.split(/\s/u, 1)[0], output: value })}\n`
-								: `${value}\n`,
-						),
-					refreshCommands: () => {},
-					reloadPlugins: async () => {},
-				});
-				if (command !== false && "consumed" in command) {
-					consumedCommand = true;
-					if (command.exitCode !== undefined && !options.suppressProcessExit) process.exitCode = command.exitCode;
-					return;
-				}
-				if (command !== false) text = command.prompt;
-			}
-			submittedPrompt = true;
-			await session.prompt(text, images ? { images } : undefined);
-		};
 
-		// Send the initial input and remaining inputs, dispatching only commands
-		// explicitly authorized for trusted local headless mode.
+		// Send initial message with attachments.
 		if (initialMessage !== undefined) {
-			await logger.time("print:prompt:initial", () => submitInput(initialMessage, initialImages));
+			await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
 		}
+
+		// Send remaining messages.
 		for (const message of messages) {
-			await logger.time("print:prompt:next", () => submitInput(message));
+			await logger.time("print:prompt:next", () => session.prompt(message));
 		}
 
 		// In text mode, output final response.
-		if (mode === "text" && (!consumedCommand || submittedPrompt)) {
+		if (mode === "text") {
 			const lastMessage = session.state.messages.findLast(message => message.role === "assistant");
 			if (lastMessage?.role === "assistant") {
 				const assistantMsg = lastMessage as AssistantMessage;
