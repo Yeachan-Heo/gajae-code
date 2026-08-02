@@ -12,6 +12,7 @@ import {
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
+	type BrokerPublicationObservation,
 	brokerDiscoveryPath,
 	brokerProcessIncarnation,
 	heartbeatBrokerDiscoveryRetained,
@@ -396,6 +397,14 @@ type BrokerLockSnapshot = {
 
 const BROKER_PUBLICATION_CADENCE_MS = 5_000;
 const BROKER_PUBLICATION_GRACE_MS = 15_000;
+// A broker that cannot observe its own publication is not provably the root, but
+// ambiguity is also not proof of replacement, so it must not be treated as a
+// `lost-root` immediately. It must still be bounded: an indefinitely ambiguous
+// broker stops heartbeating, so peers discover it as stale and spawn replacements
+// while it keeps its port and memory forever. Ambiguity therefore accrues against
+// its own deadline, generous enough to absorb transient filesystem faults and far
+// longer than the loss grace.
+const BROKER_AMBIGUITY_GRACE_MS = 120_000;
 const BROKER_SETTLEMENT_MS = 2_000;
 type BrokerPublicationState =
 	| "healthy-owned"
@@ -406,6 +415,8 @@ type BrokerPublicationState =
 type BrokerStopMode = "owned-root" | "lost-root";
 
 const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
+const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
+const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 
 export class Broker {
 	readonly settings: ResolvedBrokerSettings;
@@ -419,6 +430,7 @@ export class Broker {
 	#publication: RetainedBrokerDiscovery | null = null;
 	#publicationState: BrokerPublicationState = "healthy-owned";
 	#lossAt: bigint | null = null;
+	#ambiguousAt: bigint | null = null;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
@@ -565,6 +577,7 @@ export class Broker {
 		this.#stopping = false;
 		this.#publicationState = "healthy-owned";
 		this.#lossAt = null;
+		this.#ambiguousAt = null;
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
 		for (;;) {
@@ -648,16 +661,35 @@ export class Broker {
 	#fence(kind: "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous"): void {
 		if (this.#publicationState === "stopping") return;
 		this.#publicationState = kind;
-		if (kind === "suspect-unpublished") this.#lossAt ??= process.hrtime.bigint();
-		else this.#lossAt = null;
+		if (kind === "suspect-unpublished") {
+			this.#lossAt ??= process.hrtime.bigint();
+			this.#ambiguousAt = null;
+		} else {
+			this.#lossAt = null;
+			this.#ambiguousAt ??= process.hrtime.bigint();
+		}
+	}
+	/**
+	 * Whether this broker has been unable to confirm it is the published root for
+	 * longer than the deadline for its current fence. Replacement is proven quickly
+	 * and ambiguity slowly, but neither may persist indefinitely: a permanently
+	 * fenced broker never heartbeats, so it is unreachable through discovery while
+	 * still holding its port and memory.
+	 */
+	#fencedBeyondDeadline(): boolean {
+		const now = process.hrtime.bigint();
+		if (this.#lossAt !== null && now - this.#lossAt >= BigInt(BROKER_PUBLICATION_GRACE_MS) * 1_000_000n) return true;
+		const ambiguityGraceMs = ambiguityGraceOverridesForTest.get(this) ?? BROKER_AMBIGUITY_GRACE_MS;
+		return this.#ambiguousAt !== null && now - this.#ambiguousAt >= BigInt(ambiguityGraceMs) * 1_000_000n;
 	}
 	async #watchPublication(writeHeartbeat = true): Promise<void> {
 		if (!this.#publication || this.#publicationState === "stopping") return;
 		let observation: ReturnType<RetainedBrokerDiscovery["observe"]>;
 		try {
-			observation = this.#publication.observe();
+			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
 		} catch {
 			this.#fence("observation-ambiguous");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
 			return;
 		}
 		if (observation === "owned") {
@@ -667,15 +699,12 @@ export class Broker {
 			}
 			this.#publicationState = "healthy-owned";
 			this.#lossAt = null;
+			this.#ambiguousAt = null;
 			if (writeHeartbeat) await this.#writeHeartbeat();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
-		if (
-			this.#lossAt !== null &&
-			process.hrtime.bigint() - this.#lossAt >= BigInt(BROKER_PUBLICATION_GRACE_MS) * 1_000_000n
-		)
-			void this.#complete("lost-root");
+		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
 	}
 	async #writeHeartbeat(): Promise<void> {
 		if (!this.discovery || !this.#publication || this.#publicationState === "stopping") return;
@@ -691,6 +720,7 @@ export class Broker {
 		}
 		this.#publicationState = "healthy-owned";
 		this.#lossAt = null;
+		this.#ambiguousAt = null;
 		this.discovery = { ...this.discovery, heartbeatAt };
 	}
 	async heartbeat(): Promise<void> {
@@ -970,4 +1000,19 @@ export class Broker {
 export function setTerminalPersistenceHookForTest(broker: Broker, hook: (() => void) | undefined): void {
 	if (hook) terminalPersistenceHooksForTest.set(broker, hook);
 	else terminalPersistenceHooksForTest.delete(broker);
+}
+
+/** Test-only hook for shortening the bounded ambiguity deadline. */
+export function setAmbiguityGraceForTest(broker: Broker, graceMs: number | undefined): void {
+	if (graceMs === undefined) ambiguityGraceOverridesForTest.delete(broker);
+	else ambiguityGraceOverridesForTest.set(broker, graceMs);
+}
+
+/** Test-only hook for forcing the observation the publication watchdog sees. */
+export function setPublicationObservationForTest(
+	broker: Broker,
+	observation: BrokerPublicationObservation | undefined,
+): void {
+	if (observation === undefined) publicationObservationOverridesForTest.delete(broker);
+	else publicationObservationOverridesForTest.set(broker, observation);
 }
