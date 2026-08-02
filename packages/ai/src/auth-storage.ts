@@ -1096,6 +1096,37 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Whether credential selection for a provider is pinned to one stored row by
+	 * a runtime selector (`--credential`).
+	 *
+	 * Distinct from {@link AuthStorage.hasRuntimeApiKey}: that reports the
+	 * `--api-key` override, which lives in a different map and is mutually
+	 * exclusive with a selector. Callers that must not rotate away from a pinned
+	 * credential have to consult BOTH.
+	 */
+	hasRuntimeCredentialSelector(provider: string): boolean {
+		return this.#runtimeCredentialSelectors.has(resolveOAuthStorageProvider(provider));
+	}
+
+	/**
+	 * Opaque stored row id of the credential this session is currently using.
+	 *
+	 * Deliberately non-identifying: the persisted primary key, never an email,
+	 * account id, project id, or key material. Callers that need to correlate a
+	 * credential across a session boundary use this instead of projecting
+	 * personal metadata.
+	 *
+	 * Returns `undefined` when the session has not been routed to a stored
+	 * credential yet, or when it authenticated through an env key or fallback
+	 * resolver rather than a stored row.
+	 */
+	getSessionCredentialRowId(provider: string, sessionId?: string): number | undefined {
+		const session = this.#getSessionCredential(provider, sessionId);
+		if (!session) return undefined;
+		return this.#getStoredCredentials(provider)[session.index]?.id;
+	}
+
+	/**
 	 * Register a per-provider API key sourced from user configuration
 	 * (e.g. `models.yml` `providers.<name>.apiKey`). Higher priority than
 	 * stored credentials and OAuth tokens — when the user pins a key in

@@ -109,6 +109,7 @@ import {
 	streamSimple,
 } from "@gajae-code/ai";
 import {
+	type AuthDisposition,
 	beginAttempt,
 	classifyFallbackTrigger,
 	type FallbackAttemptToken,
@@ -14228,6 +14229,12 @@ export class AgentSession {
 			);
 		}
 		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
+		// A plain `forbidden` is terminal. Without this, the blanket
+		// `transportFailure` admission below re-admits a committed forbidden
+		// failure into retry policy: credential mutation is vetoed downstream, but
+		// the chain would still retry and advance models on a request the caller is
+		// simply not authorized to make.
+		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return false;
 		if (transportFailure) return true;
 		if (
 			trigger.class === "rate_limit" ||
@@ -14616,7 +14623,10 @@ export class AgentSession {
 		message: AssistantMessage,
 		allowLegacyUsageLimit: boolean,
 		transportFailure?: TransportFailureFacts,
-	): { class: FallbackTriggerClass; retryAfterMs?: number } | undefined {
+		// `authDisposition` is carried through from `classifyFallbackTrigger`, whose
+		// result is returned verbatim below. Narrowing it away here would silently
+		// disable the terminal-403 guard in `#markFailedCredential`.
+	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
@@ -14723,25 +14733,60 @@ export class AgentSession {
 		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
 	}
 
-	async #markFailedCredential(trigger: { class: FallbackTriggerClass; retryAfterMs?: number }): Promise<boolean> {
+	/**
+	 * Marks the credential that just failed and reports whether the session
+	 * actually moved to a DIFFERENT stored credential.
+	 *
+	 * Three invariants this enforces, in order:
+	 *
+	 * 1. **Pin guard, first and for every trigger class.** A pinned credential
+	 *    (`--api-key` or `--credential`) must never be mutated or rotated away
+	 *    from. Both overrides are consulted: they live in separate maps, so
+	 *    checking only `hasRuntimeApiKey` would silently rotate a `--credential`
+	 *    pin. Previously the guard existed only on the quota path, so the `auth`
+	 *    path invalidated pinned credentials outright.
+	 * 2. **A terminal `forbidden` never mutates credential state.** Rotation
+	 *    would hide an authorization defect and cycle through healthy rows.
+	 * 3. **Distinct-row proof in BOTH branches.** `invalidateCredentialMatching`
+	 *    reports "I matched and blocked a row", which is not the same as "the
+	 *    session now uses a different credential" — with a single-row pool it is
+	 *    true while nothing rotated. Both branches therefore re-resolve and
+	 *    require the active key to have actually changed.
+	 */
+	async #markFailedCredential(trigger: {
+		class: FallbackTriggerClass;
+		retryAfterMs?: number;
+		authDisposition?: AuthDisposition;
+	}): Promise<boolean> {
 		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
 			return false;
 		}
+		// (2) Terminal forbidden: no credential state may change.
+		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return false;
+
 		const authStorage = this.#modelRegistry.authStorage;
+		const provider = this.model.provider;
+		// (1) Pin guard, before any mutation and for every branch.
+		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) return false;
+
 		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
+		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
+
+		let mutated: boolean;
 		if (trigger.class === "auth") {
-			const apiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
-			if (!isAuthenticated(apiKey)) return false;
-			return authStorage.invalidateCredentialMatching(this.model.provider, apiKey, {
+			if (!isAuthenticated(activeApiKey)) return false;
+			mutated = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
 				sessionId: providerAffinitySessionId,
 			});
+		} else {
+			mutated = await authStorage.markUsageLimitReached(provider, providerAffinitySessionId, {
+				retryAfterMs: trigger.retryAfterMs,
+			});
 		}
-		if (authStorage.hasRuntimeApiKey(this.model.provider)) return false;
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
-		const rotated = await authStorage.markUsageLimitReached(this.model.provider, providerAffinitySessionId, {
-			retryAfterMs: trigger.retryAfterMs,
-		});
-		return rotated && (await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) !== activeApiKey;
+		if (!mutated) return false;
+
+		// (3) Distinct-row proof.
+		return (await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) !== activeApiKey;
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -14836,8 +14881,15 @@ export class AgentSession {
 			credentialRotated = await this.#markFailedCredential(trigger);
 		}
 		if (credentialRotated) {
-			if (managedFallback) controller.restorePreviousEntryForRetry();
-			outcome = "retry";
+			// A rotation only becomes a same-model retry if the controller can
+			// actually be rewound. `restorePreviousEntryForRetry()` refuses once an
+			// entry's restore budget is consumed or attempts are exhausted; ignoring
+			// that would force `outcome = "retry"` while `activeIndex` stays on the
+			// next entry and `this.model` stays on the previous one — splitting
+			// attempt attribution, exhaustion, and sticky selection across two models.
+			if (!managedFallback || controller.restorePreviousEntryForRetry()) {
+				outcome = "retry";
+			}
 		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {

@@ -163,12 +163,11 @@ function managedRetryableFailure(failure: unknown): boolean {
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
 	const trigger = classifyFallbackTrigger(facts);
-	return (
-		trigger.class === "rate_limit" ||
-		trigger.class === "quota" ||
-		trigger.class === "auth" ||
-		trigger.class === "server"
-	);
+	// A plain `forbidden` is terminal: retrying it just re-sends a request the
+	// caller is not authorized to make, and the credential-mutating consumers
+	// downstream would block healthy credentials on the way.
+	if (trigger.class === "auth") return trigger.authDisposition !== "forbidden";
+	return trigger.class === "rate_limit" || trigger.class === "quota" || trigger.class === "server";
 }
 
 /**

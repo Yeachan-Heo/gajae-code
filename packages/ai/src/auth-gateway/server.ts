@@ -279,6 +279,12 @@ async function markManagedGatewayCredentialFailure(
 ): Promise<void> {
 	const trigger = classifyFallbackTrigger(error);
 	try {
+		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") {
+			// A plain `forbidden` is an authorization or configuration defect.
+			// Blocking the credential here would hide it and would cycle through
+			// every otherwise-healthy row in a multi-credential pool.
+			return;
+		}
 		if (trigger.class === "auth") {
 			await storage.invalidateCredentialMatching(model.provider, apiKey, signal);
 		} else if (trigger.class === "quota" || trigger.class === "rate_limit") {

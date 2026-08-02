@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $credentialEnv, $env, $pickCredentialEnv, extractHttpStatusFromError } from "@gajae-code/utils";
-import { assertManagedAttempt } from "./utils/fallback-transport";
+import { assertManagedAttempt, classifyFallbackTrigger, type TransportFailureFacts } from "./utils/fallback-transport";
 
 const managedAttemptValidated = Symbol("managedAttemptValidated");
 
@@ -396,11 +396,59 @@ function extractStatusFromAssistantError(message: AssistantMessage): number | un
 	return extractHttpStatusFromError({ message: message.errorMessage });
 }
 
-function createAssistantAuthError(message: AssistantMessage): Error & { status?: number } {
-	const error: Error & { status?: number } = new Error(message.errorMessage ?? "Provider authentication failed");
+function createAssistantAuthError(
+	message: AssistantMessage,
+): Error & { status?: number; transportFailure?: TransportFailureFacts } {
+	const error: Error & { status?: number; transportFailure?: TransportFailureFacts } = new Error(
+		message.errorMessage ?? "Provider authentication failed",
+	);
 	const status = extractStatusFromAssistantError(message);
 	if (status !== undefined) error.status = status;
+	// Preserve the structured facts. Without this the callback receives a
+	// status-only error and every downstream `auth` consumer loses the provider
+	// code it needs to tell a credential problem from a plain `forbidden`.
+	if (message.transportFailure) error.transportFailure = message.transportFailure;
 	return error;
+}
+
+/**
+ * Unwraps a nested `error.transportFailure` carrier.
+ *
+ * `transportFailureFacts` dereferences `value`, `value.response`, `value.error`
+ * and the captured response, but NOT `value.transportFailure` — and that is the
+ * shape this repository actually throws for transport errors. Reading the
+ * carrier here keeps the shared extractor untouched (its ten production call
+ * sites and its idempotence invariant stay as they are) while still letting the
+ * auth veto below see the provider code.
+ */
+function carriedTransportFailure(candidate: unknown): unknown {
+	if (!candidate || typeof candidate !== "object") return undefined;
+	const carried = (candidate as { transportFailure?: unknown }).transportFailure;
+	return carried && typeof carried === "object" ? carried : undefined;
+}
+
+/** Auth-relevant facts for a thrown error or an assistant error, carrier first. */
+function authFailureFacts(candidate: unknown): unknown {
+	return carriedTransportFailure(candidate) ?? candidate;
+}
+
+/**
+ * Whether this failure is a credential problem worth retrying with a different
+ * credential.
+ *
+ * Consulted by BOTH capture exits below, and it is the ONLY auth predicate they
+ * use. Gating on HTTP 401 alone would contradict the classifier: a typed
+ * provider code is supposed to win over the status, so `403 + invalid_api_key`
+ * must be captured and `401 + forbidden` must not. A `forbidden` failure is an
+ * authorization or configuration defect — handing it to `onAuthError` lets the
+ * gateway and SDK consumers invalidate a perfectly healthy credential.
+ */
+function shouldCaptureAuthFailure(candidate: unknown, statusHint: number | undefined): boolean {
+	const trigger = classifyFallbackTrigger(authFailureFacts(candidate));
+	// Typed auth facts are authoritative and already encode code-over-status.
+	if (trigger.class === "auth") return trigger.authDisposition !== "forbidden";
+	// Nothing classifiable: keep the historical bare-401 admission.
+	return statusHint === 401;
 }
 
 function emitBufferedEvents(stream: AssistantMessageEventStream, events: AssistantMessageEvent[]): void {
@@ -447,7 +495,9 @@ export function streamSimple<TApi extends Api>(
 						!emittedReplayUnsafeEvent &&
 						captureAuthFailure &&
 						event.type === "error" &&
-						extractStatusFromAssistantError(event.error) === 401
+						// L0 gate, event exit. Classification decides; a typed
+						// `forbidden` never becomes an auth retry.
+						shouldCaptureAuthFailure(event.error, extractStatusFromAssistantError(event.error))
 					) {
 						return { error: createAssistantAuthError(event.error), bufferedEvents, terminalEvent: event };
 					}
@@ -459,7 +509,12 @@ export function streamSimple<TApi extends Api>(
 				flushBuffered();
 				if (!outer.done) outer.end(await inner.result());
 			} catch (error) {
-				if (!emittedReplayUnsafeEvent && captureAuthFailure && extractHttpStatusFromError(error) === 401) {
+				if (
+					!emittedReplayUnsafeEvent &&
+					captureAuthFailure &&
+					// L0 gate, throw exit: same rule, carrier-aware.
+					shouldCaptureAuthFailure(error, extractHttpStatusFromError(error))
+				) {
 					return { error, bufferedEvents };
 				}
 				flushBuffered();

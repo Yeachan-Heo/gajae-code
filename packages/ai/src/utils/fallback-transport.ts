@@ -1,8 +1,25 @@
 export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "server" | "unknown" | "other";
 
+/**
+ * Refinement of an `auth` trigger.
+ *
+ * The transport deliberately collapses HTTP 401 and 403 into a single `auth`
+ * class, but the two demand opposite handling: a credential problem may be
+ * recoverable by trying a different stored credential, whereas a plain
+ * `forbidden` is an authorization or configuration defect that rotation would
+ * only hide — it would cycle and block every otherwise-healthy credential.
+ *
+ * This is a refinement rather than a new {@link FallbackTriggerClass} member so
+ * every existing `trigger.class === "auth"` consumer keeps compiling and keeps
+ * its current behavior until it explicitly opts into the distinction.
+ */
+export type AuthDisposition = "credential" | "forbidden";
+
 export interface FallbackTrigger {
 	class: FallbackTriggerClass;
 	retryAfterMs?: number;
+	/** Present only when `class === "auth"`. */
+	authDisposition?: AuthDisposition;
 }
 
 /** Stable code for streams that time out before producing semantic progress. */
@@ -229,15 +246,36 @@ function isQuotaCode(code: string | undefined): boolean {
 	);
 }
 
-function isAuthCode(code: string | undefined): boolean {
+const FORBIDDEN_AUTH_CODE = "forbidden";
+
+/** Auth codes that name a credential problem rather than an authorization one. */
+function isCredentialAuthCode(code: string | undefined): boolean {
 	return (
 		code === "authentication_error" ||
 		code === "invalid_api_key" ||
 		code === "invalid_token" ||
 		code === "token_expired" ||
-		code === "unauthorized" ||
-		code === "forbidden"
+		code === "unauthorized"
 	);
+}
+
+function isAuthCode(code: string | undefined): boolean {
+	return isCredentialAuthCode(code) || code === FORBIDDEN_AUTH_CODE;
+}
+
+/**
+ * Resolves the {@link AuthDisposition} for an `auth` trigger.
+ *
+ * Precedence is explicit: a typed provider code wins over the HTTP status, so
+ * `{status: 401, providerCode: "forbidden"}` is terminal rather than a
+ * credential problem. Only when no auth code is present does the status decide,
+ * and an unknown-status `auth` defaults to `credential` because that is the
+ * classification the pre-refinement code already produced.
+ */
+function resolveAuthDisposition(code: string | undefined, status: number | undefined): AuthDisposition {
+	if (code === FORBIDDEN_AUTH_CODE) return "forbidden";
+	if (isCredentialAuthCode(code)) return "credential";
+	return status === 403 ? "forbidden" : "credential";
 }
 
 function isRateLimitCode(code: string | undefined): boolean {
@@ -272,5 +310,19 @@ export function classifyFallbackTrigger(
 						: facts.status !== undefined && facts.status >= 500 && facts.status <= 599
 							? "server"
 							: "other";
-	return retryAfterMs === undefined ? { class: triggerClass } : { class: triggerClass, retryAfterMs };
+	const trigger: FallbackTrigger = { class: triggerClass };
+	if (retryAfterMs !== undefined) trigger.retryAfterMs = retryAfterMs;
+	if (triggerClass === "auth") trigger.authDisposition = resolveAuthDisposition(code, facts.status);
+	return trigger;
+}
+
+/**
+ * True when a failure is an `auth` failure that must NOT rotate credentials.
+ *
+ * Callers that mutate credential state on auth failures should consult this
+ * first so a plain `forbidden` cannot block otherwise-healthy credentials.
+ */
+export function isForbiddenAuthFailure(errorOrFacts: TransportFailureFacts | FallbackTriggerInput | unknown): boolean {
+	const trigger = classifyFallbackTrigger(errorOrFacts);
+	return trigger.class === "auth" && trigger.authDisposition === "forbidden";
 }
