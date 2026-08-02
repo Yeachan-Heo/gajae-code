@@ -228,7 +228,7 @@ function runTmux(
 			);
 	}
 	if (result.exitCode === 0) return result.stdout?.toString() ?? "";
-	throw new Error(result.stderr?.toString().trim() || `tmux ${args.join(" ")} failed`);
+	throw new Error(result.stderr?.toString().trim() || `${tmuxCommand} ${args.join(" ")} failed`);
 }
 function normalizeExactTmuxTarget(sessionTarget: string, env: NodeJS.ProcessEnv, kind: "session" | "option"): string {
 	if (sessionTarget.startsWith("$")) return sessionTarget;
@@ -406,6 +406,13 @@ function psmuxAuthorityEnvironments(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv[]
 			});
 			if (authorities.length > 0)
 				return authorities.map(authority => environmentForProviderAuthority(env, authority));
+		}
+		if (!ambient.viaExplicitOverride && !ambientAvailable) {
+			throw new Error(
+				"gjc_tmux_provider_unavailable — GJC searched for psmux, pmux, and tmux on PATH. " +
+					"Install psmux from https://github.com/psmux/psmux for native Windows support, use WSL with real tmux, " +
+					"or set GJC_TMUX_COMMAND (and GJC_PSMUX_COMMAND when selecting a psmux compatibility alias).",
+			);
 		}
 	}
 	if (ambient.isPsmux) throw new Error("gjc_tmux_provider_authority_unavailable");
