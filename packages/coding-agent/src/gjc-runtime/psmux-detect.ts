@@ -324,25 +324,21 @@ export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}):
 		return { command: explicit, isPsmux, viaExplicitOverride: true };
 	}
 	if (platform === "win32") {
-		const candidates: Array<{ command: string; identity: string }> = [];
-		for (const candidate of PSMUX_BINARY_NAMES) {
-			const executablePath = resolveBinaryPath(candidate);
+		for (const command of ["psmux", "pmux"] as const) {
+			const executablePath = resolveBinaryPath(command);
 			if (!executablePath) continue;
-			const isPsmuxAlias = candidate !== "tmux" || detectPsmuxForCommand(candidate, runner);
-			if (!isPsmuxAlias) continue;
-			const identity = activeExecutableIdentityResolver(executablePath);
-			if (!identity)
-				throw new Error(`gjc_tmux_provider_ambiguous: Windows ${candidate} executable identity is unavailable`);
-			candidates.push({ command: candidate, identity });
+			if (!activeExecutableIdentityResolver(executablePath))
+				throw new Error(`gjc_tmux_provider_ambiguous: Windows ${command} executable identity is unavailable`);
+			return { command, isPsmux: true, viaExplicitOverride: false };
 		}
-		if (candidates.length > 0) {
-			const identities = new Set(candidates.map(candidate => candidate.identity));
-			if (identities.size !== 1)
-				throw new Error("gjc_tmux_provider_ambiguous: Windows psmux aliases resolve to different executables");
-			// The order is the canonical provider spelling, then its compatibility
-			// aliases. Identity equality above makes PATH-order alias selection safe.
-			return { command: candidates[0]!.command, isPsmux: true, viaExplicitOverride: false };
+		const tmuxPath = resolveBinaryPath("tmux");
+		if (tmuxPath) {
+			const isPsmux = outputMentionsPsmux(probeVersionOutput(tmuxPath, runner));
+			if (isPsmux && !activeExecutableIdentityResolver(tmuxPath))
+				throw new Error("gjc_tmux_provider_ambiguous: Windows tmux executable identity is unavailable");
+			return { command: "tmux", isPsmux, viaExplicitOverride: false };
 		}
+		return { command: "tmux", isPsmux: false, viaExplicitOverride: false };
 	}
 	const tmuxPath = resolveBinaryPath("tmux");
 	if (tmuxPath) {

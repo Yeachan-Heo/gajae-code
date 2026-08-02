@@ -130,15 +130,22 @@ describe("PSMUX_BINARY_NAMES", () => {
 			).toThrow("gjc_tmux_provider_ambiguous: selected psmux command requires Windows");
 		});
 
-		it("refuses Windows aliases with conflicting canonical identities", () => {
+		it("uses the canonical psmux provider despite distinct compatibility aliases", () => {
+			__setBinaryResolverForTests(candidate =>
+				candidate === "psmux" || candidate === "pmux" || candidate === "tmux"
+					? `C:\\psmux\\${candidate}.exe`
+					: null,
+			);
 			__setExecutableIdentityResolverForTests(executable => executable);
-			expect(() =>
-				resolveGjcTmuxProviderContext({
-					platform: "win32",
-					env: {},
-					runner: buildRunner(psmuxVersionOutput()),
-				}),
-			).toThrow("gjc_tmux_provider_ambiguous");
+
+			const context = resolveGjcTmuxProviderContext({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(psmuxVersionOutput()),
+			});
+
+			expect(context.kind).toBe("windows-psmux");
+			expect(context.command).toBe("C:\\psmux\\psmux.exe");
 		});
 		it("persists authority and rejects invalid sidecars before mutation", () => {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-psmux-provider-"));
@@ -530,14 +537,107 @@ describe("resolveGjcTmuxBinary", () => {
 		expect(resolved.isPsmux).toBe(true);
 	});
 
-	it("treats a selected Windows psmux executable as psmux even with a generic tmux banner", () => {
+	it("prefers psmux over distinct compatibility aliases without inspecting lower aliases", () => {
+		const resolvedCandidates: string[] = [];
+		const identityCandidates: string[] = [];
+		__setBinaryResolverForTests(candidate => {
+			resolvedCandidates.push(candidate);
+			return `C:\\tools\\${candidate}.exe`;
+		});
+		__setExecutableIdentityResolverForTests(executable => {
+			identityCandidates.push(executable);
+			return "volume:42";
+		});
+
 		const resolved = resolveGjcTmuxBinary({
 			platform: "win32",
 			env: {},
 			runner: buildRunner(tmuxVersionOutput()),
 		});
-		expect(resolved.command).toBe("psmux");
-		expect(resolved.isPsmux).toBe(true);
+
+		expect(resolved).toEqual({ command: "psmux", isPsmux: true, viaExplicitOverride: false });
+		expect(resolvedCandidates).toEqual(["psmux"]);
+		expect(identityCandidates).toEqual(["C:\\tools\\psmux.exe"]);
+	});
+
+	it("does not inspect broken lower-priority aliases after selecting psmux", () => {
+		__setBinaryResolverForTests(candidate => {
+			if (candidate === "psmux") return "C:\\tools\\psmux.exe";
+			throw new Error(`unexpected compatibility alias lookup: ${candidate}`);
+		});
+
+		expect(
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toEqual({ command: "psmux", isPsmux: true, viaExplicitOverride: false });
+	});
+
+	it("rejects psmux when its executable identity is unavailable", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\tools\\psmux.exe" : null));
+		__setExecutableIdentityResolverForTests(() => null);
+
+		expect(() =>
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toThrow("gjc_tmux_provider_ambiguous: Windows psmux executable identity is unavailable");
+	});
+
+	it("falls back to pmux when psmux is unavailable", () => {
+		__setBinaryResolverForTests(candidate => {
+			if (candidate === "psmux") return null;
+			if (candidate === "pmux") return "C:\\tools\\pmux.exe";
+			throw new Error(`unexpected lower-priority alias lookup: ${candidate}`);
+		});
+
+		expect(
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toEqual({ command: "pmux", isPsmux: true, viaExplicitOverride: false });
+	});
+
+	it("treats a tmux alias with a psmux banner as psmux when named providers are unavailable", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? "C:\\tools\\tmux.exe" : null));
+
+		expect(
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(psmuxVersionOutput()),
+			}),
+		).toEqual({ command: "tmux", isPsmux: true, viaExplicitOverride: false });
+	});
+	it("rejects a psmux-marked tmux alias when its identity is unavailable", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? "C:\\tools\\tmux.exe" : null));
+		__setExecutableIdentityResolverForTests(() => null);
+
+		expect(() =>
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(psmuxVersionOutput()),
+			}),
+		).toThrow("gjc_tmux_provider_ambiguous: Windows tmux executable identity is unavailable");
+	});
+
+	it("keeps a genuine tmux-only Windows installation on native-tmux semantics", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? "C:\\tools\\tmux.exe" : null));
+
+		expect(
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: {},
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toEqual({ command: "tmux", isPsmux: false, viaExplicitOverride: false });
 	});
 
 	it("classifies an explicit Windows tmux.exe alias by matching the psmux executable identity", () => {
