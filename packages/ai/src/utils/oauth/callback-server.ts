@@ -49,6 +49,12 @@ export abstract class OAuthCallbackFlow {
 	callbackBindHostname: string;
 	redirectUri?: string;
 	readonly #skipCallbackServer: boolean;
+	readonly #callbackServerClosed = Promise.withResolvers<void>();
+
+	/** Resolves only after the local callback listener has fully stopped accepting connections. */
+	get callbackServerClosed(): Promise<void> {
+		return this.#callbackServerClosed.promise;
+	}
 	#callbackResolve?: (result: CallbackResult) => void;
 	#callbackReject?: (error: string) => void;
 
@@ -58,6 +64,7 @@ export abstract class OAuthCallbackFlow {
 		callbackPath: string = CALLBACK_PATH,
 	) {
 		this.ctrl = ctrl;
+		void this.#callbackServerClosed.promise.catch(() => {});
 		if (typeof preferredPortOrOptions === "number") {
 			this.preferredPort = preferredPortOrOptions;
 			this.callbackPath = callbackPath;
@@ -115,11 +122,15 @@ export abstract class OAuthCallbackFlow {
 			);
 		}
 		const state = this.generateState();
-
-		// Start callback server first to get actual redirect URI
-		const { server, redirectUri } = await this.#startCallbackServer(state);
-
+		let server: Bun.Server<unknown> | undefined;
+		let credentials: OAuthCredentials | undefined;
+		let failure: unknown;
 		try {
+			// Start callback server first to get actual redirect URI
+			const started = await this.#startCallbackServer(state);
+			server = started.server;
+			const { redirectUri } = started;
+
 			// Generate auth URL with the ACTUAL redirect URI (may differ from expected if port was busy)
 			const { url: authUrl, instructions } = await this.generateAuthUrl(state, redirectUri);
 
@@ -136,10 +147,29 @@ export abstract class OAuthCallbackFlow {
 
 			this.ctrl.onProgress?.("Exchanging authorization code for tokens...");
 
-			return await this.exchangeToken(code, state, redirectUri);
+			credentials = await this.exchangeToken(code, state, redirectUri);
+		} catch (error) {
+			failure = error;
 		} finally {
-			server?.stop();
+			if (!server) {
+				this.#callbackServerClosed.resolve();
+			} else {
+				try {
+					// Give an in-flight callback response a moment to flush before forcing the
+					// listener down: force-closing immediately aborts the response the browser is
+					// still reading, while a graceful stop can hang on a keep-alive connection and
+					// would leave the per-server lease held indefinitely.
+					await Bun.sleep(50);
+					await server.stop(true);
+					this.#callbackServerClosed.resolve();
+				} catch (error) {
+					this.#callbackServerClosed.reject(error);
+					if (failure === undefined) failure = error;
+				}
+			}
 		}
+		if (failure !== undefined) throw failure;
+		return credentials!;
 	}
 
 	/**

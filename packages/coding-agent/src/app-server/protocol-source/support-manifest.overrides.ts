@@ -283,13 +283,12 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 			"MCP-WIRE-007 reload during OAuth cannot overwrite the replacement source",
 			"MCP-WIRE-008 concurrent same-server OAuth login rejects the second without an orphan credential",
 			"MCP-WIRE-009 OAuth compensation failures remain observable as an aggregate",
-			"MCP-WIRE-010 runtime close drains a queued OAuth completion without writes or reconnect",
-			"MCP-WIRE-011 runtime close drains a held autonomous reconnect before returning",
-			"MCP-WIRE-013 immediate sequential OAuth login is rejected while its callback listener is released",
+			"MCP-WIRE-010 runtime close waits for a held OAuth completion and rollback",
+			"MCP-WIRE-013 OAuth callback-listener lease rejects before release and succeeds after release",
 			"MCP-WIRE-014 OAuth cancellation after each commit stage rolls back persisted state",
 		],
 		reason:
-			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication without a serialized cause, persistence, ordering, source replacement and removal, cancellation after every OAuth commit stage, deterministic same-server serialization, held-reconnect shutdown draining, and rollback.",
+			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication without a serialized cause, persistence, ordering, source replacement, cancellation after every OAuth commit stage, deterministic same-server serialization, callback-listener lease synchronization, and rollback. Source removal and autonomous reconnect draining are covered separately by focused manager/reload tests, not claimed as OAuth semantics.",
 	},
 	"skills/list": laneRow(
 		"skillsListHandler",

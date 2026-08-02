@@ -839,6 +839,7 @@ export class MCPManager {
 	}
 
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): void {
+		if (this.#shuttingDown) return;
 		const refresh = (() => {
 			switch (kind) {
 				case "tools":
@@ -849,7 +850,8 @@ export class MCPManager {
 					return this.refreshServerPrompts(serverName);
 			}
 		})();
-		void refresh.catch(error => {
+		const tracked = this.#trackDrain(refresh);
+		void tracked.catch(error => {
 			logger.debug("Failed MCP notification refresh", { path: `mcp:${serverName}`, kind, error });
 		});
 	}
@@ -916,9 +918,15 @@ export class MCPManager {
 
 	/** Replace the stored source config used for reconnects and future tool calls. */
 	setServerConfig(name: string, config: MCPServerConfig): void {
+		if (this.#shuttingDown) throw new Error("MCP manager is shut down");
 		this.#serverConfigs.set(name, config);
 		const connection = this.#connections.get(name);
 		if (connection) connection.config = config;
+	}
+
+	/** Return whether terminal manager shutdown has begun. */
+	isShuttingDown(): boolean {
+		return this.#shuttingDown;
 	}
 
 	/**
@@ -1220,12 +1228,12 @@ export class MCPManager {
 	 * Concurrent calls for the same server share one reconnection attempt.
 	 * Returns the new connection, or null if reconnection failed.
 	 */
-	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
-		if (this.#shuttingDown || this.#toolsOnly || this.#connectionSetSealed) return null;
+	async reconnectServer(name: string, signal?: AbortSignal): Promise<MCPServerConnection | null> {
+		if (this.#shuttingDown || this.#toolsOnly || this.#connectionSetSealed || signal?.aborted) return null;
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 
-		const attempt = this.#doReconnect(name);
+		const attempt = this.#doReconnect(name, signal);
 		const tracked = this.#trackDrain(
 			attempt.finally(() => {
 				if (this.#pendingReconnections.get(name) === tracked) this.#pendingReconnections.delete(name);
@@ -1235,8 +1243,8 @@ export class MCPManager {
 		return tracked;
 	}
 
-	async #doReconnect(name: string): Promise<MCPServerConnection | null> {
-		if (this.#shuttingDown) return null;
+	async #doReconnect(name: string, signal?: AbortSignal): Promise<MCPServerConnection | null> {
+		if (this.#shuttingDown || signal?.aborted) return null;
 		const oldConnection = this.#connections.get(name);
 		const config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
@@ -1250,14 +1258,16 @@ export class MCPManager {
 		if (oldConnection) {
 			// Detach onClose to prevent re-entrant reconnect from the close itself
 			oldConnection.transport.onClose = undefined;
-			const closePromise = oldConnection.transport.close().catch(() => {});
+			const closePromise = this.#trackDrain(oldConnection.transport.close());
 			if (oldConnection.transport.closeBeforeReconnect) {
 				await closePromise;
 			} else {
 				// Fire-and-forget: don't await HTTP/SSE close — HttpTransport.close()
 				// sends a DELETE with config.timeout (30s default), and blocking here
 				// delays the reconnect loop by that amount on every server restart.
-				void closePromise;
+				void closePromise.catch(error => {
+					logger.debug("MCP transport close failed during reconnect", { path: `mcp:${name}`, error });
+				});
 			}
 			this.#connections.delete(name);
 		}
@@ -1272,6 +1282,7 @@ export class MCPManager {
 			for (let attempt = 0; attempt <= delays.length; attempt++) {
 				if (
 					this.#shuttingDown ||
+					signal?.aborted ||
 					(this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch ||
 					backoffAbort.signal.aborted
 				) {
@@ -1283,12 +1294,20 @@ export class MCPManager {
 					return null;
 				}
 				try {
-					const connection = await this.#connectAndWireServer(name, config, source, this.#epoch, reconnectEpoch);
+					const connection = await this.#connectAndWireServer(
+						name,
+						config,
+						source,
+						this.#epoch,
+						reconnectEpoch,
+						signal,
+					);
 					logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
 					return connection;
 				} catch (error) {
 					if (
 						this.#shuttingDown ||
+						signal?.aborted ||
 						(this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch ||
 						backoffAbort.signal.aborted
 					) {
@@ -1307,7 +1326,8 @@ export class MCPManager {
 							attempt: attempt + 1,
 							error: msg,
 						});
-						await delay(delays[attempt], backoffAbort.signal).catch(() => undefined);
+						const reconnectSignal = signal ? AbortSignal.any([backoffAbort.signal, signal]) : backoffAbort.signal;
+						await delay(delays[attempt], reconnectSignal).catch(() => undefined);
 					} else {
 						logger.error("MCP reconnect failed after retries", { path: `mcp:${name}`, error: msg });
 						// Don't remove stale tools — keep them in the registry so they
@@ -1332,16 +1352,18 @@ export class MCPManager {
 		source: SourceMeta | undefined,
 		globalEpoch: number,
 		disconnectEpoch: number,
+		signal?: AbortSignal,
 	): Promise<MCPServerConnection> {
-		if (this.#shuttingDown) throw new Error("MCP manager is shut down");
+		if (this.#shuttingDown || signal?.aborted) throw new Error("MCP manager is shut down");
 		const resolvedConfig = await this.#resolveAuthConfig(config);
-		if (this.#shuttingDown) throw new Error("MCP manager is shut down");
+		if (this.#shuttingDown || signal?.aborted) throw new Error("MCP manager is shut down");
 		const connectionAbort = new AbortController();
 		this.#pendingConnectionControllers.set(name, connectionAbort);
 		let connection: MCPServerConnection;
 		try {
+			const connectSignal = signal ? AbortSignal.any([connectionAbort.signal, signal]) : connectionAbort.signal;
 			connection = await connectToServer(name, resolvedConfig, {
-				signal: connectionAbort.signal,
+				signal: connectSignal,
 				onNotification: (method, params) => {
 					this.#handleServerNotification(name, method, params);
 				},
@@ -1443,6 +1465,7 @@ export class MCPManager {
 	 * Refresh tools from a specific server.
 	 */
 	async refreshServerTools(name: string): Promise<void> {
+		if (this.#shuttingDown) return;
 		if (this.#toolsOnly) return;
 		const connection = this.#connections.get(name);
 		if (!connection) return;

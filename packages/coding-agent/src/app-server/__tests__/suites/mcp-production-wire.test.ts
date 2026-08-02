@@ -41,20 +41,28 @@ for await (const line of rl) {
 	return fixture;
 }
 
-function writeGatedStdioFixture(root: string): { fixture: string; counterPath: string; releasePath: string } {
+function writeGatedStdioFixture(root: string): {
+	fixture: string;
+	counterPath: string;
+	releasePath: string;
+	readyPath: string;
+} {
 	const fixture = path.join(root, "mcp-gated-fixture.mjs");
 	const counterPath = path.join(root, "connection-count");
 	const releasePath = path.join(root, "release-reconnect");
+	const readyPath = path.join(root, "reconnect-ready");
 	writeFileSync(
 		fixture,
 		`import fs from "node:fs";
 import readline from "node:readline";
 const counterPath = process.argv[2];
 const releasePath = process.argv[3];
+const readyPath = process.argv[4];
 const count = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, "utf8") : "0") + 1;
 fs.writeFileSync(counterPath, String(count));
 if (count >= 2) {
   while (!fs.existsSync(releasePath)) await new Promise(resolve => setTimeout(resolve, 10));
+  fs.writeFileSync(readyPath, "ready");
 }
 const rl = readline.createInterface({ input: process.stdin });
 for await (const line of rl) {
@@ -66,7 +74,7 @@ for await (const line of rl) {
 }
 `,
 	);
-	return { fixture, counterPath, releasePath };
+	return { fixture, counterPath, releasePath, readyPath };
 }
 
 async function waitForFile(pathname: string, predicate: (value: string) => boolean = () => true): Promise<void> {
@@ -158,16 +166,53 @@ test("MCP-WIRE-001 production app-server reload changes the live tool set after 
 	}
 });
 
-test("MCP-WIRE-011 runtime close drains a held autonomous reconnect before returning", async () => {
-	const root = mkdtempSync("/tmp/gjc-mcp-wire-reconnect-close-");
-	const { fixture, counterPath, releasePath } = writeGatedStdioFixture(root);
+test("MCP-WIRE-015 runtime close drains a notification-triggered held tools refresh", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-refresh-close-");
+	const enteredPath = path.join(root, "refresh-entered");
+	const releasePath = path.join(root, "refresh-release");
+	const countPath = path.join(root, "tools-list-count");
+	let toolsListCount = 0;
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: async request => {
+			const url = new URL(request.url);
+			if (url.pathname !== "/mcp" || request.method !== "POST") return new Response("ok");
+			const body = (await request.json()) as { id: string | number; method: string };
+			if (body.method === "initialize")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						protocolVersion: "2025-03-26",
+						capabilities: { tools: {} },
+						serverInfo: { name: "refresh-fixture", version: "1" },
+					},
+				});
+			if (body.method !== "tools/list") return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			toolsListCount += 1;
+			writeFileSync(countPath, String(toolsListCount));
+			if (toolsListCount === 1) {
+				const notification = {
+					jsonrpc: "2.0",
+					method: "notifications/tools/list_changed",
+					params: {},
+				};
+				const response = { jsonrpc: "2.0", id: body.id, result: { tools: [] } };
+				return new Response(
+					`event: message\ndata: ${JSON.stringify(notification)}\n\nevent: message\ndata: ${JSON.stringify(response)}\n\n`,
+					{ headers: { "Content-Type": "text/event-stream" } },
+				);
+			}
+			writeFileSync(enteredPath, "entered");
+			while (!existsSync(releasePath)) await Bun.sleep(10);
+			return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
+		},
+	});
+	const configPath = path.join(root, ".mcp.json");
 	writeFileSync(
-		path.join(root, ".mcp.json"),
-		JSON.stringify({
-			mcpServers: {
-				fixture: { type: "stdio", command: process.execPath, args: [fixture, counterPath, releasePath] },
-			},
-		}),
+		configPath,
+		JSON.stringify({ mcpServers: { fixture: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` } } }),
 	);
 	const service = createMcpAppServerService({ cwd: root, agentDir: root });
 	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
@@ -178,12 +223,82 @@ test("MCP-WIRE-011 runtime close drains a held autonomous reconnect before retur
 	try {
 		await initialize(connection, frames);
 		await service.discover();
+		await waitForFile(enteredPath);
+		let closingSettled = false;
+		const closing = runtime.close().then(
+			() => {
+				closingSettled = true;
+			},
+			(error: unknown) => {
+				closingSettled = true;
+				throw error;
+			},
+		);
+		await Bun.sleep(25);
+		expect(closingSettled).toBe(false);
+		writeFileSync(releasePath, "release");
+		await closing;
+		expect(Number(readFileSync(countPath, "utf8"))).toBeGreaterThanOrEqual(2);
+	} finally {
+		writeFileSync(releasePath, "release");
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		await server.stop(true);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-011 runtime close drains a held autonomous reconnect before returning", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-reconnect-close-");
+	const { fixture, counterPath, releasePath, readyPath } = writeGatedStdioFixture(root);
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({
+			mcpServers: {
+				fixture: { type: "stdio", command: process.execPath, args: [fixture, counterPath, releasePath, readyPath] },
+			},
+		}),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	const reconnectStarted = Promise.withResolvers<void>();
+	const reconnectSettled = Promise.withResolvers<void>();
+	const order: string[] = [];
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		const manager = service.manager as unknown as {
+			reconnectServer: (name: string) => Promise<unknown>;
+		};
+		const reconnectServer = manager.reconnectServer.bind(service.manager);
+		manager.reconnectServer = async name => {
+			reconnectStarted.resolve();
+			try {
+				return await reconnectServer(name);
+			} finally {
+				order.push("reconnect");
+				reconnectSettled.resolve();
+			}
+		};
 		const mcpConnection = service.getConnection("fixture");
 		expect(mcpConnection).toBeDefined();
 		mcpConnection?.transport.onClose?.();
+		await reconnectStarted.promise;
 		await waitForFile(counterPath, value => Number(value) >= 2);
-		await runtime.close();
+
+		const closing = runtime.close().then(() => {
+			order.push("close");
+		});
+		await closing;
+		writeFileSync(releasePath, "release");
+		await reconnectSettled.promise;
 		await Bun.sleep(50);
+		expect(order).toEqual(["reconnect", "close"]);
+		expect(existsSync(readyPath)).toBe(false);
 		expect(Number(readFileSync(counterPath, "utf8"))).toBe(2);
 	} finally {
 		writeFileSync(releasePath, "release");
@@ -428,69 +543,31 @@ test("MCP-WIRE-005 runtime close aborts an in-progress OAuth flow without writes
 	}
 });
 
-test("MCP-WIRE-010 runtime close drains a queued OAuth completion without writes or reconnect", async () => {
+test("MCP-WIRE-010 runtime close waits for a held OAuth completion and rollback", async () => {
 	const fixture = await oauthFixture();
 	const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
-	const service = createMcpAppServerService({ cwd: fixture.root, agentDir: fixture.root, authStorage: storage });
-	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
-	const frames: Record<string, unknown>[] = [];
-	const wireConnection = runtime.createConnection(frame => {
-		frames.push(dec(frame));
-	});
 	const gate = Promise.withResolvers<void>();
 	const entered = Promise.withResolvers<void>();
-	let reconnects = 0;
-	try {
-		await initialize(wireConnection, frames);
-		await service.discover();
-		const manager = service.manager as unknown as {
-			disconnectAll: (options?: { propagateErrors?: boolean }) => Promise<void>;
-			reconnectServer: (name: string) => Promise<unknown>;
-		};
-		const disconnectAll = manager.disconnectAll.bind(service.manager);
-		manager.disconnectAll = async options => {
-			entered.resolve();
-			await gate.promise;
-			return disconnectAll(options);
-		};
-		const reconnectServer = manager.reconnectServer.bind(service.manager);
-		manager.reconnectServer = async name => {
-			reconnects += 1;
-			return reconnectServer(name);
-		};
-		await wireConnection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
-		const authorizationUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
-		const queuedReload = service.reload();
-		await entered.promise;
-		await fetch(authorizationUrl);
-		const closing = runtime.close();
-		gate.resolve();
-		await closing;
-		await queuedReload.catch(() => undefined);
-		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
-		expect(frames.find(frame => frame.method === "mcpServer/oauthLogin/completed")).toMatchObject({
-			params: { name: "oauth", success: false },
-		});
-		expect(reconnects).toBe(0);
-		expect(storage.exportSnapshot().credentials.some(entry => entry.credential.type === "oauth")).toBe(false);
-		const saved = JSON.parse(readFileSync(fixture.configPath, "utf8")) as {
-			mcpServers: Record<string, Record<string, unknown>>;
-		};
-		expect(saved.mcpServers.oauth.auth).toBeUndefined();
-	} finally {
-		gate.resolve();
-		await wireConnection.close().catch(() => {});
-		await runtime.close().catch(() => {});
-		storage.close();
-		fixture.server.stop();
-		rmSync(fixture.root, { recursive: true, force: true });
-	}
-});
-
-test("MCP-WIRE-013 immediate sequential OAuth login is rejected while its callback listener is released", async () => {
-	const fixture = await oauthFixture();
-	const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
-	const service = createMcpAppServerService({ cwd: fixture.root, agentDir: fixture.root, authStorage: storage });
+	const originalUpdate = updateMCPServer;
+	const service = createMcpAppServerService({
+		cwd: fixture.root,
+		agentDir: fixture.root,
+		authStorage: storage,
+		oauthPersistence: {
+			updateServer: async (filePath, name, config) => {
+				entered.resolve();
+				await gate.promise;
+				return originalUpdate(filePath, name, config);
+			},
+		},
+	});
+	let shutdownStarted = false;
+	const manager = service.manager as unknown as { shutdown: () => void };
+	const shutdown = manager.shutdown.bind(service.manager);
+	manager.shutdown = () => {
+		shutdownStarted = true;
+		shutdown();
+	};
 	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
 	const frames: Record<string, unknown>[] = [];
 	const connection = runtime.createConnection(frame => {
@@ -501,11 +578,88 @@ test("MCP-WIRE-013 immediate sequential OAuth login is rejected while its callba
 		await connection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
 		const authorizationUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
 		await fetch(authorizationUrl);
+		await entered.promise;
+
+		let closingSettled = false;
+		const closing = runtime.close().then(
+			() => {
+				closingSettled = true;
+			},
+			(error: unknown) => {
+				closingSettled = true;
+				throw error;
+			},
+		);
+		await Bun.sleep(25);
+		expect(shutdownStarted).toBe(true);
+		expect(closingSettled).toBe(false);
+		gate.resolve();
+		await closing;
+
+		const completion = frames.find(frame => frame.method === "mcpServer/oauthLogin/completed");
+		expect(completion).toMatchObject({ params: { name: "oauth", success: false } });
+		expect(storage.exportSnapshot().credentials.some(entry => entry.credential.type === "oauth")).toBe(false);
+		const saved = JSON.parse(readFileSync(fixture.configPath, "utf8")) as {
+			mcpServers: Record<string, Record<string, unknown>>;
+		};
+		expect(saved.mcpServers.oauth.auth).toBeUndefined();
+	} finally {
+		gate.resolve();
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		storage.close();
+		fixture.server.stop();
+		rmSync(fixture.root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-013 OAuth callback-listener lease rejects before release and succeeds after release", async () => {
+	const fixture = await oauthFixture();
+	const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
+	const held = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const released = Promise.withResolvers<void>();
+	const service = createMcpAppServerService({
+		cwd: fixture.root,
+		agentDir: fixture.root,
+		authStorage: storage,
+		oauthLifecycle: {
+			awaitCallbackServerClosed: async (_name, callbackServerClosed) => {
+				held.resolve();
+				await release.promise;
+				await callbackServerClosed;
+				released.resolve();
+			},
+		},
+	});
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await connection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		const firstUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
+		await fetch(firstUrl);
 		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
+		await held.promise;
+
 		await connection.process(enc('{"id":3,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
 		expect(responseFor(frames, 3)).toMatchObject({ id: 3, error: { code: -32016, message: "Resource is busy." } });
-		expect(responseFor(frames, 3).result).toBeUndefined();
+		release.resolve();
+		await released.promise;
+
+		await connection.process(enc('{"id":4,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		const secondUrl = (responseFor(frames, 4).result as Record<string, unknown>).authorizationUrl as string;
+		expect(secondUrl).toContain("/authorize?");
+		await fetch(secondUrl);
+		await waitForCondition(
+			() => frames.filter(frame => frame.method === "mcpServer/oauthLogin/completed").length >= 2,
+			"second OAuth completion",
+		);
 	} finally {
+		release.resolve();
 		await connection.close().catch(() => {});
 		await runtime.close().catch(() => {});
 		storage.close();

@@ -18,6 +18,10 @@ export interface McpAppServerServiceOptions {
 		readonly updateServer?: typeof updateMCPServer;
 		readonly writeConfig?: typeof writeMCPConfigFile;
 	};
+	/** Test seam for holding the callback-listener lease until a controlled release. */
+	readonly oauthLifecycle?: {
+		readonly awaitCallbackServerClosed?: (name: string, callbackServerClosed: Promise<void>) => Promise<void>;
+	};
 }
 
 export interface McpOAuthLoginRequest {
@@ -166,7 +170,7 @@ export class McpAppServerService {
 	readonly #oauthLocks = new Map<string, Promise<void>>();
 	readonly #activeOAuthFlows = new Map<string, { abort: AbortController; completion?: Promise<void> }>();
 	readonly #activeOAuthCompletions = new Set<Promise<void>>();
-	readonly #oauthCallbackCooldowns = new Map<string, Promise<void>>();
+	readonly #awaitCallbackServerClosed: (name: string, callbackServerClosed: Promise<void>) => Promise<void>;
 
 	constructor(options: McpAppServerServiceOptions = {}) {
 		this.manager = options.manager ?? new MCPManager(options.cwd ?? getProjectDir());
@@ -175,6 +179,8 @@ export class McpAppServerService {
 		this.#readyPromise = this.#initializeAuthStorage(options.agentDir);
 		this.#updateServer = options.oauthPersistence?.updateServer ?? updateMCPServer;
 		this.#writeConfig = options.oauthPersistence?.writeConfig ?? writeMCPConfigFile;
+		this.#awaitCallbackServerClosed =
+			options.oauthLifecycle?.awaitCallbackServerClosed ?? ((_name, callbackServerClosed) => callbackServerClosed);
 	}
 
 	async #initializeAuthStorage(agentDir?: string): Promise<void> {
@@ -252,14 +258,6 @@ export class McpAppServerService {
 				code: "busy",
 			});
 		}
-		if (this.#oauthCallbackCooldowns.has(request.name)) {
-			throw Object.assign(
-				new Error(`MCP OAuth callback listener is still releasing for server "${request.name}".`),
-				{
-					code: "busy",
-				},
-			);
-		}
 		const flowState: { abort: AbortController; completion?: Promise<void> } = {
 			abort: new AbortController(),
 		};
@@ -328,16 +326,13 @@ export class McpAppServerService {
 					},
 				)
 				.finally(async () => {
-					let cooldown!: Promise<void>;
-					cooldown = Bun.sleep(25).finally(() => {
+					try {
+						await this.#awaitCallbackServerClosed(request.name, flow.callbackServerClosed);
+					} finally {
 						if (this.#activeOAuthFlows.get(request.name) === flowState)
 							this.#activeOAuthFlows.delete(request.name);
-						if (this.#oauthCallbackCooldowns.get(request.name) === cooldown)
-							this.#oauthCallbackCooldowns.delete(request.name);
-					});
-					this.#oauthCallbackCooldowns.set(request.name, cooldown);
-					await cooldown;
-					this.#activeOAuthCompletions.delete(completion);
+						this.#activeOAuthCompletions.delete(completion);
+					}
 				});
 			flowState.completion = completion;
 			this.#activeOAuthCompletions.add(completion);
@@ -436,7 +431,7 @@ export class McpAppServerService {
 			this.manager.setServerConfig(name, updated);
 			throwIfAborted(signal);
 			reconnectAttempted = true;
-			const reconnected = await this.manager.reconnectServer(name);
+			const reconnected = await this.manager.reconnectServer(name, signal);
 			if (!reconnected) throw new Error("MCP server did not reconnect after OAuth login.");
 			throwIfAborted(signal);
 			if (previousCredentialId && previousCredentialId !== credentialId) {
@@ -455,13 +450,14 @@ export class McpAppServerService {
 					appendFailure(failures, error);
 				}
 			};
-			if (managerConfigSetAttempted) await compensate(() => this.manager.setServerConfig(name, previousConfig));
+			if (managerConfigSetAttempted && !this.manager.isShuttingDown())
+				await compensate(() => this.manager.setServerConfig(name, previousConfig));
 			if (configWriteAttempted) await compensate(() => this.#writeConfig(source.path, previousFile));
 			if (oldCredentialRemovalAttempted && previousCredential) {
 				await compensate(() => storage.set(previousCredentialId!, previousCredential));
 			}
 			if (credentialWriteAttempted) await compensate(() => storage.remove(credentialId));
-			if (reconnectAttempted)
+			if (reconnectAttempted && !this.manager.isShuttingDown())
 				await compensate(async () => {
 					const restored = await this.manager.reconnectServer(name);
 					if (!restored)
@@ -494,6 +490,16 @@ export class McpAppServerService {
 				captureFailure(error);
 			}
 		}
+
+		let managerDrain: Promise<void> | undefined;
+		try {
+			this.manager.shutdown();
+			managerDrain = this.manager.waitForClosures();
+			void managerDrain.catch(() => {});
+		} catch (error) {
+			captureFailure(error);
+		}
+
 		const activeCompletions = [...this.#activeOAuthCompletions];
 		for (const result of await Promise.allSettled(activeCompletions)) {
 			if (result.status === "rejected") captureFailure(result.reason);
@@ -511,11 +517,12 @@ export class McpAppServerService {
 		} catch (error) {
 			captureFailure(error);
 		}
-		try {
-			this.manager.shutdown();
-			await this.manager.waitForClosures();
-		} catch (error) {
-			captureFailure(error);
+		if (managerDrain) {
+			try {
+				await managerDrain;
+			} catch (error) {
+				captureFailure(error);
+			}
 		}
 		if (this.#ownsAuthStorage && this.#authStorage) {
 			try {
