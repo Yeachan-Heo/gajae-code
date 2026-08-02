@@ -614,7 +614,8 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 					const requiredRequests = requiredMethods.map(method => requests.find(frame => frame.method === method));
 					return (
 						requiredRequests.every(request => request !== undefined) &&
-						requiredRequests.every(request => answered.has(String(request!.id)))
+						requiredRequests.every(request => answered.has(String(request!.id))) &&
+						requests.every(request => answered.has(String(request.id)))
 					);
 				},
 				frameTimeoutMs,

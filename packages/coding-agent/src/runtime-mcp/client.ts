@@ -43,6 +43,11 @@ const CONNECTION_TIMEOUT_MS = 30_000;
 const MAX_PAGINATION_PAGES = 100,
 	MAX_PAGINATION_ITEMS = 10_000;
 
+type MCPListOptions = MCPRequestOptions & {
+	/** Skip cache writes when the owning manager operation is no longer current. */
+	isCurrent?: () => boolean;
+};
+
 /** Client info sent during initialization */
 const CLIENT_INFO = {
 	name: "gjc-coding-agent",
@@ -372,10 +377,7 @@ export function serverSupportsTools(capabilities: MCPServerCapabilities): boolea
 /**
  * List resources from a connected server.
  */
-export async function listResources(
-	connection: MCPServerConnection,
-	options?: { signal?: AbortSignal },
-): Promise<MCPResource[]> {
+export async function listResources(connection: MCPServerConnection, options?: MCPListOptions): Promise<MCPResource[]> {
 	if (!connection.capabilities.resources) {
 		return [];
 	}
@@ -386,6 +388,7 @@ export async function listResources(
 
 	const allResources: MCPResource[] = [];
 	await collectPaginated(connection, options, "resources/list", "resources", allResources);
+	if (options?.isCurrent?.() === false) return allResources;
 
 	connection.resources = allResources;
 	return allResources;
@@ -396,7 +399,7 @@ export async function listResources(
  */
 export async function listResourceTemplates(
 	connection: MCPServerConnection,
-	options?: { signal?: AbortSignal },
+	options?: MCPListOptions,
 ): Promise<MCPResourceTemplate[]> {
 	if (!connection.capabilities.resources) {
 		return [];
@@ -408,6 +411,7 @@ export async function listResourceTemplates(
 
 	const allTemplates: MCPResourceTemplate[] = [];
 	await collectPaginated(connection, options, "resources/templates/list", "resourceTemplates", allTemplates);
+	if (options?.isCurrent?.() === false) return allTemplates;
 
 	connection.resourceTemplates = allTemplates;
 	return allTemplates;
@@ -498,10 +502,7 @@ export function serverSupportsResources(capabilities: MCPServerCapabilities): bo
 /**
  * List prompts from a connected server.
  */
-export async function listPrompts(
-	connection: MCPServerConnection,
-	options?: { signal?: AbortSignal },
-): Promise<MCPPrompt[]> {
+export async function listPrompts(connection: MCPServerConnection, options?: MCPListOptions): Promise<MCPPrompt[]> {
 	if (!connection.capabilities.prompts) {
 		return [];
 	}
@@ -512,6 +513,7 @@ export async function listPrompts(
 
 	const allPrompts: MCPPrompt[] = [];
 	await collectPaginated(connection, options, "prompts/list", "prompts", allPrompts);
+	if (options?.isCurrent?.() === false) return allPrompts;
 
 	connection.prompts = allPrompts;
 	return allPrompts;

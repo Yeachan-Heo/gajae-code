@@ -364,6 +364,285 @@ test("MCP-WIRE-017 runtime close fences held resource and prompt notification re
 	}
 });
 
+test("MCP-WIRE-018 runtime close skips held resource and prompt cache writes after settlement", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-cache-close-");
+	const resourceRefreshEntered = Promise.withResolvers<void>();
+	const resourceRefreshRelease = Promise.withResolvers<void>();
+	const resourceRefreshDone = Promise.withResolvers<void>();
+	const promptRefreshEntered = Promise.withResolvers<void>();
+	const promptRefreshRelease = Promise.withResolvers<void>();
+	const promptRefreshDone = Promise.withResolvers<void>();
+	let resourceListCalls = 0;
+	let promptListCalls = 0;
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: async request => {
+			if (request.method !== "POST") return new Response(null, { status: 405 });
+			const body = (await request.json()) as { id: string | number; method: string };
+			if (body.method === "initialize")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						protocolVersion: "2025-03-26",
+						capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} },
+						serverInfo: { name: "cache-close-fixture", version: "1" },
+					},
+				});
+			if (body.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
+			if (body.method === "resources/list") {
+				resourceListCalls += 1;
+				if (resourceListCalls >= 2) {
+					resourceRefreshEntered.resolve();
+					await resourceRefreshRelease.promise;
+					resourceRefreshDone.resolve();
+				}
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { resources: [{ uri: "fixture://resource", name: "resource" }] },
+				});
+			}
+			if (body.method === "resources/templates/list")
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: { resourceTemplates: [] } });
+			if (body.method === "prompts/list") {
+				promptListCalls += 1;
+				if (promptListCalls >= 2) {
+					promptRefreshEntered.resolve();
+					await promptRefreshRelease.promise;
+					promptRefreshDone.resolve();
+				}
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { prompts: [{ name: "prompt", description: "prompt", arguments: [] }] },
+				});
+			}
+			if (body.method === "resources/subscribe" || body.method === "resources/unsubscribe")
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+		},
+	});
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({ mcpServers: { fixture: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` } } }),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const manager = service.manager;
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		await waitForCondition(
+			() =>
+				resourceListCalls >= 1 &&
+				promptListCalls >= 1 &&
+				service.getConnection("fixture")?.resources !== undefined &&
+				service.getConnection("fixture")?.prompts !== undefined,
+			"initial resource and prompt loads",
+		);
+		manager.setNotificationsEnabled(true);
+		await waitForCondition(
+			() => (manager.getNotificationState().subscriptions.get("fixture")?.size ?? 0) === 1,
+			"initial resource subscription",
+		);
+		const mcpConnection = service.getConnection("fixture");
+		if (!mcpConnection) throw new Error("MCP fixture connection was not established");
+		mcpConnection.transport.onNotification?.("notifications/resources/list_changed", {});
+		mcpConnection.transport.onNotification?.("notifications/prompts/list_changed", {});
+		await Promise.all([resourceRefreshEntered.promise, promptRefreshEntered.promise]);
+		const stateBeforeClose = { resources: mcpConnection.resources, prompts: mcpConnection.prompts };
+		expect(stateBeforeClose.resources).toBeUndefined();
+		expect(stateBeforeClose.prompts).toBeUndefined();
+
+		await runtime.close().catch(() => {});
+		resourceRefreshRelease.resolve();
+		promptRefreshRelease.resolve();
+		await Promise.all([resourceRefreshDone.promise, promptRefreshDone.promise]);
+		await Bun.sleep(25);
+		expect(mcpConnection.resources).toBe(stateBeforeClose.resources);
+		expect(mcpConnection.prompts).toBe(stateBeforeClose.prompts);
+	} finally {
+		resourceRefreshRelease.resolve();
+		promptRefreshRelease.resolve();
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		await server.stop(true);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-019 late MCP notifications after shutdown do not invoke callbacks", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-notification-shutdown-");
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: async request => {
+			if (request.method !== "POST") return new Response(null, { status: 405 });
+			const body = (await request.json()) as { id: string | number; method: string };
+			if (body.method === "initialize")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						protocolVersion: "2025-03-26",
+						capabilities: { tools: {}, resources: { subscribe: true } },
+						serverInfo: { name: "notification-shutdown-fixture", version: "1" },
+					},
+				});
+			if (body.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
+			if (body.method === "resources/list")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { resources: [{ uri: "fixture://resource", name: "resource" }] },
+				});
+			if (body.method === "resources/templates/list")
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: { resourceTemplates: [] } });
+			if (body.method === "resources/subscribe" || body.method === "resources/unsubscribe")
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+		},
+	});
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({ mcpServers: { fixture: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` } } }),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const manager = service.manager;
+	let genericNotifications = 0;
+	let resourceChanges = 0;
+	manager.setOnNotification(() => {
+		genericNotifications += 1;
+	});
+	manager.setOnResourcesChanged(() => {
+		resourceChanges += 1;
+	});
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		await waitForCondition(() => service.getConnection("fixture")?.resources !== undefined, "initial resource load");
+		manager.setNotificationsEnabled(true);
+		await waitForCondition(
+			() => (manager.getNotificationState().subscriptions.get("fixture")?.size ?? 0) === 1,
+			"initial resource subscription",
+		);
+		const mcpConnection = service.getConnection("fixture");
+		if (!mcpConnection) throw new Error("MCP fixture connection was not established");
+		mcpConnection.transport.onNotification?.("notifications/resources/updated", { uri: "fixture://resource" });
+		expect(resourceChanges).toBe(1);
+		expect(genericNotifications).toBe(1);
+
+		await runtime.close();
+		mcpConnection.transport.onNotification?.("notifications/resources/updated", { uri: "fixture://resource" });
+		mcpConnection.transport.onNotification?.("notifications/custom", {});
+		expect(resourceChanges).toBe(1);
+		expect(genericNotifications).toBe(1);
+	} finally {
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		await server.stop(true);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-020 disconnect rolls back a held bootstrap resource subscription", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-subscribe-disconnect-");
+	const subscribeEntered = Promise.withResolvers<void>();
+	const subscribeRelease = Promise.withResolvers<void>();
+	const closeEntered = Promise.withResolvers<void>();
+	const closeRelease = Promise.withResolvers<void>();
+	let unsubscribeCalls = 0;
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: async request => {
+			if (request.method !== "POST") return new Response(null, { status: 405 });
+			const body = (await request.json()) as { id: string | number; method: string };
+			if (body.method === "initialize")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						protocolVersion: "2025-03-26",
+						capabilities: { tools: {}, resources: { subscribe: true } },
+						serverInfo: { name: "subscribe-disconnect-fixture", version: "1" },
+					},
+				});
+			if (body.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
+			if (body.method === "resources/list")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { resources: [{ uri: "fixture://resource", name: "resource" }] },
+				});
+			if (body.method === "resources/templates/list")
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: { resourceTemplates: [] } });
+			if (body.method === "resources/subscribe") {
+				subscribeEntered.resolve();
+				await subscribeRelease.promise;
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			}
+			if (body.method === "resources/unsubscribe") {
+				unsubscribeCalls += 1;
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			}
+			return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+		},
+	});
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({ mcpServers: { fixture: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` } } }),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const manager = service.manager;
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		await waitForCondition(() => service.getConnection("fixture")?.resources !== undefined, "initial resource load");
+		manager.setNotificationsEnabled(true);
+		await subscribeEntered.promise;
+		const mcpConnection = service.getConnection("fixture");
+		if (!mcpConnection) throw new Error("MCP fixture connection was not established");
+		const close = mcpConnection.transport.close.bind(mcpConnection.transport);
+		mcpConnection.transport.close = async () => {
+			closeEntered.resolve();
+			await closeRelease.promise;
+			await close();
+		};
+
+		const disconnecting = manager.disconnectServer("fixture");
+		await closeEntered.promise;
+		subscribeRelease.resolve();
+		await waitForCondition(() => unsubscribeCalls >= 1, "stale subscription rollback");
+		expect(manager.getNotificationState().subscriptions.size).toBe(0);
+		closeRelease.resolve();
+		await disconnecting;
+		expect(manager.getNotificationState().subscriptions.size).toBe(0);
+	} finally {
+		subscribeRelease.resolve();
+		closeRelease.resolve();
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		await server.stop(true);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 test("MCP-WIRE-011 runtime close drains a held autonomous reconnect before returning", async () => {
 	const root = mkdtempSync("/tmp/gjc-mcp-wire-reconnect-close-");
 	const { fixture, counterPath, releasePath, readyPath } = writeGatedStdioFixture(root);
