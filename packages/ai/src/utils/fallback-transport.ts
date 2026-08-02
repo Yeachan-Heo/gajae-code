@@ -175,7 +175,13 @@ export function transportFailureFacts(
 		finiteStatus(propertyOf(value, "status")) ??
 		finiteStatus(propertyOf(response, "status")) ??
 		finiteStatus(propertyOf(capturedResponse, "status"));
-	const anthropicErrorType = stringValue(propertyOf(nestedError, "type")) ?? stringValue(propertyOf(value, "type"));
+	// `anthropicErrorType` is also read from its own key so re-normalizing an
+	// already-built facts object (which consumers do deliberately) preserves it
+	// instead of silently dropping the Anthropic code on the second pass.
+	const anthropicErrorType =
+		stringValue(propertyOf(nestedError, "type")) ??
+		stringValue(propertyOf(value, "anthropicErrorType")) ??
+		stringValue(propertyOf(value, "type"));
 	const openaiErrorCode =
 		stringValue(propertyOf(value, "openaiErrorCode")) ?? stringValue(propertyOf(nestedError, "code"));
 	const providerCode =
@@ -266,15 +272,27 @@ function isAuthCode(code: string | undefined): boolean {
 /**
  * Resolves the {@link AuthDisposition} for an `auth` trigger.
  *
- * Precedence is explicit: a typed provider code wins over the HTTP status, so
- * `{status: 401, providerCode: "forbidden"}` is terminal rather than a
- * credential problem. Only when no auth code is present does the status decide,
- * and an unknown-status `auth` defaults to `credential` because that is the
- * classification the pre-refinement code already produced.
+ * Precedence is explicit and ordered by specificity rather than by field,
+ * because transport facts can carry a first-party typed code and a
+ * `providerCode` that disagree:
+ *
+ * 1. A code naming a concrete credential fault (`invalid_api_key`,
+ *    `authentication_error`, …) wins, from whichever field it arrives in: it is
+ *    a specific diagnosis, while `forbidden` is the generic bucket this
+ *    refinement exists to distrust.
+ * 2. Otherwise a `forbidden` code in any field is terminal, so
+ *    `{status: 401, providerCode: "forbidden"}` does not mutate credentials.
+ * 3. Otherwise the HTTP status decides, and an unknown-status `auth` defaults to
+ *    `credential` because that is the classification the pre-refinement code
+ *    already produced.
+ *
+ * Trigger-class selection deliberately keeps its single-code precedence
+ * (`openaiErrorCode ?? anthropicErrorType ?? providerCode`); only this auth
+ * refinement reads every code field.
  */
-function resolveAuthDisposition(code: string | undefined, status: number | undefined): AuthDisposition {
-	if (code === FORBIDDEN_AUTH_CODE) return "forbidden";
-	if (isCredentialAuthCode(code)) return "credential";
+function resolveAuthDisposition(codes: readonly (string | undefined)[], status: number | undefined): AuthDisposition {
+	if (codes.some(code => isCredentialAuthCode(code))) return "credential";
+	if (codes.some(code => code === FORBIDDEN_AUTH_CODE)) return "forbidden";
 	return status === 403 ? "forbidden" : "credential";
 }
 
@@ -297,7 +315,10 @@ export function classifyFallbackTrigger(
 	const retryAfterMs =
 		parseRetryAfterMilliseconds(headers?.get("retry-after-ms") ?? null) ??
 		parseRetryAfterSeconds(headers?.get("retry-after") ?? null);
-	const code = (facts.openaiErrorCode ?? facts.anthropicErrorType ?? facts.providerCode)?.toLowerCase();
+	const codes = [facts.openaiErrorCode, facts.anthropicErrorType, facts.providerCode].map(value =>
+		value?.toLowerCase(),
+	);
+	const code = codes[0] ?? codes[1] ?? codes[2];
 	const triggerClass: FallbackTriggerClass =
 		code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE
 			? "server"
@@ -312,7 +333,7 @@ export function classifyFallbackTrigger(
 							: "other";
 	const trigger: FallbackTrigger = { class: triggerClass };
 	if (retryAfterMs !== undefined) trigger.retryAfterMs = retryAfterMs;
-	if (triggerClass === "auth") trigger.authDisposition = resolveAuthDisposition(code, facts.status);
+	if (triggerClass === "auth") trigger.authDisposition = resolveAuthDisposition(codes, facts.status);
 	return trigger;
 }
 

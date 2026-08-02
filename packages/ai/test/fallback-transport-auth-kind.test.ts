@@ -40,6 +40,54 @@ describe("fallback transport — auth disposition", () => {
 		expect(isForbiddenAuthFailure(facts(403, "invalid_api_key"))).toBe(false);
 	});
 
+	it("resolves mixed typed codes by specificity, not by field order", () => {
+		// `classifyFallbackTrigger` selects a single code for the trigger class
+		// (`openaiErrorCode ?? anthropicErrorType ?? providerCode`), so facts that
+		// carry both a first-party typed code and a provider code would otherwise
+		// have their disposition decided by which field happened to win.
+		const credentialFirst = {
+			kind: "transport" as const,
+			status: 401,
+			providerCode: "forbidden",
+			openaiErrorCode: "invalid_api_key",
+		};
+		expect(classifyFallbackTrigger(credentialFirst).class).toBe("auth");
+		expect(classifyFallbackTrigger(credentialFirst).authDisposition).toBe("credential");
+		expect(isForbiddenAuthFailure(credentialFirst)).toBe(false);
+
+		const forbiddenFirst = {
+			kind: "transport" as const,
+			status: 401,
+			providerCode: "invalid_api_key",
+			openaiErrorCode: "forbidden",
+		};
+		expect(classifyFallbackTrigger(forbiddenFirst).class).toBe("auth");
+		expect(classifyFallbackTrigger(forbiddenFirst).authDisposition).toBe("credential");
+		expect(isForbiddenAuthFailure(forbiddenFirst)).toBe(false);
+
+		// A concrete credential fault in the Anthropic field also outranks a
+		// generic `forbidden` arriving from the provider.
+		const anthropicCredential = {
+			kind: "transport" as const,
+			status: 403,
+			providerCode: "forbidden",
+			anthropicErrorType: "authentication_error",
+		};
+		expect(classifyFallbackTrigger(anthropicCredential).authDisposition).toBe("credential");
+		expect(isForbiddenAuthFailure(anthropicCredential)).toBe(false);
+
+		// With no concrete credential fault anywhere, a `forbidden` in any single
+		// field stays terminal regardless of which field carries it.
+		const forbiddenOnly = {
+			kind: "transport" as const,
+			status: 401,
+			providerCode: "forbidden",
+			openaiErrorCode: "server_error",
+		};
+		expect(classifyFallbackTrigger(forbiddenOnly).authDisposition).toBe("forbidden");
+		expect(isForbiddenAuthFailure(forbiddenOnly)).toBe(true);
+	});
+
 	it("classifies every credential-recoverable auth code as credential", () => {
 		for (const code of [
 			"authentication_error",

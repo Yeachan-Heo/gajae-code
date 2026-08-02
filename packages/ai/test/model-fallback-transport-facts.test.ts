@@ -149,6 +149,17 @@ describe("fallback transport facts", () => {
 		expect(facts).toBeDefined();
 		expect(transportFailureFacts(facts)).toEqual(facts!);
 
+		// The Anthropic code lives under its own key on an already-built facts
+		// object, so re-normalization must read that key back instead of only
+		// `error.type` / `type` — otherwise the second pass silently drops it and
+		// the auth-disposition precedence sees fewer codes than the first pass.
+		const anthropicFacts = transportFailureFacts({ status: 403, error: { type: "authentication_error" } });
+		expect(anthropicFacts).toMatchObject({ anthropicErrorType: "authentication_error" });
+		expect(transportFailureFacts(anthropicFacts)).toEqual(anthropicFacts!);
+		expect(classifyFallbackTrigger(transportFailureFacts(anthropicFacts))).toEqual(
+			classifyFallbackTrigger(anthropicFacts),
+		);
+
 		const headerOnly = transportFailureFacts({ headers: { "retry-after": "3" } });
 		expect(headerOnly).toEqual({
 			kind: "transport",
