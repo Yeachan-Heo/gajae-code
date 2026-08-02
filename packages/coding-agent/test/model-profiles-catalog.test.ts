@@ -343,6 +343,17 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["alibaba-token-plan"],
 		mapping: {
 			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:high",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-pro",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
 			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
 			planner: "alibaba-token-plan/glm-5.2:high",
 			critic: "alibaba-token-plan/glm-5.2:xhigh",
@@ -450,7 +461,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 34-profile matrix cell-for-cell", () => {
+	test("contains exact 35-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -629,6 +640,10 @@ describe("built-in model profile catalog", () => {
 			displayName: "Balanced",
 			providerGroup: "ALIBABA TOKEN PLAN",
 		});
+		expect(getModelProfilePresentation("alibaba-token-plan-pro")).toEqual({
+			displayName: "Pro",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
 		expect(getModelProfilePresentation("alibaba-token-plan-qwenmaxxing")).toEqual({
 			displayName: "QwenMaxxing",
 			providerGroup: "ALIBABA TOKEN PLAN",
@@ -667,6 +682,13 @@ describe("built-in model profile catalog", () => {
 
 	test("Alibaba Token Plan profiles route their intended roles", () => {
 		expect(builtinMapping("alibaba-token-plan-balanced")).toEqual({
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:high",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-pro")).toEqual({
 			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
 			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
 			planner: "alibaba-token-plan/glm-5.2:high",

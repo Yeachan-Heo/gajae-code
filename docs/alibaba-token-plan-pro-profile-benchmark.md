@@ -1,6 +1,6 @@
-# Alibaba Token Plan Balanced profile benchmark
+# Alibaba Token Plan Pro profile benchmark
 
-This note records the evidence used to update GJC's built-in `alibaba-token-plan-balanced` profile. It combines provider documentation, upstream model cards, and small live GJC agent-loop probes. The measurements are descriptive, not statistically significant.
+This note records the evidence used to add GJC's opt-in `alibaba-token-plan-pro` profile while preserving `alibaba-token-plan-balanced`. It combines provider documentation, upstream model cards, and small live GJC agent-loop probes. The measurements are descriptive, not statistically significant.
 
 ## Decision summary
 
@@ -12,7 +12,7 @@ This note records the evidence used to update GJC's built-in `alibaba-token-plan
 | Critic | `glm-5.2:xhigh` | Fastest correct defect-selection probe and cross-family review of DeepSeek output |
 | Architect | `qwen3.8-max-preview:xhigh` | Responses transport and 1M context for high-budget design work |
 
-The profile remains "Balanced" because it assigns three model families by role. The name does not imply medium reasoning effort.
+The Pro profile assigns three model families by role and raises only the high-value delegated budgets; it does not replace the provider's recommended Balanced profile.
 
 ## Environment
 

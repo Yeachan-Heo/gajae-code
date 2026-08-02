@@ -4,10 +4,7 @@
 ### Added
 
 - Added the paginated public SDK query `providers.list/active` (Q29), returning deterministic, deduplicated `{ provider, connectionKind }` descriptors for locally eligible providers without exposing credentials or performing remote health probes.
-
-### Changed
-
-- The built-in Alibaba Token Plan Balanced profile now uses `deepseek-v4-flash-0731:max` for execution and `glm-5.2:xhigh` for criticism, backed by a public benchmark note and official agent-evaluation results.
+- Added the opt-in Alibaba Token Plan Pro profile with `deepseek-v4-flash-0731:max` for execution and `glm-5.2:xhigh` for independent criticism, preserving the existing Balanced profile unchanged.
 
 ### Added
 
