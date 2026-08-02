@@ -226,19 +226,22 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	),
 	"config/mcpServer/reload": {
 		support: "implemented",
-		gjcSeam: "reloadMcpRuntime via mcpServerReloadHandler",
+		gjcSeam: "McpAppServerService.reload via mcpServerReloadHandler",
 		gjcBackendPath:
-			"packages/coding-agent/src/app-server/suites/mcp-handlers.ts; packages/coding-agent/src/modes/controllers/runtime-mcp-command-controller.ts",
-		semanticGaps: [],
+			"packages/coding-agent/src/runtime-mcp/app-server-service.ts; packages/coding-agent/src/app-server/create-app-server.ts; packages/coding-agent/src/app-server/suites/mcp-handlers.ts",
+		semanticGaps: [
+			"Reload is rejected while an app-server thread is loaded; this is an explicit busy policy because active AgentSession MCP tools are not rebound mid-turn.",
+		],
 		translationNotes: [
-			"GJC lazily creates the live MCPManager for app-server dispatch, then returns the vendored empty response after disconnect, rediscover, reconnect, and tool refresh.",
+			"GJC owns one MCP service per app-server runtime, invalidates the capability file cache, disconnects, rediscovers, reconnects, and returns the vendored empty response after the runtime refresh seam completes.",
 		],
 		owner: "app-server",
 		testIds: [
-			"MCP-005 config/mcpServer/reload uses the live disconnect, rediscover, reconnect, and tool refresh seam",
+			"MCP-WIRE-001 production app-server reload changes the live tool set after an on-disk edit",
 			"MCP-006 config/mcpServer/reload reports an honest failure for sealed MCP connections",
 		],
-		reason: "The handler invokes the same reloadMcpRuntime seam used by the production /mcp reload command.",
+		reason:
+			"The production runtime injects an owned McpAppServerService and the wire test proves an on-disk tool change is live after reload.",
 	},
 	"mcpServerStatus/list": laneRow(
 		"mcpServerStatusListHandler",
@@ -260,22 +263,22 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	),
 	"mcpServer/oauth/login": {
 		support: "implemented",
-		gjcSeam: "createMcpOAuthFlow via mcpServerOauthLoginHandler",
+		gjcSeam: "McpAppServerService.oauthLogin via mcpServerOauthLoginHandler",
 		gjcBackendPath:
-			"packages/coding-agent/src/app-server/suites/mcp-handlers.ts; packages/coding-agent/src/modes/controllers/runtime-mcp-command-controller.ts",
+			"packages/coding-agent/src/runtime-mcp/app-server-service.ts; packages/coding-agent/src/app-server/create-app-server.ts; packages/coding-agent/src/app-server/suites/mcp-handlers.ts",
 		semanticGaps: [
-			"OAuth completion is asynchronous and is reported only while the app-server connection remains alive.",
+			"OAuth completion is asynchronous and is reported only while the app-server connection remains alive; closing the requesting connection aborts the flow and suppresses its completion event.",
 		],
 		translationNotes: [
-			"The request returns GJC's real authorizationUrl; completion persists an MCP-bound OAuth credential and emits mcpServer/oauthLogin/completed.",
+			"The request returns GJC's real authorizationUrl; completion uses the owning runtime auth store, source-bound config persistence, per-server locking, compensating rollback, reconnect, and runtime publication of mcpServer/oauthLogin/completed.",
 		],
 		owner: "app-server",
 		testIds: [
-			"MCP-007 mcpServer/oauth/login returns the real authorization URL and reports completion persistence failure",
-			"MCP-008 mcpServer/oauth/login rejects an unknown server without claiming OAuth support",
+			"MCP-WIRE-002 production OAuth completion persists and publishes after the response",
+			"MCP-WIRE-003 OAuth persistence rolls back credential and config writes after reconnect failure",
 		],
 		reason:
-			"The handler starts the existing MCPOAuthFlow seam and reports its real authorization and completion state without emulating interactive input.",
+			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication, persistence, ordering, and rollback.",
 	},
 	"skills/list": laneRow(
 		"skillsListHandler",

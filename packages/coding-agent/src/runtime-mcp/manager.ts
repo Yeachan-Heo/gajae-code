@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as url from "node:url";
 import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema } from "@gajae-code/ai";
 import { logger } from "@gajae-code/utils";
+import { clearCache as clearCapabilityFileCache } from "../capability/fs";
 import type { SourceMeta } from "../capability/types";
 import * as configValue from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -442,6 +443,7 @@ export class MCPManager {
 			throw new Error("Tools-only MCP manager already loaded an explicit config");
 		}
 		if (this.#toolsOnly) this.#toolsOnlyConfigLoaded = true;
+		clearCapabilityFileCache();
 		const { configs, exaApiKeys, sources, configurationWarning } = await loadAllMCPConfigs(this.cwd, {
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
@@ -899,6 +901,13 @@ export class MCPManager {
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
 		return [...this.#tools];
+	}
+
+	/** Replace the stored source config used for reconnects and future tool calls. */
+	setServerConfig(name: string, config: MCPServerConfig): void {
+		this.#serverConfigs.set(name, config);
+		const connection = this.#connections.get(name);
+		if (connection) connection.config = config;
 	}
 
 	/**

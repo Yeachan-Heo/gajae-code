@@ -6,7 +6,7 @@
 // marketplace, windowsSandbox, and ChatGPT account mutations) return -32081 automatically by the
 // dispatcher (no handler registered = notSupported verdict from dispatchClientRequest).
 
-import type { MCPManager } from "../../runtime-mcp/manager";
+import type { McpAppServerService } from "../../runtime-mcp/app-server-service";
 import type { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
 import type { TurnController } from "../thread-runtime/turn-controller";
 import { accountHandlers } from "./account-handlers";
@@ -35,10 +35,14 @@ export interface HandlerContext {
 	readonly accountAuthState?: AccountAuthStateSource;
 	/** Connection the request arrived on; notification handlers target it directly. */
 	readonly connectionId?: string;
-	/** Optional live MCP manager supplied by an app-server host; handlers fall back to the singleton when absent. */
-	readonly mcpManager?: MCPManager;
+	/** Runtime-owned MCP lifecycle/auth service; absent only in isolated handler unit tests. */
+	readonly mcpService?: McpAppServerService;
+	/** Explicit test seam for a manager; production dispatch uses mcpService. */
+	readonly mcpManager?: import("../../runtime-mcp/manager").MCPManager;
 	/** Refresh the owning session's native MCP tool catalog after a lifecycle change. */
 	readonly refreshMcpTools?: (tools: readonly unknown[]) => Promise<void>;
+	/** Aborted when the owning app-server connection closes. */
+	readonly signal?: AbortSignal;
 	/** Loaded-thread runtime, for handlers that act on live threads. */
 	readonly manager?: ThreadRuntimeManager;
 	/** Live-turn controller, for handlers that interrupt or steer a running turn. */

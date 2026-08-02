@@ -5,6 +5,7 @@
  * MCP servers via stdio or HTTP transports.
  */
 
+export * from "./app-server-service";
 // Client
 export * from "./client";
 // Config

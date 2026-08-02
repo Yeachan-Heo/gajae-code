@@ -2,11 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MCPManager } from "../../../runtime-mcp/manager";
-import type { MCPServerConnection } from "../../../runtime-mcp/types";
 import type { HandlerContext } from "../../suites/handlers";
 import {
 	mcpHandlers,
-	mcpServerOauthLoginHandler,
 	mcpServerReloadHandler,
 	mcpServerResourceReadHandler,
 	mcpServerStatusListHandler,
@@ -63,8 +61,8 @@ async function connected() {
 }
 
 test("MCP-001 status lists a real connected server and inventory", async () => {
-	await connected();
-	const result = await mcpServerStatusListHandler({ detail: "full" });
+	const value = await connected();
+	const result = await mcpServerStatusListHandler({ detail: "full" }, { mcpManager: value.manager });
 	expect(result.ok).toBe(true);
 	if (!result.ok) return;
 
@@ -81,28 +79,33 @@ test("MCP-001 status lists a real connected server and inventory", async () => {
 });
 
 test("MCP-002 tool call returns real MCP content and unknown tools are notFound", async () => {
-	await connected();
-	const result = await mcpServerToolCallHandler({
-		threadId: "thread",
-		server: "fixture",
-		tool: "echo",
-		arguments: { text: "hello" },
-	});
+	const value = await connected();
+	const context = { mcpManager: value.manager };
+	const result = await mcpServerToolCallHandler(
+		{
+			threadId: "thread",
+			server: "fixture",
+			tool: "echo",
+			arguments: { text: "hello" },
+		},
+		context,
+	);
 	expect(result).toEqual({ ok: true, result: { content: [{ type: "text", text: "hello" }] } });
-	expect(await mcpServerToolCallHandler({ threadId: "thread", server: "fixture", tool: "missing" })).toEqual({
+	expect(await mcpServerToolCallHandler({ threadId: "thread", server: "fixture", tool: "missing" }, context)).toEqual({
 		ok: false,
 		errorKey: "notFound",
 	});
 });
 
 test("MCP-003 resource read returns real MCP contents and missing servers are notFound", async () => {
-	await connected();
-	const result = await mcpServerResourceReadHandler({ server: "fixture", uri: "fixture://hello" });
+	const value = await connected();
+	const context = { mcpManager: value.manager };
+	const result = await mcpServerResourceReadHandler({ server: "fixture", uri: "fixture://hello" }, context);
 	expect(result).toEqual({
 		ok: true,
 		result: { contents: [{ uri: "fixture://hello", mimeType: "text/plain", text: "real resource" }] },
 	});
-	expect(await mcpServerResourceReadHandler({ server: "missing", uri: "fixture://hello" })).toEqual({
+	expect(await mcpServerResourceReadHandler({ server: "missing", uri: "fixture://hello" }, context)).toEqual({
 		ok: false,
 		errorKey: "notFound",
 	});
@@ -155,41 +158,4 @@ test("MCP-006 config/mcpServer/reload reports an honest failure for sealed MCP c
 		ok: false,
 		errorKey: "internalError",
 	});
-});
-
-test("MCP-007 mcpServer/oauth/login returns the real authorization URL and reports completion persistence failure", async () => {
-	const dir = mkdtempSync(join("/tmp", "gjc-mcp-oauth-suite-"));
-	dirs.push(dir);
-	const mcp = new MCPManager(dir);
-	managers.push(mcp);
-	const connection = {
-		name: "oauth-fixture",
-		config: {
-			type: "http",
-			url: "https://provider.example/mcp",
-			oauth: {
-				authorizationUrl: "https://provider.example/authorize",
-				tokenUrl: "https://provider.example/token",
-				callbackPort: 0,
-			},
-		},
-	} as unknown as MCPServerConnection;
-	(mcp as unknown as { getConnection: (name: string) => MCPServerConnection | undefined }).getConnection = name =>
-		name === "oauth-fixture" ? connection : undefined;
-	const notifications: unknown[] = [];
-	const result = await mcpServerOauthLoginHandler({ name: "oauth-fixture", timeoutSecs: 1 }, {
-		mcpManager: mcp,
-		connectionId: "oauth-test",
-		emitTo: (_connectionId, _method, params) => notifications.push(params),
-	} as HandlerContext & { mcpManager: MCPManager });
-	expect(result.ok).toBe(true);
-	if (result.ok)
-		expect((result.result as { authorizationUrl: string }).authorizationUrl).toContain("provider.example/authorize");
-	await Bun.sleep(1_100);
-	expect(notifications).toContainEqual(expect.objectContaining({ name: "oauth-fixture", success: false }));
-});
-
-test("MCP-008 mcpServer/oauth/login rejects an unknown server without claiming OAuth support", async () => {
-	MCPManager.resetForTests();
-	expect(await mcpServerOauthLoginHandler({ name: "missing" })).toEqual({ ok: false, errorKey: "notFound" });
 });

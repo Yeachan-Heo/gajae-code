@@ -1,5 +1,6 @@
 // app-server production assembly: one shared runtime and per-transport connections.
-import { logger } from "@gajae-code/utils";
+import { getProjectDir, logger } from "@gajae-code/utils";
+import { createMcpAppServerService, type McpAppServerService } from "../runtime-mcp/app-server-service";
 import { serverNotifications } from "./protocol-source/catalogs.generated";
 import { experimentalValidators, stableValidators } from "./protocol-source/schema-validators.generated";
 import { ConnectionState } from "./router/connection-state";
@@ -20,6 +21,7 @@ export type AppServerRejectedFrameHandler = (reason: "malformed" | "oversize") =
 
 export interface AppServerRuntimeOptions {
 	readonly threadStartAdapter?: Omit<ChildBridgeOptions, "manager">;
+	readonly mcpService?: McpAppServerService;
 }
 
 export interface AppServerConnection {
@@ -58,6 +60,7 @@ class Runtime implements AppServerRuntime {
 	readonly registry = new HandlerRegistry();
 	readonly subscriptions = new ThreadSubscriptionIndex();
 	readonly broker = new ServerRequestBroker();
+	readonly mcpService: McpAppServerService;
 	readonly #connections = new Map<string, Connection>();
 	readonly #unpublished = new Map<string, Set<() => void>>();
 	readonly #connectionRegistry = new ConnectionRegistry();
@@ -76,6 +79,7 @@ class Runtime implements AppServerRuntime {
 		options: AppServerRuntimeOptions = {},
 	) {
 		this.manager = new ThreadRuntimeManager(config);
+		this.mcpService = options.mcpService ?? createMcpAppServerService({ cwd: getProjectDir() });
 		// A departing thread must never leave an approval waiter hanging: cancelling here settles
 		// every pending request for it, which also releases its pendingApprovals accounting.
 		this.manager.onThreadGone(threadId => {
@@ -143,6 +147,11 @@ class Runtime implements AppServerRuntime {
 		}
 		try {
 			await this.manager.waitForClosures();
+		} catch (error) {
+			captureFailure(error);
+		}
+		try {
+			await this.mcpService.close();
 		} catch (error) {
 			captureFailure(error);
 		}
@@ -306,11 +315,20 @@ class Runtime implements AppServerRuntime {
 			signal?.removeEventListener("abort", onAbort);
 		}
 	}
+	async #refreshMcpTools(_tools: readonly unknown[]): Promise<void> {
+		const loaded = this.manager.loaded();
+		if (loaded.length > 0) {
+			throw Object.assign(new Error("MCP reload is busy while an app-server thread is loaded."), { code: "busy" });
+		}
+	}
+
 	contextFor(connection: Connection, deferred: Array<() => Promise<void>>): InboundContext {
 		const active = (): boolean => this.#connections.get(connection.id) === connection && connection.active;
+		const gate = new NotificationPublicationGate();
+		deferred.push(() => gate.flush());
 		const queueMessage = (connectionId: string, message: Record<string, unknown>): void => {
 			if (!active()) return;
-			deferred.push(async () => {
+			gate.enqueue(async () => {
 				if (!active()) return;
 				await this.#connections.get(connectionId)?.enqueueMessage(message);
 			});
@@ -320,6 +338,10 @@ class Runtime implements AppServerRuntime {
 			broker: this.broker,
 			threadStartAdapter: this.#threadStartAdapter,
 			turnController: this.turnController,
+			mcpService: this.mcpService,
+			mcpManager: this.mcpService.manager,
+			refreshMcpTools: tools => this.#refreshMcpTools(tools),
+			signal: connection.signal,
 			isActive: active,
 			subscribe: threadId => {
 				if (!active()) throw new Error("Connection is inactive.");
@@ -337,8 +359,6 @@ class Runtime implements AppServerRuntime {
 				const target = this.#connections.get(connectionId);
 				const stability = this.#serverNotificationStability.get(method);
 				const validators = target?.state.capabilities?.experimentalApi ? experimentalValidators : stableValidators;
-				// Invalid outbound notifications are logged and not emitted; capability eligibility
-				// alone does not prove that a payload is safe for the receiving profile.
 				if (!validators.serverNotificationParams[method]?.(params)) {
 					logger.warn("Dropping invalid app-server notification", { connectionId, method });
 					return;
@@ -369,8 +389,29 @@ class Runtime implements AppServerRuntime {
 	}
 }
 
+class NotificationPublicationGate {
+	#flushed = false;
+	#pending: Array<() => Promise<void>> = [];
+
+	enqueue(action: () => Promise<void>): void {
+		if (this.#flushed) {
+			void action().catch(error => logger.debug("App-server notification publication failed", { error }));
+			return;
+		}
+		this.#pending.push(action);
+	}
+
+	async flush(): Promise<void> {
+		if (this.#flushed) return;
+		this.#flushed = true;
+		const pending = this.#pending.splice(0);
+		for (const action of pending) await action();
+	}
+}
+
 class Connection implements AppServerConnection {
 	readonly state = new ConnectionState();
+	readonly #abortController = new AbortController();
 	readonly #queue: BoundedOutboundQueue;
 	#inbound: Promise<void> = Promise.resolve();
 	#closed = false;
@@ -378,6 +419,10 @@ class Connection implements AppServerConnection {
 
 	get active(): boolean {
 		return !this.#closed;
+	}
+
+	get signal(): AbortSignal {
+		return this.#abortController.signal;
 	}
 	readonly #runtime: Runtime;
 	readonly #transport: AppServerTransport;
@@ -471,6 +516,7 @@ class Connection implements AppServerConnection {
 
 	async #close(): Promise<void> {
 		this.#closed = true;
+		this.#abortController.abort(new Error("App-server connection closed."));
 		this.#runtime.removeConnection(this.id);
 		const runtimeClose = this.#transport === "stdio" ? this.#runtime.close() : undefined;
 		const queueClose = this.#queue.close();
