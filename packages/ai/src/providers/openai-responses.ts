@@ -144,7 +144,12 @@ const OPENAI_DEFAULT_BASE_URL_HOST = "api.openai.com";
 function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
 	try {
 		const url = new URL(baseUrl);
-		return url.hostname === OPENAI_DEFAULT_BASE_URL_HOST && (url.pathname === "" || url.pathname === "/v1");
+		return (
+			url.protocol === "https:" &&
+			url.hostname === OPENAI_DEFAULT_BASE_URL_HOST &&
+			url.port === "" &&
+			(url.pathname === "" || url.pathname === "/v1")
+		);
 	} catch {
 		return baseUrl === OPENAI_DEFAULT_BASE_URL;
 	}

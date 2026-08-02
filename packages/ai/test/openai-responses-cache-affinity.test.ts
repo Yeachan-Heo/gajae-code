@@ -127,6 +127,16 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.clientRequestId).toBeNull();
 	});
 
+	it.each([
+		"http://api.openai.com/v1",
+		"https://api.openai.com:8443/v1",
+	])("does not set automatic session routing headers for non-canonical OpenAI endpoint %s", async baseUrl => {
+		const captured = await captureOpenAIResponseHeaders({ sessionId: "session-123" }, { ...model, baseUrl });
+
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+	});
+
 	it("never sets session routing headers for GitHub Copilot, even when compatibility metadata opts in", async () => {
 		const copilotModel = getBundledModel("github-copilot", "gpt-5-mini") as Model<"openai-responses">;
 		const captured = await captureOpenAIResponseHeaders(
