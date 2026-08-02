@@ -308,6 +308,11 @@ async function postJson(
 	return { status: response.status, body: parsed };
 }
 
+// Execution mode: this gate drives the real T3 desktop application, which is a singleton on a
+// macOS user session. It allocates a free loopback port and a temporary CODEX_HOME per run, so
+// runs do not collide on a fixed resource, but measured on this host it only sustains up to
+// four concurrent runs; at eight the probes starve and every run fails the bounded provider-probe
+// wait. Run it sequentially (as the obligations verifier does) or at low concurrency.
 test("G3b REAL-CLIENT gate: T3 Code 0.0.28 drives GJC through its spawn contract", async () => {
 	const pinnedVersion = parsePinnedBundleVersion();
 	expect(pinnedVersion).toBe(expectedClientVersion);
