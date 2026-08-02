@@ -1,5 +1,5 @@
 import { $credentialEnv, extractHttpStatusFromError, logger, structuredCloneJSON } from "@gajae-code/utils";
-import OpenAI from "openai";
+import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
 	Tool as OpenAITool,
 	ResponseCreateParamsStreaming,
@@ -38,7 +38,9 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import {
+	FirstEventTimeoutError,
 	getOpenAIStreamIdleTimeoutMs,
+	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
@@ -124,7 +126,6 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 }
 
 const OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX = "openai-responses:";
-const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS = 300_000;
 const OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI responses stream timed out while waiting for the first event";
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
@@ -314,6 +315,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 	(async () => {
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
+		let streamConnected = false;
 
 		const output: AssistantMessage = createInitialResponsesAssistantMessage(
 			"openai-responses",
@@ -392,8 +394,8 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				await notifyProviderResponse(options, response, model, request_id);
 				return data;
 			});
-			const firstEventFallbackMs =
-				model.provider === "alibaba-token-plan" ? ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS : undefined;
+			streamConnected = true;
+			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			if (premiumRequestsTotal !== undefined) output.usage.premiumRequests = premiumRequestsTotal;
@@ -447,11 +449,16 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 		} catch (error) {
 			for (const block of output.content) delete (block as { index?: number }).index;
 			const localAbortReason = abortTracker.getLocalAbortReason();
+			const normalizedError =
+				!streamConnected && model.provider === "alibaba-token-plan" && error instanceof APIConnectionTimeoutError
+					? new FirstEventTimeoutError(OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE)
+					: error;
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? error);
-			output.transportFailure = transportFailureFacts(localAbortReason ?? error);
-			output.errorMessage = localAbortReason?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
-			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
+			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? normalizedError);
+			output.transportFailure = transportFailureFacts(localAbortReason ?? normalizedError);
+			output.errorMessage =
+				localAbortReason?.message ?? (await finalizeErrorMessage(normalizedError, rawRequestDump));
+			output.errorMessage = rewriteCopilotError(output.errorMessage, normalizedError, model.provider);
 			// Explicitly mark the poisoned-history rejection so the shared
 			// `invalid_prompt` contract is present even when the SDK error surfaces
 			// only a message (no structured code). This keeps the responses

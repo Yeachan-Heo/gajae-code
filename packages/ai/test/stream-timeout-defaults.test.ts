@@ -43,6 +43,10 @@ afterEach(() => {
 });
 
 describe("getProviderFirstEventTimeoutFallbackMs(provider)", () => {
+	it("gives Alibaba Token Plan one continuous 600-second first-event window", () => {
+		expect(getProviderFirstEventTimeoutFallbackMs("alibaba-token-plan")).toBe(600_000);
+	});
+
 	it("gives Kimi Code one continuous 300-second first-event window", () => {
 		expect(getProviderFirstEventTimeoutFallbackMs("kimi-code")).toBe(300_000);
 	});

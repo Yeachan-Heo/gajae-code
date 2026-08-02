@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { getBundledModel } from "../src/models";
 import { streamAzureOpenAIResponses } from "../src/providers/azure-openai-responses";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
 import type { Context, Model, TextContent } from "../src/types";
-import { waitForDelayOrAbort } from "./helpers";
+import { waitForDelayOrAbort, withEnv } from "./helpers";
 
 const originalFetch = global.fetch;
 
@@ -13,6 +13,14 @@ const openAICompletionsModel = {
 	...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">),
 	api: "openai-completions",
 } satisfies Model<"openai-completions">;
+const alibabaOpenAIResponsesModel = getBundledModel(
+	"alibaba-token-plan",
+	"qwen3.8-max-preview",
+) as Model<"openai-responses">;
+const alibabaOpenAICompletionsModel = getBundledModel(
+	"alibaba-token-plan",
+	"deepseek-v4-pro",
+) as Model<"openai-completions">;
 const azureOpenAIResponsesModel: Model<"azure-openai-responses"> = {
 	id: "gpt-5-mini",
 	name: "GPT-5 Mini",
@@ -253,6 +261,10 @@ function getFirstTextContent(result: { content: unknown[] }): TextContent | unde
 	});
 }
 
+async function flushMicrotasks(ticks = 40): Promise<void> {
+	for (let i = 0; i < ticks; i++) await Promise.resolve();
+}
+
 async function expectDelayedRequestSetupSucceeds(
 	run: (streamFirstEventTimeoutMs: number) => Promise<{ stopReason: string; content: unknown[] }>,
 	responseFactory: () => Response,
@@ -267,6 +279,7 @@ async function expectDelayedRequestSetupSucceeds(
 
 afterEach(() => {
 	global.fetch = originalFetch;
+	vi.useRealTimers();
 });
 
 describe("OpenAI-family first-event timeouts", () => {
@@ -389,6 +402,103 @@ describe("OpenAI-family first-event timeouts", () => {
 				}).result(),
 			() => createOpenAICompletionsSuccessResponse(openAICompletionsModel.id),
 		);
+	});
+
+	it("lets Alibaba completions wait past the old 120s SDK timeout for response headers", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: undefined }, async () => {
+			let fetchAttempts = 0;
+			const delayedFetch = createDelayedFetch(150_000, () =>
+				createOpenAICompletionsSuccessResponse(alibabaOpenAICompletionsModel.id),
+			);
+			global.fetch = Object.assign(
+				async (input: string | URL | Request, init?: RequestInit) => {
+					fetchAttempts++;
+					return delayedFetch(input, init);
+				},
+				{ preconnect: originalFetch.preconnect },
+			);
+
+			const pending = streamOpenAICompletions(alibabaOpenAICompletionsModel, baseContext(), {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+			}).result();
+			await flushMicrotasks();
+			expect(fetchAttempts).toBe(1);
+
+			vi.advanceTimersByTime(120_000);
+			await flushMicrotasks();
+			let settled = false;
+			void pending.then(() => {
+				settled = true;
+			});
+			await flushMicrotasks();
+			expect(settled).toBe(false);
+
+			vi.advanceTimersByTime(30_000);
+			await flushMicrotasks();
+			const result = await pending;
+			expect(result.stopReason).toBe("stop");
+			expect(getFirstTextContent(result)).toMatchObject({ type: "text", text: "Hello delayed" });
+		});
+	});
+
+	it("normalizes an Alibaba completions SDK setup timeout as a typed first-event timeout", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: "5000" }, async () => {
+			let fetchAttempts = 0;
+			const delayedFetch = createDelayedFetch(60_000, () =>
+				createOpenAICompletionsSuccessResponse(alibabaOpenAICompletionsModel.id),
+			);
+			global.fetch = Object.assign(
+				async (input: string | URL | Request, init?: RequestInit) => {
+					fetchAttempts++;
+					return delayedFetch(input, init);
+				},
+				{ preconnect: originalFetch.preconnect },
+			);
+
+			const pending = streamOpenAICompletions(alibabaOpenAICompletionsModel, baseContext(), {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+			}).result();
+			await flushMicrotasks();
+			vi.advanceTimersByTime(5_000);
+			await flushMicrotasks(100);
+			const result = await pending;
+
+			expect(fetchAttempts).toBe(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("OpenAI completions stream timed out while waiting for the first event");
+			expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		});
+	});
+
+	it("normalizes an Alibaba responses SDK setup timeout as a typed first-event timeout", async () => {
+		vi.useFakeTimers();
+		let fetchAttempts = 0;
+		const delayedFetch = createDelayedFetch(700_000, createOpenAIResponsesSuccessResponse);
+		global.fetch = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				fetchAttempts++;
+				return delayedFetch(input, init);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const pending = streamOpenAIResponses(alibabaOpenAIResponsesModel, baseContext(), {
+			apiKey: "test-key",
+			requestMaxRetries: 0,
+		}).result();
+		await flushMicrotasks();
+		vi.advanceTimersByTime(600_000);
+		await flushMicrotasks(100);
+		const result = await pending;
+
+		expect(fetchAttempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("OpenAI responses stream timed out while waiting for the first event");
+		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
 	});
 
 	it("does not arm the first-event watchdog before Azure OpenAI responses setup finishes", async () => {

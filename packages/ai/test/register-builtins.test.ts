@@ -185,8 +185,8 @@ describe("register-builtins lazy streams", () => {
 });
 
 describe("resolveLazyStreamFirstEventFallbackMs", () => {
-	it("returns 300s for slow-first-event providers without a configured fallback", () => {
-		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan")).toBe(300_000);
+	it("returns each slow provider's centralized first-event fallback", () => {
+		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan")).toBe(600_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code")).toBe(300_000);
 	});
 	it("returns undefined for unrelated providers", () => {
@@ -261,18 +261,18 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		);
 	}
 
-	it("alibaba-token-plan survives past the 120s shared default outer watchdog", async () => {
+	it("alibaba-token-plan survives past the previous 300s outer watchdog", async () => {
 		vi.useFakeTimers();
-		// Source emits its first real token at 150s — past the 120s default but
-		// well within Alibaba's 300s outer fallback.
-		const source = createDelayedSource(150_000);
+		// Source emits its first real token at 310s — past the previous Alibaba
+		// floor but well within the widened 600s fallback.
+		const source = createDelayedSource(310_000);
 		setBedrockProviderModule({ streamBedrock: () => source });
 
 		const stream = streamBedrock(createAlibabaModel(), baseContext, {});
 		await flush();
 
-		// Advance past the shared 120s default — must NOT timeout.
-		vi.advanceTimersByTime(120_000);
+		// Advance past the previous 300s Alibaba floor — must NOT timeout.
+		vi.advanceTimersByTime(300_000);
 		await flush();
 		let settled = false;
 		void stream.result().then(() => {
@@ -281,15 +281,15 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(settled).toBe(false);
 
-		// Advance to 150s — the source emits text_delta and completes.
-		vi.advanceTimersByTime(30_000);
+		// Advance to 310s — the source emits text_delta and completes.
+		vi.advanceTimersByTime(10_000);
 		await flush();
 		const result = await stream.result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorMessage).toBeUndefined();
 	});
 
-	it("alibaba-token-plan times out at 300s when the source never emits", async () => {
+	it("alibaba-token-plan times out at 600s when the source never emits", async () => {
 		vi.useFakeTimers();
 		const source = createHangingSource();
 		setBedrockProviderModule({ streamBedrock: () => source });
@@ -297,8 +297,8 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		const stream = streamBedrock(createAlibabaModel(), baseContext, {});
 		await flush();
 
-		// 299s — still alive.
-		vi.advanceTimersByTime(299_000);
+		// 599s — still alive.
+		vi.advanceTimersByTime(599_000);
 		await flush();
 		let settled = false;
 		void stream.result().then(() => {
@@ -307,7 +307,7 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(settled).toBe(false);
 
-		// 300s — watchdog fires.
+		// 600s — watchdog fires.
 		vi.advanceTimersByTime(1_000);
 		await flush();
 		const result = await stream.result();
@@ -359,18 +359,18 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(settled).toBe(false);
 
-		// 60s — explicit override fires well before the 300s Alibaba fallback.
+		// 60s — explicit override fires well before the 600s Alibaba fallback.
 		vi.advanceTimersByTime(1_000);
 		await flush();
 		const result = await stream.result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider stream timed out while waiting for the first event");
 	});
-	it("keeps the exported OpenAI Completions lazy path alive past 120s for Alibaba", async () => {
+	it("keeps the exported OpenAI Completions lazy path alive past 300s for Alibaba", async () => {
 		vi.useFakeTimers();
 		const model = getBundledModel("alibaba-token-plan", "glm-5.2") as Model<"openai-completions">;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async () =>
-			createDelayedSseResponse(150_000, [
+			createDelayedSseResponse(310_000, [
 				{
 					id: "chatcmpl-delayed",
 					object: "chat.completion.chunk",
@@ -398,7 +398,7 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 
-		vi.advanceTimersByTime(120_000);
+		vi.advanceTimersByTime(300_000);
 		await flush();
 		let settled = false;
 		void lazyStream.result().then(() => {
@@ -407,18 +407,18 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(settled).toBe(false);
 
-		vi.advanceTimersByTime(30_000);
+		vi.advanceTimersByTime(10_000);
 		await flush();
 		const result = await lazyStream.result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toContainEqual({ type: "text", text: "Hello delayed" });
 	});
 
-	it("keeps the exported OpenAI Responses lazy path alive past 120s for Alibaba", async () => {
+	it("keeps the exported OpenAI Responses lazy path alive past 300s for Alibaba", async () => {
 		vi.useFakeTimers();
 		const model = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async () =>
-			createDelayedSseResponse(150_000, [
+			createDelayedSseResponse(310_000, [
 				{ type: "response.created", response: { id: "resp-delayed" } },
 				{
 					type: "response.output_item.added",
@@ -455,7 +455,7 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 
-		vi.advanceTimersByTime(120_000);
+		vi.advanceTimersByTime(300_000);
 		await flush();
 		let settled = false;
 		void lazyStream.result().then(() => {
@@ -464,7 +464,7 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(settled).toBe(false);
 
-		vi.advanceTimersByTime(30_000);
+		vi.advanceTimersByTime(10_000);
 		await flush();
 		const result = await lazyStream.result();
 		expect(result.stopReason).toBe("stop");

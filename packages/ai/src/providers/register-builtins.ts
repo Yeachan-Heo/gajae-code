@@ -25,6 +25,7 @@ import { AssistantMessageEventStream as EventStreamImpl } from "../utils/event-s
 import { transportFailureFacts } from "../utils/fallback-transport";
 import {
 	FirstEventTimeoutError,
+	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
@@ -197,13 +198,12 @@ interface LazyStreamLimits {
 const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
 	defaultFirstEventTimeoutMs: 300_000,
 };
-const SLOW_FIRST_EVENT_PROVIDERS = new Set(["alibaba-token-plan", "kimi-code"]);
 
 /**
  * Resolves the first-event timeout fallback for the outer lazy-stream watchdog.
  * A configured wrapper-specific fallback (from `LazyStreamLimits`) always wins;
- * otherwise providers known to have slow first events get a five-minute floor
- * matching their inner provider-level override. Returns `undefined` for
+ * otherwise providers known to have slow first events use the same centralized
+ * fallback as their inner provider-level watchdog. Returns `undefined` for
  * providers that should use the shared default.
  */
 export function resolveLazyStreamFirstEventFallbackMs(
@@ -211,7 +211,7 @@ export function resolveLazyStreamFirstEventFallbackMs(
 	configuredFallbackMs?: number,
 ): number | undefined {
 	if (configuredFallbackMs !== undefined) return configuredFallbackMs;
-	return SLOW_FIRST_EVENT_PROVIDERS.has(provider) ? 300_000 : undefined;
+	return getProviderFirstEventTimeoutFallbackMs(provider);
 }
 
 function forwardStream<TApi extends Api>(

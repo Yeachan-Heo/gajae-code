@@ -1,5 +1,5 @@
 import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
-import OpenAI from "openai";
+import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
 	ChatCompletionAssistantMessageParam,
 	ChatCompletionChunk,
@@ -47,6 +47,7 @@ import {
 	rewriteCopilotError,
 } from "../utils/http-inspector";
 import {
+	FirstEventTimeoutError,
 	getOpenAIStreamIdleTimeoutMs,
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
@@ -500,8 +501,6 @@ function getTrailingPartialDeepseekToken(text: string): string {
 	return tail;
 }
 
-const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS = 300_000;
-
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
 
@@ -515,6 +514,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	(async () => {
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
+		let streamConnected = false;
 		let getCapturedErrorResponse: (() => CapturedHttpErrorResponse | undefined) | undefined;
 
 		const output: AssistantMessage = createInitialResponsesAssistantMessage(model.api, model.provider, model.id);
@@ -640,10 +640,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					openaiStream = await createCompletionsStream("none");
 				}
 			}
-			const firstEventFallbackMs =
-				model.provider === "alibaba-token-plan"
-					? ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS
-					: getProviderFirstEventTimeoutFallbackMs(model.provider);
+			streamConnected = true;
+			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			if (premiumRequestsTotal !== undefined) {
@@ -1049,20 +1047,25 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
 			const localAbortReason = abortTracker.getLocalAbortReason();
+			const normalizedError =
+				!streamConnected && model.provider === "alibaba-token-plan" && error instanceof APIConnectionTimeoutError
+					? new FirstEventTimeoutError(OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE)
+					: error;
 			const capturedErrorResponse = getCapturedErrorResponse?.();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus =
-				extractHttpStatusFromError(localAbortReason ?? error) ??
+				extractHttpStatusFromError(localAbortReason ?? normalizedError) ??
 				(localAbortReason ? undefined : capturedErrorResponse?.status);
 			output.transportFailure = localAbortReason
 				? transportFailureFacts(localAbortReason)
-				: transportFailureFacts(error, capturedErrorResponse);
+				: transportFailureFacts(normalizedError, capturedErrorResponse);
 			output.errorMessage =
-				localAbortReason?.message ?? (await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse));
+				localAbortReason?.message ??
+				(await finalizeErrorMessage(normalizedError, rawRequestDump, capturedErrorResponse));
 			// Some providers via OpenRouter include extra details here.
-			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
+			const rawMetadata = (normalizedError as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
-			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
+			output.errorMessage = rewriteCopilotError(output.errorMessage, normalizedError, model.provider);
 			if (hasContentFilterSafetyCode(capturedErrorResponse)) {
 				output.errorKind = "provider_safety_stop";
 			}
@@ -1238,7 +1241,10 @@ async function createClient(
 	// wrapping watchdog arms. An explicit `0` disables the first-event watchdog,
 	// and the SDK treats `timeout: 0` as an immediate timeout, so do not pass a
 	// request timeout in that case.
-	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(getOpenAIStreamIdleTimeoutMs());
+	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(
+		getOpenAIStreamIdleTimeoutMs(),
+		getProviderFirstEventTimeoutFallbackMs(model.provider),
+	);
 	const sdkTimeoutMs =
 		streamFirstEventTimeoutOverride === 0
 			? undefined
