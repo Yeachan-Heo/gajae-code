@@ -187,12 +187,90 @@ fn linkat_no_replace(
 }
 
 #[cfg(target_os = "linux")]
+/// Atomic no-overwrite rename of a *directory* for filesystems that do not
+/// implement `renameat2` rename flags. `linkat` cannot hard-link a directory,
+/// so the file fallback does not apply; `mkdirat(2)` provides the missing
+/// exclusivity instead. It fails with `EEXIST` when the destination name
+/// already exists, which is the same no-overwrite guarantee `RENAME_NOREPLACE`
+/// gives, and a successful `mkdirat` means this caller now owns that name: no
+/// other publisher can create it, and nothing in this module deletes a
+/// directory it has not proven. The plain `renameat(2)` that follows can
+/// therefore only ever replace the empty directory just created here, and POSIX
+/// refuses to rename over a *non-empty* directory, so a populated collision is
+/// rejected rather than clobbered.
+///
+/// The destination name is briefly an empty directory instead of absent. That
+/// is the only observable difference from the atomic primitive, and it fails in
+/// the safe direction: a concurrent no-replace publisher racing for the same
+/// name loses at `mkdirat` exactly as it would have lost to `RENAME_NOREPLACE`.
+///
+/// A failed rename removes the placeholder again, so a rejected publish never
+/// leaves an empty directory squatting the destination name.
+fn rename_directory_no_replace(
+	source_parent: &File,
+	source_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+) -> std::io::Result<()> {
+	// SAFETY: the destination parent owns a valid fd and the name is a live
+	// NUL-terminated string for this syscall.
+	if unsafe { libc::mkdirat(destination_parent.as_raw_fd(), destination_name.as_ptr(), 0o700) }
+		!= 0
+	{
+		return Err(std::io::Error::last_os_error());
+	}
+	// SAFETY: both parents own valid fds and both names are live NUL-terminated
+	// strings for this syscall.
+	if unsafe {
+		libc::renameat(
+			source_parent.as_raw_fd(),
+			source_name.as_ptr(),
+			destination_parent.as_raw_fd(),
+			destination_name.as_ptr(),
+		)
+	} == 0
+	{
+		return Ok(());
+	}
+	let error = std::io::Error::last_os_error();
+	// SAFETY: the destination parent fd and name remain valid; this removes only
+	// the empty placeholder created above, which the failed rename did not touch.
+	unsafe {
+		libc::unlinkat(destination_parent.as_raw_fd(), destination_name.as_ptr(), libc::AT_REMOVEDIR)
+	};
+	Err(error)
+}
+
+#[cfg(target_os = "linux")]
+/// No-overwrite rename of a directory. Prefers the atomic
+/// `renameat2(RENAME_NOREPLACE)` primitive and falls back to the `mkdirat(2)`
+/// name claim of `rename_directory_no_replace` when the filesystem does not
+/// implement rename flags (see `rename_flags_unsupported`).
+fn rename_tree_no_replace(
+	source_parent: &File,
+	source_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+) -> std::io::Result<()> {
+	match renameat2_no_replace(source_parent, source_name, destination_parent, destination_name) {
+		Ok(()) => Ok(()),
+		Err(error) if rename_flags_unsupported(error.raw_os_error()) => rename_directory_no_replace(
+			source_parent,
+			source_name,
+			destination_parent,
+			destination_name,
+		),
+		Err(error) => Err(error),
+	}
+}
+
+#[cfg(target_os = "linux")]
 /// No-overwrite publish of a regular file. Prefers the atomic
 /// `renameat2(RENAME_NOREPLACE)` primitive and falls back to `linkat(2)` when
 /// the filesystem does not implement rename flags (see
 /// `rename_flags_unsupported`). Directory publishes must not use this helper:
-/// `linkat` cannot hard-link a directory, so tree renames keep calling
-/// `renameat2_no_replace` directly.
+/// `linkat` cannot hard-link a directory, so tree renames use
+/// `rename_tree_no_replace` instead.
 ///
 /// `release_source_authority` is only invoked on the `linkat` path, between the
 /// publishing link and the staging unlink; see `linkat_no_replace`. `renameat2`
@@ -2730,7 +2808,7 @@ fn rename_managed_tree_no_replace_inner(
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
 	if let Err(error) =
-		renameat2_no_replace(&source_parent, &source_name, &destination_parent, &destination_name)
+		rename_tree_no_replace(&source_parent, &source_name, &destination_parent, &destination_name)
 	{
 		return Err(
 			match error.raw_os_error() {
@@ -2789,7 +2867,6 @@ fn remove_managed_tree(
 	relative_path: &str,
 	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
 ) -> Result<RecoveryFsRetainedCleanupResult, &'static str> {
-	use std::os::fd::AsRawFd;
 	let snapshot = snapshot_managed_tree(root, relative_path)?
 		.snapshot
 		.ok_or("io_error")?;
@@ -2805,19 +2882,11 @@ fn remove_managed_tree(
 	))
 	.map_err(|_| "io_error")?;
 	let recovery_parent = recovery_directory(root, recovery)?;
-	// SAFETY: retained parent and validated names make the detach no-replace
-	// atomic.
-	if unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			source_parent.as_raw_fd(),
-			name.as_ptr(),
-			recovery_parent.as_raw_fd(),
-			quarantine.as_ptr(),
-			libc::RENAME_NOREPLACE,
-		)
-	} != 0
-	{
+	// Retained parents and validated names make the detach no-replace. The
+	// quarantine name is freshly minted and therefore absent, so on a filesystem
+	// without rename flags the `mkdirat` claim inside `rename_tree_no_replace`
+	// carries the same exclusivity the atomic primitive would have.
+	if rename_tree_no_replace(&source_parent, &name, &recovery_parent, &quarantine).is_err() {
 		return Err("io_error");
 	}
 	let detached = quarantine.to_str().map_err(|_| "io_error")?;
@@ -3477,5 +3546,137 @@ mod tests {
 		assert!(!dir.join("staged").exists(), "staging name removed after detach");
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// Seed a small directory tree and return its captured snapshot.
+	fn managed_tree(root: &File, path: &str) -> crate::path_identity::NativeDirectoryTreeSnapshot {
+		ensure_managed_directory(root, path).expect("create tree root");
+		ensure_managed_directory(root, &format!("{path}/nested")).expect("create nested directory");
+		managed_file(root, &format!("{path}/nested/leaf"), b"leaf-contents");
+		snapshot_managed_tree(root, path)
+			.expect("snapshot tree")
+			.snapshot
+			.expect("tree snapshot present")
+	}
+
+	/// `linkat` cannot hard-link a directory, so the file fallback does not
+	/// reach tree publishes; `mkdirat` supplies the missing exclusivity
+	/// instead. Without this fallback a managed fork of a session that owns
+	/// artifacts fails on every mount whose `renameat2` rejects rename flags.
+	#[test]
+	fn tree_publish_falls_back_to_mkdirat_when_rename_flags_unsupported() {
+		for unsupported in [libc::EINVAL, libc::ENOSYS] {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			ensure_managed_directory(&root, "source-parent").expect("create source parent");
+			ensure_managed_directory(&root, "destination-parent").expect("create destination parent");
+			let expected = managed_tree(&root, "source-parent/tree");
+
+			// Force the renameat2(RENAME_NOREPLACE) primitive to report the flag as
+			// unavailable, exactly as an NFS mount does with EINVAL.
+			set_retained_publish_faults([RetainedPublishFault::Rename(unsupported)]);
+			let result = rename_managed_tree_no_replace(
+				&root,
+				"source-parent/tree",
+				"destination-parent/tree",
+				&expected,
+			);
+
+			assert!(
+				result.ok,
+				"mkdirat fallback must publish the tree (errno {unsupported}): {:?}",
+				result.code
+			);
+			assert!(
+				!temporary.0.join("source-parent/tree").exists(),
+				"staging tree is removed after the fallback publish"
+			);
+			assert_eq!(
+				fs::read(temporary.0.join("destination-parent/tree/nested/leaf"))
+					.expect("published leaf"),
+				b"leaf-contents",
+				"the published tree must carry the staged contents"
+			);
+		}
+	}
+
+	/// The guarantee the fallback exists to preserve. `mkdirat` fails with
+	/// `EEXIST` exactly where `RENAME_NOREPLACE` would, so standing in for the
+	/// missing primitive never authorizes an overwrite.
+	#[test]
+	fn tree_fallback_still_refuses_to_overwrite_an_existing_destination() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		ensure_managed_directory(&root, "source-parent").expect("create source parent");
+		ensure_managed_directory(&root, "destination-parent").expect("create destination parent");
+		let expected = managed_tree(&root, "source-parent/tree");
+		// A distinct committed tree already owns the destination name.
+		managed_tree(&root, "destination-parent/tree");
+
+		set_retained_publish_faults([RetainedPublishFault::Rename(libc::EINVAL)]);
+		let result = rename_managed_tree_no_replace(
+			&root,
+			"source-parent/tree",
+			"destination-parent/tree",
+			&expected,
+		);
+
+		assert!(!result.ok, "an occupied destination must never be published over");
+		assert_eq!(result.code.as_deref(), Some("already_exists"));
+		assert_eq!(
+			fs::read(temporary.0.join("destination-parent/tree/nested/leaf"))
+				.expect("occupying leaf survives"),
+			b"leaf-contents",
+			"the occupying tree must be left untouched"
+		);
+		assert!(
+			temporary.0.join("source-parent/tree").exists(),
+			"a rejected publish leaves the staging tree in place"
+		);
+	}
+
+	/// The name claim and the rename are two steps, so a rename that fails after
+	/// the claim must give the destination name back rather than leave an empty
+	/// directory squatting it.
+	#[test]
+	fn tree_fallback_removes_its_placeholder_when_the_rename_fails() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+
+		let error = rename_directory_no_replace(
+			&root,
+			&CString::new("absent-source").expect("source name"),
+			&root,
+			&CString::new("destination").expect("destination name"),
+		)
+		.expect_err("renaming an absent source must fail");
+
+		assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+		assert!(
+			!temporary.0.join("destination").exists(),
+			"a failed rename must not leave its placeholder behind"
+		);
+	}
+
+	/// `remove_managed_tree` quarantines through the same directory no-replace
+	/// primitive, so staging-tree cleanup is blocked on the same mounts the
+	/// publish was. Fixing only the publish leaves a fork that fails mid-flight
+	/// unable to clean up after itself.
+	#[test]
+	fn managed_remove_tree_detaches_on_a_filesystem_without_rename_flags() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let expected = managed_tree(&root, "staged-tree");
+
+		set_retained_publish_faults([RetainedPublishFault::Rename(libc::EINVAL)]);
+		let result = remove_managed_tree(&root, None, "staged-tree", &expected)
+			.expect("detach must not fail on a filesystem without rename flags");
+
+		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
+		assert!(result.recovery_path.is_some(), "detach must retain recovery evidence");
+		assert!(
+			!temporary.0.join("staged-tree").exists(),
+			"canonical tree name removed after detach"
+		);
 	}
 }
