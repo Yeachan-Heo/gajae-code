@@ -1616,6 +1616,7 @@ export class SelectorController {
 			const submit = async (input: CustomProviderWizardSubmit): Promise<void> => {
 				try {
 					const result = await addApiCompatibleProvider(input);
+					if (result.credentialSource === "literal") await this.ctx.session.modelRegistry.authStorage.reload();
 					await this.ctx.session.modelRegistry.refresh("offline");
 					await this.ctx.notifyConfigChanged?.();
 					this.ctx.showStatus(formatProviderSetupResult(result));

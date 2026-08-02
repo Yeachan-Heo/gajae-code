@@ -220,6 +220,45 @@ describe("provider onboarding wizard", () => {
 		}
 	});
 
+	it("reloads pasted credentials and makes the provider available without restart", async () => {
+		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-wizard-"));
+		setAgentDir(tempAgentDir);
+		const store = await SqliteAuthCredentialStore.open(path.join(tempAgentDir, "agent.db"));
+		try {
+			const authStorage = new AuthStorage(store);
+			const registry = new ModelRegistry(authStorage, path.join(tempAgentDir, "models.yml"));
+			const ctx = createControllerContext(registry);
+			const completion = Promise.withResolvers<void>();
+			ctx.showStatus = message => {
+				ctx.statuses.push(message);
+				completion.resolve();
+			};
+			const controller = new SelectorController(ctx);
+
+			controller.showCustomProviderWizard();
+			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
+			wizard.handleInput("\n");
+			typeText(wizard, "literal-provider");
+			wizard.handleInput("\n");
+			typeText(wizard, "https://api.example.com/v1");
+			wizard.handleInput("\n");
+			wizard.handleInput("\x1b[B");
+			wizard.handleInput("\n");
+			typeText(wizard, "literal-secret");
+			wizard.handleInput("\n");
+			typeText(wizard, "literal-model");
+			wizard.handleInput("\n");
+			wizard.handleInput("\n");
+			await completion.promise;
+
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.getAvailable().some(model => model.provider === "literal-provider")).toBe(true);
+			expect(await registry.getApiKeyForProvider("literal-provider")).toBe("literal-secret");
+		} finally {
+			store.close();
+		}
+	});
+
 	it("keeps OAuth and API guide onboarding actions routed", () => {
 		const ctx = createControllerContext({ refresh: async () => undefined } as unknown as ModelRegistry);
 		const controller = new SelectorController(ctx);
