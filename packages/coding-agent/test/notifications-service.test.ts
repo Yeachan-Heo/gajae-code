@@ -13,6 +13,7 @@ import type {
 import {
 	buildNotificationStatusReport,
 	checkNotificationHealth,
+	classifyNotificationEndpoint,
 	formatNotificationHealthReport,
 	formatNotificationRecoveryReport,
 	formatNotificationStatusReport,
@@ -21,6 +22,7 @@ import {
 	sendNotificationTest,
 	writeNotificationDiagnostic,
 } from "../src/sdk/bus/notification-service";
+import { NOTIFICATION_LEAK_ARTIFACT_PREFIXES } from "../src/sdk/bus/telegram-daemon";
 import { DAEMON_GENERATION } from "../src/sdk/bus/telegram-daemon-contract";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
@@ -1302,5 +1304,43 @@ describe("notification-service diagnostic sanitization (secret-safe)", () => {
 		});
 		expect(result).toMatchObject({ ok: false, adapter: "telegram", uncertain: true });
 		expect(result.detail).toContain("no usable message receipt");
+	});
+});
+describe("endpoint classification of retained cleanup leak artifacts", () => {
+	const dir = "/state/sdk";
+	function fsWith(bytes: Record<string, string>) {
+		return {
+			readEndpointFile: async (file: string) => {
+				const raw = bytes[file];
+				if (raw === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+				return { bytes: Buffer.from(raw), identity: {} };
+			},
+		} as unknown as Parameters<typeof classifyNotificationEndpoint>[0];
+	}
+
+	test("classifies every native leak artifact prefix as a non-endpoint", async () => {
+		const names = NOTIFICATION_LEAK_ARTIFACT_PREFIXES.map(prefix => `${prefix}100000d-8b39653`);
+		const fs = fsWith(Object.fromEntries(names.map(name => [path.join(dir, name), ""])));
+		for (const name of names) {
+			const record = await classifyNotificationEndpoint(fs, path.join(dir, name), () => false);
+			expect(record.kind).toBe("non-endpoint");
+		}
+	});
+
+	test("still reports a genuinely corrupt endpoint file as unreadable", async () => {
+		const file = path.join(dir, "019fc01a-c994-7000-a08e-d0ae1fceef89.json");
+		const record = await classifyNotificationEndpoint(fsWith({ [file]: "{not json" }), file, () => false);
+		expect(record.kind).toBe("unreadable");
+	});
+
+	test("keeps notify health OK when only leak artifacts sit beside live endpoints", async () => {
+		const live = path.join(dir, "019fc01a-c994-7000-a08e-d0ae1fceef89.json");
+		const placeholder = path.join(dir, ".gjc-exact-unlink-placeholder-100000d-8b39653");
+		const fs = fsWith({
+			[live]: JSON.stringify({ sessionId: "s", url: "ws://x", token: "t", pid: process.pid }),
+			[placeholder]: "",
+		});
+		expect((await classifyNotificationEndpoint(fs, live, () => true)).kind).toBe("endpoint");
+		expect((await classifyNotificationEndpoint(fs, placeholder, () => true)).kind).toBe("non-endpoint");
 	});
 });

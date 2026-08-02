@@ -39,7 +39,12 @@ import { DiscordLiveProvider } from "./discord-live-provider";
 import type { DiscordDiagnosticProvider } from "./discord-provider";
 import { SlackLiveProvider } from "./slack-live-provider";
 import type { SlackDiagnosticProvider } from "./slack-provider";
-import { type OwnerFreshnessSnapshot, readOwnerFreshnessSnapshot, type TelegramDaemonFs } from "./telegram-daemon";
+import {
+	isNotificationLeakArtifactName,
+	type OwnerFreshnessSnapshot,
+	readOwnerFreshnessSnapshot,
+	type TelegramDaemonFs,
+} from "./telegram-daemon";
 import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
@@ -446,7 +451,12 @@ function isCanonicalLifecycleArtifactName(name: string): boolean {
 }
 
 function unreadableEndpointResult(file: string): NotificationEndpointClassification {
-	return isCanonicalLifecycleArtifactName(path.basename(file)) ? { kind: "non-endpoint" } : { kind: "unreadable" };
+	const name = path.basename(file);
+	// Retained native cleanup leak artifacts are not endpoint candidates. They are
+	// unparseable by construction (often zero-byte), so counting them as unreadable
+	// pins `notify health` to a WARN that `notify recovery` can never clear.
+	if (isCanonicalLifecycleArtifactName(name) || isNotificationLeakArtifactName(name)) return { kind: "non-endpoint" };
+	return { kind: "unreadable" };
 }
 
 /**
