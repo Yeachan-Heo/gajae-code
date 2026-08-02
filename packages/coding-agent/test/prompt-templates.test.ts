@@ -20,6 +20,11 @@ import hashlineDescription from "../src/prompts/tools/hashline.md" with { type: 
 // ============================================================================
 
 describe("substituteArgs", () => {
+	test("does not recursively expand placeholders from positional argument values", () => {
+		expect(substituteArgs("$1", ["$ARGUMENTS", "tail"])).toBe("$ARGUMENTS");
+		expect(substituteArgs("$1", ["$@", "tail"])).toBe("$@");
+	});
+
 	test("should support $@ slicing with start offset", () => {
 		expect(substituteArgs("Test: $@[2]", ["a", "b", "c"])).toBe("Test: b c");
 	});
