@@ -46,6 +46,7 @@ static MANAGED_REPLACEMENT_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 enum RetainedPublishFault {
 	Rename(i32),
+	Unlink(i32),
 	Sync(Option<i32>),
 	PostRenameSnapshot(&'static str),
 }
@@ -71,6 +72,20 @@ fn take_retained_publish_fault(rename: bool) -> Option<Option<i32>> {
 				Some(Some(code))
 			},
 			Some(RetainedPublishFault::Sync(code)) if !rename => {
+				configured.pop_front();
+				Some(code)
+			},
+			_ => None,
+		}
+	})
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_post_link_unlink_fault() -> Option<i32> {
+	RETAINED_PUBLISH_FAULTS.with(|configured| {
+		let mut configured = configured.borrow_mut();
+		match configured.front().copied() {
+			Some(RetainedPublishFault::Unlink(code)) => {
 				configured.pop_front();
 				Some(code)
 			},
@@ -136,6 +151,45 @@ const fn rename_flags_unsupported(errno: Option<i32>) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+enum NoReplacePrimitive {
+	Renameat2,
+	Linkat,
+	MkdiratRenameat,
+}
+
+#[cfg(target_os = "linux")]
+impl NoReplacePrimitive {
+	const fn as_str(self) -> &'static str {
+		match self {
+			Self::Renameat2 => "renameat2_noreplace",
+			Self::Linkat => "linkat_noreplace",
+			Self::MkdiratRenameat => "mkdirat_renameat_noreplace",
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum FileNoReplaceError {
+	PreMutation(std::io::Error),
+	PostMutation(std::io::Error),
+}
+
+#[cfg(target_os = "linux")]
+impl FileNoReplaceError {
+	fn raw_os_error(&self) -> Option<i32> {
+		match self {
+			Self::PreMutation(error) | Self::PostMutation(error) => error.raw_os_error(),
+		}
+	}
+
+	const fn committed(&self) -> bool {
+		matches!(self, Self::PostMutation(_))
+	}
+}
+
+#[cfg(target_os = "linux")]
 /// Atomic no-overwrite publish of a regular file for filesystems that do not
 /// implement `renameat2(RENAME_NOREPLACE)`. `linkat(2)` fails with `EEXIST`
 /// when the destination name already exists, giving the identical no-overwrite
@@ -158,7 +212,7 @@ fn linkat_no_replace(
 	destination_parent: &File,
 	destination_name: &CString,
 	release_source_authority: impl FnOnce(),
-) -> std::io::Result<()> {
+) -> Result<(), FileNoReplaceError> {
 	// SAFETY: both parents own valid fds and both names are live NUL-terminated
 	// strings for this syscall; flags are 0, so a symlink source is linked as-is.
 	let linked = unsafe {
@@ -171,17 +225,21 @@ fn linkat_no_replace(
 		)
 	};
 	if linked != 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(FileNoReplaceError::PreMutation(std::io::Error::last_os_error()));
 	}
 	// Publication has committed: the destination is an independent link to the
 	// verified inode. Only now may the staged descriptor be released, and it must
 	// be released before the unlink below (see the note above).
 	release_source_authority();
+	#[cfg(test)]
+	if let Some(code) = take_post_link_unlink_fault() {
+		return Err(FileNoReplaceError::PostMutation(std::io::Error::from_raw_os_error(code)));
+	}
 	// SAFETY: the source parent fd and name remain valid; the destination now
 	// owns an independent hard link to the same inode.
 	let unlinked = unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name.as_ptr(), 0) };
 	if unlinked != 0 {
-		return Err(std::io::Error::last_os_error());
+		return Err(FileNoReplaceError::PostMutation(std::io::Error::last_os_error()));
 	}
 	Ok(())
 }
@@ -251,15 +309,16 @@ fn rename_tree_no_replace(
 	source_name: &CString,
 	destination_parent: &File,
 	destination_name: &CString,
-) -> std::io::Result<()> {
+) -> std::io::Result<NoReplacePrimitive> {
 	match renameat2_no_replace(source_parent, source_name, destination_parent, destination_name) {
-		Ok(()) => Ok(()),
+		Ok(()) => Ok(NoReplacePrimitive::Renameat2),
 		Err(error) if rename_flags_unsupported(error.raw_os_error()) => rename_directory_no_replace(
 			source_parent,
 			source_name,
 			destination_parent,
 			destination_name,
-		),
+		)
+		.map(|()| NoReplacePrimitive::MkdiratRenameat),
 		Err(error) => Err(error),
 	}
 }
@@ -282,17 +341,18 @@ fn rename_file_no_replace(
 	destination_parent: &File,
 	destination_name: &CString,
 	release_source_authority: impl FnOnce(),
-) -> std::io::Result<()> {
+) -> Result<NoReplacePrimitive, FileNoReplaceError> {
 	match renameat2_no_replace(source_parent, source_name, destination_parent, destination_name) {
-		Ok(()) => Ok(()),
+		Ok(()) => Ok(NoReplacePrimitive::Renameat2),
 		Err(error) if rename_flags_unsupported(error.raw_os_error()) => linkat_no_replace(
 			source_parent,
 			source_name,
 			destination_parent,
 			destination_name,
 			release_source_authority,
-		),
-		Err(error) => Err(error),
+		)
+		.map(|()| NoReplacePrimitive::Linkat),
+		Err(error) => Err(FileNoReplaceError::PreMutation(error)),
 	}
 }
 
@@ -408,16 +468,75 @@ pub struct RecoveryFsPublishSyncFailure {
 }
 
 #[cfg(target_os = "linux")]
+struct RetainedPublishSuccess {
+	result:    RecoveryFsResult,
+	primitive: NoReplacePrimitive,
+}
+
+#[cfg(target_os = "linux")]
 enum RetainedPublishError {
 	Code(&'static str),
-	PostMutationCode(&'static str),
+	PostMutationCode {
+		code:      &'static str,
+		primitive: NoReplacePrimitive,
+	},
+	PostMutationIo {
+		code:      &'static str,
+		phase:     &'static str,
+		primitive: NoReplacePrimitive,
+		os_code:   Option<i32>,
+	},
 	SyncFailures(Vec<RecoveryFsPublishSyncFailure>),
+	PostMutationSyncFailures {
+		failures:  Vec<RecoveryFsPublishSyncFailure>,
+		primitive: NoReplacePrimitive,
+	},
 }
 
 #[cfg(target_os = "linux")]
 impl From<&'static str> for RetainedPublishError {
 	fn from(code: &'static str) -> Self {
 		Self::Code(code)
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn retained_file_publish_error(error: FileNoReplaceError) -> RetainedPublishError {
+	if error.committed() {
+		return RetainedPublishError::PostMutationIo {
+			code:      "io_error",
+			phase:     "source_unlink",
+			primitive: NoReplacePrimitive::Linkat,
+			os_code:   error.raw_os_error(),
+		};
+	}
+	match error.raw_os_error() {
+		Some(libc::EEXIST) => "already_exists",
+		Some(libc::ENOSYS) => "atomic_unavailable",
+		// renameat2 rename flags are unavailable and linkat also failed, so
+		// classify the residual errno instead of weakening no-overwrite authority.
+		Some(libc::EINVAL) => "invalid_request",
+		Some(libc::EXDEV) => "cross_device",
+		Some(libc::EACCES | libc::EPERM) => "permission_denied",
+		Some(libc::EINTR) => "interrupted",
+		_ => "io_error",
+	}
+	.into()
+}
+
+#[cfg(target_os = "linux")]
+fn bind_post_mutation_error(
+	error: RetainedPublishError,
+	primitive: NoReplacePrimitive,
+) -> RetainedPublishError {
+	match error {
+		RetainedPublishError::Code(code) => {
+			RetainedPublishError::PostMutationCode { code, primitive }
+		},
+		RetainedPublishError::SyncFailures(failures) => {
+			RetainedPublishError::PostMutationSyncFailures { failures, primitive }
+		},
+		error => error,
 	}
 }
 
@@ -447,8 +566,11 @@ pub struct RecoveryFsPublishResult {
 
 impl RecoveryFsPublishResult {
 	#[cfg(target_os = "linux")]
-	fn success(identity: RecoveryFsIdentity) -> Self {
-		Self::result(true, None, Some(identity), "committed", "proven", "none", "complete", None)
+	fn success(identity: RecoveryFsIdentity, primitive: NoReplacePrimitive) -> Self {
+		let mut result =
+			Self::result(true, None, Some(identity), "committed", "proven", "none", "complete", None);
+		primitive.as_str().clone_into(&mut result.primitive);
+		result
 	}
 
 	fn failure(
@@ -532,6 +654,37 @@ fn publish_post_mutation_failure(code: &'static str, phase: &str) -> RecoveryFsP
 }
 
 #[cfg(target_os = "linux")]
+fn publish_post_mutation_failure_with_primitive(
+	code: &'static str,
+	phase: &'static str,
+	primitive: NoReplacePrimitive,
+	os_code: Option<i32>,
+) -> RecoveryFsPublishResult {
+	let mut result = publish_post_mutation_failure(code, phase);
+	primitive.as_str().clone_into(&mut result.primitive);
+	result.diagnostic.os_code = os_code;
+	if os_code.is_some() {
+		"partial".clone_into(&mut result.diagnostic.collection_state);
+	}
+	result
+}
+
+#[cfg(target_os = "linux")]
+fn finish_retained_publish(success: RetainedPublishSuccess) -> RecoveryFsPublishResult {
+	success.result.identity.map_or_else(
+		|| {
+			publish_post_mutation_failure_with_primitive(
+				"identity_mismatch",
+				"terminal_identity",
+				success.primitive,
+				None,
+			)
+		},
+		|identity| RecoveryFsPublishResult::success(identity, success.primitive),
+	)
+}
+
+#[cfg(target_os = "linux")]
 fn publish_post_mutation_sync_failures(
 	failures: Vec<RecoveryFsPublishSyncFailure>,
 ) -> RecoveryFsPublishResult {
@@ -549,6 +702,16 @@ fn publish_post_mutation_sync_failures(
 	);
 	"partial".clone_into(&mut result.diagnostic.collection_state);
 	result.diagnostic.sync_failures = Some(failures);
+	result
+}
+
+#[cfg(target_os = "linux")]
+fn publish_post_mutation_sync_failures_with_primitive(
+	failures: Vec<RecoveryFsPublishSyncFailure>,
+	primitive: NoReplacePrimitive,
+) -> RecoveryFsPublishResult {
+	let mut result = publish_post_mutation_sync_failures(failures);
+	primitive.as_str().clone_into(&mut result.primitive);
 	result
 }
 
@@ -1884,12 +2047,12 @@ fn rename_managed_file_no_replace(
 		ctime_ns,
 		sha256,
 	) {
-		Ok(result) => result.identity.map_or_else(
-			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
-			RecoveryFsPublishResult::success,
-		),
+		Ok(success) => finish_retained_publish(success),
 		Err(RetainedPublishError::SyncFailures(failures)) => {
 			publish_post_mutation_sync_failures(failures)
+		},
+		Err(RetainedPublishError::PostMutationSyncFailures { failures, primitive }) => {
+			publish_post_mutation_sync_failures_with_primitive(failures, primitive)
 		},
 		Err(RetainedPublishError::Code("rollback_unavailable")) => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
@@ -1901,8 +2064,11 @@ fn rename_managed_file_no_replace(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
 		)) => publish_preflight_failure(code),
-		Err(RetainedPublishError::PostMutationCode(code)) => {
-			publish_post_mutation_failure(code, "terminal_identity")
+		Err(RetainedPublishError::PostMutationCode { code, primitive }) => {
+			publish_post_mutation_failure_with_primitive(code, "terminal_identity", primitive, None)
+		},
+		Err(RetainedPublishError::PostMutationIo { code, phase, primitive, os_code }) => {
+			publish_post_mutation_failure_with_primitive(code, phase, primitive, os_code)
 		},
 		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
@@ -1919,7 +2085,7 @@ fn rename_managed_file_no_replace_inner(
 	mtime_ns: &str,
 	ctime_ns: &str,
 	sha256: &str,
-) -> Result<RecoveryFsResult, RetainedPublishError> {
+) -> Result<RetainedPublishSuccess, RetainedPublishError> {
 	let source_file = open_existing(root, source, false)?;
 	crate::path_identity::platform::verify_created_owner_only_file(&source_file)?;
 	if !same_expected(&source_file, dev, ino, size, mtime_ns, ctime_ns, sha256)? {
@@ -1937,70 +2103,60 @@ fn rename_managed_file_no_replace_inner(
 		&destination_name,
 		move || drop(source_file),
 	);
-	if let Err(error) = result {
-		return Err(
-			match error.raw_os_error() {
-				Some(libc::EEXIST) => "already_exists",
-				Some(libc::ENOSYS) => "atomic_unavailable",
-				// renameat2 rename flags are unavailable on this filesystem and the
-				// linkat(2) fallback in rename_file_no_replace also failed, so classify
-				// the residual errno instead of weakening no-overwrite authority.
-				Some(libc::EINVAL) => "invalid_request",
-				Some(libc::EXDEV) => "cross_device",
-				Some(libc::EACCES | libc::EPERM) => "permission_denied",
-				Some(libc::EINTR) => "interrupted",
-				_ => "io_error",
-			}
-			.into(),
-		);
-	}
-	// The namespace mutation is authoritative immediately after renameat2 returns
-	// success. Every following failure is therefore committed-but-unproven.
-	let moved_file = open_existing(root, destination, false).map_err(|_| "rollback_unavailable")?;
-	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
-		.map_err(|_| "rollback_unavailable")?;
-	let moved = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
-	if !same_expected_after_rename(&moved_file, dev, ino, size, mtime_ns, sha256)
-		.map_err(|_| "rollback_unavailable")?
-	{
-		return Err("rollback_unavailable".into());
-	}
-	let terminal =
-		statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
-	if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
-		return Err("rollback_unavailable".into());
-	}
-	let source_parent_identity = identity(&source_parent).map_err(|_| "rollback_unavailable")?;
-	let destination_parent_identity =
-		identity(&destination_parent).map_err(|_| "rollback_unavailable")?;
-	sync_distinct_parents(
-		&source_parent,
-		&destination_parent,
-		source_parent_identity.dev == destination_parent_identity.dev
-			&& source_parent_identity.ino == destination_parent_identity.ino,
-	)?;
-	let after = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
-	let named_after =
-		statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
-	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
-		.map_err(|_| "rollback_unavailable")?;
-	let after_digest = digest_hex(&moved_file).map_err(|_| "rollback_unavailable")?;
-	if after.dev != moved.dev
-		|| after.ino != moved.ino
-		|| after.size != moved.size
-		|| after.mtime_ns != moved.mtime_ns
-		|| after.ctime_ns != moved.ctime_ns
-		|| after_digest != sha256
-		|| named_after.st_dev.to_string() != moved.dev
-		|| named_after.st_ino.to_string() != moved.ino
-		|| named_after.st_nlink != 1
-		|| (named_after.st_size as u64).to_string() != moved.size
-		|| stat_mtime_ns(&named_after).to_string() != moved.mtime_ns
-		|| stat_ctime_ns(&named_after).to_string() != moved.ctime_ns
-	{
-		return Err("rollback_unavailable".into());
-	}
-	Ok(RecoveryFsResult::success(moved))
+	let primitive = result.map_err(retained_file_publish_error)?;
+	let post_mutation = (|| -> Result<RecoveryFsResult, RetainedPublishError> {
+		// The namespace mutation is authoritative immediately after renameat2 returns
+		// success. Every following failure is therefore committed-but-unproven.
+		let moved_file =
+			open_existing(root, destination, false).map_err(|_| "rollback_unavailable")?;
+		crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
+			.map_err(|_| "rollback_unavailable")?;
+		let moved = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
+		if !same_expected_after_rename(&moved_file, dev, ino, size, mtime_ns, sha256)
+			.map_err(|_| "rollback_unavailable")?
+		{
+			return Err("rollback_unavailable".into());
+		}
+		let terminal =
+			statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
+		if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
+			return Err("rollback_unavailable".into());
+		}
+		let source_parent_identity = identity(&source_parent).map_err(|_| "rollback_unavailable")?;
+		let destination_parent_identity =
+			identity(&destination_parent).map_err(|_| "rollback_unavailable")?;
+		sync_distinct_parents(
+			&source_parent,
+			&destination_parent,
+			source_parent_identity.dev == destination_parent_identity.dev
+				&& source_parent_identity.ino == destination_parent_identity.ino,
+		)?;
+		let after = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
+		let named_after =
+			statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
+		crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
+			.map_err(|_| "rollback_unavailable")?;
+		let after_digest = digest_hex(&moved_file).map_err(|_| "rollback_unavailable")?;
+		if after.dev != moved.dev
+			|| after.ino != moved.ino
+			|| after.size != moved.size
+			|| after.mtime_ns != moved.mtime_ns
+			|| after.ctime_ns != moved.ctime_ns
+			|| after_digest != sha256
+			|| named_after.st_dev.to_string() != moved.dev
+			|| named_after.st_ino.to_string() != moved.ino
+			|| named_after.st_nlink != 1
+			|| (named_after.st_size as u64).to_string() != moved.size
+			|| stat_mtime_ns(&named_after).to_string() != moved.mtime_ns
+			|| stat_ctime_ns(&named_after).to_string() != moved.ctime_ns
+		{
+			return Err("rollback_unavailable".into());
+		}
+		Ok(RecoveryFsResult::success(moved))
+	})();
+	post_mutation
+		.map(|result| RetainedPublishSuccess { result, primitive })
+		.map_err(|error| bind_post_mutation_error(error, primitive))
 }
 
 #[cfg(target_os = "linux")]
@@ -2049,6 +2205,9 @@ fn remove_managed(
 		rename_file_no_replace(&source_parent, &name, &recovery_parent, &quarantine, move || {
 			drop(authorized);
 		}) {
+		if error.committed() {
+			return Err("rollback_unavailable");
+		}
 		return Err(match error.raw_os_error() {
 			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
 			_ => "io_error",
@@ -2311,12 +2470,12 @@ fn replace_managed(
 #[cfg(target_os = "linux")]
 fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishResult {
 	match install_inner(root, source, destination) {
-		Ok(result) => result.identity.map_or_else(
-			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
-			RecoveryFsPublishResult::success,
-		),
+		Ok(success) => finish_retained_publish(success),
 		Err(RetainedPublishError::SyncFailures(failures)) => {
 			publish_post_mutation_sync_failures(failures)
+		},
+		Err(RetainedPublishError::PostMutationSyncFailures { failures, primitive }) => {
+			publish_post_mutation_sync_failures_with_primitive(failures, primitive)
 		},
 		Err(RetainedPublishError::Code("post_mutation_identity_mismatch")) => {
 			publish_post_mutation_failure("identity_mismatch", "terminal_identity")
@@ -2328,8 +2487,11 @@ fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishRes
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
 		)) => publish_preflight_failure(code),
-		Err(RetainedPublishError::PostMutationCode(code)) => {
-			publish_post_mutation_failure(code, "terminal_identity")
+		Err(RetainedPublishError::PostMutationCode { code, primitive }) => {
+			publish_post_mutation_failure_with_primitive(code, "terminal_identity", primitive, None)
+		},
+		Err(RetainedPublishError::PostMutationIo { code, phase, primitive, os_code }) => {
+			publish_post_mutation_failure_with_primitive(code, phase, primitive, os_code)
 		},
 		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
@@ -2340,7 +2502,7 @@ fn install_inner(
 	root: &File,
 	source: &str,
 	destination: &str,
-) -> Result<RecoveryFsResult, RetainedPublishError> {
+) -> Result<RetainedPublishSuccess, RetainedPublishError> {
 	let source_file = open_existing(root, source, false)?;
 	let source_identity = regular_identity(&source_file)?;
 	let (source_parent, source_name) = open_parent(root, source)?;
@@ -2354,41 +2516,34 @@ fn install_inner(
 		&destination_name,
 		move || drop(source_file),
 	);
-	if let Err(error) = result {
-		return Err(
-			match error.raw_os_error() {
-				Some(libc::EEXIST) => "already_exists",
-				Some(libc::ENOSYS) => "atomic_unavailable",
-				Some(libc::EINVAL) => "invalid_request",
-				Some(libc::EXDEV) => "cross_device",
-				Some(libc::EACCES | libc::EPERM) => "permission_denied",
-				Some(libc::EINTR) => "interrupted",
-				_ => "io_error",
-			}
-			.into(),
-		);
-	}
-	// The rename has committed; all following verification failures are durability
-	// proof failures, never a new pre-mutation classification.
-	let installed =
-		open_existing(root, destination, false).map_err(|_| "post_mutation_identity_mismatch")?;
-	let installed_identity =
-		regular_identity(&installed).map_err(|_| "post_mutation_identity_mismatch")?;
-	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino
-	{
-		return Err("post_mutation_identity_mismatch".into());
-	}
-	let source_parent_identity =
-		identity(&source_parent).map_err(|_| "post_mutation_identity_mismatch")?;
-	let destination_parent_identity =
-		identity(&destination_parent).map_err(|_| "post_mutation_identity_mismatch")?;
-	sync_distinct_parents(
-		&source_parent,
-		&destination_parent,
-		source_parent_identity.dev == destination_parent_identity.dev
-			&& source_parent_identity.ino == destination_parent_identity.ino,
-	)?;
-	Ok(RecoveryFsResult::success(installed_identity))
+	let primitive = result.map_err(retained_file_publish_error)?;
+	let post_mutation = (|| -> Result<RecoveryFsResult, RetainedPublishError> {
+		// The rename has committed; all following verification failures are durability
+		// proof failures, never a new pre-mutation classification.
+		let installed =
+			open_existing(root, destination, false).map_err(|_| "post_mutation_identity_mismatch")?;
+		let installed_identity =
+			regular_identity(&installed).map_err(|_| "post_mutation_identity_mismatch")?;
+		if installed_identity.dev != source_identity.dev
+			|| installed_identity.ino != source_identity.ino
+		{
+			return Err("post_mutation_identity_mismatch".into());
+		}
+		let source_parent_identity =
+			identity(&source_parent).map_err(|_| "post_mutation_identity_mismatch")?;
+		let destination_parent_identity =
+			identity(&destination_parent).map_err(|_| "post_mutation_identity_mismatch")?;
+		sync_distinct_parents(
+			&source_parent,
+			&destination_parent,
+			source_parent_identity.dev == destination_parent_identity.dev
+				&& source_parent_identity.ino == destination_parent_identity.ino,
+		)?;
+		Ok(RecoveryFsResult::success(installed_identity))
+	})();
+	post_mutation
+		.map(|result| RetainedPublishSuccess { result, primitive })
+		.map_err(|error| bind_post_mutation_error(error, primitive))
 }
 
 #[cfg(target_os = "linux")]
@@ -2768,12 +2923,12 @@ fn rename_managed_tree_no_replace(
 	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
 ) -> RecoveryFsPublishResult {
 	match rename_managed_tree_no_replace_inner(root, source, destination, expected) {
-		Ok(result) => result.identity.map_or_else(
-			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
-			RecoveryFsPublishResult::success,
-		),
+		Ok(success) => finish_retained_publish(success),
 		Err(RetainedPublishError::SyncFailures(failures)) => {
 			publish_post_mutation_sync_failures(failures)
+		},
+		Err(RetainedPublishError::PostMutationSyncFailures { failures, primitive }) => {
+			publish_post_mutation_sync_failures_with_primitive(failures, primitive)
 		},
 		Err(RetainedPublishError::Code("rollback_unavailable")) => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
@@ -2785,8 +2940,11 @@ fn rename_managed_tree_no_replace(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
 		)) => publish_preflight_failure(code),
-		Err(RetainedPublishError::PostMutationCode(code)) => {
-			publish_post_mutation_failure(code, "terminal_identity")
+		Err(RetainedPublishError::PostMutationCode { code, primitive }) => {
+			publish_post_mutation_failure_with_primitive(code, "terminal_identity", primitive, None)
+		},
+		Err(RetainedPublishError::PostMutationIo { code, phase, primitive, os_code }) => {
+			publish_post_mutation_failure_with_primitive(code, phase, primitive, os_code)
 		},
 		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
@@ -2798,7 +2956,7 @@ fn rename_managed_tree_no_replace_inner(
 	source: &str,
 	destination: &str,
 	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
-) -> Result<RecoveryFsResult, RetainedPublishError> {
+) -> Result<RetainedPublishSuccess, RetainedPublishError> {
 	let before = snapshot_managed_tree(root, source)?
 		.snapshot
 		.ok_or("io_error")?;
@@ -2807,22 +2965,28 @@ fn rename_managed_tree_no_replace_inner(
 	}
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
-	if let Err(error) =
-		rename_tree_no_replace(&source_parent, &source_name, &destination_parent, &destination_name)
-	{
-		return Err(
-			match error.raw_os_error() {
-				Some(libc::EEXIST) => "already_exists",
-				Some(libc::ENOSYS) => "atomic_unavailable",
-				Some(libc::EINVAL) => "invalid_request",
-				Some(libc::EXDEV) => "cross_device",
-				Some(libc::EACCES | libc::EPERM) => "permission_denied",
-				Some(libc::EINTR) => "interrupted",
-				_ => "io_error",
-			}
-			.into(),
-		);
-	}
+	let primitive = match rename_tree_no_replace(
+		&source_parent,
+		&source_name,
+		&destination_parent,
+		&destination_name,
+	) {
+		Ok(primitive) => primitive,
+		Err(error) => {
+			return Err(
+				match error.raw_os_error() {
+					Some(libc::EEXIST) => "already_exists",
+					Some(libc::ENOSYS) => "atomic_unavailable",
+					Some(libc::EINVAL) => "invalid_request",
+					Some(libc::EXDEV) => "cross_device",
+					Some(libc::EACCES | libc::EPERM) => "permission_denied",
+					Some(libc::EINTR) => "interrupted",
+					_ => "io_error",
+				}
+				.into(),
+			);
+		},
+	};
 	let post_mutation = (|| -> Result<RecoveryFsIdentity, RetainedPublishError> {
 		let after = snapshot_managed_tree_after_rename(root, destination)?
 			.snapshot
@@ -2854,9 +3018,10 @@ fn rename_managed_tree_no_replace_inner(
 		Ok(destination_identity)
 	})();
 	match post_mutation {
-		Ok(identity) => Ok(RecoveryFsResult::success(identity)),
-		Err(RetainedPublishError::Code(code)) => Err(RetainedPublishError::PostMutationCode(code)),
-		Err(error) => Err(error),
+		Ok(identity) => {
+			Ok(RetainedPublishSuccess { result: RecoveryFsResult::success(identity), primitive })
+		},
+		Err(error) => Err(bind_post_mutation_error(error, primitive)),
 	}
 }
 
@@ -3254,6 +3419,7 @@ mod tests {
 				"linkat fallback must publish (errno {unsupported}): {:?}",
 				result.code
 			);
+			assert_eq!(result.primitive, "linkat_noreplace");
 			assert!(
 				!temporary.0.join("source-parent/source").exists(),
 				"staging source is removed after the link fallback"
@@ -3269,6 +3435,68 @@ mod tests {
 				std::os::unix::fs::MetadataExt::nlink(&published),
 				1,
 				"published file is single-linked, matching a rename"
+			);
+		}
+	}
+
+	#[test]
+	fn install_receipt_names_linkat_fallback_primitive() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		managed_file(&root, "source", b"payload");
+		set_retained_publish_faults([RetainedPublishFault::Rename(libc::EINVAL)]);
+
+		let result = install(&root, "source", "destination");
+
+		assert!(result.ok, "linkat fallback must install: {:?}", result.code);
+		assert_eq!(result.primitive, "linkat_noreplace");
+		assert!(!temporary.0.join("source").exists());
+		assert_eq!(
+			fs::read(temporary.0.join("destination")).expect("published destination"),
+			b"payload"
+		);
+	}
+
+	#[test]
+	fn linkat_unlink_failures_report_committed_mutation() {
+		for operation in ["managed_rename", "install"] {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			let contents = b"committed-payload";
+			let identity = managed_file(&root, "source", contents);
+			set_retained_publish_faults([
+				RetainedPublishFault::Rename(libc::EINVAL),
+				RetainedPublishFault::Unlink(libc::EACCES),
+			]);
+
+			let result = if operation == "managed_rename" {
+				rename_managed_file_no_replace(
+					&root,
+					"source",
+					"destination",
+					&identity.dev,
+					&identity.ino,
+					&identity.size,
+					&identity.mtime_ns,
+					&identity.ctime_ns,
+					&file_digest(contents),
+				)
+			} else {
+				install(&root, "source", "destination")
+			};
+
+			assert!(!result.ok, "{operation} must surface the failed staging unlink");
+			assert_eq!(result.code.as_deref(), Some("io_error"));
+			assert_eq!(result.mutation_state, "committed");
+			assert_eq!(result.durability_state, "not_provable");
+			assert_eq!(result.reason, "io_failure");
+			assert_eq!(result.primitive, "linkat_noreplace");
+			assert_eq!(result.phase, "source_unlink");
+			assert_eq!(result.diagnostic.os_code, Some(libc::EACCES));
+			assert!(temporary.0.join("source").exists(), "failed unlink retains staging evidence");
+			assert_eq!(
+				fs::read(temporary.0.join("destination")).expect("committed destination"),
+				contents
 			);
 		}
 	}
@@ -3587,6 +3815,7 @@ mod tests {
 				"mkdirat fallback must publish the tree (errno {unsupported}): {:?}",
 				result.code
 			);
+			assert_eq!(result.primitive, "mkdirat_renameat_noreplace");
 			assert!(
 				!temporary.0.join("source-parent/tree").exists(),
 				"staging tree is removed after the fallback publish"
