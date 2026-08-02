@@ -136,4 +136,30 @@ describe("AGENTS.md discovery bounds", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+	test.skipIf(process.platform === "win32")("rejects a FIFO candidate without blocking discovery", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-"));
+		const agentPath = path.join(tempDir, "AGENTS.md");
+		const created = Bun.spawnSync(["mkfifo", agentPath]);
+		expect(created.exitCode).toBe(0);
+		const loadPromise = loadAgentsMd(context(tempDir, tempDir));
+		try {
+			await expect(
+				Promise.race([
+					loadPromise,
+					Bun.sleep(500).then(() => {
+						throw new Error("FIFO discovery blocked");
+					}),
+				]),
+			).resolves.toEqual({ items: [], warnings: [] });
+		} finally {
+			try {
+				const writer = fs.openSync(agentPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+				fs.closeSync(writer);
+			} catch {
+				// No pending reader remains after the non-blocking descriptor check.
+			}
+			await loadPromise.catch(() => {});
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 });

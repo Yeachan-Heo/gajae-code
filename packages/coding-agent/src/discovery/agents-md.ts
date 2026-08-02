@@ -32,12 +32,17 @@ async function readBoundedAgentsMdFile(
 	maxBytes: number,
 ): Promise<{ content: string | null; byteLength: number; tooLarge: boolean }> {
 	try {
-		const file = await fs.open(filePath, "r");
+		const file = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
 		try {
 			const stats = await file.stat();
 			if (!stats.isFile()) return { content: null, byteLength: 0, tooLarge: false };
 			const bytes = Buffer.alloc(maxBytes + 1);
-			const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+			let bytesRead = 0;
+			while (bytesRead < bytes.length) {
+				const result = await file.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead);
+				if (result.bytesRead === 0) break;
+				bytesRead += result.bytesRead;
+			}
 			if (bytesRead > maxBytes) return { content: null, byteLength: bytesRead, tooLarge: true };
 			return {
 				content: new TextDecoder().decode(bytes.subarray(0, bytesRead)),
