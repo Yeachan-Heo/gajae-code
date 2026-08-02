@@ -322,16 +322,17 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		}),
 	};
 	if (validated.compat) provider.compat = validated.compat;
-	if (validated.credentialSource === "env") {
-		provider.apiKeyEnv = validated.apiKey;
-	} else {
-		const authStorage = await AuthStorage.create(getAgentDbPath());
-		try {
+	const authStorage = await AuthStorage.create(getAgentDbPath());
+	try {
+		if (validated.credentialSource === "env") {
+			await authStorage.remove(validated.providerId);
+			provider.apiKeyEnv = validated.apiKey;
+		} else {
 			await authStorage.set(validated.providerId, { type: "api_key", key: validated.apiKey });
-		} finally {
-			authStorage.close();
+			provider.apiKeyStored = true;
 		}
-		provider.apiKeyStored = true;
+	} finally {
+		authStorage.close();
 	}
 	const next: ModelsConfig = {
 		...existing,

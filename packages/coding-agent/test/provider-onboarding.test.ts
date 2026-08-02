@@ -404,6 +404,45 @@ describe("provider onboarding setup core", () => {
 		expect(await Bun.file(path.join(path.dirname(modelsPath), "agent.db")).exists()).toBe(false);
 	});
 
+	it("removes a stored key when force-replacing a provider with env auth", async () => {
+		const modelsPath = await tempModelsPath();
+		setAgentDir(tempRoot!);
+		const envName = "GJC_TEST_REPLACED_PROVIDER_KEY";
+		const previousEnv = Bun.env[envName];
+		Bun.env[envName] = "environment-secret";
+		try {
+			await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "replaced-provider",
+				baseUrl: "https://api.example.com/v1",
+				apiKey: "stale-stored-secret",
+				models: ["example-model"],
+				modelsPath,
+			});
+			await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "replaced-provider",
+				baseUrl: "https://api.example.com/v1",
+				apiKeyEnv: envName,
+				models: ["example-model"],
+				modelsPath,
+				force: true,
+			});
+
+			const authStorage = await AuthStorage.create(getAgentDbPath());
+			try {
+				expect(authStorage.get("replaced-provider")).toBeUndefined();
+				const registry = new ModelRegistry(authStorage, modelsPath);
+				expect(await registry.getApiKeyForProvider("replaced-provider")).toBe("environment-secret");
+			} finally {
+				authStorage.close();
+			}
+		} finally {
+			if (previousEnv === undefined) delete Bun.env[envName];
+			else Bun.env[envName] = previousEnv;
+		}
+	});
+
 	it("rejects remote plaintext HTTP and existing providers unless forced", async () => {
 		const modelsPath = await tempModelsPath();
 		await expect(
