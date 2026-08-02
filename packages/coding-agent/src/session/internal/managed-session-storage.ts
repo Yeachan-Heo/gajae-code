@@ -2304,6 +2304,73 @@ export class ManagedSessionDescendantStore {
 		return movedSnapshot.snapshot;
 	}
 
+	/** Move one exact managed regular file to an absent destination through retained authority. */
+	moveFileNoReplace(
+		sourceRelativePath: string,
+		destinationRelativePath: string,
+		expected: ManagedFileSnapshot,
+		options?: {
+			/** Subtree store bound to the source's directory; keeps the verification read basename-scoped when this store lacks retained authority. */
+			sourceStore: ManagedSessionDescendantStore;
+			sourceStoreRelativePath: string;
+		},
+	): ManagedFileSnapshot {
+		this.#assertBound();
+		const sourceResolved = this.#resolve(sourceRelativePath);
+		const destinationResolved = this.#resolve(destinationRelativePath);
+		if (
+			options &&
+			path.resolve(options.sourceStore.#resolve(options.sourceStoreRelativePath)) !== path.resolve(sourceResolved)
+		)
+			throw new ManagedTreeMoveOutcomeError("artifact_source_changed", false);
+		const source = options
+			? options.sourceStore.readExpected(options.sourceStoreRelativePath)
+			: this.readExpected(sourceRelativePath);
+		if (
+			!source ||
+			!sameReplacementIdentity(source.identity, expected.identity) ||
+			source.identity.sha256 !== expected.identity.sha256 ||
+			!source.bytes.equals(expected.bytes)
+		)
+			throw new ManagedTreeMoveOutcomeError("artifact_source_changed", false);
+
+		const moved = this.#authority
+			? this.#authority.renameManagedFileNoReplace(
+					this.#relative(sourceResolved),
+					this.#relative(destinationResolved),
+					expected.identity.dev.toString(),
+					expected.identity.ino.toString(),
+					expected.identity.size.toString(),
+					expected.identity.mtimeNs.toString(),
+					expected.identity.ctimeNs.toString(),
+					expected.identity.sha256,
+				)
+			: nativeSessionStorage().renameNoReplacePath(sourceResolved, destinationResolved);
+		const outcome = classifyNativePublishOutcome(moved, this.#authority ? "retained_file" : "direct_rename");
+		if (!outcome.ok)
+			throw new ManagedTreeMoveOutcomeError(publishFailure(outcome).message, mayCleanCurrentStaging(outcome));
+
+		const movedSnapshot = this.readExpected(destinationRelativePath);
+		if (
+			!movedSnapshot ||
+			!sameReplacementIdentity(movedSnapshot.identity, expected.identity) ||
+			movedSnapshot.identity.sha256 !== expected.identity.sha256 ||
+			!movedSnapshot.bytes.equals(expected.bytes)
+		)
+			throw new ManagedTreeMoveOutcomeError("artifact_destination_mismatch", false);
+		if (!this.#authority) {
+			try {
+				fsyncDirectory(path.dirname(sourceResolved));
+				if (path.dirname(sourceResolved) !== path.dirname(destinationResolved))
+					fsyncDirectory(path.dirname(destinationResolved));
+			} catch {
+				throw new ManagedTreeMoveOutcomeError("managed_publish_fsync_failed", false);
+			}
+		}
+		this.#assertBound();
+		return movedSnapshot;
+	}
+
 	removeTreeExpected(relativePath: string, expected: NativeDirectoryTreeSnapshot): void {
 		this.#beforeMutation();
 		this.#assertBound();

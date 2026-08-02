@@ -192,6 +192,7 @@ import {
 	stripInternalDetailsFields,
 } from "./messages";
 import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
+import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "./session-staging-paths";
 import type {
 	ManagedSessionSecurityContext,
 	SessionStorage,
@@ -278,6 +279,103 @@ interface PreparedNewSessionState extends PreparedNewSession {
 
 type ResidentTransitionFailurePolicy = "install-staged" | "memory-fallback" | "retain-and-throw" | "memory-only";
 type ResidentBlobMissingPolicy = "throw" | "placeholder";
+
+const MAX_STAGED_ATTEMPT_ID_LENGTH = 128;
+
+function assertSafeStagedAttemptId(attemptId: string): void {
+	if (!/^[A-Za-z0-9_-]{1,128}$/.test(attemptId) || attemptId.length > MAX_STAGED_ATTEMPT_ID_LENGTH)
+		throw new Error("Unsafe artifact attempt id");
+}
+
+const ATTEMPT_REMAP_STRUCTURAL_KEYS = new Set(["id", "parentId", "timestamp"]);
+const ARTIFACT_REFERENCE_KEYS = new Set([
+	"artifactId",
+	"artifactIds",
+	"artifactRef",
+	"artifactRefs",
+	"agentId",
+	"agentIds",
+	"agentRef",
+	"agentRefs",
+]);
+/**
+ * Trailing-selector grammar mirrored from `splitPathAndSel` / `splitInternalUrlSel` in
+ * `src/tools/path-utils.ts`. It is duplicated rather than imported because `path-utils` pulls in
+ * `internal-urls`, which reaches back into the session layer and would create an import cycle.
+ * The boundary red-team suite cross-checks these against the real parser so drift fails a test.
+ */
+const SELECTOR_RANGE_RE = /^L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*$/i;
+const SELECTOR_TAIL_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
+
+/**
+ * Decide whether a `:` directly after `<scheme>://<id>` terminates the id (so the id is a remappable
+ * reference and the tail is an opaque selector) or is part of an opaque authority (so the id must be
+ * left alone). `artifact://` splits unconditionally at the first colon; every other scheme requires a
+ * strict selector tail, so `agent://3:bogus` keeps `3:bogus` as the authority and must NOT be remapped.
+ */
+function colonTerminatesUriId(scheme: string, tail: string): boolean {
+	if (scheme.toLowerCase() === "artifact") return true;
+	if (SELECTOR_TAIL_RE.test(tail)) return true;
+	const innerColon = tail.lastIndexOf(":");
+	if (innerColon <= 0) return false;
+	const head = tail.slice(0, innerColon);
+	const last = tail.slice(innerColon + 1);
+	const headIsRaw = /^raw$/i.test(head);
+	const lastIsRaw = /^raw$/i.test(last);
+	return (headIsRaw && SELECTOR_RANGE_RE.test(last)) || (SELECTOR_RANGE_RE.test(head) && lastIsRaw);
+}
+
+function remapArtifactReferenceString(value: string, idMap: ReadonlyMap<string, string>, exactId = false): string {
+	const exact = exactId ? idMap.get(value) : undefined;
+	if (exact !== undefined) return exact;
+	// Only re-key when the ENTIRE value is a single URI reference token. A string carrying prose or
+	// multiple tokens is opaque content we do not own, and rewriting inside it caused real corruption
+	// in earlier revisions. Everything after the id (selector, query, fragment) is likewise opaque and
+	// is preserved verbatim, so nested ids inside those payloads are never re-keyed.
+	if (/[\s"'<>]/.test(value)) return value;
+	const head = value.match(/^(artifact|agent):\/\/([0-9]+)/i);
+	if (!head) return value;
+	const protocol = head[1];
+	const mapped = idMap.get(head[2]);
+	if (mapped === undefined) return value;
+	const rest = value.slice(head[0].length);
+	if (rest !== "" && !/^[:/?#]/.test(rest)) return value;
+	if (rest.startsWith(":") && !colonTerminatesUriId(protocol, rest.slice(1))) return value;
+	return `${protocol}://${mapped}${rest}`;
+}
+
+function remapAttemptReferencesInEntries(entries: readonly FileEntry[], idMap: ReadonlyMap<string, string>): void {
+	if (idMap.size === 0) return;
+	const seen = new WeakSet<object>();
+	const visit = (value: unknown, key?: string): unknown => {
+		if (
+			typeof value === "number" &&
+			key !== undefined &&
+			ARTIFACT_REFERENCE_KEYS.has(key) &&
+			Number.isSafeInteger(value)
+		) {
+			const mapped = idMap.get(String(value));
+			return mapped === undefined ? value : Number(mapped);
+		}
+		if (typeof value === "string") {
+			return remapArtifactReferenceString(value, idMap, key !== undefined && ARTIFACT_REFERENCE_KEYS.has(key));
+		}
+		if (!value || typeof value !== "object" || seen.has(value)) return value;
+		seen.add(value);
+		if (Array.isArray(value)) {
+			for (let index = 0; index < value.length; index++) value[index] = visit(value[index], key);
+			return value;
+		}
+		const record = value as Record<string, unknown>;
+		for (const [childKey, child] of Object.entries(record)) {
+			if (ATTEMPT_REMAP_STRUCTURAL_KEYS.has(childKey)) continue;
+			const next = visit(child, childKey);
+			if (next !== child) record[childKey] = next;
+		}
+		return value;
+	};
+	for (const entry of entries) visit(entry);
+}
 
 type ResidentTransitionSource =
 	| {
@@ -3339,6 +3437,7 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 			return null;
 		}
 
+		if (isStagedSessionPath(sessionFile)) return null;
 		const inspected = inspectResumeSessionFile(sessionFile, new FileSessionStorage());
 		if ("kind" in inspected) {
 			if (inspected.reason !== "missing") return null;
@@ -3352,7 +3451,8 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 			const listing = listManagedCandidates(resolved.scope);
 			if (listing.kind !== "complete") return null;
 			const migrated = listing.owned.filter(
-				candidate => path.basename(candidate.path) === path.basename(sessionFile),
+				candidate =>
+					!isStagedSessionPath(candidate.path) && path.basename(candidate.path) === path.basename(sessionFile),
 			);
 			return migrated.length === 1 ? migrated[0]!.path : null;
 		}
@@ -3367,9 +3467,14 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 		if (resolved.kind !== "resolved") return null;
 		const listing = listManagedCandidates(resolved.scope);
 		if (listing.kind !== "complete") return null;
-		const exact = listing.owned.find(candidate => path.resolve(candidate.path) === path.resolve(sessionFile));
+		const exact = listing.owned.find(
+			candidate =>
+				!isStagedSessionPath(candidate.path) && path.resolve(candidate.path) === path.resolve(sessionFile),
+		);
 		if (exact) return exact.path;
-		const byIdentity = listing.owned.find(candidate => candidate.sessionId === header.id);
+		const byIdentity = listing.owned.find(
+			candidate => !isStagedSessionPath(candidate.path) && candidate.sessionId === header.id,
+		);
 		if (byIdentity) return byIdentity.path;
 		return pathIsWithin(sessionsRoot, path.resolve(sessionFile)) ? null : path.resolve(sessionFile);
 	} catch (err) {
@@ -5940,9 +6045,11 @@ const PROJECT_SESSION_SCAN_MAX_DIRECTORIES = 4096;
 const PROJECT_SESSION_SCAN_MAX_FILES = 1000;
 
 function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
+	if (isStagedSessionPath(filePath)) return false;
 	const relative = path.relative(projectGjcDir, filePath);
 	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
 	const segments = relative.split(path.sep);
+	if (segments.includes(SESSION_STAGING_DIRNAME)) return false;
 	if (segments.length === 1) return true;
 	const parent = segments.at(-2);
 	return parent === "agent-session" || segments.includes("sessions");
@@ -5953,7 +6060,7 @@ function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string)
  * Runtime token/audit JSONL files are excluded by requiring a known transcript
  * container (`agent-session` or `sessions`).
  */
-function listProjectSessionTranscriptFiles(cwd: string): string[] {
+export function listProjectSessionTranscriptFiles(cwd: string): string[] {
 	const projectGjcDir = path.join(path.resolve(cwd), ".gjc");
 	let rootStat: fs.Stats;
 	try {
@@ -5979,6 +6086,7 @@ function listProjectSessionTranscriptFiles(cwd: string): string[] {
 			if (entry.isSymbolicLink()) continue;
 			const entryPath = path.join(directory, entry.name);
 			if (entry.isDirectory()) {
+				if (entry.name === SESSION_STAGING_DIRNAME) continue;
 				directories.push(entryPath);
 				continue;
 			}
@@ -6876,6 +6984,25 @@ export class SessionManager {
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
 	#commitGen = 0;
 	/** Failed staged persistence retains its exact writer and temporary pathname for retryable cleanup. */
+	/** Candidate-owned session publication state; set only by staged factories. */
+	#stagedPublication:
+		| {
+				finalSessionFile: string;
+				stagedSessionFile: string;
+				finalDestination: SessionDestination;
+				managedParentStore?: ManagedSessionDescendantStore;
+				/** Subtree store bound to the staging directory; basename reads stay authority-safe. */
+				managedStagingStore?: ManagedSessionDescendantStore;
+				attemptId: string;
+				committed: boolean;
+				discarded: boolean;
+				publishedFinalSnapshot?: ManagedFileSnapshot;
+				publishedFinalBytes?: Buffer;
+				deferArtifactFinalize?: boolean;
+		  }
+		| undefined;
+	#stagedArtifactParent: ArtifactManager | null = null;
+	#stagedCommitArtifactParent: ArtifactManager | null = null;
 	#preparedNewSessionCleanupInProgress = false;
 	/** Active cold-sidecar runtime (retirement + lazy resolution). Undefined when disabled. */
 	#sidecarRuntime: SessionMemorySidecarRuntime | undefined = undefined;
@@ -7080,6 +7207,23 @@ export class SessionManager {
 			}
 		}
 		// Note: call _initSession() or _initSessionFile() after construction
+	}
+	/**
+	 * A staged publication is not yet visible, so its transcript must not become the
+	 * terminal's resume breadcrumb until it commits; `force` is the post-commit path.
+	 */
+	#writeTerminalBreadcrumb(cwd: string, sessionFile: string, force = false): void {
+		if (!this.#storageProfile.terminalBreadcrumbs) return;
+		if (this.#stagedPublication && !force && !this.#stagedPublication.committed) return;
+		writeTerminalBreadcrumb(cwd, sessionFile);
+	}
+	#sidecarCacheRootDir(): string {
+		if (this.#storageProfileCustom) return path.join(this.#storageProfile.residentCacheRootDir, "sidecar-cache");
+		const profileAgentDir =
+			this.destination.kind === "managed"
+				? this.destination.securityContext.profileAgentDir
+				: (explicitProfileAgentDirs.get(this.destination) ?? getAgentDir());
+		return getSidecarCacheRootDir(profileAgentDir);
 	}
 
 	#residentBlobStores(): ResidentBlobStores {
@@ -15473,8 +15617,9 @@ export class SessionManager {
 	 * Adopt an externally-owned ArtifactManager. Used by subagents to share
 	 * the parent session's artifact directory and ID counter.
 	 */
-	adoptArtifactManager(manager: ArtifactManager): void {
+	adoptArtifactManager(manager: ArtifactManager, parent?: ArtifactManager): void {
 		this.#adoptedArtifactManager = manager;
+		if (parent) this.#stagedArtifactParent = parent;
 	}
 
 	/** Release only the matching externally adopted manager. */
@@ -16612,6 +16757,15 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			this.#readOnlyResume = false;
 		}
+	}
+
+	/** Remap artifact references in an unpublished candidate before its publication fence. */
+	async remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
+		const staged = this.#stagedPublication;
+		if (!staged || staged.committed || staged.discarded) throw new Error("Staged session is unavailable");
+		remapAttemptReferencesInEntries(this.#fileEntries, idMap);
+		this.#needsFullRewriteOnNextPersist = true;
+		await this.#rewriteFileContents();
 	}
 
 	/**
@@ -18544,6 +18698,343 @@ export class SessionManager {
 	 * @param path Path to session file
 	 * @param sessionDir Optional session directory for /new or /branch. If omitted, derives from file's parent.
 	 */
+	/** Open an unpublished candidate transcript below the reserved staging directory. */
+	static async openStaged(
+		finalSessionFile: string,
+		storage: SessionStorage = new FileSessionStorage(),
+		attemptId: string = crypto.randomUUID(),
+	): Promise<SessionManager> {
+		assertSafeStagedAttemptId(attemptId);
+
+		if (isStagedSessionPath(finalSessionFile)) throw new Error("Final session path cannot be staged");
+		const finalPath =
+			storage instanceof FileSessionStorage ? canonicalizeTrustedPath(finalSessionFile) : finalSessionFile;
+		const finalDestination = explicitDestination(path.dirname(finalPath));
+		const stagingDir = path.join(path.dirname(finalPath), SESSION_STAGING_DIRNAME);
+		await fs.promises.mkdir(stagingDir, { recursive: true, mode: 0o700 });
+		const stagedSessionFile = path.join(stagingDir, `${attemptId}.jsonl`);
+		if (path.resolve(stagedSessionFile) === path.resolve(finalPath))
+			throw new Error("Staged session path collides with final transcript");
+
+		const manager = new SessionManager(getProjectDir(), stagingDir, true, storage, finalDestination);
+		manager.#stagedPublication = {
+			finalSessionFile: finalPath,
+			stagedSessionFile,
+			finalDestination,
+			attemptId,
+			committed: false,
+			discarded: false,
+		};
+		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
+		try {
+			await manager.#initSessionFile(stagedSessionFile);
+			const parentArtifacts = new ArtifactManager(finalPath.endsWith(".jsonl") ? finalPath.slice(0, -6) : finalPath);
+			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
+			return manager;
+		} catch (error) {
+			try {
+				await manager.discardStaged();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[toError(error), toError(cleanupError)],
+					"Staged session open and cleanup both failed.",
+				);
+			}
+			throw error;
+		}
+	}
+
+	/** Managed-authority variant of {@link openStaged}. */
+	static async stagedNestedManaged(
+		finalSessionFile: string,
+		destination: SessionDestination,
+		store: ManagedSessionDescendantStore,
+		storage: SessionStorage = new FileSessionStorage(),
+		attemptId: string = crypto.randomUUID(),
+	): Promise<SessionManager> {
+		assertSafeStagedAttemptId(attemptId);
+
+		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
+			throw new Error("Nested managed session authority is unavailable");
+		if (isStagedSessionPath(finalSessionFile)) throw new Error("Final session path cannot be staged");
+		store.assertBound();
+		const finalPath = path.resolve(finalSessionFile);
+		if (path.dirname(finalPath) !== path.resolve(destination.directory))
+			throw new Error("Nested managed session escaped retained authority");
+		const stagingStore = store.deriveSubtree(SESSION_STAGING_DIRNAME);
+		const stagedDir = stagingStore.dir;
+		const stagedSessionFile = path.join(stagedDir, `${attemptId}.jsonl`);
+		if (path.resolve(stagedSessionFile) === path.resolve(finalPath))
+			throw new Error("Staged session path collides with final transcript");
+		const stagedDestination = SessionManager.nestedManagedDestination(store, stagedDir);
+		const manager = new SessionManager(getProjectDir(), stagedDir, true, storage, stagedDestination);
+		manager.#stagedPublication = {
+			finalSessionFile: finalPath,
+			stagedSessionFile,
+			finalDestination: destination,
+			managedParentStore: store,
+			managedStagingStore: stagingStore,
+			attemptId,
+			committed: false,
+			discarded: false,
+		};
+		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
+		try {
+			await manager.#initSessionFile(stagedSessionFile);
+			const parentArtifacts = new ArtifactManager(store);
+			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
+			store.assertBound();
+			return manager;
+		} catch (error) {
+			try {
+				await manager.discardStaged();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[toError(error), toError(cleanupError)],
+					"Staged session open and cleanup both failed.",
+				);
+			}
+			throw error;
+		}
+	}
+	/** Publish the candidate-owned staged transcript and artifacts at the real accept fence. */
+	static async openStagedNestedManaged(
+		finalSessionFile: string,
+		destination: SessionDestination,
+		store: ManagedSessionDescendantStore,
+		storage: SessionStorage = new FileSessionStorage(),
+		attemptId: string = crypto.randomUUID(),
+	): Promise<SessionManager> {
+		return SessionManager.stagedNestedManaged(finalSessionFile, destination, store, storage, attemptId);
+	}
+
+	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
+		const staged = this.#stagedPublication;
+		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
+		if (staged.committed) return;
+		staged.deferArtifactFinalize = options?.deferArtifactFinalize === true;
+		await this.flush();
+		await this.#closePersistWriter();
+		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
+		const parentArtifacts =
+			this.#stagedArtifactParent ??
+			new ArtifactManager(
+				staged.finalSessionFile.endsWith(".jsonl") ? staged.finalSessionFile.slice(0, -6) : staged.finalSessionFile,
+			);
+		this.#stagedCommitArtifactParent = parentArtifacts;
+		let published = false;
+		try {
+			if (stagedManager?.getAttemptId() === staged.attemptId) {
+				const stagedArtifactFiles = await stagedManager.listFiles();
+				if (stagedArtifactFiles.length > 0 || stagedManager.getAllocatedIds().length > 0) {
+					await parentArtifacts.commitAttemptStaging(stagedManager, staged.attemptId, {
+						beforePublish: idMap => this.remapStagedArtifactReferences(idMap),
+					});
+				} else await stagedManager.discardAttemptStaging();
+			}
+			if (staged.managedParentStore && staged.managedStagingStore) {
+				const stagedName = path.basename(staged.stagedSessionFile);
+				const relative = path.posix.join(SESSION_STAGING_DIRNAME, stagedName);
+				const expected = staged.managedStagingStore.readExpected(stagedName);
+				if (!expected) throw new Error("staged_session_missing");
+				staged.managedParentStore.moveFileNoReplace(relative, path.basename(staged.finalSessionFile), expected, {
+					sourceStore: staged.managedStagingStore,
+					sourceStoreRelativePath: stagedName,
+				});
+			} else {
+				const outcome = classifyNativePublishOutcome(
+					nativeSessionManager().renameNoReplacePath(staged.stagedSessionFile, staged.finalSessionFile),
+				);
+				if (!outcome.ok) throw new Error(outcome.code ?? "staged_session_publish_failed");
+			}
+			published = true;
+			if (staged.managedParentStore) {
+				staged.publishedFinalSnapshot =
+					staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile)) ?? undefined;
+				if (!staged.publishedFinalSnapshot) throw new Error("staged_session_publish_missing");
+			} else staged.publishedFinalBytes = await fs.promises.readFile(staged.finalSessionFile);
+
+			const finalStat = fs.lstatSync(staged.finalSessionFile, { bigint: true });
+			if (!finalStat.isFile() || finalStat.isSymbolicLink()) throw new Error("staged_session_identity_changed");
+			this.sessionDir = path.dirname(staged.finalSessionFile);
+			this.destination = staged.finalDestination;
+			this.#managedTranscriptStoreCache = staged.managedParentStore
+				? { directory: path.dirname(staged.finalSessionFile), store: staged.managedParentStore }
+				: null;
+			this.#sessionFile = staged.finalSessionFile;
+			this.#artifactManager = parentArtifacts;
+			this.#artifactManagerSessionFile = staged.finalSessionFile;
+			this.#adoptedArtifactManager = parentArtifacts;
+			staged.committed = true;
+			if (!staged.deferArtifactFinalize) {
+				this.#writeTerminalBreadcrumb(this.cwd, staged.finalSessionFile, true);
+				parentArtifacts.finalizeLastAttemptCommit(staged.attemptId);
+			}
+		} catch (error) {
+			const cleanupErrors: Error[] = [];
+			if (published) {
+				try {
+					if (staged.managedParentStore) {
+						const finalSnapshot = staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile));
+						if (finalSnapshot)
+							staged.managedParentStore.removeExpected(path.basename(staged.finalSessionFile), finalSnapshot);
+					} else await fs.promises.rm(staged.finalSessionFile, { force: true });
+				} catch (cleanupError) {
+					cleanupErrors.push(toError(cleanupError));
+				}
+			}
+			try {
+				await parentArtifacts.rollbackLastAttemptCommit(staged.attemptId);
+			} catch (cleanupError) {
+				cleanupErrors.push(toError(cleanupError));
+			}
+			try {
+				await this.discardStaged();
+			} catch (cleanupError) {
+				cleanupErrors.push(toError(cleanupError));
+			}
+			if (cleanupErrors.length > 0)
+				throw new AggregateError([toError(error), ...cleanupErrors], "Staged publication and cleanup both failed.");
+			throw error;
+		}
+	}
+
+	/** Finalize a staged publication whose post-fence publisher completed successfully. */
+	finalizeStagedCommit(): void {
+		const staged = this.#stagedPublication;
+		if (!staged || !staged.committed || !staged.deferArtifactFinalize) return;
+		this.#stagedCommitArtifactParent?.finalizeLastAttemptCommit(staged.attemptId);
+		this.#writeTerminalBreadcrumb(this.cwd, staged.finalSessionFile, true);
+		staged.deferArtifactFinalize = false;
+	}
+
+	/** Roll back a staged publication when post-fence visibility setup fails. */
+	async rollbackCommittedStaged(): Promise<void> {
+		const staged = this.#stagedPublication;
+		if (!staged || !staged.committed) return;
+		if (staged.managedParentStore) {
+			const current = staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile));
+			if (
+				current &&
+				staged.publishedFinalSnapshot &&
+				current.identity.dev === staged.publishedFinalSnapshot.identity.dev &&
+				current.identity.ino === staged.publishedFinalSnapshot.identity.ino
+			) {
+				if (this.#stagedCommitArtifactParent) {
+					const removed = await this.#stagedCommitArtifactParent.removeNamedBestEffort(
+						path.basename(staged.finalSessionFile),
+					);
+					if (!removed) throw new Error("staged_final_cleanup_failed");
+				} else staged.managedParentStore.removeExpected(path.basename(staged.finalSessionFile), current);
+			}
+		} else if (staged.publishedFinalBytes) {
+			const current = await fs.promises.readFile(staged.finalSessionFile).catch(() => undefined);
+			if (current && current.equals(staged.publishedFinalBytes))
+				await fs.promises.rm(staged.finalSessionFile, { force: true });
+		}
+		await this.#stagedCommitArtifactParent?.rollbackLastAttemptCommit(staged.attemptId);
+		staged.committed = false;
+		staged.discarded = true;
+		staged.deferArtifactFinalize = false;
+	}
+
+	/** Refresh the owned final snapshot after post-fence session metadata is appended. */
+	async refreshStagedCommitSnapshot(): Promise<void> {
+		const staged = this.#stagedPublication;
+		if (!staged || !staged.committed) return;
+		if (staged.managedParentStore) {
+			staged.publishedFinalSnapshot =
+				staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile)) ?? undefined;
+			if (!staged.publishedFinalSnapshot) throw new Error("staged_session_publish_missing");
+		} else staged.publishedFinalBytes = await fs.promises.readFile(staged.finalSessionFile);
+	}
+
+	/** Idempotently remove an unpublished staged transcript and its owned artifacts. */
+	async discardStaged(): Promise<void> {
+		const staged = this.#stagedPublication;
+		if (!staged || staged.committed || staged.discarded) return;
+		const cleanupErrors: Error[] = [];
+		const captureCleanupError = (error: unknown): void => {
+			const normalized = toError(error);
+			if (normalized.message !== "not_found" && !isAuthorizedPendingCleanup(normalized))
+				cleanupErrors.push(normalized);
+		};
+		try {
+			await this.#closePersistWriter();
+		} catch (error) {
+			captureCleanupError(error);
+		}
+		let managedStagingBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
+		if (staged.managedParentStore) {
+			try {
+				managedStagingBefore = staged.managedParentStore.captureTree(SESSION_STAGING_DIRNAME);
+			} catch (error) {
+				captureCleanupError(error);
+			}
+		}
+
+		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
+		if (stagedManager?.getAttemptId() === staged.attemptId) {
+			try {
+				await stagedManager.discardAttemptStaging();
+			} catch (error) {
+				captureCleanupError(error);
+			}
+		}
+		if (staged.managedParentStore) {
+			const stagedName = path.basename(staged.stagedSessionFile);
+			try {
+				const stagingStore = staged.managedStagingStore;
+				if (stagingStore) {
+					const expected = stagingStore.readExpected(stagedName);
+					if (expected) stagingStore.removeExpected(stagedName, expected);
+				}
+			} catch (error) {
+				captureCleanupError(error);
+			}
+			if (managedStagingBefore) {
+				try {
+					const after = staged.managedParentStore.captureTree(SESSION_STAGING_DIRNAME);
+					const beforePaths = new Set(managedStagingBefore.entries.map(entry => entry.relativePath));
+					for (const entry of after.entries) {
+						if (
+							entry.relativePath.length === 0 ||
+							beforePaths.has(entry.relativePath) ||
+							(!/^\.gjc-/u.test(path.posix.basename(entry.relativePath)) &&
+								!/\.removing$/u.test(path.posix.basename(entry.relativePath)))
+						)
+							continue;
+						try {
+							await fs.promises.rm(
+								path.join(staged.managedParentStore.dir, SESSION_STAGING_DIRNAME, entry.relativePath),
+								{ recursive: entry.kind === "directory", force: true },
+							);
+						} catch (error) {
+							captureCleanupError(error);
+						}
+					}
+				} catch (error) {
+					captureCleanupError(error);
+				}
+			}
+		} else {
+			try {
+				await fs.promises.rm(staged.stagedSessionFile, { force: true });
+			} catch (error) {
+				captureCleanupError(error);
+			}
+		}
+		if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "Staged session cleanup failed.");
+		staged.discarded = true;
+	}
+	async commitStagedNestedManaged(): Promise<void> {
+		return this.commitStaged();
+	}
+
+	async discardStagedNestedManaged(): Promise<void> {
+		return this.discardStaged();
+	}
+
 	static async open(
 		filePath: string,
 		destinationInput?: SessionDestinationInput,
@@ -18551,6 +19042,7 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
+		if (isStagedSessionPath(filePath)) throw new Error("Staged session paths are not resumable");
 		const destination =
 			destinationInput === undefined
 				? explicitDestination(path.dirname(filePath))
@@ -19039,7 +19531,7 @@ export class SessionManager {
 		const listing = listManagedCandidates(resolved.scope);
 		if (listing.kind === "error") return [];
 		const managed = await collectSessionsFromFiles(
-			listing.owned.map(candidate => candidate.path),
+			listing.owned.filter(candidate => !isStagedSessionPath(candidate.path)).map(candidate => candidate.path),
 			storage,
 		);
 		return mergeSessionInventories(managed, await collectProjectSessions(cwd, storage));
@@ -19057,7 +19549,10 @@ export class SessionManager {
 	): Promise<SessionInfo[]> {
 		if (!sessionDir) return await SessionManager.listManagedForResumePickerReadOnly(cwd, undefined, storage);
 		try {
-			return await collectSessionsFromFiles(storage.listFilesSync(sessionDir, "*.jsonl"), storage);
+			return await collectSessionsFromFiles(
+				storage.listFilesSync(sessionDir, "*.jsonl").filter(file => !isStagedSessionPath(file)),
+				storage,
+			);
 		} catch {
 			return [];
 		}
@@ -19777,7 +20272,13 @@ export class SessionManager {
 			await manager.close();
 			return ownershipInspection;
 		}
-		manager.#sanitizeLoadedOpenAIResponsesReplayMetadata();
+		try {
+			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+			manager.#writeTerminalBreadcrumb(manager.cwd, sessionPath);
+		} catch (error) {
+			await manager.close();
+			throw error;
+		}
 		return { kind: "opened", manager };
 	}
 
@@ -19961,7 +20462,8 @@ export class SessionManager {
 					logger.warn("Ignored invalid managed session candidates during global listing", {
 						count: listing.invalid.length,
 					});
-				for (const candidate of listing.owned) logicalFiles.add(candidate.path);
+				for (const candidate of listing.owned)
+					if (!isStagedSessionPath(candidate.path)) logicalFiles.add(candidate.path);
 			}
 			return await collectSessionsFromFiles([...logicalFiles], storage);
 		} catch {
@@ -20020,6 +20522,7 @@ export class SessionManager {
 				const failures: StrictInventoryFailure[] = [];
 				const candidates: StrictInventoryCandidate[] = [];
 				for (const managedCandidate of listing.owned) {
+					if (isStagedSessionPath(managedCandidate.path)) continue;
 					const candidate = inventoryReadCandidate(
 						storage,
 						managedCandidate.path,

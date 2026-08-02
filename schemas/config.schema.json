@@ -1121,6 +1121,83 @@
 							"additionalProperties": false,
 							"description": "provider/modelId with an optional valid thinking suffix (:minimal|low|medium|high|xhigh), no globs, no bare model ids, no pi/<role> role aliases.",
 							"default": {}
+						},
+						"setup": {
+							"type": "object",
+							"properties": {
+								"schema": {
+									"type": "integer",
+									"const": 1
+								},
+								"providers": {
+									"type": "array",
+									"minItems": 1,
+									"uniqueItems": true,
+									"items": {
+										"type": "string",
+										"minLength": 1
+									}
+								},
+								"models": {
+									"type": "array",
+									"items": {
+										"type": "string",
+										"pattern": "^[^/\\s*?\\[]+\\/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$"
+									}
+								}
+							},
+							"additionalProperties": false,
+							"required": [
+								"schema",
+								"providers"
+							]
+						},
+						"provenance": {
+							"type": "object",
+							"properties": {
+								"schema": {
+									"type": "integer",
+									"const": 1
+								},
+								"source": {
+									"type": "object",
+									"properties": {
+										"catalogFingerprint": {
+											"type": "string",
+											"pattern": "^[0-9a-f]{64}$"
+										},
+										"mapFingerprint": {
+											"type": "string",
+											"pattern": "^[0-9a-f]{64}$"
+										},
+										"generatorVersion": {
+											"type": "integer",
+											"minimum": 1
+										}
+									},
+									"additionalProperties": false,
+									"required": [
+										"catalogFingerprint",
+										"mapFingerprint",
+										"generatorVersion"
+									]
+								},
+								"declarationFingerprint": {
+									"type": "string",
+									"pattern": "^[0-9a-f]{64}$"
+								},
+								"tiersFingerprint": {
+									"type": "string",
+									"pattern": "^[0-9a-f]{64}$"
+								}
+							},
+							"additionalProperties": false,
+							"required": [
+								"schema",
+								"source",
+								"declarationFingerprint",
+								"tiersFingerprint"
+							]
 						}
 					},
 					"additionalProperties": false

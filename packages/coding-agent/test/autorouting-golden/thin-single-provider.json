@@ -1,0 +1,8 @@
+{
+  "catalog": [
+    { "provider": "qianfan", "id": "deepseek-v3.2", "reasoning": false }
+  ],
+  "setup": { "schema": 1, "providers": ["qianfan"] },
+  "expectedTiers": {},
+  "expectedCanonicalBytes": "{}"
+}

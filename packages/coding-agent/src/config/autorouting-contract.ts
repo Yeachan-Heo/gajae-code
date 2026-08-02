@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Dependency-free autorouting vocabulary, presets, and settings validators.
  *
@@ -15,6 +17,24 @@ export type TierMap = Partial<Record<AutoroutingTier, string[]>>;
 
 /** The permissive input shape accepted by the settings surface. */
 export type AutoroutingTierMapInput = Partial<Record<AutoroutingTier, string | string[]>>;
+
+export type AutoroutingSetup = {
+	schema: 1;
+	providers: string[];
+	models?: string[];
+};
+
+/** Fingerprints describing the generated autorouting declaration and materialized tiers. */
+export type AutoroutingProvenance = {
+	schema: 1;
+	source: {
+		catalogFingerprint: string;
+		mapFingerprint: string;
+		generatorVersion: number;
+	};
+	declarationFingerprint: string;
+	tiersFingerprint: string;
+};
 
 export type AutoroutingPresetId = "anthropic" | "openai-codex" | "google" | "xai";
 
@@ -56,7 +76,12 @@ export type AutoroutingReasonCode =
 	| "map_absent"
 	| "selector_not_provider_qualified"
 	| "auth_substituted"
-	| "assistant_model_mismatch";
+	| "assistant_model_mismatch"
+	| "provider_disabled"
+	| "snapshot_missing"
+	| "credential_unavailable"
+	| "preflight_spawn_failed"
+	| "preflight_exhausted";
 
 export type AutoroutingLocalIssue = {
 	path: string;
@@ -159,6 +184,103 @@ function validateSelectorValue(path: string, value: unknown, issues: Autorouting
 	}
 }
 
+/** Validate the typed auto-setup declaration without consulting the model catalog. */
+export function validateAutoroutingSetup(value: unknown): AutoroutingLocalIssue[] {
+	const issues: AutoroutingLocalIssue[] = [];
+	if (!isRecord(value)) {
+		issues.push(issue("", "config_invalid", "Expected an autorouting setup object."));
+		return issues;
+	}
+	for (const key of Object.keys(value)) {
+		if (key !== "schema" && key !== "providers" && key !== "models") {
+			issues.push(issue(key, "config_invalid", "Unknown autorouting setup key."));
+		}
+	}
+	if (value.schema !== 1) issues.push(issue("schema", "config_invalid", "Expected schema version 1."));
+	if (!Array.isArray(value.providers)) {
+		issues.push(issue("providers", "config_invalid", "Expected a non-empty array of provider names."));
+	} else {
+		if (value.providers.length === 0) {
+			issues.push(issue("providers", "config_invalid", "Expected a non-empty array of provider names."));
+		}
+		const seen = new Set<string>();
+		for (let index = 0; index < value.providers.length; index++) {
+			const provider = value.providers[index];
+			if (typeof provider !== "string" || provider.length === 0 || provider.trim() !== provider) {
+				issues.push(issue(`providers.${index}`, "config_invalid", "Expected a non-empty provider name."));
+				continue;
+			}
+			if (seen.has(provider)) {
+				issues.push(issue(`providers.${index}`, "config_invalid", "Provider declarations must be unique."));
+				continue;
+			}
+			seen.add(provider);
+		}
+	}
+	if (value.models !== undefined) {
+		if (!Array.isArray(value.models)) {
+			issues.push(issue("models", "config_invalid", "Expected an array of provider-qualified model selectors."));
+		} else {
+			for (let index = 0; index < value.models.length; index++) {
+				if (!isValidAutoroutingSelector(value.models[index])) {
+					issues.push(
+						issue(
+							`models.${index}`,
+							"selector_not_provider_qualified",
+							`Expected ${AUTOROUTING_SELECTOR_DESCRIPTION}`,
+						),
+					);
+				}
+			}
+		}
+	}
+	return issues;
+}
+
+const FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/u;
+
+function validateFingerprint(path: string, value: unknown, issues: AutoroutingLocalIssue[]): void {
+	if (typeof value !== "string" || !FINGERPRINT_PATTERN.test(value)) {
+		issues.push(issue(path, "config_invalid", "Expected a lowercase 64-character SHA-256 fingerprint."));
+	}
+}
+
+/** Validate generated-tier provenance and its source identity. */
+export function validateAutoroutingProvenance(value: unknown): AutoroutingLocalIssue[] {
+	const issues: AutoroutingLocalIssue[] = [];
+	if (!isRecord(value)) {
+		issues.push(issue("", "config_invalid", "Expected an autorouting provenance object."));
+		return issues;
+	}
+	for (const key of Object.keys(value)) {
+		if (key !== "schema" && key !== "source" && key !== "declarationFingerprint" && key !== "tiersFingerprint") {
+			issues.push(issue(key, "config_invalid", "Unknown autorouting provenance key."));
+		}
+	}
+	if (value.schema !== 1) issues.push(issue("schema", "config_invalid", "Expected schema version 1."));
+	if (!isRecord(value.source)) {
+		issues.push(issue("source", "config_invalid", "Expected a provenance source object."));
+	} else {
+		for (const key of Object.keys(value.source)) {
+			if (key !== "catalogFingerprint" && key !== "mapFingerprint" && key !== "generatorVersion") {
+				issues.push(issue(`source.${key}`, "config_invalid", "Unknown provenance source key."));
+			}
+		}
+		validateFingerprint("source.catalogFingerprint", value.source.catalogFingerprint, issues);
+		validateFingerprint("source.mapFingerprint", value.source.mapFingerprint, issues);
+		if (
+			typeof value.source.generatorVersion !== "number" ||
+			!Number.isSafeInteger(value.source.generatorVersion) ||
+			value.source.generatorVersion < 1
+		) {
+			issues.push(issue("source.generatorVersion", "config_invalid", "Expected an integer generator version >= 1."));
+		}
+	}
+	validateFingerprint("declarationFingerprint", value.declarationFingerprint, issues);
+	validateFingerprint("tiersFingerprint", value.tiersFingerprint, issues);
+	return issues;
+}
+
 /** Validate only local types, keys, and selector grammar for one source layer. */
 export function validateAutoroutingLocal(fragment: unknown): AutoroutingLocalIssue[] {
 	const issues: AutoroutingLocalIssue[] = [];
@@ -169,7 +291,7 @@ export function validateAutoroutingLocal(fragment: unknown): AutoroutingLocalIss
 	}
 
 	for (const key of Object.keys(fragment)) {
-		if (key !== "enabled" && key !== "preset" && key !== "tiers") {
+		if (!new Set(["enabled", "preset", "tiers", "setup", "provenance"]).has(key)) {
 			issues.push(issue(key, "config_invalid", "Unknown autorouting setting key."));
 		}
 	}
@@ -178,6 +300,19 @@ export function validateAutoroutingLocal(fragment: unknown): AutoroutingLocalIss
 	}
 	if (fragment.preset !== undefined && typeof fragment.preset !== "string") {
 		issues.push(issue("preset", "config_invalid", "Expected a string."));
+	}
+	if (fragment.setup !== undefined) {
+		for (const setupIssue of validateAutoroutingSetup(fragment.setup)) {
+			issues.push({ ...setupIssue, path: setupIssue.path ? `setup.${setupIssue.path}` : "setup" });
+		}
+	}
+	if (fragment.provenance !== undefined) {
+		for (const provenanceIssue of validateAutoroutingProvenance(fragment.provenance)) {
+			issues.push({
+				...provenanceIssue,
+				path: provenanceIssue.path ? `provenance.${provenanceIssue.path}` : "provenance",
+			});
+		}
 	}
 	if (fragment.tiers === undefined) return issues;
 	if (!isRecord(fragment.tiers)) {
@@ -192,6 +327,105 @@ export function validateAutoroutingLocal(fragment: unknown): AutoroutingLocalIss
 		validateSelectorValue(`tiers.${key}`, fragment.tiers[key], issues);
 	}
 	return issues;
+}
+
+/** Return a canonical JSON representation with sorted object keys and stored array order. */
+function canonicalAutoroutingJson(value: unknown): string {
+	if (value === null) return "null";
+	if (value === undefined) return "undefined";
+	switch (typeof value) {
+		case "string":
+		case "boolean":
+			return JSON.stringify(value);
+		case "number":
+			return Number.isFinite(value) ? JSON.stringify(value) : "null";
+		case "bigint":
+			throw new TypeError("Cannot canonicalize bigint");
+		case "function":
+		case "symbol":
+			return "undefined";
+		case "object":
+			if (Array.isArray(value)) {
+				return `[${value
+					.map(item => {
+						const encoded = canonicalAutoroutingJson(item);
+						return encoded === "undefined" ? "null" : encoded;
+					})
+					.join(",")}]`;
+			}
+			return `{${Object.keys(value as Record<string, unknown>)
+				.sort()
+				.flatMap(key => {
+					const encoded = canonicalAutoroutingJson((value as Record<string, unknown>)[key]);
+					return encoded === "undefined" ? [] : [`${JSON.stringify(key)}:${encoded}`];
+				})
+				.join(",")}}`;
+		default:
+			return "undefined";
+	}
+}
+
+function autoroutingSha256(value: unknown): string {
+	return createHash("sha256")
+		.update(new TextEncoder().encode(canonicalAutoroutingJson(value)))
+		.digest("hex");
+}
+
+export type AutoroutingProvenanceState = {
+	staleMap: boolean;
+	staleCatalog: boolean;
+	handEdited: boolean;
+};
+
+/** Compare recorded provenance with the current catalog/map/tier materialization. */
+export function evaluateAutoroutingProvenanceState(
+	provenance: AutoroutingProvenance | undefined,
+	current: { catalogFingerprint: string; mapFingerprint: string; tiers: unknown },
+): AutoroutingProvenanceState {
+	if (!provenance) return { staleMap: false, staleCatalog: false, handEdited: false };
+	return {
+		staleMap: provenance.source.mapFingerprint !== current.mapFingerprint,
+		staleCatalog: provenance.source.catalogFingerprint !== current.catalogFingerprint,
+		handEdited: provenance.tiersFingerprint !== autoroutingSha256(current.tiers),
+	};
+}
+
+export type AutoroutingSettingsBatchPatch =
+	| { path: "task.autorouting.tiers"; op: "set"; value: TierMap }
+	| { path: "task.autorouting.setup"; op: "set"; value: AutoroutingSetup }
+	| { path: "task.autorouting.provenance"; op: "set"; value: AutoroutingProvenance }
+	| { path: "task.autorouting.tiers" | "task.autorouting.setup" | "task.autorouting.provenance"; op: "unset" };
+
+/** Build the one atomic settings batch used by autorouting Apply/Refresh or Clear. */
+export function buildAutoroutingSettingsBatch(
+	input: { tiers: TierMap; setup: AutoroutingSetup; provenance: AutoroutingProvenance } | { clear: true },
+): readonly AutoroutingSettingsBatchPatch[] {
+	if ("clear" in input) {
+		return [
+			{ path: "task.autorouting.tiers", op: "unset" },
+			{ path: "task.autorouting.setup", op: "unset" },
+			{ path: "task.autorouting.provenance", op: "unset" },
+		];
+	}
+	return [
+		{ path: "task.autorouting.tiers", op: "set", value: structuredClone(input.tiers) },
+		{ path: "task.autorouting.setup", op: "set", value: structuredClone(input.setup) },
+		{ path: "task.autorouting.provenance", op: "set", value: structuredClone(input.provenance) },
+	];
+}
+
+/** Convenience aliases for controller intents that all use one atomic batch. */
+export const buildAutoroutingApplyPatches = buildAutoroutingSettingsBatch;
+export const buildAutoroutingRefreshPatches = buildAutoroutingSettingsBatch;
+export const buildAutoroutingClearPatches = () => buildAutoroutingSettingsBatch({ clear: true });
+
+/** Build the separate single-key enabled toggle mutation. */
+export function buildAutoroutingEnabledPatch(enabled: boolean): {
+	path: "task.autorouting.enabled";
+	op: "set";
+	value: boolean;
+} {
+	return { path: "task.autorouting.enabled", op: "set", value: enabled };
 }
 
 /** Validate effective enablement and map/preset cross-field semantics. */

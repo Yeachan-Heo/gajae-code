@@ -26,7 +26,8 @@ import {
 } from "@gajae-code/coding-agent/async";
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
-import { type RoutingOutcome, resolveTaskRouting } from "../config/autorouting";
+import { normalizeTierSelector, type RoutingOutcome, resolveTaskRouting } from "../config/autorouting";
+import type { AutoroutingReasonCode } from "../config/autorouting-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
@@ -68,7 +69,12 @@ import { registerOwnedIfLineaged } from "../session/terminal-abort";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
-import { createManagedTaskPersistence, renderSubagentUserPrompt, runSubprocess } from "./executor";
+import {
+	buildBoundedRoutingSkips,
+	createManagedTaskPersistence,
+	renderSubagentUserPrompt,
+	runSubprocess,
+} from "./executor";
 
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
@@ -1964,34 +1970,105 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: validateAllocatedTaskId(uniqueIds[i] ?? "") }));
 
 			const effectiveAutorouting = this.session.settings.getEffectiveAutorouting();
-			const routingSnapshot = this.session.modelRegistry?.getAvailable();
+			const registry = this.session.modelRegistry as
+				| {
+						getAvailable?: () => Model[];
+						getAll?: () => Model[];
+						getApiKey?: (model: Model) => Promise<string | undefined>;
+				  }
+				| undefined;
+			const routingSnapshot = registry?.getAll?.() ?? registry?.getAvailable?.();
 			const routingByIndex = new Map<number, RoutingOutcome>();
+			const routingCandidatesByIndex = new Map<number, string[]>();
+			const routingSkipsByIndex = new Map<number, Array<{ selector: string; code: AutoroutingReasonCode }>>();
 			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
 				const task = tasksWithUniqueIds[i];
-				routingByIndex.set(
-					i,
-					routingSnapshot
-						? resolveTaskRouting({
-								effectiveAutorouting,
+				const outcome = routingSnapshot
+					? resolveTaskRouting({
+							effectiveAutorouting,
+							requestedTier: task.tier,
+							availableModels: routingSnapshot,
+						})
+					: effectiveAutorouting.active
+						? {
+								kind: "manual-fallback" as const,
+								tier: task.tier ?? "balanced",
 								requestedTier: task.tier,
-								availableModels: routingSnapshot,
-							})
-						: effectiveAutorouting.active
-							? {
-									kind: "manual-fallback",
-									tier: task.tier ?? "balanced",
-									requestedTier: task.tier,
-									...(task.tier === undefined ? { defaultTierApplied: true as const } : {}),
-									source:
-										effectiveAutorouting.source === "tiers"
-											? "tiers"
-											: { preset: effectiveAutorouting.source.preset },
-									attemptedSelectorCount: 0,
-									reason: "tier_unmatched",
-								}
-							: { kind: "disabled" },
+								...(task.tier === undefined ? { defaultTierApplied: true as const } : {}),
+								source:
+									effectiveAutorouting.source === "tiers"
+										? ("tiers" as const)
+										: { preset: effectiveAutorouting.source.preset },
+								attemptedSelectorCount: 0,
+								reason: "tier_unmatched" as const,
+							}
+						: { kind: "disabled" as const };
+				routingByIndex.set(i, outcome);
+				if (outcome.kind === "disabled" || !routingSnapshot || !effectiveAutorouting.active) continue;
+
+				// Enumerate every configured selector before choosing a routed or manual
+				// outcome. This keeps AC12 evidence complete even when every selector is
+				// missing, malformed, or disabled.
+				const configured = effectiveAutorouting.map[outcome.tier] ?? [];
+				const candidates: string[] = [];
+				const skips: Array<{ selector: string; code: AutoroutingReasonCode }> = [];
+				const disabledProviders = new Set(
+					this.session.settings.get("disabledProviders").map(provider => provider.toLowerCase()),
 				);
+				for (const selector of configured) {
+					const slash = selector.indexOf("/");
+					const provider = slash > 0 ? selector.slice(0, slash).toLowerCase() : "";
+					// Disabled takes precedence over snapshot presence: a disabled provider
+					// that is also absent must remain truthfully classified as disabled.
+					if (disabledProviders.has(provider)) {
+						skips.push({ selector, code: "provider_disabled" });
+						continue;
+					}
+					const normalized = normalizeTierSelector(selector, routingSnapshot);
+					if (!("pinned" in normalized)) {
+						skips.push({
+							selector,
+							code: "rejected" in normalized ? "selector_not_provider_qualified" : "snapshot_missing",
+						});
+						continue;
+					}
+					candidates.push(normalized.pinned);
+				}
+				routingCandidatesByIndex.set(i, candidates);
+				routingSkipsByIndex.set(i, skips);
 			}
+			const resolveAutoroutingCandidates = async (
+				index: number,
+			): Promise<{
+				candidates: string[];
+				skips: Array<{ selector: string; code: AutoroutingReasonCode }>;
+			}> => {
+				const candidates = [...(routingCandidatesByIndex.get(index) ?? [])];
+				const skips = [...(routingSkipsByIndex.get(index) ?? [])];
+				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips };
+				const authenticated: string[] = [];
+				for (const selector of candidates) {
+					const slash = selector.indexOf("/");
+					const provider = selector.slice(0, slash).toLowerCase();
+					const modelId = selector.slice(slash + 1);
+					const model = routingSnapshot.find(
+						candidate =>
+							candidate.provider.toLowerCase() === provider &&
+							(modelId === candidate.id || modelId.startsWith(`${candidate.id}:`)),
+					);
+					if (!model) {
+						skips.push({ selector, code: "snapshot_missing" });
+						continue;
+					}
+					try {
+						if (await registry.getApiKey(model)) authenticated.push(selector);
+						else skips.push({ selector, code: "credential_unavailable" });
+					} catch {
+						skips.push({ selector, code: "credential_unavailable" });
+					}
+				}
+				return { candidates: authenticated, skips };
+			};
 			const effectivePatterns = (index: number): string | string[] => {
 				const outcome = routingByIndex.get(index);
 				return outcome?.kind === "routed" ? [outcome.pinnedSelector] : modelOverride;
@@ -2134,6 +2211,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				};
 
 				const effectiveRunMode = overrides?.runMode ?? executionOverrides?.runMode;
+				const autoroutingInitial =
+					routingOutcome?.kind === "routed" && (effectiveRunMode ?? "initial") === "initial";
+				const autoroutingData =
+					(effectiveRunMode ?? "initial") === "initial" && routingOutcome && routingOutcome.kind !== "disabled"
+						? routingOutcome.kind === "routed"
+							? await resolveAutoroutingCandidates(index)
+							: { candidates: undefined, skips: [...(routingSkipsByIndex.get(index) ?? [])] }
+						: { candidates: undefined, skips: undefined };
+				const routingForRun = routeEvidence(
+					routingOutcome,
+					effectiveRunMode === "resume" || effectiveRunMode === "message",
+				);
+				if (routingForRun && autoroutingData.skips)
+					Object.assign(routingForRun, buildBoundedRoutingSkips(autoroutingData.skips));
 				const taskSessionFile = managedPersistence
 					? null
 					: (overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null);
@@ -2177,10 +2268,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,
-						routing: routeEvidence(
-							routingOutcome,
-							effectiveRunMode === "resume" || effectiveRunMode === "message",
-						),
+						routing: routingForRun,
+						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
+						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
+						autoroutingPreflight: autoroutingInitial,
 
 						onProgress: progress => {
 							progressMap.set(index, {
@@ -2261,10 +2352,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,
-						routing: routeEvidence(
-							routingOutcome,
-							effectiveRunMode === "resume" || effectiveRunMode === "message",
-						),
+						routing: routingForRun,
+						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
+						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
+						autoroutingPreflight: autoroutingInitial,
 						onProgress: progress => {
 							progressMap.set(index, {
 								...structuredClone(progress),

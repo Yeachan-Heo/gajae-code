@@ -1,4 +1,5 @@
 import {
+	assertRoutingEvidenceInvariant,
 	hasCompleteUsageCostBreakdown,
 	type ReviewFindingsArtifactRef,
 	type SingleResult,
@@ -245,6 +246,23 @@ export function buildTaskRoiSummary(receipts: readonly TaskResultReceipt[]): Tas
 		lowRoiChildIds: receipts.filter(receipt => receipt.roi?.lowRoi).map(receipt => receipt.id),
 	};
 }
+function validatedRoutingEvidence(value: TaskRoutingEvidence | undefined): TaskRoutingEvidence | undefined {
+	if (!value) return undefined;
+	try {
+		const bounded: TaskRoutingEvidence = {
+			...value,
+			requestedSelector: value.requestedSelector.slice(0, 256),
+			skips: value.skips?.slice(0, 16).map(skip => ({ ...skip, selector: skip.selector.slice(0, 256) })),
+			attempts: value.attempts
+				?.slice(0, 6)
+				.map(attempt => ({ ...attempt, selector: attempt.selector.slice(0, 256) })),
+		};
+		assertRoutingEvidenceInvariant(bounded);
+		return bounded;
+	} catch {
+		return undefined;
+	}
+}
 
 export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 	// Receipts only include outputRef when production code kept outputMeta after a
@@ -286,7 +304,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		contextWindow: raw.contextWindow,
 		modelOverride: raw.modelOverride,
 		modelSubstitutionWarning: raw.modelSubstitutionWarning,
-		routing: raw.routing,
+		routing: validatedRoutingEvidence(raw.routing),
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
 		usageCostBreakdownComplete:

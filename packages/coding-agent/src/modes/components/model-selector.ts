@@ -14,6 +14,12 @@ import {
 	truncateToWidth,
 } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
+import {
+	type AutoroutingSetup,
+	evaluateAutoroutingProvenanceState,
+	resolveTierMap,
+	validateAutoroutingSetup,
+} from "../../config/autorouting-contract";
 import { isModelProfileProviderAvailable } from "../../config/model-profile-contract";
 import {
 	getModelProfilePresentation,
@@ -46,6 +52,8 @@ import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-gu
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
+import type { SmartRoutingIntent, SmartRoutingPreview } from "./smart-routing-panel";
+import { SmartRoutingPanelComponent } from "./smart-routing-panel";
 
 function makeInvertedBadge(label: string, color: ThemeColor): string {
 	const fgAnsi = theme.getFgAnsi(color);
@@ -147,6 +155,10 @@ export type ModelSelectorSelection =
 	| {
 			kind: "deleteProfile";
 			profileName: string;
+	  }
+	| {
+			kind: "smartRouting";
+			intent: SmartRoutingIntent;
 	  };
 
 interface PendingThinkingChoice {
@@ -180,7 +192,7 @@ function createProviderTab(providerId: string): ProviderTabState {
 	return { id: providerId, label: formatProviderTabLabel(providerId), providerId };
 }
 
-type ModelSelectorViewMode = "presets" | "models";
+type ModelSelectorViewMode = "presets" | "models" | "smart-routing";
 
 interface PresetGroupRow {
 	kind: "group";
@@ -216,6 +228,10 @@ interface PresetImageRoleRow {
 	kind: "imageRole";
 }
 
+interface PresetSmartRoutingRow {
+	kind: "smartRouting";
+}
+
 type PresetLandingRow =
 	| PresetGroupRow
 	| PresetProfileRow
@@ -223,7 +239,8 @@ type PresetLandingRow =
 	| PresetCreateUnavailableRow
 	| PresetAlreadySavedRow
 	| PresetBrowseRow
-	| PresetImageRoleRow;
+	| PresetImageRoleRow
+	| PresetSmartRoutingRow;
 
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
@@ -244,6 +261,8 @@ function presetRowIdentity(row: PresetLandingRow): string {
 			return `alreadySaved:${row.profile.name}`;
 		case "imageRole":
 			return "imageRole";
+		case "smartRouting":
+			return "smartRouting";
 	}
 }
 
@@ -391,6 +410,8 @@ export class ModelSelectorComponent extends Container {
 	#presetLoginHint?: string;
 	#authSessionId?: string;
 	#imageRoleFilter: boolean = false;
+	#smartRoutingPanel?: SmartRoutingPanelComponent;
+	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => SmartRoutingPreview;
 
 	// Tab state
 	#providers: ProviderTabState[] = STATIC_PROVIDER_TABS;
@@ -414,6 +435,7 @@ export class ModelSelectorComponent extends Container {
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
+			smartRoutingPreview?: (draft: AutoroutingSetup) => SmartRoutingPreview;
 		},
 	) {
 		super();
@@ -426,6 +448,7 @@ export class ModelSelectorComponent extends Container {
 		this.#onCancelCallback = onCancel;
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
+		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
 		this.#currentModel = _currentModel;
 		this.#currentThinkingLevel = options?.currentThinkingLevel;
 		this.#activeModelProfile = options?.activeModelProfile;
@@ -1229,6 +1252,7 @@ export class ModelSelectorComponent extends Container {
 			rows.push({ kind: "createUnavailable", label: "Select a model before creating a custom preset" });
 		}
 		rows.push({ kind: "imageRole" });
+		rows.push({ kind: "smartRouting" });
 		rows.push({ kind: "browse" });
 		return rows;
 	}
@@ -1435,7 +1459,8 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageRole"
+			selected.kind === "imageRole" ||
+			selected.kind === "smartRouting"
 		)
 			return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
@@ -1452,7 +1477,8 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageRole"
+			selected.kind === "imageRole" ||
+			selected.kind === "smartRouting"
 		)
 			return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
@@ -1518,6 +1544,100 @@ export class ModelSelectorComponent extends Container {
 		return truncateToWidth(label, ROLE_BINDING_MAX_WIDTH);
 	}
 
+	#smartRoutingSetup(): AutoroutingSetup {
+		const stored = this.#settings.get("task.autorouting.setup");
+		if (validateAutoroutingSetup(stored).length === 0 && stored !== undefined) return structuredClone(stored);
+		const providers = [...new Set(this.#modelRegistry.getAll().map(model => model.provider))];
+		return { schema: 1, providers: providers.length > 0 ? providers : ["anthropic"] };
+	}
+
+	#smartRoutingPreview(setup: AutoroutingSetup): SmartRoutingPreview {
+		if (!this.#smartRoutingPreviewBuilder) {
+			throw new Error("Smart-routing preview is unavailable in this selector context.");
+		}
+		return this.#smartRoutingPreviewBuilder(setup);
+	}
+
+	#smartRoutingIsStale(): boolean {
+		const provenance = this.#settings.get("task.autorouting.provenance");
+		if (!provenance || validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+		try {
+			const preview = this.#smartRoutingPreview(this.#smartRoutingSetup());
+			const state = evaluateAutoroutingProvenanceState(provenance, {
+				catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
+				mapFingerprint: preview.sourceIdentity.mapFingerprint,
+				tiers: this.#settings.get("task.autorouting.tiers") ?? {},
+			});
+			return state.staleMap || state.staleCatalog || state.handEdited;
+		} catch {
+			return true;
+		}
+	}
+
+	#smartRoutingReadOnly(): boolean {
+		return this.#temporaryOnly || this.#scopedModels.length > 0 || !this.#settings.canWriteDurableConfig();
+	}
+
+	#enterSmartRoutingMode(): void {
+		if (!this.#smartRoutingPreviewBuilder) {
+			this.#presetLoginHint = "Smart-routing setup is unavailable in this selector context.";
+			this.#renderPresetLanding();
+			return;
+		}
+		const setup = this.#smartRoutingSetup();
+		const preview = this.#smartRoutingPreview(setup);
+		const tiers = resolveTierMap({ tiers: this.#settings.get("task.autorouting.tiers") });
+		const provenance = this.#settings.get("task.autorouting.provenance");
+		this.#viewMode = "smart-routing";
+		this.#smartRoutingPanel = new SmartRoutingPanelComponent({
+			setup,
+			tiers,
+			provenance,
+			enabled: this.#settings.get("task.autorouting.enabled") === true,
+			preset: this.#settings.get("task.autorouting.preset"),
+			readOnly: this.#smartRoutingReadOnly(),
+			stale: this.#smartRoutingIsStale(),
+			preview,
+			generatePreview: draft => this.#smartRoutingPreview(draft),
+			onSelect: async intent => {
+				await this.#onSelectCallback({ kind: "smartRouting", intent });
+				return intent.kind === "apply" ? this.#smartRoutingPreview(intent.draft) : undefined;
+			},
+			onCancel: () => this.#switchToPresetMode(),
+		});
+		this.#headerContainer.clear();
+		this.#headerContainer.addChild(new Text(theme.fg("accent", "Smart routing"), 0, 0));
+		this.#tabBar = null;
+		this.#listContainer.clear();
+		this.#listContainer.addChild(this.#smartRoutingPanel);
+		this.#tui.requestRender();
+	}
+
+	#switchToPresetMode(): void {
+		this.#smartRoutingPanel = undefined;
+		this.#viewMode = "presets";
+		this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, this.#getPresetRows().length - 1));
+		this.#renderPresetLanding();
+		this.#tui.requestRender();
+	}
+
+	refreshSmartRoutingState(): void {
+		const panel = this.#smartRoutingPanel;
+		if (!panel || this.#viewMode !== "smart-routing") return;
+		const setup = this.#smartRoutingSetup();
+		const preview = this.#smartRoutingPreview(setup);
+		panel.refreshState({
+			setup,
+			tiers: resolveTierMap({ tiers: this.#settings.get("task.autorouting.tiers") }),
+			provenance: this.#settings.get("task.autorouting.provenance"),
+			enabled: this.#settings.get("task.autorouting.enabled") === true,
+			preset: this.#settings.get("task.autorouting.preset"),
+			stale: this.#smartRoutingIsStale(),
+			preview,
+		});
+		this.#tui.requestRender();
+	}
+
 	#renderPresetLanding(): void {
 		this.#headerContainer.clear();
 		this.#tabBar = null;
@@ -1531,6 +1651,12 @@ export class ModelSelectorComponent extends Container {
 			const row = rows[i];
 			const selected = i === this.#presetCursor;
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			if (row.kind === "smartRouting") {
+				const stale = this.#smartRoutingIsStale();
+				const label = stale ? "Smart routing (stale)" : "Smart routing setup";
+				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
+				continue;
+			}
 			if (row.kind === "create") {
 				const label = "Create custom preset";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
@@ -1921,6 +2047,10 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.#viewMode === "smart-routing") {
+			this.#smartRoutingPanel?.handleInput(keyData);
+			return;
+		}
 		if (this.#assignmentState === "assigning") {
 			if (getKeybindings().matches(keyData, "tui.select.cancel")) {
 				this.#closeAfterAssignment = true;
@@ -2106,6 +2236,10 @@ export class ModelSelectorComponent extends Container {
 		}
 		const row = this.#getSelectedPresetRow();
 		if (!row) return;
+		if (row.kind === "smartRouting") {
+			this.#enterSmartRoutingMode();
+			return;
+		}
 		if (row.kind === "create") {
 			this.#onSelectCallback({ kind: "createProfile", profile: this.#buildCustomModelProfileSnapshot() });
 			return;
@@ -2430,6 +2564,16 @@ export class ModelSelectorComponent extends Container {
 	__testSelectedPresetRowIdentity(): string | undefined {
 		const row = this.#getSelectedPresetRow();
 		return row ? presetRowIdentity(row) : undefined;
+	}
+	__testGetSmartRoutingPanel(): SmartRoutingPanelComponent | undefined {
+		return this.#smartRoutingPanel;
+	}
+
+	__testViewMode(): ModelSelectorViewMode {
+		return this.#viewMode;
+	}
+	__testOpenSmartRoutingPanel(): void {
+		this.#enterSmartRoutingMode();
 	}
 }
 

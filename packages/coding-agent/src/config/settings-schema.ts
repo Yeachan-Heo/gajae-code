@@ -8,8 +8,13 @@ import {
 	AUTOROUTING_SELECTOR_DESCRIPTION,
 	AUTOROUTING_SELECTOR_PATTERN,
 	AUTOROUTING_TIERS,
+	type AutoroutingLocalIssue,
+	type AutoroutingProvenance,
+	type AutoroutingSetup,
 	type AutoroutingTierMapInput,
 	validateAutoroutingLocal,
+	validateAutoroutingProvenance,
+	validateAutoroutingSetup,
 } from "./autorouting-contract";
 import type { ModelSelectorValue } from "./model-selector-value";
 import { UPDATE_CHANNELS } from "./update-channel";
@@ -155,6 +160,22 @@ export type AnyUiMetadata = UiBase & {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 };
 
+/** JSON Schema fragment carried by settings definitions that own nested validation. */
+export type JsonSchemaObject = {
+	[key: string]: unknown;
+	type?: string;
+	properties?: Record<string, JsonSchemaObject>;
+	additionalProperties?: boolean | JsonSchemaObject;
+	items?: JsonSchemaObject;
+	required?: readonly string[];
+	pattern?: string;
+	minItems?: number;
+	minLength?: number;
+	uniqueItems?: boolean;
+	minimum?: number;
+	const?: unknown;
+};
+
 interface BooleanDef {
 	type: "boolean";
 	default?: boolean;
@@ -212,14 +233,23 @@ interface RecordDef<T> {
 	ui?: UiBase;
 }
 
-type SettingDef =
+export interface OptionalObjectDef<T> {
+	type: "optional-object";
+	default: undefined;
+	jsonSchema: JsonSchemaObject;
+	validate: (value: unknown) => AutoroutingLocalIssue[];
+	_value?: T;
+}
+
+export type SettingDef =
 	| BooleanDef
 	| StringDef
 	| NumberDef
 	| EnumDef<readonly string[]>
 	| ArrayDef<unknown>
 	| RecordDef<unknown>
-	| ConstrainedRecordDef<unknown>;
+	| ConstrainedRecordDef<unknown>
+	| OptionalObjectDef<unknown>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Schema Definition
@@ -280,6 +310,46 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 		message: "Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation.",
 	},
 ];
+
+const AUTOROUTING_SETUP_JSON_SCHEMA: JsonSchemaObject = {
+	type: "object",
+	properties: {
+		schema: { type: "integer", const: 1 },
+		providers: {
+			type: "array",
+			minItems: 1,
+			uniqueItems: true,
+			items: { type: "string", minLength: 1 },
+		},
+		models: {
+			type: "array",
+			items: { type: "string", pattern: AUTOROUTING_SELECTOR_PATTERN },
+		},
+	},
+	additionalProperties: false,
+	required: ["schema", "providers"],
+};
+
+const AUTOROUTING_PROVENANCE_JSON_SCHEMA: JsonSchemaObject = {
+	type: "object",
+	properties: {
+		schema: { type: "integer", const: 1 },
+		source: {
+			type: "object",
+			properties: {
+				catalogFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+				mapFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+				generatorVersion: { type: "integer", minimum: 1 },
+			},
+			additionalProperties: false,
+			required: ["catalogFingerprint", "mapFingerprint", "generatorVersion"],
+		},
+		declarationFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+		tiersFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+	},
+	additionalProperties: false,
+	required: ["schema", "source", "declarationFingerprint", "tiersFingerprint"],
+};
 
 export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
@@ -3514,6 +3584,20 @@ export const SETTINGS_SCHEMA = {
 		description: AUTOROUTING_SELECTOR_DESCRIPTION,
 	},
 
+	"task.autorouting.setup": {
+		type: "optional-object",
+		default: undefined,
+		jsonSchema: AUTOROUTING_SETUP_JSON_SCHEMA,
+		validate: validateAutoroutingSetup,
+	} as OptionalObjectDef<AutoroutingSetup>,
+
+	"task.autorouting.provenance": {
+		type: "optional-object",
+		default: undefined,
+		jsonSchema: AUTOROUTING_PROVENANCE_JSON_SCHEMA,
+		validate: validateAutoroutingProvenance,
+	} as OptionalObjectDef<AutoroutingProvenance>,
+
 	"tasks.todoClearDelay": {
 		type: "number",
 		default: 60,
@@ -3862,7 +3946,9 @@ export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boo
 							? D
 							: Schema[P] extends { type: "constrained-record"; default: infer D }
 								? D
-								: never;
+								: Schema[P] extends OptionalObjectDef<infer D>
+									? D | undefined
+									: never;
 
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
@@ -3936,7 +4022,11 @@ function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
 		const path = prefix ? `${prefix}.${key}` : key;
 		const definition = SETTINGS_SCHEMA[path as SettingPath];
 		// Records intentionally accept user-defined keys; validate their entries below.
-		if (definition?.type === "record" || definition?.type === "constrained-record") {
+		if (
+			definition?.type === "record" ||
+			definition?.type === "constrained-record" ||
+			definition?.type === "optional-object"
+		) {
 			paths.push(path);
 		} else if (child && typeof child === "object" && !Array.isArray(child)) {
 			paths.push(...schemaPaths(child as Record<string, unknown>, path));
@@ -3972,7 +4062,9 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 			(definition.values as readonly string[]).includes(value)) ||
 		(definition.type === "array" &&
 			validArraySettingValue(value, "items" in definition ? definition.items?.enum : undefined)) ||
-		((definition.type === "record" || definition.type === "constrained-record") &&
+		((definition.type === "record" ||
+			definition.type === "constrained-record" ||
+			definition.type === "optional-object") &&
 			!!value &&
 			typeof value === "object" &&
 			!Array.isArray(value))
@@ -4066,8 +4158,25 @@ export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 			schemaSetAtPath(settings, path, next);
 			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
 		}
+		if (definition.type === "optional-object") {
+			for (const localIssue of definition.validate(next)) {
+				issues.push({
+					path: localIssue.path ? `${path}.${localIssue.path}` : path,
+					kind: "invalid",
+					detail: localIssue.detail,
+				});
+			}
+			continue;
+		}
 		if (definition.type === "constrained-record") {
-			for (const localIssue of validateAutoroutingLocal(schemaValueAtPath(settings, "task.autorouting"))) {
+			const autorouting = schemaValueAtPath(settings, "task.autorouting");
+			const tiersFragment =
+				autorouting && typeof autorouting === "object" && !Array.isArray(autorouting)
+					? Object.fromEntries(
+							Object.entries(autorouting).filter(([key]) => key !== "setup" && key !== "provenance"),
+						)
+					: autorouting;
+			for (const localIssue of validateAutoroutingLocal(tiersFragment)) {
 				issues.push({
 					path: localIssue.path ? `task.autorouting.${localIssue.path}` : "task.autorouting",
 					kind: "invalid",

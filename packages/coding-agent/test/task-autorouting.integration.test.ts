@@ -5,7 +5,8 @@ import { Settings } from "../src/config/settings";
 import { TaskTool } from "../src/task";
 import * as discoveryModule from "../src/task/discovery";
 import type { runSubprocess } from "../src/task/executor";
-import type { SingleResult } from "../src/task/types";
+import { buildTaskReceipt } from "../src/task/receipt";
+import type { SingleResult, TaskRoutingEvidence } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
 
 const agents = [
@@ -216,6 +217,51 @@ describe("TaskTool autorouting integration surfaces", () => {
 		).toEqual(["anthropic/claude-sonnet-5"]);
 	});
 
+	it("bounds manual-fallback skip evidence before dispatch", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
+		const captured: Array<{ routing?: TaskRoutingEvidence }> = [];
+		const stub = async (options: Parameters<typeof runSubprocess>[0]) => {
+			captured.push({ routing: options.routing });
+			return {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				assignment: options.assignment,
+				exitCode: 0,
+				output: "ok",
+				stderr: "",
+				truncated: false,
+				durationMs: 1,
+				tokens: 1,
+				modelOverride: options.modelOverride,
+				routing: options.routing,
+			} as SingleResult;
+		};
+		const unavailable = Array.from({ length: 20 }, (_, index) => `missing/model-${index}`);
+		AsyncJobManager.setInstance(new AsyncJobManager({ maxRunningJobs: 4, onJobComplete: async () => {} }));
+		const settings = Settings.isolated({
+			"task.autorouting.enabled": true,
+			"task.autorouting.tiers": { fast: unavailable },
+			"task.agentModelOverrides": { task: manual },
+		});
+		const tool = await TaskTool.create(
+			session({}, { settings, modelRegistry: { getAvailable: () => registryModels } as never }),
+			{ runSubprocess: stub },
+		);
+		await tool.execute("bounded-fallback", {
+			agent: "task",
+			tasks: [{ id: "Fallback", description: "fallback", assignment: "a", tier: "fast" }],
+		} as never);
+		await AsyncJobManager.instance()!.waitForAll();
+		const routing = captured[0]?.routing;
+		expect(routing?.manualFallbackReason).toBe("tier_unmatched");
+		expect(routing?.skips).toHaveLength(16);
+		expect(routing?.skips?.every(skip => skip.selector.length <= 256)).toBe(true);
+		expect(routing?.omittedSkipCount).toBe(4);
+		expect(routing?.omittedByCode).toEqual({ snapshot_missing: 4 });
+	});
 	it("disabled capture matches manual patterns and emits no routing", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
 		const captured: Array<{ index?: number; modelOverride?: string | string[]; routing?: unknown }> = [];
@@ -320,5 +366,41 @@ describe("TaskTool autorouting integration surfaces", () => {
 		expect(synthetic.notExecuted).toBe(true);
 		expect(synthetic.requestedSelector).not.toBe("manual-model-chain");
 		expect(synthetic.tier).toBe("fast");
+	});
+});
+
+describe("autorouting evidence receipt extensions", () => {
+	it("retains bounded skip overflow accounting and terminal preflight evidence", () => {
+		const raw = {
+			index: 0,
+			id: "Evidence",
+			agent: "task",
+			agentSource: "bundled" as const,
+			task: "task",
+			exitCode: 1,
+			output: "",
+			stderr: "preflight exhausted",
+			truncated: false,
+			durationMs: 1,
+			tokens: 0,
+			routing: {
+				tier: "balanced" as const,
+				source: "tiers" as const,
+				requestedSelector: "anthropic/model",
+				notExecuted: true as const,
+				substitutions: [],
+				terminal: "preflight_exhausted" as const,
+				skips: Array.from({ length: 16 }, (_, index) => ({
+					selector: `provider/${index}`,
+					code: "snapshot_missing" as const,
+				})),
+				omittedSkipCount: 2,
+				omittedByCode: { snapshot_missing: 1, credential_unavailable: 1 },
+			},
+		} as SingleResult;
+		const receipt = buildTaskReceipt(raw);
+		expect(receipt.routing?.terminal).toBe("preflight_exhausted");
+		expect(receipt.routing?.skips).toHaveLength(16);
+		expect(receipt.routing?.omittedSkipCount).toBe(2);
 	});
 });

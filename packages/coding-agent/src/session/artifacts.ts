@@ -34,6 +34,13 @@ function isSafeFilename(filename: string): boolean {
 	return /^[a-zA-Z0-9_.-]+$/.test(filename);
 }
 
+const MAX_ATTEMPT_ID_LENGTH = 128;
+
+function assertSafeAttemptId(attemptId: string): void {
+	if (!/^[A-Za-z0-9_-]{1,128}$/.test(attemptId) || attemptId.length > MAX_ATTEMPT_ID_LENGTH)
+		throw new Error("Unsafe artifact attempt id");
+}
+
 function parseManagedOutputGeneration(value: Uint8Array, outputFilenamePrefix: string): ManagedOutputGeneration | null {
 	try {
 		const parsed = JSON.parse(Buffer.from(value).toString("utf8")) as Partial<ManagedOutputGeneration>;
@@ -99,13 +106,29 @@ export class ArtifactManager {
 	#dirCreated = false;
 	#initialized: Promise<void> | undefined;
 	#initializedComplete = false;
+	readonly #attemptId: string | undefined;
+	readonly #allocatedIds = new Set<string>();
+	readonly #retiredIds = new Set<string>();
+	#reservations = new Map<string, { start: number; count: number; names: string[] }>();
+	readonly #stagingParentStore: ManagedSessionDescendantStore | undefined;
+	readonly #stagingRelativePath: string | undefined;
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
 	 */
-	constructor(target: string | ManagedSessionDescendantStore) {
+	constructor(
+		target: string | ManagedSessionDescendantStore,
+		options?: {
+			readonly attemptId?: string;
+			readonly stagingParentStore?: ManagedSessionDescendantStore;
+			readonly stagingRelativePath?: string;
+		},
+	) {
 		this.#store = typeof target === "string" ? undefined : target;
 		this.#dir = typeof target === "string" ? target : target.dir;
+		this.#attemptId = options?.attemptId;
+		this.#stagingParentStore = options?.stagingParentStore;
+		this.#stagingRelativePath = options?.stagingRelativePath;
 	}
 
 	/**
@@ -188,8 +211,12 @@ export class ArtifactManager {
 	}
 
 	async #publish(content: string, filename: string): Promise<void> {
-		if (this.#store) await this.#store.publishNoReplace(filename, Buffer.from(content, "utf8"));
-		else await publishManagedFileNoReplace(path.join(this.#dir, filename), Buffer.from(content, "utf8"));
+		await this.#publishBytes(Buffer.from(content, "utf8"), filename);
+	}
+
+	async #publishBytes(bytes: Uint8Array, filename: string): Promise<void> {
+		if (this.#store) await this.#store.publishNoReplace(filename, bytes);
+		else await publishManagedFileNoReplace(path.join(this.#dir, filename), bytes);
 	}
 
 	async replaceNamed(filename: string, content: string): Promise<void> {
@@ -289,8 +316,34 @@ export class ArtifactManager {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) return false;
 		try {
 			if (this.#store) {
+				const before = this.#store.captureTree("");
 				const staged = this.#store.readExpected(filename);
 				if (staged) this.#store.removeExpected(filename, staged);
+				const after = this.#store.captureTree("");
+				const beforePaths = new Set(before.entries.map(entry => entry.relativePath));
+				// Clean only residue that APPEARED as a result of this removal (the before/after diff)
+				// and that matches the native residue shapes. Two shapes exist: quarantine named after
+				// the artifact (`<filename>.removing`) and native placeholders whose names do NOT carry
+				// the filename (`.gjc-remove-*`, `.gjc-exact-unlink-placeholder-*`). A filename match is
+				// therefore required to be a whole-name boundary rather than a substring, so
+				// `1.tool.log` can never claim `11.tool.log.removing`.
+				// Sibling subagents share this parent store; a concurrent attempt interleaving between
+				// the two snapshots is out of scope per the accepted no-concurrent-attempt limitation.
+				for (const entry of after.entries) {
+					const basename = path.posix.basename(entry.relativePath);
+					const nativeResidue = /^\.gjc-/u.test(basename);
+					const ownQuarantine = basename === `${filename}.removing` || basename.startsWith(`${filename}.`);
+					if (
+						entry.relativePath.length === 0 ||
+						beforePaths.has(entry.relativePath) ||
+						(!nativeResidue && !ownQuarantine)
+					)
+						continue;
+					await fs.rm(path.join(this.#store.dir, entry.relativePath), {
+						recursive: entry.kind === "directory",
+						force: true,
+					});
+				}
 			} else {
 				await fs.unlink(path.join(this.#dir, filename));
 			}
@@ -326,7 +379,10 @@ export class ArtifactManager {
 	 * Prefer `allocatePath` or `save`; this synchronous seam exists for pruning callbacks.
 	 */
 	allocateId(): number {
-		return this.#claimNextIdSync();
+		while (this.#retiredIds.has(String(this.#nextId))) this.#nextId++;
+		const id = this.#claimNextIdSync();
+		this.#allocatedIds.add(String(id));
+		return id;
 	}
 
 	/**
@@ -378,10 +434,196 @@ export class ArtifactManager {
 	 */
 	async listFiles(): Promise<string[]> {
 		try {
+			if (this.#store) {
+				return this.#store
+					.captureTree("")
+					.entries.filter(entry => entry.kind === "file" && entry.relativePath.length > 0)
+					.map(entry => entry.relativePath);
+			}
 			return await fs.readdir(this.#dir);
 		} catch {
 			return [];
 		}
+	}
+	getAttemptId(): string | undefined {
+		return this.#attemptId;
+	}
+
+	getAllocatedIds(): readonly string[] {
+		return [...this.#allocatedIds].sort((a, b) => Number(a) - Number(b));
+	}
+
+	/** Create an isolated artifact manager rooted below this manager's staging area. */
+	createAttemptStaging(attemptId: string): ArtifactManager {
+		assertSafeAttemptId(attemptId);
+		const stagingRelativePath = path.posix.join(".staging", attemptId);
+		const target = this.#store
+			? this.#store.deriveSubtree(stagingRelativePath)
+			: path.join(this.#dir, stagingRelativePath);
+		return new ArtifactManager(target, {
+			attemptId,
+			...(this.#store ? { stagingParentStore: this.#store, stagingRelativePath } : {}),
+		});
+	}
+
+	/** Reserve and publish a candidate's staged artifacts with a contiguous parent ID block. */
+	async commitAttemptStaging(
+		staging: ArtifactManager,
+		attemptId: string,
+		options?: { beforePublish?: (mapping: ReadonlyMap<string, string>) => Promise<void> | void },
+	): Promise<ReadonlyMap<string, string>> {
+		if (staging.#attemptId !== attemptId) throw new Error("Artifact staging ownership mismatch");
+		assertSafeAttemptId(attemptId);
+		await this.#ensureDir();
+		await staging.#ensureDir();
+		const ids = staging.getAllocatedIds();
+		const start = this.#nextId;
+		this.#nextId += ids.length;
+		const mapping = new Map<string, string>();
+		for (let index = 0; index < ids.length; index++) mapping.set(ids[index]!, String(start + index));
+		const frozenMap = new Map(mapping) as Map<string, string> & ReadonlyMap<string, string>;
+		Object.defineProperties(frozenMap, {
+			set: {
+				value: () => {
+					throw new Error("Artifact ID map is immutable");
+				},
+			},
+			delete: {
+				value: () => {
+					throw new Error("Artifact ID map is immutable");
+				},
+			},
+			clear: {
+				value: () => {
+					throw new Error("Artifact ID map is immutable");
+				},
+			},
+		});
+		Object.freeze(frozenMap);
+		const publishedNames: string[] = [];
+		try {
+			await options?.beforePublish?.(frozenMap);
+			for (const filename of await staging.listFiles()) {
+				const bytes = staging.#store
+					? staging.#store.readExpected(filename)?.bytes
+					: await fs.readFile(path.join(staging.#dir, filename));
+				if (!bytes) continue;
+				const match = filename.match(/^(\d+)(\..*)$/);
+				const mappedFilename = match ? `${mapping.get(match[1]!) ?? match[1]}${match[2]}` : filename;
+				await this.#publishBytes(bytes, mappedFilename);
+				publishedNames.push(mappedFilename);
+			}
+			this.#reservations.set(attemptId, { start, count: ids.length, names: [...publishedNames] });
+			await staging.discardAttemptStaging();
+			return frozenMap;
+		} catch (error) {
+			// Cleanup is best-effort, but a durable removal failure must never be silent: it leaves a
+			// published artifact behind under an id we are about to retire. Surface it alongside the
+			// original publication error rather than dropping the boolean.
+			const unremoved: string[] = [];
+			for (const filename of publishedNames.reverse())
+				if (!(await this.removeNamedBestEffort(filename))) unremoved.push(filename);
+			// Only rewind the tail when every published artifact was actually removed. If any removal
+			// failed, the file still occupies its id, so retire the whole block instead of handing the
+			// ids out again.
+			if (unremoved.length === 0 && this.#nextId === start + ids.length) this.#nextId = start;
+			else for (const id of mapping.values()) this.#retiredIds.add(id);
+			if (unremoved.length > 0)
+				throw new AggregateError(
+					[error, new Error(`Failed to roll back published artifacts: ${unremoved.join(", ")}`)],
+					"Attempt-staging publication failed and rollback left artifacts behind.",
+				);
+			throw error;
+		}
+	}
+	async rollbackLastAttemptCommit(attemptId?: string): Promise<void> {
+		if (attemptId === undefined) return;
+		const reservation = this.#reservations.get(attemptId);
+		if (!reservation) return;
+		const unremoved: string[] = [];
+		for (const filename of [...reservation.names].reverse())
+			if (!(await this.removeNamedBestEffort(filename))) unremoved.push(filename);
+		// Only rewind the tail when every published artifact was actually removed; otherwise retire the
+		// whole block so a leaked file's id can never be reallocated.
+		if (unremoved.length === 0 && this.#nextId === reservation.start + reservation.count)
+			this.#nextId = reservation.start;
+		else
+			for (let index = 0; index < reservation.count; index++)
+				this.#retiredIds.add(String(reservation.start + index));
+		this.#reservations.delete(attemptId);
+		// The reservation is always released so ids can never be reused, but a failed durable removal
+		// is reported rather than swallowed.
+		if (unremoved.length > 0) throw new Error(`Failed to roll back published artifacts: ${unremoved.join(", ")}`);
+	}
+
+	finalizeLastAttemptCommit(attemptId?: string): void {
+		if (attemptId !== undefined) this.#reservations.delete(attemptId);
+	}
+
+	async discardAttemptStaging(): Promise<void> {
+		if (this.#store) {
+			const cleanupStore = this.#stagingParentStore ?? this.#store;
+			const cleanupPath = this.#stagingParentStore ? this.#stagingRelativePath! : "";
+			const parentCleanupPath = cleanupPath ? path.posix.dirname(cleanupPath) : "";
+			let parentBefore: ReturnType<ManagedSessionDescendantStore["captureTree"]> | undefined;
+			if (this.#stagingParentStore) {
+				try {
+					parentBefore = cleanupStore.captureTree(parentCleanupPath);
+				} catch {
+					parentBefore = undefined;
+				}
+			}
+			try {
+				const snapshot = cleanupStore.captureTree(cleanupPath);
+				cleanupStore.removeTreeExpected(cleanupPath, snapshot);
+			} catch (error) {
+				if (!(error instanceof Error && (error.message === "not_found" || error.message === "cleanup_pending")))
+					throw error;
+			}
+			if (this.#stagingParentStore && parentBefore) {
+				try {
+					const after = cleanupStore.captureTree(parentCleanupPath);
+					const beforePaths = new Set(parentBefore.entries.map(entry => entry.relativePath));
+					for (const entry of after.entries) {
+						if (
+							entry.kind === "directory" &&
+							entry.relativePath.length > 0 &&
+							!beforePaths.has(entry.relativePath) &&
+							/\.removing$/u.test(path.posix.basename(entry.relativePath))
+						) {
+							await fs.rm(path.join(cleanupStore.dir, parentCleanupPath, entry.relativePath), {
+								recursive: true,
+								force: true,
+							});
+							continue;
+						}
+						if (
+							entry.kind !== "file" ||
+							beforePaths.has(entry.relativePath) ||
+							!/^\\.gjc-(?:exact-unlink-placeholder|remove)-/u.test(path.posix.basename(entry.relativePath))
+						)
+							continue;
+						const relative = path.posix.join(parentCleanupPath, entry.relativePath);
+						const expected = cleanupStore.readExpected(relative);
+						if (expected) {
+							try {
+								cleanupStore.removeExpected(relative, expected);
+							} catch (cleanupError) {
+								if (!(cleanupError instanceof Error && cleanupError.message === "cleanup_pending"))
+									throw cleanupError;
+							}
+						}
+						await fs.rm(path.join(cleanupStore.dir, relative), { force: true }).catch(() => undefined);
+					}
+				} catch {
+					// Retained cleanup evidence is safe to leave for a later maintenance pass.
+				}
+			}
+			this.#store.close();
+		} else {
+			await fs.rm(this.#dir, { recursive: true, force: true });
+		}
+		this.#dirCreated = false;
 	}
 
 	/** Persist exact UTF-8 text for heap-eviction rehydration. */

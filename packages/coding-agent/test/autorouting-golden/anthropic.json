@@ -1,0 +1,16 @@
+{
+  "catalog": [
+    { "provider": "anthropic", "id": "claude-haiku-4-5", "reasoning": true },
+    { "provider": "anthropic", "id": "claude-sonnet-5", "reasoning": true },
+    { "provider": "anthropic", "id": "claude-sonnet-4-6", "reasoning": true },
+    { "provider": "anthropic", "id": "claude-opus-5", "reasoning": true },
+    { "provider": "anthropic", "id": "claude-opus-4-8", "reasoning": true }
+  ],
+  "setup": { "schema": 1, "providers": ["anthropic"] },
+  "expectedTiers": {
+    "fast": ["anthropic/claude-haiku-4-5"],
+    "balanced": ["anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4-6"],
+    "strong": ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-8:high"]
+  },
+  "expectedCanonicalBytes": "{\"balanced\":[\"anthropic/claude-sonnet-5\",\"anthropic/claude-sonnet-4-6\"],\"fast\":[\"anthropic/claude-haiku-4-5\"],\"strong\":[\"anthropic/claude-opus-5:high\",\"anthropic/claude-opus-4-8:high\"]}"
+}

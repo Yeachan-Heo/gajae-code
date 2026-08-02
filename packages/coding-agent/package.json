@@ -33,6 +33,7 @@
 		"check": "biome check . && bun run check:types",
 		"check:runtime": "bun run generate-hotkeys-docs --check && bun run verify:sdk-canonicalization",
 		"check:types": "tsc -p tsconfig.json --noEmit",
+		"check:autorouting-map": "bun scripts/check-autorouting-tier-map.ts",
 		"lint": "biome lint .",
 		"test": "bun test",
 		"generate-hotkeys-docs": "bun scripts/generate-hotkeys-docs.ts",

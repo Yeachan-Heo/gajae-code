@@ -1,0 +1,13 @@
+{
+  "catalog": [
+    { "provider": "openai-codex", "id": "gpt-5.6-terra", "reasoning": true },
+    { "provider": "openai-codex", "id": "gpt-5.6-sol", "reasoning": true }
+  ],
+  "setup": { "schema": 1, "providers": ["openai-codex"] },
+  "expectedTiers": {
+    "fast": ["openai-codex/gpt-5.6-terra:low"],
+    "balanced": ["openai-codex/gpt-5.6-terra:medium"],
+    "strong": ["openai-codex/gpt-5.6-sol:high"]
+  },
+  "expectedCanonicalBytes": "{\"balanced\":[\"openai-codex/gpt-5.6-terra:medium\"],\"fast\":[\"openai-codex/gpt-5.6-terra:low\"],\"strong\":[\"openai-codex/gpt-5.6-sol:high\"]}"
+}

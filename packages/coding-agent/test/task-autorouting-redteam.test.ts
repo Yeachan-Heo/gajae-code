@@ -378,3 +378,27 @@ it("preserves synthetic cancellation evidence and fresh resume markers", () => {
 	expect(resumed.freshOnResume).toBe(true);
 	expect(resumed.note).toContain("freshOnResume");
 });
+
+describe("autorouting preflight red-team evidence", () => {
+	it("rejects invalid phase pairing and oversized selectors fail closed", () => {
+		const base = {
+			tier: "fast" as const,
+			source: "tiers" as const,
+			requestedSelector: "anthropic/model",
+			substitutions: [],
+			notExecuted: true as const,
+		};
+		expect(() =>
+			assertRoutingEvidenceInvariant({
+				...base,
+				attempts: [{ selector: "anthropic/model", phase: "probe", code: "accepted" }],
+			}),
+		).toThrow();
+		expect(() =>
+			assertRoutingEvidenceInvariant({
+				...base,
+				attempts: [{ selector: "x".repeat(257), phase: "probe", code: "probe_passed" }],
+			}),
+		).toThrow();
+	});
+});
