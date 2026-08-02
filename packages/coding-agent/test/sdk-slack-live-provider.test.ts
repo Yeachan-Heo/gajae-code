@@ -167,6 +167,33 @@ describe("SlackLiveProvider fake Socket Mode protocol", () => {
 		expect(fixture.requests[0]?.init?.body).toContain("client_msg_id");
 	});
 
+	it("sends Web API calls as Slack-compatible form encoding and omits undefined values", async () => {
+		const fixture = setup([
+			response({ ok: true, messages: [] }),
+			response({ ok: true, messages: [{ ts: "2.0", client_msg_id: "client-1" }] }),
+		]);
+		await expect(
+			fixture.provider.findMessageByClientMsgId({ channel: "C1", threadTs: "0.0", clientMsgId: "client-1" }),
+		).resolves.toEqual({ channel: "C1", ts: "2.0", client_msg_id: "client-1" });
+		const replies = fixture.requests[1];
+		expect(replies?.url).toBe("https://slack.com/api/conversations.replies");
+		expect(new Headers(replies?.init?.headers).get("content-type")).toBe(
+			"application/x-www-form-urlencoded; charset=utf-8",
+		);
+		expect([...new URLSearchParams(String(replies?.init?.body))]).toEqual([
+			["channel", "C1"],
+			["ts", "0.0"],
+		]);
+
+		const posted = setup([response({ ok: true, channel: "C1", ts: "1.0", client_msg_id: "client-1" })]);
+		await posted.provider.postMessage({ channel: "C1", text: "hello world", clientMsgId: "client-1" });
+		expect([...new URLSearchParams(String(posted.requests[0]?.init?.body))]).toEqual([
+			["channel", "C1"],
+			["text", "hello world"],
+			["client_msg_id", "client-1"],
+		]);
+	});
+
 	it("bounds rate-limit retry and exposes no credential in typed errors", async () => {
 		const fixture = setup([
 			response({ ok: false }, 429, { "retry-after": "120" }),

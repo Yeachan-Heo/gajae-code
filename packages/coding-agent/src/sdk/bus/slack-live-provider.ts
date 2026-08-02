@@ -98,6 +98,17 @@ function socketFromGlobal(url: string): SlackWebSocket {
 }
 
 /**
+ * Slack's Web API rejects JSON bodies for read methods such as conversations.replies
+ * with `invalid_arguments`, so every call is encoded as a form body with undefined
+ * parameters omitted rather than serialized.
+ */
+function formBody(body: Record<string, string | undefined>): string {
+	const parameters = new URLSearchParams();
+	for (const [key, value] of Object.entries(body)) if (value !== undefined) parameters.set(key, value);
+	return parameters.toString();
+}
+
+/**
  * Production Socket Mode and Web API client. It keeps all connection state in
  * memory and deliberately never maintains a Slack cursor.
  */
@@ -385,8 +396,11 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 			try {
 				response = await this.#fetch(`${SLACK_API}/${operation}`, {
 					method: "POST",
-					headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=utf-8" },
-					body: JSON.stringify(body),
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+					},
+					body: formBody(body),
 					signal,
 				});
 			} catch {

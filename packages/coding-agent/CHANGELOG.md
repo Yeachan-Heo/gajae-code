@@ -22,6 +22,7 @@
 
 - A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the durable configuration already carries the attempted bot token, chat id, and enabled state. The wording now follows the stored configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own. A commit that was entered and then failed while the stored configuration is also unreadable is reported as undecided, pointing at `notify status`, instead of guessing either outcome (#3761).
 - Continuing a large managed session on Darwin now batches stale OpenAI Responses replay-metadata patches into one transcript append instead of performing one identity-verified whole-file replacement per patch. Interactive startup also renders before exact MCP connection and explicit `--mpreset` activation, gates every provider turn until both are ready, and refreshes models online only after the UI is usable, preventing `gjc -c` from remaining at `GJC warming workspace` with sustained CPU, multi-gigabyte RSS growth, or avoidable network waits (#3793).
+- Slack Web API requests now use form encoding instead of JSON, preventing thread reconciliation through `conversations.replies` from failing with `invalid_arguments`.
 
 ## [0.12.11] - 2026-08-03
 
