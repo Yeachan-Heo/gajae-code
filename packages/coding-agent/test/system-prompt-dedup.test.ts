@@ -195,4 +195,18 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(promptText).toContain("Root context instructions");
 		expect(promptText).toContain("Near context instructions");
 	});
+	it("exposes bounded AGENTS.md discovery warnings on the production prompt result", async () => {
+		const projectDir = path.join(tempDir, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.writeFileSync(path.join(projectDir, "AGENTS.md"), "x".repeat(64 * 1024 + 1));
+
+		const built = await buildSystemPrompt({
+			cwd: projectDir,
+			skills: [],
+			rules: [],
+			toolNames: [],
+		});
+
+		expect(built.warnings).toContain("[AGENTS.md] Skipped one or more AGENTS.md files that exceed the 64 KiB limit.");
+	});
 });

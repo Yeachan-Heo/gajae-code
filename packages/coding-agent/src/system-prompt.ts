@@ -245,8 +245,12 @@ function dedupeExactContextFiles(
 		// Keep the closest matching context entry when content is byte-for-byte identical.
 		lastIndexByContent.set(file.content, index);
 	}
-
 	return contextFiles.filter((file, index) => lastIndexByContent.get(file.content) === index);
+}
+
+export interface ProjectContextFilesResult {
+	contextFiles: Array<{ path: string; content: string; depth?: number }>;
+	warnings: string[];
 }
 
 /**
@@ -257,11 +261,10 @@ function dedupeExactContextFiles(
  * prominent. User-home files from foreign providers (`~/.claude/CLAUDE.md`,
  * `~/.codex/AGENTS.md`, …) stay excluded — only gjc's own user config applies.
  */
-export async function loadProjectContextFiles(
+export async function loadProjectContextFilesResult(
 	options: LoadContextFilesOptions = {},
-): Promise<Array<{ path: string; content: string; depth?: number }>> {
+): Promise<ProjectContextFilesResult> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
-
 	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd });
 	const items = result.items as ContextFile[];
 
@@ -288,7 +291,17 @@ export async function loadProjectContextFiles(
 		return depthB - depthA;
 	});
 
-	return dedupeExactContextFiles([...userFiles, ...projectFiles]);
+	return {
+		contextFiles: dedupeExactContextFiles([...userFiles, ...projectFiles]),
+		warnings: result.warnings,
+	};
+}
+
+/** Load project context files without exposing discovery diagnostics. */
+export async function loadProjectContextFiles(
+	options: LoadContextFilesOptions = {},
+): Promise<Array<{ path: string; content: string; depth?: number }>> {
+	return (await loadProjectContextFilesResult(options)).contextFiles;
 }
 
 /**
@@ -386,10 +399,11 @@ export interface BuildSystemPromptOptions {
 	subagent?: boolean;
 }
 
-/** Result of building provider-facing system prompt messages. */
 export interface BuildSystemPromptResult {
 	/** Ordered system prompt blocks. Providers should preserve entries as distinct messages/blocks. */
 	systemPrompt: string[];
+	/** Context-file discovery warnings visible to SDK and session callers. */
+	warnings: string[];
 }
 export interface BuildVolatileProjectContextOptions {
 	cwd?: string;
@@ -421,7 +435,7 @@ export function buildVolatileProjectContext(options: BuildVolatileProjectContext
 /** Build the system prompt with tools, guidelines, and context */
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	if ($env.NULL_PROMPT === "true") {
-		return { systemPrompt: [] };
+		return { systemPrompt: [], warnings: [] };
 	}
 
 	const {
@@ -448,7 +462,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedCustomPrompt: undefined as string | undefined,
 		resolvedAppendPrompt: undefined as string | undefined,
 		systemPromptCustomization: null as string | null,
-		contextFiles: dedupeExactContextFiles(providedContextFiles ?? []),
+		contextFiles: { contextFiles: [] as Array<{ path: string; content: string; depth?: number }>, warnings: [] },
 		workspaceTree: {
 			rootPath: resolvedCwd,
 			rendered: "",
@@ -490,8 +504,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd: resolvedCwd,
 	});
 	const contextFilesPromise = providedContextFiles
-		? Promise.resolve(providedContextFiles)
-		: logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
+		? Promise.resolve({ contextFiles: providedContextFiles, warnings: [] })
+		: logger.time("loadProjectContextFiles", loadProjectContextFilesResult, { cwd: resolvedCwd });
 	const workspaceTreePromise =
 		providedWorkspaceTree !== undefined
 			? Promise.resolve(providedWorkspaceTree)
@@ -499,7 +513,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
 				);
 
-	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, workspaceTree] =
+	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFileResult, workspaceTree] =
 		await Promise.all([
 			withDeadline(
 				"customPrompt",
@@ -516,11 +530,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				systemPromptCustomizationPromise,
 				prepDefaults.systemPromptCustomization,
 			),
-			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles).then(
-				dedupeExactContextFiles,
-			),
+			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles),
 			withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
 		]);
+	const contextFiles = dedupeExactContextFiles(contextFileResult.contextFiles);
 	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
 
 	if (timedOut.length > 0) {
@@ -628,5 +641,5 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		systemPrompt.push(pluginAppendices.trim());
 	}
 
-	return { systemPrompt };
+	return { systemPrompt, warnings: contextFileResult.warnings };
 }

@@ -2233,6 +2233,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			settings.get("tools.intentTracing"),
 			options.hasUI ?? false,
 		);
+		const emittedContextFileWarnings = new Set<string>();
 		const intentField = intentTracingEnabled ? INTENT_FIELD : undefined;
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
@@ -2311,14 +2312,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				subagent: options.parentTaskPrefix !== undefined,
 			});
 
+			for (const warning of defaultPrompt.warnings) {
+				if (emittedContextFileWarnings.has(warning)) continue;
+				emittedContextFileWarnings.add(warning);
+				logger.warn("Context file discovery warning", { warning });
+			}
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;
 			}
 			if (Array.isArray(options.systemPrompt)) {
-				return { systemPrompt: options.systemPrompt };
+				return { systemPrompt: options.systemPrompt, warnings: defaultPrompt.warnings };
 			}
 			return {
 				systemPrompt: options.systemPrompt(defaultPrompt.systemPrompt),
+				warnings: defaultPrompt.warnings,
 			};
 		};
 

@@ -18,6 +18,7 @@
 - First-event timeout retries now require a typed, content-free failure from the current clean attempt scope, preventing prior or stale extension activity from suppressing or admitting a later request (#3553).
 - The issue-1979 Korean prose wrap test now cleans up inherited multiplexer env vars (`TMUX`, `TMUX_PANE`, etc.) so it deterministically exercises the plain-terminal render path regardless of the CI runner's terminal session (#1979).
 - The model selector's assignment menu now shows the model each role currently resolves to (`Set as EXECUTOR (Executor) — now: anthropic/claude-haiku-4-5`), distinguishing an unset default, a role that inherits the default, and a configured-but-unresolvable selector. Previously the role rows were unlabeled, so the only way to learn a role's model was to scan the whole 800+ entry model list for role badges.
+- Standalone `AGENTS.md` ancestor discovery now bounds directory traversal, per-file reads, and aggregate instruction bytes while surfacing content-free omission warnings (#3722).
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31

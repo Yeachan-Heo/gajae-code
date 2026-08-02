@@ -5,56 +5,110 @@
  * This handles AGENTS.md files that live in project root (not in config directories
  * like .OpenAI code backend/ or .gemini/, which are handled by their respective providers).
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
-import { readFile } from "../capability/fs";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { calculateDepth, createSourceMeta } from "./helpers";
 
 const PROVIDER_ID = "agents-md";
 const DISPLAY_NAME = "AGENTS.md";
+// Bound hostile ancestor walks and instruction payloads before they reach prompt assembly.
+const MAX_ANCESTOR_DIRECTORIES = 32;
+const MAX_FILE_BYTES = 64 * 1024;
+const MAX_AGGREGATE_BYTES = 256 * 1024;
+const DIRECTORY_LIMIT_WARNING = "AGENTS.md discovery stopped after scanning 32 ancestor directories.";
+const FILE_LIMIT_WARNING = "Skipped one or more AGENTS.md files that exceed the 64 KiB limit.";
+const AGGREGATE_LIMIT_WARNING = "Skipped one or more AGENTS.md files that exceed the 256 KiB aggregate limit.";
+
+export type AgentsMdReader = (
+	filePath: string,
+	maxBytes: number,
+) => Promise<{ content: string | null; byteLength: number; tooLarge: boolean }>;
+
+async function readBoundedAgentsMdFile(
+	filePath: string,
+	maxBytes: number,
+): Promise<{ content: string | null; byteLength: number; tooLarge: boolean }> {
+	try {
+		const file = await fs.open(filePath, "r");
+		try {
+			const bytes = Buffer.alloc(maxBytes + 1);
+			const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+			if (bytesRead > maxBytes) return { content: null, byteLength: bytesRead, tooLarge: true };
+			return {
+				content: new TextDecoder().decode(bytes.subarray(0, bytesRead)),
+				byteLength: bytesRead,
+				tooLarge: false,
+			};
+		} finally {
+			await file.close();
+		}
+	} catch {
+		return { content: null, byteLength: 0, tooLarge: false };
+	}
+}
 
 /**
  * Load standalone AGENTS.md files.
  */
-async function loadAgentsMd(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
+export async function loadAgentsMd(
+	ctx: LoadContext,
+	readCandidate: AgentsMdReader = readBoundedAgentsMdFile,
+): Promise<LoadResult<ContextFile>> {
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
-
-	// Walk up from cwd looking for AGENTS.md files
 	let current = ctx.cwd;
+	let scannedDirectories = 0;
+	let aggregateBytes = 0;
+	let omittedOversizedFile = false;
+	let omittedAggregateFile = false;
 
 	while (true) {
+		scannedDirectories += 1;
 		const candidate = path.join(current, "AGENTS.md");
-		const content = await readFile(candidate);
+		const parent = path.dirname(candidate);
+		const baseName = parent.split(path.sep).pop() ?? "";
 
-		if (content !== null) {
-			const parent = path.dirname(candidate);
-			const baseName = parent.split(path.sep).pop() ?? "";
-
-			if (!baseName.startsWith(".")) {
-				const fileDir = path.dirname(candidate);
-				const calculatedDepth = calculateDepth(ctx.cwd, fileDir, path.sep);
-
-				items.push({
-					path: candidate,
-					content,
-					level: "project",
-					depth: calculatedDepth,
-					_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
-				});
+		if (!baseName.startsWith(".")) {
+			const remainingAggregateBytes = MAX_AGGREGATE_BYTES - aggregateBytes;
+			if (remainingAggregateBytes === 0) {
+				omittedAggregateFile = true;
+			} else {
+				const allowedBytes = Math.min(MAX_FILE_BYTES, remainingAggregateBytes);
+				const result = await readCandidate(candidate, allowedBytes);
+				if (result.tooLarge) {
+					if (allowedBytes < MAX_FILE_BYTES) omittedAggregateFile = true;
+					else omittedOversizedFile = true;
+				} else if (result.content !== null) {
+					const fileDir = path.dirname(candidate);
+					items.push({
+						path: candidate,
+						content: result.content,
+						level: "project",
+						depth: calculateDepth(ctx.cwd, fileDir, path.sep),
+						_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
+					});
+					aggregateBytes += result.byteLength;
+				}
 			}
 		}
 
-		if (current === (ctx.repoRoot ?? ctx.home)) break; // scanned repo root or home, stop
+		const stopDirectory = ctx.repoRoot ?? ctx.home;
+		if (current === stopDirectory) break;
+		if (scannedDirectories === MAX_ANCESTOR_DIRECTORIES) {
+			warnings.push(DIRECTORY_LIMIT_WARNING);
+			break;
+		}
 
-		// Move to parent directory
-		const parent = path.dirname(current);
-		if (parent === current) break; // Reached filesystem root
-		current = parent;
+		const parentDirectory = path.dirname(current);
+		if (parentDirectory === current) break;
+		current = parentDirectory;
 	}
 
+	if (omittedOversizedFile) warnings.push(FILE_LIMIT_WARNING);
+	if (omittedAggregateFile) warnings.push(AGGREGATE_LIMIT_WARNING);
 	return { items, warnings };
 }
 
