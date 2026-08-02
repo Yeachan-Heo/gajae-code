@@ -269,6 +269,7 @@ interface ProviderValidationConfig {
 	headers?: Record<string, string>;
 	apiKey?: string;
 	apiKeyEnv?: string;
+	apiKeyStored?: true;
 	api?: Api;
 	auth?: ProviderAuthMode;
 	oauthConfigured?: boolean;
@@ -326,6 +327,7 @@ function validateProviderConfiguration(
 				: !usesProviderCredentialChain &&
 					!config.apiKey &&
 					!config.apiKeyEnv &&
+					!config.apiKeyStored &&
 					(config.auth ?? "apiKey") !== "none";
 		if (requiresAuth) {
 			throw new Error(
@@ -333,8 +335,9 @@ function validateProviderConfiguration(
 					? `Provider ${providerName}: "apiKey" or "oauth" is required when defining models.`
 					: `Provider ${providerName}: custom models need a credential source, but none is configured. ` +
 							`"auth" only selects the scheme ("auth: apiKey" does not supply a key). ` +
+							`One of "apiKey", "apiKeyEnv", or "apiKeyStored" is required unless auth is "none". ` +
 							`Fix by adding "apiKeyEnv: <ENV_VAR>" (recommended) or "apiKey: <literal-key>", ` +
-							`or set "auth: none" if the endpoint is genuinely unauthenticated.`,
+							`using a credential stored by provider setup, or setting "auth: none" for an unauthenticated endpoint.`,
 			);
 		}
 	}
@@ -421,6 +424,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 					headers: providerConfig.headers,
 					apiKey: providerConfig.apiKey,
 					apiKeyEnv: providerConfig.apiKeyEnv,
+					apiKeyStored: providerConfig.apiKeyStored,
 					api: providerConfig.api as Api | undefined,
 					auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
 					discovery: providerConfig.discovery as ProviderDiscovery | undefined,

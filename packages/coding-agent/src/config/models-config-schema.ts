@@ -210,6 +210,7 @@ const ProviderConfigSchema = z
 		baseUrl: z.string().min(1).optional(),
 		apiKey: z.string().min(1).optional(),
 		apiKeyEnv: z.string().min(1).optional(),
+		apiKeyStored: z.literal(true).optional(),
 		api: z
 			.enum([
 				"openai-completions",

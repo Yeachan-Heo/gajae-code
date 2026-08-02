@@ -4291,6 +4291,40 @@ describe("ModelRegistry", () => {
 		expect(message).toContain("unsupportedModelKey");
 	});
 
+	test("loads custom models that declare a stored API key", async () => {
+		await authStorage.set("stored-provider", { type: "api_key", key: "stored-secret" });
+		writeRawModelsJson({
+			"stored-provider": {
+				baseUrl: "https://api.example.com/v1",
+				apiKeyStored: true,
+				api: "openai-completions",
+				auth: "apiKey",
+				models: [{ id: "stored-model" }],
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("stored-provider", "stored-model")).toBeDefined();
+		expect(await registry.getApiKeyForProvider("stored-provider")).toBe("stored-secret");
+	});
+
+	test("still rejects custom models without a declared credential source", () => {
+		writeRawModelsJson({
+			"missing-credential": {
+				baseUrl: "https://api.example.com/v1",
+				api: "openai-completions",
+				auth: "apiKey",
+				models: [{ id: "missing-model" }],
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(String(registry.getError()?.message)).toContain('"apiKey", "apiKeyEnv", or "apiKeyStored" is required');
+	});
+
 	test("rejects model-level request shaping on non-OpenAI-compatible APIs", () => {
 		writeRawModelsConfig({
 			providers: {
