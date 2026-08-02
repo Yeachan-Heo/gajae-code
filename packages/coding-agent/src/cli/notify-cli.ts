@@ -69,6 +69,7 @@ export interface NotifyCommandArgs {
 	slackChannelId?: string;
 	slackAuthorizedUserId?: string;
 	redact?: boolean;
+	forceDaemonLock?: boolean;
 	probe?: boolean;
 	message?: string;
 }
@@ -193,7 +194,12 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 			message: typeof flags.get("--message") === "string" ? (flags.get("--message") as string) : undefined,
 		};
 	}
-	if (action === "recovery") return args.length === 2 ? { action, rawArgs: [] } : undefined;
+	if (action === "recovery") {
+		const flags = parseFlags(args.slice(2), new Set(), new Set(["--force-daemon-lock"]));
+		return flags
+			? { action, rawArgs: args.slice(2), forceDaemonLock: flags.get("--force-daemon-lock") === true }
+			: undefined;
+	}
 	if (action === "daemon-internal") {
 		return {
 			action,
@@ -224,7 +230,7 @@ export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyComma
 			await runTest(deps, cmd);
 			return;
 		case "recovery":
-			await runRecovery(deps);
+			await runRecovery(deps, cmd.forceDaemonLock);
 			return;
 		case "daemon-internal":
 			if (cmd.smoke) {
@@ -716,9 +722,9 @@ async function runTest(deps: NotifyCommandDeps, cmd: NotifyCommandArgs): Promise
 	else if (!result.ok) process.exitCode = 1;
 }
 
-async function runRecovery(deps: NotifyCommandDeps): Promise<void> {
+async function runRecovery(deps: NotifyCommandDeps, forceDaemonLock = false): Promise<void> {
 	const settings = await getSettings(deps);
-	const report = await recoverNotifications({ settings });
+	const report = await recoverNotifications({ settings, forceDaemonLock });
 	process.stdout.write(`${formatNotificationRecoveryReport(report)}\n`);
 }
 
@@ -737,14 +743,14 @@ ${chalk.bold("Usage:")}
   ${APP_NAME} notify status
   ${APP_NAME} notify health [--provider telegram|discord|slack] [--probe]
   ${APP_NAME} notify test [--provider telegram|discord|slack] [--message <text>]
-  ${APP_NAME} notify recovery
+  ${APP_NAME} notify recovery [--force-daemon-lock]
 
 ${chalk.bold("Subcommands:")}
   setup     Pair Telegram or atomically save and activate complete Discord/Slack settings
   status    Show global master and provider configured/repair/desired/effective state without secrets
   health    Report selected provider state; --probe uses REST only and never opens Gateway/Socket Mode
   test      Send a one-off test through one selected or uniquely effective provider
-  recovery  Clear dead-owner daemon locks and stale per-session endpoint files (never touches a live owner)
+  recovery  Clear dead-owner daemon locks and stale per-session endpoint files (never touches a live owner); --force-daemon-lock retries only with the same fail-closed dead-owner proof
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} notify setup

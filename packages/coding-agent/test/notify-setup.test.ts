@@ -162,6 +162,13 @@ describe("notify setup cli", () => {
 			rawArgs: ["--smoke"],
 		});
 	});
+	test("parses the explicit dead-owner recovery escape hatch", () => {
+		expect(parseNotifyArgs(["notify", "recovery", "--force-daemon-lock"])).toEqual({
+			action: "recovery",
+			rawArgs: ["--force-daemon-lock"],
+			forceDaemonLock: true,
+		});
+	});
 
 	test("interactive token prompt disables echo and does not write raw token", async () => {
 		const input = new FakeTokenInput();

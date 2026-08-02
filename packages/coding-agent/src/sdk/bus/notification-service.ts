@@ -63,6 +63,49 @@ export function sanitizeDiagnostic(text: string, token?: string): string {
 	return out.replace(TELEGRAM_TOKEN_PATTERN, "<redacted>");
 }
 
+export interface NotificationDiagnosticEvent {
+	timestamp: string;
+	operation: string;
+	phase: string;
+	outcome: string;
+	reason: string;
+	pid?: number;
+	incarnation?: string;
+	ageMs?: number;
+	detail?: string;
+}
+
+/** Append a bounded, private, secret-safe daemon diagnostic event. */
+export async function writeNotificationDiagnostic(
+	settings: Pick<Settings, "getAgentDir">,
+	event: Omit<NotificationDiagnosticEvent, "timestamp"> & { timestamp?: string },
+): Promise<void> {
+	const file = daemonPaths(settings.getAgentDir()).diagnostic;
+	const dir = path.dirname(file);
+	let events: NotificationDiagnosticEvent[] = [];
+	try {
+		const parsed = JSON.parse(await fsPromises.readFile(file, "utf8")) as { events?: unknown };
+		if (Array.isArray(parsed.events)) events = parsed.events as NotificationDiagnosticEvent[];
+	} catch {
+		// A missing or corrupt diagnostic history must not block notification recovery.
+	}
+	const safe: NotificationDiagnosticEvent = {
+		timestamp: event.timestamp ?? new Date().toISOString(),
+		operation: event.operation.slice(0, 80),
+		phase: event.phase.slice(0, 80),
+		outcome: event.outcome.slice(0, 80),
+		reason: event.reason.slice(0, 120),
+		...(event.pid === undefined ? {} : { pid: event.pid }),
+		...(event.incarnation === undefined ? {} : { incarnation: event.incarnation.slice(0, 120) }),
+		...(event.ageMs === undefined ? {} : { ageMs: Math.max(0, Math.floor(event.ageMs)) }),
+		...(event.detail === undefined ? {} : { detail: sanitizeDiagnostic(event.detail).slice(0, 512) }),
+	};
+	await fsPromises.mkdir(dir, { recursive: true, mode: 0o700 });
+	await fsPromises.writeFile(file, `${JSON.stringify({ version: 1, events: [...events, safe].slice(-64) })}\n`, {
+		mode: 0o600,
+	});
+}
+
 function sanitizeProviderDiagnostic(text: string, cfg: NotificationConfig, provider: NotificationProvider): string {
 	const secrets =
 		provider === "telegram"
@@ -182,6 +225,7 @@ export interface NotificationServiceDeps {
 	fs?: NotificationServiceFs;
 	now?: () => number;
 	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 	fetchImpl?: typeof fetch;
 	apiBase?: string;
 	createDiscordDiagnostic?: (config: { applicationId: string; botToken: string }) => DiscordDiagnosticProvider;
@@ -1126,6 +1170,9 @@ export interface NotificationRecoveryReport {
 		action: DaemonRecoveryAction;
 		detail: string;
 		ownerId: string | undefined;
+		blockingReason?: string;
+		markerAgeMs?: number;
+		forceCommand?: string;
 		pid: number | undefined;
 	};
 }
@@ -1134,6 +1181,7 @@ export interface RecoveryOptions {
 	settings: Settings;
 	stateRoot?: string;
 	deps?: NotificationServiceDeps;
+	forceDaemonLock?: boolean;
 }
 
 export interface DaemonTransitionLock {
@@ -1167,6 +1215,7 @@ type TransitionMarkerFs = {
 	writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
 	readEndpointFile?(file: string): Promise<NotificationEndpointFile>;
 	exactUnlink?(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
+	stat?(file: string): Promise<{ mtimeMs: number }>;
 };
 
 async function readTransitionMarker(
@@ -1318,6 +1367,36 @@ function defaultTransitionPidIncarnation(pid: number): string | undefined {
 	return processIncarnation(pid);
 }
 
+const TRANSITION_MARKER_GRACE_MS = 3 * HEARTBEAT_TTL_MS;
+
+async function detachStaleTransitionMarker(input: {
+	fs: TransitionMarkerFs;
+	path: string;
+	now: number;
+	pidAlive: (pid: number) => boolean;
+	pidIncarnation: (pid: number) => string | undefined;
+}): Promise<boolean> {
+	const snapshot = await readTransitionMarker(input.fs, input.path);
+	if (!snapshot) return false;
+	let marker: unknown;
+	try {
+		marker = JSON.parse(snapshot.raw);
+	} catch {
+		return false;
+	}
+	if (!isDaemonTransitionLock(marker)) return false;
+	const currentIncarnation = input.pidIncarnation(marker.pid);
+	if (
+		input.pidAlive(marker.pid) ||
+		!isProcessIncarnation(marker.incarnation) ||
+		(isProcessIncarnation(currentIncarnation) && currentIncarnation === marker.incarnation)
+	)
+		return false;
+	const ageMs = input.now - marker.createdAt;
+	if (!Number.isFinite(ageMs) || ageMs <= TRANSITION_MARKER_GRACE_MS) return false;
+	return await detachTransitionMarker(input.fs, input.path, snapshot);
+}
+
 /**
  * Owner-bound removal of a dead daemon's lock. Closes the classic
  * check-then-unlink TOCTOU: a naive `unlink(lock)` after observing a dead owner
@@ -1332,20 +1411,36 @@ async function removeDeadOwnerLock(
 	paths: DaemonPaths,
 	pidAlive: (pid: number) => boolean,
 	expected: NormalizedDaemonState,
+	now: () => number,
+	pidIncarnation: (pid: number) => string | undefined,
 ): Promise<"cleared" | "contended" | "superseded" | "now-alive" | "unlink-failed"> {
-	const transition = await acquireDaemonTransitionLock({
+	let transition = await acquireDaemonTransitionLock({
 		fs,
 		path: paths.steal,
 		pid: process.pid,
 		pidAlive: defaultTransitionPidAlive,
 		pidIncarnation: defaultTransitionPidIncarnation,
 	});
+	if (!transition) {
+		await detachStaleTransitionMarker({
+			fs,
+			path: paths.steal,
+			now: now(),
+			pidAlive,
+			pidIncarnation,
+		});
+		transition = await acquireDaemonTransitionLock({
+			fs,
+			path: paths.steal,
+			pid: process.pid,
+			pidAlive: defaultTransitionPidAlive,
+			pidIncarnation: defaultTransitionPidIncarnation,
+		});
+	}
 	if (!transition) return "contended";
 	try {
 		const current = await readDaemonStateFile(fs, paths.state);
-		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) {
-			return "superseded";
-		}
+		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) return "superseded";
 		if (pidAlive(current.pid)) return "now-alive";
 		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
 		try {
@@ -1373,6 +1468,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	const deps = opts.deps ?? {};
 	const fs = deps.fs ?? nodeServiceFs;
 	const pidAlive = deps.pidAlive ?? defaultPidAlive;
+	const now = deps.now ?? Date.now;
 	const stateRoot = opts.stateRoot ?? defaultStateRoot();
 
 	const dir = endpointDir(stateRoot);
@@ -1472,7 +1568,14 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 			pid: state.pid,
 		};
 	} else if (hasLock) {
-		const outcome = await removeDeadOwnerLock(fs, paths, pidAlive, state);
+		const outcome = await removeDeadOwnerLock(
+			fs,
+			paths,
+			pidAlive,
+			state,
+			now,
+			deps.pidIncarnation ?? defaultTransitionPidIncarnation,
+		);
 		const action: DaemonRecoveryAction =
 			outcome === "cleared"
 				? "cleared-dead-owner-lock"
@@ -1491,9 +1594,35 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 					: outcome === "superseded"
 						? "a new daemon owner took over during recovery; lock left untouched"
 						: outcome === "contended"
-							? "another daemon is starting or stealing the lock; lock left untouched"
+							? `recovery blocked by transition marker; lock left untouched${opts.forceDaemonLock ? " even after forced stale-marker retry" : ""}`
 							: `could not remove lock of dead owner pid ${state.pid}`;
-		daemon = { action, detail, ownerId: state.ownerId, pid: state.pid };
+		const blockingReason = outcome === "contended" ? "transition-marker-unavailable-or-contended" : undefined;
+		const markerAgeMs =
+			blockingReason && fs.stat
+				? (await fs.stat(paths.steal).catch(() => undefined))?.mtimeMs
+					? now() - (await fs.stat(paths.steal).catch(() => undefined))!.mtimeMs
+					: undefined
+				: undefined;
+		if (blockingReason) {
+			await writeNotificationDiagnostic(opts.settings, {
+				operation: "notify.recovery",
+				phase: "recovery",
+				outcome: action,
+				reason: blockingReason,
+				pid: state.pid,
+				ageMs: markerAgeMs,
+				detail,
+			});
+		}
+		daemon = {
+			action,
+			detail,
+			ownerId: state.ownerId,
+			pid: state.pid,
+			...(blockingReason
+				? { blockingReason, markerAgeMs, forceCommand: "gjc notify recovery --force-daemon-lock" }
+				: {}),
+		};
 	} else {
 		daemon = {
 			action: "none",
@@ -1533,5 +1662,9 @@ export function formatNotificationRecoveryReport(report: NotificationRecoveryRep
 	for (const unknown of report.endpointsRetainedUnknown ?? [])
 		lines.push(`    - retained unverified cleanup path ${unknown}`);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
+	if (report.daemon.blockingReason) lines.push(`    - blocking reason: ${report.daemon.blockingReason}`);
+	if (report.daemon.markerAgeMs !== undefined)
+		lines.push(`    - transition marker age: ${report.daemon.markerAgeMs}ms`);
+	if (report.daemon.forceCommand) lines.push(`    - safe escape: ${report.daemon.forceCommand}`);
 	return lines.join("\n");
 }

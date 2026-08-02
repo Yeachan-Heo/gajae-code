@@ -19,6 +19,7 @@ import {
 	recoverNotifications,
 	sanitizeDiagnostic,
 	sendNotificationTest,
+	writeNotificationDiagnostic,
 } from "../src/sdk/bus/notification-service";
 import { DAEMON_GENERATION } from "../src/sdk/bus/telegram-daemon-contract";
 
@@ -172,6 +173,25 @@ describe("notification-service status", () => {
 		expect(report.telegram.configured).toBe(true);
 		expect(text).toContain("redact: true");
 		expect(text).toContain(`telegram.fingerprint: ${tokenFingerprint(TOKEN)}`);
+	});
+	test("writes bounded secret-safe daemon diagnostics", async () => {
+		const settings = Settings.isolated();
+		await writeNotificationDiagnostic(settings, {
+			operation: "notify.setup",
+			phase: "activation",
+			outcome: "failed",
+			reason: "network_error",
+			pid: 123,
+			incarnation: "linux:1",
+			detail: `token ${TOKEN} chat 999 raw exception text`,
+		});
+		const diagnostic = JSON.parse(await Bun.file(daemonPaths(settings.getAgentDir()).diagnostic).text()) as {
+			events: Array<{ detail?: string; pid?: number }>;
+		};
+		const event = diagnostic.events.at(-1);
+		expect(event).toMatchObject({ pid: 123 });
+		expect(diagnostic.events.every(item => !item.detail?.includes(TOKEN))).toBe(true);
+		expect(event?.detail).toContain("<redacted>");
 	});
 });
 
@@ -1022,6 +1042,11 @@ describe("notification-service recovery lock TOCTOU (owner-bound)", () => {
 			deps: { fs, pidAlive: () => false },
 		});
 		expect(report.daemon.action).toBe("left-contended");
+		expect(report.daemon.blockingReason).toBe("transition-marker-unavailable-or-contended");
+		expect(report.daemon.forceCommand).toBe("gjc notify recovery --force-daemon-lock");
+		const text = formatNotificationRecoveryReport(report);
+		expect(text).toContain("blocking reason: transition-marker-unavailable-or-contended");
+		expect(text).toContain("safe escape: gjc notify recovery --force-daemon-lock");
 		expect(unlinked).not.toContain(paths.lock);
 	});
 
