@@ -238,6 +238,7 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		owner: "app-server",
 		testIds: [
 			"MCP-WIRE-001 production app-server reload changes the live tool set after an on-disk edit",
+			"MCP-WIRE-012 production app-server reload removes a deleted MCP source",
 			"MCP-006 config/mcpServer/reload reports an honest failure for sealed MCP connections",
 			"MCP-WIRE-004 loaded-thread reload is rejected before manager or tool mutation",
 		],
@@ -268,7 +269,7 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		gjcBackendPath:
 			"packages/coding-agent/src/runtime-mcp/app-server-service.ts; packages/coding-agent/src/app-server/create-app-server.ts; packages/coding-agent/src/app-server/suites/mcp-handlers.ts",
 		semanticGaps: [
-			"OAuth completion is asynchronous and is reported only while the app-server connection remains alive; closing the requesting connection aborts the flow and suppresses its completion event. A same-server login already in progress is rejected with the busy error rather than creating a second credential.",
+			"OAuth completion is asynchronous and is reported only while the app-server connection remains alive; closing the requesting connection aborts the flow and suppresses its completion event. A same-server login already in progress, including the short callback-listener release window after completion, is rejected with the busy error rather than creating a second credential.",
 		],
 		translationNotes: [
 			"The request returns GJC's real authorizationUrl; completion uses the owning runtime auth store, source-bound config persistence, stale-source/version checks under the lifecycle lock, per-server serialization, compensating rollback with observable aggregate failures, reconnect, and runtime publication of mcpServer/oauthLogin/completed.",
@@ -282,10 +283,13 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 			"MCP-WIRE-007 reload during OAuth cannot overwrite the replacement source",
 			"MCP-WIRE-008 concurrent same-server OAuth login rejects the second without an orphan credential",
 			"MCP-WIRE-009 OAuth compensation failures remain observable as an aggregate",
-			"MCP-WIRE-010 runtime close drains queued OAuth without writes or reconnect",
+			"MCP-WIRE-010 runtime close drains a queued OAuth completion without writes or reconnect",
+			"MCP-WIRE-011 runtime close drains a held autonomous reconnect before returning",
+			"MCP-WIRE-013 immediate sequential OAuth login is rejected while its callback listener is released",
+			"MCP-WIRE-014 OAuth cancellation after each commit stage rolls back persisted state",
 		],
 		reason:
-			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication, persistence, ordering, stale-source rejection, cancellation, serialization, and rollback.",
+			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication without a serialized cause, persistence, ordering, source replacement and removal, cancellation after every OAuth commit stage, deterministic same-server serialization, held-reconnect shutdown draining, and rollback.",
 	},
 	"skills/list": laneRow(
 		"skillsListHandler",

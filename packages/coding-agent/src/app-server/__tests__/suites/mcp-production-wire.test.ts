@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { createMcpAppServerService } from "../../../runtime-mcp/app-server-service";
+import { updateMCPServer } from "../../../runtime-mcp/config-writer";
+import type { MCPServerConfig } from "../../../runtime-mcp/types";
 import { AuthStorage } from "../../../session/auth-storage";
 import { createAppServerRuntime } from "../../create-app-server";
 
@@ -39,6 +41,43 @@ for await (const line of rl) {
 	return fixture;
 }
 
+function writeGatedStdioFixture(root: string): { fixture: string; counterPath: string; releasePath: string } {
+	const fixture = path.join(root, "mcp-gated-fixture.mjs");
+	const counterPath = path.join(root, "connection-count");
+	const releasePath = path.join(root, "release-reconnect");
+	writeFileSync(
+		fixture,
+		`import fs from "node:fs";
+import readline from "node:readline";
+const counterPath = process.argv[2];
+const releasePath = process.argv[3];
+const count = Number(fs.existsSync(counterPath) ? fs.readFileSync(counterPath, "utf8") : "0") + 1;
+fs.writeFileSync(counterPath, String(count));
+if (count >= 2) {
+  while (!fs.existsSync(releasePath)) await new Promise(resolve => setTimeout(resolve, 10));
+}
+const rl = readline.createInterface({ input: process.stdin });
+for await (const line of rl) {
+  const req = JSON.parse(line); if (req.id === undefined) continue;
+  let result = {};
+  if (req.method === "initialize") result = { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "gated-fixture", version: "1" } };
+  else if (req.method === "tools/list") result = { tools: [{ name: "gated", description: "gated", inputSchema: { type: "object" } }] };
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }) + "\\n");
+}
+`,
+	);
+	return { fixture, counterPath, releasePath };
+}
+
+async function waitForFile(pathname: string, predicate: (value: string) => boolean = () => true): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		if (existsSync(pathname) && predicate(readFileSync(pathname, "utf8"))) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for file ${pathname}`);
+}
+
 function responseFor(frames: Record<string, unknown>[], id: number): Record<string, unknown> {
 	const frame = frames.find(value => value.id === id);
 	if (!frame) throw new Error(`Missing response frame ${id}: ${JSON.stringify(frames)}`);
@@ -55,6 +94,15 @@ async function waitForFrame(
 		await Bun.sleep(10);
 	}
 	throw new Error(`Timed out waiting for frame: ${JSON.stringify(frames)}`);
+}
+
+async function waitForCondition(predicate: () => boolean, description: string): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for ${description}`);
 }
 
 test("MCP-WIRE-001 production app-server reload changes the live tool set after an on-disk edit", async () => {
@@ -110,6 +158,74 @@ test("MCP-WIRE-001 production app-server reload changes the live tool set after 
 	}
 });
 
+test("MCP-WIRE-011 runtime close drains a held autonomous reconnect before returning", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-reconnect-close-");
+	const { fixture, counterPath, releasePath } = writeGatedStdioFixture(root);
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({
+			mcpServers: {
+				fixture: { type: "stdio", command: process.execPath, args: [fixture, counterPath, releasePath] },
+			},
+		}),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		const mcpConnection = service.getConnection("fixture");
+		expect(mcpConnection).toBeDefined();
+		mcpConnection?.transport.onClose?.();
+		await waitForFile(counterPath, value => Number(value) >= 2);
+		await runtime.close();
+		await Bun.sleep(50);
+		expect(Number(readFileSync(counterPath, "utf8"))).toBe(2);
+	} finally {
+		writeFileSync(releasePath, "release");
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-012 production app-server reload removes a deleted MCP source", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-removal-");
+	const fixture = writeStdioFixture(root);
+	const configPath = path.join(root, ".mcp.json");
+	writeFileSync(
+		configPath,
+		JSON.stringify({
+			mcpServers: { fixture: { type: "stdio", command: process.execPath, args: [fixture, "one"] } },
+		}),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		expect(service.manager.getSource("fixture")).toBeDefined();
+		writeFileSync(configPath, JSON.stringify({ mcpServers: {} }));
+		await connection.process(enc('{"id":2,"method":"config/mcpServer/reload"}'));
+		expect(responseFor(frames, 2)).toEqual({ id: 2, result: {} });
+		expect(service.manager.getConnection("fixture")).toBeUndefined();
+		expect(service.manager.getSource("fixture")).toBeUndefined();
+		await connection.process(enc('{"id":3,"method":"mcpServerStatus/list","params":{}}'));
+		expect(responseFor(frames, 3)).toMatchObject({ id: 3, result: { data: [] } });
+	} finally {
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 async function oauthFixture(): Promise<{ root: string; configPath: string; server: Bun.Server<unknown> }> {
 	const root = mkdtempSync("/tmp/gjc-mcp-wire-oauth-");
 	const server = Bun.serve({
@@ -224,6 +340,8 @@ test("MCP-WIRE-003 OAuth persistence rolls back credential and config writes aft
 		expect(frames.find(frame => frame.method === "mcpServer/oauthLogin/completed")).toMatchObject({
 			params: { name: "oauth", success: false },
 		});
+		const failedCompletion = frames.find(frame => frame.method === "mcpServer/oauthLogin/completed");
+		expect(failedCompletion && "cause" in ((failedCompletion.params ?? {}) as Record<string, unknown>)).toBe(false);
 		expect(storage.exportSnapshot().credentials.some(entry => entry.credential.type === "oauth")).toBe(false);
 		const saved = JSON.parse(readFileSync(fixture.configPath, "utf8")) as {
 			mcpServers: Record<string, Record<string, unknown>>;
@@ -310,7 +428,7 @@ test("MCP-WIRE-005 runtime close aborts an in-progress OAuth flow without writes
 	}
 });
 
-test("MCP-WIRE-010 runtime close drains queued OAuth without writes or reconnect", async () => {
+test("MCP-WIRE-010 runtime close drains a queued OAuth completion without writes or reconnect", async () => {
 	const fixture = await oauthFixture();
 	const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
 	const service = createMcpAppServerService({ cwd: fixture.root, agentDir: fixture.root, authStorage: storage });
@@ -320,29 +438,45 @@ test("MCP-WIRE-010 runtime close drains queued OAuth without writes or reconnect
 		frames.push(dec(frame));
 	});
 	const gate = Promise.withResolvers<void>();
+	const entered = Promise.withResolvers<void>();
+	let reconnects = 0;
 	try {
 		await initialize(wireConnection, frames);
 		await service.discover();
 		const manager = service.manager as unknown as {
-			discoverAndConnect: () => Promise<unknown>;
+			disconnectAll: (options?: { propagateErrors?: boolean }) => Promise<void>;
+			reconnectServer: (name: string) => Promise<unknown>;
 		};
-		const discoverAndConnect = manager.discoverAndConnect.bind(service.manager);
-		manager.discoverAndConnect = async () => {
+		const disconnectAll = manager.disconnectAll.bind(service.manager);
+		manager.disconnectAll = async options => {
+			entered.resolve();
 			await gate.promise;
-			return discoverAndConnect();
+			return disconnectAll(options);
 		};
-		const queued = service.oauthLogin({ name: "oauth" });
-		await Bun.sleep(10);
+		const reconnectServer = manager.reconnectServer.bind(service.manager);
+		manager.reconnectServer = async name => {
+			reconnects += 1;
+			return reconnectServer(name);
+		};
+		await wireConnection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		const authorizationUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
+		const queuedReload = service.reload();
+		await entered.promise;
+		await fetch(authorizationUrl);
 		const closing = runtime.close();
 		gate.resolve();
 		await closing;
-		await queued.catch(() => undefined);
+		await queuedReload.catch(() => undefined);
+		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
+		expect(frames.find(frame => frame.method === "mcpServer/oauthLogin/completed")).toMatchObject({
+			params: { name: "oauth", success: false },
+		});
+		expect(reconnects).toBe(0);
 		expect(storage.exportSnapshot().credentials.some(entry => entry.credential.type === "oauth")).toBe(false);
 		const saved = JSON.parse(readFileSync(fixture.configPath, "utf8")) as {
 			mcpServers: Record<string, Record<string, unknown>>;
 		};
 		expect(saved.mcpServers.oauth.auth).toBeUndefined();
-		await wireConnection.close().catch(() => {});
 	} finally {
 		gate.resolve();
 		await wireConnection.close().catch(() => {});
@@ -350,6 +484,137 @@ test("MCP-WIRE-010 runtime close drains queued OAuth without writes or reconnect
 		storage.close();
 		fixture.server.stop();
 		rmSync(fixture.root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-013 immediate sequential OAuth login is rejected while its callback listener is released", async () => {
+	const fixture = await oauthFixture();
+	const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
+	const service = createMcpAppServerService({ cwd: fixture.root, agentDir: fixture.root, authStorage: storage });
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await connection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		const authorizationUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
+		await fetch(authorizationUrl);
+		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
+		await connection.process(enc('{"id":3,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		expect(responseFor(frames, 3)).toMatchObject({ id: 3, error: { code: -32016, message: "Resource is busy." } });
+		expect(responseFor(frames, 3).result).toBeUndefined();
+	} finally {
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		storage.close();
+		fixture.server.stop();
+		rmSync(fixture.root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-014 OAuth cancellation after each commit stage rolls back persisted state", async () => {
+	const stages = ["config", "manager", "reconnect", "credential"] as const;
+	for (const stage of stages) {
+		const fixture = await oauthFixture();
+		const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
+		let connection!: ReturnType<ReturnType<typeof createAppServerRuntime>["createConnection"]>;
+		let cancelOnce = true;
+		const cancelRequester = (): void => {
+			if (!cancelOnce) return;
+			cancelOnce = false;
+			void connection.close();
+		};
+		const service = createMcpAppServerService({
+			cwd: fixture.root,
+			agentDir: fixture.root,
+			authStorage: storage,
+			...(stage === "config"
+				? {
+						oauthPersistence: {
+							updateServer: async (filePath: string, name: string, config: MCPServerConfig) => {
+								await updateMCPServer(filePath, name, config);
+								cancelRequester();
+							},
+						},
+					}
+				: {}),
+		});
+		const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+		const frames: Record<string, unknown>[] = [];
+		connection = runtime.createConnection(frame => {
+			frames.push(dec(frame));
+		});
+		let previousCredentialId: string | undefined;
+		try {
+			await initialize(connection, frames);
+			await service.discover();
+
+			if (stage === "manager") {
+				const manager = service.manager as unknown as {
+					setServerConfig: (name: string, config: MCPServerConfig) => void;
+				};
+				const originalSetServerConfig = manager.setServerConfig.bind(service.manager);
+				manager.setServerConfig = (name, config) => {
+					originalSetServerConfig(name, config);
+					cancelRequester();
+				};
+			}
+			if (stage === "reconnect") {
+				const manager = service.manager as unknown as {
+					reconnectServer: (name: string) => Promise<unknown>;
+				};
+				const originalReconnect = manager.reconnectServer.bind(service.manager);
+				manager.reconnectServer = async name => {
+					const result = await originalReconnect(name);
+					cancelRequester();
+					return result;
+				};
+			}
+			if (stage === "credential") {
+				await connection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+				const firstUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
+				await fetch(firstUrl);
+				await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
+				await Bun.sleep(30);
+				previousCredentialId = storage
+					.exportSnapshot()
+					.credentials.find(entry => entry.credential.type === "oauth")?.provider;
+				const storageOverride = storage as unknown as {
+					remove: (provider: string) => Promise<void>;
+				};
+				const originalRemove = storage.remove.bind(storage);
+				storageOverride.remove = async provider => {
+					await originalRemove(provider);
+					cancelRequester();
+				};
+			}
+
+			const requestId = stage === "credential" ? 3 : 2;
+			await connection.process(
+				enc(`{"id":${requestId},"method":"mcpServer/oauth/login","params":{"name":"oauth"}}`),
+			);
+			const authorizationUrl = (responseFor(frames, requestId).result as Record<string, unknown>)
+				.authorizationUrl as string;
+			await fetch(authorizationUrl);
+			await waitForCondition(() => {
+				const saved = JSON.parse(readFileSync(fixture.configPath, "utf8")) as {
+					mcpServers: { oauth?: { auth?: { credentialId?: string } } };
+				};
+				const credentials = storage.exportSnapshot().credentials.filter(entry => entry.credential.type === "oauth");
+				if (stage === "credential")
+					return credentials.length === 1 && saved.mcpServers.oauth?.auth?.credentialId === previousCredentialId;
+				return credentials.length === 0 && saved.mcpServers.oauth?.auth === undefined;
+			}, `OAuth rollback after ${stage} cancellation`);
+		} finally {
+			await connection.close().catch(() => {});
+			await service.close().catch(() => {});
+			await runtime.close().catch(() => {});
+			storage.close();
+			fixture.server.stop();
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
 	}
 });
 test("MCP-WIRE-006 requester close before OAuth commit compensates the pending write", async () => {

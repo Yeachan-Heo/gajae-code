@@ -166,6 +166,7 @@ export class McpAppServerService {
 	readonly #oauthLocks = new Map<string, Promise<void>>();
 	readonly #activeOAuthFlows = new Map<string, { abort: AbortController; completion?: Promise<void> }>();
 	readonly #activeOAuthCompletions = new Set<Promise<void>>();
+	readonly #oauthCallbackCooldowns = new Map<string, Promise<void>>();
 
 	constructor(options: McpAppServerServiceOptions = {}) {
 		this.manager = options.manager ?? new MCPManager(options.cwd ?? getProjectDir());
@@ -251,6 +252,14 @@ export class McpAppServerService {
 				code: "busy",
 			});
 		}
+		if (this.#oauthCallbackCooldowns.has(request.name)) {
+			throw Object.assign(
+				new Error(`MCP OAuth callback listener is still releasing for server "${request.name}".`),
+				{
+					code: "busy",
+				},
+			);
+		}
 		const flowState: { abort: AbortController; completion?: Promise<void> } = {
 			abort: new AbortController(),
 		};
@@ -318,8 +327,16 @@ export class McpAppServerService {
 						await request.onCompletion?.(completion);
 					},
 				)
-				.finally(() => {
-					if (this.#activeOAuthFlows.get(request.name) === flowState) this.#activeOAuthFlows.delete(request.name);
+				.finally(async () => {
+					let cooldown!: Promise<void>;
+					cooldown = Bun.sleep(25).finally(() => {
+						if (this.#activeOAuthFlows.get(request.name) === flowState)
+							this.#activeOAuthFlows.delete(request.name);
+						if (this.#oauthCallbackCooldowns.get(request.name) === cooldown)
+							this.#oauthCallbackCooldowns.delete(request.name);
+					});
+					this.#oauthCallbackCooldowns.set(request.name, cooldown);
+					await cooldown;
 					this.#activeOAuthCompletions.delete(completion);
 				});
 			flowState.completion = completion;
@@ -495,7 +512,8 @@ export class McpAppServerService {
 			captureFailure(error);
 		}
 		try {
-			await this.manager.disconnectAll({ propagateErrors: true });
+			this.manager.shutdown();
+			await this.manager.waitForClosures();
 		} catch (error) {
 			captureFailure(error);
 		}

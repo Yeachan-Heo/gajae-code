@@ -77,6 +77,7 @@ const STARTUP_TIMEOUT_GRACE_MS = 500;
  */
 const MAX_STARTUP_TIMEOUT_MS = 1_750;
 const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
+const MCP_SHUTDOWN_TIMEOUT_MS = 1_000;
 
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
 	const ceiling =
@@ -259,6 +260,9 @@ export class MCPManager {
 	#serverConfigs = new Map<string, MCPServerConfig>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
 	#epoch = 0;
+	#shuttingDown = false;
+	#shutdownPromise: Promise<void> | undefined;
+	readonly #pendingDrains = new Set<Promise<unknown>>();
 	readonly #toolsOnly: boolean;
 	#toolsOnlyConfigLoaded = false;
 	#connectionSetSealed = false;
@@ -270,6 +274,7 @@ export class MCPManager {
 		if (this.#toolsOnly) throw new Error("Tools-only MCP manager does not allow raw MCP access");
 	}
 	#assertConnectionSetMutable(): void {
+		if (this.#shuttingDown) throw new Error("MCP manager is shut down");
 		if (this.#connectionSetSealed) throw new Error("MCP manager connection set is sealed");
 	}
 
@@ -487,6 +492,7 @@ export class MCPManager {
 		const connectionTasks: ConnectionTask[] = [];
 
 		for (const [name, config] of Object.entries(configs)) {
+			if (this.#shuttingDown) throw new Error("MCP manager is shut down");
 			if (sources[name]) {
 				this.#sources.set(name, sources[name]);
 				const existing = this.#connections.get(name);
@@ -532,7 +538,9 @@ export class MCPManager {
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			const connectionPromise = (async () => {
+				if (this.#shuttingDown) throw new Error("MCP manager is shut down");
 				const resolvedConfig = await this.#resolveAuthConfig(config);
+				if (this.#shuttingDown) throw new Error("MCP manager is shut down");
 				return connectToServer(name, resolvedConfig, {
 					advertiseRoots: !this.#toolsOnly,
 					signal: connectionAbort.signal,
@@ -555,6 +563,7 @@ export class MCPManager {
 					}
 					const stillPending = this.#pendingConnections.get(name) === connectionPromise;
 					const stillCurrent =
+						!this.#shuttingDown &&
 						this.#epoch === connectionEpoch &&
 						(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch &&
 						this.#serverConfigs.get(name) === config &&
@@ -602,6 +611,7 @@ export class MCPManager {
 				},
 			);
 			this.#pendingConnections.set(name, connectionPromise);
+			this.#trackDrain(connectionPromise);
 
 			const toolsPromise = connectionPromise.then(async connection => {
 				let serverTools: Awaited<ReturnType<typeof listTools>>;
@@ -624,6 +634,7 @@ export class MCPManager {
 				return { connection, serverTools };
 			});
 			this.#pendingToolLoads.set(name, toolsPromise);
+			this.#trackDrain(toolsPromise);
 
 			const tracked = trackPromise(toolsPromise);
 			connectionTasks.push({
@@ -1077,6 +1088,90 @@ export class MCPManager {
 		await Promise.allSettled(tasks.map(task => this.#disconnectServer(task.name)));
 	}
 
+	#trackDrain<T>(promise: Promise<T>): Promise<T> {
+		const tracked = promise.finally(() => this.#pendingDrains.delete(tracked));
+		this.#pendingDrains.add(tracked);
+		void tracked.catch(() => {});
+		return tracked;
+	}
+
+	async #closeConnectionBounded(connection: MCPServerConnection): Promise<void> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				disconnectServer(connection),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error(`MCP transport close timed out for server "${connection.name}".`)),
+						MCP_SHUTDOWN_TIMEOUT_MS,
+					);
+				}),
+			]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
+	/** Begin terminal shutdown and abort every operation that can reconnect or connect. */
+	shutdown(): void {
+		if (this.#shuttingDown) return;
+		this.#shuttingDown = true;
+		this.#epoch++;
+
+		for (const conn of this.#connections.values()) conn.transport.onClose = undefined;
+		for (const controller of this.#pendingConnectionControllers.values())
+			controller.abort(new Error("MCP manager disconnected"));
+		for (const controller of this.#reconnectBackoffs.values())
+			controller.abort(new Error("MCP manager disconnected"));
+
+		const connections = [...this.#connections.values()];
+		this.#shutdownPromise = Promise.allSettled(
+			connections.map(connection => this.#closeConnectionBounded(connection)),
+		).then(results => {
+			const failures = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+			if (failures.length > 0)
+				throw new AggregateError(failures, `MCP shutdown failed for ${failures.length} server(s).`);
+		});
+		void this.#shutdownPromise.catch(() => {});
+
+		this.#pendingConnectionControllers.clear();
+		this.#pendingConnections.clear();
+		this.#pendingToolLoads.clear();
+		this.#reconnectBackoffs.clear();
+		this.#pendingReconnections.clear();
+		this.#pendingResourceRefresh.clear();
+		this.#sources.clear();
+		this.#serverConfigs.clear();
+		this.#connections.clear();
+		this.#tools = [];
+		this.#subscribedResources.clear();
+	}
+
+	/** Await terminal shutdown, with a bounded escape for non-cooperative transports. */
+	async waitForClosures(): Promise<void> {
+		if (!this.#shuttingDown) return;
+		const pending = [...(this.#shutdownPromise ? [this.#shutdownPromise] : []), ...this.#pendingDrains];
+		if (pending.length === 0) return;
+		const settled = Promise.allSettled(pending);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const completed = await Promise.race([
+			settled.then(() => true),
+			new Promise<boolean>(resolve => {
+				timer = setTimeout(() => resolve(false), MCP_SHUTDOWN_TIMEOUT_MS);
+			}),
+		]);
+		if (timer !== undefined) clearTimeout(timer);
+		if (!completed) {
+			throw new AggregateError(
+				[new Error(`MCP shutdown timed out after ${MCP_SHUTDOWN_TIMEOUT_MS}ms.`)],
+				"MCP shutdown did not settle all pending operations.",
+			);
+		}
+		const results = await settled;
+		const failures = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		if (failures.length > 0) throw new AggregateError(failures, "MCP shutdown failed.");
+	}
+
 	/**
 	 * Disconnect from all servers.
 	 */
@@ -1126,18 +1221,22 @@ export class MCPManager {
 	 * Returns the new connection, or null if reconnection failed.
 	 */
 	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
-		if (this.#toolsOnly || this.#connectionSetSealed) return null;
+		if (this.#shuttingDown || this.#toolsOnly || this.#connectionSetSealed) return null;
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 
 		const attempt = this.#doReconnect(name);
-		this.#pendingReconnections.set(name, attempt);
-		return attempt.finally(() => {
-			if (this.#pendingReconnections.get(name) === attempt) this.#pendingReconnections.delete(name);
-		});
+		const tracked = this.#trackDrain(
+			attempt.finally(() => {
+				if (this.#pendingReconnections.get(name) === tracked) this.#pendingReconnections.delete(name);
+			}),
+		);
+		this.#pendingReconnections.set(name, tracked);
+		return tracked;
 	}
 
 	async #doReconnect(name: string): Promise<MCPServerConnection | null> {
+		if (this.#shuttingDown) return null;
 		const oldConnection = this.#connections.get(name);
 		const config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
@@ -1171,7 +1270,11 @@ export class MCPManager {
 			// Retry with backoff — the server may still be starting up.
 			const delays = [500, 1000, 2000, 4000];
 			for (let attempt = 0; attempt <= delays.length; attempt++) {
-				if ((this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch || backoffAbort.signal.aborted) {
+				if (
+					this.#shuttingDown ||
+					(this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch ||
+					backoffAbort.signal.aborted
+				) {
 					logger.debug("MCP reconnect aborted before attempt after server disconnected", {
 						path: `mcp:${name}`,
 						storedEpoch: reconnectEpoch,
@@ -1184,7 +1287,11 @@ export class MCPManager {
 					logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
 					return connection;
 				} catch (error) {
-					if ((this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch || backoffAbort.signal.aborted) {
+					if (
+						this.#shuttingDown ||
+						(this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch ||
+						backoffAbort.signal.aborted
+					) {
 						logger.debug("MCP reconnect aborted after server disconnected", {
 							path: `mcp:${name}`,
 							storedEpoch: reconnectEpoch,
@@ -1226,7 +1333,9 @@ export class MCPManager {
 		globalEpoch: number,
 		disconnectEpoch: number,
 	): Promise<MCPServerConnection> {
+		if (this.#shuttingDown) throw new Error("MCP manager is shut down");
 		const resolvedConfig = await this.#resolveAuthConfig(config);
+		if (this.#shuttingDown) throw new Error("MCP manager is shut down");
 		const connectionAbort = new AbortController();
 		this.#pendingConnectionControllers.set(name, connectionAbort);
 		let connection: MCPServerConnection;
@@ -1252,6 +1361,7 @@ export class MCPManager {
 		// Bail out if the server was disconnected or the manager was reset
 		// while we were connecting (e.g. /mcp reload called disconnectAll).
 		if (
+			this.#shuttingDown ||
 			!this.#serverConfigs.has(name) ||
 			this.#epoch !== globalEpoch ||
 			(this.#disconnectEpochs.get(name) ?? 0) !== disconnectEpoch
