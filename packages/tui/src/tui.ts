@@ -4141,17 +4141,31 @@ export class TUI extends Container {
 			// this frame would commit already sit in native scrollback under their old
 			// index, so emitting them appends a second copy — a pending tool block
 			// stranded above its own completed copy, with the rows between duplicated.
-			// The last committed row changing is the observable signal of that shift.
-			const committedBoundary = prevViewportTop - 1;
-			const committedBoundaryShifted =
-				committedBoundary >= diffStart &&
-				(this.#previousLines[committedBoundary] ?? "") !== (newLines[committedBoundary] ?? "");
-			if (committedBoundaryShifted) {
-				const reason = `offscreen growth shifted committed rows (${firstChanged} < ${prevViewportTop})`;
-				logRedraw(reason);
-				if (useViewportRepaintPath) viewportRepaint(reason);
-				else fullRender(true, reason);
-				return;
+			//
+			// Rendered bytes at any single index cannot tell those apart: a
+			// substitution changes the boundary row without moving anything, and an
+			// insertion moves everything without necessarily changing the boundary
+			// row's bytes (repeated separators, blank rows). Score the two mappings
+			// instead. Over the previously visible rows, count how many still match at
+			// their own index versus how many match `shift` rows lower. Only a strict
+			// win for the shifted mapping proves committed content moved; a tie means
+			// the region is uniform enough that re-emitting a row cannot be seen.
+			const shift = newLines.length - this.#previousLines.length;
+			if (shift > 0 && prevViewportTop > diffStart) {
+				let alignedMatches = 0;
+				let shiftedMatches = 0;
+				for (let i = prevViewportTop; i < this.#previousLines.length; i++) {
+					const oldLine = this.#previousLines[i];
+					if (oldLine === newLines[i]) alignedMatches += 1;
+					if (oldLine === newLines[i + shift]) shiftedMatches += 1;
+				}
+				if (shiftedMatches > alignedMatches) {
+					const reason = `offscreen growth shifted committed rows (${firstChanged} < ${prevViewportTop}, shift=${shift})`;
+					logRedraw(reason);
+					if (useViewportRepaintPath) viewportRepaint(reason);
+					else fullRender(true, reason);
+					return;
+				}
 			}
 			let suffixStart = -1;
 			for (let i = Math.max(diffStart, prevViewportTop); i < maxLines; i++) {

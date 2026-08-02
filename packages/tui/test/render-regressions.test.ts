@@ -1254,6 +1254,84 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		for (const isProcessTerminal of [false, true]) {
+			it(`does not re-emit an off-screen block whose boundary row repeats (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// The row at the committed frontier is byte-identical before and after the
+				// insertion, so a single-row boundary check cannot see the shift.
+				const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent([
+					"prefix",
+					"block-old",
+					"pre-2",
+					"FILL",
+					"FILL",
+					...rows("old-", 5),
+				]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines([
+						"prefix",
+						"block-new-0",
+						"block-new-1",
+						"pre-2",
+						"FILL",
+						"FILL",
+						...rows("old-", 5),
+					]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					// The insertion must not push a second copy of the committed FILL rows
+					// into scrollback, and the new block must not be emitted twice.
+					expect(countMatches(scrollback, /^FILL$/)).toBe(2);
+					expect(countMatches(scrollback, /^block-new-0$/)).toBeLessThanOrEqual(1);
+					// A viewport repaint cannot retract the already committed stale row, but
+					// it must never remain visible alongside its replacement.
+					expect(visible(term)).toEqual(rows("old-", 5));
+					expect(countMatches(scrollback, /^block-old$/)).toBeLessThanOrEqual(1);
+				} finally {
+					tui.stop();
+				}
+			});
+		}
+
+		it("still commits appended rows when an off-screen boundary row is substituted", async () => {
+			// The mutated off-screen row is the last committed row, but nothing moves:
+			// the appended rows must still reach native scrollback exactly once.
+			const term = new VirtualTerminal(36, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const status = new MutableLinesComponent(["status-0"]);
+			const body = new MutableLinesComponent(rows("line-", 6));
+			tui.addChild(status);
+			tui.addChild(body);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				for (let i = 1; i <= 6; i++) {
+					status.setLines([`status-${i}`]);
+					body.setLines(rows("line-", 6 + i));
+					tui.requestRender();
+					await settle(term);
+				}
+
+				const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+				for (let i = 0; i < 12; i++) {
+					expect(countMatches(scrollback, new RegExp(`^line-${i}$`)), `line-${i} exactly once`).toBe(1);
+				}
+				expect(visible(term)).toEqual(rows("line-", 12).slice(-6));
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("repaints live viewport when overflowed content shrinks only at the tail", async () => {
 			const term = new VirtualTerminal(20, 5);
 			const tui = new TUI(term);
