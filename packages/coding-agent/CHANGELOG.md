@@ -9,6 +9,7 @@
 ### Fixed
 
 - Composer Bash policy rejections now identify the active provider surface and direct Cursor Composer models to their native repository tools, enabling the agent runtime's bounded automatic recovery instead of leaving a blocked shell attempt as a terminal turn.
+- The `AgentSession retry fallback > invalidates an auth-failed managed credential` test now uses a stored credential instead of a runtime-key override, matching the pin-guard behavior added in #3724 where `--api-key`/`--credential` pinned keys are never invalidated; the shared test fixture installed runtime keys as plumbing, which silently tripped the new guard and blocked the auth invalidation path.
 - The Extension Control Center inspector no longer crashes when a narrow two-column layout leaves its preview pane fewer than two columns wide.
 - Prompt-template positional arguments now preserve literal `$@` and `$ARGUMENTS` text instead of recursively expanding it during placeholder substitution.
 - Native Windows session and GC commands now report the searched `psmux` / `pmux` / `tmux` provider set when no compatible multiplexer is available instead of leaking a literal `tmux` spawn error (#3688).

@@ -1527,6 +1527,13 @@ describe("AgentSession retry fallback", () => {
 	});
 
 	it("invalidates an auth-failed managed credential before its next outer attempt", async () => {
+	// #3724 added a pin guard that refuses to rotate credentials set via
+	// setRuntimeApiKey (—api-key/—credential). The shared beforeEach installs
+	// runtime keys for every provider as test plumbing, which silently tripped
+	// that guard and blocked invalidation on the auth path. Use a stored
+	// credential instead, matching the other rotation tests in this suite.
+	authStorage.removeRuntimeApiKey("anthropic");
+	await authStorage.set("anthropic", [{ type: "api_key", key: "anthropic-test-key" }]);
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
