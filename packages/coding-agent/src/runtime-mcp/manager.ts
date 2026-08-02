@@ -1080,7 +1080,7 @@ export class MCPManager {
 	/**
 	 * Disconnect from all servers.
 	 */
-	async disconnectAll(): Promise<void> {
+	async disconnectAll(options: { propagateErrors?: boolean } = {}): Promise<void> {
 		// Invalidate any in-flight reconnection attempts that outlive this call.
 		// They captured the old epoch; after increment they'll detect staleness.
 		this.#epoch++;
@@ -1088,8 +1088,9 @@ export class MCPManager {
 		for (const conn of this.#connections.values()) {
 			conn.transport.onClose = undefined;
 		}
-		const promises = Array.from(this.#connections.values()).map(conn => disconnectServer(conn));
-		await Promise.allSettled(promises);
+		const results = await Promise.allSettled(
+			Array.from(this.#connections.values()).map(conn => disconnectServer(conn)),
+		);
 
 		for (const controller of this.#pendingConnectionControllers.values()) {
 			controller.abort(new Error("MCP manager disconnected"));
@@ -1108,6 +1109,13 @@ export class MCPManager {
 		this.#connections.clear();
 		this.#tools = [];
 		this.#subscribedResources.clear();
+
+		if (options.propagateErrors) {
+			const failures = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+			if (failures.length > 0) {
+				throw new AggregateError(failures, `MCP disconnect failed for ${failures.length} server(s).`);
+			}
+		}
 	}
 
 	/**

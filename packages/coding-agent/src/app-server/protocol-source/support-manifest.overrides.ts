@@ -230,15 +230,16 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		gjcBackendPath:
 			"packages/coding-agent/src/runtime-mcp/app-server-service.ts; packages/coding-agent/src/app-server/create-app-server.ts; packages/coding-agent/src/app-server/suites/mcp-handlers.ts",
 		semanticGaps: [
-			"Reload is rejected while an app-server thread is loaded; this is an explicit busy policy because active AgentSession MCP tools are not rebound mid-turn.",
+			"Reload is rejected before any disconnect, rediscovery, tool refresh, or publication while an app-server thread is loaded; active AgentSession MCP tools are not rebound mid-turn.",
 		],
 		translationNotes: [
-			"GJC owns one MCP service per app-server runtime, invalidates the capability file cache, disconnects, rediscovers, reconnects, and returns the vendored empty response after the runtime refresh seam completes.",
+			"GJC owns one MCP service per app-server runtime, invalidates the capability file cache, disconnects, rediscovers, reconnects, and returns the vendored empty response only after the preflight and runtime refresh seams complete.",
 		],
 		owner: "app-server",
 		testIds: [
 			"MCP-WIRE-001 production app-server reload changes the live tool set after an on-disk edit",
 			"MCP-006 config/mcpServer/reload reports an honest failure for sealed MCP connections",
+			"MCP-WIRE-004 loaded-thread reload is rejected before manager or tool mutation",
 		],
 		reason:
 			"The production runtime injects an owned McpAppServerService and the wire test proves an on-disk tool change is live after reload.",
@@ -267,18 +268,24 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		gjcBackendPath:
 			"packages/coding-agent/src/runtime-mcp/app-server-service.ts; packages/coding-agent/src/app-server/create-app-server.ts; packages/coding-agent/src/app-server/suites/mcp-handlers.ts",
 		semanticGaps: [
-			"OAuth completion is asynchronous and is reported only while the app-server connection remains alive; closing the requesting connection aborts the flow and suppresses its completion event.",
+			"OAuth completion is asynchronous and is reported only while the app-server connection remains alive; closing the requesting connection aborts the flow and suppresses its completion event. A same-server login already in progress is rejected with the busy error rather than creating a second credential.",
 		],
 		translationNotes: [
-			"The request returns GJC's real authorizationUrl; completion uses the owning runtime auth store, source-bound config persistence, per-server locking, compensating rollback, reconnect, and runtime publication of mcpServer/oauthLogin/completed.",
+			"The request returns GJC's real authorizationUrl; completion uses the owning runtime auth store, source-bound config persistence, stale-source/version checks under the lifecycle lock, per-server serialization, compensating rollback with observable aggregate failures, reconnect, and runtime publication of mcpServer/oauthLogin/completed.",
 		],
 		owner: "app-server",
 		testIds: [
 			"MCP-WIRE-002 production OAuth completion persists and publishes after the response",
 			"MCP-WIRE-003 OAuth persistence rolls back credential and config writes after reconnect failure",
+			"MCP-WIRE-005 runtime close aborts an in-progress OAuth flow without writes or reconnect",
+			"MCP-WIRE-006 requester close before OAuth commit compensates the pending write",
+			"MCP-WIRE-007 reload during OAuth cannot overwrite the replacement source",
+			"MCP-WIRE-008 concurrent same-server OAuth login rejects the second without an orphan credential",
+			"MCP-WIRE-009 OAuth compensation failures remain observable as an aggregate",
+			"MCP-WIRE-010 runtime close drains queued OAuth without writes or reconnect",
 		],
 		reason:
-			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication, persistence, ordering, and rollback.",
+			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication, persistence, ordering, stale-source rejection, cancellation, serialization, and rollback.",
 	},
 	"skills/list": laneRow(
 		"skillsListHandler",

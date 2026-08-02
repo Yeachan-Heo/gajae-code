@@ -315,11 +315,15 @@ class Runtime implements AppServerRuntime {
 			signal?.removeEventListener("abort", onAbort);
 		}
 	}
-	async #refreshMcpTools(_tools: readonly unknown[]): Promise<void> {
+	#assertMcpReloadAllowed(): void {
 		const loaded = this.manager.loaded();
 		if (loaded.length > 0) {
 			throw Object.assign(new Error("MCP reload is busy while an app-server thread is loaded."), { code: "busy" });
 		}
+	}
+
+	async #refreshMcpTools(_tools: readonly unknown[]): Promise<void> {
+		this.#assertMcpReloadAllowed();
 	}
 
 	contextFor(connection: Connection, deferred: Array<() => Promise<void>>): InboundContext {
@@ -341,6 +345,7 @@ class Runtime implements AppServerRuntime {
 			mcpService: this.mcpService,
 			mcpManager: this.mcpService.manager,
 			refreshMcpTools: tools => this.#refreshMcpTools(tools),
+			assertMcpReloadAllowed: () => this.#assertMcpReloadAllowed(),
 			signal: connection.signal,
 			isActive: active,
 			subscribe: threadId => {

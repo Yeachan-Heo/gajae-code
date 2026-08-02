@@ -115,12 +115,12 @@ export const mcpServerReloadHandler: MethodHandler = async (params, context) => 
 	try {
 		const mcpService = service(context);
 		if (mcpService) {
-			await mcpService.reload(context?.refreshMcpTools);
+			await mcpService.reload(context?.refreshMcpTools, context?.assertMcpReloadAllowed);
 			return { ok: true, result: {} };
 		}
 		const mcp = manager(context);
 		if (!mcp) return notFound();
-		await reloadMcpRuntime(mcp, context?.refreshMcpTools);
+		await reloadMcpRuntime(mcp, context?.refreshMcpTools, context?.assertMcpReloadAllowed);
 		return { ok: true, result: {} };
 	} catch (error) {
 		if (typeof error === "object" && error !== null && (error as { code?: unknown }).code === "busy") {
@@ -203,6 +203,8 @@ export const mcpServerOauthLoginHandler: MethodHandler = async (params, context)
 		});
 		return { ok: true, result };
 	} catch (error) {
+		if (typeof error === "object" && error !== null && (error as { code?: unknown }).code === "busy")
+			return { ok: false, errorKey: "busy" };
 		const message = error instanceof Error ? error.message : String(error);
 		if (message.includes("not connected")) return notFound();
 		if (message.includes("unavailable") || message.includes("invalid")) return invalid();

@@ -41,6 +41,8 @@ export interface HandlerContext {
 	readonly mcpManager?: import("../../runtime-mcp/manager").MCPManager;
 	/** Refresh the owning session's native MCP tool catalog after a lifecycle change. */
 	readonly refreshMcpTools?: (tools: readonly unknown[]) => Promise<void>;
+	/** Preflight check run before any MCP reload mutation. */
+	readonly assertMcpReloadAllowed?: () => void | Promise<void>;
 	/** Aborted when the owning app-server connection closes. */
 	readonly signal?: AbortSignal;
 	/** Loaded-thread runtime, for handlers that act on live threads. */
