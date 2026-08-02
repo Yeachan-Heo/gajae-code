@@ -136,6 +136,7 @@ import {
 	buildSystemPrompt as buildSystemPromptInternal,
 	buildSystemPromptToolMetadata,
 	loadProjectContextFiles as loadContextFilesInternal,
+	loadProjectContextFilesResult as loadContextFilesResultInternal,
 } from "../system-prompt";
 import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
@@ -1166,10 +1167,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
 		// at their respective consumer sites. Their work can overlap with model resolution, secret loading,
 		// session-context build, tool creation, MCP discovery, and extension discovery.
-		const contextFilesPromise = options.contextFiles
-			? Promise.resolve(options.contextFiles)
-			: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
-		contextFilesPromise.catch(() => {});
+		const contextFilesResultPromise = options.contextFiles
+			? Promise.resolve({ contextFiles: options.contextFiles, warnings: [] })
+			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd });
+		contextFilesResultPromise.catch(() => {});
 		const promptTemplatesPromise = options.promptTemplates
 			? Promise.resolve(options.promptTemplates)
 			: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
@@ -1465,10 +1466,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return result;
 		};
-		const [contextFiles, resolvedWorkspaceTree] = await Promise.all([
-			contextFilesPromise,
+		const [contextFilesResult, resolvedWorkspaceTree] = await Promise.all([
+			contextFilesResultPromise,
 			raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
 		]);
+		const contextFiles = contextFilesResult.contextFiles;
+		const discoveredContextFileWarnings = contextFilesResult.warnings;
 
 		const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
 		const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
@@ -2233,7 +2236,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			settings.get("tools.intentTracing"),
 			options.hasUI ?? false,
 		);
-		const emittedContextFileWarnings = new Set<string>();
+		const emittedContextFileWarnings = new Set(discoveredContextFileWarnings);
+		const contextFileWarnings = [...discoveredContextFileWarnings];
+		for (const warning of discoveredContextFileWarnings) {
+			logger.warn("Context file discovery warning", { warning });
+		}
 		const intentField = intentTracingEnabled ? INTENT_FIELD : undefined;
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
@@ -2315,6 +2322,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			for (const warning of defaultPrompt.warnings) {
 				if (emittedContextFileWarnings.has(warning)) continue;
 				emittedContextFileWarnings.add(warning);
+				contextFileWarnings.push(warning);
+				if (hasSession) session.configWarnings.push(warning);
 				logger.warn("Context file discovery warning", { warning });
 			}
 			if (options.systemPrompt === undefined) {
@@ -2804,6 +2813,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+		session.configWarnings.push(...contextFileWarnings);
 		hasSession = true;
 		if (asyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {

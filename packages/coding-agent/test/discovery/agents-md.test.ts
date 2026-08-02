@@ -28,12 +28,13 @@ describe("AGENTS.md discovery bounds", () => {
 		expect(result.warnings).toEqual(["AGENTS.md discovery stopped after scanning 32 ancestor directories."]);
 	});
 
-	test("uses raw byte counts to retain nearest whole files without reading past a full aggregate budget", async () => {
+	test("uses raw byte counts without warning for nonexistent ancestors beyond a full aggregate budget", async () => {
 		const root = path.join(path.sep, "repo");
 		const cwd = path.join(root, "one", "two", "three", "four");
 		const requestedBytes: number[] = [];
 		const reader: AgentsMdReader = async (filePath, maxBytes) => {
 			requestedBytes.push(maxBytes);
+			if (path.dirname(filePath) === root) return { content: null, byteLength: 0, tooLarge: false };
 			return {
 				content: path.basename(path.dirname(filePath)),
 				byteLength: MAX_FILE_BYTES,
@@ -44,7 +45,28 @@ describe("AGENTS.md discovery bounds", () => {
 		const result = await loadAgentsMd(context(cwd, root), reader);
 
 		expect(result.items.map(item => item.content)).toEqual(["four", "three", "two", "one"]);
-		expect(requestedBytes).toEqual([MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_FILE_BYTES]);
+		expect(requestedBytes).toEqual([MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_FILE_BYTES, 0]);
+		expect(result.warnings).toEqual([]);
+	});
+
+	test("warns when an existing ancestor is omitted after the aggregate budget is full", async () => {
+		const root = path.join(path.sep, "repo");
+		const cwd = path.join(root, "one", "two", "three", "four");
+		const requestedBytes: number[] = [];
+		const reader: AgentsMdReader = async (filePath, maxBytes) => {
+			requestedBytes.push(maxBytes);
+			if (maxBytes === 0) return { content: null, byteLength: 1, tooLarge: true };
+			return {
+				content: path.basename(path.dirname(filePath)),
+				byteLength: MAX_FILE_BYTES,
+				tooLarge: false,
+			};
+		};
+
+		const result = await loadAgentsMd(context(cwd, root), reader);
+
+		expect(result.items.map(item => item.content)).toEqual(["four", "three", "two", "one"]);
+		expect(requestedBytes).toEqual([MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_FILE_BYTES, MAX_FILE_BYTES, 0]);
 		expect(result.warnings).toEqual(["Skipped one or more AGENTS.md files that exceed the 256 KiB aggregate limit."]);
 	});
 
@@ -96,6 +118,19 @@ describe("AGENTS.md discovery bounds", () => {
 			await expect(loadAgentsMd(context(tempDir, tempDir))).resolves.toEqual({
 				items: [],
 				warnings: ["Skipped one or more AGENTS.md files that exceed the 64 KiB limit."],
+			});
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	test("ignores non-regular AGENTS.md candidates", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-"));
+		const agentPath = path.join(tempDir, "AGENTS.md");
+		try {
+			fs.mkdirSync(agentPath);
+			await expect(loadAgentsMd(context(tempDir, tempDir))).resolves.toEqual({
+				items: [],
+				warnings: [],
 			});
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });

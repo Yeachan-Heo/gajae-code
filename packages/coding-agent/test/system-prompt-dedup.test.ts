@@ -209,4 +209,30 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		expect(built.warnings).toContain("[AGENTS.md] Skipped one or more AGENTS.md files that exceed the 64 KiB limit.");
 	});
+	it("exposes AGENTS.md discovery warnings on the created session once", async () => {
+		const projectDir = path.join(tempDir, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.writeFileSync(path.join(projectDir, "AGENTS.md"), "x".repeat(64 * 1024 + 1));
+
+		const { session } = await createAgentSession({
+			cwd: projectDir,
+			agentDir: projectDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			expect(session.configWarnings).toEqual([
+				"[AGENTS.md] Skipped one or more AGENTS.md files that exceed the 64 KiB limit.",
+			]);
+		} finally {
+			await session.dispose();
+		}
+	}, 15_000);
 });

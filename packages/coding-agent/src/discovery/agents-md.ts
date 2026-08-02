@@ -34,6 +34,8 @@ async function readBoundedAgentsMdFile(
 	try {
 		const file = await fs.open(filePath, "r");
 		try {
+			const stats = await file.stat();
+			if (!stats.isFile()) return { content: null, byteLength: 0, tooLarge: false };
 			const bytes = Buffer.alloc(maxBytes + 1);
 			const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
 			if (bytesRead > maxBytes) return { content: null, byteLength: bytesRead, tooLarge: true };
@@ -73,25 +75,21 @@ export async function loadAgentsMd(
 
 		if (!baseName.startsWith(".")) {
 			const remainingAggregateBytes = MAX_AGGREGATE_BYTES - aggregateBytes;
-			if (remainingAggregateBytes === 0) {
-				omittedAggregateFile = true;
-			} else {
-				const allowedBytes = Math.min(MAX_FILE_BYTES, remainingAggregateBytes);
-				const result = await readCandidate(candidate, allowedBytes);
-				if (result.tooLarge) {
-					if (allowedBytes < MAX_FILE_BYTES) omittedAggregateFile = true;
-					else omittedOversizedFile = true;
-				} else if (result.content !== null) {
-					const fileDir = path.dirname(candidate);
-					items.push({
-						path: candidate,
-						content: result.content,
-						level: "project",
-						depth: calculateDepth(ctx.cwd, fileDir, path.sep),
-						_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
-					});
-					aggregateBytes += result.byteLength;
-				}
+			const allowedBytes = Math.min(MAX_FILE_BYTES, remainingAggregateBytes);
+			const result = await readCandidate(candidate, allowedBytes);
+			if (result.tooLarge) {
+				if (allowedBytes < MAX_FILE_BYTES) omittedAggregateFile = true;
+				else omittedOversizedFile = true;
+			} else if (result.content !== null) {
+				const fileDir = path.dirname(candidate);
+				items.push({
+					path: candidate,
+					content: result.content,
+					level: "project",
+					depth: calculateDepth(ctx.cwd, fileDir, path.sep),
+					_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
+				});
+				aggregateBytes += result.byteLength;
 			}
 		}
 
