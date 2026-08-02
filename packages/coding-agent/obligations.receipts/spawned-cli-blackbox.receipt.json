@@ -8,7 +8,7 @@
 	],
 	"cwd": ".",
 	"exitCode": 0,
-	"treeHash": "5bfd40190d34fb139c9a54436c78655ebc4daff0c3dfa2b07aa5486dd493279f",
+	"treeHash": "f2a7b7f400245a65d87b6e03cf1618c7d1592d8d87beec192ca39f811da62123",
 	"artifacts": [
 		{
 			"path": "obligations.artifacts/spawned-cli-blackbox/stdout.txt",
