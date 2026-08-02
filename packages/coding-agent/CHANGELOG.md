@@ -7,6 +7,7 @@
 - The Extension Control Center inspector no longer crashes when a narrow two-column layout leaves its preview pane fewer than two columns wide.
 - Prompt-template positional arguments now preserve literal `$@` and `$ARGUMENTS` text instead of recursively expanding it during placeholder substitution.
 - Native Windows session and GC commands now report the searched `psmux` / `pmux` / `tmux` provider set when no compatible multiplexer is available instead of leaking a literal `tmux` spawn error (#3688).
+- Managed-session recovery now preserves committed mutation state and the actual Linux fallback primitive in native publish receipts, preventing unsafe retry classification after a post-link staging unlink failure (#3746).
 
 ## [0.12.8] - 2026-08-02
 ### Added
