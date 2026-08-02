@@ -22,7 +22,7 @@ import {
 } from "@gajae-code/ai";
 import {
 	CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
-	isComposerBashPolicyBlockedError,
+	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
 import { extractHttpStatusFromError } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue } from "./agent-loop";
@@ -77,7 +77,7 @@ function isCursorComposerBashPolicyBlockedResult(message: ToolResultMessage): bo
 	return (
 		message.isError &&
 		message.toolName === "bash" &&
-		message.content.some(content => content.type === "text" && isComposerBashPolicyBlockedError(content.text))
+		message.content.some(content => content.type === "text" && isCurrentComposerBashPolicyBlockedError(content.text))
 	);
 }
 

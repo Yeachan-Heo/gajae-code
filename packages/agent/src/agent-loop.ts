@@ -22,7 +22,7 @@ import {
 } from "@gajae-code/ai";
 import {
 	COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
-	isComposerBashPolicyBlockedError,
+	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
 import { isInvalidPromptError, neutralizeReservedControlTokens } from "@gajae-code/ai/utils";
 import { sanitizeText } from "@gajae-code/utils";
@@ -132,7 +132,7 @@ function isComposerBashPolicyBlockedToolResult(result: ToolResultMessage): boole
 	return (
 		result.isError &&
 		result.toolName === "bash" &&
-		result.content.some(content => content.type === "text" && isComposerBashPolicyBlockedError(content.text))
+		result.content.some(content => content.type === "text" && isCurrentComposerBashPolicyBlockedError(content.text))
 	);
 }
 

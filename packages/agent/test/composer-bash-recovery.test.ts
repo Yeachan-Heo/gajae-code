@@ -60,6 +60,18 @@ function composerPolicyBlockedBashTool(): AgentTool<typeof bashSchema> {
 	};
 }
 
+function failingBashToolWithOutput(text: string): AgentTool<typeof bashSchema> {
+	return {
+		name: "bash",
+		label: "Bash",
+		description: "Runs terminal commands.",
+		parameters: bashSchema,
+		async execute() {
+			return { content: [{ type: "text", text }], isError: true };
+		},
+	};
+}
+
 function readTool(onExecute?: () => void): AgentTool<typeof readSchema> {
 	return {
 		name: "read",
@@ -213,6 +225,38 @@ describe("Composer bash policy recovery", () => {
 			expect(lastAssistant.stopReason).toBe("error");
 			expect(lastAssistant.errorMessage).toContain("one automatic recovery turn");
 		}
+	});
+
+	it("does not recover when ordinary Bash failure output merely quotes the policy error", async () => {
+		const quotedPolicyError = `Test failure output:\n${formatComposerBashPolicyError("generic")}\nCommand exited with code 1`;
+		const context: AgentContext = {
+			systemPrompt: ["Test"],
+			messages: [createUserMessage("Run the test and report its failure.")],
+			tools: [failingBashToolWithOutput(quotedPolicyError)],
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "bun test" } }] },
+				{ content: ["The test failed."] },
+			],
+		});
+		const requests: CapturedRequest[] = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			toolChoice: "required",
+		};
+
+		await drain(
+			agentLoopContinue(context, config, undefined, (model, requestContext, options) => {
+				requests.push({ context: requestContext, options });
+				return mock.stream(model, requestContext, options);
+			}),
+		);
+
+		expect(requests).toHaveLength(2);
+		expect(hasText(requests[1]!.context.messages, COMPOSER_BASH_POLICY_RECOVERY_PROMPT)).toBe(false);
+		expect(requests[1]!.options?.toolChoice).toBe("required");
 	});
 
 	it("continues a Cursor Composer turn once after a provider-side policy block", async () => {

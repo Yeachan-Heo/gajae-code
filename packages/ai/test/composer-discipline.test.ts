@@ -13,6 +13,7 @@ import {
 	formatComposerBashPolicyError,
 	isComposerBashPolicyBlockedError,
 	isComposerHarnessModel,
+	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
 import { buildCursorSystemPromptJsons } from "@gajae-code/ai/providers/cursor";
 import { convertMessages } from "@gajae-code/ai/providers/openai-completions";
@@ -122,16 +123,24 @@ describe("isComposerBashPolicyBlockedError", () => {
 		const error = formatComposerBashPolicyError("generic");
 		expect(error).toContain(COMPOSER_BASH_POLICY_ERROR_CODE);
 		expect(isComposerBashPolicyBlockedError(error)).toBe(true);
+		expect(isCurrentComposerBashPolicyBlockedError(error)).toBe(true);
 	});
 
 	it("recognizes prefix-only errors from sessions created before the structured marker", () => {
 		const legacyError = `${COMPOSER_BASH_POLICY_ERROR_PREFIX} Use find, search, read, and edit tools.`;
 		expect(legacyError).not.toContain(COMPOSER_BASH_POLICY_ERROR_CODE);
 		expect(isComposerBashPolicyBlockedError(legacyError)).toBe(true);
+		expect(isCurrentComposerBashPolicyBlockedError(legacyError)).toBe(false);
 	});
 
 	it("rejects unrelated shell errors", () => {
 		expect(isComposerBashPolicyBlockedError("Command failed with exit code 1")).toBe(false);
+	});
+
+	it("does not treat failed command output that quotes a structured policy error as the policy gate", () => {
+		const quotedError = `Test failure output:\n${formatComposerBashPolicyError("generic")}\nCommand exited with code 1`;
+		expect(isComposerBashPolicyBlockedError(quotedError)).toBe(true);
+		expect(isCurrentComposerBashPolicyBlockedError(quotedError)).toBe(false);
 	});
 });
 

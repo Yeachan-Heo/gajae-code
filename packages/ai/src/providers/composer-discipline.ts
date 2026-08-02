@@ -62,6 +62,15 @@ export function isComposerBashPolicyBlockedError(text: string): boolean {
 	return text.includes(COMPOSER_BASH_POLICY_ERROR_PREFIX);
 }
 
+/**
+ * Matches only errors emitted directly by the current policy implementation.
+ * Live recovery must use this strict form so failed shell output that merely
+ * quotes a policy error cannot masquerade as the policy gate itself.
+ */
+export function isCurrentComposerBashPolicyBlockedError(text: string): boolean {
+	return text === formatComposerBashPolicyError("generic") || text === formatComposerBashPolicyError("cursor");
+}
+
 /** One bounded, tool-enabled retry instruction for generic Composer agent loops. */
 export const COMPOSER_BASH_POLICY_RECOVERY_PROMPT = composerBashPolicyRecoveryPrompt;
 
