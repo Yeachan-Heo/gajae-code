@@ -10,6 +10,7 @@
 - Native Windows session and GC commands now report the searched `psmux` / `pmux` / `tmux` provider set when no compatible multiplexer is available instead of leaking a literal `tmux` spawn error (#3688).
 - Managed-session recovery now preserves committed mutation state and the actual Linux fallback primitive in native publish receipts, preventing unsafe retry classification after a post-link staging unlink failure (#3746).
 - The system prompt now requires non-ASCII tool-input text to be written as literal UTF-8 rather than hand-spelled `\uXXXX` escapes, including JSON serialized into a string field, while leaving escapes that are intended source syntax alone. Models that hand-spell hex codepoints for CJK mis-type them, and each mis-typed escape decodes to a valid-but-wrong syllable, so Korean text in tool parameters silently arrives corrupted (anthropics/claude-code#83033).
+- The `models.yml` validation error for a custom provider without a credential source now explains that `auth` selects only the auth scheme and lists the three corrective forms (`apiKeyEnv`, literal `apiKey`, or `auth: none`) instead of restating the rule that was already misread. `docs/models.md` documents the same contract in a table (#3738).
 
 ## [0.12.8] - 2026-08-02
 ### Added

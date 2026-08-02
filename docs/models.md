@@ -311,6 +311,16 @@ providers:
 
 Use provider-level `headers` for proxy-required headers. Keep the provider `api` set to `openai-completions` when the proxy exposes Chat Completions-compatible `/v1/chat/completions` semantics. `auth: apiKey` sends the resolved token as bearer auth; use `auth: none` only for trusted local/no-auth endpoints.
 
+`auth` selects the transport scheme only; it never supplies a credential. A provider that declares `models:` must therefore also declare where its key comes from, and `models.yml` validation rejects the config before model discovery otherwise:
+
+| Intent | Required keys |
+| --- | --- |
+| Authenticated proxy (recommended) | `auth: apiKey` (default) + `apiKeyEnv: MY_TOKEN` |
+| Authenticated proxy, key inline | `auth: apiKey` (default) + `apiKey: sk-…` (less safe; stored in plaintext) |
+| Genuinely unauthenticated endpoint | `auth: none`, no key |
+
+Omitting both `apiKey` and `apiKeyEnv` while leaving `auth` at its `apiKey` default fails with `Provider <name>: custom models need a credential source, but none is configured.` — the fix is to add one of the rows above, not to change `api` or `baseUrl`.
+
 `input` is the model modality list GJC uses to decide whether image content is forwarded. When a custom model omits `input`, GJC defaults to `[text]` (unless a bundled model with the same id contributes a reference). Vision-capable upstream models therefore need an explicit `input: [text, image]`; otherwise `read`/tool images are stripped before the request and replaced with `[image omitted: model does not support vision]`, even if the remote model can see images.
 
 ```yaml
@@ -381,7 +391,7 @@ modelBindings:
 Required:
 
 - `baseUrl`
-- `apiKey` unless `auth: none`
+- A credential source: `apiKeyEnv` or `apiKey`. `auth` selects the scheme, not the credential, so `auth: apiKey` (the default) still needs one of them. Exempt: `auth: none`, and `api: bedrock-converse-stream`, which resolves AWS credentials from its own chain.
 - `api` at provider level or each model
 
 ### Override-only provider (`models` missing or empty)

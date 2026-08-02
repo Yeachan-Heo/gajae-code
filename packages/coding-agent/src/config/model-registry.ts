@@ -331,7 +331,10 @@ function validateProviderConfiguration(
 			throw new Error(
 				mode === "runtime-register"
 					? `Provider ${providerName}: "apiKey" or "oauth" is required when defining models.`
-					: `Provider ${providerName}: "apiKey" or "apiKeyEnv" is required when defining custom models unless auth is "none".`,
+					: `Provider ${providerName}: custom models need a credential source, but none is configured. ` +
+							`"auth" only selects the scheme ("auth: apiKey" does not supply a key). ` +
+							`Fix by adding "apiKeyEnv: <ENV_VAR>" (recommended) or "apiKey: <literal-key>", ` +
+							`or set "auth: none" if the endpoint is genuinely unauthenticated.`,
 			);
 		}
 	}
