@@ -341,7 +341,16 @@ test("MCP-WIRE-012 production app-server reload removes a deleted MCP source", a
 		rmSync(root, { recursive: true, force: true });
 	}
 });
-async function oauthFixture(): Promise<{ root: string; configPath: string; server: Bun.Server<unknown> }> {
+interface OAuthFixtureOptions {
+	readonly tokenExchange?: {
+		readonly entered: () => void;
+		readonly release: Promise<void>;
+	};
+}
+
+async function oauthFixture(
+	options: OAuthFixtureOptions = {},
+): Promise<{ root: string; configPath: string; server: Bun.Server<unknown> }> {
 	const root = mkdtempSync("/tmp/gjc-mcp-wire-oauth-");
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -354,8 +363,11 @@ async function oauthFixture(): Promise<{ root: string; configPath: string; serve
 				if (!redirect || !state) return new Response("missing redirect", { status: 400 });
 				return Response.redirect(`${redirect}?code=wire-code&state=${encodeURIComponent(state)}`, 302);
 			}
-			if (url.pathname === "/token" && request.method === "POST")
+			if (url.pathname === "/token" && request.method === "POST") {
+				options.tokenExchange?.entered();
+				if (options.tokenExchange) await options.tokenExchange.release;
 				return Response.json({ access_token: "wire-access", refresh_token: "wire-refresh", expires_in: 3600 });
+			}
 			if (url.pathname === "/mcp" && request.method === "POST") {
 				const body = (await request.json()) as { id: string | number; method: string };
 				const result =
@@ -612,22 +624,86 @@ test("MCP-WIRE-010 runtime close waits for a held OAuth completion and rollback"
 		rmSync(fixture.root, { recursive: true, force: true });
 	}
 });
-
-test("MCP-WIRE-013 OAuth callback-listener lease rejects before release and succeeds after release", async () => {
+test("MCP-WIRE-016 runtime close bounds an OAuth reconnect that ignores abort", async () => {
 	const fixture = await oauthFixture();
 	const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
-	const held = Promise.withResolvers<void>();
+	const reconnectEntered = Promise.withResolvers<void>();
+	const reconnectRelease = Promise.withResolvers<void>();
+	const service = createMcpAppServerService({ cwd: fixture.root, agentDir: fixture.root, authStorage: storage });
+	const manager = service.manager as unknown as {
+		reconnectServer: (name: string, signal?: AbortSignal) => Promise<unknown>;
+	};
+	manager.reconnectServer = async () => {
+		reconnectEntered.resolve();
+		await reconnectRelease.promise;
+		return null;
+	};
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	let callbackRequest: Promise<Response> | undefined;
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		await connection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		const authorizationUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
+		callbackRequest = fetch(authorizationUrl);
+		await reconnectEntered.promise;
+
+		const started = Date.now();
+		let closeError: unknown;
+		try {
+			await service.close();
+		} catch (error) {
+			closeError = error;
+		}
+		expect(Date.now() - started).toBeLessThan(1_500);
+		expect(closeError).toBeInstanceOf(AggregateError);
+		const failures = (closeError as AggregateError).errors.map(error => String(error));
+		expect(failures).toEqual(
+			expect.arrayContaining([expect.stringMatching(/MCP OAuth completion wait timed out after 1000ms/)]),
+		);
+
+		reconnectRelease.resolve();
+		await callbackRequest;
+		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
+	} finally {
+		reconnectRelease.resolve();
+		await callbackRequest?.catch(() => {});
+		await connection.close().catch(() => {});
+		await service.close().catch(() => {});
+		storage.close();
+		fixture.server.stop();
+		rmSync(fixture.root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-013 OAuth callback-listener lease rejects before release and succeeds after release", async () => {
+	const tokenEntered = Promise.withResolvers<void>();
+	const tokenRelease = Promise.withResolvers<void>();
+	const fixture = await oauthFixture({
+		tokenExchange: {
+			entered: () => tokenEntered.resolve(),
+			release: tokenRelease.promise,
+		},
+	});
+	const storage = await AuthStorage.create(path.join(fixture.root, "auth.db"));
 	const release = Promise.withResolvers<void>();
+	const listenerClosed = Promise.withResolvers<void>();
 	const released = Promise.withResolvers<void>();
+	let listenerClosedObserved = false;
 	const service = createMcpAppServerService({
 		cwd: fixture.root,
 		agentDir: fixture.root,
 		authStorage: storage,
 		oauthLifecycle: {
 			awaitCallbackServerClosed: async (_name, callbackServerClosed) => {
-				held.resolve();
-				await release.promise;
 				await callbackServerClosed;
+				listenerClosedObserved = true;
+				listenerClosed.resolve();
+				await release.promise;
 				released.resolve();
 			},
 		},
@@ -641,17 +717,25 @@ test("MCP-WIRE-013 OAuth callback-listener lease rejects before release and succ
 		await initialize(connection, frames);
 		await connection.process(enc('{"id":2,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
 		const firstUrl = (responseFor(frames, 2).result as Record<string, unknown>).authorizationUrl as string;
-		await fetch(firstUrl);
-		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
-		await held.promise;
-
+		const firstCallback = fetch(firstUrl);
+		await tokenEntered.promise;
+		// Token exchange is blocked before OAuthCallbackFlow.login() enters its finally block.
+		expect(listenerClosedObserved).toBe(false);
 		await connection.process(enc('{"id":3,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
 		expect(responseFor(frames, 3)).toMatchObject({ id: 3, error: { code: -32016, message: "Resource is busy." } });
+
+		tokenRelease.resolve();
+		await firstCallback;
+		await listenerClosed.promise;
+		expect(listenerClosedObserved).toBe(true);
+		await connection.process(enc('{"id":4,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		expect(responseFor(frames, 4)).toMatchObject({ id: 4, error: { code: -32016, message: "Resource is busy." } });
 		release.resolve();
 		await released.promise;
+		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
 
-		await connection.process(enc('{"id":4,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
-		const secondUrl = (responseFor(frames, 4).result as Record<string, unknown>).authorizationUrl as string;
+		await connection.process(enc('{"id":5,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
+		const secondUrl = (responseFor(frames, 5).result as Record<string, unknown>).authorizationUrl as string;
 		expect(secondUrl).toContain("/authorize?");
 		await fetch(secondUrl);
 		await waitForCondition(
@@ -659,6 +743,7 @@ test("MCP-WIRE-013 OAuth callback-listener lease rejects before release and succ
 			"second OAuth completion",
 		);
 	} finally {
+		tokenRelease.resolve();
 		release.resolve();
 		await connection.close().catch(() => {});
 		await runtime.close().catch(() => {});

@@ -265,7 +265,8 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	),
 	"mcpServer/oauth/login": {
 		support: "implemented",
-		gjcSeam: "McpAppServerService.oauthLogin via mcpServerOauthLoginHandler",
+		gjcSeam:
+			"McpAppServerService.oauthLogin via mcpServerOauthLoginHandler; OAuthCallbackFlow.callbackServerClosed (packages/ai/src/utils/oauth/callback-server.ts)",
 		gjcBackendPath:
 			"packages/coding-agent/src/runtime-mcp/app-server-service.ts; packages/coding-agent/src/app-server/create-app-server.ts; packages/coding-agent/src/app-server/suites/mcp-handlers.ts",
 		semanticGaps: [
@@ -286,9 +287,10 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 			"MCP-WIRE-010 runtime close waits for a held OAuth completion and rollback",
 			"MCP-WIRE-013 OAuth callback-listener lease rejects before release and succeeds after release",
 			"MCP-WIRE-014 OAuth cancellation after each commit stage rolls back persisted state",
+			"MCP-WIRE-016 runtime close bounds an OAuth reconnect that ignores abort",
 		],
 		reason:
-			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication without a serialized cause, persistence, ordering, source replacement, cancellation after every OAuth commit stage, deterministic same-server serialization, callback-listener lease synchronization, and rollback. Source removal and autonomous reconnect draining are covered separately by focused manager/reload tests, not claimed as OAuth semantics.",
+			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication without a serialized cause, persistence, ordering, source replacement, cancellation after every OAuth commit stage, deterministic same-server serialization, the callbackServerClosed listener boundary, and rollback.",
 	},
 	"skills/list": laneRow(
 		"skillsListHandler",

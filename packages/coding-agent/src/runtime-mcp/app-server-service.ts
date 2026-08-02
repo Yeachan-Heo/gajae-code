@@ -3,7 +3,7 @@ import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@ga
 import { getAgentDir, getProjectDir } from "@gajae-code/utils";
 import { AuthStorage, type OAuthCredential } from "../session/auth-storage";
 import { readMCPConfigFile, updateMCPServer, writeMCPConfigFile } from "./config-writer";
-import { type MCPLoadResult, MCPManager } from "./manager";
+import { MCP_SHUTDOWN_TIMEOUT_MS, type MCPLoadResult, MCPManager } from "./manager";
 import { discoverOAuthEndpoints } from "./oauth-discovery";
 import { type MCPOAuthConfig, MCPOAuthFlow } from "./oauth-flow";
 import type { MCPServerConfig, MCPServerConnection } from "./types";
@@ -151,6 +151,29 @@ function throwIfAborted(signal?: AbortSignal): void {
 function appendFailure(failures: unknown[], error: unknown): void {
 	if (error instanceof AggregateError) failures.push(...error.errors);
 	else failures.push(error);
+}
+
+type DeadlineWait<T> = { settled: true; value: T } | { settled: false };
+
+type Observed<T> = { ok: true; value: T } | { ok: false; error: unknown };
+function awaitBeforeDeadline<T>(promise: Promise<T>, deadline: number): Promise<DeadlineWait<T>> {
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) return Promise.resolve({ settled: false });
+	return new Promise((resolve, reject) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const settle = (result: DeadlineWait<T>): void => {
+			if (timer !== undefined) clearTimeout(timer);
+			resolve(result);
+		};
+		promise.then(
+			value => settle({ settled: true, value }),
+			error => {
+				if (timer !== undefined) clearTimeout(timer);
+				reject(error);
+			},
+		);
+		timer = setTimeout(() => settle({ settled: false }), remaining);
+	});
 }
 
 /**
@@ -491,6 +514,8 @@ export class McpAppServerService {
 			}
 		}
 
+		// One deadline covers manager drains and active OAuth completions. Escaped completions keep owned storage alive below.
+		const terminalDeadline = Date.now() + MCP_SHUTDOWN_TIMEOUT_MS;
 		let managerDrain: Promise<void> | undefined;
 		try {
 			this.manager.shutdown();
@@ -501,32 +526,81 @@ export class McpAppServerService {
 		}
 
 		const activeCompletions = [...this.#activeOAuthCompletions];
-		for (const result of await Promise.allSettled(activeCompletions)) {
-			if (result.status === "rejected") captureFailure(result.reason);
+		const activeSettled = Promise.allSettled(activeCompletions);
+		const activeFailures: unknown[] = [];
+		for (const completion of activeCompletions) {
+			void completion.catch(error => {
+				activeFailures.push(error);
+			});
 		}
-		const lifecycle = this.#lifecyclePromise;
-		if (lifecycle) {
-			try {
-				await lifecycle;
-			} catch (error) {
-				captureFailure(error);
+		const observe = <T>(promise: Promise<T> | undefined): Promise<DeadlineWait<Observed<T>>> => {
+			const guarded: Promise<Observed<T>> = promise
+				? promise.then(
+						value => ({ ok: true as const, value }),
+						error => ({ ok: false as const, error }),
+					)
+				: Promise.resolve({ ok: true as const, value: undefined as T });
+			return awaitBeforeDeadline(guarded, terminalDeadline);
+		};
+		const [activeWait, readyWait, managerWait] = await Promise.all([
+			observe(activeSettled),
+			observe(this.#readyPromise),
+			observe(managerDrain),
+		]);
+		const escaped: Promise<unknown>[] = [];
+
+		if (!activeWait.settled) {
+			captureFailure(new Error(`MCP OAuth completion wait timed out after ${MCP_SHUTDOWN_TIMEOUT_MS}ms.`));
+			for (const error of activeFailures) captureFailure(error);
+			escaped.push(activeSettled);
+		} else if (!activeWait.value.ok) {
+			captureFailure(activeWait.value.error);
+		} else {
+			for (const result of activeWait.value.value) {
+				if (result.status === "rejected") captureFailure(result.reason);
 			}
 		}
-		try {
-			await this.#readyPromise;
-		} catch (error) {
-			captureFailure(error);
-		}
-		if (managerDrain) {
-			try {
-				await managerDrain;
-			} catch (error) {
-				captureFailure(error);
+
+		if (activeWait.settled) {
+			const lifecycle = this.#lifecyclePromise;
+			const lifecycleWait = await observe(lifecycle);
+			if (!lifecycleWait.settled) {
+				captureFailure(new Error(`MCP lifecycle wait timed out after ${MCP_SHUTDOWN_TIMEOUT_MS}ms.`));
+				if (lifecycle) escaped.push(lifecycle);
+			} else if (!lifecycleWait.value.ok) {
+				captureFailure(lifecycleWait.value.error);
 			}
 		}
-		if (this.#ownsAuthStorage && this.#authStorage) {
+		if (!readyWait.settled) {
+			captureFailure(new Error(`MCP auth initialization wait timed out after ${MCP_SHUTDOWN_TIMEOUT_MS}ms.`));
+			escaped.push(this.#readyPromise);
+		} else if (!readyWait.value.ok) {
+			captureFailure(readyWait.value.error);
+		}
+		if (!managerWait.settled) {
+			captureFailure(new Error(`MCP manager drain wait timed out after ${MCP_SHUTDOWN_TIMEOUT_MS}ms.`));
+			if (managerDrain) escaped.push(managerDrain);
+		} else if (!managerWait.value.ok) {
+			captureFailure(managerWait.value.error);
+		}
+
+		const closeOwnedAuthStorage = (): void => {
+			if (!this.#ownsAuthStorage || !this.#authStorage) return;
+			const storage = this.#authStorage;
+			storage.close();
+			this.#authStorage = undefined;
+		};
+		if (escaped.length > 0) {
+			void Promise.allSettled([this.#readyPromise, ...escaped]).then(() => {
+				try {
+					closeOwnedAuthStorage();
+				} catch {
+					// The terminal failure was already reported; preserve ownership until this best-effort close.
+				}
+			});
+		} else {
 			try {
-				this.#authStorage.close();
+				closeOwnedAuthStorage();
 			} catch (error) {
 				captureFailure(error);
 			}

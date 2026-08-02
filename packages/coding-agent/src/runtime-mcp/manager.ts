@@ -77,7 +77,7 @@ const STARTUP_TIMEOUT_GRACE_MS = 500;
  */
 const MAX_STARTUP_TIMEOUT_MS = 1_750;
 const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
-const MCP_SHUTDOWN_TIMEOUT_MS = 1_000;
+export const MCP_SHUTDOWN_TIMEOUT_MS = 1_000;
 
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
 	const ceiling =
@@ -355,30 +355,33 @@ export class MCPManager {
 	}
 
 	#subscribeAndTrack(name: string, connection: MCPServerConnection, uris: string[], notificationEpoch: number): void {
-		void subscribeToResources(connection, uris)
+		const subscription = subscribeToResources(connection, uris)
 			.then(() => {
-				const action = resolveSubscriptionPostAction(
-					this.#notificationsEnabled,
-					this.#notificationsEpoch,
-					notificationEpoch,
-				);
+				const action = this.#shuttingDown
+					? "rollback"
+					: this.#connections.get(name) === connection
+						? resolveSubscriptionPostAction(
+								this.#notificationsEnabled,
+								this.#notificationsEpoch,
+								notificationEpoch,
+							)
+						: "ignore";
 				if (action === "rollback") {
-					void unsubscribeFromResources(connection, uris).catch(error => {
+					return unsubscribeFromResources(connection, uris).catch(error => {
 						logger.debug("Failed to rollback stale MCP resource subscription", {
 							path: `mcp:${name}`,
 							error,
 						});
 					});
-					return;
 				}
-				if (action === "ignore") {
-					return;
-				}
+				if (action === "ignore") return;
 				this.#subscribedResources.set(name, new Set(uris));
 			})
 			.catch(error => {
 				logger.debug("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
 			});
+		const tracked = this.#trackDrain(subscription);
+		void tracked.catch(() => {});
 	}
 
 	setNotificationsEnabled(enabled: boolean): void {
@@ -648,7 +651,7 @@ export class MCPManager {
 				disconnectEpoch,
 			});
 
-			void toolsPromise
+			const postConnect = toolsPromise
 				.then(async ({ connection, serverTools }) => {
 					if (connectionAbort.signal.aborted) return;
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
@@ -662,8 +665,17 @@ export class MCPManager {
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
-					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
+					if (!this.#toolsOnly && this.toolCache) {
+						await this.#trackDrain(this.toolCache.set(name, config, serverTools)).catch(error => {
+							logger.debug("Failed to cache MCP tools", { path: `mcp:${name}`, error });
+						});
+					}
+					if (
+						!this.#toolsOnly &&
+						this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)
+					) {
+						await this.#loadServerResourcesAndPrompts(name, connection, connectionEpoch, disconnectEpoch);
+					}
 				})
 				.catch(error => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
@@ -672,6 +684,8 @@ export class MCPManager {
 					const message = error instanceof Error ? error.message : String(error);
 					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
 				});
+			const trackedPostConnect = this.#trackDrain(postConnect);
+			void trackedPostConnect.catch(() => {});
 		}
 
 		// Notify about servers we're connecting to
@@ -1417,10 +1431,22 @@ export class MCPManager {
 			}
 			const reconnect = () => this.reconnectServer(name);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
-			void this.toolCache?.set(name, config, serverTools);
+			if (this.toolCache) {
+				await this.#trackDrain(this.toolCache.set(name, config, serverTools)).catch(error => {
+					logger.debug("Failed to cache MCP tools", { path: `mcp:${name}`, error });
+				});
+			}
+			if (!this.#isCurrentConnection(name, config, globalEpoch, disconnectEpoch, connection)) {
+				connection.transport.onClose = undefined;
+				await connection.transport.close().catch(() => {});
+				throw new Error(`Server "${name}" was disconnected during tool loading`);
+			}
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
-			void this.#loadServerResourcesAndPrompts(name, connection);
+			const resourceLoad = this.#trackDrain(
+				this.#loadServerResourcesAndPrompts(name, connection, globalEpoch, disconnectEpoch),
+			);
+			void resourceLoad.catch(() => {});
 			return connection;
 		} catch (error) {
 			// Clean up the connection to avoid zombie transports
@@ -1435,12 +1461,21 @@ export class MCPManager {
 	 * Best-effort loading of resources, resource subscriptions, and prompts.
 	 * Shared between initial connection and reconnection.
 	 */
-	async #loadServerResourcesAndPrompts(name: string, connection: MCPServerConnection): Promise<void> {
-		if (this.#toolsOnly) return;
+	async #loadServerResourcesAndPrompts(
+		name: string,
+		connection: MCPServerConnection,
+		globalEpoch: number,
+		disconnectEpoch: number,
+	): Promise<void> {
+		if (
+			this.#toolsOnly ||
+			!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)
+		)
+			return;
 		if (serverSupportsResources(connection.capabilities)) {
 			try {
 				const [resources] = await Promise.all([listResources(connection), listResourceTemplates(connection)]);
-
+				if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 				if (this.#notificationsEnabled && connection.capabilities.resources?.subscribe) {
 					const uris = resources.map(r => r.uri);
 					const notificationEpoch = this.#notificationsEpoch;
@@ -1454,6 +1489,7 @@ export class MCPManager {
 		if (serverSupportsPrompts(connection.capabilities)) {
 			try {
 				await listPrompts(connection);
+				if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 				this.#onPromptsChanged?.(name);
 			} catch (error) {
 				logger.debug("Failed to load MCP prompts", { path: `mcp:${name}`, error });
@@ -1480,7 +1516,12 @@ export class MCPManager {
 		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		const reconnect = () => this.reconnectServer(name);
 		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
-		void this.toolCache?.set(name, connection.config, serverTools);
+		if (this.toolCache) {
+			await this.#trackDrain(this.toolCache.set(name, connection.config, serverTools)).catch(error => {
+				logger.debug("Failed to cache MCP tools", { path: `mcp:${name}`, error });
+			});
+		}
+		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);
