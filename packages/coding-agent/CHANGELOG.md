@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The Extension Control Center inspector no longer crashes when a narrow two-column layout leaves its preview pane fewer than two columns wide.
+
 ## [0.12.8] - 2026-08-02
 ### Added
 
