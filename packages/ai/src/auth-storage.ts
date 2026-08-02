@@ -37,7 +37,13 @@ import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorag
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
-import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId } from "./utils/oauth/types";
+import type {
+	OAuthController,
+	OAuthCredentials,
+	OAuthLoginOptions,
+	OAuthProvider,
+	OAuthProviderId,
+} from "./utils/oauth/types";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Credential Types
@@ -1880,6 +1886,7 @@ export class AuthStorage {
 			/** onPrompt is required for some providers (github-copilot, OpenAI code provider) */
 			onPrompt: (prompt: { message: string; placeholder?: string }) => Promise<string>;
 		},
+		options: OAuthLoginOptions = {},
 	): Promise<void> {
 		let credentials: OAuthCredentials;
 		const saveApiKeyCredential = async (apiKey: string): Promise<void> => {
@@ -1895,10 +1902,13 @@ export class AuthStorage {
 			}
 			case "anthropic": {
 				const { loginAnthropic } = await import("./utils/oauth/anthropic");
-				credentials = await loginAnthropic({
-					...ctrl,
-					onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
-				});
+				credentials = await loginAnthropic(
+					{
+						...ctrl,
+						onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
+					},
+					{ manualCode: options.manualCode },
+				);
 				break;
 			}
 			case "alibaba-token-plan": {

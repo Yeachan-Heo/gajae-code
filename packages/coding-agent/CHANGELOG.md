@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `/login anthropic --manual` pairs by pasting the authorization code Anthropic shows in the browser instead of waiting on a `localhost:54545` callback the browser cannot reach. Complete it with `/login <code>`. Use it when gjc runs over SSH, in a container, or on a headless host; the default `/login anthropic` still uses the loopback callback. The flag is resolved before the paste fallback, so it is never mistaken for an authorization code, and providers without a paste-a-code redirect reject it explicitly instead of silently falling back.
+
 ### Fixed
 
 - Composer Bash policy rejections now identify the active provider surface and direct Cursor Composer models to their native repository tools, enabling the agent runtime's bounded automatic recovery instead of leaving a blocked shell attempt as a terminal turn.

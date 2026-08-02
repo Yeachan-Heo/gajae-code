@@ -4,6 +4,8 @@
  * Handles:
  * - Port allocation (tries expected port, falls back to random)
  * - Callback server setup and request handling
+ * - Opting out of the local listener entirely (`skipCallbackServer`) for
+ *   providers that redirect somewhere this process cannot observe
  * - Common OAuth flow logic
  *
  * Providers extend this and implement:
@@ -27,6 +29,13 @@ export interface OAuthCallbackFlowOptions {
 	callbackBindHostname?: string;
 	/** Exact redirect URI advertised to the provider; disables port fallback. */
 	redirectUri?: string;
+	/**
+	 * Do not bind a local listener at all. The provider redirects somewhere this
+	 * process cannot observe (a hosted "copy this code" page, a custom protocol),
+	 * so the code arrives by paste instead. Requires both `redirectUri` and an
+	 * `onManualCodeInput` handler on the controller.
+	 */
+	skipCallbackServer?: boolean;
 }
 
 /**
@@ -39,6 +48,7 @@ export abstract class OAuthCallbackFlow {
 	callbackHostname: string;
 	callbackBindHostname: string;
 	redirectUri?: string;
+	readonly #skipCallbackServer: boolean;
 	#callbackResolve?: (result: CallbackResult) => void;
 	#callbackReject?: (error: string) => void;
 
@@ -53,6 +63,7 @@ export abstract class OAuthCallbackFlow {
 			this.callbackPath = callbackPath;
 			this.callbackHostname = DEFAULT_HOSTNAME;
 			this.callbackBindHostname = DEFAULT_HOSTNAME;
+			this.#skipCallbackServer = false;
 			return;
 		}
 
@@ -61,6 +72,7 @@ export abstract class OAuthCallbackFlow {
 		this.callbackHostname = preferredPortOrOptions.callbackHostname ?? DEFAULT_HOSTNAME;
 		this.callbackBindHostname = preferredPortOrOptions.callbackBindHostname ?? this.callbackHostname;
 		this.redirectUri = preferredPortOrOptions.redirectUri;
+		this.#skipCallbackServer = preferredPortOrOptions.skipCallbackServer === true;
 	}
 
 	/**
@@ -95,6 +107,13 @@ export abstract class OAuthCallbackFlow {
 	 * Execute the OAuth login flow.
 	 */
 	async login(): Promise<OAuthCredentials> {
+		if (this.#skipCallbackServer && !this.ctrl.onManualCodeInput) {
+			// Fail before a browser is opened: without a listener and without a paste
+			// handler the flow can only sit until the 5-minute timeout.
+			throw new Error(
+				"OAuth flow is configured without a local callback server, but no manual authorization-code handler was provided",
+			);
+		}
 		const state = this.generateState();
 
 		// Start callback server first to get actual redirect URI
@@ -106,7 +125,11 @@ export abstract class OAuthCallbackFlow {
 
 			// Notify controller that auth is ready
 			this.ctrl.onAuth?.({ url: authUrl, instructions });
-			this.ctrl.onProgress?.("Waiting for browser authentication...");
+			this.ctrl.onProgress?.(
+				this.#skipCallbackServer
+					? "Waiting for the authorization code..."
+					: "Waiting for browser authentication...",
+			);
 
 			// Wait for callback or manual input
 			const { code } = await this.#waitForCallback(state);
@@ -115,14 +138,23 @@ export abstract class OAuthCallbackFlow {
 
 			return await this.exchangeToken(code, state, redirectUri);
 		} finally {
-			server.stop();
+			server?.stop();
 		}
 	}
 
 	/**
 	 * Start callback server, trying preferred port first, falling back to random.
+	 * Returns no server when the flow opted out of the local listener.
 	 */
-	async #startCallbackServer(expectedState: string): Promise<{ server: Bun.Server<unknown>; redirectUri: string }> {
+	async #startCallbackServer(
+		expectedState: string,
+	): Promise<{ server: Bun.Server<unknown> | undefined; redirectUri: string }> {
+		if (this.#skipCallbackServer) {
+			if (!this.redirectUri) {
+				throw new Error("OAuth flow skips the local callback server but no redirect URI was configured");
+			}
+			return { server: undefined, redirectUri: this.redirectUri };
+		}
 		try {
 			const server = this.#createServer(this.preferredPort, expectedState);
 			if (this.redirectUri) {
@@ -216,30 +248,46 @@ export abstract class OAuthCallbackFlow {
 			this.#callbackResolve = resolve;
 			this.#callbackReject = reject;
 
-			signal.addEventListener("abort", () => {
+			const cancel = () => {
 				this.#callbackResolve = undefined;
 				this.#callbackReject = undefined;
 				reject(new Error(`OAuth callback cancelled: ${signal.reason}`));
-			});
+			};
+			// A signal that aborted before the listener was attached never fires the
+			// event. Without a local listener to fall back on there would be nothing
+			// left to settle this promise, so check the current state too.
+			if (signal.aborted) {
+				cancel();
+				return;
+			}
+			signal.addEventListener("abort", cancel);
 		});
+
+		const parseManualInput = (input: string): CallbackResult | null => {
+			const parsed = parseCallbackInput(input);
+			if (!parsed.code) return null;
+			if (expectedState && parsed.state && parsed.state !== expectedState) return null;
+			return { code: parsed.code, state: parsed.state ?? "" };
+		};
 
 		// Manual input race (if supported)
 		if (this.ctrl.onManualCodeInput) {
 			const requestManualInput = this.ctrl.onManualCodeInput;
 			const manualPromise = (async (): Promise<CallbackResult> => {
 				while (true) {
-					const result = await Promise.race([
-						callbackPromise,
-						requestManualInput()
-							.then((input): CallbackResult | null => {
-								const parsed = parseCallbackInput(input);
-								if (!parsed.code) return null;
-								if (expectedState && parsed.state && parsed.state !== expectedState) return null;
-								return { code: parsed.code, state: parsed.state ?? "" };
-							})
-							.catch((): CallbackResult | null => null),
-					]);
+					const attempt = requestManualInput().then(parseManualInput);
+					// The losing branch of the race can still reject long after the login
+					// settled (the pending prompt is cleared on teardown); keep that from
+					// surfacing as an unhandled rejection.
+					attempt.catch(() => undefined);
+					// A rejection that arrives first is a cancellation — the prompt was
+					// cleared or superseded — not a bad value. Re-prompting would spin
+					// forever, and with no local listener nothing else can settle this.
+					const result = await Promise.race([callbackPromise, attempt]);
 					if (result) return result;
+					// Yield to the macrotask queue so a handler that immediately resolves
+					// unusable values cannot starve the abort/timeout timer.
+					await Bun.sleep(0);
 				}
 			})();
 

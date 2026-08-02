@@ -201,6 +201,11 @@ const CALLBACK_SERVER_PROVIDERS = new Set<string>([
 
 const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect URL>.";
 
+/** Providers whose authorization server can display a code for `/login <provider> --manual`. */
+const MANUAL_CODE_PROVIDERS = new Set<string>(["anthropic"]);
+
+const MANUAL_CODE_LOGIN_TIP = "Tip: You can complete pairing with /login <code>.";
+
 function isThemePreviewSuperseded(result: { success: boolean; error?: string }): boolean {
 	return !result.success && result.error?.includes("superseded by a newer request") === true;
 }
@@ -2945,7 +2950,14 @@ export class SelectorController {
 		});
 	}
 
-	async #handleOAuthLogin(providerId: string): Promise<void> {
+	async #handleOAuthLogin(providerId: string, options?: OAuthSelectorOptions): Promise<void> {
+		const manualCode = options?.manualCode === true;
+		if (manualCode && !MANUAL_CODE_PROVIDERS.has(providerId)) {
+			this.ctx.showError(
+				`${providerId} has no paste-a-code login. Supported: ${[...MANUAL_CODE_PROVIDERS].join(", ")}.`,
+			);
+			return;
+		}
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
 		const useManualInput = CALLBACK_SERVER_PROVIDERS.has(providerId as OAuthProvider);
@@ -2953,51 +2965,57 @@ export class SelectorController {
 			this.ctx.showStatus("Checking the local OpenCodex proxy…");
 		}
 		try {
-			await this.ctx.session.modelRegistry.authStorage.login(providerId as OAuthProvider, {
-				onAuth: (info: { url: string; instructions?: string }) => {
-					this.ctx.chatContainer.addChild(new Spacer(1));
-					this.ctx.chatContainer.addChild(new Text(theme.fg("dim", info.url), 1, 0));
-					const hyperlink = `\x1b]8;;${info.url}\x07Click here to login\x1b]8;;\x07`;
-					this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
-					if (info.instructions) {
+			await this.ctx.session.modelRegistry.authStorage.login(
+				providerId as OAuthProvider,
+				{
+					onAuth: (info: { url: string; instructions?: string }) => {
 						this.ctx.chatContainer.addChild(new Spacer(1));
-						this.ctx.chatContainer.addChild(new Text(theme.fg("warning", info.instructions), 1, 0));
-					}
-					if (useManualInput) {
+						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", info.url), 1, 0));
+						const hyperlink = `\x1b]8;;${info.url}\x07Click here to login\x1b]8;;\x07`;
+						this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
+						if (info.instructions) {
+							this.ctx.chatContainer.addChild(new Spacer(1));
+							this.ctx.chatContainer.addChild(new Text(theme.fg("warning", info.instructions), 1, 0));
+						}
+						if (useManualInput) {
+							this.ctx.chatContainer.addChild(new Spacer(1));
+							this.ctx.chatContainer.addChild(
+								new Text(theme.fg("dim", manualCode ? MANUAL_CODE_LOGIN_TIP : MANUAL_LOGIN_TIP), 1, 0),
+							);
+						}
+						this.ctx.ui.requestRender();
+						this.ctx.openInBrowser(info.url);
+					},
+					onPrompt: async (prompt: { message: string; placeholder?: string }) => {
 						this.ctx.chatContainer.addChild(new Spacer(1));
-						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", MANUAL_LOGIN_TIP), 1, 0));
-					}
-					this.ctx.ui.requestRender();
-					this.ctx.openInBrowser(info.url);
-				},
-				onPrompt: async (prompt: { message: string; placeholder?: string }) => {
-					this.ctx.chatContainer.addChild(new Spacer(1));
-					this.ctx.chatContainer.addChild(new Text(theme.fg("warning", prompt.message), 1, 0));
-					if (prompt.placeholder) {
-						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", prompt.placeholder), 1, 0));
-					}
-					this.ctx.ui.requestRender();
-					const { promise, resolve } = Promise.withResolvers<string>();
-					const codeInput = new Input();
-					codeInput.onSubmit = () => {
-						const code = codeInput.getValue();
+						this.ctx.chatContainer.addChild(new Text(theme.fg("warning", prompt.message), 1, 0));
+						if (prompt.placeholder) {
+							this.ctx.chatContainer.addChild(new Text(theme.fg("dim", prompt.placeholder), 1, 0));
+						}
+						this.ctx.ui.requestRender();
+						const { promise, resolve } = Promise.withResolvers<string>();
+						const codeInput = new Input();
+						codeInput.onSubmit = () => {
+							const code = codeInput.getValue();
+							this.ctx.editorContainer.clear();
+							this.ctx.editorContainer.addChild(this.ctx.editor);
+							this.ctx.ui.setFocus(this.ctx.editor);
+							resolve(code);
+						};
 						this.ctx.editorContainer.clear();
-						this.ctx.editorContainer.addChild(this.ctx.editor);
-						this.ctx.ui.setFocus(this.ctx.editor);
-						resolve(code);
-					};
-					this.ctx.editorContainer.clear();
-					this.ctx.editorContainer.addChild(codeInput);
-					this.ctx.ui.setFocus(codeInput);
-					this.ctx.ui.requestRender();
-					return promise;
+						this.ctx.editorContainer.addChild(codeInput);
+						this.ctx.ui.setFocus(codeInput);
+						this.ctx.ui.requestRender();
+						return promise;
+					},
+					onProgress: (message: string) => {
+						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", message), 1, 0));
+						this.ctx.ui.requestRender();
+					},
+					onManualCodeInput: useManualInput ? () => manualInput.waitForInput(providerId) : undefined,
 				},
-				onProgress: (message: string) => {
-					this.ctx.chatContainer.addChild(new Text(theme.fg("dim", message), 1, 0));
-					this.ctx.ui.requestRender();
-				},
-				onManualCodeInput: useManualInput ? () => manualInput.waitForInput(providerId) : undefined,
-			});
+				{ manualCode },
+			);
 			await this.ctx.session.modelRegistry.refresh();
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			const successMessage =
@@ -3050,7 +3068,7 @@ export class SelectorController {
 				return;
 			}
 			if (mode === "login") {
-				await this.#handleOAuthLogin(providerId);
+				await this.#handleOAuthLogin(providerId, options);
 			} else {
 				await this.#handleOAuthLogout(providerId);
 			}

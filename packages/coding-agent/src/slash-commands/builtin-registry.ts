@@ -417,6 +417,9 @@ function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: st
 		.join("\n\n");
 }
 
+/** Opt into the paste-a-code OAuth login for browsers that cannot reach this machine. */
+const MANUAL_LOGIN_FLAG = "--manual";
+
 const EFFORT_COMMAND_INPUT_HINT = "[inherit|off|minimal|low|medium|high|xhigh|max]";
 const EFFORT_COMMAND_ACCEPTED_VALUES = ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -1364,20 +1367,45 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "login",
 		description: "Login with OAuth provider",
-		inlineHint: "[provider|redirect URL]",
+		inlineHint: "[provider|redirect URL] [--manual]",
 		allowArgs: true,
 		handleTui: (command, runtime) => {
 			const manualInput = runtime.ctx.oauthManualInput;
 			const args = command.args.trim();
+			const pendingLoginMessage = (): string => {
+				const pendingProvider = manualInput.pendingProviderId;
+				return pendingProvider
+					? `OAuth login already in progress for ${pendingProvider}. Paste the redirect URL with /login <url>.`
+					: "OAuth login already in progress. Paste the redirect URL with /login <url>.";
+			};
 			if (args.length > 0) {
+				const tokens = args.split(/\s+/);
+				// `--manual` is resolved before the paste fallback below, otherwise
+				// `/login anthropic --manual` would be submitted as an authorization code.
+				if (tokens.includes(MANUAL_LOGIN_FLAG)) {
+					const rest = tokens.filter(token => token !== MANUAL_LOGIN_FLAG);
+					const requestedProvider = rest.length === 1 ? rest[0] : undefined;
+					const manualProvider = requestedProvider
+						? getOAuthProviders().find(provider => provider.id === requestedProvider)
+						: undefined;
+					if (!manualProvider) {
+						runtime.ctx.showWarning(`Usage: /login <provider> ${MANUAL_LOGIN_FLAG}`);
+						runtime.ctx.editor.setText("");
+						return;
+					}
+					if (manualInput.hasPending()) {
+						runtime.ctx.showWarning(pendingLoginMessage());
+						runtime.ctx.editor.setText("");
+						return;
+					}
+					void runtime.ctx.showOAuthSelector("login", manualProvider.id, { manualCode: true });
+					runtime.ctx.editor.setText("");
+					return;
+				}
 				const matchedProvider = getOAuthProviders().find(provider => provider.id === args);
 				if (matchedProvider) {
 					if (manualInput.hasPending()) {
-						const pendingProvider = manualInput.pendingProviderId;
-						const message = pendingProvider
-							? `OAuth login already in progress for ${pendingProvider}. Paste the redirect URL with /login <url>.`
-							: "OAuth login already in progress. Paste the redirect URL with /login <url>.";
-						runtime.ctx.showWarning(message);
+						runtime.ctx.showWarning(pendingLoginMessage());
 						runtime.ctx.editor.setText("");
 						return;
 					}
@@ -1396,11 +1424,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 
 			if (manualInput.hasPending()) {
-				const provider = manualInput.pendingProviderId;
-				const message = provider
-					? `OAuth login already in progress for ${provider}. Paste the redirect URL with /login <url>.`
-					: "OAuth login already in progress. Paste the redirect URL with /login <url>.";
-				runtime.ctx.showWarning(message);
+				runtime.ctx.showWarning(pendingLoginMessage());
 				runtime.ctx.editor.setText("");
 				return;
 			}
