@@ -1290,7 +1290,9 @@ describe("TUI terminal-state regressions", () => {
 					// The insertion must not push a second copy of the committed FILL rows
 					// into scrollback, and the new block must not be emitted twice.
 					expect(countMatches(scrollback, /^FILL$/)).toBe(2);
-					expect(countMatches(scrollback, /^block-new-0$/)).toBeLessThanOrEqual(1);
+					// A full render replays the frame, so it must reconstruct the block
+					// exactly once; a viewport repaint paints it into the live region.
+					expect(countMatches(scrollback, /^block-new-0$/)).toBe(isProcessTerminal ? 0 : 1);
 					// A viewport repaint cannot retract the already committed stale row, but
 					// it must never remain visible alongside its replacement.
 					expect(visible(term)).toEqual(rows("old-", 5));
@@ -1302,9 +1304,9 @@ describe("TUI terminal-state regressions", () => {
 		}
 
 		// Repeated and blank rows make byte identity ambiguous, so an off-screen
-		// insertion can leave the frontier row, or a majority of rows, looking
-		// unmoved. Each case duplicates a committed row unless the alignment
-		// tolerance rejects it.
+		// insertion can leave the frontier row, a majority of rows, or every row it
+		// is measured against looking unmoved. Each case duplicates a committed row
+		// unless the displaced run is detected at its own offset.
 		const ambiguousShiftCases = [
 			{
 				id: "a run of identical rows spans the frontier",
@@ -1327,6 +1329,25 @@ describe("TUI terminal-state regressions", () => {
 				duplicated: /^p4$/,
 				limit: 1,
 			},
+			{
+				// Every measured row matches at its own index, so an alignment count
+				// finds nothing wrong even though the frontier row moved.
+				id: "the displaced rows below the frontier are identical",
+				before: ["p0", "p1", "p2", "p3", "X", "A", "A", "A", "A", "A"],
+				after: ["p0", "p1", "INSERT", "p2", "p3", "X", "A", "A", "A", "A", "A"],
+				duplicated: /^X$/,
+				limit: 1,
+				appended: false,
+			},
+			{
+				// The append is larger than the visible region, so a tolerance scaled to
+				// the growth would permit the frame with no evidence at all.
+				id: "the append is larger than the visible region",
+				before: ["p0", "p1", "p2", "p3", "X", "A", "B", "C", "D", "E"],
+				after: ["p0", "I", "p1", "p2", "p3", "X", "A", "B", "C", "D", "E", "Q0", "Q1", "Q2", "APPEND"],
+				duplicated: /^X$/,
+				limit: 1,
+			},
 		];
 		for (const ambiguous of ambiguousShiftCases) {
 			for (const isProcessTerminal of [false, true]) {
@@ -1346,13 +1367,45 @@ describe("TUI terminal-state regressions", () => {
 
 						const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
 						expect(countMatches(scrollback, ambiguous.duplicated)).toBeLessThanOrEqual(ambiguous.limit);
-						expect(countMatches(scrollback, /^APPEND$/)).toBe(1);
+						if (ambiguous.appended !== false) expect(countMatches(scrollback, /^APPEND$/)).toBe(1);
 						expect(visible(term)).toEqual(ambiguous.after.slice(-5));
 					} finally {
 						tui.stop();
 					}
 				});
 			}
+		}
+
+		for (const isProcessTerminal of [false, true]) {
+			it(`still commits when every visible row is rewritten in place (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// Nothing moves here: the off-screen row and all five visible rows are
+				// substituted while one row is appended. Rejecting this as "unaligned"
+				// would repaint and silently drop the first replacement row.
+				const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(["status-0", ...rows("A", 5)]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines(["status-1", "B0", "B1", "B2", "B3", "A4", "APP"]);
+					tui.requestRender();
+					await settle(term);
+					component.setLines(["status-1", "B0", "B1", "B2", "B3", "A4", "APP", "TAIL"]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					for (const row of ["B0", "B1", "APP"]) {
+						expect(countMatches(scrollback, new RegExp(`^${row}$`)), `${row} exactly once`).toBe(1);
+					}
+					expect(visible(term)).toEqual(["B2", "B3", "A4", "APP", "TAIL"]);
+				} finally {
+					tui.stop();
+				}
+			});
 		}
 
 		it("still commits appended rows when an off-screen boundary row is substituted", async () => {

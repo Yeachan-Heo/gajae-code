@@ -4134,32 +4134,35 @@ export class TUI extends Container {
 		// the mutated off-screen prefix; the latest frame is updated below so each
 		// appended row is emitted exactly once.
 		if (firstChanged < prevViewportTop && appendedLines) {
-			// A same-length substitution above the viewport (a streaming status line,
-			// say) leaves every later row at its original index, so the visible suffix
-			// can still be committed. Growth *inside* the off-screen prefix instead
-			// shifts committed content down across the scrollback frontier: the rows
-			// this frame would commit already sit in native scrollback under their old
+			// A substitution above the viewport (a streaming status line, say) leaves
+			// every later row at its original index, so the visible suffix can still be
+			// committed. An insertion *inside* the off-screen prefix instead displaces
+			// committed content down across the scrollback frontier: the rows this
+			// frame would commit already sit in native scrollback under their old
 			// index, so emitting them appends a second copy — a pending tool block
 			// stranded above its own completed copy, with the rows between duplicated.
 			//
-			// Rendered bytes cannot prove which logical row moved: a substitution
-			// changes a row without moving anything, and an insertion moves everything
-			// without necessarily changing any particular row's bytes (repeated
-			// separators, blank rows). So require positive evidence that nothing moved
-			// rather than trying to detect movement. Appending `shift` rows can
-			// legitimately displace at most the last `shift` previously visible rows;
-			// every other previously visible row must still be byte-equal at its own
-			// index. Anything less means the frame no longer lines up with what native
-			// scrollback already holds, and only a repaint can be trusted.
+			// Rendered bytes carry no row identity, so neither a single row nor an
+			// aggregate match count can tell the two apart: a substitution changes rows
+			// without moving anything, and an insertion moves everything without
+			// necessarily changing any given row (repeated separators, blank rows).
+			// What does distinguish them is that a displacement moves the whole visible
+			// region by one uniform offset. Look for that offset: if the previously
+			// visible rows reappear almost intact `offset` rows lower, they were pushed
+			// across the frontier and the suffix must not be re-emitted. Rows merely
+			// rewritten in place produce no such run at any offset, so they still
+			// commit. `offset` is bounded by the visible region, which is bounded by
+			// the terminal height.
 			const shift = newLines.length - this.#previousLines.length;
-			if (shift > 0 && prevViewportTop > diffStart) {
-				const visibleRows = this.#previousLines.length - prevViewportTop;
-				let alignedRows = 0;
-				for (let i = prevViewportTop; i < this.#previousLines.length; i++) {
-					if (this.#previousLines[i] === newLines[i]) alignedRows += 1;
-				}
-				if (alignedRows < visibleRows - shift) {
-					const reason = `offscreen growth unaligned committed rows (${firstChanged} < ${prevViewportTop}, aligned=${alignedRows}/${visibleRows}, shift=${shift})`;
+			const visibleRows = this.#previousLines.length - prevViewportTop;
+			if (shift > 0 && prevViewportTop > diffStart && visibleRows > 1) {
+				for (let offset = 1; offset <= Math.min(shift, visibleRows - 1); offset++) {
+					let displacedRows = 0;
+					for (let i = prevViewportTop; i < this.#previousLines.length; i++) {
+						if (this.#previousLines[i] === newLines[i + offset]) displacedRows += 1;
+					}
+					if (displacedRows < visibleRows - offset) continue;
+					const reason = `offscreen insertion displaced committed rows (${firstChanged} < ${prevViewportTop}, offset=${offset}/${visibleRows})`;
 					logRedraw(reason);
 					if (useViewportRepaintPath) viewportRepaint(reason);
 					else fullRender(true, reason);
