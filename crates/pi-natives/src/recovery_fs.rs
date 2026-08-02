@@ -2104,59 +2104,60 @@ fn rename_managed_file_no_replace_inner(
 		move || drop(source_file),
 	);
 	let primitive = result.map_err(retained_file_publish_error)?;
-	let post_mutation = (|| -> Result<RecoveryFsResult, RetainedPublishError> {
-		// The namespace mutation is authoritative immediately after renameat2 returns
-		// success. Every following failure is therefore committed-but-unproven.
-		let moved_file =
-			open_existing(root, destination, false).map_err(|_| "rollback_unavailable")?;
-		crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
-			.map_err(|_| "rollback_unavailable")?;
-		let moved = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
-		if !same_expected_after_rename(&moved_file, dev, ino, size, mtime_ns, sha256)
-			.map_err(|_| "rollback_unavailable")?
-		{
-			return Err("rollback_unavailable".into());
-		}
-		let terminal =
-			statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
-		if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
-			return Err("rollback_unavailable".into());
-		}
-		let source_parent_identity = identity(&source_parent).map_err(|_| "rollback_unavailable")?;
-		let destination_parent_identity =
-			identity(&destination_parent).map_err(|_| "rollback_unavailable")?;
-		sync_distinct_parents(
-			&source_parent,
-			&destination_parent,
-			source_parent_identity.dev == destination_parent_identity.dev
-				&& source_parent_identity.ino == destination_parent_identity.ino,
-		)?;
-		let after = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
-		let named_after =
-			statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
-		crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
-			.map_err(|_| "rollback_unavailable")?;
-		let after_digest = digest_hex(&moved_file).map_err(|_| "rollback_unavailable")?;
-		if after.dev != moved.dev
-			|| after.ino != moved.ino
-			|| after.size != moved.size
-			|| after.mtime_ns != moved.mtime_ns
-			|| after.ctime_ns != moved.ctime_ns
-			|| after_digest != sha256
-			|| named_after.st_dev.to_string() != moved.dev
-			|| named_after.st_ino.to_string() != moved.ino
-			|| named_after.st_nlink != 1
-			|| (named_after.st_size as u64).to_string() != moved.size
-			|| stat_mtime_ns(&named_after).to_string() != moved.mtime_ns
-			|| stat_ctime_ns(&named_after).to_string() != moved.ctime_ns
-		{
-			return Err("rollback_unavailable".into());
-		}
-		Ok(RecoveryFsResult::success(moved))
-	})();
-	post_mutation
-		.map(|result| RetainedPublishSuccess { result, primitive })
-		.map_err(|error| bind_post_mutation_error(error, primitive))
+	// The namespace mutation is authoritative immediately after renameat2 returns
+	// success. Every following failure is therefore committed-but-unproven.
+	let post_mutation_code = |code| RetainedPublishError::PostMutationCode { code, primitive };
+	let moved_file = open_existing(root, destination, false)
+		.map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
+		.map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	let moved =
+		regular_identity(&moved_file).map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	if !same_expected_after_rename(&moved_file, dev, ino, size, mtime_ns, sha256)
+		.map_err(|_| post_mutation_code("rollback_unavailable"))?
+	{
+		return Err(post_mutation_code("rollback_unavailable"));
+	}
+	let terminal = statat(&destination_parent, &destination_name)
+		.map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
+		return Err(post_mutation_code("rollback_unavailable"));
+	}
+	let source_parent_identity =
+		identity(&source_parent).map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	let destination_parent_identity =
+		identity(&destination_parent).map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	sync_distinct_parents(
+		&source_parent,
+		&destination_parent,
+		source_parent_identity.dev == destination_parent_identity.dev
+			&& source_parent_identity.ino == destination_parent_identity.ino,
+	)
+	.map_err(|error| bind_post_mutation_error(error, primitive))?;
+	let after =
+		regular_identity(&moved_file).map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	let named_after = statat(&destination_parent, &destination_name)
+		.map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
+		.map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	let after_digest =
+		digest_hex(&moved_file).map_err(|_| post_mutation_code("rollback_unavailable"))?;
+	if after.dev != moved.dev
+		|| after.ino != moved.ino
+		|| after.size != moved.size
+		|| after.mtime_ns != moved.mtime_ns
+		|| after.ctime_ns != moved.ctime_ns
+		|| after_digest != sha256
+		|| named_after.st_dev.to_string() != moved.dev
+		|| named_after.st_ino.to_string() != moved.ino
+		|| named_after.st_nlink != 1
+		|| (named_after.st_size as u64).to_string() != moved.size
+		|| stat_mtime_ns(&named_after).to_string() != moved.mtime_ns
+		|| stat_ctime_ns(&named_after).to_string() != moved.ctime_ns
+	{
+		return Err(post_mutation_code("rollback_unavailable"));
+	}
+	Ok(RetainedPublishSuccess { result: RecoveryFsResult::success(moved), primitive })
 }
 
 #[cfg(target_os = "linux")]
@@ -2517,33 +2518,29 @@ fn install_inner(
 		move || drop(source_file),
 	);
 	let primitive = result.map_err(retained_file_publish_error)?;
-	let post_mutation = (|| -> Result<RecoveryFsResult, RetainedPublishError> {
-		// The rename has committed; all following verification failures are durability
-		// proof failures, never a new pre-mutation classification.
-		let installed =
-			open_existing(root, destination, false).map_err(|_| "post_mutation_identity_mismatch")?;
-		let installed_identity =
-			regular_identity(&installed).map_err(|_| "post_mutation_identity_mismatch")?;
-		if installed_identity.dev != source_identity.dev
-			|| installed_identity.ino != source_identity.ino
-		{
-			return Err("post_mutation_identity_mismatch".into());
-		}
-		let source_parent_identity =
-			identity(&source_parent).map_err(|_| "post_mutation_identity_mismatch")?;
-		let destination_parent_identity =
-			identity(&destination_parent).map_err(|_| "post_mutation_identity_mismatch")?;
-		sync_distinct_parents(
-			&source_parent,
-			&destination_parent,
-			source_parent_identity.dev == destination_parent_identity.dev
-				&& source_parent_identity.ino == destination_parent_identity.ino,
-		)?;
-		Ok(RecoveryFsResult::success(installed_identity))
-	})();
-	post_mutation
-		.map(|result| RetainedPublishSuccess { result, primitive })
-		.map_err(|error| bind_post_mutation_error(error, primitive))
+	// The rename has committed; all following verification failures are durability
+	// proof failures, never a new pre-mutation classification.
+	let post_mutation_code = |code| RetainedPublishError::PostMutationCode { code, primitive };
+	let installed = open_existing(root, destination, false)
+		.map_err(|_| post_mutation_code("post_mutation_identity_mismatch"))?;
+	let installed_identity = regular_identity(&installed)
+		.map_err(|_| post_mutation_code("post_mutation_identity_mismatch"))?;
+	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino
+	{
+		return Err(post_mutation_code("post_mutation_identity_mismatch"));
+	}
+	let source_parent_identity = identity(&source_parent)
+		.map_err(|_| post_mutation_code("post_mutation_identity_mismatch"))?;
+	let destination_parent_identity = identity(&destination_parent)
+		.map_err(|_| post_mutation_code("post_mutation_identity_mismatch"))?;
+	sync_distinct_parents(
+		&source_parent,
+		&destination_parent,
+		source_parent_identity.dev == destination_parent_identity.dev
+			&& source_parent_identity.ino == destination_parent_identity.ino,
+	)
+	.map_err(|error| bind_post_mutation_error(error, primitive))?;
+	Ok(RetainedPublishSuccess { result: RecoveryFsResult::success(installed_identity), primitive })
 }
 
 #[cfg(target_os = "linux")]
