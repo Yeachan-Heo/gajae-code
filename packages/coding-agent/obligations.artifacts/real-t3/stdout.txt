@@ -6,5 +6,5 @@ src/app-server/__tests__/e2e/real-client-t3.test.ts:
 
  1 pass
  0 fail
- 58 expect() calls
+ 57 expect() calls
 Ran 1 test across 1 file. <duration>
