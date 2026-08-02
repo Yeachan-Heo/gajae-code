@@ -48,6 +48,7 @@ export * from "./utils/h2-fetch";
 export * from "./utils/oauth";
 export type {
 	OAuthCredentials,
+	OAuthLoginOptions,
 	OAuthProvider,
 	OAuthProviderId,
 	OAuthProviderInfo,

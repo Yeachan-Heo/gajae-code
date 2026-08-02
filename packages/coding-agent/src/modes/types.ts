@@ -495,4 +495,10 @@ export interface OAuthSelectorOptions {
 	allowExternalCredentialDiscovery?: boolean;
 	trigger?: "bare-login";
 	externalCredentialDiscover?: CredentialAutoImportOptions["discover"];
+	/**
+	 * Pair by pasting the code the provider displays instead of waiting on the
+	 * loopback callback. Set by `/login <provider> --manual` for browsers that
+	 * cannot reach this machine.
+	 */
+	manualCode?: boolean;
 }

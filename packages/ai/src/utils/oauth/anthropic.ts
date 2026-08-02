@@ -1,7 +1,7 @@
 /**
  * Anthropic OAuth flow (Anthropic model Pro/Max)
  */
-import { OAuthCallbackFlow } from "./callback-server";
+import { OAuthCallbackFlow, type OAuthCallbackFlowOptions } from "./callback-server";
 import { generatePKCE } from "./pkce";
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -11,6 +11,17 @@ const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const TOKEN_URL = "https://api.anthropic.com/v1/oauth/token";
 const CALLBACK_PORT = 54545;
 const CALLBACK_PATH = "/callback";
+/**
+ * Redirect target for the paste-a-code login. Anthropic renders the
+ * authorization code on this page instead of redirecting into this machine, so
+ * a gjc running over SSH, in a container, or on a headless box can be paired
+ * from a browser that has no route back to `localhost:54545`.
+ *
+ * Deliberately a hard-coded constant rather than an env/config override: this
+ * is where the authorization code is delivered, so making it injectable would
+ * turn any writable environment into an auth-code exfiltration channel.
+ */
+export const ANTHROPIC_MANUAL_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
 const SCOPES = "org:create_api_key user:profile user:inference";
 
 function formatErrorDetails(error: unknown): string {
@@ -91,12 +102,30 @@ function extractAccountFromTokenResponse(data: AnthropicTokenResponse): {
 	};
 }
 
+export interface AnthropicOAuthFlowOptions {
+	/**
+	 * Pair by pasting the code Anthropic displays instead of waiting on a local
+	 * `localhost:54545` callback. Use when the browser completing the login has
+	 * no network route back to the machine running gjc.
+	 */
+	manualCode?: boolean;
+}
+
 export class AnthropicOAuthFlow extends OAuthCallbackFlow {
 	#verifier: string = "";
 	#challenge: string = "";
+	readonly #manualCode: boolean;
 
-	constructor(ctrl: OAuthController) {
-		super(ctrl, CALLBACK_PORT, CALLBACK_PATH);
+	constructor(ctrl: OAuthController, options: AnthropicOAuthFlowOptions = {}) {
+		const manualCode = options.manualCode === true;
+		const flowOptions: OAuthCallbackFlowOptions = {
+			preferredPort: CALLBACK_PORT,
+			callbackPath: CALLBACK_PATH,
+			redirectUri: manualCode ? ANTHROPIC_MANUAL_REDIRECT_URI : undefined,
+			skipCallbackServer: manualCode,
+		};
+		super(ctrl, flowOptions);
+		this.#manualCode = manualCode;
 	}
 
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string; instructions?: string }> {
@@ -118,8 +147,9 @@ export class AnthropicOAuthFlow extends OAuthCallbackFlow {
 
 		return {
 			url,
-			instructions:
-				"Complete login in your browser. If the browser cannot reach this machine, paste the final redirect URL or authorization code when prompted.",
+			instructions: this.#manualCode
+				? "Complete login in your browser. Anthropic will show an authorization code — paste it here."
+				: "Complete login in your browser. If the browser cannot reach this machine, paste the final redirect URL or authorization code when prompted. To pair by code instead, cancel this login and run /login anthropic --manual.",
 		};
 	}
 
@@ -167,8 +197,11 @@ export class AnthropicOAuthFlow extends OAuthCallbackFlow {
 /**
  * Login with Anthropic OAuth
  */
-export async function loginAnthropic(ctrl: OAuthController): Promise<OAuthCredentials> {
-	const flow = new AnthropicOAuthFlow(ctrl);
+export async function loginAnthropic(
+	ctrl: OAuthController,
+	options: AnthropicOAuthFlowOptions = {},
+): Promise<OAuthCredentials> {
+	const flow = new AnthropicOAuthFlow(ctrl, options);
 	return flow.login();
 }
 
