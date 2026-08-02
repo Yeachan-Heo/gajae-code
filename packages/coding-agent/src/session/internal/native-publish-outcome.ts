@@ -16,6 +16,8 @@ export type NativePublishOperation = "direct_rename" | "retained_file" | "retain
 
 export type NativePublishPrimitive =
 	| "renameat2_noreplace"
+	| "linkat_noreplace"
+	| "mkdirat_renameat_noreplace"
 	| "renameatx_np_excl"
 	| "windows_rename_noreplace"
 	| "unsupported"
@@ -83,6 +85,8 @@ const reasons = new Set<NativePublishReason>([
 ]);
 const primitives = new Set<NativePublishPrimitive>([
 	"renameat2_noreplace",
+	"linkat_noreplace",
+	"mkdirat_renameat_noreplace",
 	"renameatx_np_excl",
 	"windows_rename_noreplace",
 	"unsupported",
@@ -247,8 +251,12 @@ export function classifyNativePublishOutcome(
 	const outcome = value as unknown as NativePublishOutcome;
 	if (!legalOutcome(outcome)) return malformed;
 	if (operation === "direct_rename") return outcome;
+	const retainedPrimitiveValid =
+		operation === "retained_file"
+			? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "linkat_noreplace"
+			: outcome.primitive === "renameat2_noreplace" || outcome.primitive === "mkdirat_renameat_noreplace";
 	if (
-		outcome.primitive !== "renameat2_noreplace" ||
+		!retainedPrimitiveValid ||
 		(outcome.ok && (!outcome.identity || outcome.durabilityState !== "proven" || outcome.phase !== "complete"))
 	)
 		return malformed;
