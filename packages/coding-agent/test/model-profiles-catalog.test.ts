@@ -343,9 +343,9 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["alibaba-token-plan"],
 		mapping: {
 			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
-			executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
 			planner: "alibaba-token-plan/glm-5.2:high",
-			critic: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 		},
 	},
@@ -570,7 +570,7 @@ describe("built-in model profile catalog", () => {
 		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.k3).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
 		expect(
-			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-pro"],
+			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-flash-0731"],
 		).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["glm-5.2"]).toBeDefined();
 		expect(
@@ -668,9 +668,9 @@ describe("built-in model profile catalog", () => {
 	test("Alibaba Token Plan profiles route their intended roles", () => {
 		expect(builtinMapping("alibaba-token-plan-balanced")).toEqual({
 			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
-			executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
 			planner: "alibaba-token-plan/glm-5.2:high",
-			critic: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 		});
 		expect(builtinMapping("alibaba-token-plan-qwenmaxxing")).toEqual({

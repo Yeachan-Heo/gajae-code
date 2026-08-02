@@ -5,6 +5,10 @@
 
 - Added the paginated public SDK query `providers.list/active` (Q29), returning deterministic, deduplicated `{ provider, connectionKind }` descriptors for locally eligible providers without exposing credentials or performing remote health probes.
 
+### Changed
+
+- The built-in Alibaba Token Plan Balanced profile now uses `deepseek-v4-flash-0731:max` for execution and `glm-5.2:xhigh` for criticism, backed by a public benchmark note and official agent-evaluation results.
+
 ### Added
 
 - Notification settings now expose first-class Telegram, Discord, and Slack configuration, desired-intent toggles, provider-local quarantine and repair guidance, explicit `keep | replace | remove` secret actions, provider-specific health/test diagnostics, and truthful saved-but-runtime-degraded outcomes. The global master preserves provider credentials and intent, `GJC_NOTIFICATIONS=0` suppresses only automatic generic-session admission, and blocked Telegram ownership uses an isolated chat-only endpoint so verified Discord or Slack siblings can continue without exposing the shared endpoint.

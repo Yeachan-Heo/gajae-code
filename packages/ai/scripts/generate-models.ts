@@ -111,6 +111,34 @@ export function injectImageGenerationModels(models: Model[]): void {
 	}
 }
 
+/**
+ * Keep the Alibaba Token Plan executor model available when authenticated
+ * catalog discovery is unavailable during generation.
+ */
+export function injectAlibabaTokenPlanModels(models: Model[]): void {
+	const metadata: Model<"openai-completions"> = {
+		id: "deepseek-v4-flash-0731",
+		name: "DeepSeek V4 Flash 0731",
+		api: "openai-completions",
+		provider: "alibaba-token-plan",
+		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		compat: { supportsDeveloperRole: false },
+	};
+	const existing = models.find(
+		model => model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731",
+	);
+	if (existing) {
+		Object.assign(existing, metadata);
+		return;
+	}
+	models.push(metadata);
+}
+
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
 		const value = $env[envVar as keyof typeof $env];
@@ -497,6 +525,7 @@ async function generateModels() {
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyClaudeOpusVisionCorrections(allModels);
+	injectAlibabaTokenPlanModels(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);
 	injectImageGenerationModels(allModels);

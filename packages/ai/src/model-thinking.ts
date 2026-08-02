@@ -51,6 +51,7 @@ const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effo
 const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
 const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -198,7 +199,12 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
  */
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
-		const model = refreshModelThinking(models[index]!);
+		const source = models[index]!;
+		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
+			source.reasoning = true;
+			source.name = "DeepSeek V4 Flash 0731";
+		}
+		const model = refreshModelThinking(source);
 		applyGeneratedModelPolicy(model);
 		models[index] = model;
 	}
@@ -437,6 +443,17 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	if (model.provider === "zai" && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
 	}
+	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+		model.contextWindow = 1_000_000;
+		model.maxTokens = 384_000;
+		model.compat = {
+			...(model.compat ?? {}),
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			reasoningContentField: "reasoning_content",
+			requiresReasoningContentForToolCalls: true,
+		};
+	}
 	// MiniMax-M3: MiniMax exposes a 1M context tier, but usage beyond 512K is
 	// billed separately. Keep bundled/default metadata at the billing-safe 512K
 	// unless an explicit paid-tier contract is added.
@@ -616,6 +633,9 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return KIMI_K3_EFFORTS;
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+		return DEEPSEEK_V4_FLASH_0731_EFFORTS;
 	}
 	switch (parsedModel.family) {
 		case "openai":

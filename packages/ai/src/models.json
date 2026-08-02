@@ -1,5 +1,40 @@
 {
 	"alibaba-token-plan": {
+		"deepseek-v4-flash-0731": {
+			"id": "deepseek-v4-flash-0731",
+			"name": "DeepSeek V4 Flash 0731",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 384000,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
+			}
+		},
 		"deepseek-v4-pro": {
 			"id": "deepseek-v4-pro",
 			"name": "DeepSeek V4 Pro",

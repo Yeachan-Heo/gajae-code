@@ -42,7 +42,7 @@ function captureResponsesPayload(
 
 function captureCompletionsPayload(
 	model: Model<"openai-completions">,
-	reasoning: "high" | "xhigh",
+	reasoning: "high" | "xhigh" | "max",
 ): Promise<Record<string, unknown>> {
 	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
 	streamOpenAICompletions(model, testContext, {
@@ -56,7 +56,7 @@ function captureCompletionsPayload(
 
 const qwen = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
 const glm = getBundledModel("alibaba-token-plan", "glm-5.2") as Model<"openai-completions">;
-const deepseek = getBundledModel("alibaba-token-plan", "deepseek-v4-pro") as Model<"openai-completions">;
+const deepseek = getBundledModel("alibaba-token-plan", "deepseek-v4-flash-0731") as Model<"openai-completions">;
 
 describe("Alibaba Token Plan reasoning request parameters", () => {
 	it("resolves only the documented Alibaba Token Plan credential environment variable", () => {
@@ -81,8 +81,8 @@ describe("Alibaba Token Plan reasoning request parameters", () => {
 		expect(payload.thinking).toBeUndefined();
 	});
 
-	it("maps xhigh to max for DeepSeek V4 Pro Completions via the DeepSeek-family effort map", async () => {
-		const payload = await captureCompletionsPayload(deepseek, "xhigh");
+	it("sends max for DeepSeek V4 Flash 0731 Completions", async () => {
+		const payload = await captureCompletionsPayload(deepseek, "max");
 
 		expect(payload.reasoning_effort).toBe("max");
 		expect(payload.thinking).toBeUndefined();
