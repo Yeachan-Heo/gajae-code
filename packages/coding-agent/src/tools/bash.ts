@@ -982,8 +982,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 		}
 
+		const activeModel = this.session.model;
 		const composerPolicy = checkComposerBashPolicy({
-			modelId: this.session.getActiveModelString?.() ?? this.session.getModelString?.() ?? this.session.model?.id,
+			modelId: this.session.getActiveModelString?.() ?? this.session.getModelString?.() ?? activeModel?.id,
+			provider: activeModel?.provider,
 			commands: rawCommand === command ? [command] : [rawCommand, command],
 		});
 		if (!composerPolicy.allowed) {

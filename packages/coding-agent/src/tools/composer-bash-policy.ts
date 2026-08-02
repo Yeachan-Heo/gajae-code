@@ -1,7 +1,11 @@
-import { isComposerHarnessModel } from "@gajae-code/ai/providers/composer-discipline";
+import {
+	type ComposerBashPolicyToolSurface,
+	formatComposerBashPolicyError,
+	isComposerHarnessModel,
+} from "@gajae-code/ai/providers/composer-discipline";
 
-export const COMPOSER_BASH_POLICY_ERROR =
-	"Composer bash policy blocked repository file I/O. Use find, search, read, and edit tools for file discovery, file inspection, and file mutation.";
+export const COMPOSER_BASH_POLICY_ERROR = formatComposerBashPolicyError("generic");
+export const CURSOR_COMPOSER_BASH_POLICY_ERROR = formatComposerBashPolicyError("cursor");
 
 type ComposerBashPolicyResult =
 	| { allowed: true }
@@ -9,6 +13,7 @@ type ComposerBashPolicyResult =
 			allowed: false;
 			reason: string;
 			message: string;
+			surface: ComposerBashPolicyToolSurface;
 	  };
 
 const BLOCK_PATTERNS: Array<{ id: string; pattern: RegExp }> = [
@@ -77,19 +82,30 @@ export function isComposerBashPolicyModel(modelId: string | undefined): boolean 
 	return Boolean(modelId && isComposerHarnessModel(modelId));
 }
 
+export function resolveComposerBashPolicyToolSurface(input: {
+	modelId?: string;
+	provider?: string;
+}): ComposerBashPolicyToolSurface {
+	if (input.provider?.toLowerCase() === "cursor") return "cursor";
+	return /(?:^|[/:._-])cursor(?:[/:._-]|$)/i.test(input.modelId ?? "") ? "cursor" : "generic";
+}
+
 export function checkComposerBashPolicy(input: {
 	modelId?: string;
+	provider?: string;
 	commands: readonly string[];
 }): ComposerBashPolicyResult {
 	if (!isComposerBashPolicyModel(input.modelId)) return { allowed: true };
+	const surface = resolveComposerBashPolicyToolSurface(input);
+	const message = formatComposerBashPolicyError(surface);
 	for (const command of input.commands) {
 		for (const block of BLOCK_PATTERNS) {
 			if (block.pattern.test(command)) {
-				return { allowed: false, reason: block.id, message: COMPOSER_BASH_POLICY_ERROR };
+				return { allowed: false, reason: block.id, message, surface };
 			}
 		}
 		if (!isAllowedComposerTerminalCommand(command)) {
-			return { allowed: false, reason: "not-allowlisted", message: COMPOSER_BASH_POLICY_ERROR };
+			return { allowed: false, reason: "not-allowlisted", message, surface };
 		}
 	}
 	return { allowed: true };

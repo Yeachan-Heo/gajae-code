@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Composer shell-policy failures now expose a stable structured marker plus provider-specific recovery guidance, while retaining recognition of prefix-only errors from older sessions. Cursor Composer requests use a native `read`/`grep`/`write`/`delete` discipline prompt rather than the generic hashline-tool vocabulary.
 - Alibaba Token Plan streams now allow 600 seconds for the first semantic event, matching observed long-context TTFT above the previous 300-second cutoff. The outer lazy watchdog and both OpenAI transports share one provider fallback; OpenAI Completions also applies it before response headers, and Alibaba SDK connection timeouts from that pre-stream phase are normalized to the typed first-event failure so session retry policy does not replay the request as an unknown timeout.
 
 ## [0.12.8] - 2026-08-02

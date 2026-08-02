@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Composer repository-file shell policy rejections now receive one bounded, tool-enabled recovery turn without persisting the synthetic instruction. Generic loops retain their repository tools with `toolChoice: auto`; Cursor remote turns continue only when native tools did not already recover, queued user follow-ups take priority, and a second policy block terminates instead of looping. Existing malformed-tool recovery remains tool-free and does not consume dynamic tool-choice state.
+
 ## [0.12.8] - 2026-08-02
 
 ## [0.12.7] - 2026-07-31

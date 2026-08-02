@@ -20,6 +20,10 @@ import {
 	type ToolChoice,
 	type ToolResultMessage,
 } from "@gajae-code/ai";
+import {
+	CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
+	isComposerBashPolicyBlockedError,
+} from "@gajae-code/ai/providers/composer-discipline";
 import { extractHttpStatusFromError } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
@@ -65,6 +69,20 @@ function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[
 			.join("\n");
 		assertImagePlaceholdersHavePayload(text, content);
 	}
+}
+
+const CURSOR_NATIVE_REPOSITORY_RECOVERY_TOOL_NAMES = new Set(["read", "grep", "search", "find", "write", "delete"]);
+
+function isCursorComposerBashPolicyBlockedResult(message: ToolResultMessage): boolean {
+	return (
+		message.isError &&
+		message.toolName === "bash" &&
+		message.content.some(content => content.type === "text" && isComposerBashPolicyBlockedError(content.text))
+	);
+}
+
+function isSuccessfulCursorNativeRepositoryToolResult(message: ToolResultMessage): boolean {
+	return message.isError !== true && CURSOR_NATIVE_REPOSITORY_RECOVERY_TOOL_NAMES.has(message.toolName);
 }
 
 /**
@@ -1488,6 +1506,11 @@ export class Agent {
 			messages: this.#state.messages.slice(),
 			tools: this.#state.tools,
 		};
+		// Cursor can execute native tools inside one remote turn, then return
+		// `turnEnded` without another model request. Remember a Composer policy
+		// rejection until the loop reaches that safe continuation boundary.
+		let cursorComposerBashRecoveryPending = false;
+		let cursorComposerBashRecoveryAttempted = false;
 
 		const cursorOnToolResult =
 			!fallbackManaged && (this.#cursorExecHandlers || this.#cursorOnToolResult)
@@ -1506,6 +1529,16 @@ export class Agent {
 									finalMessage = updated;
 								}
 							} catch {}
+						}
+						if (isCursorComposerBashPolicyBlockedResult(finalMessage)) {
+							cursorComposerBashRecoveryPending = true;
+						} else if (
+							cursorComposerBashRecoveryPending &&
+							isSuccessfulCursorNativeRepositoryToolResult(finalMessage)
+						) {
+							// The same remote turn already replanned through a native tool,
+							// so do not create a redundant local continuation afterward.
+							cursorComposerBashRecoveryPending = false;
 						}
 						// Cursor executes tools server-side during streaming, so the assistant message
 						// already incorporates results. We buffer here and emit in correct order
@@ -1651,6 +1684,23 @@ export class Agent {
 					return [];
 				}
 				return queued;
+			},
+			getSyntheticRecoveryMessage: async () => {
+				if (
+					this.#activeRunId !== runId ||
+					!cursorComposerBashRecoveryPending ||
+					cursorComposerBashRecoveryAttempted
+				) {
+					return undefined;
+				}
+				cursorComposerBashRecoveryPending = false;
+				cursorComposerBashRecoveryAttempted = true;
+				return {
+					role: "user",
+					content: CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
+					synthetic: true,
+					timestamp: Date.now(),
+				};
 			},
 			onBeforeYield: async () => {
 				if (this.#activeRunId !== runId) return;

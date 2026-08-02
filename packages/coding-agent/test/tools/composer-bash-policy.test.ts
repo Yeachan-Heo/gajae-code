@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	COMPOSER_BASH_POLICY_ERROR,
+	CURSOR_COMPOSER_BASH_POLICY_ERROR,
 	checkComposerBashPolicy,
 	isComposerBashPolicyModel,
 } from "../../src/tools/composer-bash-policy";
@@ -93,6 +94,29 @@ describe("composer bash policy", () => {
 			commands: ["cd repo && cat src/secret.ts", "cat src/secret.ts"],
 		});
 		expect(result.allowed).toBe(false);
+	});
+
+	it("uses Cursor-native recovery guidance on the Cursor tool surface", () => {
+		const result = checkComposerBashPolicy({
+			modelId: "composer-2.5",
+			provider: "cursor",
+			commands: ["cat src/secret.ts"],
+		});
+		expect(result.allowed).toBe(false);
+		if (!result.allowed) {
+			expect(result.message).toBe(CURSOR_COMPOSER_BASH_POLICY_ERROR);
+			expect(result.message).toContain("Cursor-native read, grep, write, or delete");
+			expect(result.message).not.toContain("find, search, read, and edit tools");
+		}
+	});
+
+	it("recognizes Cursor's provider marker when no provider value is available", () => {
+		const result = checkComposerBashPolicy({
+			modelId: "cursor/composer-2.5",
+			commands: ["cat src/secret.ts"],
+		});
+		expect(result.allowed).toBe(false);
+		if (!result.allowed) expect(result.message).toBe(CURSOR_COMPOSER_BASH_POLICY_ERROR);
 	});
 
 	it("preserves non-composer behavior", () => {

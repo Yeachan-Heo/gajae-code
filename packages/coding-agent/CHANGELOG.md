@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Composer Bash policy rejections now identify the active provider surface and direct Cursor Composer models to their native repository tools, enabling the agent runtime's bounded automatic recovery instead of leaving a blocked shell attempt as a terminal turn.
 - The Extension Control Center inspector no longer crashes when a narrow two-column layout leaves its preview pane fewer than two columns wide.
 - Prompt-template positional arguments now preserve literal `$@` and `$ARGUMENTS` text instead of recursively expanding it during placeholder substitution.
 - Native Windows session and GC commands now report the searched `psmux` / `pmux` / `tmux` provider set when no compatible multiplexer is available instead of leaking a literal `tmux` spawn error (#3688).

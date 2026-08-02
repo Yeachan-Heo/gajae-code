@@ -20,6 +20,10 @@ import {
 	validateToolArguments,
 	zodToWireSchema,
 } from "@gajae-code/ai";
+import {
+	COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
+	isComposerBashPolicyBlockedError,
+} from "@gajae-code/ai/providers/composer-discipline";
 import { isInvalidPromptError, neutralizeReservedControlTokens } from "@gajae-code/ai/utils";
 import { sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
@@ -123,6 +127,15 @@ const standaloneOwnershipStates = new WeakMap<StandaloneRunOwnership, Standalone
  * bounded too.
  */
 const MAX_CONSECUTIVE_MALFORMED_TURNS = 5;
+
+function isComposerBashPolicyBlockedToolResult(result: ToolResultMessage): boolean {
+	return (
+		result.isError &&
+		result.toolName === "bash" &&
+		result.content.some(content => content.type === "text" && isComposerBashPolicyBlockedError(content.text))
+	);
+}
+
 function managedContextOverflow(message: AssistantMessage, config: AgentLoopConfig): boolean {
 	const transportFailure = managedTransportFailure(message);
 	// Managed empty-stop responses may be repaired by the managed shell below; only
@@ -1407,12 +1420,16 @@ async function runLoopBody(
 	// `invalid_prompt` circuit breaker below.
 	let invalidPromptRepairAttempted = false;
 	let previousMalformedToolSignatures = new Set<string>();
-	const recoveryState: {
-		pending: boolean;
-		inserted: boolean;
-		syntheticMessage?: UserMessage;
-	} = { pending: false, inserted: false };
+	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider";
+	let pendingRecovery:
+		| {
+				kind: SyntheticRecoveryKind;
+				inserted: boolean;
+				syntheticMessage?: UserMessage;
+		  }
+		| undefined;
 	let malformedToolRecoveryAttempted = false;
+	let composerBashPolicyRecoveryAttempted = false;
 	// Deterministic terminal circuit breaker for argument-validation loops.
 	//
 	// Counts CONSECUTIVE turns whose tool calls were all malformed, regardless of
@@ -1507,6 +1524,8 @@ async function runLoopBody(
 			let recovered: HarmonyRecoveredToolCall | undefined;
 			let message: AssistantMessage;
 			const attemptTransaction = transaction;
+			const recoveryAttempt = pendingRecovery;
+			const wasMalformedToolRecoveryAttempt = recoveryAttempt?.kind === "malformed-tool-call";
 			try {
 				const attemptConfig = attemptTransaction
 					? {
@@ -1515,14 +1534,22 @@ async function runLoopBody(
 								attemptTransaction.stageAssistantMessageEvent(partial, event),
 						}
 					: config;
-				if (recoveryState.pending && !recoveryState.inserted) {
-					recoveryState.syntheticMessage = {
-						role: "user",
-						content: repeatedToolFailureRecoveryPrompt,
-						synthetic: true,
-						timestamp: Date.now(),
-					};
-					recoveryState.inserted = true;
+				if (recoveryAttempt && !recoveryAttempt.inserted) {
+					const recoveryContent =
+						recoveryAttempt.kind === "composer-bash-policy"
+							? COMPOSER_BASH_POLICY_RECOVERY_PROMPT
+							: recoveryAttempt.kind === "malformed-tool-call"
+								? repeatedToolFailureRecoveryPrompt
+								: undefined;
+					if (recoveryContent) {
+						recoveryAttempt.syntheticMessage = {
+							role: "user",
+							content: recoveryContent,
+							synthetic: true,
+							timestamp: Date.now(),
+						};
+					}
+					recoveryAttempt.inserted = true;
 				}
 				message = await streamAssistantResponse(
 					currentContext,
@@ -1535,8 +1562,12 @@ async function runLoopBody(
 					attemptScope,
 					streamFn,
 					harmonyRetryAttempt,
-					recoveryState.pending && recoveryState.syntheticMessage
-						? { syntheticMessage: recoveryState.syntheticMessage }
+					recoveryAttempt?.syntheticMessage
+						? {
+								syntheticMessage: recoveryAttempt.syntheticMessage,
+								disableTools: wasMalformedToolRecoveryAttempt,
+								forceAutoToolChoice: !wasMalformedToolRecoveryAttempt,
+							}
 						: undefined,
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
@@ -1708,8 +1739,6 @@ async function runLoopBody(
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
 			}
-			const wasRecoveryAttempt = recoveryState.pending;
-
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				// Create placeholder tool results for any tool calls in the aborted message
 				// This maintains the tool_use/tool_result pairing that the API requires
@@ -1749,8 +1778,9 @@ async function runLoopBody(
 
 			const toolResults: ToolResultMessage[] = [];
 			let repeatedMalformedToolCall = false;
+			let sawComposerBashPolicyBlock = false;
 			if (hasMoreToolCalls) {
-				if (wasRecoveryAttempt) {
+				if (wasMalformedToolRecoveryAttempt) {
 					for (const toolCall of toolCalls) {
 						const result = createAbortedToolResult(
 							toolCall,
@@ -1781,6 +1811,7 @@ async function runLoopBody(
 
 					toolResults.push(...executionResult.toolResults);
 					steeringMessagesFromExecution = executionResult.steeringMessages;
+					sawComposerBashPolicyBlock = executionResult.toolResults.some(isComposerBashPolicyBlockedToolResult);
 
 					const malformedSignatures = executionResult.malformedToolCallSignatures;
 					const allToolCallsMalformed =
@@ -1804,10 +1835,8 @@ async function runLoopBody(
 				}
 			}
 
-			if (wasRecoveryAttempt) {
-				recoveryState.pending = false;
-				recoveryState.inserted = false;
-				recoveryState.syntheticMessage = undefined;
+			if (recoveryAttempt) {
+				pendingRecovery = undefined;
 			}
 
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
@@ -1828,10 +1857,26 @@ async function runLoopBody(
 				stream.end(newMessages);
 				return;
 			}
-			if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
-				recoveryState.pending = true;
-				recoveryState.inserted = false;
-				recoveryState.syntheticMessage = undefined;
+			if (sawComposerBashPolicyBlock && !composerBashPolicyRecoveryAttempted) {
+				pendingRecovery = { kind: "composer-bash-policy", inserted: false };
+				composerBashPolicyRecoveryAttempted = true;
+			} else if (sawComposerBashPolicyBlock) {
+				message.stopReason = "error";
+				const recoveryLimitMessage =
+					"Composer bash policy blocked repository file I/O again after its one automatic recovery turn. Continue with dedicated repository tools.";
+				message.errorMessage = message.errorMessage
+					? `${message.errorMessage} | ${recoveryLimitMessage}`
+					: recoveryLimitMessage;
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
+				stream.end(newMessages);
+				return;
+			} else if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
+				pendingRecovery = { kind: "malformed-tool-call", inserted: false };
 				malformedToolRecoveryAttempted = true;
 			} else if (consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS) {
 				// Deterministic terminal circuit breaker. The one-shot recovery turn
@@ -1868,10 +1913,21 @@ async function runLoopBody(
 			stream.end(newMessages);
 			return;
 		}
+		// Poll the consume-on-read recovery candidate before follow-ups so a real
+		// user message can supersede it without letting the stale recovery resurface
+		// after that follow-up turn.
+		const syntheticRecoveryMessage = await config.getSyntheticRecoveryMessage?.();
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
+			continue;
+		}
+		if (syntheticRecoveryMessage) {
+			// Provider-side tool protocols (such as Cursor) can finish their remote
+			// turn after a local policy rejection. Continue once without committing
+			// the recovery instruction to durable history.
+			pendingRecovery = { kind: "provider", inserted: true, syntheticMessage: syntheticRecoveryMessage };
 			continue;
 		}
 
@@ -1920,7 +1976,11 @@ async function streamAssistantResponse(
 	scope?: AttemptScope,
 	streamFn?: StreamFn,
 	harmonyRetryAttempt = 0,
-	recoveryMode?: { syntheticMessage: UserMessage },
+	recoveryMode?: {
+		syntheticMessage: UserMessage;
+		disableTools?: boolean;
+		forceAutoToolChoice?: boolean;
+	},
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -1951,7 +2011,11 @@ async function streamAssistantResponse(
 				await config.convertToLlm([recoveryMode.syntheticMessage]),
 				config.model,
 			);
-			llmContext = { ...llmContext, messages: [...llmContext.messages, ...syntheticMessages], tools: [] };
+			llmContext = {
+				...llmContext,
+				messages: [...llmContext.messages, ...syntheticMessages],
+				tools: recoveryMode.disableTools ? [] : llmContext.tools,
+			};
 		} else {
 			llmContext = {
 				...llmContext,
@@ -1959,7 +2023,7 @@ async function streamAssistantResponse(
 					await config.convertToLlm([...messages, recoveryMode.syntheticMessage]),
 					config.model,
 				),
-				tools: [],
+				tools: recoveryMode.disableTools ? [] : llmContext.tools,
 			};
 		}
 	}
@@ -1977,6 +2041,8 @@ async function streamAssistantResponse(
 
 	const resolvedMetadata = config.metadataResolver ? config.metadataResolver(config.model.provider) : config.metadata;
 
+	// Synthetic recovery requests choose their tool mode explicitly below and
+	// must never consume a queued dynamic choice intended for an ordinary turn.
 	const dynamicToolChoice = recoveryMode ? undefined : config.getToolChoice?.();
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
@@ -1994,7 +2060,11 @@ async function streamAssistantResponse(
 				: AbortSignal.any(requestSignals);
 	const effectiveTemperature =
 		harmonyRetryAttempt > 0 && config.temperature !== undefined ? config.temperature + 0.05 : config.temperature;
-	const effectiveToolChoice = recoveryMode ? "none" : (dynamicToolChoice ?? config.toolChoice);
+	const effectiveToolChoice = recoveryMode?.disableTools
+		? "none"
+		: recoveryMode?.forceAutoToolChoice
+			? "auto"
+			: (dynamicToolChoice ?? config.toolChoice);
 	const effectiveReasoning = dynamicReasoning ?? config.reasoning;
 
 	const chatStepNumber = stepCounter.count;

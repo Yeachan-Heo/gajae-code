@@ -15,6 +15,7 @@ import type {
 	ToolResultMessage,
 	TransportFailureFacts,
 	TSchema,
+	UserMessage,
 } from "@gajae-code/ai";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptMinter, AttemptRunHandle, AttemptScope } from "./attempt-scope";
@@ -319,6 +320,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * continues with another turn.
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
+	/**
+	 * Supplies one bounded synthetic recovery instruction before the loop would
+	 * otherwise yield. Unlike a follow-up, it is sent only to the provider and
+	 * is not committed to durable agent message history.
+	 */
+	getSyntheticRecoveryMessage?: () => Promise<UserMessage | undefined>;
 	/**
 	 * Cooperative pause checkpoint evaluated at safe loop boundaries.
 	 *

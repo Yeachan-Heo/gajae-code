@@ -1,0 +1,1 @@
+A Composer bash policy block interrupted a shell attempt. This is not a terminal condition: continue the same task now. Do not retry repository file I/O in shell. Use Cursor-native read for files or directories, grep for search or globs, write for changes, and delete only when deletion is required; then continue with the next safe step.

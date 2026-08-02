@@ -1,3 +1,9 @@
+import composerBashPolicyRecoveryPrompt from "../prompts/composer-bash-policy-recovery.md" with { type: "text" };
+import cursorComposerBashPolicyRecoveryPrompt from "../prompts/cursor-composer-bash-policy-recovery.md" with {
+	type: "text",
+};
+import cursorComposerEditDisciplinePrompt from "../prompts/cursor-composer-edit-discipline.md" with { type: "text" };
+
 /**
  * Anchor/edit discipline for composer-harness models (xai grok-composer-*,
  * cursor composer-*).
@@ -30,6 +36,38 @@ export function isComposerHarnessModel(modelId: string): boolean {
 	return COMPOSER_MODEL_ID_PATTERN.test(modelId);
 }
 
+/** Stable text contract for a local shell rejection caused by Composer file-I/O discipline. */
+export const COMPOSER_BASH_POLICY_ERROR_PREFIX = "Composer bash policy blocked repository file I/O.";
+export const COMPOSER_BASH_POLICY_ERROR_CODE = "composer-bash-policy:repository-file-io";
+
+export type ComposerBashPolicyToolSurface = "generic" | "cursor";
+
+/**
+ * Format the model-visible policy rejection with a stable marker and the tool
+ * vocabulary the model actually receives on this provider surface.
+ */
+export function formatComposerBashPolicyError(surface: ComposerBashPolicyToolSurface = "generic"): string {
+	const recovery =
+		surface === "cursor"
+			? "Continue the same task with Cursor-native read, grep, write, or delete tools; do not retry repository file I/O through shell."
+			: "Continue the same task with find, search, read, and edit tools; do not retry repository file I/O through bash.";
+	return `${COMPOSER_BASH_POLICY_ERROR_PREFIX} [${COMPOSER_BASH_POLICY_ERROR_CODE}] Recovery required: ${recovery}`;
+}
+
+/**
+ * Matches both the structured current error and the original prefix so a
+ * resumed session can recover after an upgrade without string-version skew.
+ */
+export function isComposerBashPolicyBlockedError(text: string): boolean {
+	return text.includes(COMPOSER_BASH_POLICY_ERROR_PREFIX);
+}
+
+/** One bounded, tool-enabled retry instruction for generic Composer agent loops. */
+export const COMPOSER_BASH_POLICY_RECOVERY_PROMPT = composerBashPolicyRecoveryPrompt;
+
+/** One bounded, tool-enabled retry instruction for Cursor's native remote tool surface. */
+export const CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT = cursorComposerBashPolicyRecoveryPrompt;
+
 export const COMPOSER_EDIT_DISCIPLINE_PROMPT = `File-editing discipline for this Composer harness (this OVERRIDES contrary habits from your training):
 
 - Discover file names ONLY with the find tool; search file contents ONLY with the search tool; read file bodies or line ranges ONLY with the read tool. NEVER inspect repository files through shell commands (ls, find, fd, cat, sed, awk, grep, rg, head, tail, less, more) or scripts — that output carries no hashline anchors and bypasses the agent's safety limits.
@@ -39,3 +77,10 @@ export const COMPOSER_EDIT_DISCIPLINE_PROMPT = `File-editing discipline for this
 - If an edit is rejected with "anchors do not match", the rejection message prints the current lines WITH fresh anchors. Retry using exactly those printed anchors.
 - Tool-call arguments must be the exact JSON/schema object requested by the tool. Do not include Markdown, commentary, analysis text, or invented fields inside tool arguments.
 - Use bash only for terminal operations such as tests, builds, package scripts, and git commands. A shell command string must contain only the command itself; NEVER interleave reasoning or commentary into command strings or heredocs.`;
+
+/**
+ * Cursor executes a different native tool vocabulary from the generic agent
+ * loop. Keep this prompt separate so Composer is never told to call `edit`,
+ * `find`, or `search` when those names are unavailable remotely.
+ */
+export const CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT = cursorComposerEditDisciplinePrompt;

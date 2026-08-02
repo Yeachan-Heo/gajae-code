@@ -30,7 +30,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { parseStreamingJson } from "../utils/json-parse";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
-import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
+import { CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import { CURSOR_CLIENT_VERSION } from "./cursor/client-version";
 import type { McpToolDefinition } from "./cursor/gen/agent_pb";
 import {
@@ -2329,7 +2329,7 @@ export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | u
 	// Composer-harness models need anchor/edit discipline pinned ahead of any
 	// host/default prompt (see composer-discipline.ts for the observed failure modes).
 	if (modelId !== undefined && isComposerHarnessModel(modelId)) {
-		jsons.unshift(JSON.stringify({ role: "system", content: COMPOSER_EDIT_DISCIPLINE_PROMPT }));
+		jsons.unshift(JSON.stringify({ role: "system", content: CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT }));
 	}
 	return jsons;
 }
