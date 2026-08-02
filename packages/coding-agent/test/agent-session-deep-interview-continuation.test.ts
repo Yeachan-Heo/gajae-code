@@ -14,7 +14,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 const REMINDER_MARKER = "deep-interview workflow is still active";
@@ -174,6 +174,28 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(reminder).toContain("stop gate: gjc_skill_deep_interview_");
 		expect(reminder).toContain("score and persist the answered round");
 		expect(reminder).toContain("use the ask tool for the next question");
+	});
+	it("contains a scheduled continuation persistence failure and allows the next continuation", async () => {
+		await activateWorkflow("deep-interview");
+		const persistenceFailure = new Error("managed_replace_exact_unavailable");
+		const continueSpy = vi
+			.spyOn(session.agent, "continue")
+			.mockRejectedValueOnce(persistenceFailure)
+			.mockResolvedValue();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		await emitAssistantStop(100);
+		await emitAssistantStop(200);
+
+		expect(continueSpy).toHaveBeenCalledTimes(2);
+		expect(developerReminders()).toHaveLength(2);
+		expect(
+			warnSpy.mock.calls.some(
+				call =>
+					call[0] === "agent.continue failed after scheduling" &&
+					(call[1] as { error?: unknown } | undefined)?.error === "managed_replace_exact_unavailable",
+			),
+		).toBe(true);
 	});
 
 	it("persists the reminder to the canonical transcript after the assistant stop", async () => {

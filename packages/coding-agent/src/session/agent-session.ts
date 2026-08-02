@@ -427,6 +427,7 @@ import {
 	getLatestCompactionEntry,
 	getSessionMessageEntryId,
 	getSessionMessageObservationId,
+	SessionAppendPersistenceError,
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
@@ -3899,14 +3900,19 @@ export class AgentSession {
 			) {
 				const isRosterReminder = event.message.role === "custom" && event.message.customType === "irc-peer-roster";
 				if (!isRosterReminder) {
-					this.#appendCustomMessageEntry(
-						event.message.customType,
-						event.message.content,
-						event.message.display,
-						event.message.details,
-						event.message.attribution ?? "agent",
-						getSessionMessageObservationId(event.message),
-					);
+					try {
+						this.#appendCustomMessageEntry(
+							event.message.customType,
+							event.message.content,
+							event.message.display,
+							event.message.details,
+							event.message.attribution ?? "agent",
+							getSessionMessageObservationId(event.message),
+						);
+					} catch (error) {
+						this.agent.abort();
+						throw error;
+					}
 				}
 			} else if (
 				event.message.role === "user" ||
@@ -3915,7 +3921,73 @@ export class AgentSession {
 				event.message.role === "toolResult" ||
 				event.message.role === "fileMention"
 			) {
-				this.sessionManager.appendMessage(event.message);
+				try {
+					this.sessionManager.appendMessage(event.message);
+				} catch (error) {
+					if (
+						event.message.role !== "toolResult" ||
+						event.message.toolName !== "todo_write" ||
+						!(error instanceof SessionAppendPersistenceError) ||
+						error.phase !== "current_append"
+					) {
+						this.agent.abort();
+						throw error;
+					}
+					this.agent.abort();
+
+					const failure = error.persistenceError.message;
+					const failedEntryId = error.entryId;
+					this.#syncTodoPhasesFromBranch();
+					event.message.isError = true;
+					event.message.content = [
+						{
+							type: "text",
+							text: `Todo state persistence failed: ${failure}\nDo not change the payload solely because of this failure. The durable outcome is unknown; reconcile the session state before retrying or continuing.`,
+						},
+					];
+					event.message.details = {
+						...(event.message.details && typeof event.message.details === "object" ? event.message.details : {}),
+						phases: this.getTodoPhases(),
+						failureKind: "persistence",
+					};
+					this.agent.touchContext();
+					let recovered = false;
+					try {
+						await this.sessionManager.recoverPersistenceFailure();
+						recovered = true;
+					} catch (recoveryError) {
+						logger.warn("Todo persistence recovery failed", {
+							error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+						});
+					}
+					if (recovered) {
+						const durableTodoResult = this.sessionManager
+							.getBranch()
+							.find(
+								entry =>
+									entry.id === failedEntryId &&
+									entry.type === "message" &&
+									entry.message.role === "toolResult" &&
+									entry.message.toolName === "todo_write",
+							);
+						this.#syncTodoPhasesFromBranch();
+						if (durableTodoResult?.type === "message" && durableTodoResult.message.role === "toolResult") {
+							event.message.content = durableTodoResult.message.content;
+							event.message.details = durableTodoResult.message.details;
+							event.message.isError = durableTodoResult.message.isError;
+						} else {
+							event.message.details = {
+								...(event.message.details && typeof event.message.details === "object"
+									? event.message.details
+									: {}),
+								phases: this.getTodoPhases(),
+								failureKind: "persistence",
+							};
+							this.sessionManager.appendMessage(event.message);
+							this.agent.touchContext();
+						}
+					}
+				}
 			}
 		}
 
@@ -4189,7 +4261,13 @@ export class AgentSession {
 			if (event.message.role === "toolResult") {
 				const { toolName, details, isError, content } = event.message as {
 					toolName?: string;
-					details?: { path?: string; phases?: TodoPhase[]; report?: string; startedAt?: string };
+					details?: {
+						path?: string;
+						phases?: TodoPhase[];
+						report?: string;
+						startedAt?: string;
+						failureKind?: "payload_rejected" | "argument_validation" | "execution" | "persistence";
+					};
 					isError?: boolean;
 					content?: Array<TextContent | ImageContent>;
 				};
@@ -4202,22 +4280,34 @@ export class AgentSession {
 				}
 				if (toolName === "todo_write" && isError) {
 					const errorText = content?.find(part => part.type === "text")?.text;
+					const payloadRejected =
+						details?.failureKind === "payload_rejected" || details?.failureKind === "argument_validation";
 					const reminderText = [
 						"<system-reminder>",
-						"todo_write failed, so todo progress is not visible to the user.",
+						payloadRejected
+							? "todo_write rejected its payload. The requested todo update was not applied."
+							: "todo_write did not complete because the turn aborted during runtime execution or persistence.",
 						errorText ? `Failure: ${errorText}` : "Failure: todo_write returned an error.",
-						"Fix the todo payload and call todo_write again before continuing.",
+						payloadRejected
+							? "Correct the payload and call todo_write again before continuing."
+							: "Do not change the payload solely because of this failure. The durable outcome is unknown; reconcile the session state before retrying or continuing.",
 						"</system-reminder>",
 					].join("\n");
-					await this.sendCustomMessage(
-						{
-							customType: "todo-write-error-reminder",
-							content: reminderText,
-							display: false,
-							details: { toolName, errorText },
-						},
-						{ deliverAs: "nextTurn" },
-					);
+					try {
+						await this.sendCustomMessage(
+							{
+								customType: "todo-write-error-reminder",
+								content: reminderText,
+								display: false,
+								details: { toolName, errorText },
+							},
+							{ deliverAs: "nextTurn" },
+						);
+					} catch (error) {
+						logger.warn("Todo write error reminder persistence failed", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
 				}
 				if (toolName === "checkpoint" && !isError) {
 					const checkpointEntryId = this.sessionManager.getLeafId();

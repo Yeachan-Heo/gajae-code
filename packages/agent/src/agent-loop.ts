@@ -2702,7 +2702,9 @@ async function executeToolCalls(
 				caughtError = e;
 				result = {
 					content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-					details: {},
+					details: {
+						failureKind: record.argumentValidationFailed ? "argument_validation" : "execution",
+					},
 				};
 				isError = true;
 			}

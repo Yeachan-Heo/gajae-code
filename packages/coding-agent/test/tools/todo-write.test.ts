@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { validateToolArguments } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { applyOpsToPhases, type TodoPhase, TodoWriteTool } from "@gajae-code/coding-agent/tools";
+import { todoWriteToolRenderer } from "../../src/tools/todo-write";
 
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	let phases = initialPhases;
@@ -17,6 +19,13 @@ function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 			phases = next;
 		},
 	};
+}
+
+async function getUiTheme() {
+	await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+	const theme = await themeModule.getThemeByName("red-claw");
+	if (!theme) throw new Error("Expected red-claw theme");
+	return theme;
 }
 
 describe("TodoWriteTool auto-start behavior", () => {
@@ -235,5 +244,28 @@ describe("TodoWriteTool ops operations", () => {
 		const result = await tool.execute("call-2", { ops: [{ op: "drop", phase: "Work" }] });
 		const tasks = result.details?.phases[0]?.tasks ?? [];
 		expect(tasks.map(task => task.status)).toEqual(["abandoned", "abandoned"]);
+	});
+});
+
+describe("TodoWriteTool renderer", () => {
+	it("renders persistence failures as errors without showing rejected phases", async () => {
+		const uiTheme = await getUiTheme();
+		const component = todoWriteToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "Todo state persistence failed: disk failed" }],
+				details: {
+					phases: [{ name: "Work", tasks: [{ content: "Rejected task", status: "in_progress" }] }],
+					storage: "session",
+					failureKind: "persistence",
+				},
+				isError: true,
+			},
+			{ expanded: true, isPartial: false },
+			uiTheme,
+		);
+
+		const rendered = Bun.stripANSI(component.render(160).join("\n"));
+		expect(rendered).toContain("Todo state persistence failed: disk failed");
+		expect(rendered).not.toContain("Rejected task");
 	});
 });

@@ -2911,7 +2911,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 40 process authority hardening and provider-intent admission", () => {
+	test("keeps wire protocol 3 through generation 43 native replacement authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -2921,9 +2921,10 @@ describe("telegram daemon", () => {
 		// generation 40 hardens exact Bash process-tree ownership. Generation 38
 		// also adds durable Telegram provider-intent admission without changing
 		// the wire protocol.
-		// generation 42 applies first-class provider-settings admission to Telegram
-		// lifecycle controls.
-		expect(DAEMON_GENERATION).toBe(42);
+		// Generation 42 applies first-class provider-settings admission to Telegram
+		// lifecycle controls; generation 43 applies identity-bound exact replacement
+		// cleanup shared by managed-session and daemon filesystem authority.
+		expect(DAEMON_GENERATION).toBe(43);
 	});
 	test.each([
 		"1",

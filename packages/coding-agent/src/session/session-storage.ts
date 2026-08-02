@@ -28,6 +28,7 @@ export interface SessionStorageStat {
 	size: number;
 	mtimeMs: number;
 	mtimeNs: bigint;
+	ctimeNs: bigint;
 	mtime: Date;
 	isFile: boolean;
 }
@@ -47,6 +48,7 @@ function statFromNode(stats: fs.BigIntStats): SessionStorageStat {
 		size: Number(stats.size),
 		mtimeMs: Number(stats.mtimeMs),
 		mtimeNs: stats.mtimeNs,
+		ctimeNs: stats.ctimeNs,
 		mtime: stats.mtime,
 		isFile: stats.isFile(),
 	};
@@ -1624,6 +1626,7 @@ export class MemorySessionStorage implements SessionStorage {
 			size: entry.content.byteLength,
 			mtimeMs: entry.mtimeMs,
 			mtimeNs: BigInt(entry.mtimeMs) * 1_000_000n,
+			ctimeNs: BigInt(entry.mtimeMs) * 1_000_000n,
 			mtime: new Date(entry.mtimeMs),
 			isFile: true,
 		};

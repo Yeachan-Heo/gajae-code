@@ -899,6 +899,7 @@ export interface ResumeSessionIdentity {
 	size: number;
 	mtimeMs: number;
 	mtimeNs: bigint;
+	ctimeNs?: bigint;
 	sha256: string;
 }
 
@@ -918,6 +919,21 @@ export interface ResumeTailError {
 }
 
 export type SessionDirectoryMigrationPolicy = ManagedMigrationPolicy;
+export type SessionAppendPersistenceFailurePhase = "current_append" | "prior_failure";
+
+export class SessionAppendPersistenceError extends Error {
+	readonly phase: SessionAppendPersistenceFailurePhase;
+	readonly entryId: string;
+	readonly persistenceError: Error;
+
+	constructor(phase: SessionAppendPersistenceFailurePhase, entryId: string, persistenceError: Error) {
+		super(persistenceError.message, { cause: persistenceError });
+		this.name = "SessionAppendPersistenceError";
+		this.phase = phase;
+		this.entryId = entryId;
+		this.persistenceError = persistenceError;
+	}
+}
 
 export class SessionManagedStorageError extends Error {
 	readonly code = "managed_storage_unsupported";
@@ -2161,6 +2177,7 @@ function sameResumeIdentity(left: ResumeSessionIdentity, right: ResumeSessionIde
 		left.size === right.size &&
 		left.mtimeMs === right.mtimeMs &&
 		left.mtimeNs === right.mtimeNs &&
+		(left.ctimeNs === undefined || right.ctimeNs === undefined || left.ctimeNs === right.ctimeNs) &&
 		left.sha256 === right.sha256
 	);
 }
@@ -2174,7 +2191,8 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 		left.nlink === right.nlink &&
 		left.size === right.size &&
 		left.mtimeMs === right.mtimeMs &&
-		left.mtimeNs === right.mtimeNs
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
 	);
 }
 
@@ -2372,6 +2390,7 @@ function inspectResumeSessionFile(
 			size: snapshot.size,
 			mtimeMs: snapshot.mtimeMs,
 			mtimeNs: snapshot.mtimeNs,
+			ctimeNs: snapshot.ctimeNs,
 			sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
 		};
 		return { identity, content: bytes, entries, context, migrationApplied };
@@ -2380,6 +2399,46 @@ function inspectResumeSessionFile(
 	}
 }
 
+function fsyncResumeSessionIdentity(expected: ResumeSessionIdentity): void {
+	const fd = fs.openSync(expected.canonicalPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	try {
+		const before = fs.fstatSync(fd, { bigint: true });
+		if (
+			before.dev !== expected.dev ||
+			before.ino !== expected.ino ||
+			(expected.nlink !== undefined && before.nlink !== expected.nlink) ||
+			Number(before.size) !== expected.size ||
+			before.mtimeNs !== expected.mtimeNs ||
+			(expected.ctimeNs !== undefined && before.ctimeNs !== expected.ctimeNs)
+		) {
+			throw new Error("session_persistence_recovery_identity_mismatch");
+		}
+		fs.fsyncSync(fd);
+		const after = fs.fstatSync(fd, { bigint: true });
+		const named = fs.lstatSync(expected.canonicalPath, { bigint: true });
+		if (
+			after.dev !== before.dev ||
+			after.ino !== before.ino ||
+			after.nlink !== before.nlink ||
+			after.size !== before.size ||
+			after.mtimeNs !== before.mtimeNs ||
+			after.ctimeNs !== before.ctimeNs ||
+			named.dev !== after.dev ||
+			named.ino !== after.ino ||
+			named.nlink !== after.nlink
+		) {
+			throw new Error("session_persistence_recovery_identity_mismatch");
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+	const parentFd = fs.openSync(path.dirname(expected.canonicalPath), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+	try {
+		fs.fsyncSync(parentFd);
+	} finally {
+		fs.closeSync(parentFd);
+	}
+}
 /** Revalidate previously parsed authority without another decode, parse, migration, or context build. */
 function revalidateResumeSessionIdentity(
 	filePath: string,
@@ -2410,6 +2469,7 @@ function revalidateResumeSessionIdentity(
 		size: snapshot.stat.size,
 		mtimeMs: snapshot.stat.mtimeMs,
 		mtimeNs: snapshot.stat.mtimeNs,
+		ctimeNs: snapshot.stat.ctimeNs,
 		sha256: crypto.createHash("sha256").update(snapshot.bytes).digest("hex"),
 	};
 	return sameResumeIdentity(expected, observed) ? { kind: "valid" } : { kind: "error", reason: "identity-mismatch" };
@@ -4751,7 +4811,9 @@ export class SessionManager {
 	#recoveryPromotionTranscriptPath: string | undefined;
 	#memoryGuardParticipantIngressToken: symbol | undefined;
 	#fileEntries: FileEntry[] = [];
-	#pendingStrictAdoption: { canonicalPath: string; identity: ResumeSessionIdentity } | undefined;
+	#pendingStrictAdoption:
+		| { canonicalPath: string; identity: ResumeSessionIdentity; inspection?: ResumeInspectionSnapshot }
+		| undefined;
 	#byId: Map<string, SessionEntry> = new Map();
 	#labelsById: Map<string, string> = new Map();
 	#leafId: string | null = null;
@@ -5501,11 +5563,14 @@ export class SessionManager {
 			if (strictAdoption && resolvedSessionFile === strictAdoption.canonicalPath) {
 				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
 				if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
-					throw new Error("Prepared managed session changed before strict adoption.");
+					throw new Error("Prepared session changed before strict adoption.");
 			}
 			let entries: FileEntry[];
 			let candidateMigrationApplied = false;
-			if (this.storage.existsSync(resolvedSessionFile)) {
+			if (strictAdoption?.inspection && resolvedSessionFile === strictAdoption.canonicalPath) {
+				entries = strictAdoption.inspection.entries;
+				candidateMigrationApplied = strictAdoption.inspection.migrationApplied;
+			} else if (this.storage.existsSync(resolvedSessionFile)) {
 				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
 				if ("kind" in inspected) throw new Error(`Could not switch session: ${inspected.reason}`);
 				entries = inspected.entries;
@@ -5516,7 +5581,7 @@ export class SessionManager {
 			if (strictAdoption) {
 				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
 				if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
-					throw new Error("Prepared managed session changed during strict adoption.");
+					throw new Error("Prepared session changed during strict adoption.");
 			}
 			if (entries.length > 0) {
 				const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -5540,6 +5605,13 @@ export class SessionManager {
 				} catch (error) {
 					prepared.dispose();
 					throw error;
+				}
+				if (strictAdoption) {
+					const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+					if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity)) {
+						prepared.dispose();
+						throw new Error("Prepared session changed before strict adoption commit.");
+					}
 				}
 				const previous = {
 					sessionId: this.#sessionId,
@@ -8265,13 +8337,31 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = this.#prepareEntryForCurrentResidentStore(normalizedEntry) as SessionEntry;
+		const previousLeafId = this.#leafId;
+		const priorPersistenceError = this.#persistError;
 		this.#fileEntries.push(residentEntry);
 		this.#byId.set(residentEntry.id, residentEntry);
 		this.#leafId = residentEntry.id;
 		this.#bumpEntryRevision();
 		this.#leafRevision++;
 		if (entry.type === "label") this.#labelRevision++;
-		this._persist(residentEntry);
+		try {
+			this._persist(residentEntry);
+		} catch (error) {
+			const removed = this.#fileEntries.pop();
+			if (removed !== residentEntry)
+				throw new Error("Session append rollback lost resident ordering.", { cause: error });
+			this.#byId.delete(residentEntry.id);
+			this.#leafId = previousLeafId;
+			this.#bumpEntryRevision();
+			this.#leafRevision++;
+			if (entry.type === "label") this.#labelRevision++;
+			throw new SessionAppendPersistenceError(
+				priorPersistenceError ? "prior_failure" : "current_append",
+				residentEntry.id,
+				this.#persistError ?? toError(error),
+			);
+		}
 		// Same validated, overflow-guarded aggregation as the resume path (#buildIndex): a
 		// malformed task-result or assistant usage shape reaching the append path must not
 		// crash or poison getUsageStatistics() either.
@@ -8513,6 +8603,50 @@ export class SessionManager {
 		this.#replayMetadataRevision++;
 	}
 
+	/**
+	 * Rehydrate the canonical transcript after a synchronous persistence failure.
+	 *
+	 * The failed append may have committed before reporting an uncertain outcome,
+	 * so callers must not clear the sticky error or retry against the resident
+	 * branch. Reloading the exact session file is the only supported recovery
+	 * boundary for both managed and explicit persistent destinations.
+	 */
+	async recoverPersistenceFailure(): Promise<void> {
+		const persistenceError = this.#persistError;
+		if (!persistenceError) return;
+		if (!this.#sessionFile) throw persistenceError;
+		const sessionFile = this.#sessionFile;
+		try {
+			await this.#closePersistWriter();
+		} catch {
+			// A writer reports its prior write failure after a confirmed close. A
+			// second close clears that terminal writer; retryable close failures are
+			// genuinely re-dispatched and still fail if the descriptor cannot settle.
+		}
+		await this.#closePersistWriter();
+		const inspected = inspectResumeSessionFile(sessionFile, this.storage);
+		if ("kind" in inspected) throw persistenceError;
+		try {
+			fsyncResumeSessionIdentity(inspected.identity);
+		} catch {
+			throw persistenceError;
+		}
+		const durable = inspectResumeSessionFile(sessionFile, this.storage);
+		if ("kind" in durable || !sameResumeIdentity(inspected.identity, durable.identity)) {
+			throw persistenceError;
+		}
+		const adoption = {
+			canonicalPath: durable.identity.canonicalPath,
+			identity: durable.identity,
+			inspection: durable,
+		};
+		this.#pendingStrictAdoption = adoption;
+		try {
+			await this.setSessionFile(durable.identity.canonicalPath);
+		} finally {
+			if (this.#pendingStrictAdoption === adoption) this.#pendingStrictAdoption = undefined;
+		}
+	}
 	/**
 	 * Rewrite the session file after in-place entry updates.
 	 * Use sparingly (e.g., pruning old tool outputs).

@@ -7,10 +7,10 @@ import {
 	applyOwnerOnlyPathSecurity,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
-	exactRestore,
 	exactUnlink,
 	linkNoReplacePath,
 	type NativeDirectoryTreeSnapshot,
+	type NativeExactUnlinkResult,
 	type NativeOwnerOnlySecurityResult,
 	openRecoveryFsRoot,
 	type RecoveryFsRoot,
@@ -55,6 +55,28 @@ export class ManagedPublishError extends Error {
 		this.diagnostic = formatNativePublishDiagnostic(outcome);
 	}
 }
+export class ManagedReplaceError extends Error {
+	readonly code: string;
+	readonly cleanupReceiptPath: string;
+	readonly detachedPath: string | undefined;
+	readonly retainedSuccessorPath: string | undefined;
+	readonly retainedPlaceholderPath: string | undefined;
+	readonly retainedUnknownPath: string | undefined;
+	readonly replacementCause: unknown;
+
+	constructor(result: NativeExactUnlinkResult, cleanupReceiptPath: string, replacementCause?: unknown) {
+		const code = result.code ?? "unknown";
+		super(`managed_replace_failed:${code}`, replacementCause === undefined ? undefined : { cause: replacementCause });
+		this.name = "ManagedReplaceError";
+		this.code = code;
+		this.cleanupReceiptPath = cleanupReceiptPath;
+		this.detachedPath = result.detachedPath;
+		this.retainedSuccessorPath = result.retainedSuccessorPath;
+		this.retainedPlaceholderPath = result.retainedPlaceholderPath;
+		this.retainedUnknownPath = result.retainedUnknownPath;
+		this.replacementCause = replacementCause;
+	}
+}
 
 function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
 	const classification =
@@ -72,6 +94,17 @@ function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
 								? "io_error"
 								: "durability_failed";
 	return new ManagedPublishError(classification, outcome);
+}
+
+function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
+	return (
+		result.ok ||
+		(result.code === "cleanup_pending" &&
+			result.payloadDurable === true &&
+			result.detachedPath !== undefined &&
+			result.retainedSuccessorPath === undefined &&
+			result.retainedUnknownPath === undefined)
+	);
 }
 
 /** A same-filesystem rename updates the moved root's ctime but no other tree identity. */
@@ -166,27 +199,69 @@ export interface ManagedFileSnapshot {
 	};
 }
 
+type SerializedReplacementIdentity = {
+	dev: string;
+	ino: string;
+	nlink: string;
+	size: string;
+	mtimeNs: string;
+	ctimeNs: string;
+	sha256: string;
+};
+
 type ReplacementCleanupReceipt = {
-	version: 1;
-	predecessor: string;
-	successor: string;
-	identity: {
-		dev: string;
-		ino: string;
-		nlink: string;
-		size: string;
-		mtimeNs: string;
-		ctimeNs: string;
-		sha256: string;
-	};
+	version: 3;
+	staging: string;
+	destination: string;
+	successor: SerializedReplacementIdentity;
+	predecessor: SerializedReplacementIdentity;
 };
 
 const U64_MAX = 18_446_744_073_709_551_615n;
 
-function parseCanonicalU64(value: unknown): bigint | undefined {
-	if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return undefined;
-	const parsed = BigInt(value);
-	return parsed <= U64_MAX ? parsed : undefined;
+function replacementCleanupReceiptBinding(
+	name: string,
+): { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } } | undefined {
+	const match =
+		/^\.gjc-replace-cleanup-(0|[1-9a-f][0-9a-f]*)-(0|[1-9a-f][0-9a-f]*)-receipt-(0|[1-9a-f][0-9a-f]*)-(0|[1-9a-f][0-9a-f]*)\.json$/.exec(
+			name,
+		);
+	if (!match?.[1] || !match[2] || !match[3] || !match[4]) return undefined;
+	const predecessor = { dev: BigInt(`0x${match[1]}`), ino: BigInt(`0x${match[2]}`) };
+	const receipt = { dev: BigInt(`0x${match[3]}`), ino: BigInt(`0x${match[4]}`) };
+	return predecessor.dev <= U64_MAX && predecessor.ino <= U64_MAX && receipt.dev <= U64_MAX && receipt.ino <= U64_MAX
+		? { predecessor, receipt }
+		: undefined;
+}
+
+function serializeReplacementIdentity(identity: ManagedFileSnapshot["identity"]): SerializedReplacementIdentity {
+	return {
+		dev: identity.dev.toString(),
+		ino: identity.ino.toString(),
+		nlink: identity.nlink.toString(),
+		size: String(identity.size),
+		mtimeNs: identity.mtimeNs.toString(),
+		ctimeNs: identity.ctimeNs.toString(),
+		sha256: identity.sha256,
+	};
+}
+
+function replacementReceiptPath(
+	baseDir: string,
+	predecessor: ManagedFileSnapshot["identity"],
+	receipt: ManagedFileSnapshot["identity"],
+): string {
+	return path.join(
+		baseDir,
+		`.gjc-replace-cleanup-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}-receipt-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}.json`,
+	);
+}
+
+function replacementReceiptRetirementName(
+	receipt: ManagedFileSnapshot["identity"],
+	predecessor: ManagedFileSnapshot["identity"],
+): string {
+	return `.gjc-receipt-remove-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}`;
 }
 
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
@@ -710,72 +785,44 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#detachReplacementCleanupReceipt(receiptPath: string): void {
+		const binding = replacementCleanupReceiptBinding(path.basename(receiptPath));
+		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
+		const receipt = captureManagedFileNoFollow(receiptPath);
+		if (receipt.identity.dev !== binding.receipt.dev || receipt.identity.ino !== binding.receipt.ino)
+			throw new Error("managed_replace_cleanup_receipt_invalid");
+		const predecessor = binding.predecessor;
+		const quarantineName = `.gjc-receipt-remove-${receipt.identity.dev.toString(16)}-${receipt.identity.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}`;
+		const detached = exactUnlink(receiptPath, {
+			dev: receipt.identity.dev,
+			ino: receipt.identity.ino,
+			nlink: receipt.identity.nlink,
+			parentDev: this.#subtreeRoot.dev,
+			parentIno: this.#subtreeRoot.ino,
+			size: BigInt(receipt.identity.size),
+			mtimeNs: receipt.identity.mtimeNs,
+			sha256: receipt.identity.sha256,
+			detachOnly: true,
+			quarantineName,
+		});
+		if (
+			(!detached.ok && detached.code !== "cleanup_pending") ||
+			detached.detachedPath !== path.join(this.#baseDir, quarantineName) ||
+			detached.retainedSuccessorPath ||
+			detached.retainedUnknownPath
+		)
+			throw new Error(`managed_replace_receipt_cleanup_pending:${detached.code ?? "unknown"}`);
+		fsyncDirectory(this.#baseDir);
+	}
+
 	#reconcileReplacementCleanupReceipts(): void {
 		if (this.#reconcilingReplacementCleanup) return;
 		this.#reconcilingReplacementCleanup = true;
 		try {
 			for (const name of fs.readdirSync(this.#baseDir)) {
-				const match = /^\.gjc-replace-cleanup-([0-9a-f]+)-([0-9a-f]+)\.json$/.exec(name);
-				if (!match) continue;
-				const receiptPath = path.join(this.#baseDir, name);
-				const parsed = JSON.parse(
-					captureManagedFileNoFollow(receiptPath).bytes.toString("utf8"),
-				) as Partial<ReplacementCleanupReceipt>;
-				const identity = parsed.identity;
-				const dev = parseCanonicalU64(identity?.dev);
-				const ino = parseCanonicalU64(identity?.ino);
-				const nlink = parseCanonicalU64(identity?.nlink);
-				const size = parseCanonicalU64(identity?.size);
-				const mtimeNs = parseCanonicalU64(identity?.mtimeNs);
-				const ctimeNs = parseCanonicalU64(identity?.ctimeNs);
-				const expectedPredecessor =
-					dev !== undefined && ino !== undefined
-						? path.join(this.#baseDir, `.gjc-exact-replace-destination-${dev.toString(16)}-${ino.toString(16)}`)
-						: undefined;
-				if (
-					parsed.version !== 1 ||
-					dev === undefined ||
-					ino === undefined ||
-					nlink === undefined ||
-					size === undefined ||
-					mtimeNs === undefined ||
-					ctimeNs === undefined ||
-					typeof identity?.sha256 !== "string" ||
-					!match[1] ||
-					!match[2] ||
-					BigInt(`0x${match[1]}`) !== dev ||
-					BigInt(`0x${match[2]}`) !== ino ||
-					typeof parsed.predecessor !== "string" ||
-					path.resolve(parsed.predecessor) !== expectedPredecessor ||
-					typeof parsed.successor !== "string" ||
-					path.dirname(path.resolve(parsed.successor)) !== this.#baseDir
-				)
-					throw new Error("managed_replace_cleanup_receipt_invalid");
-				const retired = exactUnlink(expectedPredecessor, {
-					dev,
-					ino,
-					nlink,
-					parentDev: this.#subtreeRoot.dev,
-					parentIno: this.#subtreeRoot.ino,
-					size,
-					mtimeNs,
-					sha256: identity.sha256,
-					quarantineName: `.gjc-replace-retry-${dev.toString(16)}-${ino.toString(16)}`,
-				});
-				if (!retired.ok) throw new Error(`managed_replace_cleanup_pending:${retired.code ?? "unknown"}`);
-				const receipt = captureManagedFileNoFollow(receiptPath);
-				const removed = exactUnlink(receiptPath, {
-					dev: receipt.identity.dev,
-					ino: receipt.identity.ino,
-					nlink: receipt.identity.nlink,
-					parentDev: this.#subtreeRoot.dev,
-					parentIno: this.#subtreeRoot.ino,
-					size: BigInt(receipt.identity.size),
-					mtimeNs: receipt.identity.mtimeNs,
-					sha256: receipt.identity.sha256,
-					quarantineName: `.gjc-receipt-remove-${receipt.identity.dev.toString(16)}-${receipt.identity.ino.toString(16)}`,
-				});
-				if (!removed.ok) throw new Error(`managed_replace_receipt_cleanup_pending:${removed.code ?? "unknown"}`);
+				if (!name.startsWith(".gjc-replace-cleanup-")) continue;
+				if (!replacementCleanupReceiptBinding(name)) throw new Error("managed_replace_cleanup_receipt_invalid");
+				this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
 			}
 		} finally {
 			this.#reconcilingReplacementCleanup = false;
@@ -861,21 +908,7 @@ export class ManagedSessionDescendantStore {
 			const current = captureManagedFileNoFollow(resolved);
 			if (!sameIdentity(current.identity, expected.identity) || current.identity.sha256 !== expected.identity.sha256)
 				throw new Error("managed_replace_identity_mismatch");
-			replaceManagedFileSync(
-				resolved,
-				bytes,
-				this.#subtreeRoot,
-				this.#policy,
-				() => {
-					const currentAtCommit = captureManagedFileNoFollow(resolved);
-					if (
-						!sameIdentity(currentAtCommit.identity, expected.identity) ||
-						currentAtCommit.identity.sha256 !== expected.identity.sha256
-					)
-						throw new Error("managed_replace_identity_mismatch");
-				},
-				expected.identity,
-			);
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, expected.identity);
 			return;
 		}
 		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
@@ -914,7 +947,7 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
-		let existing = this.readExpected(relativePath);
+		const existing = this.readExpected(relativePath);
 		if (!existing) throw new Error("managed_append_missing");
 		if (this.#authority) {
 			const appended = this.#authority.appendManaged(
@@ -931,52 +964,18 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return;
 		}
-		// On Darwin, the first write-append open can change only ctime (e.g. com.apple.provenance)
-		// while leaving dev/ino/size/mtime/content intact. Allow one bounded refresh+retry for that
-		// transition only; any other identity change or a second ctime transition stays fail-closed.
-		// See https://github.com/Yeachan-Heo/gajae-code/issues/2944
-		let fd: number | undefined;
-		let darwinCtimeRefreshConsumed = false;
-		try {
-			for (;;) {
-				fd = fs.openSync(resolved, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
-				const before = identity(fs.fstatSync(fd, { bigint: true }));
-				if (!sameIdentity(before, existing.identity)) {
-					const allowDarwinCtimeRefresh =
-						process.platform === "darwin" &&
-						!darwinCtimeRefreshConsumed &&
-						isCtimeOnlyIdentityMismatch(before, existing.identity);
-					if (!allowDarwinCtimeRefresh) throw new Error("identity_mismatch");
-					fs.closeSync(fd);
-					fd = undefined;
-					darwinCtimeRefreshConsumed = true;
-					const original = existing;
-					const refreshed = this.readExpected(relativePath);
-					if (
-						!refreshed ||
-						!sameStableIdentityIgnoringCtime(refreshed.identity, original.identity) ||
-						refreshed.identity.sha256 !== original.identity.sha256 ||
-						!refreshed.bytes.equals(original.bytes)
-					) {
-						throw new Error("identity_mismatch");
-					}
-					existing = refreshed;
-					continue;
-				}
-				secureFileDescriptor(resolved, fd, "verify");
-				let offset = 0;
-				while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
-				fs.fsyncSync(fd);
-				secureFileDescriptor(resolved, fd, "verify");
-				const after = identity(fs.fstatSync(fd, { bigint: true }));
-				const named = identity(fs.lstatSync(resolved, { bigint: true }));
-				if (!sameIdentity(after, named) || after.dev !== before.dev || after.ino !== before.ino)
-					throw new Error("identity_mismatch");
-				break;
-			}
-		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
-		}
+		// Darwin has no retained native root authority. Do not append in place:
+		// a short write can leave a malformed JSONL tail with no safe recovery
+		// boundary. Replace the exact captured file instead so the old transcript
+		// or the complete successor remains recoverable after every reported error.
+		replaceManagedFileSync(
+			resolved,
+			Buffer.concat([existing.bytes, Buffer.from(bytes)]),
+			this.#subtreeRoot,
+			this.#policy,
+			undefined,
+			existing.identity,
+		);
 		this.#assertBound();
 	}
 
@@ -1425,23 +1424,17 @@ function sameIdentity(left: ManagedFileSnapshot["identity"], right: ManagedFileS
 		left.ctimeNs === right.ctimeNs
 	);
 }
-
-/** Content/path identity that remains meaningful across a Darwin write-open ctime-only transition. */
-function sameStableIdentityIgnoringCtime(
+function sameReplacementIdentity(
 	left: ManagedFileSnapshot["identity"],
 	right: ManagedFileSnapshot["identity"],
 ): boolean {
 	return (
-		left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs
 	);
-}
-
-/** True when observed identity matches expected on every field except ctimeNs. */
-function isCtimeOnlyIdentityMismatch(
-	observed: ManagedFileSnapshot["identity"],
-	expected: ManagedFileSnapshot["identity"],
-): boolean {
-	return sameStableIdentityIgnoringCtime(observed, expected) && observed.ctimeNs !== expected.ctimeNs;
 }
 
 function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
@@ -1668,12 +1661,13 @@ export function publishManagedFileNoReplaceSync(
 	bytes: Uint8Array,
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
-): void {
+): ManagedFileSnapshot["identity"] {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
 	let fd: number | undefined;
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
+	let publishedIdentity: ManagedFileSnapshot["identity"] | undefined;
 	let failure: unknown;
 	let outcome: NativePublishOutcome | undefined;
 	let linkPublished = false;
@@ -1691,6 +1685,7 @@ export function publishManagedFileNoReplaceSync(
 		secureFileDescriptor(staging, fd, "verify");
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
+		publishedIdentity = identity(staged, createHash("sha256").update(bytes).digest("hex"));
 
 		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
 		if (renameFlagsUnsupported(outcome)) {
@@ -1726,6 +1721,8 @@ export function publishManagedFileNoReplaceSync(
 		}
 	}
 	if (failure !== undefined) throw failure;
+	if (!publishedIdentity) throw new Error("managed_publish_identity_unavailable");
+	return publishedIdentity;
 }
 
 /** Replace one managed regular file while retaining the secured staging fd through publication. */
@@ -1743,6 +1740,16 @@ export function replaceManagedFileSync(
 	let fd: number | undefined;
 	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
 	let preserveStaging = false;
+	let receiptCleanup:
+		| {
+				path: string;
+				parentDev: bigint;
+				parentIno: bigint;
+				identity: ManagedFileSnapshot["identity"];
+				predecessor: ManagedFileSnapshot["identity"];
+		  }
+		| undefined;
+	let failure: unknown;
 	try {
 		fd = fs.openSync(
 			staging,
@@ -1762,23 +1769,54 @@ export function replaceManagedFileSync(
 		}
 		assertManagedDirectoryRoot(root);
 		assertFence?.();
-		if (process.platform !== "win32" && expectedDestination) {
-			throw new Error("managed_replace_exact_unavailable");
-		}
-		if (process.platform === "win32" && expectedDestination) {
+		if (expectedDestination) {
 			const parentIdentity = fs.lstatSync(parent, { bigint: true });
+			const successor = identity(staged, createHash("sha256").update(bytes).digest("hex"));
+			const receiptStagingPath = path.join(parent, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
+			preserveStaging = true;
+			const publishedReceiptIdentity = publishManagedFileNoReplaceSync(
+				receiptStagingPath,
+				Buffer.from(
+					JSON.stringify({
+						version: 3,
+						staging,
+						destination,
+						successor: serializeReplacementIdentity(successor),
+						predecessor: serializeReplacementIdentity(expectedDestination),
+					} satisfies ReplacementCleanupReceipt),
+				),
+				root,
+				policy,
+			);
+			const receiptPath = replacementReceiptPath(parent, expectedDestination, publishedReceiptIdentity);
+			const receiptPublish = classifyNativePublishOutcome(renameNoReplacePath(receiptStagingPath, receiptPath));
+			if (!receiptPublish.ok) throw publishFailure(receiptPublish);
+			const namedReceipt = captureManagedFileNoFollow(receiptPath);
+			if (
+				namedReceipt.identity.dev !== publishedReceiptIdentity.dev ||
+				namedReceipt.identity.ino !== publishedReceiptIdentity.ino
+			)
+				throw new Error("managed_replace_cleanup_receipt_identity_changed");
+			fsyncDirectory(parent);
+			receiptCleanup = {
+				path: receiptPath,
+				parentDev: parentIdentity.dev,
+				parentIno: parentIdentity.ino,
+				identity: publishedReceiptIdentity,
+				predecessor: expectedDestination,
+			};
 			const replaced = exactReplacePath(
 				staging,
 				destination,
 				{
-					dev: staged.dev,
-					ino: staged.ino,
-					nlink: staged.nlink,
+					dev: successor.dev,
+					ino: successor.ino,
+					nlink: successor.nlink,
 					parentDev: parentIdentity.dev,
 					parentIno: parentIdentity.ino,
-					size: staged.size,
-					mtimeNs: staged.mtimeNs,
-					sha256: createHash("sha256").update(bytes).digest("hex"),
+					size: BigInt(successor.size),
+					mtimeNs: successor.mtimeNs,
+					sha256: successor.sha256,
 				},
 				{
 					dev: expectedDestination.dev,
@@ -1791,88 +1829,12 @@ export function replaceManagedFileSync(
 					sha256: expectedDestination.sha256,
 				},
 			);
-			if (!replaced.ok) {
-				const committedWithPredecessor =
-					replaced.detachedPath === replaced.retainedPlaceholderPath &&
-					replaced.retainedSuccessorPath === destination;
-				if (committedWithPredecessor) {
-					const retired = exactUnlink(replaced.retainedPlaceholderPath!, {
-						dev: expectedDestination.dev,
-						ino: expectedDestination.ino,
-						nlink: expectedDestination.nlink,
-						parentDev: parentIdentity.dev,
-						parentIno: parentIdentity.ino,
-						size: BigInt(expectedDestination.size),
-						mtimeNs: expectedDestination.mtimeNs,
-						sha256: expectedDestination.sha256,
-						quarantineName: `.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}`,
-					});
-					if (!retired.ok) {
-						const predecessor =
-							retired.detachedPath ?? retired.retainedPlaceholderPath ?? replaced.retainedPlaceholderPath;
-						const receiptPath = path.join(
-							parent,
-							`.gjc-replace-cleanup-${expectedDestination.dev.toString(16)}-${expectedDestination.ino.toString(16)}.json`,
-						);
-						publishManagedFileNoReplaceSync(
-							receiptPath,
-							Buffer.from(
-								JSON.stringify({
-									version: 1,
-									predecessor,
-									successor: destination,
-									identity: {
-										dev: expectedDestination.dev.toString(),
-										ino: expectedDestination.ino.toString(),
-										nlink: expectedDestination.nlink.toString(),
-										size: String(expectedDestination.size),
-										mtimeNs: expectedDestination.mtimeNs.toString(),
-										ctimeNs: expectedDestination.ctimeNs.toString(),
-										sha256: expectedDestination.sha256,
-									},
-								}),
-							),
-							root,
-							policy,
-						);
-						throw new Error(
-							`managed_replace_cleanup_pending:receipt=${receiptPath}:predecessor=${predecessor}:successor=${destination}:code=${retired.code ?? "unknown"}`,
-						);
-					}
-				}
-				if (!committedWithPredecessor) {
-					if (replaced.detachedPath) {
-						const restored = exactRestore(replaced.detachedPath, staging, {
-							dev: staged.dev,
-							ino: staged.ino,
-							nlink: staged.nlink,
-							parentDev: parentIdentity.dev,
-							parentIno: parentIdentity.ino,
-							size: staged.size,
-							mtimeNs: staged.mtimeNs,
-							sha256: createHash("sha256").update(bytes).digest("hex"),
-						});
-						if (restored.ok) preserveStaging = true;
-						if (!restored.ok)
-							throw new Error(
-								`managed_replace_failed:${replaced.code ?? "unknown"}:retained=${replaced.detachedPath}:restore=${restored.code ?? "unknown"}`,
-							);
-					}
-					const retained = [
-						replaced.detachedPath,
-						replaced.retainedSuccessorPath,
-						replaced.retainedPlaceholderPath,
-						replaced.retainedUnknownPath,
-					]
-						.filter((pathname): pathname is string => typeof pathname === "string")
-						.join(",");
-					throw new Error(
-						`managed_replace_failed:${replaced.code ?? "unknown"}${retained ? `:retained=${retained}` : ""}`,
-					);
-				}
-			}
+			if (!replaced.ok) throw new ManagedReplaceError(replaced, receiptCleanup.path);
+			const named = captureManagedFileNoFollow(destination);
+			if (!sameReplacementIdentity(named.identity, successor) || named.identity.sha256 !== successor.sha256)
+				throw new Error("destination_identity_changed");
+			fsyncDirectory(parent);
 		} else fs.renameSync(staging, destination);
-		assertFence?.();
 		assertManagedDirectoryRoot(root);
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
@@ -1884,17 +1846,53 @@ export function replaceManagedFileSync(
 			fd = undefined;
 		}
 		fsyncDirectory(parent);
+		if (receiptCleanup) {
+			try {
+				const removed = exactUnlink(receiptCleanup.path, {
+					dev: receiptCleanup.identity.dev,
+					ino: receiptCleanup.identity.ino,
+					nlink: receiptCleanup.identity.nlink,
+					parentDev: receiptCleanup.parentDev,
+					parentIno: receiptCleanup.parentIno,
+					size: BigInt(receiptCleanup.identity.size),
+					mtimeNs: receiptCleanup.identity.mtimeNs,
+					sha256: receiptCleanup.identity.sha256,
+					quarantineName: replacementReceiptRetirementName(receiptCleanup.identity, receiptCleanup.predecessor),
+				});
+				if (!exactUnlinkCompleted(removed) && removed.code !== "not_found")
+					throw new ManagedReplaceError(removed, receiptCleanup.path);
+				try {
+					fsyncDirectory(parent);
+				} catch (error) {
+					throw new ManagedReplaceError(
+						{ ...removed, ok: false, code: "durability_failed" },
+						receiptCleanup.path,
+						error,
+					);
+				}
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+	} catch (error) {
+		failure = error;
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 		if (stagedIdentity && !preserveStaging) {
 			try {
 				const named = fs.lstatSync(staging, { bigint: true });
 				if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino) fs.unlinkSync(staging);
-			} catch {
-				// Never delete an object whose staging identity is no longer proven.
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					failure =
+						failure === undefined
+							? error
+							: new AggregateError([failure, error], "Managed replacement and staging cleanup both failed.");
+				}
 			}
 		}
 	}
+	if (failure !== undefined) throw failure;
 }
 
 export async function replaceManagedFile(

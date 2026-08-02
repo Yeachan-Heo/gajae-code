@@ -149,6 +149,7 @@ pub struct NativeExactFileIdentity {
 	pub sha256:          Option<String>,
 }
 
+#[derive(Clone)]
 struct ExactFileIdentity {
 	dev:             u64,
 	ino:             u64,
@@ -394,10 +395,40 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
+	fn detached_failure_with_durable_payload_and_unknown(
+		code: &str,
+		path: String,
+		unknown_path: String,
+	) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: Some(true),
+			detached_path: Some(path),
+			retained_successor_path: None,
+			retained_placeholder_path: None,
+			retained_unknown_path: Some(unknown_path),
+		}
+	}
+
+	#[cfg(unix)]
+	fn detached_failure_with_successor(code: &str, path: String, successor_path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: None,
+			detached_path: Some(path),
+			retained_successor_path: Some(successor_path),
+			retained_placeholder_path: None,
+			retained_unknown_path: None,
+		}
+	}
+
 	#[cfg(windows)]
 	fn detached_failure_with_successor_and_placeholder(
 		code: &str,
-		detached_path: String,
+		path: String,
 		successor_path: String,
 		placeholder_path: String,
 	) -> Self {
@@ -405,11 +436,36 @@ impl NativeExactUnlinkResult {
 			ok: false,
 			code: Some(code.to_owned()),
 			payload_durable: None,
-			detached_path: Some(detached_path),
+			detached_path: Some(path),
 			retained_successor_path: Some(successor_path),
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 		}
+	}
+
+	#[cfg(unix)]
+	fn with_retained_successor(mut self, successor_path: String, unknown_path: String) -> Self {
+		self.retained_successor_path = Some(successor_path);
+		if self.detached_path.is_none()
+			&& self.retained_placeholder_path.is_none()
+			&& self.retained_unknown_path.is_none()
+		{
+			self.retained_unknown_path = Some(unknown_path);
+		}
+		self
+	}
+
+	#[cfg(unix)]
+	fn with_retained_successor_and_expected_detached(
+		mut self,
+		successor_path: String,
+		expected_detached_path: String,
+	) -> Self {
+		self.retained_successor_path = Some(successor_path);
+		if self.detached_path.is_none() {
+			self.detached_path = Some(expected_detached_path);
+		}
+		self
 	}
 
 	#[cfg(unix)]
@@ -872,13 +928,12 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	};
 	platform::exact_unlink(Path::new(&path), &identity)
 }
-/// Replace a staged regular file only after validating the exact staged source
-/// and deleting the exact expected destination.
+/// Atomically replace a staged regular file only after validating the exact
+/// staged source and expected destination.
 ///
-/// Both identities must describe regular files, not directories or detach-only
-/// requests. Publication uses the retained verified source handle and a
-/// no-replace rename, so source substitution is rejected and a destination
-/// successor is preserved.
+/// Both identities must describe regular files in the same retained parent, not
+/// directories or detach-only requests. Publication uses an atomic namespace
+/// exchange so a substituted source or destination is never overwritten.
 #[napi]
 pub fn exact_replace_path(
 	source_path: String,
@@ -895,7 +950,7 @@ pub fn exact_replace_path(
 	let Some(expected_destination) = exact_file_identity(&expected_destination) else {
 		return NativeExactUnlinkResult::failure("identity_mismatch");
 	};
-	#[cfg(windows)]
+	#[cfg(any(unix, windows))]
 	{
 		platform::exact_replace_path(
 			Path::new(&source_path),
@@ -904,7 +959,7 @@ pub fn exact_replace_path(
 			&expected_destination,
 		)
 	}
-	#[cfg(not(windows))]
+	#[cfg(not(any(unix, windows)))]
 	{
 		let _ = (source_path, destination_path, expected_source, expected_destination);
 		NativeExactUnlinkResult::failure("unsupported_platform")
@@ -1269,6 +1324,10 @@ pub(crate) mod platform {
 	thread_local! {
 		static ROOT_PARENT_FSYNC_FAIL_ON_CALL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 	}
+	#[cfg(test)]
+	thread_local! {
+		static RENAME_EXCHANGE_FAIL_ON_CALL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+	}
 
 	#[cfg(test)]
 	pub(super) fn inject_root_parent_fsync_failure(call: u32) {
@@ -1289,6 +1348,27 @@ pub(crate) mod platform {
 
 	#[cfg(not(test))]
 	const fn take_injected_root_parent_fsync_failure() -> bool {
+		false
+	}
+	#[cfg(test)]
+	pub(super) fn inject_rename_exchange_failure(call: u32) {
+		RENAME_EXCHANGE_FAIL_ON_CALL.with(|target| target.set(call));
+	}
+
+	#[cfg(test)]
+	fn take_injected_rename_exchange_failure() -> bool {
+		RENAME_EXCHANGE_FAIL_ON_CALL.with(|target| {
+			let current = target.get();
+			if current == 0 {
+				return false;
+			}
+			target.set(current - 1);
+			current == 1
+		})
+	}
+
+	#[cfg(not(test))]
+	const fn take_injected_rename_exchange_failure() -> bool {
 		false
 	}
 
@@ -1326,6 +1406,16 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(test)]
+	static EXACT_REPLACE_AFTER_EXCHANGE_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+
+	#[cfg(test)]
+	static EXACT_REPLACE_BEFORE_FINAL_VERIFY_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+
+	#[cfg(test)]
 	static AFTER_EXCHANGE_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
 		OnceLock::new();
 
@@ -1359,6 +1449,26 @@ pub(crate) mod platform {
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
 
+	#[cfg(test)]
+	pub(super) fn set_exact_replace_after_exchange_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*EXACT_REPLACE_AFTER_EXCHANGE_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_exact_replace_before_final_verify_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*EXACT_REPLACE_BEFORE_FINAL_VERIFY_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
 	#[cfg(all(test, target_os = "linux"))]
 	pub(super) fn set_after_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*AFTER_EXCHANGE_HOOK
@@ -1367,7 +1477,7 @@ pub(crate) mod platform {
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
-	#[cfg(all(test, target_os = "linux"))]
+	#[cfg(test)]
 	pub(super) fn set_before_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*BEFORE_EXCHANGE_HOOK
 			.get_or_init(|| Mutex::new(None))
@@ -1431,6 +1541,38 @@ pub(crate) mod platform {
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	fn pause_exact_replace_after_exchange_for_test() {
+		if let Some((entered, resume)) = EXACT_REPLACE_AFTER_EXCHANGE_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered
+				.send(())
+				.expect("exact replace exchange hook receiver");
+			resume.recv().expect("exact replace exchange hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_exact_replace_before_final_verify_for_test() {
+		if let Some((entered, resume)) = EXACT_REPLACE_BEFORE_FINAL_VERIFY_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered
+				.send(())
+				.expect("exact replace final verify hook receiver");
+			resume
+				.recv()
+				.expect("exact replace final verify hook resume");
+		}
 	}
 
 	#[cfg(test)]
@@ -2752,6 +2894,9 @@ pub(crate) mod platform {
 		source: &CString,
 		destination: &CString,
 	) -> Result<(), &'static str> {
+		if take_injected_rename_exchange_failure() {
+			return Err("io_error");
+		}
 		// SAFETY: the descriptor and both NUL-terminated CString pointers remain valid.
 		let result = unsafe {
 			libc::syscall(
@@ -2835,6 +2980,9 @@ pub(crate) mod platform {
 		source: &CString,
 		destination: &CString,
 	) -> Result<(), &'static str> {
+		if take_injected_rename_exchange_failure() {
+			return Err("io_error");
+		}
 		const RENAME_SWAP: u32 = 0x0000_0002;
 		// SAFETY: both descriptors and NUL-terminated CString pointers remain valid.
 		if unsafe {
@@ -2939,7 +3087,6 @@ pub(crate) mod platform {
 	#[allow(dead_code, reason = "retained cleanup outcomes are platform-conditional")]
 	enum ExchangePlaceholderRemoval {
 		Removed,
-		RestoredMismatch,
 		RetainedMismatch(CString),
 		Failed,
 		RetainedFailure(CString, &'static str),
@@ -2975,10 +3122,7 @@ pub(crate) mod platform {
 			&& detached.st_ino as u64 == expected.ino;
 
 		if !matches {
-			return match rename_no_replace(parent_fd, parent_fd, &detached_name, name) {
-				Ok(()) => ExchangePlaceholderRemoval::RestoredMismatch,
-				Err(_) => ExchangePlaceholderRemoval::RetainedMismatch(detached_name),
-			};
+			return ExchangePlaceholderRemoval::RetainedMismatch(detached_name);
 		}
 		ExchangePlaceholderRemoval::RetainedFailure(detached_name, "cleanup_pending")
 	}
@@ -3165,6 +3309,18 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("io_error");
 		};
+		let result = exact_unlink_at(parent_fd, name, path, identity);
+		// SAFETY: this function owns the walked parent descriptor exactly once.
+		unsafe { libc::close(parent_fd) };
+		result
+	}
+
+	fn exact_unlink_at(
+		parent_fd: libc::c_int,
+		name: CString,
+		path: &Path,
+		identity: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
 		// SAFETY: zero is a valid initialized representation for this output struct.
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
 		// SAFETY: the descriptor and CString are live; the initialized output struct is
@@ -3173,13 +3329,9 @@ pub(crate) mod platform {
 			!= 0
 		{
 			let error = std::io::Error::last_os_error();
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure(security_code(&error));
 		}
 		if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("reparse_point");
 		}
 		let expected_kind = if identity.directory {
@@ -3188,8 +3340,6 @@ pub(crate) mod platform {
 			libc::S_IFREG
 		};
 		if named.st_mode & libc::S_IFMT != expected_kind {
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure(if identity.directory {
 				"not_directory"
 			} else {
@@ -3201,41 +3351,29 @@ pub(crate) mod platform {
 			|| named.st_size as u64 != identity.size
 			|| stat_mtime_ns(&named) != i128::from(identity.mtime_ns)
 		{
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 		if !identity.directory
 			&& (named.st_nlink != 1 || identity.nlink.is_some_and(|nlink| nlink != 1))
 		{
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
 		if !identity.directory
 			&& digest_openat(parent_fd, &name).ok().as_ref() != identity.sha256.as_ref()
 		{
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 
 		let Some(quarantine_name) = identity.quarantine_name.as_deref() else {
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("quarantine_destination_required");
 		};
 		let Ok(quarantine) = CString::new(quarantine_name) else {
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("io_error");
 		};
 		let placeholder =
 			match create_exchange_placeholder(parent_fd, &quarantine, identity.directory) {
 				Ok(placeholder) => placeholder,
 				Err(code) => {
-					// SAFETY: this branch owns the live descriptor and closes it exactly once.
-					unsafe { libc::close(parent_fd) };
 					return NativeExactUnlinkResult::failure(code);
 				},
 			};
@@ -3246,8 +3384,6 @@ pub(crate) mod platform {
 		pause_before_exchange_for_test();
 		if let Err(code) = rename_exchange(parent_fd, parent_fd, &name, &quarantine) {
 			let cleanup = remove_exchange_placeholder(parent_fd, &quarantine, placeholder);
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return match cleanup {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::failure(code),
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
@@ -3272,7 +3408,7 @@ pub(crate) mod platform {
 							.into_owned(),
 					)
 				},
-				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+				ExchangePlaceholderRemoval::Failed => {
 					NativeExactUnlinkResult::retained_unknown_failure(
 						"cleanup_failed",
 						path
@@ -3315,7 +3451,7 @@ pub(crate) mod platform {
 				ExchangePlaceholderRemoval::Removed => {
 					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
 				},
-				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+				ExchangePlaceholderRemoval::Failed => {
 					NativeExactUnlinkResult::detached_failure_with_unknown(
 						"identity_mismatch",
 						detached_path,
@@ -3347,14 +3483,12 @@ pub(crate) mod platform {
 					)
 				},
 			};
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return result;
 		}
 		if identity.directory || identity.detach_only {
 			let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::detached(detached_path),
-				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+				ExchangePlaceholderRemoval::Failed => {
 					NativeExactUnlinkResult::detached_failure_with_unknown(
 						"identity_mismatch",
 						detached_path,
@@ -3386,19 +3520,15 @@ pub(crate) mod platform {
 					)
 				},
 			};
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return result;
 		}
 		// POSIX cannot descriptor-unlink, but it can descriptor-scrub the exact
 		// detached regular file. Durable zero-length retained entries are then
 		// reconciled as internal placeholders without preserving transcript bytes.
 		if let Err(code) = scrub_regular_file_openat(parent_fd, &quarantine, identity) {
-			// SAFETY: this error branch owns `parent_fd` and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::detached_failure(code, detached_path);
 		}
-		let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
+		match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 			ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
 			ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
 				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
@@ -3413,7 +3543,7 @@ pub(crate) mod platform {
 				)
 			},
 			ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
-				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_unknown(
 					"cleanup_pending",
 					detached_path,
 					path
@@ -3424,18 +3554,14 @@ pub(crate) mod platform {
 						.into_owned(),
 				)
 			},
-			ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
-				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+			ExchangePlaceholderRemoval::Failed => {
+				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_unknown(
 					"cleanup_pending",
 					detached_path,
 					path.to_string_lossy().into_owned(),
 				)
 			},
-		};
-
-		// SAFETY: this branch owns the live descriptor and closes it exactly once.
-		unsafe { libc::close(parent_fd) };
-		result
+		}
 	}
 
 	fn open_parent_no_follow(
@@ -3661,6 +3787,233 @@ pub(crate) mod platform {
 		})
 	}
 
+	fn exact_regular_matches(
+		parent_fd: libc::c_int,
+		name: &CString,
+		identity: &ExactFileIdentity,
+	) -> Result<bool, &'static str> {
+		// SAFETY: the retained parent descriptor and NUL-terminated name are live;
+		// O_NOFOLLOW rejects a substituted symlink and O_NONBLOCK avoids blocking on
+		// a substituted special file before fstat rejects it.
+		let fd = unsafe {
+			libc::openat(
+				parent_fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			)
+		};
+		if fd < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		let result = (|| {
+			// SAFETY: zero is a valid initialized representation for fstat output.
+			let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: fd is live and opened is writable.
+			if unsafe { libc::fstat(fd, &mut opened) } != 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			if opened.st_mode & libc::S_IFMT != libc::S_IFREG {
+				return Ok(false);
+			}
+			let digest = digest_fd(fd)?;
+			// Linearize the pathname observation after descriptor hashing: the live name
+			// must still resolve no-follow to the descriptor whose metadata and bytes were
+			// checked above.
+			// SAFETY: zero is a valid initialized representation for fstatat output.
+			let mut named: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is live, name is NUL-terminated, and named is writable.
+			if unsafe {
+				libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+			} != 0
+			{
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			Ok(opened.st_dev as u64 == identity.dev
+				&& opened.st_ino as u64 == identity.ino
+				&& opened.st_size as u64 == identity.size
+				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
+				&& opened.st_nlink == 1
+				&& identity.nlink.is_none_or(|nlink| nlink == 1)
+				&& identity.sha256.as_ref() == Some(&digest)
+				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
+				&& named.st_dev == opened.st_dev
+				&& named.st_ino == opened.st_ino)
+		})();
+		// SAFETY: this function owns fd exactly once.
+		unsafe { libc::close(fd) };
+		result
+	}
+
+	pub(super) fn exact_replace_path(
+		source_path: &Path,
+		destination_path: &Path,
+		expected_source: &ExactFileIdentity,
+		expected_destination: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		if expected_source.directory
+			|| expected_source.detach_only
+			|| expected_destination.directory
+			|| expected_destination.detach_only
+			|| expected_source.parent_dev != expected_destination.parent_dev
+			|| expected_source.parent_ino != expected_destination.parent_ino
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let (source_parent, source_name) = match open_parent_no_follow(source_path) {
+			Ok(value) => value,
+			Err(result) => return *result,
+		};
+		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
+			Ok(value) => value,
+			Err(result) => {
+				// SAFETY: this branch owns source_parent exactly once.
+				unsafe { libc::close(source_parent) };
+				return *result;
+			},
+		};
+		let preflight = (|| {
+			for (parent, identity) in
+				[(source_parent, expected_source), (destination_parent, expected_destination)]
+			{
+				let Some((dev, ino)) = identity.parent_dev.zip(identity.parent_ino) else {
+					return Err("parent_mismatch");
+				};
+				// SAFETY: zero is a valid initialized representation for fstat output.
+				let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+				// SAFETY: parent is a retained live descriptor and stat is writable.
+				if unsafe { libc::fstat(parent, &mut stat) } != 0
+					|| stat.st_dev as u64 != dev
+					|| stat.st_ino as u64 != ino
+				{
+					return Err("parent_mismatch");
+				}
+			}
+			if !exact_regular_matches(source_parent, &source_name, expected_source)?
+				|| !exact_regular_matches(destination_parent, &destination_name, expected_destination)?
+			{
+				return Err("identity_mismatch");
+			}
+			// Revalidate immediately before the atomic exchange. There is no
+			// delete-then-rename publication gap.
+			if !exact_regular_matches(source_parent, &source_name, expected_source)?
+				|| !exact_regular_matches(destination_parent, &destination_name, expected_destination)?
+			{
+				return Err("identity_mismatch");
+			}
+			#[cfg(test)]
+			pause_before_exchange_for_test();
+			rename_exchange(source_parent, destination_parent, &source_name, &destination_name)?;
+			#[cfg(test)]
+			pause_exact_replace_after_exchange_for_test();
+			Ok(())
+		})();
+		let result = if let Err(code) = preflight {
+			NativeExactUnlinkResult::failure(code)
+		} else {
+			let successor_matches =
+				exact_regular_matches(destination_parent, &destination_name, expected_source);
+			let predecessor_matches =
+				exact_regular_matches(source_parent, &source_name, expected_destination);
+			match (matches!(successor_matches, Ok(true)), matches!(predecessor_matches, Ok(true))) {
+				(true, false) => NativeExactUnlinkResult::retained_unknown_failure(
+					"identity_mismatch",
+					source_path.to_string_lossy().into_owned(),
+				)
+				.with_retained_successor(
+					destination_path.to_string_lossy().into_owned(),
+					source_path.to_string_lossy().into_owned(),
+				),
+				(false, _) => NativeExactUnlinkResult::detached_failure_with_unknown(
+					"identity_mismatch",
+					source_path.to_string_lossy().into_owned(),
+					destination_path.to_string_lossy().into_owned(),
+				),
+				(true, true) => {
+					if fsync_root_parent(source_parent).is_err() {
+						NativeExactUnlinkResult::detached_failure_with_successor(
+							"durability_failed",
+							source_path.to_string_lossy().into_owned(),
+							destination_path.to_string_lossy().into_owned(),
+						)
+					} else {
+						let predecessor_name = format!(
+							".gjc-exact-replace-destination-{:x}-{:x}",
+							expected_destination.dev, expected_destination.ino
+						);
+						let predecessor_path = source_path.with_file_name(&predecessor_name);
+						let mut cleanup_identity = expected_destination.clone();
+						cleanup_identity.quarantine_name = Some(predecessor_name);
+						let cleanup = exact_unlink_at(
+							source_parent,
+							source_name.clone(),
+							source_path,
+							&cleanup_identity,
+						);
+						let securely_retired = cleanup.ok
+							|| (cleanup.code.as_deref() == Some("cleanup_pending")
+								&& cleanup.payload_durable == Some(true)
+								&& cleanup.detached_path.as_deref()
+									== Some(predecessor_path.to_string_lossy().as_ref())
+								&& cleanup.retained_placeholder_path.is_some()
+								&& cleanup.retained_successor_path.is_none()
+								&& cleanup.retained_unknown_path.is_none());
+						if securely_retired {
+							#[cfg(test)]
+							pause_exact_replace_before_final_verify_for_test();
+							let successor_still_matches = matches!(
+								exact_regular_matches(
+									destination_parent,
+									&destination_name,
+									expected_source,
+								),
+								Ok(true)
+							);
+							if successor_still_matches {
+								if fsync_root_parent(source_parent).is_err() {
+									NativeExactUnlinkResult::retained_successor_failure(
+										"durability_failed",
+										destination_path.to_string_lossy().into_owned(),
+									)
+								} else if matches!(
+									exact_regular_matches(
+										destination_parent,
+										&destination_name,
+										expected_source,
+									),
+									Ok(true)
+								) {
+									NativeExactUnlinkResult::success()
+								} else {
+									NativeExactUnlinkResult::detached_failure_with_unknown(
+										"identity_mismatch",
+										source_path.to_string_lossy().into_owned(),
+										destination_path.to_string_lossy().into_owned(),
+									)
+								}
+							} else {
+								NativeExactUnlinkResult::detached_failure_with_unknown(
+									"identity_mismatch",
+									source_path.to_string_lossy().into_owned(),
+									destination_path.to_string_lossy().into_owned(),
+								)
+							}
+						} else {
+							cleanup.with_retained_successor_and_expected_detached(
+								destination_path.to_string_lossy().into_owned(),
+								source_path.to_string_lossy().into_owned(),
+							)
+						}
+					}
+				},
+			}
+		};
+		// SAFETY: this function owns both retained descriptors exactly once.
+		unsafe {
+			libc::close(source_parent);
+			libc::close(destination_parent);
+		}
+		result
+	}
 	pub(super) fn exact_restore(
 		detached_path: &Path,
 		original_path: &Path,
@@ -3790,8 +4143,15 @@ pub(crate) mod platform {
 		}
 		match remove_exchange_placeholder(parent_fd, &detached_name, placeholder) {
 			ExchangePlaceholderRemoval::Removed => {},
-			ExchangePlaceholderRemoval::RetainedMismatch(retained_name)
-			| ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
+			ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::retained_unknown_failure(
+					"cleanup_pending",
+					retained_name.to_string_lossy().into_owned(),
+				);
+			},
+			ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
 				// SAFETY: this branch owns the live descriptor and closes it exactly once.
 				unsafe { libc::close(parent_fd) };
 				return NativeExactUnlinkResult::retained_placeholder_failure(
@@ -3799,7 +4159,7 @@ pub(crate) mod platform {
 					retained_name.to_string_lossy().into_owned(),
 				);
 			},
-			ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+			ExchangePlaceholderRemoval::Failed => {
 				// SAFETY: this branch owns the live descriptor and closes it exactly once.
 				unsafe { libc::close(parent_fd) };
 				return NativeExactUnlinkResult::retained_unknown_failure(
@@ -7548,6 +7908,9 @@ mod rename_no_replace_eintr_tests {
 	}
 }
 
+#[cfg(all(test, unix))]
+static PATH_IDENTITY_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // These tests pause exact_unlink at internal exchange hooks and block on
 // unbounded channel recvs; macOS renameatx_np(RENAME_SWAP) rejects the
 // file<->directory placeholder swap, so the hook is never reached and the
@@ -7558,13 +7921,14 @@ mod exact_unlink_placeholder_tests {
 	use std::{
 		fs,
 		os::unix::fs::MetadataExt,
-		sync::{Mutex, MutexGuard, OnceLock, mpsc},
+		sync::{MutexGuard, mpsc},
 		thread,
 		time::{SystemTime, UNIX_EPOCH},
 	};
 
 	use super::{
-		ExactFileIdentity, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, platform, sha256,
+		ExactFileIdentity, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
+		PATH_IDENTITY_HOOK_TEST_LOCK, platform, sha256,
 	};
 
 	struct ExchangeHookTestGuard {
@@ -7585,10 +7949,8 @@ mod exact_unlink_placeholder_tests {
 	}
 
 	fn exchange_hook_test_guard() -> ExchangeHookTestGuard {
-		static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 		ExchangeHookTestGuard {
-			_guard: GUARD
-				.get_or_init(|| Mutex::new(()))
+			_guard: PATH_IDENTITY_HOOK_TEST_LOCK
 				.lock()
 				.unwrap_or_else(|poisoned| poisoned.into_inner()),
 		}
@@ -7645,7 +8007,12 @@ mod exact_unlink_placeholder_tests {
 		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
 		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
 		assert_eq!(result.payload_durable, Some(true));
-		assert_eq!(fs::read(&target).expect("successor preserved"), b"live successor");
+		let retained_successor = result
+			.retained_unknown_path
+			.as_deref()
+			.expect("successor retained at an explicit unknown path");
+		assert!(!target.exists(), "unclassified successor must not be restored by pathname");
+		assert_eq!(fs::read(retained_successor).expect("read retained successor"), b"live successor");
 		assert!(
 			fs::read(&stale)
 				.expect("stale quarantine scrubbed")
@@ -7705,7 +8072,17 @@ mod exact_unlink_placeholder_tests {
 		assert!(matches!(result.code.as_deref(), Some("cleanup_pending" | "identity_mismatch")));
 
 		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
-		assert_eq!(fs::metadata(&target).expect("stat successor").is_dir(), target_is_directory);
+		let retained_successor = result
+			.retained_unknown_path
+			.as_deref()
+			.expect("successor retained at an explicit unknown path");
+		assert!(!target.exists(), "unclassified successor must not be restored by pathname");
+		assert_eq!(
+			fs::metadata(retained_successor)
+				.expect("stat retained successor")
+				.is_dir(),
+			target_is_directory
+		);
 		assert!(stale.exists(), "stale quarantine was not retained");
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
@@ -7773,8 +8150,17 @@ mod exact_unlink_placeholder_tests {
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
 		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
-		assert_eq!(result.retained_unknown_path.as_deref(), Some(target.to_string_lossy().as_ref()));
-		assert_eq!(fs::metadata(&target).expect("stat successor").is_dir(), target_is_directory);
+		let retained_successor = result
+			.retained_unknown_path
+			.as_deref()
+			.expect("successor retained at an explicit unknown path");
+		assert!(!target.exists(), "unclassified successor must not be restored by pathname");
+		assert_eq!(
+			fs::metadata(retained_successor)
+				.expect("stat retained successor")
+				.is_dir(),
+			target_is_directory
+		);
 		assert!(stale.exists(), "mutated stale object was not recoverable at its detached path");
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
@@ -7971,7 +8357,7 @@ mod exact_unlink_placeholder_tests {
 	}
 
 	#[test]
-	fn exchange_failure_retains_placeholder_cleanup_path() {
+	fn exchange_failure_retains_replaced_placeholder_at_detached_path() {
 		let _guard = exchange_hook_test_guard();
 		let root = std::env::temp_dir().join(format!(
 			"gjc-exact-unlink-exchange-failure-placeholder-{}-{}",
@@ -8025,7 +8411,8 @@ mod exact_unlink_placeholder_tests {
 					.is_some_and(|name| name.starts_with(".gjc-exact-unlink-placeholder-"))
 			})
 			.expect("find detached placeholder");
-		fs::write(&retained, b"retained").expect("poison retained regular placeholder");
+		fs::remove_file(&retained).expect("remove detached placeholder");
+		fs::write(&retained, b"unrelated").expect("replace detached placeholder");
 		placeholder_resume_tx
 			.send(())
 			.expect("resume placeholder cleanup");
@@ -8037,11 +8424,16 @@ mod exact_unlink_placeholder_tests {
 		assert_eq!(result.code.as_deref(), Some("cleanup_failed"));
 		assert!(result.detached_path.is_none());
 		assert!(result.retained_successor_path.is_none());
+		assert!(result.retained_placeholder_path.is_none());
 		assert_eq!(
-			result.retained_placeholder_path.as_deref(),
+			result.retained_unknown_path.as_deref(),
 			Some(retained.to_string_lossy().as_ref())
 		);
-		assert!(retained.is_file(), "retained cleanup path is not a regular placeholder");
+		assert!(
+			!root.join(".quarantine").exists(),
+			"unrelated detached object was republished at the canonical cleanup name"
+		);
+		assert_eq!(fs::read(&retained).expect("read retained unrelated object"), b"unrelated");
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
@@ -8719,6 +9111,478 @@ mod link_no_replace_tests {
 	}
 }
 
+#[cfg(all(test, unix))]
+mod exact_replace_path_tests {
+	use std::{
+		fs,
+		os::unix::fs::MetadataExt,
+		path::{Path, PathBuf},
+		sync::{
+			atomic::{AtomicU64, Ordering},
+			mpsc,
+		},
+		thread,
+	};
+
+	use super::{
+		ExactFileIdentity, PATH_IDENTITY_HOOK_TEST_LOCK as EXACT_REPLACE_HOOK_LOCK, platform, sha256,
+	};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-exact-replace-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			fs::create_dir(&path).expect("create exact replace temp directory");
+			Self(path)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn identity(path: &Path, parent: &Path, bytes: &[u8]) -> ExactFileIdentity {
+		let metadata = fs::metadata(path).expect("stat exact replace file");
+		let parent = fs::metadata(parent).expect("stat exact replace parent");
+		ExactFileIdentity {
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      Some(parent.dev()),
+			parent_ino:      Some(parent.ino()),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       false,
+			detach_only:     false,
+			quarantine_name: None,
+			sha256:          Some(sha256(bytes)),
+		}
+	}
+
+	#[test]
+	fn exact_replace_path_commits_and_scrubs_the_predecessor() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+
+		let result = platform::exact_replace_path(
+			&source,
+			&destination,
+			&expected_source,
+			&expected_destination,
+		);
+
+		assert!(result.ok, "exact replacement failed: {:?}", result.code);
+		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
+		assert!(!source.exists(), "the random staging name must not survive replacement");
+		let retained = fs::read_dir(&temporary.0)
+			.expect("read replacement directory")
+			.filter_map(Result::ok)
+			.map(|entry| entry.path())
+			.filter(|path| path != &destination)
+			.collect::<Vec<_>>();
+		assert_eq!(retained.len(), 2, "only scrubbed internal placeholders may remain");
+		for path in retained {
+			assert_eq!(fs::read(path).expect("read scrubbed placeholder"), b"");
+		}
+	}
+
+	#[test]
+	fn exact_replace_path_refuses_a_substituted_destination() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		let authorized = temporary.0.join("authorized-predecessor");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		fs::rename(&destination, &authorized).expect("retain authorized predecessor");
+		fs::write(&destination, b"substituted").expect("publish substituted destination");
+
+		let result = platform::exact_replace_path(
+			&source,
+			&destination,
+			&expected_source,
+			&expected_destination,
+		);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(fs::read(&destination).expect("read substituted destination"), b"substituted");
+		assert_eq!(fs::read(&source).expect("read untouched successor"), b"successor");
+		assert_eq!(fs::read(&authorized).expect("read authorized predecessor"), b"predecessor");
+	}
+
+	#[test]
+	fn exact_replace_path_reports_both_mutated_names_after_pre_exchange_substitution() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		let retained_source = temporary.0.join("authorized-successor");
+		let retained_destination = temporary.0.join("authorized-predecessor");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_before_exchange_hook(Some((entered_tx, resume_rx)));
+		let source_for_replace = source.clone();
+		let destination_for_replace = destination.clone();
+		let replace = thread::spawn(move || {
+			platform::exact_replace_path(
+				&source_for_replace,
+				&destination_for_replace,
+				&expected_source,
+				&expected_destination,
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for exact replacement pre-exchange hook");
+		fs::rename(&source, &retained_source).expect("retain authorized successor");
+		fs::write(&source, b"attacker-source").expect("substitute source");
+		fs::rename(&destination, &retained_destination).expect("retain authorized predecessor");
+		fs::write(&destination, b"attacker-destination").expect("substitute destination");
+		resume_tx.send(()).expect("resume exact replacement");
+		let result = replace.join().expect("exact replacement thread");
+		platform::set_before_exchange_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(
+			result.retained_unknown_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		assert_eq!(fs::read(&destination).expect("read mutated destination"), b"attacker-source");
+		assert_eq!(fs::read(&source).expect("read mutated source"), b"attacker-destination");
+		assert_eq!(fs::read(&retained_source).expect("read retained successor"), b"successor");
+		assert_eq!(
+			fs::read(&retained_destination).expect("read retained predecessor"),
+			b"predecessor"
+		);
+	}
+	#[test]
+	fn exact_replace_path_preserves_substituted_source_after_exchange() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		let predecessor = temporary.0.join("authorized-predecessor");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_exact_replace_after_exchange_hook(Some((entered_tx, resume_rx)));
+		let source_for_replace = source.clone();
+		let destination_for_replace = destination.clone();
+		let replace = thread::spawn(move || {
+			platform::exact_replace_path(
+				&source_for_replace,
+				&destination_for_replace,
+				&expected_source,
+				&expected_destination,
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for exact replacement exchange");
+		fs::rename(&source, &predecessor).expect("retain authorized predecessor");
+		fs::write(&source, b"attacker").expect("substitute source name");
+		resume_tx.send(()).expect("resume exact replacement");
+		let result = replace.join().expect("exact replacement thread");
+		platform::set_exact_replace_after_exchange_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(
+			result.retained_successor_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		assert_eq!(result.retained_unknown_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
+		assert_eq!(fs::read(&predecessor).expect("read retained predecessor"), b"predecessor");
+		assert_eq!(fs::read(&source).expect("read substituted source"), b"attacker");
+	}
+
+	#[test]
+	fn exact_replace_path_preserves_substituted_destination_after_exchange() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		let successor = temporary.0.join("retained-successor");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_exact_replace_after_exchange_hook(Some((entered_tx, resume_rx)));
+		let source_for_replace = source.clone();
+		let destination_for_replace = destination.clone();
+		let replace = thread::spawn(move || {
+			platform::exact_replace_path(
+				&source_for_replace,
+				&destination_for_replace,
+				&expected_source,
+				&expected_destination,
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for exact replacement exchange");
+		fs::rename(&destination, &successor).expect("retain committed successor");
+		fs::write(&destination, b"attacker").expect("substitute destination name");
+		resume_tx.send(()).expect("resume exact replacement");
+		let result = replace.join().expect("exact replacement thread");
+		platform::set_exact_replace_after_exchange_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(
+			result.retained_unknown_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		assert_eq!(result.retained_successor_path, None);
+		assert_eq!(fs::read(&successor).expect("read retained successor"), b"successor");
+		assert_eq!(fs::read(&source).expect("read retained predecessor"), b"predecessor");
+		assert_eq!(fs::read(&destination).expect("read substituted destination"), b"attacker");
+	}
+
+	#[test]
+	fn exact_replace_path_preserves_successor_moved_before_final_verification() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_exact_replace_before_final_verify_hook(Some((entered_tx, resume_rx)));
+		let source_for_replace = source.clone();
+		let destination_for_replace = destination.clone();
+		let replace = thread::spawn(move || {
+			platform::exact_replace_path(
+				&source_for_replace,
+				&destination_for_replace,
+				&expected_source,
+				&expected_destination,
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for final replacement verification");
+		fs::rename(&destination, &source).expect("move committed successor back to staging");
+		fs::write(&destination, b"attacker").expect("substitute destination name");
+		resume_tx
+			.send(())
+			.expect("resume final replacement verification");
+		let result = replace.join().expect("exact replacement thread");
+		platform::set_exact_replace_before_final_verify_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(
+			result.retained_unknown_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		assert_eq!(fs::read(&source).expect("read retained successor"), b"successor");
+		assert_eq!(fs::read(&destination).expect("read substituted destination"), b"attacker");
+	}
+
+	#[test]
+	fn exact_replace_path_reports_both_names_after_post_cleanup_substitution() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		let retained_successor = temporary.0.join("retained-successor");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_exact_replace_before_final_verify_hook(Some((entered_tx, resume_rx)));
+		let source_for_replace = source.clone();
+		let destination_for_replace = destination.clone();
+		let replace = thread::spawn(move || {
+			platform::exact_replace_path(
+				&source_for_replace,
+				&destination_for_replace,
+				&expected_source,
+				&expected_destination,
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for final replacement verification");
+		fs::rename(&destination, &retained_successor).expect("retain committed successor");
+		fs::write(&source, b"attacker-source").expect("substitute source name");
+		fs::write(&destination, b"attacker-destination").expect("substitute destination name");
+		resume_tx
+			.send(())
+			.expect("resume final replacement verification");
+		let result = replace.join().expect("exact replacement thread");
+		platform::set_exact_replace_before_final_verify_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(
+			result.retained_unknown_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		assert_eq!(fs::read(&retained_successor).expect("read retained successor"), b"successor");
+		assert_eq!(fs::read(&source).expect("read substituted source"), b"attacker-source");
+		assert_eq!(
+			fs::read(&destination).expect("read substituted destination"),
+			b"attacker-destination"
+		);
+	}
+	#[test]
+	fn exact_replace_path_reports_predecessor_when_retirement_exchange_fails() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("session.replacement");
+		let destination = temporary.0.join("session.jsonl");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		platform::inject_rename_exchange_failure(2);
+
+		let result = platform::exact_replace_path(
+			&source,
+			&destination,
+			&expected_source,
+			&expected_destination,
+		);
+		platform::inject_rename_exchange_failure(0);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("cleanup_failed"));
+		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(
+			result.retained_successor_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		let retained_placeholder = result
+			.retained_placeholder_path
+			.as_deref()
+			.expect("retained cleanup helper path");
+		assert!(Path::new(retained_placeholder).exists());
+		assert_eq!(fs::read(&source).expect("read retained predecessor"), b"predecessor");
+		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
+	}
+	#[test]
+	fn exact_replace_path_reports_predecessor_when_exchange_fsync_fails() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		platform::inject_root_parent_fsync_failure(1);
+
+		let result = platform::exact_replace_path(
+			&source,
+			&destination,
+			&expected_source,
+			&expected_destination,
+		);
+		platform::inject_root_parent_fsync_failure(0);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("durability_failed"));
+		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(
+			result.retained_successor_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		assert_eq!(fs::read(&source).expect("read retained predecessor"), b"predecessor");
+		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
+	}
+
+	#[test]
+	fn exact_replace_path_reports_successor_when_final_fsync_fails() {
+		let _guard = EXACT_REPLACE_HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("staging");
+		let destination = temporary.0.join("session.json");
+		fs::write(&source, b"successor").expect("seed staged successor");
+		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
+		let expected_source = identity(&source, &temporary.0, b"successor");
+		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
+		platform::inject_root_parent_fsync_failure(2);
+
+		let result = platform::exact_replace_path(
+			&source,
+			&destination,
+			&expected_source,
+			&expected_destination,
+		);
+		platform::inject_root_parent_fsync_failure(0);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("durability_failed"));
+		assert_eq!(result.detached_path, None);
+		assert_eq!(
+			result.retained_successor_path.as_deref(),
+			Some(destination.to_string_lossy().as_ref())
+		);
+		assert!(!source.exists());
+		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
+	}
+}
 #[cfg(test)]
 mod sha256_tests {
 	use std::io::{self, Read};

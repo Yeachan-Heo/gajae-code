@@ -12,6 +12,7 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { FallbackChainController } from "@gajae-code/coding-agent/session/fallback-chain-controller";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import * as native from "@gajae-code/natives";
 import { getProjectAgentDir, logger, TempDir, withTimeout } from "@gajae-code/utils";
 
 const runtimeSignalStoreKey = "__gjcAutoContinueSignals";
@@ -56,7 +57,7 @@ describe("AgentSession auto-compaction continuation", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 
-	async function createSession(settings: Record<string, unknown> = {}, extensionExtra = "") {
+	async function createSession(settings: Record<string, unknown> = {}, extensionExtra = "", managed = false) {
 		tempDir = TempDir.createSync("@pi-auto-compaction-continue-");
 		vi.useRealTimers();
 		const extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
@@ -84,7 +85,8 @@ describe("AgentSession auto-compaction continuation", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
-		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const destination = managed ? SessionManager.managedDestination(tempDir.path(), tempDir.path()) : tempDir.path();
+		sessionManager = SessionManager.create(tempDir.path(), destination);
 		getRuntimeSignals().length = 0;
 		const extensionsResult = await loadExtensions([extensionPath], tempDir.path());
 		const extensionRunner = new ExtensionRunner(
@@ -184,6 +186,56 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(compactionEntry.summary).toContain("Active goal: Preserve hook compaction state");
 		expect(compactionEntry.summary).toContain("Open todos: Keep working");
 	});
+
+	it.skipIf(process.platform !== "darwin")(
+		"persists repeated disk-backed compactions through native exact replacement",
+		async () => {
+			await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+			await createSession({ "compaction.keepRecentTokens": 1 }, "", true);
+
+			const replaceSpy = vi.spyOn(native, "exactReplacePath");
+			const rewriteSpy = vi.spyOn(sessionManager, "rewriteEntries");
+			vi.spyOn(session.agent, "prompt").mockResolvedValue();
+			for (let index = 0; index < 8; index++) {
+				sessionManager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: `disk-backed compaction context ${index} `.repeat(10_000) }],
+					timestamp: Date.now() + index,
+				});
+			}
+
+			await driveCompaction();
+			await advancePostPrompt(50);
+			await session.waitForIdle();
+			const firstBranch = sessionManager.getBranch();
+			const firstCompaction = firstBranch.findLast(entry => entry.type === "compaction");
+			if (firstCompaction?.type !== "compaction") throw new Error("Expected first compaction");
+			expect(firstBranch.findIndex(entry => entry.id === firstCompaction.firstKeptEntryId)).toBeGreaterThan(0);
+			expect(rewriteSpy).toHaveBeenCalled();
+			const firstReplacementCount = replaceSpy.mock.calls.length;
+			expect(firstReplacementCount).toBeGreaterThan(0);
+
+			for (let index = 0; index < 8; index++) {
+				sessionManager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: `subsequent disk-backed context ${index} `.repeat(10_000) }],
+					timestamp: Date.now() + 100 + index,
+				});
+			}
+			await driveCompaction();
+			await advancePostPrompt(50);
+			await session.waitForIdle();
+
+			expect(replaceSpy.mock.calls.length).toBeGreaterThan(firstReplacementCount);
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+			const persisted = fs.readFileSync(sessionFile, "utf8");
+			expect(persisted.match(/"type":"compaction"/g)).toHaveLength(2);
+			expect(getRuntimeSignals().filter(signal => signal === "compaction:end:ok")).toHaveLength(2);
+		},
+	);
 
 	it("discards the compaction-triggering agent_end so it never leaks as terminal readiness", async () => {
 		// Regression: the async event-handler / extension barriers added to defer

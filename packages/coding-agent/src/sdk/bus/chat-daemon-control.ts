@@ -49,11 +49,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * semantics; discord generation 23 / slack generation 22 hardens exact Bash
  * process-tree ownership shared by chat daemon cleanup.
  * Discord generation 24 / slack generation 23 apply provider-completeness and
- * effective-enable admission to chat daemon lifecycle controls.
+ * effective-enable admission to chat daemon lifecycle controls. Discord
+ * generation 25 / slack generation 24 apply identity-bound exact replacement
+ * cleanup shared by managed-session and daemon filesystem authority.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 24,
-	slack: 23,
+	discord: 25,
+	slack: 24,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

@@ -56,9 +56,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * adds durable provider-intent admission without changing owner, reclaim,
  * signal, or spawn authority.
  * Generation 42 applies first-class provider-settings admission to Telegram
- * lifecycle controls.
+ * lifecycle controls. Generation 43 applies identity-bound exact replacement
+ * cleanup shared by managed-session and daemon filesystem authority.
  */
-export const DAEMON_GENERATION = 42;
+export const DAEMON_GENERATION = 43;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers

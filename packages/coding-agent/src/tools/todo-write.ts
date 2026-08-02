@@ -39,6 +39,7 @@ export interface TodoPhase {
 export interface TodoWriteToolDetails {
 	phases: TodoPhase[];
 	storage: "session" | "memory";
+	failureKind?: "payload_rejected" | "persistence";
 }
 
 // =============================================================================
@@ -520,6 +521,9 @@ function formatSummary(phases: TodoPhase[], errors: string[]): string {
 	}
 	return lines.join("\n");
 }
+function formatPayloadRejectedSummary(phases: TodoPhase[], errors: string[]): string {
+	return `${formatSummary(phases, errors)}\nTodo update was not applied.`;
+}
 
 // =============================================================================
 // Tool Class
@@ -547,26 +551,32 @@ export class TodoWriteTool implements AgentTool<typeof todoWriteSchema, TodoWrit
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<TodoWriteToolDetails>> {
 		const previousPhases = clonePhases(this.session.getTodoPhases?.() ?? []);
+		const storage = this.session.getSessionFile() ? "session" : "memory";
 		const missingTarget = params.ops.find(
 			entry => (entry.op === "done" || entry.op === "drop") && !entry.task && !entry.phase,
 		);
 		if (missingTarget) {
-			const storage = this.session.getSessionFile() ? "session" : "memory";
 			const errors = [`Missing task or phase for ${missingTarget.op} operation`];
 			return {
-				content: [{ type: "text", text: formatSummary(previousPhases, errors) }],
-				details: { phases: previousPhases, storage },
+				content: [{ type: "text", text: formatPayloadRejectedSummary(previousPhases, errors) }],
+				details: { phases: previousPhases, storage, failureKind: "payload_rejected" },
 				isError: true,
 			};
 		}
-		const { phases: updated, errors } = applyParams(previousPhases, params);
-		this.session.setTodoPhases?.(updated);
-		const storage = this.session.getSessionFile() ? "session" : "memory";
+		const { phases: updated, errors } = applyParams(clonePhases(previousPhases), params);
+		const rejected = errors.length > 0;
+		if (!rejected) this.session.setTodoPhases?.(updated);
+		const phases = rejected ? previousPhases : updated;
 
 		return {
-			content: [{ type: "text", text: formatSummary(updated, errors) }],
-			details: { phases: updated, storage },
-			isError: errors.length > 0 ? true : undefined,
+			content: [
+				{
+					type: "text",
+					text: rejected ? formatPayloadRejectedSummary(phases, errors) : formatSummary(phases, errors),
+				},
+			],
+			details: rejected ? { phases, storage, failureKind: "payload_rejected" } : { phases, storage },
+			isError: rejected || undefined,
 		};
 	}
 }
@@ -698,19 +708,27 @@ export const todoWriteToolRenderer = {
 	},
 
 	renderResult(
-		result: { content: Array<{ type: string; text?: string }>; details?: TodoWriteToolDetails },
+		result: {
+			content: Array<{ type: string; text?: string }>;
+			details?: TodoWriteToolDetails;
+			isError?: boolean;
+		},
 		options: RenderResultOptions,
 		uiTheme: Theme,
 		_args?: TodoWriteRenderArgs,
 	): Component {
 		const phases = (result.details?.phases ?? []).filter(phase => phase.tasks.length > 0);
 		const allTasks = phases.flatMap(phase => phase.tasks);
+		const fallback = result.content?.find(content => content.type === "text")?.text ?? "No todos";
+		if (result.isError) {
+			const header = renderStatusLine({ icon: "error", title: "Todo Write" }, uiTheme);
+			return new Text(`${header}\n${uiTheme.fg("error", fallback)}`, 0, 0);
+		}
 		const header = renderStatusLine(
 			{ icon: "success", title: "Todo Write", meta: [`${allTasks.length} tasks`] },
 			uiTheme,
 		);
 		if (allTasks.length === 0) {
-			const fallback = result.content?.find(content => content.type === "text")?.text ?? "No todos";
 			return new Text(`${header}\n${uiTheme.fg("dim", fallback)}`, 0, 0);
 		}
 
