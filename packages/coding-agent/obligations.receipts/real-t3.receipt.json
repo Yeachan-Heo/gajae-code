@@ -8,7 +8,7 @@
 	],
 	"cwd": ".",
 	"exitCode": 0,
-	"treeHash": "f2a7b7f400245a65d87b6e03cf1618c7d1592d8d87beec192ca39f811da62123",
+	"treeHash": "5d9b448b5ec69d9f82009d24b742745a948d733b964d532cf83cb154fc0fc482",
 	"artifacts": [
 		{
 			"path": "obligations.artifacts/real-t3/stdout.txt",
