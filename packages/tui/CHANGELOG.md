@@ -8,7 +8,7 @@
 ### Fixed
 
 - `Ctrl+J` now inserts a newline when multiplexers such as Herdr forward it through Kitty CSI-u or xterm `modifyOtherKeys`, matching the existing legacy line-feed behavior and displayed shortcut.
-- A terminal that disappears under a running session (tmux pane killed, SSH connection dropped, terminal window closed) no longer kills the agent process. The in-flight `stdin` read fails with `EIO`, and `process.stdin` had no `error` listener, so the event was rethrown as an uncaught exception; `stdin` errors now retire the terminal the same way `stdout` errors already did.
+- A terminal that disappears under a running session (tmux pane killed, SSH connection dropped, terminal window closed) no longer kills the agent process. The in-flight `stdin` read fails with `EIO`, and `process.stdin` had no `error` listener, so the event was rethrown as an uncaught exception; an `EIO` on `stdin` now retires the terminal the same way `stdout` errors already did. Only `EIO` is treated as a detach — any other `stdin` error (`EBADF`, `EPIPE`, an unexpected platform failure) keeps its default `EventEmitter` propagation and leaves the terminal usable, so the new listener cannot silently swallow unrelated stream failures.
 
 ## [0.12.8] - 2026-08-02
 ### Fixed

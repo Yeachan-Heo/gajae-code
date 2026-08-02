@@ -232,7 +232,25 @@ export function __stdinErrorSubscriberCountForTests(): number {
 export function __stdinErrorDispatcherInstalledForTests(): boolean {
 	return process.stdin.listeners("error").includes(dispatchStdinError);
 }
+/**
+ * A vanished controlling terminal fails the in-flight stdin read with EIO.
+ * That is the only stdin error this module owns; every other failure
+ * (EBADF, EPIPE, an unexpected platform error) keeps its default
+ * EventEmitter propagation so it stays observable instead of being
+ * downgraded to a silently retired terminal.
+ */
+function isTerminalDetachStdinError(err: Error): boolean {
+	return (err as NodeJS.ErrnoException).code === "EIO";
+}
 const dispatchStdinError = (err: Error): void => {
+	if (!isTerminalDetachStdinError(err)) {
+		// Our listener must not be the reason a non-EIO error stops propagating.
+		// When no other "error" listener exists, EventEmitter would have thrown;
+		// rethrowing from inside emit() reproduces that exact contract.
+		const hasOtherListener = process.stdin.listeners("error").some(listener => listener !== dispatchStdinError);
+		if (!hasOtherListener) throw err;
+		return;
+	}
 	for (const subscriber of stdinErrorSubscribers) subscriber(err);
 };
 

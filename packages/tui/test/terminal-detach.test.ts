@@ -312,6 +312,72 @@ describe("terminal detach handling", () => {
 			pauseSpy.mockRestore();
 		}
 	});
+	it("keeps a non-EIO stdin error propagating instead of retiring the terminal", () => {
+		// Only EIO means "the controlling terminal vanished". Any other stream
+		// failure (EBADF, EPIPE, ...) must keep the EventEmitter contract: with no
+		// other "error" listener it throws, and the terminal stays usable.
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		// Ambient listeners installed by the runtime would absorb the throw, so
+		// detach them for the duration of this assertion and restore them after.
+		const ambientListeners = process.stdin.listeners("error") as Array<(...args: unknown[]) => void>;
+		for (const listener of ambientListeners) process.stdin.removeListener("error", listener);
+		const badFileDescriptor = Object.assign(new Error("bad file descriptor"), { code: "EBADF" });
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				expect(terminal.available).toBe(true);
+				expect(() => {
+					process.stdin.emit("error", badFileDescriptor);
+				}).toThrow(badFileDescriptor);
+				expect(terminal.available).toBe(true);
+			});
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			for (const listener of ambientListeners) process.stdin.on("error", listener);
+		}
+	});
+	it("delivers a non-EIO stdin error to other listeners without retiring the terminal", () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const observed: Error[] = [];
+		const observer = (err: Error): void => {
+			observed.push(err);
+		};
+		process.stdin.on("error", observer);
+		const brokenPipe = Object.assign(new Error("broken pipe"), { code: "EPIPE" });
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				expect(() => {
+					process.stdin.emit("error", brokenPipe);
+				}).not.toThrow();
+				expect(observed).toEqual([brokenPipe]);
+				expect(terminal.available).toBe(true);
+			});
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			process.stdin.removeListener("error", observer);
+		}
+	});
 	it("keeps stdin error listener armed briefly after stop and releases it afterwards", async () => {
 		const terminal = new ProcessTerminal();
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
