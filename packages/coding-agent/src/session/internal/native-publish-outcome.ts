@@ -26,6 +26,7 @@ export type NativePublishPhase =
 	| "preflight"
 	| "file_sync"
 	| "rename"
+	| "source_unlink"
 	| "source_parent_sync"
 	| "destination_parent_sync"
 	| "terminal_identity"
@@ -96,6 +97,7 @@ const phases = new Set<NativePublishPhase>([
 	"preflight",
 	"file_sync",
 	"rename",
+	"source_unlink",
 	"source_parent_sync",
 	"destination_parent_sync",
 	"terminal_identity",
@@ -208,7 +210,7 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 		((outcome.reason === "durability_not_provable" &&
 			["file_sync", "source_parent_sync", "destination_parent_sync"].includes(outcome.phase)) ||
 			(outcome.reason === "identity_violation" && outcome.phase === "terminal_identity") ||
-			(outcome.reason === "io_failure" && outcome.phase === "terminal_identity"))
+			(outcome.reason === "io_failure" && ["source_unlink", "terminal_identity"].includes(outcome.phase)))
 	);
 }
 
