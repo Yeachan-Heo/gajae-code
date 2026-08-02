@@ -304,13 +304,13 @@ function isApprovedSource(winner: GjcHit): boolean {
 	return isApprovedWorkspaceSource(winner.file, winner.real);
 }
 
-function assertResolvedGjcIsSource(winner: GjcHit | undefined): void {
-	if (!winner || isApprovedSource(winner)) return;
+function assertResolvedGjcMatchesTarget(winner: GjcHit | undefined, expectedReal: string): void {
+	if (!winner || winner.real === expectedReal) return;
 	console.error("");
 	console.error("✗ Linked, but `gjc` still resolves to a different command earlier on PATH.");
 	console.error(`  Resolved: ${winner.file}`);
 	console.error(`       -> ${describe(winner.real)}`);
-	console.error(`  Expected source: ${cliSourceReal}`);
+	console.error(`  Expected target: ${expectedReal}`);
 	console.error(`  The managed link was created at: ${path.join(targetDir, "gjc")}`);
 	console.error("  Move the managed link directory earlier on PATH or remove the shadowing command.");
 	process.exit(1);
@@ -423,7 +423,7 @@ function link(binary: boolean): never {
 		console.warn(`    Remove it: rm "${hit.file}"`);
 	}
 	const winner = findGjcOnPath()[0];
-	assertResolvedGjcIsSource(winner);
+	assertResolvedGjcMatchesTarget(winner, linkSourceReal);
 	const smoke = smokeTest(winner?.file ?? target);
 	if (!smoke.ok) {
 		console.error("");

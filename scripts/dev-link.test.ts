@@ -265,6 +265,35 @@ describe.skipIf(process.platform === "win32")("dev:link Windows Bun workspace sh
 });
 
 describe("dev:link", () => {
+	test.skipIf(process.platform === "win32")("fails when --binary is shadowed by this checkout's source", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-mode-shadow-"));
+		tempRoots.push(root);
+		const fixtureScript = path.join(root, "scripts", "dev-link.ts");
+		const source = path.join(root, "packages", "coding-agent", "src", "cli.ts");
+		const binary = path.join(root, "packages", "coding-agent", "dist", "gjc");
+		const shadowDir = path.join(root, "shadow-bin");
+		const targetDir = path.join(root, "managed-bin");
+		const smokeFixture = '#!/bin/sh\nif [ "$1" = "--smoke-test" ]; then echo "smoke-test: ok"; fi\n';
+
+		await fs.mkdir(path.dirname(fixtureScript), { recursive: true });
+		await Bun.write(fixtureScript, Bun.file(path.join(import.meta.dir, "dev-link.ts")));
+		await makeExecutable(source, smokeFixture);
+		await makeExecutable(binary, smokeFixture);
+		await fs.mkdir(shadowDir, { recursive: true });
+		await fs.symlink(source, path.join(shadowDir, "gjc"));
+
+		const result = Bun.spawnSync([process.execPath, fixtureScript, "--binary"], {
+			cwd: root,
+			env: { ...process.env, GJC_DEV_LINK_DIR: targetDir, PATH: `${shadowDir}:${targetDir}` },
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain("still resolves to a different command earlier on PATH");
+		expect(result.stderr.toString()).toContain(path.join(shadowDir, "gjc"));
+	});
+
 	test.skipIf(process.platform === "win32")("removes Bun global links that resolve to this checkout wrapper", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-bun-shadow-"));
 		tempRoots.push(root);
