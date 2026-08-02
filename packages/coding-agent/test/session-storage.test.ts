@@ -234,6 +234,30 @@ describe("native publish outcome classification", () => {
 		).toBe("unknown");
 	});
 
+	it("preserves committed linkat unlink failures", () => {
+		const outcome = classifyNativePublishOutcome(
+			{
+				...preMutation,
+				code: "io_error",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+				reason: "io_failure",
+				primitive: "linkat_noreplace",
+				phase: "source_unlink",
+				diagnostic: { schemaVersion: 1, collectionState: "partial", osCode: 13 },
+			},
+			"retained_file",
+		);
+		expect(outcome).toMatchObject({
+			mutationState: "committed",
+			durabilityState: "not_provable",
+			reason: "io_failure",
+			primitive: "linkat_noreplace",
+			phase: "source_unlink",
+		});
+		expect(mayCleanCurrentStaging(outcome)).toBe(false);
+	});
+
 	it("keeps an EINVAL-classified retained request out of atomic-unavailable fallback while allowing exact staging cleanup", () => {
 		const outcome = classifyNativePublishOutcome(
 			{
