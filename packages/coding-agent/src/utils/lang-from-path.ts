@@ -201,18 +201,16 @@ function lspExtensionKey(filePath: string): string {
  * Language id for syntax highlighting and UI (icons, read tool), or undefined if unknown.
  */
 export function getLanguageFromPath(filePath: string): string | undefined {
-	const pair = EXTENSION_LANG[themeExtensionKey(filePath)];
-	if (pair) return pair[0];
-
 	const baseName = path.basename(filePath).toLowerCase();
 	if (baseName.startsWith(".env.")) return "env";
 	if (baseName === "dockerfile" || baseName.startsWith("dockerfile.") || baseName === "containerfile") {
 		return "dockerfile";
 	}
+	if (baseName === "makefile" || baseName === "gnumakefile") return "make";
 	if (baseName === "justfile") return "just";
 	if (baseName === "cmakelists.txt") return "cmake";
 
-	return undefined;
+	return EXTENSION_LANG[themeExtensionKey(filePath)]?.[0];
 }
 
 /**
