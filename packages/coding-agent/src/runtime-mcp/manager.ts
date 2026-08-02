@@ -630,8 +630,12 @@ export class MCPManager {
 
 			const toolsPromise = connectionPromise.then(async connection => {
 				let serverTools: Awaited<ReturnType<typeof listTools>>;
+				const isCurrent = (): boolean =>
+					!connectionAbort.signal.aborted &&
+					!this.#shuttingDown &&
+					this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection);
 				try {
-					serverTools = await listTools(connection);
+					serverTools = await listTools(connection, { isCurrent });
 				} catch (error) {
 					connection.transport.onClose = undefined;
 					if (this.#connections.get(name) === connection) this.#connections.delete(name);
@@ -1437,7 +1441,9 @@ export class MCPManager {
 			void this.reconnectServer(name);
 		};
 		try {
-			const serverTools = await listTools(connection);
+			const isCurrent = (): boolean =>
+				!this.#shuttingDown && this.#isCurrentConnection(name, config, globalEpoch, disconnectEpoch, connection);
+			const serverTools = await listTools(connection, { isCurrent });
 			if (!this.#isCurrentConnection(name, config, globalEpoch, disconnectEpoch, connection)) {
 				connection.transport.onClose = undefined;
 				await connection.transport.close().catch(() => {});
@@ -1527,12 +1533,15 @@ export class MCPManager {
 		if (!connection) return;
 		const globalEpoch = this.#epoch;
 		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
+		const isCurrent = (): boolean =>
+			!this.#shuttingDown &&
+			this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection);
 
 		// Clear cached tools
 		connection.tools = undefined;
 
 		// Reload tools
-		const serverTools = await listTools(connection);
+		const serverTools = await listTools(connection, { isCurrent });
 		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		const reconnect = () => this.reconnectServer(name);
 		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);

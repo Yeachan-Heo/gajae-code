@@ -609,7 +609,11 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 					const outbound = decodeJsonLines(probe.stdin).frames;
 					const inbound = decodeJsonLines(probe.stdout).frames;
 					const requests = outbound.filter(frame => frame.id !== undefined);
-					const answered = new Set(inbound.map(frame => String(frame.id)));
+					const answered = new Set(
+						inbound
+							.filter(frame => frame.id !== undefined && ("result" in frame || "error" in frame))
+							.map(frame => String(frame.id)),
+					);
 					const requiredMethods = ["account/read", "model/list", "skills/list"];
 					const requiredRequests = requiredMethods.map(method => requests.find(frame => frame.method === method));
 					return (

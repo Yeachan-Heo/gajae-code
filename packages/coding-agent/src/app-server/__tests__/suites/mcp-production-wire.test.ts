@@ -430,6 +430,20 @@ test("MCP-WIRE-018 runtime close skips held resource and prompt cache writes aft
 	);
 	const service = createMcpAppServerService({ cwd: root, agentDir: root });
 	const manager = service.manager;
+	let clientResourceRefresh: Promise<void> | undefined;
+	const refreshResources = manager.refreshServerResources.bind(manager);
+	manager.refreshServerResources = async name => {
+		clientResourceRefresh = refreshResources(name);
+		await clientResourceRefresh;
+	};
+
+	let clientPromptRefresh: Promise<void> | undefined;
+	const refreshPrompts = manager.refreshServerPrompts.bind(manager);
+	manager.refreshServerPrompts = async name => {
+		clientPromptRefresh = refreshPrompts(name);
+		await clientPromptRefresh;
+	};
+
 	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
 	const frames: Record<string, unknown>[] = [];
 	const connection = runtime.createConnection(frame => {
@@ -456,6 +470,8 @@ test("MCP-WIRE-018 runtime close skips held resource and prompt cache writes aft
 		mcpConnection.transport.onNotification?.("notifications/resources/list_changed", {});
 		mcpConnection.transport.onNotification?.("notifications/prompts/list_changed", {});
 		await Promise.all([resourceRefreshEntered.promise, promptRefreshEntered.promise]);
+		if (!clientResourceRefresh || !clientPromptRefresh) throw new Error("MCP refresh promises were not captured");
+
 		const stateBeforeClose = { resources: mcpConnection.resources, prompts: mcpConnection.prompts };
 		expect(stateBeforeClose.resources).toBeUndefined();
 		expect(stateBeforeClose.prompts).toBeUndefined();
@@ -464,6 +480,7 @@ test("MCP-WIRE-018 runtime close skips held resource and prompt cache writes aft
 		resourceRefreshRelease.resolve();
 		promptRefreshRelease.resolve();
 		await Promise.all([resourceRefreshDone.promise, promptRefreshDone.promise]);
+		await Promise.all([clientResourceRefresh, clientPromptRefresh]);
 		await Bun.sleep(25);
 		expect(mcpConnection.resources).toBe(stateBeforeClose.resources);
 		expect(mcpConnection.prompts).toBe(stateBeforeClose.prompts);
@@ -477,6 +494,91 @@ test("MCP-WIRE-018 runtime close skips held resource and prompt cache writes aft
 	}
 });
 
+test("MCP-WIRE-021 runtime close skips held tools cache writes after settlement", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-tools-cache-close-");
+	const toolsRefreshEntered = Promise.withResolvers<void>();
+	const toolsRefreshRelease = Promise.withResolvers<void>();
+	const toolsRefreshDone = Promise.withResolvers<void>();
+	let toolsListCalls = 0;
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: async request => {
+			if (request.method !== "POST") return new Response(null, { status: 405 });
+			const body = (await request.json()) as { id: string | number; method: string };
+			if (body.method === "initialize")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						protocolVersion: "2025-03-26",
+						capabilities: { tools: {} },
+						serverInfo: { name: "tools-cache-close-fixture", version: "1" },
+					},
+				});
+			if (body.method === "tools/list") {
+				toolsListCalls += 1;
+				if (toolsListCalls >= 2) {
+					toolsRefreshEntered.resolve();
+					await toolsRefreshRelease.promise;
+					toolsRefreshDone.resolve();
+				}
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						tools: [{ name: "fixture-tool", description: "fixture-tool", inputSchema: { type: "object" } }],
+					},
+				});
+			}
+			return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+		},
+	});
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({ mcpServers: { fixture: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` } } }),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const manager = service.manager;
+	let clientToolsRefresh: Promise<void> | undefined;
+	const refreshTools = manager.refreshServerTools.bind(manager);
+	manager.refreshServerTools = async name => {
+		clientToolsRefresh = refreshTools(name);
+		await clientToolsRefresh;
+	};
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		await waitForCondition(
+			() => toolsListCalls >= 1 && service.getConnection("fixture")?.tools !== undefined,
+			"initial tools load",
+		);
+		const mcpConnection = service.getConnection("fixture");
+		if (!mcpConnection) throw new Error("MCP fixture connection was not established");
+		mcpConnection.transport.onNotification?.("notifications/tools/list_changed", {});
+		await toolsRefreshEntered.promise;
+		if (!clientToolsRefresh) throw new Error("MCP tools refresh promise was not captured");
+		const stateBeforeClose = mcpConnection.tools;
+		expect(stateBeforeClose).toBeUndefined();
+
+		await runtime.close().catch(() => {});
+		toolsRefreshRelease.resolve();
+		await toolsRefreshDone.promise;
+		await clientToolsRefresh;
+		expect(mcpConnection.tools).toBe(stateBeforeClose);
+	} finally {
+		toolsRefreshRelease.resolve();
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		await server.stop(true);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 test("MCP-WIRE-019 late MCP notifications after shutdown do not invoke callbacks", async () => {
 	const root = mkdtempSync("/tmp/gjc-mcp-wire-notification-shutdown-");
 	const server = Bun.serve({
