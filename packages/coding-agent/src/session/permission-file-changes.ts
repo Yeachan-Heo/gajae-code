@@ -258,6 +258,9 @@ async function capturePathIdentity(path: string): Promise<PathIdentity | undefin
 	if (!(await hasNoSymlinkPath(path))) return undefined;
 	try {
 		const info = await lstat(path);
+		// Re-assert the symlink predicate on this exact stat: a link inserted between the
+		// `hasNoSymlinkPath` check and here must not be captured as a legitimate identity.
+		if (info.isSymbolicLink()) return undefined;
 		return { path, exists: true, realPath: await realpath(path), deviceAndInode: identityKey(info) };
 	} catch (error) {
 		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return undefined;
