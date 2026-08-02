@@ -4142,21 +4142,32 @@ export class TUI extends Container {
 			// index, so emitting them appends a second copy — a pending tool block
 			// stranded above its own completed copy, with the rows between duplicated.
 			//
-			// Rendered bytes carry no row identity, so neither a single row nor an
-			// aggregate match count can tell the two apart: a substitution changes rows
-			// without moving anything, and an insertion moves everything without
-			// necessarily changing any given row (repeated separators, blank rows).
-			// What does distinguish them is that a displacement moves the whole visible
-			// region by one uniform offset. Look for that offset: if the previously
-			// visible rows reappear almost intact `offset` rows lower, they were pushed
-			// across the frontier and the suffix must not be re-emitted. Rows merely
-			// rewritten in place produce no such run at any offset, so they still
-			// commit. `offset` is bounded by the visible region, which is bounded by
-			// the terminal height.
+			// Rendered bytes carry no row identity, so no test on them can prove which
+			// logical row moved: a substitution changes rows without moving anything,
+			// an insertion moves everything without necessarily changing any given row,
+			// and a run of repeated rows makes a plain append look exactly like a
+			// displacement. Since the two are not always distinguishable, look for the
+			// harm rather than the cause, and require both halves of it.
+			//
+			// First, a displacement moves the whole visible region down by one uniform
+			// offset, so the previously visible rows must reappear almost intact
+			// `offset` rows lower. Second — and this is what an append behind repeated
+			// rows cannot fake — the rows that displacement pulls into the top of the
+			// visible region must be exactly the last `offset` rows already committed
+			// to native scrollback. That second half is the damage itself: those rows
+			// are about to be emitted a second time. Rows merely rewritten in place
+			// push nothing back into view, so they still commit their suffix.
 			const shift = newLines.length - this.#previousLines.length;
 			const visibleRows = this.#previousLines.length - prevViewportTop;
 			if (shift > 0 && prevViewportTop > diffStart && visibleRows > 1) {
-				for (let offset = 1; offset <= Math.min(shift, visibleRows - 1); offset++) {
+				for (let offset = 1; offset <= Math.min(shift, prevViewportTop, visibleRows - 1); offset++) {
+					let recommittedRows = 0;
+					for (let j = 0; j < offset; j++) {
+						if (this.#previousLines[prevViewportTop - offset + j] === newLines[prevViewportTop + j]) {
+							recommittedRows += 1;
+						}
+					}
+					if (recommittedRows < offset) continue;
 					let displacedRows = 0;
 					for (let i = prevViewportTop; i < this.#previousLines.length; i++) {
 						if (this.#previousLines[i] === newLines[i + offset]) displacedRows += 1;

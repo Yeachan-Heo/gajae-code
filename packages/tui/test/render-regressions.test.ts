@@ -1407,6 +1407,36 @@ describe("TUI terminal-state regressions", () => {
 				}
 			});
 		}
+		for (const isProcessTerminal of [false, true]) {
+			it(`still commits an append behind a run of repeated rows (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// Byte-wise this is indistinguishable from inserting a row above the
+				// viewport: the repeated rows match at a shifted offset. Nothing moved
+				// though, so repainting here would drop the top row from scrollback.
+				const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(["status-0", "M", "M", "A", "A", "A"]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines(["status-1", "M", "M", "A", "A", "A", "A"]);
+					tui.requestRender();
+					await settle(term);
+					component.setLines(["status-1", "M", "M", "A", "A", "A", "A", "T"]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					expect(countMatches(scrollback, /^M$/)).toBe(2);
+					expect(countMatches(scrollback, /^A$/)).toBe(4);
+					expect(visible(term)).toEqual(["M", "A", "A", "A", "A", "T"].slice(-5));
+				} finally {
+					tui.stop();
+				}
+			});
+		}
 
 		it("still commits appended rows when an off-screen boundary row is substituted", async () => {
 			// The mutated off-screen row is the last committed row, but nothing moves:
