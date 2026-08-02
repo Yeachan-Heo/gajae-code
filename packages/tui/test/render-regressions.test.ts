@@ -1438,6 +1438,33 @@ describe("TUI terminal-state regressions", () => {
 			});
 		}
 
+		for (const isProcessTerminal of [false, true]) {
+			it(`repaints a two-row off-screen insertion at a two-row frontier (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// Only offset 2 explains this frame, and it needs both committed rows to
+				// re-enter the viewport, so it exercises the upper end of the offset scan.
+				const term = new VirtualTerminal(40, 3, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(["P0", "P1", "V0", "V1", "V2"]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines(["I0", "I1", "P0", "P1", "V0", "V1", "V2"]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					expect(countMatches(scrollback, /^P0$/)).toBe(1);
+					expect(countMatches(scrollback, /^P1$/)).toBe(1);
+					expect(visible(term)).toEqual(["V0", "V1", "V2"]);
+				} finally {
+					tui.stop();
+				}
+			});
+		}
+
 		it("still commits appended rows when an off-screen boundary row is substituted", async () => {
 			// The mutated off-screen row is the last committed row, but nothing moves:
 			// the appended rows must still reach native scrollback exactly once.
