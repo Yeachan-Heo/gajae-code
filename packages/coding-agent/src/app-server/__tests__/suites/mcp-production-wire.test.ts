@@ -247,6 +247,122 @@ test("MCP-WIRE-015 runtime close drains a notification-triggered held tools refr
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+test("MCP-WIRE-017 runtime close fences held resource and prompt notification refreshes", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-resource-refresh-close-");
+	const resourceRefreshEntered = Promise.withResolvers<void>();
+	const resourceRefreshRelease = Promise.withResolvers<void>();
+	const promptRefreshEntered = Promise.withResolvers<void>();
+	const promptRefreshRelease = Promise.withResolvers<void>();
+	let resourceListCalls = 0;
+	let promptListCalls = 0;
+	let promptChanges = 0;
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: async request => {
+			if (request.method !== "POST") return new Response(null, { status: 405 });
+			const body = (await request.json()) as { id: string | number; method: string };
+			if (body.method === "initialize")
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						protocolVersion: "2025-03-26",
+						capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} },
+						serverInfo: { name: "refresh-fixture", version: "1" },
+					},
+				});
+			if (body.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [] } });
+			if (body.method === "resources/list") {
+				resourceListCalls += 1;
+				if (resourceListCalls >= 2) {
+					resourceRefreshEntered.resolve();
+					await resourceRefreshRelease.promise;
+				}
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { resources: [{ uri: "fixture://resource", name: "resource" }] },
+				});
+			}
+			if (body.method === "resources/templates/list")
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: { resourceTemplates: [] } });
+			if (body.method === "prompts/list") {
+				promptListCalls += 1;
+				if (promptListCalls >= 2) {
+					promptRefreshEntered.resolve();
+					await promptRefreshRelease.promise;
+				}
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: { prompts: [{ name: "prompt", description: "prompt", arguments: [] }] },
+				});
+			}
+			if (body.method === "resources/subscribe" || body.method === "resources/unsubscribe")
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+		},
+	});
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({ mcpServers: { fixture: { type: "http", url: `http://127.0.0.1:${server.port}/mcp` } } }),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const manager = service.manager;
+	manager.setOnPromptsChanged(() => {
+		promptChanges += 1;
+	});
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		await waitForCondition(
+			() =>
+				resourceListCalls >= 1 &&
+				promptListCalls >= 1 &&
+				service.getConnection("fixture")?.resources !== undefined &&
+				service.getConnection("fixture")?.prompts !== undefined,
+			"initial resource and prompt loads",
+		);
+		const promptChangesBeforeRefresh = promptChanges;
+		manager.setNotificationsEnabled(true);
+		await waitForCondition(
+			() => (manager.getNotificationState().subscriptions.get("fixture")?.size ?? 0) === 1,
+			"initial resource subscription",
+		);
+
+		const mcpConnection = service.getConnection("fixture");
+		expect(mcpConnection).toBeDefined();
+		mcpConnection?.transport.onNotification?.("notifications/resources/list_changed", {});
+		mcpConnection?.transport.onNotification?.("notifications/prompts/list_changed", {});
+		await Promise.all([resourceRefreshEntered.promise, promptRefreshEntered.promise]);
+
+		let closingSettled = false;
+		const closing = runtime.close().finally(() => {
+			closingSettled = true;
+		});
+		await waitForCondition(() => manager.isShuttingDown(), "MCP manager shutdown");
+		expect(closingSettled).toBe(false);
+
+		resourceRefreshRelease.resolve();
+		promptRefreshRelease.resolve();
+		await closing;
+		expect(manager.getNotificationState().subscriptions.size).toBe(0);
+		expect(promptChanges).toBe(promptChangesBeforeRefresh);
+	} finally {
+		resourceRefreshRelease.resolve();
+		promptRefreshRelease.resolve();
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		await server.stop(true);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 test("MCP-WIRE-011 runtime close drains a held autonomous reconnect before returning", async () => {
 	const root = mkdtempSync("/tmp/gjc-mcp-wire-reconnect-close-");
@@ -733,15 +849,27 @@ test("MCP-WIRE-013 OAuth callback-listener lease rejects before release and succ
 		release.resolve();
 		await released.promise;
 		await waitForFrame(frames, frame => frame.method === "mcpServer/oauthLogin/completed");
+		const firstCredentialId = storage
+			.exportSnapshot()
+			.credentials.find(entry => entry.credential.type === "oauth")?.provider;
+		expect(firstCredentialId).toBeDefined();
 
 		await connection.process(enc('{"id":5,"method":"mcpServer/oauth/login","params":{"name":"oauth"}}'));
 		const secondUrl = (responseFor(frames, 5).result as Record<string, unknown>).authorizationUrl as string;
 		expect(secondUrl).toContain("/authorize?");
-		await fetch(secondUrl);
+		const secondCallbackResponse = await fetch(secondUrl);
+		expect(secondCallbackResponse.ok).toBe(true);
 		await waitForCondition(
 			() => frames.filter(frame => frame.method === "mcpServer/oauthLogin/completed").length >= 2,
 			"second OAuth completion",
 		);
+		const completions = frames.filter(frame => frame.method === "mcpServer/oauthLogin/completed");
+		expect(completions[1]).toMatchObject({ params: { name: "oauth", success: true } });
+		const secondCredentialId = storage
+			.exportSnapshot()
+			.credentials.find(entry => entry.credential.type === "oauth")?.provider;
+		expect(secondCredentialId).toBeDefined();
+		expect(secondCredentialId).not.toBe(firstCredentialId);
 	} finally {
 		tokenRelease.resolve();
 		release.resolve();

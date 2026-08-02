@@ -290,7 +290,7 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 			"MCP-WIRE-016 runtime close bounds an OAuth reconnect that ignores abort",
 		],
 		reason:
-			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication without a serialized cause, persistence, ordering, source replacement, cancellation after every OAuth commit stage, deterministic same-server serialization, the callbackServerClosed listener boundary, and rollback.",
+			"The production runtime injects an owned MCP service with configured AuthStorage and the wire tests prove completion publication without a serialized cause, persistence, ordering, source replacement, cancellation after every OAuth commit stage, deterministic same-server serialization, the callbackServerClosed listener boundary, a successful post-release callback response and credential, and rollback.",
 	},
 	"skills/list": laneRow(
 		"skillsListHandler",

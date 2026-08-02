@@ -608,9 +608,14 @@ child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 					if (!probe) return false;
 					const outbound = decodeJsonLines(probe.stdin).frames;
 					const inbound = decodeJsonLines(probe.stdout).frames;
-					const issued = outbound.filter(frame => frame.id !== undefined).map(frame => String(frame.id));
+					const requests = outbound.filter(frame => frame.id !== undefined);
 					const answered = new Set(inbound.map(frame => String(frame.id)));
-					return issued.length > 0 && issued.every(id => answered.has(id));
+					const requiredMethods = ["account/read", "model/list", "skills/list"];
+					const requiredRequests = requiredMethods.map(method => requests.find(frame => frame.method === method));
+					return (
+						requiredRequests.every(request => request !== undefined) &&
+						requiredRequests.every(request => answered.has(String(request!.id)))
+					);
 				},
 				frameTimeoutMs,
 				"T3 provider-probe requests",

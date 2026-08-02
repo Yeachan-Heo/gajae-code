@@ -1544,56 +1544,67 @@ export class MCPManager {
 		if (this.#toolsOnly) return;
 		const connection = this.#connections.get(name);
 		if (!connection || !serverSupportsResources(connection.capabilities)) return;
+		const globalEpoch = this.#epoch;
+		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
+		const isCurrent = (): boolean =>
+			this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection);
+		if (!isCurrent()) return;
 
 		const existing = this.#pendingResourceRefresh.get(name);
 		if (existing && existing.connection === connection) return existing.promise;
 
 		const doRefresh = async (): Promise<void> => {
+			if (!isCurrent()) return;
+
 			// Clear cached resources
 			connection.resources = undefined;
 			connection.resourceTemplates = undefined;
 
 			// Reload
 			const [resources] = await Promise.all([listResources(connection), listResourceTemplates(connection)]);
-			if (this.#notificationsEnabled && connection.capabilities.resources?.subscribe) {
-				const newUris = new Set(resources.map(r => r.uri));
-				const oldUris = this.#subscribedResources.get(name);
-				const notificationEpoch = this.#notificationsEpoch;
+			if (!isCurrent()) return;
+			if (!this.#notificationsEnabled || !connection.capabilities.resources?.subscribe) return;
 
-				// Unsubscribe URIs that were removed
-				if (oldUris) {
-					const removed = [...oldUris].filter(uri => !newUris.has(uri));
-					if (removed.length > 0) {
-						try {
-							await unsubscribeFromResources(connection, removed);
-						} catch (error) {
-							logger.debug("Failed to unsubscribe stale MCP resources", { path: `mcp:${name}`, error });
-						}
-					}
-				}
+			const newUris = new Set(resources.map(r => r.uri));
+			const oldUris = this.#subscribedResources.get(name);
+			const notificationEpoch = this.#notificationsEpoch;
 
-				// Subscribe to the current set and update tracking atomically
-				try {
-					const allUris = [...newUris];
-					await subscribeToResources(connection, allUris);
-					const action = resolveSubscriptionPostAction(
-						this.#notificationsEnabled,
-						this.#notificationsEpoch,
-						notificationEpoch,
-					);
-					if (action === "rollback") {
-						await unsubscribeFromResources(connection, allUris).catch(error => {
-							logger.debug("Failed to rollback stale MCP resource subscription", { path: `mcp:${name}`, error });
-						});
-						return;
+			// Unsubscribe URIs that were removed
+			if (oldUris) {
+				const removed = [...oldUris].filter(uri => !newUris.has(uri));
+				if (removed.length > 0) {
+					try {
+						await unsubscribeFromResources(connection, removed);
+					} catch (error) {
+						logger.debug("Failed to unsubscribe stale MCP resources", { path: `mcp:${name}`, error });
 					}
-					if (action === "ignore") {
-						return;
-					}
-					this.#subscribedResources.set(name, newUris);
-				} catch (error) {
-					logger.debug("Failed to re-subscribe to MCP resources", { path: `mcp:${name}`, error });
+					if (!isCurrent()) return;
 				}
+			}
+			if (!isCurrent()) return;
+
+			// Subscribe to the current set and update tracking atomically
+			try {
+				const allUris = [...newUris];
+				await subscribeToResources(connection, allUris);
+				const action =
+					this.#shuttingDown || !isCurrent()
+						? "rollback"
+						: resolveSubscriptionPostAction(
+								this.#notificationsEnabled,
+								this.#notificationsEpoch,
+								notificationEpoch,
+							);
+				if (action === "rollback") {
+					await unsubscribeFromResources(connection, allUris).catch(error => {
+						logger.debug("Failed to rollback stale MCP resource subscription", { path: `mcp:${name}`, error });
+					});
+					return;
+				}
+				if (action === "ignore" || !isCurrent()) return;
+				this.#subscribedResources.set(name, newUris);
+			} catch (error) {
+				logger.debug("Failed to re-subscribe to MCP resources", { path: `mcp:${name}`, error });
 			}
 		};
 
@@ -1614,10 +1625,15 @@ export class MCPManager {
 		if (this.#toolsOnly) return;
 		const connection = this.#connections.get(name);
 		if (!connection || !serverSupportsPrompts(connection.capabilities)) return;
+		const globalEpoch = this.#epoch;
+		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
+		const isCurrent = (): boolean =>
+			this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection);
+		if (!isCurrent()) return;
 
 		connection.prompts = undefined;
 		await listPrompts(connection);
-
+		if (!isCurrent()) return;
 		this.#onPromptsChanged?.(name);
 	}
 
