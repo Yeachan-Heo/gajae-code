@@ -4142,25 +4142,24 @@ export class TUI extends Container {
 			// index, so emitting them appends a second copy — a pending tool block
 			// stranded above its own completed copy, with the rows between duplicated.
 			//
-			// Rendered bytes at any single index cannot tell those apart: a
-			// substitution changes the boundary row without moving anything, and an
-			// insertion moves everything without necessarily changing the boundary
-			// row's bytes (repeated separators, blank rows). Score the two mappings
-			// instead. Over the previously visible rows, count how many still match at
-			// their own index versus how many match `shift` rows lower. Only a strict
-			// win for the shifted mapping proves committed content moved; a tie means
-			// the region is uniform enough that re-emitting a row cannot be seen.
+			// Rendered bytes cannot prove which logical row moved: a substitution
+			// changes a row without moving anything, and an insertion moves everything
+			// without necessarily changing any particular row's bytes (repeated
+			// separators, blank rows). So require positive evidence that nothing moved
+			// rather than trying to detect movement. Appending `shift` rows can
+			// legitimately displace at most the last `shift` previously visible rows;
+			// every other previously visible row must still be byte-equal at its own
+			// index. Anything less means the frame no longer lines up with what native
+			// scrollback already holds, and only a repaint can be trusted.
 			const shift = newLines.length - this.#previousLines.length;
 			if (shift > 0 && prevViewportTop > diffStart) {
-				let alignedMatches = 0;
-				let shiftedMatches = 0;
+				const visibleRows = this.#previousLines.length - prevViewportTop;
+				let alignedRows = 0;
 				for (let i = prevViewportTop; i < this.#previousLines.length; i++) {
-					const oldLine = this.#previousLines[i];
-					if (oldLine === newLines[i]) alignedMatches += 1;
-					if (oldLine === newLines[i + shift]) shiftedMatches += 1;
+					if (this.#previousLines[i] === newLines[i]) alignedRows += 1;
 				}
-				if (shiftedMatches > alignedMatches) {
-					const reason = `offscreen growth shifted committed rows (${firstChanged} < ${prevViewportTop}, shift=${shift})`;
+				if (alignedRows < visibleRows - shift) {
+					const reason = `offscreen growth unaligned committed rows (${firstChanged} < ${prevViewportTop}, aligned=${alignedRows}/${visibleRows}, shift=${shift})`;
 					logRedraw(reason);
 					if (useViewportRepaintPath) viewportRepaint(reason);
 					else fullRender(true, reason);

@@ -1301,6 +1301,60 @@ describe("TUI terminal-state regressions", () => {
 			});
 		}
 
+		// Repeated and blank rows make byte identity ambiguous, so an off-screen
+		// insertion can leave the frontier row, or a majority of rows, looking
+		// unmoved. Each case duplicates a committed row unless the alignment
+		// tolerance rejects it.
+		const ambiguousShiftCases = [
+			{
+				id: "a run of identical rows spans the frontier",
+				before: ["p0", "p1", "p2", "p3", "p4", "SAME", "SAME", "keep-a", "keep-b", "keep-c"],
+				after: ["p0", "p1", "INSERT", "p2", "p3", "p4", "SAME", "SAME", "keep-a", "keep-b", "keep-c", "APPEND"],
+				duplicated: /^p4$/,
+				limit: 1,
+			},
+			{
+				id: "most visible rows still match at their own index",
+				before: ["p0", "p1", "p2", "p3", "S", "S", "S", "X", "Y", "Z"],
+				after: ["p0", "p1", "p2", "INSERT", "p3", "S", "S", "S", "X", "Y", "Z", "APPEND"],
+				duplicated: /^S$/,
+				limit: 3,
+			},
+			{
+				id: "aligned and shifted readings are exactly tied",
+				before: ["p0", "p1", "p2", "p3", "p4", "A", "A", "B", "B", "C"],
+				after: ["p0", "p1", "INSERT", "p2", "p3", "p4", "A", "A", "B", "B", "C", "APPEND"],
+				duplicated: /^p4$/,
+				limit: 1,
+			},
+		];
+		for (const ambiguous of ambiguousShiftCases) {
+			for (const isProcessTerminal of [false, true]) {
+				it(`repaints an off-screen insertion when ${ambiguous.id} (isProcessTerminal=${isProcessTerminal})`, async () => {
+					const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+					const tui = new TUI(term);
+					const component = new MutableLinesComponent(ambiguous.before);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+
+						component.setLines(ambiguous.after);
+						tui.requestRender();
+						await settle(term);
+
+						const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+						expect(countMatches(scrollback, ambiguous.duplicated)).toBeLessThanOrEqual(ambiguous.limit);
+						expect(countMatches(scrollback, /^APPEND$/)).toBe(1);
+						expect(visible(term)).toEqual(ambiguous.after.slice(-5));
+					} finally {
+						tui.stop();
+					}
+				});
+			}
+		}
+
 		it("still commits appended rows when an off-screen boundary row is substituted", async () => {
 			// The mutated off-screen row is the last committed row, but nothing moves:
 			// the appended rows must still reach native scrollback exactly once.
