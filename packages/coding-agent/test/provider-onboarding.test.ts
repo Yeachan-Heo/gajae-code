@@ -352,7 +352,7 @@ describe("provider onboarding setup core", () => {
 	it("stores literal keys in AuthStorage instead of models.yml", async () => {
 		const modelsPath = await tempModelsPath();
 		setAgentDir(tempRoot!);
-		await addApiCompatibleProvider({
+		const result = await addApiCompatibleProvider({
 			compatibility: "openai",
 			providerId: "literal-key-provider",
 			baseUrl: "https://api.example.com/v1",
@@ -362,6 +362,10 @@ describe("provider onboarding setup core", () => {
 		});
 		const text = await Bun.file(modelsPath).text();
 		expect(text).not.toContain("literal-secret");
+		const output = formatProviderSetupResult(result);
+		expect(output).not.toContain("literal-secret");
+		expect(output).not.toContain("literal-sec");
+		expect(output).toContain("API key:");
 		const parsed = YAML.parse(text) as { providers: Record<string, { apiKeyStored?: true }> };
 		expect(parsed.providers["literal-key-provider"]?.apiKeyStored).toBe(true);
 		const authStorage = await AuthStorage.create(getAgentDbPath());
@@ -440,6 +444,99 @@ describe("provider onboarding setup core", () => {
 		} finally {
 			if (previousEnv === undefined) delete Bun.env[envName];
 			else Bun.env[envName] = previousEnv;
+		}
+	});
+	it("restores a stored credential and models config when env replacement cannot be committed", async () => {
+		const modelsPath = await tempModelsPath();
+		setAgentDir(tempRoot!);
+		await addApiCompatibleProvider({
+			compatibility: "openai",
+			providerId: "atomic-env-provider",
+			baseUrl: "https://api.example.com/v1",
+			apiKey: "old-stored-secret",
+			models: ["old-model"],
+			modelsPath,
+		});
+		const oldModelsConfig = await Bun.file(modelsPath).text();
+		const renameSpy = vi.spyOn(fs, "rename").mockRejectedValueOnce(new Error("write failed for new-env-secret"));
+		let failure: Error;
+		try {
+			failure = await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "atomic-env-provider",
+				baseUrl: "https://api.example.com/v2",
+				apiKeyEnv: "NEW_ENV_SECRET",
+				models: ["new-model"],
+				modelsPath,
+				force: true,
+			}).then(
+				() => {
+					throw new Error("Expected models config write to fail.");
+				},
+				error => (error instanceof Error ? error : new Error(String(error))),
+			);
+		} finally {
+			renameSpy.mockRestore();
+		}
+
+		expect(failure.message).toContain("credential changes were rolled back");
+		expect(failure.message).not.toContain("old-stored-secret");
+		expect(failure.message).not.toContain("new-env-secret");
+		expect(await Bun.file(modelsPath).text()).toBe(oldModelsConfig);
+		const authStorage = await AuthStorage.create(getAgentDbPath());
+		try {
+			expect(authStorage.get("atomic-env-provider")).toEqual({ type: "api_key", key: "old-stored-secret" });
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			expect(await registry.getApiKeyForProvider("atomic-env-provider")).toBe("old-stored-secret");
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("restores a stored credential and models config when literal replacement cannot be committed", async () => {
+		const modelsPath = await tempModelsPath();
+		setAgentDir(tempRoot!);
+		await addApiCompatibleProvider({
+			compatibility: "openai",
+			providerId: "atomic-literal-provider",
+			baseUrl: "https://api.example.com/v1",
+			apiKey: "old-literal-secret",
+			models: ["old-model"],
+			modelsPath,
+		});
+		const oldModelsConfig = await Bun.file(modelsPath).text();
+		const renameSpy = vi.spyOn(fs, "rename").mockRejectedValueOnce(new Error("write failed for new-literal-secret"));
+		let failure: Error;
+		try {
+			failure = await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "atomic-literal-provider",
+				baseUrl: "https://api.example.com/v2",
+				apiKey: "new-literal-secret",
+				models: ["new-model"],
+				modelsPath,
+				force: true,
+			}).then(
+				() => {
+					throw new Error("Expected models config write to fail.");
+				},
+				error => (error instanceof Error ? error : new Error(String(error))),
+			);
+		} finally {
+			renameSpy.mockRestore();
+		}
+
+		expect(failure.message).toContain("credential changes were rolled back");
+		expect(failure.message).not.toContain("old-literal-secret");
+		expect(failure.message).not.toContain("new-literal-secret");
+		expect(await Bun.file(modelsPath).text()).toBe(oldModelsConfig);
+		const authStorage = await AuthStorage.create(getAgentDbPath());
+		try {
+			expect(authStorage.get("atomic-literal-provider")).toEqual({ type: "api_key", key: "old-literal-secret" });
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			expect(await registry.getApiKeyForProvider("atomic-literal-provider")).toBe("old-literal-secret");
+		} finally {
+			authStorage.close();
 		}
 	});
 

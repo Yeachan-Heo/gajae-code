@@ -116,7 +116,7 @@ describe("provider onboarding wizard red-team", () => {
 		expect(rendered).toContain("Base URL must use https unless it targets localhost or a loopback address");
 	});
 
-	it("does not report success when config notification rejects and renders the wizard error", async () => {
+	it("reports a committed provider separately when config notification rejects", async () => {
 		await withRegistry(async registry => {
 			let notificationAttempts = 0;
 			const ctx = createControllerContext(registry, async () => {
@@ -133,8 +133,10 @@ describe("provider onboarding wizard red-team", () => {
 			await errorRendered.promise;
 
 			expect(notificationAttempts).toBe(1);
-			expect(ctx.statuses).toEqual([]);
-			expect(visibleText(wizard)).toContain("Provider setup failed: notification unavailable");
+			expect(ctx.statuses).toEqual([
+				"Provider 'notify-failure' was configured and reloaded, but configuration notification failed: notification unavailable",
+			]);
+			expect(visibleText(wizard)).not.toContain("Provider setup failed");
 		});
 	});
 

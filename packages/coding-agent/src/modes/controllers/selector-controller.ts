@@ -1614,19 +1614,39 @@ export class SelectorController {
 		this.showSelector(done => {
 			let wizard: CustomProviderWizardComponent;
 			const submit = async (input: CustomProviderWizardSubmit): Promise<void> => {
+				let result: Awaited<ReturnType<typeof addApiCompatibleProvider>>;
 				try {
-					const result = await addApiCompatibleProvider(input);
-					if (result.credentialSource === "literal") await this.ctx.session.modelRegistry.authStorage.reload();
-					await this.ctx.session.modelRegistry.refresh("offline");
-					await this.ctx.notifyConfigChanged?.();
-					this.ctx.showStatus(formatProviderSetupResult(result));
-					wizard.complete();
-					done();
-					this.ctx.ui.requestRender();
+					result = await addApiCompatibleProvider(input);
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					wizard.setSubmitError(`Provider setup failed: ${message}`);
+					return;
 				}
+				try {
+					await this.ctx.session.modelRegistry.authStorage.reload();
+					await this.ctx.session.modelRegistry.refresh("offline");
+				} catch {
+					wizard.setSubmitError(
+						"Provider was configured, but the live provider list could not be reloaded. Retry setup and confirm replacement, or restart GJC.",
+					);
+					return;
+				}
+				try {
+					await this.ctx.notifyConfigChanged?.();
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					this.ctx.showStatus(
+						`Provider '${result.providerId}' was configured and reloaded, but configuration notification failed: ${message}`,
+					);
+					wizard.complete();
+					done();
+					this.ctx.ui.requestRender();
+					return;
+				}
+				this.ctx.showStatus(formatProviderSetupResult(result));
+				wizard.complete();
+				done();
+				this.ctx.ui.requestRender();
 			};
 			wizard = new CustomProviderWizardComponent(
 				input => {

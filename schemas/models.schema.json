@@ -25,6 +25,10 @@
 						"type": "string",
 						"minLength": 1
 					},
+					"apiKeyStored": {
+						"type": "boolean",
+						"const": true
+					},
 					"api": {
 						"type": "string",
 						"enum": [

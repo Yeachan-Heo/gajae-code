@@ -317,10 +317,11 @@ Use provider-level `headers` for proxy-required headers. Keep the provider `api`
 | Intent | Required keys |
 | --- | --- |
 | Authenticated proxy (recommended) | `auth: apiKey` (default) + `apiKeyEnv: MY_TOKEN` |
+| Authenticated proxy, key stored by GJC | `auth: apiKey` (default) + `apiKeyStored: true`; configure it through `/provider` so the credential exists in GJC's credential database |
 | Authenticated proxy, key inline | `auth: apiKey` (default) + `apiKey: sk-…` (less safe; stored in plaintext) |
 | Genuinely unauthenticated endpoint | `auth: none`, no key |
 
-Omitting both `apiKey` and `apiKeyEnv` while leaving `auth` at its `apiKey` default fails with `Provider <name>: custom models need a credential source, but none is configured.` — the fix is to add one of the rows above, not to change `api` or `baseUrl`.
+Omitting all three credential sources (`apiKey`, `apiKeyEnv`, and `apiKeyStored`) while leaving `auth` at its `apiKey` default fails with `Provider <name>: custom models need a credential source, but none is configured.` Add one of the authenticated rows above, or use `auth: none` only when the endpoint is genuinely unauthenticated.
 
 `input` is the model modality list GJC uses to decide whether image content is forwarded. When a custom model omits `input`, GJC defaults to `[text]` (unless a bundled model with the same id contributes a reference). Vision-capable upstream models therefore need an explicit `input: [text, image]`; otherwise `read`/tool images are stripped before the request and replaced with `[image omitted: model does not support vision]`, even if the remote model can see images.
 

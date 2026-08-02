@@ -175,9 +175,12 @@ describe("provider onboarding wizard", () => {
 	it("refreshes offline after success and exposes the provider in model selector data without restart", async () => {
 		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-wizard-"));
 		setAgentDir(tempAgentDir);
+		const previousEnv = Bun.env.CUSTOM_PROVIDER_KEY;
+		Bun.env.CUSTOM_PROVIDER_KEY = "environment-secret";
 		const store = await SqliteAuthCredentialStore.open(path.join(tempAgentDir, "agent.db"));
 		try {
 			const authStorage = new AuthStorage(store);
+			await authStorage.set("live-provider", { type: "api_key", key: "stale-stored-secret" });
 			const registry = new ModelRegistry(authStorage, path.join(tempAgentDir, "models.yml"));
 			const refreshModes: (string | undefined)[] = [];
 			const originalRefresh = registry.refresh.bind(registry);
@@ -214,7 +217,44 @@ describe("provider onboarding wizard", () => {
 			expect(refreshModes).toEqual(["offline"]);
 			expect(configChanged).toBe(true);
 			expect(registry.find("live-provider", "live-model")).toBeDefined();
+			expect(await registry.getApiKeyForProvider("live-provider")).toBe("environment-secret");
 			expect(ctx.statuses).toEqual([successStatus]);
+		} finally {
+			store.close();
+			if (previousEnv === undefined) delete Bun.env.CUSTOM_PROVIDER_KEY;
+			else Bun.env.CUSTOM_PROVIDER_KEY = previousEnv;
+		}
+	});
+	it("keeps the wizard retryable when offline refresh fails after provider setup commits", async () => {
+		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-wizard-"));
+		setAgentDir(tempAgentDir);
+		const store = await SqliteAuthCredentialStore.open(path.join(tempAgentDir, "agent.db"));
+		try {
+			const authStorage = new AuthStorage(store);
+			const registry = new ModelRegistry(authStorage, path.join(tempAgentDir, "models.yml"));
+			const refreshStarted = Promise.withResolvers<void>();
+			registry.refresh = async mode => {
+				expect(mode).toBe("offline");
+				refreshStarted.resolve();
+				throw new Error("reload failed for literal-secret");
+			};
+			const ctx = createControllerContext(registry);
+			const reloadFailureRendered = Promise.withResolvers<void>();
+			const controller = new SelectorController(ctx);
+			controller.showCustomProviderWizard();
+			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
+			driveEnvWizard(wizard, { providerId: "reload-failure-provider", model: "reload-failure-model" });
+			ctx.ui.requestRender = () => reloadFailureRendered.resolve();
+			wizard.handleInput("\n");
+			await refreshStarted.promise;
+			await reloadFailureRendered.promise;
+
+			const rendered = visibleText(wizard);
+			expect(rendered).toContain("Provider was configured, but the live provider list could not be reloaded.");
+			expect(rendered).toContain("Retry setup and confirm replacement, or restart GJC.");
+			expect(rendered).not.toContain("literal-secret");
+			expect(ctx.statuses).toEqual([]);
+			expect(await Bun.file(path.join(tempAgentDir, "models.yml")).exists()).toBe(true);
 		} finally {
 			store.close();
 		}

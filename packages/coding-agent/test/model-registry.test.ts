@@ -4321,8 +4321,13 @@ describe("ModelRegistry", () => {
 		});
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const message = String(registry.getError()?.message);
 
-		expect(String(registry.getError()?.message)).toContain('"apiKey", "apiKeyEnv", or "apiKeyStored" is required');
+		expect(message).toContain("Provider missing-credential: custom models need a credential source");
+		expect(message).toContain('"auth" only selects the scheme');
+		expect(message).toContain('"apiKey", "apiKeyEnv", or "apiKeyStored" is required');
+		expect(message).toContain('"apiKeyEnv: <ENV_VAR>"');
+		expect(message).toContain('"auth: none"');
 	});
 
 	test("rejects model-level request shaping on non-OpenAI-compatible APIs", () => {

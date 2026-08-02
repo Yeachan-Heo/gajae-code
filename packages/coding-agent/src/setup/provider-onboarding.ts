@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { resolveOAuthStorageProvider } from "@gajae-code/ai";
 import { getAgentDbPath, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { enqueueAtomicYamlOperation } from "../config/atomic-yaml-patch";
+import { withFileLock } from "../config/file-lock";
 import { type ModelsConfig, ModelsConfigSchema } from "../config/models-config-schema";
 import { compareRankedProviders, famousProviderIndex } from "../config/provider-ranking";
 import { AuthStorage } from "../session/auth-storage";
@@ -308,52 +311,83 @@ async function writeModelsConfig(modelsPath: string, config: ModelsConfig): Prom
 export async function addApiCompatibleProvider(input: ProviderSetupInput): Promise<ProviderSetupResult> {
 	const validated = validateSetupInput(input);
 	const modelsPath = input.modelsPath ?? getDefaultModelsPath();
-	const existing = await readModelsConfig(modelsPath);
-	if (existing.providers?.[validated.providerId] && !input.force) {
-		throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
-	}
-	const provider: ProviderConfig = {
-		baseUrl: validated.baseUrl,
-		api: validated.api,
-		auth: "apiKey",
-		models: validated.models.map(id => {
-			const api = validated.modelApi?.[id];
-			return api ? { id, api } : { id };
-		}),
-	};
-	if (validated.compat) provider.compat = validated.compat;
-	const authStorage = await AuthStorage.create(getAgentDbPath());
-	try {
-		if (validated.credentialSource === "env") {
-			await authStorage.remove(validated.providerId);
-			provider.apiKeyEnv = validated.apiKey;
-		} else {
-			await authStorage.set(validated.providerId, { type: "api_key", key: validated.apiKey });
-			provider.apiKeyStored = true;
-		}
-	} finally {
-		authStorage.close();
-	}
-	const next: ModelsConfig = {
-		...existing,
-		providers: {
-			...(existing.providers ?? {}),
-			[validated.providerId]: provider,
-		},
-	};
-	await writeModelsConfig(modelsPath, next);
-	return {
-		providerId: validated.providerId,
-		compatibility: validated.compatibility,
-		api: validated.api,
-		baseUrl: validated.baseUrl,
-		modelIds: validated.models,
-		modelsPath,
-		redactedApiKey: redactSecret(validated.apiKey),
-		credentialSource: validated.credentialSource,
-		preset: validated.preset?.id,
-		presetName: validated.preset?.name,
-	};
+
+	return await enqueueAtomicYamlOperation(getAgentDbPath(), async () =>
+		enqueueAtomicYamlOperation(modelsPath, async () =>
+			withFileLock(modelsPath, async () => {
+				const existing = await readModelsConfig(modelsPath);
+				if (existing.providers?.[validated.providerId] && !input.force) {
+					throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
+				}
+
+				const provider: ProviderConfig = {
+					baseUrl: validated.baseUrl,
+					api: validated.api,
+					auth: "apiKey",
+					models: validated.models.map(id => {
+						const api = validated.modelApi?.[id];
+						return api ? { id, api } : { id };
+					}),
+				};
+				if (validated.compat) provider.compat = validated.compat;
+
+				const storageProvider = resolveOAuthStorageProvider(validated.providerId);
+				const authStorage = await AuthStorage.create(getAgentDbPath());
+				const previousCredentials = authStorage.getAll()[storageProvider];
+				let credentialMutationCompleted = false;
+				try {
+					if (validated.credentialSource === "env") {
+						await authStorage.remove(storageProvider);
+						provider.apiKeyEnv = validated.apiKey;
+					} else {
+						await authStorage.set(storageProvider, { type: "api_key", key: validated.apiKey });
+						provider.apiKeyStored = true;
+					}
+					credentialMutationCompleted = true;
+
+					const next: ModelsConfig = {
+						...existing,
+						providers: {
+							...(existing.providers ?? {}),
+							[validated.providerId]: provider,
+						},
+					};
+					await writeModelsConfig(modelsPath, next);
+				} catch (error) {
+					if (!credentialMutationCompleted) throw error;
+					try {
+						if (previousCredentials) {
+							await authStorage.set(storageProvider, previousCredentials);
+						} else {
+							await authStorage.remove(storageProvider);
+						}
+					} catch {
+						throw new Error(
+							"Provider setup could not save models configuration and could not restore the previous credential.",
+						);
+					}
+					throw new Error(
+						"Provider setup could not save models configuration; credential changes were rolled back.",
+					);
+				} finally {
+					authStorage.close();
+				}
+
+				return {
+					providerId: validated.providerId,
+					compatibility: validated.compatibility,
+					api: validated.api,
+					baseUrl: validated.baseUrl,
+					modelIds: validated.models,
+					modelsPath,
+					redactedApiKey: redactSecret(validated.apiKey),
+					credentialSource: validated.credentialSource,
+					preset: validated.preset?.id,
+					presetName: validated.preset?.name,
+				};
+			}),
+		),
+	);
 }
 
 function isLocalHttpHost(hostname: string): boolean {
