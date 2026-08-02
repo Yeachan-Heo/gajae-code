@@ -4134,6 +4134,25 @@ export class TUI extends Container {
 		// the mutated off-screen prefix; the latest frame is updated below so each
 		// appended row is emitted exactly once.
 		if (firstChanged < prevViewportTop && appendedLines) {
+			// A same-length substitution above the viewport (a streaming status line,
+			// say) leaves every later row at its original index, so the visible suffix
+			// can still be committed. Growth *inside* the off-screen prefix instead
+			// shifts committed content down across the scrollback frontier: the rows
+			// this frame would commit already sit in native scrollback under their old
+			// index, so emitting them appends a second copy — a pending tool block
+			// stranded above its own completed copy, with the rows between duplicated.
+			// The last committed row changing is the observable signal of that shift.
+			const committedBoundary = prevViewportTop - 1;
+			const committedBoundaryShifted =
+				committedBoundary >= diffStart &&
+				(this.#previousLines[committedBoundary] ?? "") !== (newLines[committedBoundary] ?? "");
+			if (committedBoundaryShifted) {
+				const reason = `offscreen growth shifted committed rows (${firstChanged} < ${prevViewportTop})`;
+				logRedraw(reason);
+				if (useViewportRepaintPath) viewportRepaint(reason);
+				else fullRender(true, reason);
+				return;
+			}
 			let suffixStart = -1;
 			for (let i = Math.max(diffStart, prevViewportTop); i < maxLines; i++) {
 				const oldLine = i < this.#previousLines.length ? this.#previousLines[i] : "";

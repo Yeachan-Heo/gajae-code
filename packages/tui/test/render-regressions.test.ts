@@ -1209,6 +1209,51 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("does not re-emit an off-screen tool block that grows in place", async () => {
+			const term = new VirtualTerminal(40, 10);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent([]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				const history = rows("history-", 6);
+				const chrome = rows("chrome-", 12);
+				const block = (state: string, output: number) => [
+					`tool-${state}-top`,
+					"tool-command",
+					"tool-output-label",
+					...rows("tool-out-", output),
+				];
+
+				// Pending compact render, then the block grows in place while it sits
+				// above the live viewport top (the bottom chrome keeps it off-screen).
+				component.setLines([...history, "tool-pending-compact", ...chrome]);
+				tui.requestRender();
+				await settle(term);
+
+				component.setLines([...history, ...block("partial", 0), ...chrome]);
+				tui.requestRender();
+				await settle(term);
+
+				component.setLines([...history, ...block("done", 2), ...chrome]);
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				// The stale pending copies must not be stranded above the finished block,
+				// and no chrome row may be committed twice.
+				expect(countMatches(scrollback, /tool-pending-compact/)).toBe(0);
+				expect(countMatches(scrollback, /tool-partial-top/)).toBe(0);
+				expect(countMatches(scrollback, /tool-done-top/)).toBe(1);
+				expect(countMatches(scrollback, /\bchrome-0\b/)).toBe(1);
+				expect(countMatches(scrollback, /\bchrome-1\b/)).toBe(1);
+				expect(visible(term)).toEqual(rows("chrome-", 12).slice(-10));
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("repaints live viewport when overflowed content shrinks only at the tail", async () => {
 			const term = new VirtualTerminal(20, 5);
 			const tui = new TUI(term);
