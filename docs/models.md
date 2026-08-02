@@ -246,7 +246,7 @@ gjc --mpreset codex-medium
 gjc --mpreset opencodego --default
 ```
 
-The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically.
+The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically. When that wizard receives a pasted API key, it stores the secret in GJC's credential database and writes only `apiKeyStored: true` to `models.yml`.
 
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 
@@ -282,6 +282,7 @@ providers:
 ### Allowed auth/discovery values
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
+- `apiKeyStored: true`: resolve the provider key from GJC's credential database without writing the secret to `models.yml`; `/provider` adds this marker for pasted keys
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
 - `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, or `openai-models-list`
 - `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models use top-level automatic caching and emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints default to explicit block markers because compatible proxies commonly inject, rewrite, or reject top-level cache controls; they omit `ttl` unless `compat.supportsLongCacheRetention: true` opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
@@ -391,7 +392,7 @@ modelBindings:
 Required:
 
 - `baseUrl`
-- A credential source: `apiKeyEnv` or `apiKey`. `auth` selects the scheme, not the credential, so `auth: apiKey` (the default) still needs one of them. Exempt: `auth: none`, and `api: bedrock-converse-stream`, which resolves AWS credentials from its own chain.
+- A credential source: `apiKeyEnv`, `apiKey`, or `apiKeyStored: true`. `auth` selects the scheme, not the credential, so `auth: apiKey` (the default) still needs a source. Provider setup writes `apiKeyStored: true` when it saves the credential in auth storage. Exempt: `auth: none`, and `api: bedrock-converse-stream`, which resolves AWS credentials from its own chain.
 - `api` at provider level or each model
 
 ### Override-only provider (`models` missing or empty)

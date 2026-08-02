@@ -92,6 +92,9 @@
 ### Changed
 
 - Updated the Cursor Eco, Medium, and Pro profiles from Composer 1.5 to distinct Composer 2.5 tiers: standard throughout for Eco, Fast on execution/review/design roles for Medium, and Fast throughout for Pro. Removed inert generic effort suffixes that the Cursor RPC could not transport.
+### Fixed
+
+- Pasted API keys from the custom-provider wizard now leave an explicit stored-credential marker in `models.yml`, so the generated provider survives immediate registry refresh and later restarts without exposing the secret (#3738).
 
 ## [0.12.8] - 2026-08-02
 ### Added
