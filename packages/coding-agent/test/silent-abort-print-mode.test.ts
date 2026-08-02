@@ -61,9 +61,10 @@ function installImmediateStdoutMock(output: string[] = []): void {
 /** Minimal mock of the AgentSession text-output path. */
 function createMockSession(
 	messages: Message[],
-	opts?: { contextWindow?: number; autoCompactionEnabled?: boolean },
+	opts?: { contextWindow?: number; autoCompactionEnabled?: boolean; configWarnings?: string[] },
 ): AgentSession {
 	return {
+		configWarnings: opts?.configWarnings ?? [],
 		state: { messages },
 		model: opts?.contextWindow !== undefined ? { contextWindow: opts.contextWindow } : undefined,
 		autoCompactionEnabled: opts?.autoCompactionEnabled ?? false,
@@ -113,6 +114,7 @@ function createPrintModeTrackingSession(
 		lifecycle.push("prompt:end");
 	});
 	const session = {
+		configWarnings: [],
 		state: { messages },
 		sessionManager: { getHeader: () => header },
 		extensionRunner: undefined,
@@ -155,6 +157,17 @@ describe("Print mode", () => {
 		process.exitCode = previousExitCode ?? 0;
 	});
 
+	it("prints each session configuration warning to stderr once", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock();
+		const warning = "[AGENTS.md] Skipped one or more oversized files.";
+
+		await runPrintMode(createMockSession([], { configWarnings: [warning, warning] }), { mode: "text" });
+
+		expect(stderrOutput).toEqual([`Warning: ${warning}\n`]);
+	});
 	it("does not render a silent-abort marker or overwrite a caller status", async () => {
 		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];

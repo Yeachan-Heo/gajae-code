@@ -198,6 +198,9 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	let unsubscribe: (() => void) | undefined;
 
 	try {
+		for (const warning of new Set(session.configWarnings)) {
+			await writeStderrAndQuiesce(`Warning: ${warning}\n`);
+		}
 		// Emit session header for JSON mode.
 		if (mode === "json") {
 			const header = session.sessionManager.getHeader();
