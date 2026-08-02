@@ -2,8 +2,12 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MCPManager } from "../../../runtime-mcp/manager";
+import type { MCPServerConnection } from "../../../runtime-mcp/types";
+import type { HandlerContext } from "../../suites/handlers";
 import {
 	mcpHandlers,
+	mcpServerOauthLoginHandler,
+	mcpServerReloadHandler,
 	mcpServerResourceReadHandler,
 	mcpServerStatusListHandler,
 	mcpServerToolCallHandler,
@@ -104,16 +108,88 @@ test("MCP-003 resource read returns real MCP contents and missing servers are no
 	});
 });
 
-test("MCP-004 malformed pinned params are rejected and only genuinely backed methods are registered", async () => {
+test("MCP-004 malformed pinned params are rejected and all genuinely backed methods are registered", async () => {
 	expect(await mcpServerToolCallHandler({ server: "fixture", tool: "echo" })).toEqual({
 		ok: false,
 		errorKey: "invalidParams",
 	});
 	expect(await mcpServerResourceReadHandler({ server: "fixture" })).toEqual({ ok: false, errorKey: "invalidParams" });
 	expect(Object.keys(mcpHandlers).sort()).toEqual([
+		"config/mcpServer/reload",
+		"mcpServer/oauth/login",
 		"mcpServer/resource/read",
 		"mcpServer/tool/call",
 		"mcpServerStatus/list",
 	]);
 	expect(await mcpServerStatusListHandler({ detail: "invalid" })).toEqual({ ok: false, errorKey: "invalidParams" });
+});
+
+test("MCP-005 config/mcpServer/reload uses the live disconnect, rediscover, reconnect, and tool refresh seam", async () => {
+	const value = await connected();
+	const connect = value.manager.connectServers.bind(value.manager);
+	let discoveries = 0;
+	value.manager.discoverAndConnect = async () => {
+		discoveries += 1;
+		return connect({ fixture: { type: "stdio", command: process.execPath, args: [value.server] } }, {});
+	};
+	const snapshots: number[] = [];
+	const result = await mcpServerReloadHandler({}, {
+		mcpManager: value.manager,
+		refreshMcpTools: async tools => {
+			snapshots.push(tools.length);
+		},
+	} as HandlerContext & {
+		mcpManager: MCPManager;
+		refreshMcpTools: (tools: ReturnType<MCPManager["getTools"]>) => Promise<void>;
+	});
+	expect(result).toEqual({ ok: true, result: {} });
+	expect(discoveries).toBe(1);
+	expect(value.manager.getConnection("fixture")).toBeDefined();
+	expect(snapshots).toEqual([1]);
+});
+
+test("MCP-006 config/mcpServer/reload reports an honest failure for sealed MCP connections", async () => {
+	const value = await connected();
+	value.manager.sealConnectionSet();
+	expect(await mcpServerReloadHandler({}, { mcpManager: value.manager } as HandlerContext)).toEqual({
+		ok: false,
+		errorKey: "internalError",
+	});
+});
+
+test("MCP-007 mcpServer/oauth/login returns the real authorization URL and reports completion persistence failure", async () => {
+	const dir = mkdtempSync(join("/tmp", "gjc-mcp-oauth-suite-"));
+	dirs.push(dir);
+	const mcp = new MCPManager(dir);
+	managers.push(mcp);
+	const connection = {
+		name: "oauth-fixture",
+		config: {
+			type: "http",
+			url: "https://provider.example/mcp",
+			oauth: {
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				callbackPort: 0,
+			},
+		},
+	} as unknown as MCPServerConnection;
+	(mcp as unknown as { getConnection: (name: string) => MCPServerConnection | undefined }).getConnection = name =>
+		name === "oauth-fixture" ? connection : undefined;
+	const notifications: unknown[] = [];
+	const result = await mcpServerOauthLoginHandler({ name: "oauth-fixture", timeoutSecs: 1 }, {
+		mcpManager: mcp,
+		connectionId: "oauth-test",
+		emitTo: (_connectionId, _method, params) => notifications.push(params),
+	} as HandlerContext & { mcpManager: MCPManager });
+	expect(result.ok).toBe(true);
+	if (result.ok)
+		expect((result.result as { authorizationUrl: string }).authorizationUrl).toContain("provider.example/authorize");
+	await Bun.sleep(1_100);
+	expect(notifications).toContainEqual(expect.objectContaining({ name: "oauth-fixture", success: false }));
+});
+
+test("MCP-008 mcpServer/oauth/login rejects an unknown server without claiming OAuth support", async () => {
+	MCPManager.resetForTests();
+	expect(await mcpServerOauthLoginHandler({ name: "missing" })).toEqual({ ok: false, errorKey: "notFound" });
 });

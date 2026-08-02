@@ -5,6 +5,7 @@
  */
 import * as path from "node:path";
 import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai";
+import type { OAuthController } from "@gajae-code/ai/utils/oauth/types";
 import { Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
@@ -18,7 +19,8 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
-import { MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
+import { type MCPOAuthConfig, MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
+
 import {
 	clearSmitheryApiKey,
 	createSmitheryCliAuthSession,
@@ -48,6 +50,25 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
 	const { promise: timeoutPromise, reject } = Promise.withResolvers<T>();
 	const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
 	return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+/** Reload the live MCP runtime and republish its native tool snapshot. */
+export async function reloadMcpRuntime(
+	mcpManager: MCPManager,
+	refreshSessionTools?: (tools: ReturnType<MCPManager["getTools"]>) => Promise<void>,
+): Promise<Awaited<ReturnType<MCPManager["discoverAndConnect"]>>> {
+	if (mcpManager.isConnectionSetSealed()) {
+		throw new Error("This session's plugin-bundle MCP connections are fixed for its lifetime.");
+	}
+	await mcpManager.disconnectAll();
+	const result = await mcpManager.discoverAndConnect();
+	if (refreshSessionTools) await refreshSessionTools(mcpManager.getTools());
+	else await mcpManager.refreshAllTools();
+	return result;
+}
+
+/** Construct the production MCP OAuth flow used by both TUI and app-server callers. */
+export function createMcpOAuthFlow(config: MCPOAuthConfig, ctrl: OAuthController): MCPOAuthFlow {
+	return new MCPOAuthFlow(config, ctrl);
 }
 
 /**
@@ -543,7 +564,7 @@ export class MCPCommandController {
 
 		try {
 			// Create OAuth flow
-			const flow = new MCPOAuthFlow(
+			const flow = createMcpOAuthFlow(
 				{
 					authorizationUrl: authUrl,
 					tokenUrl: tokenEndpoint,
@@ -1473,16 +1494,8 @@ export class MCPCommandController {
 		if (!this.ctx.mcpManager) {
 			return;
 		}
-		if (this.ctx.mcpManager.isConnectionSetSealed()) {
-			throw new Error("This session's plugin-bundle MCP connections are fixed for its lifetime.");
-		}
 
-		// Disconnect all existing servers
-		await this.ctx.mcpManager.disconnectAll();
-
-		// Rediscover and connect
-		const result = await this.ctx.mcpManager.discoverAndConnect();
-		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
+		const result = await reloadMcpRuntime(this.ctx.mcpManager, tools => this.ctx.session.refreshMCPTools(tools));
 
 		// Show any connection errors
 		if (result.errors.size > 0) {

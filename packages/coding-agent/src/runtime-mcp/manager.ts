@@ -414,6 +414,16 @@ export class MCPManager {
 		this.#authStorage = authStorage;
 	}
 
+	/** Return the auth storage used for MCP OAuth credential resolution. */
+	getAuthStorage(): AuthStorage | undefined {
+		return this.#authStorage ?? undefined;
+	}
+
+	/** Return the workspace used for MCP configuration discovery. */
+	getCwd(): string {
+		return this.cwd;
+	}
+
 	/**
 	 * Discover and connect to all MCP servers from .mcp.json files.
 	 * Returns tools and any connection errors.

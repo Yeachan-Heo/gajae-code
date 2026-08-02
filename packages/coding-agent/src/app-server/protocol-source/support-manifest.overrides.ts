@@ -225,14 +225,20 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		"A batch is validated in full before one atomic Settings commit.",
 	),
 	"config/mcpServer/reload": {
-		support: "not_supported",
-		gjcSeam: null,
-		gjcBackendPath: null,
-		semanticGaps: ["No GJC runtime seam reloads MCP server configuration."],
-		translationNotes: [],
+		support: "implemented",
+		gjcSeam: "reloadMcpRuntime via mcpServerReloadHandler",
+		gjcBackendPath:
+			"packages/coding-agent/src/app-server/suites/mcp-handlers.ts; packages/coding-agent/src/modes/controllers/runtime-mcp-command-controller.ts",
+		semanticGaps: [],
+		translationNotes: [
+			"GJC lazily creates the live MCPManager for app-server dispatch, then returns the vendored empty response after disconnect, rediscover, reconnect, and tool refresh.",
+		],
 		owner: "app-server",
-		testIds: ["the modelConfig lane exposes exactly the methods GJC can back"],
-		reason: "GJC has no MCP configuration reload entry point, so no handler is registered.",
+		testIds: [
+			"MCP-005 config/mcpServer/reload uses the live disconnect, rediscover, reconnect, and tool refresh seam",
+			"MCP-006 config/mcpServer/reload reports an honest failure for sealed MCP connections",
+		],
+		reason: "The handler invokes the same reloadMcpRuntime seam used by the production /mcp reload command.",
 	},
 	"mcpServerStatus/list": laneRow(
 		"mcpServerStatusListHandler",
@@ -253,14 +259,23 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 		"Resource reads go through the real MCP client.",
 	),
 	"mcpServer/oauth/login": {
-		support: "not_supported",
-		gjcSeam: null,
-		gjcBackendPath: null,
-		semanticGaps: ["No app-server-owned MCP OAuth login orchestration or completion event exists."],
-		translationNotes: [],
+		support: "implemented",
+		gjcSeam: "createMcpOAuthFlow via mcpServerOauthLoginHandler",
+		gjcBackendPath:
+			"packages/coding-agent/src/app-server/suites/mcp-handlers.ts; packages/coding-agent/src/modes/controllers/runtime-mcp-command-controller.ts",
+		semanticGaps: [
+			"OAuth completion is asynchronous and is reported only while the app-server connection remains alive.",
+		],
+		translationNotes: [
+			"The request returns GJC's real authorizationUrl; completion persists an MCP-bound OAuth credential and emits mcpServer/oauthLogin/completed.",
+		],
 		owner: "app-server",
-		testIds: ["MCP-004 malformed pinned params are rejected and only genuinely backed methods are registered"],
-		reason: "MCPOAuthFlow exists but has no reachable app-server login seam, so no handler is registered.",
+		testIds: [
+			"MCP-007 mcpServer/oauth/login returns the real authorization URL and reports completion persistence failure",
+			"MCP-008 mcpServer/oauth/login rejects an unknown server without claiming OAuth support",
+		],
+		reason:
+			"The handler starts the existing MCPOAuthFlow seam and reports its real authorization and completion state without emulating interactive input.",
 	},
 	"skills/list": laneRow(
 		"skillsListHandler",

@@ -6,10 +6,12 @@
 // marketplace, windowsSandbox, and ChatGPT account mutations) return -32081 automatically by the
 // dispatcher (no handler registered = notSupported verdict from dispatchClientRequest).
 
+import type { MCPManager } from "../../runtime-mcp/manager";
 import type { ThreadRuntimeManager } from "../thread-runtime/thread-runtime-manager";
 import type { TurnController } from "../thread-runtime/turn-controller";
 import { accountHandlers } from "./account-handlers";
 import { commandExecHandlers } from "./command-exec-handlers";
+
 import { environmentAppHandlers } from "./environment-app-handlers";
 import { fsWatchHandlers } from "./fs-watch-handlers";
 import { goalsReviewHandlers } from "./goals-review-handlers";
@@ -33,6 +35,10 @@ export interface HandlerContext {
 	readonly accountAuthState?: AccountAuthStateSource;
 	/** Connection the request arrived on; notification handlers target it directly. */
 	readonly connectionId?: string;
+	/** Optional live MCP manager supplied by an app-server host; handlers fall back to the singleton when absent. */
+	readonly mcpManager?: MCPManager;
+	/** Refresh the owning session's native MCP tool catalog after a lifecycle change. */
+	readonly refreshMcpTools?: (tools: readonly unknown[]) => Promise<void>;
 	/** Loaded-thread runtime, for handlers that act on live threads. */
 	readonly manager?: ThreadRuntimeManager;
 	/** Live-turn controller, for handlers that interrupt or steer a running turn. */

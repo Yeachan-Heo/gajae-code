@@ -136,8 +136,6 @@ test("config writes reject unknown and invalid values without mutating the confi
 });
 
 test("the modelConfig lane exposes exactly the methods GJC can back", () => {
-	// config/mcpServer/reload is intentionally absent: no GJC runtime seam reloads MCP
-	// configuration, so the dispatcher answers -32081 from its not_supported manifest row.
 	expect(Object.keys(modelConfigHandlers).sort()).toEqual([
 		"config/batchWrite",
 		"config/read",
