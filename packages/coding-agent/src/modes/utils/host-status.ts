@@ -1,13 +1,23 @@
 /**
  * Host-terminal agent status markers.
  *
- * Terax runs `gjc` inside its own PTY and shows per-tab agent status. It reads
- * an OSC 777 marker (`notify;Terax;gjc;<event>`) from the PTY stream, so the
- * status is reported here rather than through the extension surface, which is
- * quarantined for filesystem-discovered modules.
+ * Interactive turns announce their state as an OSC 777 sequence:
  *
- * The marker is written only when the host advertises itself through
- * `TERAX_TERMINAL`; every other terminal sees nothing.
+ *     ESC ] 777 ; notify;Terax;gjc;<event> BEL
+ *
+ * A terminal that understands the sequence (Terax reads it to drive its per-tab
+ * agent status and header bell) reacts; every other terminal discards the OSC
+ * as unknown, exactly like the OSC 133 prompt marks and OSC 7 cwd reports that
+ * shells emit unconditionally. So there is no host sniffing and no env gate:
+ * any host that wants agent status can parse the stream without gjc knowing it
+ * exists.
+ *
+ * `notify;Terax;` is the wire identifier of the only protocol that currently
+ * carries per-turn agent state, not a host check - the payload names gjc as the
+ * reporting agent.
+ *
+ * Interactive TUI only. Print and RPC mode stdout stays byte-for-byte parseable
+ * because they never reach these controllers.
  */
 
 export type HostStatusEvent = "working" | "attention" | "finished";
@@ -20,7 +30,6 @@ export function emitHostStatus(
 	event: HostStatusEvent,
 	output: Pick<NodeJS.WriteStream, "write"> = process.stdout,
 ): void {
-	if (!process.env.TERAX_TERMINAL) return;
 	try {
 		output.write(marker(event));
 	} catch {
