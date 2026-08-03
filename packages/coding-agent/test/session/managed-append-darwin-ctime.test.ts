@@ -1,10 +1,9 @@
 /**
  * Regression for https://github.com/Yeachan-Heo/gajae-code/issues/2944
  *
- * On Darwin, the first O_WRONLY|O_APPEND open of a managed transcript can change
- * only ctime (write-provenance / com.apple.provenance) while leaving dev, ino,
- * size, mtime, and content unchanged. appendSync must accept a single bounded
- * refresh+retry for that case and stay fail-closed for real races.
+ * Darwin managed transcript appends now publish an exact replacement instead of
+ * opening the destination with O_APPEND. The replacement must tolerate a ctime-only
+ * transition while rejecting real destination mutations after capture.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -51,33 +50,16 @@ async function createStore(options?: { withoutNativeAuthority?: boolean }): Prom
 	return { root, store, filePath: path.join(root, relativePath), relativePath };
 }
 
-function isWriteAppendOpen(_file: fs.PathLike, flags: fs.OpenMode | undefined): boolean {
-	if (typeof flags !== "number") return false;
-	const write = (flags & fs.constants.O_WRONLY) !== 0 || (flags & fs.constants.O_RDWR) !== 0;
-	const append = (flags & fs.constants.O_APPEND) !== 0;
-	return write && append;
-}
-
-function installWriteOpenHook(
-	targetPath: string,
-	hook: (pathname: string) => void,
-	options?: { maxCalls?: number },
-): { calls: number } {
+function installFirstFsyncHook(hook: () => void): { calls: number } {
 	const state = { calls: 0 };
-	const maxCalls = options?.maxCalls ?? Number.POSITIVE_INFINITY;
-	const realOpenSync = fs.openSync.bind(fs);
-	vi.spyOn(fs, "openSync").mockImplementation(((
-		file: fs.PathLike,
-		flags?: fs.OpenMode | undefined,
-		mode?: fs.Mode | undefined,
-	) => {
-		const pathname = typeof file === "string" ? file : file.toString();
-		if (pathname === targetPath && isWriteAppendOpen(file, flags) && state.calls < maxCalls) {
+	const realFsyncSync = fs.fsyncSync.bind(fs);
+	vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+		if (state.calls === 0) {
 			state.calls += 1;
-			hook(pathname);
+			hook();
 		}
-		return realOpenSync(file, flags as never, mode as never);
-	}) as typeof fs.openSync);
+		return realFsyncSync(fd);
+	});
 	return state;
 }
 
@@ -87,22 +69,18 @@ function bumpCtimeOnly(pathname: string): void {
 	fs.chmodSync(pathname, mode & 0o7777);
 }
 
-describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
-	it("rejects size mutation between capture and write-open without appending the request", async () => {
+describe("ManagedSessionDescendantStore.appendSync fail-closed replacement races", () => {
+	it("rejects size mutation between capture and exact replacement without appending the request", async () => {
 		const { store, filePath, relativePath } = await createStore({ withoutNativeAuthority: true });
 		const beforeBytes = fs.readFileSync(filePath);
 		const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m-race" })}\n`, "utf8");
 
-		const openState = installWriteOpenHook(
-			filePath,
-			pathname => {
-				fs.appendFileSync(pathname, "stale-race\n");
-			},
-			{ maxCalls: 1 },
-		);
+		const fsyncState = installFirstFsyncHook(() => {
+			fs.appendFileSync(filePath, "stale-race\n");
+		});
 
 		expect(() => store.appendSync(relativePath, record)).toThrow("identity_mismatch");
-		expect(openState.calls).toBe(1);
+		expect(fsyncState.calls).toBe(1);
 		const after = fs.readFileSync(filePath, "utf8");
 		expect(after).toBe(`${beforeBytes.toString("utf8")}stale-race\n`);
 		expect(after.includes('"id":"m-race"')).toBe(false);
@@ -110,42 +88,23 @@ describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
 });
 
 describe.skipIf(process.platform !== "darwin")(
-	"ManagedSessionDescendantStore.appendSync Darwin ctime-only refresh (#2944)",
+	"ManagedSessionDescendantStore.appendSync Darwin ctime-only replacement (#2944)",
 	() => {
-		it("accepts a one-time ctime-only transition before write-open and appends exactly once", async () => {
+		it("accepts a ctime-only transition before exact replacement and appends exactly once", async () => {
 			const { store, filePath, relativePath } = await createStore();
 			const beforeBytes = fs.readFileSync(filePath);
 			const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m1" })}\n`, "utf8");
 
-			// One-shot ctime bump on the first write-append open only.
-			const openState = installWriteOpenHook(
-				filePath,
-				pathname => {
-					bumpCtimeOnly(pathname);
-				},
-				{ maxCalls: 1 },
-			);
+			const fsyncState = installFirstFsyncHook(() => {
+				bumpCtimeOnly(filePath);
+			});
 
 			store.appendSync(relativePath, record);
 
-			expect(openState.calls).toBe(1);
+			expect(fsyncState.calls).toBe(1);
 			const afterBytes = fs.readFileSync(filePath);
 			expect(afterBytes.equals(Buffer.concat([beforeBytes, record]))).toBe(true);
 			expect(afterBytes.toString("utf8").trimEnd().split("\n")).toHaveLength(2);
-		});
-
-		it("rejects a second ctime-only transition after the single bounded refresh", async () => {
-			const { store, filePath, relativePath } = await createStore();
-			const beforeBytes = fs.readFileSync(filePath);
-			const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m3" })}\n`, "utf8");
-
-			// Every write-append open bumps ctime → refresh once, then fail closed.
-			installWriteOpenHook(filePath, pathname => {
-				bumpCtimeOnly(pathname);
-			});
-
-			expect(() => store.appendSync(relativePath, record)).toThrow("identity_mismatch");
-			expect(fs.readFileSync(filePath).equals(beforeBytes)).toBe(true);
 		});
 
 		it("documents that same-mode chmod can change only ctime on this host", async () => {
@@ -159,8 +118,7 @@ describe.skipIf(process.platform !== "darwin")(
 			expect(Number(after.size)).toBe(captured.identity.size);
 			expect(after.mtimeNs).toBe(captured.identity.mtimeNs);
 			// Some hosts/FS configurations may not advance ctime for a no-op mode rewrite;
-			// the openSync-hook tests above still cover the repair path deterministically when
-			// ctime does move. Soft-assert here so CI hosts without the delta do not fail.
+			// the replacement hook above still covers the path deterministically when it moves.
 			if (after.ctimeNs === captured.identity.ctimeNs) return;
 			expect(after.ctimeNs).not.toBe(captured.identity.ctimeNs);
 		});
