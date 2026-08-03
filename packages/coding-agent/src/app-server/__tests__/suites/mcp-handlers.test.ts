@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MCPManager } from "../../../runtime-mcp/manager";
+import type { MCPServerConnection } from "../../../runtime-mcp/types";
 import type { HandlerContext } from "../../suites/handlers";
 import {
 	mcpHandlers,
@@ -9,6 +10,7 @@ import {
 	mcpServerResourceReadHandler,
 	mcpServerStatusListHandler,
 	mcpServerToolCallHandler,
+	projectWireJson,
 } from "../../suites/mcp-handlers";
 
 const dirs: string[] = [];
@@ -59,6 +61,101 @@ async function connected() {
 	);
 	return value;
 }
+
+function wireManager(connection: MCPServerConnection): MCPManager {
+	return {
+		getAllServerNames: () => [connection.name],
+		getConnection: (name: string) => (name === connection.name ? connection : undefined),
+	} as unknown as MCPManager;
+}
+
+function wireConnection(inputSchema: unknown): MCPServerConnection {
+	const transport: MCPServerConnection["transport"] = {
+		connected: true,
+		request: async <T = unknown>() => ({}) as T,
+		notify: async () => {},
+		close: async () => {},
+	};
+	return {
+		name: "fixture",
+		config: { type: "stdio", command: "fixture" },
+		transport,
+		serverInfo: { name: "fixture", version: "1" },
+		capabilities: { tools: {} },
+		tools: [{ name: "echo", inputSchema: inputSchema as { type: "object" } }],
+	};
+}
+
+test("MCP wire projection rejects unsupported values instead of silently pruning them", () => {
+	class CustomPayload {
+		value = 1;
+		toJSON() {
+			return { value: 2 };
+		}
+	}
+	const accessor: Record<string, unknown> = {};
+	Object.defineProperty(accessor, "value", { enumerable: true, get: () => 1 });
+	const hidden: Record<string, unknown> = {};
+	Object.defineProperty(hidden, "value", { value: 1 });
+	const symbolProperty: Record<string, unknown> = {};
+	Object.defineProperty(symbolProperty, Symbol("extra"), { enumerable: true, value: 1 });
+	const cyclicArray: unknown[] = [];
+	cyclicArray.push(cyclicArray);
+	const cyclicObject: Record<string, unknown> = {};
+	cyclicObject.self = cyclicObject;
+	const sparseArray: unknown[] = [];
+	sparseArray.length = 1;
+	const cases: Array<[string, unknown]> = [
+		["Date", new Date(0)],
+		["Map", new Map([["value", 1]])],
+		["class instance", new CustomPayload()],
+		["accessor", accessor],
+		["hidden property", hidden],
+		["undefined", { value: undefined }],
+		["infinity", { value: Number.POSITIVE_INFINITY }],
+		["NaN", { value: Number.NaN }],
+		["function", { value: () => 1 }],
+		["symbol", { value: Symbol("value") }],
+		["enumerable symbol property", symbolProperty],
+		["cyclic array", cyclicArray],
+		["cyclic object", cyclicObject],
+		["sparse array", sparseArray],
+	];
+	for (const [label, value] of cases) expect(() => projectWireJson(value), label).toThrow();
+});
+
+test("MCP wire projection round-trips a deeply nested JSON schema", () => {
+	const schema = {
+		type: "object",
+		properties: {
+			settings: {
+				type: "object",
+				properties: {
+					name: { type: "string" },
+					flags: { type: "array", items: { type: "boolean" } },
+					metadata: {
+						type: "object",
+						properties: { count: { type: "integer" }, enabled: { type: "boolean" } },
+						required: ["count"],
+					},
+				},
+				required: ["name"],
+			},
+			values: { type: "array", items: { anyOf: [{ type: "string" }, { type: "null" }] } },
+		},
+		required: ["settings"],
+	};
+	Object.defineProperty(schema, Symbol("normalization-stamp"), { value: true });
+	expect(projectWireJson(schema)).toEqual(schema);
+});
+
+test("MCP status returns internalError when cached MCP data violates the JSON-only invariant", async () => {
+	const result = await mcpServerStatusListHandler(
+		{ detail: "toolsAndAuthOnly" },
+		{ mcpManager: wireManager(wireConnection(new Date(0))) },
+	);
+	expect(result).toEqual({ ok: false, errorKey: "internalError" });
+});
 
 test("MCP-001 status lists a real connected server and inventory", async () => {
 	const value = await connected();

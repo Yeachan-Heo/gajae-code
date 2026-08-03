@@ -19,38 +19,67 @@ function record(value: unknown): value is RecordValue {
  * MCP tool schemas are normalized for the agent and carry non-enumerable symbol
  * stamps; this boundary deliberately copies only enumerable data properties.
  */
-function projectWireJson(value: unknown, seen = new WeakSet<object>()): unknown {
+export function projectWireJson(value: unknown, path = "$", active = new WeakSet<object>()): unknown {
 	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
-	if (typeof value !== "object") return undefined;
-	if (seen.has(value)) return undefined;
-	seen.add(value);
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new Error(`MCP wire payload contains a non-finite number at ${path}.`);
+		return value;
+	}
+	if (value === undefined) throw new Error(`MCP wire payload contains undefined at ${path}.`);
+	if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") {
+		throw new Error(`MCP wire payload contains an unsupported value at ${path}.`);
+	}
+	if (typeof value !== "object") throw new Error(`MCP wire payload contains an unsupported value at ${path}.`);
+	if (active.has(value)) throw new Error(`MCP wire payload contains a cycle at ${path}.`);
+	active.add(value);
 	try {
 		if (Array.isArray(value)) {
+			for (const key of Object.getOwnPropertySymbols(value)) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, key);
+				if (descriptor?.enumerable) throw new Error(`MCP wire payload contains a symbol property at ${path}.`);
+			}
+			for (const key of Object.getOwnPropertyNames(value)) {
+				if (key === "length") continue;
+				const index = Number(key);
+				if (!Number.isInteger(index) || index < 0 || String(index) !== key || index >= value.length) {
+					throw new Error(`MCP wire payload contains an invalid array property at ${path}.${key}.`);
+				}
+			}
 			const result: unknown[] = [];
 			for (let index = 0; index < value.length; index++) {
-				const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-				const projected =
-					descriptor?.enumerable && "value" in descriptor ? projectWireJson(descriptor.value, seen) : undefined;
-				result.push(projected === undefined ? null : projected);
+				const key = String(index);
+				const descriptor = Object.getOwnPropertyDescriptor(value, key);
+				if (!descriptor?.enumerable || !("value" in descriptor)) {
+					throw new Error(`MCP wire payload contains an invalid array slot at ${path}[${index}].`);
+				}
+				result.push(projectWireJson(descriptor.value, `${path}[${index}]`, active));
 			}
 			return result;
 		}
+
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) {
+			throw new Error(`MCP wire payload contains a non-plain object at ${path}.`);
+		}
+		for (const key of Object.getOwnPropertySymbols(value)) {
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (descriptor?.enumerable) throw new Error(`MCP wire payload contains a symbol property at ${path}.`);
+		}
 		const result: RecordValue = {};
 		for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
-			if (!descriptor.enumerable || !("value" in descriptor)) continue;
-			const projected = projectWireJson(descriptor.value, seen);
-			if (projected !== undefined)
-				Object.defineProperty(result, key, {
-					value: projected,
-					enumerable: true,
-					writable: true,
-					configurable: true,
-				});
+			if (!descriptor.enumerable || !("value" in descriptor)) {
+				throw new Error(`MCP wire payload contains a hidden or accessor property at ${path}.${key}.`);
+			}
+			Object.defineProperty(result, key, {
+				value: projectWireJson(descriptor.value, `${path}.${key}`, active),
+				enumerable: true,
+				writable: true,
+				configurable: true,
+			});
 		}
 		return result;
 	} finally {
-		seen.delete(value);
+		active.delete(value);
 	}
 }
 
@@ -151,7 +180,11 @@ export const mcpServerStatusListHandler: MethodHandler = async (params, context)
 	);
 	const result: RecordValue = { data };
 	if (start + selected.length < names.length) result.nextCursor = String(start + selected.length);
-	return { ok: true, result: projectWireObject(result) };
+	try {
+		return { ok: true, result: projectWireObject(result) };
+	} catch {
+		return internal();
+	}
 };
 
 /** Reload configured MCP servers through the runtime-owned lifecycle service. */
