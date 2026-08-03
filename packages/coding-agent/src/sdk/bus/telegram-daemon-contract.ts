@@ -57,9 +57,16 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * signal, or spawn authority.
  * Generation 42 applies first-class provider-settings admission to Telegram
  * lifecycle controls. Generation 43 applies identity-bound exact replacement
- * cleanup shared by managed-session and daemon filesystem authority.
+ * cleanup shared by managed-session and daemon filesystem authority. Generation
+ * 44 makes callback recovery restart-safe by revoking persisted routes and
+ * callback receipts durable before routing and binds aliases to exact asks.
+ * Generation 46 stages accepted callback activation and makes callback
+ * consumption transactional under exact pending and lease authority. Generation
+ * 47 settles failed staged revocation and guards the complete callback authority
+ * and polling dependency chain. Generation 48 uses crash-durable callback
+ * receipts, a legacy-disjoint random alias namespace, and exact topic leases.
  */
-export const DAEMON_GENERATION = 43;
+export const DAEMON_GENERATION = 48;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers

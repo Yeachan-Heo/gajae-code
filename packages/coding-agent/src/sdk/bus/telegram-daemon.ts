@@ -152,7 +152,7 @@ export interface TelegramDaemonFs {
 	writeFile(path: string, data: string, opts?: fs.WriteFileOptions): Promise<void>;
 	rename(oldPath: string, newPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
-	open(path: string, flags: string, mode?: number): Promise<{ close(): Promise<void> }>;
+	open(path: string, flags: string, mode?: number): Promise<{ sync?: () => Promise<void>; close(): Promise<void> }>;
 	readdir(path: string): Promise<string[]>;
 	chmod(path: string, mode: number): Promise<void>;
 	stat?(path: string): Promise<{
@@ -589,11 +589,87 @@ async function readJson<T>(fsImpl: TelegramDaemonFs, file: string): Promise<T | 
 	}
 }
 
-async function writeJsonAtomic(fsImpl: TelegramDaemonFs, file: string, data: unknown): Promise<void> {
+async function writeJsonAtomic(
+	fsImpl: TelegramDaemonFs,
+	file: string,
+	data: unknown,
+	options: { durable?: boolean } = {},
+): Promise<void> {
 	const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-	await fsImpl.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
-	await fsImpl.rename(tmp, file);
+	let renamed = false;
+	try {
+		await fsImpl.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+		await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
+		if (options.durable) await syncTelegramFile(fsImpl, tmp);
+		await fsImpl.rename(tmp, file);
+		renamed = true;
+		if (options.durable) await syncTelegramDirectory(fsImpl, path.dirname(file));
+	} catch (error) {
+		if (renamed) throw error;
+		let cleanupError: unknown;
+		try {
+			await fsImpl.unlink(tmp);
+		} catch (candidate) {
+			if ((candidate as NodeJS.ErrnoException).code !== "ENOENT") cleanupError = candidate;
+		}
+		if (cleanupError) throw new AggregateError([error, cleanupError], "Atomic JSON write and cleanup failed");
+		throw error;
+	}
+}
+
+async function syncTelegramFile(fsImpl: TelegramDaemonFs, file: string): Promise<void> {
+	const handle = await fsImpl.open(file, "r+");
+	let syncError: unknown;
+	try {
+		if (typeof handle.sync !== "function")
+			throw new Error("Telegram alias durability requires filesystem sync support");
+		await handle.sync();
+	} catch (error) {
+		syncError = error;
+	}
+	let closeError: unknown;
+	try {
+		await handle.close();
+	} catch (error) {
+		closeError = error;
+	}
+	if (syncError && closeError)
+		throw new AggregateError([syncError, closeError], "Telegram alias file sync and close failed");
+	if (syncError) throw syncError;
+	if (closeError) throw closeError;
+}
+
+async function syncTelegramDirectory(fsImpl: TelegramDaemonFs, directory: string): Promise<void> {
+	let handle: Awaited<ReturnType<TelegramDaemonFs["open"]>>;
+	try {
+		handle = await fsImpl.open(directory, "r");
+	} catch (error) {
+		if (process.platform === "win32" && isUnsupportedTelegramDirectoryBarrier(error)) return;
+		throw error;
+	}
+	let syncError: unknown;
+	try {
+		if (typeof handle.sync !== "function")
+			throw new Error("Telegram alias durability requires filesystem sync support");
+		await handle.sync();
+	} catch (error) {
+		if (!(process.platform === "win32" && isUnsupportedTelegramDirectoryBarrier(error))) syncError = error;
+	}
+	let closeError: unknown;
+	try {
+		await handle.close();
+	} catch (error) {
+		closeError = error;
+	}
+	if (syncError && closeError)
+		throw new AggregateError([syncError, closeError], "Telegram alias directory sync and close failed");
+	if (syncError) throw syncError;
+	if (closeError) throw closeError;
+}
+
+function isUnsupportedTelegramDirectoryBarrier(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return code === "EINVAL" || code === "EISDIR" || code === "ENOTSUP" || code === "EPERM";
 }
 
 function validDaemonPid(pid: unknown): pid is number {
@@ -4118,6 +4194,13 @@ export interface TelegramDaemonOptions {
 	topics?: { nameTemplate?: string };
 }
 
+interface StagedCallbackActivation {
+	pending: { sessionId: string; actionId: string };
+	socketLease: { session: SessionSocket; token: number; logicalSessionId: string };
+	topicLease?: TopicAuthorityLease;
+	settled: Promise<boolean>;
+}
+
 interface SessionSocket {
 	/** Immutable key of the transport endpoint that owns this socket. */
 	sessionId: string;
@@ -4245,6 +4328,37 @@ type BotApiCallOutcome =
 interface BotApiCallResult {
 	response: unknown;
 	outcome: BotApiCallOutcome;
+}
+function createBotApiAdapter(
+	call: (
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	) => Promise<BotApiCallResult>,
+): BotApi {
+	return {
+		call: async (method, body, callOpts) => (await call(method, body, callOpts)).response,
+	};
+}
+function createBotApiPipeline(
+	rawBotApi: BotApi,
+	callBotApi: (
+		rawBotApi: BotApi,
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	) => Promise<BotApiCallResult>,
+): {
+	classified: (
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	) => Promise<BotApiCallResult>;
+	api: BotApi;
+} {
+	const classified = (method: string, body: unknown, callOpts?: { signal?: AbortSignal; noRetry?: boolean }) =>
+		callBotApi(rawBotApi, method, body, callOpts);
+	return { classified, api: createBotApiAdapter(classified) };
 }
 
 function classifyBotApiCallOutcome(response: unknown, cooldownSuppressed = false): BotApiCallOutcome {
@@ -4388,7 +4502,18 @@ class TelegramEffectSupervisor {
 
 export class TelegramNotificationDaemon {
 	readonly aliasTable: AliasTable;
+	/** Callback aliases are routable only by the immutable socket lease that rendered them. */
+	#callbackAliasLeases = new Map<string, { session: SessionSocket; token: number; logicalSessionId: string }>();
+	/** Each active alias is bound to the exact pending ask object that rendered it. */
+	#callbackAliasPending = new Map<string, { sessionId: string; actionId: string }>();
+	/** Active callbacks preserve the exact topic authority under which their keyboard was rendered. */
+	#callbackAliasTopics = new Map<string, TopicAuthorityLease>();
+	/** Exposed aliases wait for their accepted receipt persistence before routing. */
+	#stagedCallbackActivations = new Map<string, StagedCallbackActivation>();
 	readonly messageRoutes = new Map<string | number, CallbackRoute | Omit<CallbackRoute, "answer">>();
+	/** Restart-revoked aliases retained only to terminalize their old keyboards on an authoritative replay. */
+	private readonly reissueBacklog = new Map<string, CallbackRoute>();
+	private aliasPersistenceQueue: Promise<void> = Promise.resolve();
 	/** Telegram message id backing each streamed `${sessionId}:${coalesceKey}`, for in-place edits. */
 	private readonly liveMessages = new Map<string, number>();
 	/** Endpoint-bound ownership for visible or dispatching tool bubbles. */
@@ -4981,10 +5106,9 @@ export class TelegramNotificationDaemon {
 				fetchImpl: opts.fetchImpl,
 				setTimeoutImpl: opts.setTimeoutImpl,
 			});
-		this.callBotApiClassified = (method, body, callOpts) => this.callBotApi(rawBotApi, method, body, callOpts);
-		this.botApi = {
-			call: async (method, body, callOpts) => (await this.callBotApiClassified(method, body, callOpts)).response,
-		};
+		const botApiPipeline = createBotApiPipeline(rawBotApi, this.callBotApi.bind(this));
+		this.callBotApiClassified = botApiPipeline.classified;
+		this.botApi = botApiPipeline.api;
 		this.runtime = new NotificationOperatorRuntime({
 			now: opts.now,
 			setTimeoutImpl: opts.setTimeoutImpl,
@@ -5287,13 +5411,33 @@ export class TelegramNotificationDaemon {
 
 	async loadAliases(): Promise<void> {
 		const raw = await readJson<unknown>(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).aliases);
-		if (raw) this.aliasTable.load(raw);
+		if (!raw) return;
+		const persisted = raw as { revokedRoutes?: unknown };
+		const revoked = createAliasTable();
+		revoked.load({ version: 2, next: 1, routes: persisted.revokedRoutes });
+		for (const [alias, route] of revoked.entries()) this.reissueBacklog.set(alias, route);
+		this.aliasTable.load(raw);
+		for (const [alias, route] of this.aliasTable.entries()) this.reissueBacklog.set(alias, route);
+		this.aliasTable.clear();
+		await this.persistAliases();
 	}
 
-	async persistAliases(): Promise<void> {
-		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		await ensureDir(this.fsImpl, paths.dir);
-		await writeJsonAtomic(this.fsImpl, paths.aliases, this.aliasTable.serialize());
+	persistAliases(): Promise<void> {
+		const pending = this.aliasPersistenceQueue.then(async () => {
+			const paths = daemonPaths(this.opts.settings.getAgentDir());
+			await ensureDir(this.fsImpl, paths.dir);
+			await writeJsonAtomic(
+				this.fsImpl,
+				paths.aliases,
+				{
+					...this.aliasTable.serialize(),
+					revokedRoutes: Object.fromEntries(this.reissueBacklog),
+				},
+				{ durable: true },
+			);
+		});
+		this.aliasPersistenceQueue = pending.catch(() => undefined);
+		return pending;
 	}
 
 	async loadSeenUpdateIds(): Promise<void> {
@@ -5753,12 +5897,24 @@ export class TelegramNotificationDaemon {
 	}
 
 	private dropSession(session: SessionSocket, reason: string): void {
+		// Capture the exact callback lease before revoking recovery authority. A
+		// predecessor transport can remain keyed by its own session id after a
+		// successor becomes the logical owner, so logical-session revocation
+		// would incorrectly delete the successor's freshly accepted aliases.
+		const callbackLease = {
+			session,
+			token: session.recoveryLease?.token ?? 0,
+			logicalSessionId: this.#logicalSessionId(session),
+		};
 		// A dropped socket must lose authority before any teardown-triggered asynchronous
 		// work can observe it. Its immutable lease token remains captured by queued work,
 		// but is no longer usable.
 		if (session.recoveryLease) session.recoveryLease = { ...session.recoveryLease, state: "rejected" };
 		const isCurrentSession = this.sessions.get(session.sessionId) === session;
-		if (isCurrentSession) this.droppedSessions.add(session);
+		if (isCurrentSession) {
+			this.revokeCallbackAliases(callbackLease);
+			this.droppedSessions.add(session);
+		}
 		if (isCurrentSession) this.cancelLegacyToolStartsForSession(session);
 		if (isCurrentSession) this.scheduleVisibleToolTerminalization(session.endpointDigest).catch(() => undefined);
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
@@ -6094,6 +6250,82 @@ export class TelegramNotificationDaemon {
 			}
 		}
 	}
+	#revokeCallbackAlias(alias: string): CallbackRoute | undefined {
+		const route = this.aliasTable.get(alias);
+		if (!route) return undefined;
+		this.reissueBacklog.set(alias, route);
+		this.aliasTable.delete(alias);
+		this.#callbackAliasLeases.delete(alias);
+		this.#callbackAliasPending.delete(alias);
+		this.#callbackAliasTopics.delete(alias);
+		return route;
+	}
+	#stageCallbackActivation(
+		aliases: Iterable<string>,
+		pending: { sessionId: string; actionId: string },
+		socketLease: { session: SessionSocket; token: number; logicalSessionId: string },
+		topicLease: TopicAuthorityLease | undefined,
+	): PromiseWithResolvers<boolean> {
+		const activation = Promise.withResolvers<boolean>();
+		const staged: StagedCallbackActivation = { pending, socketLease, topicLease, settled: activation.promise };
+		for (const alias of aliases) this.#stagedCallbackActivations.set(alias, staged);
+		return activation;
+	}
+
+	revokeCallbackAliases(socketLease: { session: SessionSocket; token: number; logicalSessionId: string }): void {
+		const actions = new Set<string>();
+		for (const [alias, aliasLease] of this.#callbackAliasLeases) {
+			if (
+				aliasLease.session === socketLease.session &&
+				aliasLease.token === socketLease.token &&
+				aliasLease.logicalSessionId === socketLease.logicalSessionId
+			) {
+				const route = this.#revokeCallbackAlias(alias);
+				if (route) actions.add(route.actionId);
+			}
+		}
+		if (actions.size === 0) return;
+		const terminalization = this.effects.track(
+			(async () => {
+				await this.persistAliases();
+				for (const actionId of actions) await this.reissuePendingAction(socketLease.logicalSessionId, actionId);
+			})(),
+		);
+		void terminalization.catch(() => undefined);
+	}
+
+	private async reissuePendingAction(sessionId: string, actionId: string): Promise<void> {
+		const oldEntries = [...this.reissueBacklog.entries()].filter(
+			([, route]) => route.sessionId === sessionId && route.actionId === actionId,
+		);
+		const messageIds = new Set<number>();
+		for (const [, route] of oldEntries) {
+			if (String(route.chatId) === String(this.opts.chatId) && Number.isSafeInteger(route.messageId))
+				messageIds.add(route.messageId!);
+		}
+		const terminalizedMessageIds = new Set<number>();
+		for (const messageId of messageIds) {
+			try {
+				const terminalized = (await this.botApi.call("editMessageReplyMarkup", {
+					chat_id: this.opts.chatId,
+					message_id: messageId,
+					reply_markup: { inline_keyboard: [] },
+				})) as { ok?: unknown } | undefined;
+				if (terminalized?.ok === true) terminalizedMessageIds.add(messageId);
+			} catch {
+				// Retain the durable receipt so a later replay can retry terminalization.
+			}
+		}
+		for (const [alias, route] of oldEntries) {
+			if (
+				String(route.chatId) === String(this.opts.chatId) &&
+				Number.isSafeInteger(route.messageId) &&
+				terminalizedMessageIds.has(route.messageId!)
+			)
+				this.reissueBacklog.delete(alias);
+		}
+		await this.persistAliases();
+	}
 
 	#logicalSessionId(session: SessionSocket): string {
 		return session.logicalSessionId ?? session.sessionId;
@@ -6214,8 +6446,15 @@ export class TelegramNotificationDaemon {
 		if (previousSessionId !== logicalSessionId && this.logicalSessionOwners.get(previousSessionId) === session)
 			this.logicalSessionOwners.delete(previousSessionId);
 		const previousOwner = this.logicalSessionOwners.get(logicalSessionId);
-		if (previousOwner && previousOwner !== session && previousOwner.recoveryLease)
+		if (previousOwner && previousOwner !== session && previousOwner.recoveryLease) {
+			const predecessorLease = {
+				session: previousOwner,
+				token: previousOwner.recoveryLease.token,
+				logicalSessionId,
+			};
 			previousOwner.recoveryLease = { ...previousOwner.recoveryLease, state: "rejected" };
+			this.revokeCallbackAliases(predecessorLease);
+		}
 		this.logicalSessionOwners.set(logicalSessionId, session);
 		this.preservedInitiatorTopics.delete(logicalSessionId);
 		session.logicalSessionId = logicalSessionId;
@@ -6229,8 +6468,18 @@ export class TelegramNotificationDaemon {
 	}
 
 	async #revokeAskAuthority(sessionId: string): Promise<void> {
+		const actionIds = new Set<string>();
 		for (const [alias, route] of this.aliasTable.entries()) {
-			if (route.sessionId === sessionId) this.aliasTable.delete(alias);
+			if (route.sessionId !== sessionId) continue;
+			this.reissueBacklog.set(alias, route);
+			this.aliasTable.delete(alias);
+			this.#callbackAliasLeases.delete(alias);
+			this.#callbackAliasPending.delete(alias);
+			this.#callbackAliasTopics.delete(alias);
+			actionIds.add(route.actionId);
+		}
+		for (const route of this.reissueBacklog.values()) {
+			if (route.sessionId === sessionId) actionIds.add(route.actionId);
 		}
 		for (const session of this.sessions.values()) {
 			if (session.sessionId === sessionId || this.#logicalSessionId(session) === sessionId) {
@@ -6240,6 +6489,7 @@ export class TelegramNotificationDaemon {
 			}
 		}
 		await this.persistAliases();
+		for (const actionId of actionIds) await this.reissuePendingAction(sessionId, actionId);
 	}
 
 	#clearModelChoiceAliasesForSocket(session: SessionSocket): void {
@@ -8594,14 +8844,18 @@ export class TelegramNotificationDaemon {
 		);
 		if (!this.#leaseTokenAllows(socketLease) || !this.topicLeaseIsCurrent(topicLease)) return false;
 		try {
-			const response = await this.botApi.call("sendMessage", {
-				chat_id: this.opts.chatId,
-				message_thread_id: Number(topicId),
-				text: rendered.text,
-				parse_mode: TELEGRAM_PARSE_MODE,
-				reply_markup: { inline_keyboard },
-				...(telegramDisableNotification(this.opts.sound, "ask") === true ? { disable_notification: true } : {}),
-			});
+			const response = await this.botApi.call(
+				"sendMessage",
+				{
+					chat_id: this.opts.chatId,
+					message_thread_id: Number(topicId),
+					text: rendered.text,
+					parse_mode: TELEGRAM_PARSE_MODE,
+					reply_markup: { inline_keyboard },
+					...(telegramDisableNotification(this.opts.sound, "ask") === true ? { disable_notification: true } : {}),
+				},
+				{ noRetry: true },
+			);
 			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
 				logger.warn("notifications: failed to send model selection keyboard");
@@ -9195,7 +9449,11 @@ export class TelegramNotificationDaemon {
 			const logicalSessionId = this.#logicalSessionId(session);
 			const socketLease = this.#socketLease(session, logicalSessionId);
 			if (!socketLease) return;
-			if (msg.kind === "ask") session.pending.set(msg.id, { sessionId: logicalSessionId, actionId: msg.id });
+			const pendingAction = msg.kind === "ask" ? { sessionId: logicalSessionId, actionId: msg.id } : undefined;
+			if (pendingAction) {
+				session.pending.set(msg.id, pendingAction);
+				await this.reissuePendingAction(logicalSessionId, msg.id);
+			}
 			if (
 				this.topics.get(logicalSessionId)?.authorityState === "delete_pending" ||
 				this.topics.get(logicalSessionId)?.bindingMalformed
@@ -9258,81 +9516,245 @@ export class TelegramNotificationDaemon {
 				controls,
 				summary: msg.summary,
 			});
+			const kind = msg.kind === "idle" ? "idle" : "ask";
+			const callbackDispatchAuthorityIsCurrent = (): boolean =>
+				this.#leaseTokenAllows(socketLease) &&
+				(!topicLease || this.topicLeaseIsCurrent(topicLease)) &&
+				(kind !== "ask" || (pendingAction !== undefined && session.pending.get(msg.id) === pendingAction));
+			const createdAliases: Array<[string, CallbackRoute]> = [];
+			const createAlias = (answer: CallbackRoute["answer"]): string => {
+				const alias = this.aliasTable.allocate(candidate => this.reissueBacklog.has(candidate));
+				createdAliases.push([
+					alias,
+					{
+						sessionId: logicalSessionId,
+						actionId: msg.id,
+						answer,
+					},
+				]);
+				return alias;
+			};
 			const inline_keyboard = [
-				...buildCompactChoiceGrid(displayOptions, (i: number) =>
-					this.aliasTable.put({ sessionId: logicalSessionId, actionId: msg.id, answer: i }),
-				),
+				...buildCompactChoiceGrid(displayOptions, (i: number) => createAlias(i)),
 				...controls.map(control => [
 					{
 						text: control.label,
-						callback_data: this.aliasTable.put({
-							sessionId: logicalSessionId,
-							actionId: msg.id,
-							answer: { controlId: control.id },
-						}),
+						callback_data: createAlias({ controlId: control.id }),
 					},
 				]),
 			];
-			const kind = msg.kind === "idle" ? "idle" : "ask";
+			if (createdAliases.length > 0) {
+				for (const [alias, route] of createdAliases) {
+					if (!this.aliasTable.activate(alias, route)) throw new Error("callback alias reservation conflicted");
+				}
+				// Reserve every exposed callback token durably before Telegram can
+				// accept a keyboard. A restart loads these non-receipt routes only
+				// into the non-routable reissue backlog.
+				await this.persistAliases();
+			}
 			// HTML delivery: one sendMessage per chunk, keyboard on the last chunk;
-			// returns the last chunk's message_id (the reply-routable message).
+			// returns the last chunk's authoritative message_id (the reply-routable message).
+			let callbackDelivery: "accepted" | "rejected" | "ambiguous" = "rejected";
 			const sendHtmlChunks = async (): Promise<number | undefined> => {
 				const chunks = splitTelegramHtml(rendered.text);
-				let result: { result?: { message_id?: number } } | undefined;
+				let acceptedMessageId: number | undefined;
 				for (let i = 0; i < chunks.length; i++) {
-					if (!this.#leaseTokenAllows(socketLease) || (topicLease && !this.topicLeaseIsCurrent(topicLease)))
+					const exposesCallbacks = i === chunks.length - 1 && inline_keyboard.length > 0;
+					if (!callbackDispatchAuthorityIsCurrent()) return undefined;
+					let result: { ok?: unknown; result?: { message_id?: unknown } } | undefined;
+					try {
+						result = (await this.botApi.call(
+							"sendMessage",
+							{
+								chat_id: this.opts.chatId,
+								...threadField,
+								text: chunks[i]!,
+								parse_mode: TELEGRAM_PARSE_MODE,
+								...(telegramDisableNotification(this.opts.sound, kind, i === chunks.length - 1) === true
+									? { disable_notification: true }
+									: {}),
+								...(exposesCallbacks ? { reply_markup: { inline_keyboard } } : {}),
+							},
+							{ noRetry: true },
+						)) as { ok?: unknown; result?: { message_id?: unknown } } | undefined;
+					} catch {
+						if (exposesCallbacks) callbackDelivery = "ambiguous";
 						return undefined;
-					result = (await this.botApi.call("sendMessage", {
-						chat_id: this.opts.chatId,
-						...threadField,
-						text: chunks[i]!,
-						parse_mode: TELEGRAM_PARSE_MODE,
-						...(telegramDisableNotification(this.opts.sound, kind, i === chunks.length - 1) === true
-							? { disable_notification: true }
-							: {}),
-						...(i === chunks.length - 1 && inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
-					})) as { result?: { message_id?: number } } | undefined;
-					if (result === undefined) return undefined;
+					}
+					if (result?.ok !== true) {
+						if (exposesCallbacks && result?.ok !== false) callbackDelivery = "ambiguous";
+						return undefined;
+					}
+					const candidate = result.result?.message_id;
+					if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate <= 0) {
+						if (exposesCallbacks) callbackDelivery = "ambiguous";
+						return undefined;
+					}
+					if (exposesCallbacks) callbackDelivery = "accepted";
+					acceptedMessageId = candidate;
 				}
-				return result?.result?.message_id;
+				return acceptedMessageId;
 			};
+			let messageId: number | undefined;
 			if (this.opts.rich?.enabled !== false) {
 				// Rich (default on): promote to sendRichMessage with a top-level
 				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.
-
-				if (!this.#leaseTokenAllows(socketLease) || (topicLease && !this.topicLeaseIsCurrent(topicLease))) return;
-				const outcome = await deliverRichActionWithFallback(
-					this.botApi,
-					{
-						chat_id: this.opts.chatId,
-						...threadField,
-						...(telegramDisableNotification(this.opts.sound, kind) === true
-							? { disable_notification: true }
-							: {}),
-					},
-					{
-						markdown: buildActionMarkdown({
-							kind,
-							question: msg.question,
-							options: displayOptions,
-							recommendedIndex: msg.recommendedIndex,
-							summary: msg.summary,
-						}),
-						replyMarkup: kind === "ask" && inline_keyboard.length ? { inline_keyboard } : undefined,
-					},
-					AbortSignal.any([this.#deliveryAbort.signal, AbortSignal.timeout(30_000)]),
-					sendHtmlChunks,
-					logger,
-				);
-				// Only asks are reply-routable; idle pings register no route.
-				if (kind === "ask" && outcome.messageId !== undefined)
-					this.messageRoutes.set(String(outcome.messageId), { sessionId: logicalSessionId, actionId: msg.id });
+				if (callbackDispatchAuthorityIsCurrent()) {
+					const outcome = await deliverRichActionWithFallback(
+						this.botApi,
+						{
+							chat_id: this.opts.chatId,
+							...threadField,
+							...(telegramDisableNotification(this.opts.sound, kind) === true
+								? { disable_notification: true }
+								: {}),
+						},
+						{
+							markdown: buildActionMarkdown({
+								kind,
+								question: msg.question,
+								options: displayOptions,
+								recommendedIndex: msg.recommendedIndex,
+								summary: msg.summary,
+							}),
+							replyMarkup: kind === "ask" && inline_keyboard.length ? { inline_keyboard } : undefined,
+						},
+						AbortSignal.any([this.#deliveryAbort.signal, AbortSignal.timeout(30_000)]),
+						sendHtmlChunks,
+						logger,
+					);
+					messageId = outcome.messageId;
+					if (createdAliases.length > 0 && messageId !== undefined) callbackDelivery = "accepted";
+					else if (createdAliases.length > 0 && !outcome.usedFallback) callbackDelivery = "ambiguous";
+				}
 			} else {
 				// Rich disabled: deliver through the HTML chunk path.
-				const messageId = await sendHtmlChunks();
-				// Only asks are reply-routable; idle pings register no route.
-				if (kind === "ask" && messageId !== undefined)
-					this.messageRoutes.set(String(messageId), { sessionId: logicalSessionId, actionId: msg.id });
+				messageId = await sendHtmlChunks();
+			}
+			const pendingActionIsCurrent = pendingAction !== undefined && session.pending.get(msg.id) === pendingAction;
+			const mayActivate =
+				kind === "ask" &&
+				messageId !== undefined &&
+				pendingActionIsCurrent &&
+				this.#leaseTokenAllows(socketLease) &&
+				(!topicLease || this.topicLeaseIsCurrent(topicLease));
+			if (mayActivate) {
+				for (const [alias, route] of createdAliases) {
+					if (
+						!this.aliasTable.update(alias, {
+							...route,
+							chatId: String(this.opts.chatId),
+							messageId,
+							ownerId: this.opts.ownerId,
+							generation: DAEMON_GENERATION,
+						})
+					)
+						throw new Error("callback alias receipt update conflicted");
+				}
+				this.messageRoutes.set(String(messageId), { sessionId: logicalSessionId, actionId: msg.id });
+				const activation = this.#stageCallbackActivation(
+					createdAliases.map(([alias]) => alias),
+					pendingAction,
+					socketLease,
+					topicLease,
+				);
+				try {
+					// A receipt is durable before an alias gets a routable socket lease.
+					await this.persistAliases();
+				} catch {
+					for (const [alias] of createdAliases) {
+						this.#stagedCallbackActivations.delete(alias);
+						this.#revokeCallbackAlias(alias);
+					}
+					this.deleteMessageRoutes(logicalSessionId, msg.id);
+					try {
+						await this.persistAliases();
+					} catch {
+						// The in-memory backlog retains the accepted receipt for shutdown terminalization.
+					}
+					activation.resolve(false);
+					throw new Error("callback alias receipt persistence failed");
+				}
+				if (
+					session.pending.get(msg.id) !== pendingAction ||
+					!this.#leaseTokenAllows(socketLease) ||
+					(topicLease && !this.topicLeaseIsCurrent(topicLease))
+				) {
+					for (const [alias] of createdAliases) {
+						this.#revokeCallbackAlias(alias);
+						this.#stagedCallbackActivations.delete(alias);
+					}
+					this.deleteMessageRoutes(logicalSessionId, msg.id);
+					let revocationPersistenceError: unknown;
+					try {
+						await this.persistAliases();
+					} catch (error) {
+						revocationPersistenceError = error;
+					} finally {
+						activation.resolve(false);
+					}
+					try {
+						await this.botApi.call("editMessageReplyMarkup", {
+							chat_id: this.opts.chatId,
+							message_id: messageId,
+							reply_markup: { inline_keyboard: [] },
+						});
+					} catch {
+						// The accepted receipt remains in memory for shutdown terminalization if persistence failed.
+					}
+					if (revocationPersistenceError !== undefined)
+						throw new Error("callback alias revocation persistence failed", {
+							cause: revocationPersistenceError,
+						});
+					return;
+				}
+				for (const [alias] of createdAliases) {
+					this.#callbackAliasPending.set(alias, pendingAction);
+					this.#callbackAliasLeases.set(alias, socketLease);
+					if (topicLease) this.#callbackAliasTopics.set(alias, topicLease);
+					this.#stagedCallbackActivations.delete(alias);
+				}
+				activation.resolve(true);
+			} else if (kind === "ask" && messageId !== undefined) {
+				// The send may have succeeded after authority ended. Persist every
+				// receipt as revoked before best-effort remote terminalization.
+				for (const [alias, route] of createdAliases) {
+					const receipt = {
+						...route,
+						chatId: String(this.opts.chatId),
+						messageId,
+						ownerId: this.opts.ownerId,
+						generation: DAEMON_GENERATION,
+					};
+					if (this.aliasTable.update(alias, receipt)) {
+						this.#revokeCallbackAlias(alias);
+						continue;
+					}
+					const revoked = this.reissueBacklog.get(alias);
+					if (
+						revoked &&
+						(revoked.sessionId !== route.sessionId ||
+							revoked.actionId !== route.actionId ||
+							revoked.answer !== route.answer)
+					)
+						throw new Error("callback alias revocation update conflicted");
+					this.reissueBacklog.set(alias, receipt);
+				}
+				await this.persistAliases();
+				try {
+					const terminalized = (await this.botApi.call("editMessageReplyMarkup", {
+						chat_id: this.opts.chatId,
+						message_id: messageId,
+						reply_markup: { inline_keyboard: [] },
+					})) as { ok?: unknown } | undefined;
+					if (terminalized?.ok === true) for (const [alias] of createdAliases) this.reissueBacklog.delete(alias);
+				} catch {
+					// The accepted receipt remains durably terminalizable even if its keyboard cannot be removed.
+				}
+			} else if (kind === "ask" && callbackDelivery === "ambiguous") {
+				for (const [alias] of createdAliases) this.#revokeCallbackAlias(alias);
+			} else if (kind === "ask") {
+				for (const [alias] of createdAliases) this.aliasTable.delete(alias);
 			}
 			await this.persistAliases();
 		} else if (msg.type === "action_resolved" && msg.id) {
@@ -9340,8 +9762,9 @@ export class TelegramNotificationDaemon {
 			this.deleteMessageRoutes(this.#logicalSessionId(session), msg.id);
 			for (const [alias, route] of this.aliasTable.entries()) {
 				if (route.sessionId === this.#logicalSessionId(session) && route.actionId === msg.id)
-					this.aliasTable.delete(alias);
+					this.#revokeCallbackAlias(alias);
 			}
+			await this.reissuePendingAction(this.#logicalSessionId(session), msg.id);
 			await this.persistAliases();
 		}
 	}
@@ -9556,14 +9979,18 @@ export class TelegramNotificationDaemon {
 			}),
 		}));
 		try {
-			const response = await this.botApi.call("sendMessage", {
-				chat_id: this.opts.chatId,
-				message_thread_id: threadId,
-				text: "Choose where to start the GJC session:",
-				reply_markup: {
-					inline_keyboard: aliases.map(choice => [{ text: choice.label, callback_data: choice.alias }]),
+			const response = await this.botApi.call(
+				"sendMessage",
+				{
+					chat_id: this.opts.chatId,
+					message_thread_id: threadId,
+					text: "Choose where to start the GJC session:",
+					reply_markup: {
+						inline_keyboard: aliases.map(choice => [{ text: choice.label, callback_data: choice.alias }]),
+					},
 				},
-			});
+				{ noRetry: true },
+			);
 			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
 				for (const choice of aliases) this.#adoptionPickerAliases.delete(choice.alias);
 				return false;
@@ -9626,12 +10053,16 @@ export class TelegramNotificationDaemon {
 			index => aliases[index]!.alias,
 		);
 		try {
-			const response = await this.botApi.call("sendMessage", {
-				chat_id: this.opts.chatId,
-				message_thread_id: threadId,
-				text: "Pick a recent work folder to start a session here:",
-				reply_markup: { inline_keyboard },
-			});
+			const response = await this.botApi.call(
+				"sendMessage",
+				{
+					chat_id: this.opts.chatId,
+					message_thread_id: threadId,
+					text: "Pick a recent work folder to start a session here:",
+					reply_markup: { inline_keyboard },
+				},
+				{ noRetry: true },
+			);
 			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
 				for (const a of aliases) this.#adoptionPickerAliases.delete(a.alias);
 				return false;
@@ -10088,6 +10519,7 @@ export class TelegramNotificationDaemon {
 			await this.handleTelegramUpdate(update);
 		} catch (err) {
 			logger.error("notifications daemon: handleTelegramUpdate failed", { error: String(err) });
+			return "retry";
 		}
 		return "consumed";
 	}
@@ -10627,19 +11059,102 @@ export class TelegramNotificationDaemon {
 		const callbackId = (update as { callback_query?: { id?: unknown } }).callback_query?.id;
 		if (await this.#handleAdoptionPickerCallback(update, callbackId)) return;
 		if (await this.#handleModelChoiceCallback(update, callbackId)) return;
+		const callbackAlias = (update as { callback_query?: { data?: unknown } }).callback_query?.data;
+		const stagedActivation =
+			typeof callbackAlias === "string" ? this.#stagedCallbackActivations.get(callbackAlias) : undefined;
+		if (stagedActivation && !(await stagedActivation.settled)) {
+			await this.sendStaleGuidance(callbackId);
+			return;
+		}
 		const decision = routeInboundUpdate(update, {
 			aliasTable: this.aliasTable,
 			messageRoutes: this.messageRoutes,
 			pairedChatId: this.opts.chatId,
 		});
 		if (decision.kind === "reply") {
+			const callbackLease =
+				typeof callbackAlias === "string" ? this.#callbackAliasLeases.get(callbackAlias) : undefined;
+			const callbackPending =
+				typeof callbackAlias === "string" ? this.#callbackAliasPending.get(callbackAlias) : undefined;
+			const callbackTopic =
+				typeof callbackAlias === "string" ? this.#callbackAliasTopics.get(callbackAlias) : undefined;
 			const session = this.logicalSessionOwners.get(decision.sessionId) ?? this.sessions.get(decision.sessionId);
+			const pendingAction = session?.pending.get(decision.actionId);
 			if (
+				(typeof callbackAlias === "string" &&
+					(!callbackLease ||
+						!callbackPending ||
+						callbackPending !== pendingAction ||
+						!this.#leaseTokenAllows(callbackLease) ||
+						(callbackTopic
+							? !this.topicLeaseIsCurrent(callbackTopic)
+							: this.topics.get(decision.sessionId) !== undefined))) ||
 				session?.ws.readyState !== WebSocket.OPEN ||
-				!session.pending.has(decision.actionId) ||
-				!this.#leaseAllows(session, decision.sessionId) ||
-				(this.topics.get(decision.sessionId) !== undefined &&
-					!this.topicAuthorityLeaseFromRegistry(decision.sessionId))
+				!pendingAction ||
+				!this.#leaseAllows(session, decision.sessionId)
+			) {
+				if (
+					typeof callbackAlias === "string" &&
+					callbackPending !== undefined &&
+					callbackPending !== pendingAction &&
+					this.#revokeCallbackAlias(callbackAlias)
+				)
+					await this.persistAliases();
+				await this.sendStaleGuidance(callbackId);
+				return;
+			}
+			const consumedAliases: Array<
+				[
+					string,
+					CallbackRoute,
+					{ session: SessionSocket; token: number; logicalSessionId: string } | undefined,
+					{ sessionId: string; actionId: string } | undefined,
+					TopicAuthorityLease | undefined,
+				]
+			> = [];
+			// Consume only controls from this exact rendered ask. Predecessor receipts
+			// remain in the terminalization backlog until their authoritative outcome.
+			for (const [alias, route] of this.aliasTable.entries()) {
+				if (
+					route.sessionId === decision.sessionId &&
+					route.actionId === decision.actionId &&
+					this.#callbackAliasPending.get(alias) === pendingAction
+				) {
+					consumedAliases.push([
+						alias,
+						route,
+						this.#callbackAliasLeases.get(alias),
+						this.#callbackAliasPending.get(alias),
+						this.#callbackAliasTopics.get(alias),
+					]);
+					this.aliasTable.delete(alias);
+					this.#callbackAliasLeases.delete(alias);
+					this.#callbackAliasPending.delete(alias);
+					this.#callbackAliasTopics.delete(alias);
+				}
+			}
+			try {
+				await this.persistAliases();
+			} catch {
+				for (const [alias, route, lease, pending, topic] of consumedAliases) {
+					this.aliasTable.activate(alias, route);
+					if (lease) this.#callbackAliasLeases.set(alias, lease);
+					if (pending) this.#callbackAliasPending.set(alias, pending);
+					if (topic) this.#callbackAliasTopics.set(alias, topic);
+				}
+				throw new Error("callback receipt consumption was not durably persisted");
+			}
+			if (
+				session.ws.readyState !== WebSocket.OPEN ||
+				session.pending.get(decision.actionId) !== pendingAction ||
+				(typeof callbackAlias === "string" &&
+					(!callbackPending ||
+						callbackPending !== pendingAction ||
+						!callbackLease ||
+						!this.#leaseTokenAllows(callbackLease) ||
+						(callbackTopic
+							? !this.topicLeaseIsCurrent(callbackTopic)
+							: this.topics.get(decision.sessionId) !== undefined)))
 			) {
 				await this.sendStaleGuidance(callbackId);
 				return;
@@ -10722,6 +11237,7 @@ export class TelegramNotificationDaemon {
 			} catch (error) {
 				logger.warn(`notifications: startup self-heal failed: ${sanitizeDiagnostic(String(error))}`);
 			}
+			await this.loadAliases();
 			// Owner-only: start lifecycle control immediately after ownership proof,
 			// before timers or pre-poll startup work can invalidate this run.
 			// Best-effort; notification delivery remains available on failure.
@@ -10736,7 +11252,6 @@ export class TelegramNotificationDaemon {
 			this.startTypingTimer();
 			await this.refreshBotIdentity();
 			await this.registerBotCommands();
-			await this.loadAliases();
 			await this.loadTopics();
 			await this.loadAdoptionIntents();
 			this.startAdoptionSweepTimer();

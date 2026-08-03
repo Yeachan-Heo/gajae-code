@@ -405,6 +405,73 @@ test("detects restoring tool activity to default-on and bypassing daemon admissi
 		}
 	});
 
+	test("generation-fences callback receipt directory-barrier bypass policy", () => {
+		const callbackInventory = {
+			telegram: {
+				[telegramContract]: ["DAEMON_GENERATION"],
+				[telegramDaemon]: ["isUnsupportedTelegramDirectoryBarrier"],
+			},
+			discord: {},
+			slack: {},
+		} as const;
+		const base = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 48;"],
+			[
+				telegramDaemon,
+				'function isUnsupportedTelegramDirectoryBarrier(error: unknown) { return (error as { code?: string }).code === "EINVAL"; }',
+			],
+		]);
+		const head = new Map(base);
+		head.set(
+			telegramDaemon,
+			'function isUnsupportedTelegramDirectoryBarrier(error: unknown) { return (error as { code?: string }).code === "EACCES"; }',
+		);
+		const result = evaluate(base, head, callbackInventory);
+		expect(result.protectedChanges).toContain(
+			`telegram:${telegramDaemon}:isUnsupportedTelegramDirectoryBarrier`,
+		);
+		expect(result.telegramGenerationBumped).toBe(false);
+	});
+	test.each([
+		[
+			"TelegramEffectSupervisor",
+			"class TelegramEffectSupervisor { call(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body, opts); } }",
+			"class TelegramEffectSupervisor { call(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body); } }",
+		],
+		[
+			"callBotApi",
+			"class TelegramNotificationDaemon { callBotApi(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body, opts); } }",
+			"class TelegramNotificationDaemon { callBotApi(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body); } }",
+		],
+		[
+			"createBotApiAdapter",
+			"function createBotApiAdapter(call: any) { return { call: (method: string, body: unknown, opts?: unknown) => call(method, body, opts) }; }",
+			"function createBotApiAdapter(call: any) { return { call: (method: string, body: unknown, opts?: unknown) => call(method, body) }; }",
+		],
+		[
+			"createBotApiPipeline",
+			"function createBotApiPipeline(raw: any, call: any) { const classified = (method: string, body: unknown, opts?: unknown) => call(raw, method, body, opts); return { classified }; }",
+			"function createBotApiPipeline(raw: any, call: any) { const classified = (method: string, body: unknown, opts?: unknown) => call(raw, method, body); return { classified }; }",
+		],
+	] as const)("generation-fences the %s no-retry propagation seam", (symbol, before, after) => {
+		const callbackInventory = {
+			telegram: {
+				[telegramContract]: ["DAEMON_GENERATION"],
+				[telegramDaemon]: [symbol],
+			},
+			discord: {},
+			slack: {},
+		} as const;
+		const base = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 48;"],
+			[telegramDaemon, before],
+		]);
+		const head = new Map(base);
+		head.set(telegramDaemon, after);
+		expect(evaluate(base, head, callbackInventory).protectedChanges).toContain(
+			`telegram:${telegramDaemon}:${symbol}`,
+		);
+	});
 	test("AST extraction ignores strings and comments while preserving typed declarations", () => {
 		const source = `// export function acquireDaemonOwnership() {}\nconst message = "acquireDaemonOwnership()";\nexport async function acquireDaemonOwnership<T>(value: T): Promise<T> { return value; }`;
 		expect(declaration(source, "acquireDaemonOwnership")).toContain("Promise<T>");
@@ -721,6 +788,13 @@ test("fails closed when a protected native authority declaration is missing or m
 				"startLifecycleControl",
 				"run",
 				"writeJsonAtomic",
+				"syncTelegramFile",
+				"syncTelegramDirectory",
+				"isUnsupportedTelegramDirectoryBarrier",
+				"TelegramEffectSupervisor",
+				"callBotApi",
+				"createBotApiAdapter",
+				"createBotApiPipeline",
 				"ownershipLockMatchesState",
 				"ownershipLockMatchesMetadata",
 				"ownershipLockIsReclaimable",
@@ -932,7 +1006,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
-	}, 20000);
+	}, 60000);
 
 	test("guard authority proves immutable event objects without pinning the mutable base ref", () => {
 		const head = "a".repeat(40);

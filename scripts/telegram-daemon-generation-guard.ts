@@ -8,10 +8,12 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 35;
+export const GUARD_CONTRACT_VERSION = 42;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
+const telegramReference = "packages/coding-agent/src/sdk/bus/telegram-reference.ts";
+const richRender = "packages/coding-agent/src/sdk/bus/rich-render.ts";
 const sdkHost = "packages/coding-agent/src/sdk/host/host.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
@@ -67,7 +69,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "1bbef1183dfd65b613e8c7a3399bc4ac4dac6d46f788a2e82fd81ba019d608d6";
+const PROTECTED_INVENTORY_SHA256 = "bef21d66aa1784d3dc93df813f98074773c116eac8cd4c4ec2adbed1aec6432c";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -109,6 +111,31 @@ export const TELEGRAM_PROCESS_AUTHORITY_PROTECTED_DECLARATIONS = ["DaemonProcess
 
 /** Telegram authentication and lifecycle control must remain generation-fenced. */
 export const TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS = ["validBotToken", "requestStop", "startLifecycleControl", "run"] as const;
+/** Callback receipt activation and revocation define durable reply authority. */
+export const TELEGRAM_CALLBACK_RECEIPT_PROTECTED_DECLARATIONS = [
+	"dropSession",
+	"TelegramUpdatePoller",
+	"TelegramBotTransport",
+	"fetchWithRetry",
+	"isTransientNetworkError",
+	"TelegramEffectSupervisor",
+	"callBotApi",
+	"createBotApiAdapter",
+	"createBotApiPipeline",
+	"writeJsonAtomic",
+	"syncTelegramFile",
+	"syncTelegramDirectory",
+	"isUnsupportedTelegramDirectoryBarrier",
+	"TelegramNotificationDaemon.#authorizeLease",
+	"TelegramNotificationDaemon.#leaseAllows",
+	"TelegramNotificationDaemon.#leaseTokenAllows",
+	"TelegramNotificationDaemon.#socketLease",
+	"TelegramNotificationDaemon.#revokeCallbackAlias",
+	"TelegramNotificationDaemon.#stageCallbackActivation",
+	"topicAuthorityLeaseFromRegistry",
+	"topicLeaseIsCurrent",
+	"reissuePendingAction",
+] as const;
 
 /** Chat daemon CLI helpers determine whether a prior owner can be replaced. */
 export const CHAT_CLI_PROTECTED_DECLARATIONS = ["defaultPidAlive", "loadConfig", "ownerPid"] as const;
@@ -155,6 +182,25 @@ export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
 		"createSessionRouter",
 	],
 } as const;
+/** Callback recovery receipt and routing primitives must remain generation-fenced. */
+export const TELEGRAM_CALLBACK_RECOVERY_PROTECTED_DECLARATIONS = {
+	[telegramDaemon]: [
+		"handleTelegramUpdate",
+		"loadAliases",
+		"persistAliases",
+		"revokeCallbackAliases",
+	],
+	[telegramReference]: ["createAliasTable", "routeInboundUpdate"],
+	[richRender]: ["deliverRichActionWithFallback"],
+} as const;
+
+function validateTelegramCallbackRecoveryInventory(inventory: Inventory): void {
+	for (const [file, required] of Object.entries(TELEGRAM_CALLBACK_RECOVERY_PROTECTED_DECLARATIONS)) {
+		const symbols = inventory.telegram[file];
+		if (!symbols || required.some(symbol => !symbols.includes(symbol)))
+			throw new Error("telegram-daemon-generation-guard: Telegram callback recovery primitives must be protected by the Telegram generation contract");
+	}
+}
 
 /** Chat credential, provenance, and persistence are shared takeover authority. */
 export const CHAT_OWNER_LOCK_PROTECTED_DECLARATIONS = [
@@ -234,6 +280,12 @@ function validateTelegramLifecycleInventory(inventory: Inventory): void {
 	if (!symbols || TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
 		throw new Error("telegram-daemon-generation-guard: Telegram authentication and lifecycle primitives must be protected by the Telegram generation contract");
 }
+function validateTelegramCallbackReceiptInventory(inventory: Inventory): void {
+	const symbols = inventory.telegram[telegramDaemon];
+	if (!symbols || TELEGRAM_CALLBACK_RECEIPT_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
+		throw new Error("telegram-daemon-generation-guard: Telegram callback receipt authority primitives must be protected by the Telegram generation contract");
+}
+
 
 function validateTransitionTokenInventory(inventory: Inventory): void {
 	const symbols = inventory.telegram["packages/coding-agent/src/sdk/bus/notification-service.ts"];
@@ -266,11 +318,13 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateTelegramOwnerLockInventory(inventory);
 	validateTelegramLifecycleInventory(inventory);
 	validateTelegramProcessAuthorityInventory(inventory);
+	validateTelegramCallbackReceiptInventory(inventory);
 	validateChatOwnerLockInventory(inventory);
 	validateChatCliInventory(inventory);
 	validateChatConfigInventory(inventory);
 	validateChatEndpointDiscoveryInventory(inventory);
 	validateTelegramToolActivityInventory(inventory);
+	validateTelegramCallbackRecoveryInventory(inventory);
 }
 
 export function validateManifest(value: unknown = manifest): asserts value is GuardManifest {
@@ -443,6 +497,7 @@ export function assertGuardAuthority(input: {
 function nodeName(node: any): string | undefined {
 	if (node?.id?.type === "Identifier") return node.id.name;
 	if (node?.key?.type === "Identifier") return node.key.name;
+	if (node?.key?.type === "PrivateName" && node.key.id?.type === "Identifier") return `#${node.key.id.name}`;
 	if (node?.key?.type === "StringLiteral") return node.key.value;
 }
 
@@ -472,6 +527,13 @@ function declarationNodes(node: any, name: string, found: any[] = []): any[] {
 }
 
 function resolveDeclaration(node: any, name: string): { node?: any; ambiguous: boolean } {
+	const [className, privateMethod] = name.split(".#");
+	if (privateMethod) {
+		const classes = declarationNodes(node, className);
+		if (classes.length !== 1 || classes[0]?.type !== "ClassDeclaration") return { ambiguous: classes.length > 1 };
+		const methods = classes[0].body?.body?.filter((member: any) => nodeName(member) === `#${privateMethod}`) ?? [];
+		return methods.length === 1 ? { node: methods[0], ambiguous: false } : { ambiguous: methods.length > 1 };
+	}
 	const [rootName, property] = name.split(".");
 	const matches = declarationNodes(node, rootName);
 	// More than one match is ambiguous and must fail closed as malformed; zero is
