@@ -1,3 +1,4 @@
+experimental: schema trees cached from the pinned upstream source
 experimental/json: expected a6f333fed7efc24b4f45c70b0c220a13327bc2ae actual a6f333fed7efc24b4f45c70b0c220a13327bc2ae OK
 experimental/typescript: expected 670f3696b8ae24842ed6285b56f9752394dc6951 actual 670f3696b8ae24842ed6285b56f9752394dc6951 OK
 PASS experimental schema oracle: frozen subtree OIDs verified

@@ -89,3 +89,16 @@ python/gjc-sdk/build/
 
 # Obligation-gate re-execution HOME (the verifier points HOME here; never repository content)
 packages/coding-agent/.obligations-home/
+
+# Codex app-server protocol schema trees: the committed slice is derived and
+# enforced by scripts/app-server-schema-closure.ts, whose generated ignore file
+# lives at packages/coding-agent/vendor/codex-app-server-schema/.gitignore.
+
+# Derived protocol sources, rendered by `bun run codegen:app-server` from the
+# committed schema bundle and the envelope schemas above.
+packages/coding-agent/src/app-server/protocol-source/types.generated.ts
+packages/coding-agent/src/app-server/protocol-source/validators.generated.ts
+packages/coding-agent/src/app-server/protocol-source/catalogs.generated.ts
+packages/coding-agent/src/app-server/protocol-source/support-manifest.generated.ts
+packages/coding-agent/src/app-server/protocol-source/schema-validators.generated.ts
+packages/coding-agent/src/app-server/protocol-source/behavior/generated-behavior.ts

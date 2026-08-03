@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeAll, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,10 +8,19 @@ import {
 	verifyVendoredSchemaProvenance,
 	verifyVendoredStableSchemaProvenance,
 } from "../vendored-schema-provenance";
+import { materializeSchemaProfile } from "../../../../../scripts/codex-app-server-schema-materialize";
 
 const repositoryRoot = path.resolve(import.meta.dir, "../../../../..");
 const vendorRoot = path.join(repositoryRoot, "packages/coding-agent/vendor/codex-app-server-schema");
 const temporaryRoots: string[] = [];
+
+// Only the import closure of the schema trees is committed; these tests hash the
+// complete trees, so they reproduce them first. Materialization is a no-op once
+// the trees already hash to the frozen OIDs.
+beforeAll(async () => {
+	await materializeSchemaProfile("stable");
+	await materializeSchemaProfile("experimental");
+}, 600_000);
 
 afterEach(async () => {
 	await Promise.all(temporaryRoots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));

@@ -8,11 +8,11 @@
 	],
 	"cwd": ".",
 	"exitCode": 0,
-	"treeHash": "bcdbc2c51c22b68730aa406679ae976b524b775f8cdf20adb99679ecd5ff2ad4",
+	"treeHash": "412095adc4ab9e39915e5b23978a6758c99cc530bba1d11b416915f87d8cb5d3",
 	"artifacts": [
 		{
 			"path": "obligations.artifacts/oracle-experimental/stdout.txt",
-			"sha256": "18c169c2d8b6091b2c603f85e1c52ab45985a346234a24a7e6a67a9c161fba0c"
+			"sha256": "7e831d7f13ec22507281b200823ad48a2e313e0282bf79bdb0292d8ec68b98f1"
 		}
 	]
 }
