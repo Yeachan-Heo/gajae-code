@@ -563,7 +563,9 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 function telegramIntentIsPersisted(settings: Settings, botToken: string, chatId: string): boolean | undefined {
 	try {
 		const cfg = getNotificationConfig(settings);
-		return cfg.enabled === true && cfg.botToken === botToken && cfg.chatId === chatId;
+		return (
+			cfg.enabled === true && cfg.telegram?.enabled === true && cfg.botToken === botToken && cfg.chatId === chatId
+		);
 	} catch {
 		return undefined;
 	}
