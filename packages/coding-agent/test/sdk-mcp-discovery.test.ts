@@ -191,6 +191,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		}
 	});
 	it("defers exact MCP connection and activates tools only after the startup handle runs", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
 		const configPath = path.join(tempDir, "deferred-explicit-mcp.json");
 		const discovery = Promise.withResolvers<MCPLoadResult>();
 		const discoverAndConnect = vi
