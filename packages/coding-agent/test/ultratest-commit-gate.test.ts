@@ -29,6 +29,17 @@ function git(cwd: string, args: string[]): string {
 	return result.stdout.toString().trim();
 }
 
+function gitWithEnvironment(cwd: string, args: string[], env: Record<string, string>): string {
+	const result = Bun.spawnSync(["git", ...args], {
+		cwd,
+		env: { ...process.env, ...env },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+	return result.stdout.toString().trim();
+}
+
 async function writeActiveSkill(cwd: string, skill: "team" | "ultratest" = "ultratest"): Promise<void> {
 	const now = new Date().toISOString();
 	await fs.mkdir(sessionStateDir(cwd, sessionId), { recursive: true });
@@ -170,6 +181,36 @@ describe("ultratest commit gate", () => {
 		);
 
 		expect(decision.blocked).toBe(false);
+	});
+
+	it("uses literal Git context assignments to inspect the repository and index the commit will use", async () => {
+		const cwdWithoutTest = await createFixture("src/example.ts");
+		const targetWithTest = await createFixture();
+		const targetDecision = await mutationDecision(
+			cwdWithoutTest,
+			`GIT_DIR=${path.join(targetWithTest, ".git")} GIT_WORK_TREE=${targetWithTest} git commit -m "test: redirected repository"`,
+		);
+		expect(targetDecision.blocked).toBe(true);
+
+		const cwdWithTest = await createFixture();
+		const targetWithoutTest = await createFixture("src/example.ts");
+		const inverseDecision = await mutationDecision(
+			cwdWithTest,
+			`GIT_DIR=${path.join(targetWithoutTest, ".git")} GIT_WORK_TREE=${targetWithoutTest} git commit -m "test: redirected repository"`,
+		);
+		expect(inverseDecision.blocked).toBe(false);
+
+		const alternateIndexCwd = await createFixture("src/example.ts");
+		const alternateIndex = path.join(alternateIndexCwd, "alternate.index");
+		await Bun.write(path.join(alternateIndexCwd, "src", "alternate.test.ts"), "export const alternate = true;\n");
+		gitWithEnvironment(alternateIndexCwd, ["add", "src/alternate.test.ts"], { GIT_INDEX_FILE: alternateIndex });
+		expect(git(alternateIndexCwd, ["diff", "--cached", "--name-only"])).toBe("src/example.ts");
+
+		const alternateIndexDecision = await mutationDecision(
+			alternateIndexCwd,
+			`GIT_INDEX_FILE=${alternateIndex} git commit -m "test: alternate index"`,
+		);
+		expect(alternateIndexDecision.blocked).toBe(true);
 	});
 
 	it("fails open for nonliteral, operator, and ambiguous commit forms", async () => {

@@ -23,6 +23,7 @@ export interface UltratestCommitGateDecision {
 interface ParsedInlineCommit {
 	readonly message: string;
 	readonly bypass: boolean;
+	readonly gitEnvironment: Readonly<Record<string, string>>;
 }
 
 interface ShellWords {
@@ -94,14 +95,20 @@ function parseInlineCommit(command: string): ParsedInlineCommit | null {
 	if (!parsed.inspectable) return null;
 	const words = [...parsed.words];
 	let bypass = false;
+	const gitEnvironment: Record<string, string> = {};
 	while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[0] ?? "")) {
 		const assignment = words.shift();
+		if (!assignment) return null;
+		const separator = assignment.indexOf("=");
+		const name = assignment.slice(0, separator);
+		const value = assignment.slice(separator + 1);
 		if (assignment === "GJC_ALLOW_NO_ULTRATEST=1") bypass = true;
+		if (name.startsWith("GIT_")) gitEnvironment[name] = value;
 	}
 	if (words.length !== 4) return null;
 	if (words[0] !== "git" || words[1] !== "commit") return null;
 	if (words[2] !== "-m" && words[2] !== "--message") return null;
-	return { message: words[3] ?? "", bypass };
+	return { message: words[3] ?? "", bypass, gitEnvironment };
 }
 
 function isSupportedTestPath(filePath: string): boolean {
@@ -114,10 +121,11 @@ function isSupportedTestPath(filePath: string): boolean {
 	return /_test\.go$/u.test(base);
 }
 
-function hasStagedTest(cwd: string): boolean | null {
+function hasStagedTest(cwd: string, gitEnvironment: Readonly<Record<string, string>>): boolean | null {
 	try {
 		const result = Bun.spawnSync(["git", "diff", "--cached", "--name-only", "--diff-filter=ACDMRTUXB", "-z", "--"], {
 			cwd,
+			env: { ...process.env, ...gitEnvironment },
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "ignore",
@@ -142,7 +150,7 @@ export function getUltratestCommitGateDecision(input: UltratestCommitGateInput):
 	) {
 		return { blocked: false, command: input.command };
 	}
-	const stagedTest = hasStagedTest(input.cwd);
+	const stagedTest = hasStagedTest(input.cwd, commit.gitEnvironment);
 	if (stagedTest !== true) return { blocked: false, command: input.command };
 	return {
 		blocked: true,
