@@ -2,11 +2,13 @@
 //! scope (binding + transcripts), then list and parse it through the crate's
 //! public API only.
 
-use gjc_session::scope::{
-	MANAGED_SESSION_BINDING_FILE, ScopePlatform, list_scopes, scope_directory_name,
-	scope_directory_path,
+use gjc_session::{
+	scope::{
+		MANAGED_SESSION_BINDING_FILE, ScopePlatform, list_scopes, scope_directory_name,
+		scope_directory_path,
+	},
+	transcript::{Transcript, list_transcripts},
 };
-use gjc_session::transcript::{Transcript, list_transcripts};
 
 const FIXTURE: &str = include_str!("fixtures/session-v4.jsonl");
 
@@ -25,13 +27,15 @@ fn lists_and_parses_a_synthetic_sessions_root() {
 
 	let digest = scope_directory_name(ScopePlatform::current(), cwd);
 	let digest = digest.strip_prefix("v2-").unwrap();
-	std::fs::write(
-        scope_dir.join(MANAGED_SESSION_BINDING_FILE),
-        format!(
-            "{{\"schemaVersion\":1,\"layoutVersion\":2,\"identityVersion\":1,\"platform\":\"posix\",\"canonicalPath\":\"{cwd}\",\"identityDigest\":\"{digest}\"}}\n"
-        ),
-    )
-    .unwrap();
+	let binding = serde_json::json!({
+		"schemaVersion": 1,
+		"layoutVersion": 2,
+		"identityVersion": 1,
+		"platform": "posix",
+		"canonicalPath": cwd,
+		"identityDigest": digest,
+	});
+	std::fs::write(scope_dir.join(MANAGED_SESSION_BINDING_FILE), format!("{binding}\n")).unwrap();
 	std::fs::write(
 		scope_dir.join("2026-07-18T13-22-00-198Z_019f0000-1111-7000-aaaa-000000000001.jsonl"),
 		FIXTURE,

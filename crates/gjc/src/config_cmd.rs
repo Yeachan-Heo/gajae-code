@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use clap::Subcommand;
-use gjc_config::dirs::{Dirs, DirsInput};
-use gjc_config::secrets::redact_config_value;
-use gjc_config::settings::Settings;
-use gjc_config::settings_schema::{SettingDef, SettingKind};
+use gjc_config::{
+	dirs::{Dirs, DirsInput},
+	secrets::redact_config_value,
+	settings::Settings,
+	settings_schema::{SettingDef, SettingKind},
+};
 use serde_json::{Value, json};
 
 #[derive(Subcommand)]
@@ -21,15 +23,15 @@ pub enum ConfigAction {
 	/// List all settings with current values.
 	List {
 		#[arg(long)]
-		json: bool,
+		json:         bool,
 		#[arg(long = "show-secrets")]
 		show_secrets: bool,
 	},
 	/// Get a single setting value.
 	Get {
-		key: String,
+		key:          String,
 		#[arg(long)]
-		json: bool,
+		json:         bool,
 		#[arg(long = "show-secrets")]
 		show_secrets: bool,
 	},

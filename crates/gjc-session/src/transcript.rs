@@ -20,17 +20,17 @@ use serde_json::{Map, Value};
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
 	#[serde(rename = "type")]
-	pub kind: String,
-	pub version: u32,
-	pub id: String,
-	pub timestamp: String,
-	pub cwd: String,
+	pub kind:         String,
+	pub version:      u32,
+	pub id:           String,
+	pub timestamp:    String,
+	pub cwd:          String,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub title: Option<String>,
+	pub title:        Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub title_source: Option<String>,
 	#[serde(flatten)]
-	pub extra: Map<String, Value>,
+	pub extra:        Map<String, Value>,
 }
 
 /// One transcript entry after the header.
@@ -38,13 +38,13 @@ pub struct SessionHeader {
 #[serde(rename_all = "camelCase")]
 pub struct SessionEntry {
 	#[serde(rename = "type")]
-	pub kind: String,
+	pub kind:      String,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub id: Option<String>,
+	pub id:        Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub timestamp: Option<String>,
 	#[serde(flatten)]
-	pub extra: Map<String, Value>,
+	pub extra:     Map<String, Value>,
 }
 
 impl SessionEntry {
@@ -59,7 +59,7 @@ impl SessionEntry {
 /// A parsed transcript: header plus entries.
 #[derive(Clone, Debug)]
 pub struct Transcript {
-	pub header: SessionHeader,
+	pub header:  SessionHeader,
 	pub entries: Vec<SessionEntry>,
 }
 
@@ -105,9 +105,9 @@ impl Transcript {
 /// Summary of one transcript file found in a scope directory.
 #[derive(Clone, Debug)]
 pub struct TranscriptFile {
-	pub path: PathBuf,
+	pub path:           PathBuf,
 	/// Session id parsed from the filename (`<timestamp>_<id>.jsonl`).
-	pub session_id: String,
+	pub session_id:     String,
 	/// Filename timestamp segment (filesystem-safe encoding).
 	pub file_timestamp: String,
 }

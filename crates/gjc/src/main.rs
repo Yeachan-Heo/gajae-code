@@ -1,9 +1,10 @@
 //! `gjc` — single-binary coding agent runtime.
 //!
-//! Rust host that replaces the Bun entry point (`packages/gajae-code/bin/gjc.js`).
-//! Migration strategy: this binary owns the process; subsystems are ported from
-//! TypeScript in dependency order. Anything not yet ported (browser tooling,
-//! background jobs, TS plugins/extensions) runs as a subprocess.
+//! Rust host that replaces the Bun entry point
+//! (`packages/gajae-code/bin/gjc.js`). Migration strategy: this binary owns the
+//! process; subsystems are ported from TypeScript in dependency order. Anything
+//! not yet ported (browser tooling, background jobs, TS plugins/extensions)
+//! runs as a subprocess.
 
 mod cli;
 mod config_cmd;

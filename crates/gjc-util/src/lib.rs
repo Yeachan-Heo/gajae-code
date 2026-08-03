@@ -13,9 +13,9 @@
 //!
 //! Deliberately skipped for now (Bun/runtime coupling or later-phase owner):
 //! - `logger.ts`, `procmgr.ts`, `ptree.ts`, `stream.ts`, `broken-pipe.ts`,
-//!   `abortable.ts`, `async.ts`, `temp.ts`, `hook-fetch.ts`,
-//!   `fetch-retry.ts`, `postmortem.ts`, `prompt.ts`, `cli.ts` — process/IO
-//!   runtime layers; the Rust host uses `tracing`/tokio idioms instead
+//!   `abortable.ts`, `async.ts`, `temp.ts`, `hook-fetch.ts`, `fetch-retry.ts`,
+//!   `postmortem.ts`, `prompt.ts`, `cli.ts` — process/IO runtime layers; the
+//!   Rust host uses `tracing`/tokio idioms instead
 //! - `frontmatter.ts` — needs a Bun.YAML-compatible parser corpus first;
 //!   deferred to the skills port (phase 5)
 //! - `glob.ts`, `which.ts`, `color.ts`, `tab-spacing.ts`, `ring.ts`,

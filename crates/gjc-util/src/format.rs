@@ -5,7 +5,8 @@ const MIN: u64 = 60 * SEC;
 const HOUR: u64 = 60 * MIN;
 const DAY: u64 = 24 * HOUR;
 
-/// Format a duration in milliseconds: `123ms`, `1.5s`, `30m15s`, `2h30m`, `3d2h`.
+/// Format a duration in milliseconds: `123ms`, `1.5s`, `30m15s`, `2h30m`,
+/// `3d2h`.
 pub fn format_duration(ms: u64) -> String {
 	if ms < SEC {
 		return format!("{ms}ms");

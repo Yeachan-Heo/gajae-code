@@ -1,4 +1,5 @@
-//! Image metadata sniffing from file headers. Port of `packages/utils/src/mime.ts`.
+//! Image metadata sniffing from file headers. Port of
+//! `packages/utils/src/mime.ts`.
 
 /// Supported image mime types (TS `SUPPORTED_IMAGE_MIME_TYPES`).
 pub const SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] =
@@ -8,9 +9,9 @@ pub const SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] =
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ImageMetadata {
 	pub mime_type: &'static str,
-	pub width: Option<u32>,
-	pub height: Option<u32>,
-	pub channels: Option<u8>,
+	pub width:     Option<u32>,
+	pub height:    Option<u32>,
+	pub channels:  Option<u8>,
 	pub has_alpha: Option<bool>,
 }
 
@@ -98,9 +99,9 @@ fn parse_jpeg(header: &[u8]) -> Option<ImageMetadata> {
 			let channels = header[segment_offset + 7];
 			return Some(ImageMetadata {
 				mime_type: "image/jpeg",
-				width: Some(u32::from(width)),
-				height: Some(u32::from(height)),
-				channels: Some(channels),
+				width:     Some(u32::from(width)),
+				height:    Some(u32::from(height)),
+				channels:  Some(channels),
 				has_alpha: Some(false),
 			});
 		}
@@ -118,9 +119,9 @@ fn parse_gif(header: &[u8]) -> Option<ImageMetadata> {
 	}
 	Some(ImageMetadata {
 		mime_type: "image/gif",
-		width: Some(u32::from(u16::from_le_bytes([header[6], header[7]]))),
-		height: Some(u32::from(u16::from_le_bytes([header[8], header[9]]))),
-		channels: Some(3),
+		width:     Some(u32::from(u16::from_le_bytes([header[6], header[7]]))),
+		height:    Some(u32::from(u16::from_le_bytes([header[8], header[9]]))),
+		channels:  Some(3),
 		has_alpha: None,
 	})
 }
@@ -140,9 +141,9 @@ fn parse_webp(header: &[u8]) -> Option<ImageMetadata> {
 			(u32::from(header[27]) | (u32::from(header[28]) << 8) | (u32::from(header[29]) << 16)) + 1;
 		return Some(ImageMetadata {
 			mime_type: "image/webp",
-			width: Some(width),
-			height: Some(height),
-			channels: Some(if has_alpha { 4 } else { 3 }),
+			width:     Some(width),
+			height:    Some(height),
+			channels:  Some(if has_alpha { 4 } else { 3 }),
 			has_alpha: Some(has_alpha),
 		});
 	}
@@ -156,9 +157,9 @@ fn parse_webp(header: &[u8]) -> Option<ImageMetadata> {
 		let has_alpha = ((bits >> 28) & 0x1) == 1;
 		return Some(ImageMetadata {
 			mime_type: "image/webp",
-			width: Some(width),
-			height: Some(height),
-			channels: Some(if has_alpha { 4 } else { 3 }),
+			width:     Some(width),
+			height:    Some(height),
+			channels:  Some(if has_alpha { 4 } else { 3 }),
 			has_alpha: Some(has_alpha),
 		});
 	}
@@ -167,9 +168,9 @@ fn parse_webp(header: &[u8]) -> Option<ImageMetadata> {
 		let height = u32::from(u16::from_le_bytes([header[28], header[29]]) & 0x3fff);
 		return Some(ImageMetadata {
 			mime_type: "image/webp",
-			width: Some(width),
-			height: Some(height),
-			channels: Some(3),
+			width:     Some(width),
+			height:    Some(height),
+			channels:  Some(3),
 			has_alpha: Some(false),
 		});
 	}

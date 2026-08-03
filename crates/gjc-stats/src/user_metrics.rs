@@ -4,8 +4,8 @@
 //! Two JS regex constructs are rewritten for the Rust `regex` crate and
 //! covered by TS-generated parity vectors (`tests/fixtures`):
 //! - `XML_TAG_PAIR_RE` used a backreference; here a manual open/close scan
-//! - `BLAME_STOP_RE` used a lookbehind; here the sentence boundary is
-//!   consumed by the match (counting semantics are unchanged)
+//! - `BLAME_STOP_RE` used a lookbehind; here the sentence boundary is consumed
+//!   by the match (counting semantics are unchanged)
 
 use std::sync::LazyLock;
 
@@ -14,14 +14,14 @@ use regex::Regex;
 /// Metrics for one user message (mirrors the TS `UserMessageMetrics`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct UserMessageMetrics {
-	pub chars: usize,
-	pub words: usize,
-	pub yelling: usize,
-	pub profanity: usize,
-	pub anguish: usize,
-	pub negation: usize,
+	pub chars:      usize,
+	pub words:      usize,
+	pub yelling:    usize,
+	pub profanity:  usize,
+	pub anguish:    usize,
+	pub negation:   usize,
 	pub repetition: usize,
-	pub blame: usize,
+	pub blame:      usize,
 }
 
 const PROFANITY: &[&str] = &[

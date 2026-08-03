@@ -1,12 +1,12 @@
 //! Flat settings-schema table.
 //!
-//! The table is generated from `packages/coding-agent/src/config/settings-schema.ts`
-//! by `scripts/generate-json-schemas.ts` into `schemas/settings-flat.json` and
+//! The table is generated from
+//! `packages/coding-agent/src/config/settings-schema.ts` by `scripts/
+//! generate-json-schemas.ts` into `schemas/settings-flat.json` and
 //! embedded here. Drift is caught by the generator's `--check` CI mode; never
 //! hand-edit the JSON.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -43,20 +43,20 @@ impl SettingKind {
 #[derive(Clone, Debug, Deserialize)]
 pub struct SettingDef {
 	#[serde(rename = "type")]
-	pub kind: SettingKind,
+	pub kind:        SettingKind,
 	/// Default value; `None` mirrors a TS `undefined` default.
 	#[serde(default)]
-	pub default: Option<Value>,
+	pub default:     Option<Value>,
 	/// Enum values when `kind == Enum`.
 	#[serde(default)]
-	pub values: Option<Vec<String>>,
+	pub values:      Option<Vec<String>>,
 	/// UI description (`ui.description`); settings without UI have none, and
 	/// the CLI renders those as an empty string like the Bun CLI does.
 	#[serde(default)]
 	pub description: Option<String>,
 	/// UI tab (`ui.tab`); the CLI groups tab-less settings under `internal`.
 	#[serde(default)]
-	pub tab: Option<String>,
+	pub tab:         Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -67,7 +67,7 @@ struct FlatFile {
 /// The full settings schema in definition order.
 pub struct SettingsSchema {
 	order: Vec<String>,
-	defs: HashMap<String, SettingDef>,
+	defs:  HashMap<String, SettingDef>,
 }
 
 impl SettingsSchema {

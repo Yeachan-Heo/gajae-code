@@ -59,8 +59,9 @@ pub fn redact_config_value(path: &str, value: Option<Value>, show_secrets: bool)
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use serde_json::json;
+
+	use super::*;
 
 	#[test]
 	fn secret_paths() {

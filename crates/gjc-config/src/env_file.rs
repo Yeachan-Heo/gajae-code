@@ -5,8 +5,7 @@
 //! dotenv keys must be POSIX shell identifiers, values must not contain NUL,
 //! and shell startup files are parsed without executing user shell code.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 /// Strict shell-identifier shape: `[A-Za-z_][A-Za-z0-9_]*`.
 pub fn is_valid_env_name(name: &str) -> bool {
@@ -130,8 +129,9 @@ pub fn parse_shell_env_file(path: &Path) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::io::Write;
+
+	use super::*;
 
 	fn write_temp(content: &str) -> tempfile::NamedTempFile {
 		let mut f = tempfile::NamedTempFile::new().unwrap();

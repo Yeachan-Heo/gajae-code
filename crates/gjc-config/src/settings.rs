@@ -14,8 +14,8 @@
 //! Deliberately not ported yet (documented deferrals, tracked in
 //! `docs/roadmap/full-conversion-to-rust.md`):
 //! - write path (atomic YAML patching, persistence, hooks)
-//! - legacy raw-settings migrations (`#migrateRawSettings`); configs written
-//!   by current Bun builds carry `configSchemaVersion: 1` and skip them too
+//! - legacy raw-settings migrations (`#migrateRawSettings`); configs written by
+//!   current Bun builds carry `configSchemaVersion: 1` and skip them too
 //! - imported-agent settings providers (claude/gemini/cursor discovery)
 //! - path-scoped string-array resolution (`resolvePathScopedStringArray`)
 
@@ -23,8 +23,10 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use crate::dirs::Dirs;
-use crate::settings_schema::{SettingsSchema, schema};
+use crate::{
+	dirs::Dirs,
+	settings_schema::{SettingsSchema, schema},
+};
 
 /// Project-safe notification keys (TS `LOCAL_NOTIFICATION_SETTING_KEYS`).
 const LOCAL_NOTIFICATION_SETTING_KEYS: [&str; 4] =
@@ -166,8 +168,9 @@ fn get_by_path<'a>(map: &'a Map<String, Value>, path: &str) -> Option<&'a Value>
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use serde_json::json;
+
+	use super::*;
 
 	fn obj(v: Value) -> Map<String, Value> {
 		v.as_object().unwrap().clone()
@@ -235,9 +238,9 @@ mod tests {
 		std::fs::write(proj.join("settings.json"), r#"{"theme": {"dark": "blue-crab"}}"#).unwrap();
 
 		let dirs = Dirs::resolve(crate::dirs::DirsInput {
-			home: tmp.path().join("home"),
-			cwd: tmp.path().join("proj"),
-			env: std::collections::HashMap::new(),
+			home:         tmp.path().join("home"),
+			cwd:          tmp.path().join("proj"),
+			env:          std::collections::HashMap::new(),
 			xdg_platform: false,
 		});
 		let s = Settings::load(&dirs);

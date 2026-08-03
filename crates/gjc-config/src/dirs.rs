@@ -16,8 +16,10 @@
 //! root into attacker-controlled territory. The Rust binary keeps the same
 //! rule so behavior is identical under any launcher that pre-loads `.env`.
 
-use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::{
+	collections::HashMap,
+	path::{Component, Path, PathBuf},
+};
 
 use crate::env_file::parse_env_file;
 
@@ -39,9 +41,9 @@ pub enum Xdg {
 /// parity harness can construct arbitrary environments.
 #[derive(Clone, Debug)]
 pub struct DirsInput {
-	pub home: PathBuf,
-	pub cwd: PathBuf,
-	pub env: HashMap<String, String>,
+	pub home:         PathBuf,
+	pub cwd:          PathBuf,
+	pub env:          HashMap<String, String>,
 	/// Whether XDG redirection may apply (`linux`/`macos` in production).
 	pub xdg_platform: bool,
 }
@@ -103,13 +105,13 @@ fn join_under(base: &Path, name: &str) -> PathBuf {
 /// Resolved, XDG-aware directory set (port of the TS `DirResolver`).
 #[derive(Clone, Debug)]
 pub struct Dirs {
-	input: DirsInput,
+	input:           DirsInput,
 	/// Config root (`~/.gjc`).
 	pub config_root: PathBuf,
 	/// Agent directory (`~/.gjc/agent` unless overridden).
-	pub agent_dir: PathBuf,
-	root_bases: [PathBuf; 3],  // data, state, cache
-	agent_bases: [PathBuf; 3], // data, state, cache
+	pub agent_dir:   PathBuf,
+	root_bases:      [PathBuf; 3], // data, state, cache
+	agent_bases:     [PathBuf; 3], // data, state, cache
 }
 
 impl Dirs {
@@ -145,7 +147,8 @@ impl Dirs {
 			pick(&xdg_state, &config_root),
 			pick(&xdg_cache, &config_root),
 		];
-		// XDG flattens the agent/ prefix: ~/.gjc/agent/sessions → $XDG_DATA_HOME/gjc/sessions
+		// XDG flattens the agent/ prefix: ~/.gjc/agent/sessions →
+		// $XDG_DATA_HOME/gjc/sessions
 		let agent_bases =
 			[pick(&xdg_data, &agent_dir), pick(&xdg_state, &agent_dir), pick(&xdg_cache, &agent_dir)];
 
@@ -243,9 +246,9 @@ mod tests {
 
 	fn input(env: &[(&str, &str)]) -> DirsInput {
 		DirsInput {
-			home: PathBuf::from("/home/u"),
-			cwd: PathBuf::from("/proj"),
-			env: env
+			home:         PathBuf::from("/home/u"),
+			cwd:          PathBuf::from("/proj"),
+			env:          env
 				.iter()
 				.map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
 				.collect(),

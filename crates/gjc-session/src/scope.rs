@@ -84,15 +84,15 @@ pub fn scope_directory_path(sessions_root: &Path, canonical_cwd: &str) -> PathBu
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScopeBinding {
-	pub schema_version: u32,
-	pub layout_version: u32,
+	pub schema_version:   u32,
+	pub layout_version:   u32,
 	pub identity_version: u32,
-	pub platform: String,
-	pub canonical_path: String,
-	pub identity_digest: String,
+	pub platform:         String,
+	pub canonical_path:   String,
+	pub identity_digest:  String,
 	/// Preserve fields future layouts may add.
 	#[serde(flatten)]
-	pub extra: serde_json::Map<String, serde_json::Value>,
+	pub extra:            serde_json::Map<String, serde_json::Value>,
 }
 
 impl ScopeBinding {
