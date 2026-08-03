@@ -2949,7 +2949,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 48 durable callback routing", () => {
+	test("keeps wire protocol 3 through generation 49 durable callback routing", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -2965,8 +2965,9 @@ describe("telegram daemon", () => {
 		// 44 adds restart-safe callback recovery; generation 45 makes accepted callback
 		// receipts durable before exact-ask routing; generation 46 stages activation;
 		// generation 47 settles failed staged revocation; generation 48 makes receipts
-		// crash-durable, aliases legacy-disjoint, and topic authority exact.
-		expect(DAEMON_GENERATION).toBe(48);
+		// crash-durable, aliases legacy-disjoint, and topic authority exact; generation
+		// 49 drains admitted session handlers before final persistence and ownership release.
+		expect(DAEMON_GENERATION).toBe(49);
 	});
 	test.each([
 		"1",
@@ -19182,6 +19183,97 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
 	});
 
+	test("shutdown admission tracks callback alias persistence before the durable barrier", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const sendStarted = Promise.withResolvers<void>();
+		const releaseSend = Promise.withResolvers<unknown>();
+		class HeldSendBotApi extends FakeBotApi {
+			override async call(
+				method: string,
+				body: unknown,
+				options?: { noRetry?: boolean; signal?: AbortSignal },
+			): Promise<unknown> {
+				if (method !== "sendMessage") return await super.call(method, body, options);
+				this.calls.push({ method, body, options });
+				sendStarted.resolve();
+				return await releaseSend.promise;
+			}
+		}
+		const bot = new HeldSendBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://session", "token");
+		const session = daemon.sessions.get("S")!;
+		const handlerPersistStarted = Promise.withResolvers<void>();
+		const releaseHandlerPersist = Promise.withResolvers<void>();
+		const persistAliases = daemon.persistAliases.bind(daemon);
+		let heldReceiptPersistence = false;
+		spyOn(daemon, "persistAliases").mockImplementation(async () => {
+			if (
+				!heldReceiptPersistence &&
+				daemon.aliasTable.entries().some(([, route]) => route.actionId === "ask" && route.messageId === 7)
+			) {
+				heldReceiptPersistence = true;
+				handlerPersistStarted.resolve();
+				await releaseHandlerPersist.promise;
+			}
+			await persistAliases();
+		});
+
+		(session.ws as unknown as FakeWs).emit({
+			type: "action_needed",
+			sessionId: "S",
+			id: "ask",
+			kind: "ask",
+			question: "Continue?",
+			options: ["Yes"],
+		});
+		await sendStarted.promise;
+		const effects = (
+			daemon as unknown as {
+				effects: { closeAdmission(): void; join(deadlineMs: number): Promise<boolean> };
+			}
+		).effects;
+		effects.closeAdmission();
+		const aliasesBeforeRejectedMessage = Array.from(daemon.aliasTable.entries()).length;
+		(session.ws as unknown as FakeWs).emit({
+			type: "action_needed",
+			sessionId: "S",
+			id: "rejected-after-shutdown",
+			kind: "ask",
+			question: "Must not admit",
+			options: ["No"],
+		});
+		expect(Array.from(daemon.aliasTable.entries())).toHaveLength(aliasesBeforeRejectedMessage);
+
+		releaseSend.resolve({ ok: true, result: { message_id: 7 } });
+		await handlerPersistStarted.promise;
+		let joined = false;
+		const joinedEffect = effects.join(100).then(value => {
+			joined = value;
+			return value;
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(joined).toBe(false);
+
+		releaseHandlerPersist.resolve();
+		await expect(joinedEffect).resolves.toBe(true);
+		const persistedAliases = JSON.parse(fs.readFileSync(daemonPaths(agentDir).aliases, "utf8")) as {
+			routes: Record<string, unknown>;
+		};
+		expect(Object.values(persistedAliases.routes)).toEqual([
+			expect.objectContaining({ actionId: "ask", messageId: 7, sessionId: "S" }),
+		]);
+	});
 	test("shutdown retains ownership and returns when control persistence never settles", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);

@@ -4443,6 +4443,7 @@ interface PendingBtwDelivery {
 
 class TelegramEffectSupervisor {
 	#stopping = false;
+	#admitting = true;
 	readonly #abort = new AbortController();
 	readonly #terminalContext = new AsyncLocalStorage<boolean>();
 	readonly #pending = new Set<Promise<unknown>>();
@@ -4464,6 +4465,16 @@ class TelegramEffectSupervisor {
 		return this.track(api.call(method, body, { ...opts, signal }));
 	}
 
+	admit<T>(effect: () => Promise<T>): Promise<T> {
+		if (!this.#admitting)
+			return Promise.reject(Object.assign(new Error("Daemon is stopping"), { name: "AbortError" }));
+		try {
+			return this.track(effect());
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
 	track<T>(effect: Promise<T>): Promise<T> {
 		this.#pending.add(effect);
 		void effect.then(
@@ -4477,7 +4488,12 @@ class TelegramEffectSupervisor {
 		return this.#stopping;
 	}
 
+	closeAdmission(): void {
+		this.#admitting = false;
+	}
+
 	beginShutdown(): void {
+		this.closeAdmission();
 		this.#stopping = true;
 		this.#abort.abort("daemon_shutdown");
 	}
@@ -4680,6 +4696,7 @@ export class TelegramNotificationDaemon {
 	 */
 	requestStop(_reason?: "reload" | "stop" | "signal"): void {
 		this.stopRequested = true;
+		this.effects.closeAdmission();
 
 		const toolShutdown = this.beginToolActivityShutdown();
 		void toolShutdown
@@ -5723,11 +5740,13 @@ export class TelegramNotificationDaemon {
 			// Identity guard: a delayed frame from a superseded socket must not act
 			// through the replacement session.
 			if (this.sessions.get(sessionId) !== session) return;
-			void this.handleSessionMessage(session, JSON.parse(String(ev.data))).catch(err => {
-				// Surface frame-handling failures (e.g. a rejected ask sendMessage) to
-				// the daemon log instead of an invisible unhandled rejection.
-				logger.error("notifications daemon: handleSessionMessage failed", { error: String(err) });
-			});
+			void this.effects
+				.admit(() => this.handleSessionMessage(session, JSON.parse(String(ev.data))))
+				.catch(err => {
+					// Surface frame-handling failures (e.g. a rejected ask sendMessage) to
+					// the daemon log instead of an invisible unhandled rejection.
+					logger.error("notifications daemon: handleSessionMessage failed", { error: String(err) });
+				});
 		});
 		ws.addEventListener("close", () => {
 			this.dropSession(session, "socket_closed");
@@ -11322,37 +11341,41 @@ export class TelegramNotificationDaemon {
 				}
 				this.effects.beginShutdown();
 				this.#deliveryAbort.abort();
+				this.stopFlushTimer();
+				this.stopScanTimer();
+				this.stopTypingTimer();
+				this.stopAdoptionSweepTimer();
+				this.stopLifecycleControl();
 				let persisted = false;
-				const shutdown = this.effects.allowTerminal(async () => {
-					if (toolShutdownError) throw toolShutdownError;
-					await this.#drainBtwTurns();
-					await this.toolTerminalizationChain;
-					this.stopFlushTimer();
-					this.stopScanTimer();
-					this.stopTypingTimer();
-					this.stopAdoptionSweepTimer();
-					this.stopLifecycleControl();
-					await this.cleanupAllAttachmentDirs();
-					await this.persistAliases();
-					await this.persistTopics();
-					await this.persistSeenUpdateIds();
-					await this.opts.control?.clear?.(this.opts.ownerId);
-					persisted = true;
-				});
-				const deadline = Promise.withResolvers<boolean>();
-				const deadlineTimer = setTimeout(() => deadline.resolve(false), BTW_SHUTDOWN_JOIN_MS);
-				const completed = await Promise.race([
-					shutdown.then(
-						() => true,
-						error => {
-							logger.warn(`notifications: shutdown persistence failed: ${sanitizeDiagnostic(String(error))}`);
-							return false;
-						},
-					),
-					deadline.promise,
-				]);
-				clearTimeout(deadlineTimer);
-				const quiesced = completed && heartbeatJoined && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
+				const sessionEffectsQuiesced = await this.effects.join(BTW_SHUTDOWN_JOIN_MS);
+				let completed = false;
+				if (sessionEffectsQuiesced) {
+					const shutdown = this.effects.allowTerminal(async () => {
+						if (toolShutdownError) throw toolShutdownError;
+						await this.#drainBtwTurns();
+						await this.toolTerminalizationChain;
+						await this.cleanupAllAttachmentDirs();
+						await this.persistAliases();
+						await this.persistTopics();
+						await this.persistSeenUpdateIds();
+						await this.opts.control?.clear?.(this.opts.ownerId);
+						persisted = true;
+					});
+					const deadline = Promise.withResolvers<boolean>();
+					const deadlineTimer = setTimeout(() => deadline.resolve(false), BTW_SHUTDOWN_JOIN_MS);
+					completed = await Promise.race([
+						shutdown.then(
+							() => true,
+							error => {
+								logger.warn(`notifications: shutdown persistence failed: ${sanitizeDiagnostic(String(error))}`);
+								return false;
+							},
+						),
+						deadline.promise,
+					]);
+					clearTimeout(deadlineTimer);
+				}
+				const quiesced = completed && heartbeatJoined && sessionEffectsQuiesced;
 				if (!quiesced || !persisted) {
 					logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
 				} else {

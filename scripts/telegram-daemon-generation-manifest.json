@@ -1,5 +1,5 @@
 {
-  "contractVersion": 42,
+  "contractVersion": 43,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -531,7 +531,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:ownerPidFromOwnerId": "46691373b2bee01f28f3817a6aa6a7efffe880c2cea337c89155582c98d952bf",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:runDaemonInternal": "8d9135cabb89a9d022cb22d0aad159d4f1fe1b7c574afc61dadaeaa66b1b7e36",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:runDaemonSmoke": "6f085a667aa5c83de46d2d8945fb845c355fcbb43c46872342a44489203a5830",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "21bc75f6f42e3cc2158bca1ba60aafb51d962a54c15e8eb36e55fe65177dfe61",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "13e924c3b28a3e8a16edc1e2adc2bec8a5bc3e1989be1d4b2b637f355d4895a3",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:NOTIFICATION_PROTOCOL_VERSION": "b99289f651fedcf020d28dbaf6f07dd37e7e4a5f6dc1f5118b872112325f1e81",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:DaemonProcessReference": "c3d13e3670a6245a1250c4ebfcd80a36dd8fc96c67ab64d9f979182bd117bc4e",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:TelegramDaemonController": "7381b51cd968199876bfccd341ce79f1bcd895c9fb3899149394d6c54459f07f",
@@ -554,7 +554,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TOOL_ACTIVITY_CAPABILITY": "547f80bd6b3bd1c615fc3d885e507aba4418e6c4c54c47d36938b8b2e5d2abd7",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramBotTransport": "a52ed3c9633e50db460c4cf020172dec284124563bd62d5bc647bf4461ec9aa0",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramDaemonOwnershipPhase": "e18b8212480f9c8c7d21c3e97b9b4813d445e5afa8f13c16916cc145d0a45339",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramEffectSupervisor": "bda743ada8426b1f22471ad3410d4107f3ce8bd608794918317374a99fd55b14",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramEffectSupervisor": "10188ff7bfc0eb88ccc6fd75aec7e882666cc2e4ff9817ed00815abdaa6de906",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#authorizeLease": "8798e128b9dd7e53788221b7a2e94332cb607e74e467457b8b885911315ff82a",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#leaseAllows": "c83f77e57d8f4199c8b8c39707cd719efe46bfc14f03ac0b42d40711cd9664ad",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#leaseTokenAllows": "611a62a9f4a8593725463387d4a28d76e426234db8d84600332203aa7c088883",
@@ -611,12 +611,12 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:reissuePendingAction": "05a1f010289fc997e0b95d0e888a8f43b0253d4b719480807c2f6a1ee3a08554",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:releaseDaemonOwnership": "b4116e177d692673ac104cb4cc25c1f971e08ac00fb52c3a8bb24906491a04b6",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:renewDaemonHeartbeat": "abd555094701af127d2300dac50e0b195b6879592d504040c9908dd46fafa695",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:requestStop": "09541e49e39af232b571d29d8eac79cfa71eb142ae0d8f0d2d34c731fa41b57a",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:requestStop": "cbca8fba4193aad7a4348c5a1a0a71e2d831c683d49f7738ab3196018196b621",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:restoreNotificationRootRegistration": "8361cce360804d2dab321da3477e7c3c6f148b49c49afb77d519a081281f267b",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:retireProvisionalDaemonOwnership": "d5f45044ea524f0694691bda67f47f9d74eaa5506926b718f40f2613a892d82f",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:revokeCallbackAliases": "42407ae6ce220a36e06f6b74a339b59dc1ec1efd44fa0e4c80fb2cf43d4fb5ba",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:rollbackOwnershipLockRebind": "7e9bc148e69268c393051e0b87417c20ce44824e777d4be050b9e91607c410a1",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:run": "402fad8c2dd1bd4eee40dc01107ec50151cf911365d06ac1ff66664081f07f19",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:run": "234ec760a43e3322653eb9c1f4ea5bb13131b590134d9d7d29ad326fd69d3944",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:spawnTelegramDaemonOwner": "8c8fc501b466b3d75ed696483821e52023681b05a1c943398d9abe6306c7eef0",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:startLifecycleControl": "237cf7c7881048e0e4329650567c8a47f597abe43206fe2f29376eb912cd6d1c",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:syncTelegramDirectory": "d056e2d84b39bd98a2c0b5a6f22ab0bb13adcd909c092b2f0636382dca488468",

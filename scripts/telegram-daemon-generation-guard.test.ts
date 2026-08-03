@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
+import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -763,6 +763,11 @@ test("fails closed when a protected native authority declaration is missing or m
 		const endpointDiscovery = mutableInventory();
 		delete endpointDiscovery.discord[chatRuntime];
 		expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
+	});
+	test("protects Telegram shutdown admission and durable drain authorities", () => {
+		expect(protectedInventory.telegram[telegramDaemon]).toEqual(
+			expect.arrayContaining([...TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS]),
+		);
 	});
 
 	test("protects Telegram provenance and signaling authorities", () => {

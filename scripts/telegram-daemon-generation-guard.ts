@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 42;
+export const GUARD_CONTRACT_VERSION = 43;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -202,6 +202,13 @@ function validateTelegramCallbackRecoveryInventory(inventory: Inventory): void {
 	}
 }
 
+/** Shutdown must fence new session work and await admitted handlers before durable release. */
+export const TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS = [
+	"TelegramEffectSupervisor",
+	"handleSessionMessage",
+	"run",
+] as const;
+
 /** Chat credential, provenance, and persistence are shared takeover authority. */
 export const CHAT_OWNER_LOCK_PROTECTED_DECLARATIONS = [
 	"identityFor",
@@ -280,6 +287,12 @@ function validateTelegramLifecycleInventory(inventory: Inventory): void {
 	if (!symbols || TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
 		throw new Error("telegram-daemon-generation-guard: Telegram authentication and lifecycle primitives must be protected by the Telegram generation contract");
 }
+function validateTelegramShutdownDrainInventory(inventory: Inventory): void {
+	const symbols = inventory.telegram[telegramDaemon];
+	if (!symbols || TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
+		throw new Error("telegram-daemon-generation-guard: Telegram shutdown admission and durable drain primitives must be protected by the Telegram generation contract");
+}
+
 function validateTelegramCallbackReceiptInventory(inventory: Inventory): void {
 	const symbols = inventory.telegram[telegramDaemon];
 	if (!symbols || TELEGRAM_CALLBACK_RECEIPT_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
@@ -325,6 +338,7 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateChatEndpointDiscoveryInventory(inventory);
 	validateTelegramToolActivityInventory(inventory);
 	validateTelegramCallbackRecoveryInventory(inventory);
+	validateTelegramShutdownDrainInventory(inventory);
 }
 
 export function validateManifest(value: unknown = manifest): asserts value is GuardManifest {

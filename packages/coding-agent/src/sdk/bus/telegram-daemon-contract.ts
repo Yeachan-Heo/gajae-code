@@ -65,8 +65,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * 47 settles failed staged revocation and guards the complete callback authority
  * and polling dependency chain. Generation 48 uses crash-durable callback
  * receipts, a legacy-disjoint random alias namespace, and exact topic leases.
+ * Generation 49 drains every admitted session-message handler before final
+ * durable persistence and ownership release.
  */
-export const DAEMON_GENERATION = 48;
+export const DAEMON_GENERATION = 49;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers

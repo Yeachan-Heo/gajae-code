@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
-- Telegram daemon restart now revokes every persisted callback alias before polling. Reconnecting sessions must replay a pending ask to receive fresh, owner-bound aliases; old controls remain stale, and their keyboards are best-effort terminalized when the original Telegram message id is available (#3727).
+- Telegram daemon restart now revokes every persisted callback alias before polling. Reconnecting sessions must replay a pending ask to receive fresh, owner-bound aliases; old controls remain stale, and their keyboards are best-effort terminalized when the original Telegram message id is available. Shutdown now fences new session messages and drains every admitted handler before final callback persistence and ownership release, preventing a successful send racing shutdown from publishing alias state after a successor takes ownership (#3727).
 
 ## [0.12.11] - 2026-08-03
 
