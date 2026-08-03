@@ -1,0 +1,5 @@
+{"type":"session","version":4,"id":"019f0000-1111-7000-aaaa-000000000001","timestamp":"2026-07-18T13:22:00.198Z","cwd":"/tmp/fixture-project","title":"Fixture Session","titleSource":"auto"}
+{"type":"model_change","id":"aaaa0001","parentId":null,"timestamp":"2026-07-18T13:22:00.309Z","model":"example-provider/example-model"}
+{"type":"thinking_level_change","id":"aaaa0002","parentId":"aaaa0001","timestamp":"2026-07-18T13:22:00.310Z","thinkingLevel":"inherit"}
+{"type":"message","id":"aaaa0003","parentId":"aaaa0002","timestamp":"2026-07-18T13:22:05.000Z","message":{"role":"user","content":[{"type":"text","text":"hello fixture"}]}}
+{"type":"custom","customType":"workflow-intent-diff","data":{"version":1,"route":"none","claimsLedger":{"version":1,"claims":[]}}}
