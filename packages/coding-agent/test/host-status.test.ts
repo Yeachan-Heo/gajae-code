@@ -1,26 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { emitHostStatus } from "@gajae-code/coding-agent/modes/utils/host-status";
 
-const original = process.env.TERAX_TERMINAL;
-
 afterEach(() => {
-	if (original === undefined) delete process.env.TERAX_TERMINAL;
-	else process.env.TERAX_TERMINAL = original;
 	vi.restoreAllMocks();
 });
 
 describe("host status markers", () => {
-	it("stays silent outside a host terminal", () => {
-		delete process.env.TERAX_TERMINAL;
-		const output = { write: vi.fn(() => true) };
-
-		emitHostStatus("working", output);
-
-		expect(output.write).not.toHaveBeenCalled();
-	});
-
 	it("writes the agent-attributed OSC 777 marker for each event", () => {
-		process.env.TERAX_TERMINAL = "1";
 		const output = { write: vi.fn(() => true) };
 
 		emitHostStatus("working", output);
@@ -32,8 +18,31 @@ describe("host status markers", () => {
 		expect(output.write).toHaveBeenNthCalledWith(3, "\x1b]777;notify;Terax;gjc;finished\x07");
 	});
 
+	it("reports without asking the host to identify itself", () => {
+		const previous = process.env.TERAX_TERMINAL;
+		delete process.env.TERAX_TERMINAL;
+		const output = { write: vi.fn(() => true) };
+
+		emitHostStatus("finished", output);
+
+		expect(output.write).toHaveBeenCalledTimes(1);
+		if (previous !== undefined) process.env.TERAX_TERMINAL = previous;
+	});
+
+	it("emits a self-terminating OSC that carries no cursor movement", () => {
+		const output = { write: vi.fn(() => true) };
+
+		emitHostStatus("working", output);
+
+		const written = output.write.mock.calls[0][0] as string;
+		expect(written.startsWith("\x1b]")).toBe(true);
+		expect(written.endsWith("\x07")).toBe(true);
+		// A terminal that does not know the sequence discards it; nothing here
+		// may render or move the cursor if it does not.
+		expect(written.slice(2, -1)).toMatch(/^[\x20-\x7e]*$/);
+	});
+
 	it("swallows write failures so a broken stdout can't abort a turn", () => {
-		process.env.TERAX_TERMINAL = "1";
 		const output = {
 			write: vi.fn(() => {
 				throw new Error("EPIPE");
