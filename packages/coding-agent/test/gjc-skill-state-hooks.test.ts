@@ -24,6 +24,7 @@ import {
 } from "../src/hooks/codex-native-hooks-config";
 import { dispatchGjcNativeSkillHook } from "../src/hooks/native-skill-hook";
 import {
+	buildSanitizedEffectiveSkillConfigContext,
 	detectSkillKeywords,
 	ensureWorkflowSkillActivationState,
 	readVisibleSkillActiveState,
@@ -275,6 +276,17 @@ describe("GJC native skill-state hooks", () => {
 		expect(result.hookEventName).toBe("UserPromptSubmit");
 		expect(await readVisibleSkillActiveState(root, "session-ultratest-explicit")).toBeNull();
 		await expect(fs.stat(modeStatePath(root, "session-ultratest-explicit", "ultratest"))).rejects.toThrow();
+	});
+
+	it("keeps opt-in ultratest out of default skill-config activation guidance", () => {
+		for (const input of [undefined, { skillsSettings: {} }]) {
+			const context = buildSanitizedEffectiveSkillConfigContext(input);
+			expect(context).toContain("deep-interview, ralplan, team, ultragoal");
+			expect(context).not.toContain(
+				"bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, team, ultratest",
+			);
+			expect(context).toContain("ultratest requires an explicitly installed skill");
+		}
 	});
 
 	it("UserPromptSubmit adds advisory answer-only context for question-only prompts", async () => {

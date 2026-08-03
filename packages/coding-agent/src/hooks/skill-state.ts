@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
+import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
@@ -30,7 +31,6 @@ import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import {
 	compareSkillKeywordMatches,
 	GJC_SKILL_KEYWORD_DEFINITIONS,
-	GJC_WORKFLOW_SKILLS,
 	type GjcWorkflowSkill,
 	isGjcWorkflowSkill,
 } from "./skill-keywords";
@@ -46,7 +46,9 @@ export interface EffectiveSkillConfigInput {
 
 const SANITIZED_CONFIG_VALUE_LIMIT = 80;
 const DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD = 0.05;
-const GJC_WORKFLOW_ACTIVATION_NAMES = GJC_WORKFLOW_SKILLS.join(", ");
+const DEFAULT_GJC_WORKFLOW_ACTIVATION_NAMES = DEFAULT_GJC_DEFINITION_NAMES.join(", ");
+const ULTRATEST_OPT_IN_ACTIVATION_GUIDANCE =
+	"ultratest requires an explicitly installed skill and a resolved /skill:ultratest invocation";
 
 function sanitizeConfigValue(value: string): string {
 	const compact = value.replace(/[\r\n\t]+/g, " ").trim();
@@ -69,8 +71,10 @@ export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillC
 		return (
 			"Sanitized effective skill config unavailable (" +
 			reason +
-			"); bundled GJC workflow activation remains available for " +
-			GJC_WORKFLOW_ACTIVATION_NAMES +
+			"); bundled GJC workflow activation remains available for exactly " +
+			DEFAULT_GJC_WORKFLOW_ACTIVATION_NAMES +
+			"; " +
+			ULTRATEST_OPT_IN_ACTIVATION_GUIDANCE +
 			"."
 		);
 	}
@@ -85,7 +89,9 @@ export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillC
 
 	return [
 		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly " +
-			GJC_WORKFLOW_ACTIVATION_NAMES +
+			DEFAULT_GJC_WORKFLOW_ACTIVATION_NAMES +
+			"; " +
+			ULTRATEST_OPT_IN_ACTIVATION_GUIDANCE +
 			".",
 		`Skill discovery booleans: ${[
 			formatBoolean("enabled", settings.enabled),
