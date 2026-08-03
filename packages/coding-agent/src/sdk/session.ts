@@ -408,6 +408,11 @@ export interface CreateAgentSessionOptions {
 	/** Load MCP tools for a top-level session only from this caller-owned absolute config file path.
 	 * Mutually exclusive with mcpManager. */
 	mcpConfigPath?: string;
+	/**
+	 * Defer connecting an exact MCP config until the interactive UI is ready.
+	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
+	 */
+	deferMcpConfigStartup?: boolean;
 
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
@@ -498,6 +503,8 @@ export interface CreateAgentSessionResult {
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
 	/** MCP manager for server lifecycle management (undefined if MCP disabled or an exact tools-only config is session-owned) */
 	mcpManager?: MCPManager;
+	/** Starts a deferred exact-config MCP connection. Present only when deferMcpConfigStartup was requested. */
+	startDeferredMcpConfig?: () => Promise<DeferredMcpConfigStartupResult>;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
 	/** LSP servers configured for lazy startup in interactive mode */
@@ -509,6 +516,11 @@ export interface CreateAgentSessionResult {
 	 * this session published. Undefined when no GJC bundles participated.
 	 */
 	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+}
+
+export interface DeferredMcpConfigStartupResult {
+	loadedToolCount: number;
+	hasErrors: boolean;
 }
 
 // Re-exports
@@ -1007,6 +1019,7 @@ const MCP_CONFIG_PATH_ABSOLUTE_ERROR = "mcpConfigPath requires an absolute path"
 const MCP_TOOLS_ONLY_MANAGER_SUBSESSION_ERROR = "tools-only MCP managers cannot be reused in sub-sessions";
 const MCP_CONFIG_PATH_SUBSESSION_ERROR = "mcpConfigPath cannot be used in sub-sessions";
 const MAX_EXACT_MCP_TOOL_COLLISION_NAMES = 10;
+const DEFERRED_MCP_CONFIG_STARTUP_ERROR = "MCP tools could not be loaded.";
 const MAX_EXACT_MCP_TOOL_NAME_LENGTH = 100;
 const pluginMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
 
@@ -1039,6 +1052,20 @@ function findExactMcpToolNameCollisions(
 		}
 	}
 	return collisions;
+}
+
+function findDeferredExactMcpToolNameCollisions(
+	exactMcpToolNames: readonly string[],
+	catalogToolNames: Iterable<string>,
+): string[] {
+	const catalog = new Set(catalogToolNames);
+	const seen = new Set<string>();
+	const collisions = new Set<string>();
+	for (const toolName of exactMcpToolNames) {
+		if (catalog.has(toolName) || seen.has(toolName)) collisions.add(toolName);
+		seen.add(toolName);
+	}
+	return [...collisions];
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
@@ -1685,6 +1712,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const customTools: CustomTool[] = [];
 		const exactMcpToolNames: string[] = [];
 		const pluginMcpToolNames: string[] = [];
+		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
 		// Add image tools when the active model or configured image providers can generate images.
 		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
@@ -1785,12 +1813,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpManager = owned;
 			ownsMcpManager = true;
 			cleanupOwnedMcpManager = () => owned.disconnectAll();
-			const result = await owned.discoverAndConnect({ configPath: explicitMcpConfigPath });
-			const resultTools = result.tools as CustomTool[];
-			exactMcpToolNames.push(...resultTools.map(tool => tool.name));
-			customTools.push(...resultTools);
-			if (result.errors.size > 0 || result.tools.length === 0) {
-				logger.warn("MCP tools could not be loaded.");
+			if (options.deferMcpConfigStartup) {
+				deferredExactMcpConfig = { manager: owned, configPath: explicitMcpConfigPath };
+			} else {
+				const result = await owned.discoverAndConnect({ configPath: explicitMcpConfigPath });
+				const resultTools = result.tools as CustomTool[];
+				exactMcpToolNames.push(...resultTools.map(tool => tool.name));
+				customTools.push(...resultTools);
+				if (result.errors.size > 0 || result.tools.length === 0) {
+					logger.warn("MCP tools could not be loaded.");
+				}
 			}
 		} else if (!mcpManager && !isCanonicalSubSession) {
 			// Always-on GJC plugin-bundle MCP servers. Top-level sessions own a manager
@@ -2198,13 +2230,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		// Exact-config MCP tools cannot claim a name already represented by the final candidate catalog.
 		// Other catalog collisions retain their legacy override behavior.
+		const exactMcpCatalogToolNames = [
+			...builtinCandidateTools.map(tool => tool.name),
+			...preExactCustomToolNames,
+			...wrappedExtensionTools.map(tool => tool.name),
+		];
 		if (exactMcpToolNames.length > 0) {
-			const catalogToolNames = [
-				...builtinCandidateTools.map(tool => tool.name),
-				...preExactCustomToolNames,
-				...wrappedExtensionTools.map(tool => tool.name),
-			];
-			const collidingToolNames = findExactMcpToolNameCollisions(exactMcpToolNames, catalogToolNames);
+			const collidingToolNames = findExactMcpToolNameCollisions(exactMcpToolNames, exactMcpCatalogToolNames);
 			if (collidingToolNames.length > 0) {
 				throw new ExactMcpToolNameCollisionError(collidingToolNames);
 			}
@@ -2397,10 +2429,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		let initialToolNames = [...initialRequestedActiveToolNames];
 		if (mcpDiscoveryEnabled) {
-			const restoredSelectedMCPToolNames = existingSession.selectedMCPToolNames.filter(
-				name => toolRegistry.has(name) && !mandatoryMCPToolNameSet.has(name),
-			);
+			const restoredSelectedMCPToolNames = deferredExactMcpConfig
+				? existingSession.selectedMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name))
+				: existingSession.selectedMCPToolNames.filter(
+						name => toolRegistry.has(name) && !mandatoryMCPToolNameSet.has(name),
+					);
 			if (
+				!deferredExactMcpConfig &&
 				existingSession.hasPersistedMCPToolSelection &&
 				restoredSelectedMCPToolNames.length !== existingSession.selectedMCPToolNames.length
 			) {
@@ -2751,6 +2786,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
+		const deferredMcpTurnReady = deferredExactMcpConfig ? Promise.withResolvers<void>() : undefined;
+		if (deferredMcpTurnReady) void deferredMcpTurnReady.promise.catch(() => {});
+
 		session = new AgentSession({
 			agent,
 			thinkingLevel,
@@ -2767,6 +2805,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// subagents and callers that merely observe a manager must not (see
 			// AgentSession.dispose).
 			ownedMcpManager: ownsMcpManager ? mcpManager : undefined,
+			startupTurnBarrier: deferredMcpTurnReady?.promise,
 			scopedModels: options.scopedModels,
 			promptTemplates,
 			slashCommands,
@@ -2793,6 +2832,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpDiscoveryEnabled,
 			discoveryMode: effectiveDiscoveryMode,
 			initialSelectedMCPToolNames,
+			preserveUnavailableInitialMCPToolSelection: deferredExactMcpConfig !== undefined,
 			initialMCPToolSelectionIsExplicit: hasExplicitMCPToolSelection,
 			initialDiscoveredBuiltinToolSelectionIsExplicit: hasExplicitDiscoveredBuiltinToolSelection,
 			initialSelectedDiscoveredBuiltinToolNames,
@@ -2949,6 +2989,58 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// microtask (the ToolSession closure needs `session` assigned). Await it
 		// so a resumed canonical workflow session returns with `ask` resident.
 		await session.workflowGateToolRestoration;
+		let startDeferredMcpConfig: (() => Promise<DeferredMcpConfigStartupResult>) | undefined;
+		if (deferredExactMcpConfig) {
+			const { manager, configPath } = deferredExactMcpConfig;
+			let cancelled = false;
+			let startupPromise: Promise<DeferredMcpConfigStartupResult> | undefined;
+			session.registerToolSessionCleanup(async () => {
+				cancelled = true;
+				deferredMcpTurnReady?.resolve();
+				if (startupPromise) {
+					await manager.disconnectAll().catch(() => {});
+					await startupPromise.catch(() => {});
+				}
+			});
+			startDeferredMcpConfig = () => {
+				if (!startupPromise && session.isDisposed) {
+					return Promise.reject(new Error(DEFERRED_MCP_CONFIG_STARTUP_ERROR));
+				}
+				startupPromise ??= (async () => {
+					try {
+						const result = await manager.discoverAndConnect({ configPath });
+						const resultTools = result.tools as CustomTool[];
+						const toolNames = resultTools.map(tool => tool.name);
+						const collidingToolNames = findDeferredExactMcpToolNameCollisions(
+							toolNames,
+							exactMcpCatalogToolNames,
+						);
+						if (collidingToolNames.length > 0) {
+							throw new ExactMcpToolNameCollisionError(collidingToolNames);
+						}
+						if (!cancelled && !session.isDisposed) {
+							await session.refreshMCPTools(resultTools);
+							if (
+								!session.isDisposed &&
+								(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
+							) {
+								await session.activateDiscoveredTools(toolNames);
+							}
+						}
+						deferredMcpTurnReady?.resolve();
+						const hasErrors = result.errors.size > 0 || result.tools.length === 0;
+						if (hasErrors) logger.warn(DEFERRED_MCP_CONFIG_STARTUP_ERROR);
+						return { loadedToolCount: cancelled || session.isDisposed ? 0 : resultTools.length, hasErrors };
+					} catch {
+						const startupError = new Error(DEFERRED_MCP_CONFIG_STARTUP_ERROR);
+						deferredMcpTurnReady?.reject(startupError);
+						await manager.disconnectAll().catch(() => {});
+						throw startupError;
+					}
+				})();
+				return startupPromise;
+			};
+		}
 		// Expose the published evidence on the session itself so UI surfaces that
 		// only hold a session (Settings) can consume it without threading the
 		// creation result through every controller.
@@ -2959,6 +3051,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionsResult,
 			setToolUIContext,
 			mcpManager: ownsMcpManager && mcpManager?.isToolsOnly() ? undefined : mcpManager,
+			startDeferredMcpConfig,
 			modelFallbackMessage,
 			lspServers,
 			eventBus,

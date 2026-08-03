@@ -406,6 +406,7 @@ type StartupModelProfileArgs = {
 	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
+	preferCachedModels?: boolean;
 };
 
 async function applyStartupModelProfilesWithPolicy(
@@ -416,16 +417,17 @@ async function applyStartupModelProfilesWithPolicy(
 		profileName: string,
 		persistDefault: boolean,
 		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
-	): Promise<void> => {
+	): Promise<boolean> => {
 		try {
 			await activateModelProfile(
 				{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
 				{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
 			);
+			return true;
 		} catch (error) {
 			if (onCredentialError && error instanceof ModelProfileCredentialError) {
 				onCredentialError(error);
-				return;
+				return false;
 			}
 			throw error;
 		}
@@ -436,7 +438,9 @@ async function applyStartupModelProfilesWithPolicy(
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
 	const defaultProfile = args.settings.get("modelProfile.default");
-	if (defaultProfile || args.parsedArgs.mpreset) {
+	const preferCachedMpreset =
+		args.preferCachedModels === true && !defaultProfile && args.parsedArgs.mpreset !== undefined;
+	if (defaultProfile || (args.parsedArgs.mpreset && !preferCachedMpreset)) {
 		await args.modelRegistry.refresh("online-if-uncached");
 	}
 
@@ -448,7 +452,21 @@ async function applyStartupModelProfilesWithPolicy(
 		});
 	}
 	if (args.parsedArgs.mpreset) {
-		await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+		if (preferCachedMpreset) {
+			let applied: boolean;
+			let refreshedOnline = false;
+			try {
+				applied = await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+			} catch (error) {
+				if (error instanceof ModelProfileCredentialError) throw error;
+				await args.modelRegistry.refresh("online-if-uncached");
+				refreshedOnline = true;
+				applied = await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+			}
+			if (applied && !refreshedOnline) args.modelRegistry.refreshInBackground();
+		} else {
+			await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+		}
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
@@ -509,14 +527,19 @@ export async function applyStartupModelProfilesForRoot(
 		resumeAction: "continue-tail" | "open-idle" | undefined;
 	},
 ): Promise<{ recoverableErrors: string[] }> {
+	const policyArgs = { ...args, preferCachedModels: args.isInteractive };
 	if (!isStartupModelProfileCredentialRecoveryEligible(args)) {
-		await applyStartupModelProfilesOrExit(args);
+		try {
+			await applyStartupModelProfilesWithPolicy(policyArgs);
+		} catch (error) {
+			await exitForStartupModelProfileError(args, error);
+		}
 		return { recoverableErrors: [] };
 	}
 
 	const recoverableErrors: string[] = [];
 	try {
-		await applyStartupModelProfilesWithPolicy(args, error => recoverableErrors.push(error.message));
+		await applyStartupModelProfilesWithPolicy(policyArgs, error => recoverableErrors.push(error.message));
 	} catch (error) {
 		await exitForStartupModelProfileError(args, error);
 	}
@@ -616,6 +639,7 @@ export async function runInteractiveMode(
 	initialImages?: ImageContent[],
 	createInteractiveMode?: CreateInteractiveMode,
 	resumeAction?: "continue-tail" | "open-idle",
+	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -658,6 +682,23 @@ export async function runInteractiveMode(
 		} else if (notify.kind === "info") {
 			mode.showStatus(notify.message);
 		}
+	}
+	if (startDeferredMcpConfig) {
+		mode.showStatus("Connecting MCP tools…");
+		void startDeferredMcpConfig()
+			.then(result => {
+				if (result.hasErrors) {
+					mode.showWarning(
+						result.loadedToolCount > 0 ? "Some MCP tools could not be loaded." : "MCP tools could not be loaded.",
+					);
+					return;
+				}
+				mode.showStatus(`${result.loadedToolCount} MCP tool${result.loadedToolCount === 1 ? "" : "s"} connected`);
+			})
+			.catch(() => {
+				logger.warn("Deferred MCP startup failed.");
+				mode.showError("MCP tools could not be loaded.");
+			});
 	}
 
 	const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
@@ -1494,6 +1535,9 @@ export async function runRootCommand(
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
+	if (isInteractive && sessionOptions.mcpConfigPath) {
+		sessionOptions.deferMcpConfigStartup = true;
+	}
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 
 	// Research-mode (RLM) preset: augment session options before session creation.
@@ -1574,10 +1618,15 @@ export async function runRootCommand(
 			if (!deps.suppressProcessExit) await postmortem.cleanup();
 		}
 	} else {
-		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } = await createSession(
-			sessionOptions,
-			{ skipPostCreateModelRefresh: hasRootStartupProfile },
-		);
+		const {
+			session,
+			setToolUIContext,
+			modelFallbackMessage,
+			lspServers,
+			mcpManager,
+			startDeferredMcpConfig,
+			eventBus,
+		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
 
 		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
@@ -1690,6 +1739,7 @@ export async function runRootCommand(
 						initialImages,
 						deps.createInteractiveMode,
 						bareResumeAction,
+						startDeferredMcpConfig,
 					);
 				}
 			} catch (error) {

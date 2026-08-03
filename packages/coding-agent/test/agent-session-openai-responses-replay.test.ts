@@ -376,6 +376,62 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		}
 	});
 
+	it("sanitizes a managed transcript larger than 20 MiB with one durable replacement", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-large-managed-open-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const assistantTexts = Array.from(
+			{ length: 256 },
+			(_, index) => `Large stale managed assistant ${index} ${"x".repeat(96 * 1024)}`,
+		);
+
+		const sourceManager = SessionManager.create(tempDir, path.join(tempDir, "source"));
+		for (const assistantText of assistantTexts) {
+			sourceManager.appendMessage(createStaleAssistantMessage(assistantText));
+		}
+		await sourceManager.flush();
+		const sourceFile = sourceManager.getSessionFile();
+		if (!sourceFile) throw new Error("Expected large source session file");
+		await sourceManager.close();
+
+		const destination = SessionManager.managedDestination(tempDir, path.join(tempDir, "agent"));
+		const placeholderManager = SessionManager.create(tempDir, destination);
+		await placeholderManager.flush();
+		const sessionFile = placeholderManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected managed destination session file");
+		await placeholderManager.close();
+		fs.copyFileSync(sourceFile, sessionFile);
+		expect(fs.statSync(sessionFile).size).toBeGreaterThan(20 * 1024 * 1024);
+
+		const appendSync = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendSync");
+		let openedSessionManager: SessionManager | undefined;
+		try {
+			const opened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = opened;
+			expect(appendSync).toHaveBeenCalledTimes(1);
+
+			for (const assistantText of [assistantTexts[0]!, assistantTexts.at(-1)!]) {
+				const { message } = findPersistedMessageEntry(opened, "assistant", assistantText);
+				if (message.role !== "assistant") throw new Error("Expected large persisted assistant message");
+				expectAssistantReplayMetadataSanitized(message);
+			}
+
+			await opened.close();
+			openedSessionManager = undefined;
+			const reopened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = reopened;
+			expect(appendSync).toHaveBeenCalledTimes(1);
+			expect(
+				fs
+					.readFileSync(sessionFile, "utf8")
+					.split("\n")
+					.filter(record => record.includes('"type":"entry_patch"')),
+			).toHaveLength(assistantTexts.length);
+		} finally {
+			await openedSessionManager?.close();
+			appendSync.mockRestore();
+		}
+	}, 15_000);
+
 	it("sanitizes stale assistant replay metadata when forking a persisted session", async () => {
 		const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-source-${Snowflake.next()}-`));
 		const forkDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-target-${Snowflake.next()}-`));
