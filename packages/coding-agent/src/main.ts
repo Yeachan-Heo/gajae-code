@@ -551,6 +551,33 @@ export async function applyStartupModelProfilesForRoot(
 	return { recoverableErrors };
 }
 
+type DeferredModelProfileStartup = () => Promise<{ recoverableErrors: string[] }>;
+class DeferredModelProfileStartupError extends Error {
+	readonly profileError: unknown;
+
+	constructor(profileError: unknown) {
+		super("Deferred model profile startup failed");
+		this.profileError = profileError;
+	}
+}
+
+async function applyDeferredStartupModelProfilesForRoot(
+	args: StartupModelProfileArgs & {
+		isInteractive: boolean;
+		hasInteractiveTerminal: boolean;
+		initialMessage: string | undefined;
+		initialMessages: readonly string[];
+		resumeAction: "continue-tail" | "open-idle" | undefined;
+	},
+): Promise<{ recoverableErrors: string[] }> {
+	const recoverableErrors: string[] = [];
+	const onCredentialError = isStartupModelProfileCredentialRecoveryEligible(args)
+		? (error: ModelProfileCredentialError) => recoverableErrors.push(error.message)
+		: undefined;
+	await applyStartupModelProfilesWithPolicy({ ...args, preferCachedModels: true }, onCredentialError);
+	return { recoverableErrors };
+}
+
 interface InteractiveModeFactoryOptions {
 	session: AgentSession;
 	version: string;
@@ -645,6 +672,7 @@ export async function runInteractiveMode(
 	createInteractiveMode?: CreateInteractiveMode,
 	resumeAction?: "continue-tail" | "open-idle",
 	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
+	startDeferredModelProfiles?: DeferredModelProfileStartup,
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -705,45 +733,81 @@ export async function runInteractiveMode(
 				mode.showError("MCP tools could not be loaded.");
 			});
 	}
-
-	const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
-	if (!hasStartupInput && resumeAction === "continue-tail") {
-		try {
-			await session.continuePersistedHistory();
-		} catch (error: unknown) {
-			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-			mode.showError(errorMessage);
-		}
+	let deferredModelProfileFailure: Promise<never> | undefined;
+	if (startDeferredModelProfiles) {
+		mode.showStatus("Loading model profile…");
+		deferredModelProfileFailure = startDeferredModelProfiles().then(
+			result => {
+				for (const error of result.recoverableErrors) mode.showError(error);
+				mode.showStatus("Model profile ready");
+				return Promise.withResolvers<never>().promise;
+			},
+			error => {
+				const message = error instanceof Error ? error.message : "Model profile could not be loaded.";
+				mode.showError(message);
+				throw new DeferredModelProfileStartupError(error);
+			},
+		);
 	}
 
-	if (initialMessage !== undefined) {
-		try {
-			await session.prompt(initialMessage, { images: initialImages });
-		} catch (error: unknown) {
-			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-			mode.showError(errorMessage);
+	const runStartupInputAndPromptLoop = async (): Promise<never> => {
+		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
+		if (!hasStartupInput && resumeAction === "continue-tail") {
+			try {
+				await session.continuePersistedHistory();
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				mode.showError(errorMessage);
+			}
 		}
-	}
 
-	for (const message of initialMessages) {
-		try {
-			let text = message;
-			const slashResult = await executeBuiltinSlashCommand(text, {
-				ctx: mode,
-				handleBackgroundCommand: () => mode.handleBackgroundCommand(),
-			});
-			if (slashResult === true) continue;
-			if (typeof slashResult === "string") text = slashResult;
-			await session.prompt(text);
-		} catch (error: unknown) {
-			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-			mode.showError(errorMessage);
+		if (initialMessage !== undefined) {
+			try {
+				await session.prompt(initialMessage, { images: initialImages });
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				mode.showError(errorMessage);
+			}
 		}
-	}
 
-	while (true) {
-		const input = await mode.getUserInput();
-		await submitInteractiveInput(mode, session, input);
+		for (const message of initialMessages) {
+			try {
+				let text = message;
+				const slashResult = await executeBuiltinSlashCommand(text, {
+					ctx: mode,
+					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+				});
+				if (slashResult === true) continue;
+				if (typeof slashResult === "string") text = slashResult;
+				await session.prompt(text);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				mode.showError(errorMessage);
+			}
+		}
+
+		while (true) {
+			const input = await mode.getUserInput();
+			await submitInteractiveInput(mode, session, input);
+		}
+	};
+
+	const inputLoop = runStartupInputAndPromptLoop();
+	if (!deferredModelProfileFailure) {
+		await inputLoop;
+		return;
+	}
+	try {
+		await Promise.race([inputLoop, deferredModelProfileFailure]);
+	} catch (error) {
+		if (!(error instanceof DeferredModelProfileStartupError)) throw error;
+		try {
+			await mode.shutdown();
+		} finally {
+			mode.stop();
+		}
+		await inputLoop.catch(() => {});
+		throw error.profileError;
 	}
 }
 
@@ -1648,8 +1712,9 @@ export async function runRootCommand(
 			}
 		}
 
+		let startDeferredModelProfiles: DeferredModelProfileStartup | undefined;
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
-			const { recoverableErrors } = await applyStartupModelProfilesForRoot({
+			const profileArgs = {
 				session,
 				settings: settingsInstance,
 				modelRegistry,
@@ -1661,9 +1726,25 @@ export async function runRootCommand(
 				initialMessage,
 				initialMessages: parsedArgs.messages,
 				resumeAction: bareResumeAction,
-			});
-			for (const recoverableError of recoverableErrors) {
-				notifs.push({ kind: "error", message: recoverableError });
+			};
+			if (isInteractive && parsedArgs.mpreset) {
+				const ready = Promise.withResolvers<void>();
+				session.extendStartupTurnBarrier(ready.promise);
+				startDeferredModelProfiles = async () => {
+					try {
+						const result = await applyDeferredStartupModelProfilesForRoot(profileArgs);
+						ready.resolve();
+						return result;
+					} catch (error) {
+						ready.reject(error);
+						throw error;
+					}
+				};
+			} else {
+				const { recoverableErrors } = await applyStartupModelProfilesForRoot(profileArgs);
+				for (const recoverableError of recoverableErrors) {
+					notifs.push({ kind: "error", message: recoverableError });
+				}
 			}
 		}
 
@@ -1745,6 +1826,7 @@ export async function runRootCommand(
 						deps.createInteractiveMode,
 						bareResumeAction,
 						startDeferredMcpConfig,
+						startDeferredModelProfiles,
 					);
 				}
 			} catch (error) {

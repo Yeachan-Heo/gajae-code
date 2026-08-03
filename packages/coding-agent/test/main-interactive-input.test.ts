@@ -138,6 +138,122 @@ describe("interactive startup input ordering", () => {
 
 		expect(events).toEqual(["init", "render", "prompt:first queued", "prompt:second queued"]);
 	});
+	it("starts deferred model profiles after the first render and before persisted continuation", async () => {
+		const events: string[] = [];
+		const stop = new Error("stop interactive input");
+		const session = {
+			continuePersistedHistory: async () => events.push("continue"),
+		} as unknown as AgentSession;
+		const createMode = (): InteractiveMode =>
+			({
+				init: async () => events.push("init"),
+				showNewVersionNotification: () => {},
+				renderInitialMessages: () => events.push("render"),
+				showStatus: (message: string) => events.push(`status:${message}`),
+				showError: () => {},
+				getUserInput: async () => {
+					throw stop;
+				},
+			}) as unknown as InteractiveMode;
+
+		await expect(
+			runInteractiveMode(
+				session,
+				"test",
+				undefined,
+				[],
+				new StartupUpdateOrchestrator(
+					"interactive",
+					() => false,
+					async () => undefined,
+				),
+				[],
+				() => {},
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				createMode,
+				"continue-tail",
+				undefined,
+				async () => {
+					events.push("profile:start");
+					return { recoverableErrors: [] };
+				},
+			),
+		).rejects.toBe(stop);
+
+		expect(events.slice(0, 5)).toEqual([
+			"init",
+			"render",
+			"status:Loading model profile…",
+			"profile:start",
+			"continue",
+		]);
+	});
+	it("propagates deferred model profile failures after the first render", async () => {
+		const events: string[] = [];
+		const failure = new Error("profile activation failed");
+		const pendingInput = Promise.withResolvers<SubmittedUserInput>();
+		const session = {} as unknown as AgentSession;
+		const createMode = (): InteractiveMode =>
+			({
+				init: async () => events.push("init"),
+				showNewVersionNotification: () => {},
+				renderInitialMessages: () => events.push("render"),
+				showStatus: (message: string) => events.push(`status:${message}`),
+				showError: (message: string) => events.push(`error:${message}`),
+				getUserInput: () => {
+					events.push("input:wait");
+					return pendingInput.promise;
+				},
+				shutdown: async () => events.push("shutdown"),
+				stop: () => {
+					events.push("stop");
+					pendingInput.reject(new Error("input stopped"));
+				},
+			}) as unknown as InteractiveMode;
+
+		await expect(
+			runInteractiveMode(
+				session,
+				"test",
+				undefined,
+				[],
+				new StartupUpdateOrchestrator(
+					"interactive",
+					() => false,
+					async () => undefined,
+				),
+				[],
+				() => {},
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				createMode,
+				undefined,
+				undefined,
+				async () => {
+					events.push("profile:start");
+					throw failure;
+				},
+			),
+		).rejects.toBe(failure);
+
+		expect(events).toEqual([
+			"init",
+			"render",
+			"status:Loading model profile…",
+			"profile:start",
+			"input:wait",
+			"error:profile activation failed",
+			"shutdown",
+			"stop",
+		]);
+	});
 
 	it("awaits coordinator readiness after initialization and before rendering or startup prompt submission", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-interactive-readiness-"));

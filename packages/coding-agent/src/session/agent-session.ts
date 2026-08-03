@@ -2280,6 +2280,11 @@ export class AgentSession {
 		await barrier;
 		if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrier = undefined;
 	}
+	extendStartupTurnBarrier(barrier: Promise<void>): void {
+		const current = this.#startupTurnBarrier;
+		this.#startupTurnBarrier = current ? Promise.all([current, barrier]).then(() => {}) : barrier;
+		void this.#startupTurnBarrier.catch(() => {});
+	}
 
 	async #withSessionAdmission<T>(
 		kind: SessionAdmissionKind,
