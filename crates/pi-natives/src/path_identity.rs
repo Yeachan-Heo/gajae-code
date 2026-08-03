@@ -197,19 +197,19 @@ pub struct NativeDarwinReplacementIdentity {
 /// Closed result returned by the Darwin descriptor-bound replacement exchange.
 #[napi(object)]
 pub struct NativeDarwinReplacementResult {
-	pub ok:             bool,
-	pub state:          String,
-	pub code:           Option<String>,
-	pub phase:          String,
-	pub reason:         String,
-	pub parent_fsync:   bool,
-	pub source:         Option<NativeDarwinReplacementIdentity>,
-	pub destination:    Option<NativeDarwinReplacementIdentity>,
-	pub operation_id:   String,
+	pub ok:           bool,
+	pub state:        String,
+	pub code:         Option<String>,
+	pub phase:        String,
+	pub reason:       String,
+	pub parent_fsync: bool,
+	pub source:       Option<NativeDarwinReplacementIdentity>,
+	pub destination:  Option<NativeDarwinReplacementIdentity>,
+	pub operation_id: String,
 }
 
-/// Darwin-only persistent kernel replacement admission. The descriptor is opaque
-/// to JavaScript and remains held until `close` or process teardown.
+/// Darwin-only persistent kernel replacement admission. The descriptor is
+/// opaque to JavaScript and remains held until `close` or process teardown.
 #[napi]
 pub struct DarwinReplacementAuth {
 	#[cfg(target_os = "macos")]
@@ -1014,7 +1014,8 @@ pub fn exchange_darwin_managed_file(
 	{
 		let (parent_dev_negative, parent_dev, parent_dev_lossless) = parent_dev.get_u64();
 		let (parent_ino_negative, parent_ino, parent_ino_lossless) = parent_ino.get_u64();
-		if parent_dev_negative || parent_ino_negative || !parent_dev_lossless || !parent_ino_lossless {
+		if parent_dev_negative || parent_ino_negative || !parent_dev_lossless || !parent_ino_lossless
+		{
 			return NativeDarwinReplacementResult {
 				ok: false,
 				state: "not_committed".to_owned(),
@@ -1401,7 +1402,6 @@ pub(crate) mod platform {
 	use std::os::unix::fs::MetadataExt;
 	#[cfg(test)]
 	use std::sync::{Mutex, OnceLock, mpsc};
-	use napi::bindgen_prelude::BigInt;
 	use std::{
 		borrow::Cow,
 		ffi::CString,
@@ -1413,6 +1413,8 @@ pub(crate) mod platform {
 		},
 		path::{Component, Path},
 	};
+
+	use napi::bindgen_prelude::BigInt;
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDarwinReplacementIdentity,
@@ -4875,12 +4877,12 @@ pub(crate) mod platform {
 	}
 	#[cfg(target_os = "macos")]
 	pub(super) struct DarwinReplacementAuthHandle {
-		lock_fd: libc::c_int,
-		parent_fd: libc::c_int,
+		lock_fd:    libc::c_int,
+		parent_fd:  libc::c_int,
 		parent_dev: u64,
 		parent_ino: u64,
-		lock_dev: u64,
-		lock_ino: u64,
+		lock_dev:   u64,
+		lock_ino:   u64,
 	}
 
 	#[cfg(target_os = "macos")]
@@ -4901,7 +4903,12 @@ pub(crate) mod platform {
 
 	#[cfg(target_os = "macos")]
 	fn darwin_component(value: &str) -> Result<CString, &'static str> {
-		if value.is_empty() || value == "." || value == ".." || value.contains('/') || value.contains('\\') {
+		if value.is_empty()
+			|| value == "."
+			|| value == ".."
+			|| value.contains('/')
+			|| value.contains('\\')
+		{
 			return Err("invalid_request");
 		}
 		CString::new(value.as_bytes()).map_err(|_| "invalid_request")
@@ -4909,14 +4916,15 @@ pub(crate) mod platform {
 
 	#[cfg(target_os = "macos")]
 	fn darwin_parent_fd(path: &Path) -> Result<(libc::c_int, libc::stat), &'static str> {
-		let authority = checked_file(path, "directory").map_err(|result| match result.code.as_deref() {
-			Some("reparse_point") => "reparse_point",
-			Some("not_directory") => "not_directory",
-			Some("owner_mismatch") => "owner_mismatch",
-			Some("mode_mismatch") => "mode_mismatch",
-			Some("acl_verify_failed") => "acl_verify_failed",
-			_ => "io_error",
-		})?;
+		let authority =
+			checked_file(path, "directory").map_err(|result| match result.code.as_deref() {
+				Some("reparse_point") => "reparse_point",
+				Some("not_directory") => "not_directory",
+				Some("owner_mismatch") => "owner_mismatch",
+				Some("mode_mismatch") => "mode_mismatch",
+				Some("acl_verify_failed") => "acl_verify_failed",
+				_ => "io_error",
+			})?;
 		let security = verify_authority(&authority, "directory");
 		if !security.ok {
 			return Err(match security.code.as_deref() {
@@ -4969,17 +4977,20 @@ pub(crate) mod platform {
 	#[cfg(target_os = "macos")]
 	#[derive(Clone, Copy)]
 	struct DarwinExpectedIdentity {
-		dev: u64,
-		ino: u64,
-		nlink: u64,
-		size: u64,
+		dev:      u64,
+		ino:      u64,
+		nlink:    u64,
+		size:     u64,
 		mtime_ns: i64,
 		ctime_ns: i64,
-		digest: [u8; 32],
+		digest:   [u8; 32],
 	}
 
 	#[cfg(target_os = "macos")]
-	fn darwin_identity_value(stat: &libc::stat, digest: [u8; 32]) -> NativeDarwinReplacementIdentity {
+	fn darwin_identity_value(
+		stat: &libc::stat,
+		digest: [u8; 32],
+	) -> NativeDarwinReplacementIdentity {
 		let mut sha256 = String::with_capacity(64);
 		for byte in digest {
 			let _ = write!(sha256, "{byte:02x}");
@@ -5036,8 +5047,12 @@ pub(crate) mod platform {
 		}
 		let mut lock: libc::stat = unsafe { std::mem::zeroed() };
 		// SAFETY: parent_fd, lock name, and output storage are valid.
-		let lock_name = CString::new("darwin-replacement-admission.lock").map_err(|_| "invalid_request")?;
-		if unsafe { libc::fstatat(handle.parent_fd, lock_name.as_ptr(), &mut lock, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+		let lock_name =
+			CString::new("darwin-replacement-admission.lock").map_err(|_| "invalid_request")?;
+		if unsafe {
+			libc::fstatat(handle.parent_fd, lock_name.as_ptr(), &mut lock, libc::AT_SYMLINK_NOFOLLOW)
+		} != 0
+		{
 			return Err("migration_busy");
 		}
 		if lock.st_dev as u64 != handle.lock_dev
@@ -5049,8 +5064,8 @@ pub(crate) mod platform {
 		{
 			return Err("migration_busy");
 		}
-		// SAFETY: flock only inspects/reacquires the live descriptor and does not mutate
-		// the namespace.
+		// SAFETY: flock only inspects/reacquires the live descriptor and does not
+		// mutate the namespace.
 		if unsafe { flock(handle.lock_fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
 			return Err("migration_busy");
 		}
@@ -5069,7 +5084,12 @@ pub(crate) mod platform {
 		let (parent_fd, parent) = darwin_parent_fd(parent_path)?;
 		let mut lock_before: libc::stat = unsafe { std::mem::zeroed() };
 		let existed = unsafe {
-			libc::fstatat(parent_fd, requested_name.as_ptr(), &mut lock_before, libc::AT_SYMLINK_NOFOLLOW)
+			libc::fstatat(
+				parent_fd,
+				requested_name.as_ptr(),
+				&mut lock_before,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
 		} == 0;
 		let lock_fd = unsafe {
 			libc::openat(
@@ -5096,7 +5116,8 @@ pub(crate) mod platform {
 			}
 			return Err("identity_mismatch");
 		}
-		// SAFETY: flock is called on the owned descriptor with a nonblocking exclusive lock.
+		// SAFETY: flock is called on the owned descriptor with a nonblocking exclusive
+		// lock.
 		if unsafe { flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
 			let code = std::io::Error::last_os_error().raw_os_error();
 			unsafe {
@@ -5136,7 +5157,9 @@ pub(crate) mod platform {
 		verify_timestamps: bool,
 	) -> Result<(libc::stat, [u8; 32]), &'static str> {
 		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
+		{
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
 		if stat.st_mode & libc::S_IFMT != libc::S_IFREG
@@ -5184,50 +5207,167 @@ pub(crate) mod platform {
 		operation_id: &str,
 	) -> NativeDarwinReplacementResult {
 		let Some(source) = darwin_identity_parts(expected_source) else {
-			return darwin_result(false, "not_committed", Some("identity_mismatch"), "preflight", "invalid_source_identity", false, None, None, operation_id);
+			return darwin_result(
+				false,
+				"not_committed",
+				Some("identity_mismatch"),
+				"preflight",
+				"invalid_source_identity",
+				false,
+				None,
+				None,
+				operation_id,
+			);
 		};
 		let Some(destination) = darwin_identity_parts(expected_destination) else {
-			return darwin_result(false, "not_committed", Some("identity_mismatch"), "preflight", "invalid_destination_identity", false, None, None, operation_id);
+			return darwin_result(
+				false,
+				"not_committed",
+				Some("identity_mismatch"),
+				"preflight",
+				"invalid_destination_identity",
+				false,
+				None,
+				None,
+				operation_id,
+			);
 		};
 		if source_name == destination_name {
-			return darwin_result(false, "not_committed", Some("invalid_request"), "preflight", "names_equal", false, None, None, operation_id);
+			return darwin_result(
+				false,
+				"not_committed",
+				Some("invalid_request"),
+				"preflight",
+				"names_equal",
+				false,
+				None,
+				None,
+				operation_id,
+			);
 		}
 		let source_name = match darwin_component(source_name) {
 			Ok(name) => name,
-			Err(code) => return darwin_result(false, "not_committed", Some(code), "preflight", "invalid_source_name", false, None, None, operation_id),
+			Err(code) => {
+				return darwin_result(
+					false,
+					"not_committed",
+					Some(code),
+					"preflight",
+					"invalid_source_name",
+					false,
+					None,
+					None,
+					operation_id,
+				);
+			},
 		};
 		let destination_name = match darwin_component(destination_name) {
 			Ok(name) => name,
-			Err(code) => return darwin_result(false, "not_committed", Some(code), "preflight", "invalid_destination_name", false, None, None, operation_id),
+			Err(code) => {
+				return darwin_result(
+					false,
+					"not_committed",
+					Some(code),
+					"preflight",
+					"invalid_destination_name",
+					false,
+					None,
+					None,
+					operation_id,
+				);
+			},
 		};
 		if let Err(code) = darwin_revalidate_auth(handle) {
-			return darwin_result(false, "not_committed", Some(code), "preflight", "authorization_unavailable", false, None, None, operation_id);
+			return darwin_result(
+				false,
+				"not_committed",
+				Some(code),
+				"preflight",
+				"authorization_unavailable",
+				false,
+				None,
+				None,
+				operation_id,
+			);
 		}
 		let (parent_fd, parent) = match darwin_parent_fd(parent_path) {
 			Ok(value) => value,
-			Err(code) => return darwin_result(false, "not_committed", Some(code), "preflight", "parent_unavailable", false, None, None, operation_id),
+			Err(code) => {
+				return darwin_result(
+					false,
+					"not_committed",
+					Some(code),
+					"preflight",
+					"parent_unavailable",
+					false,
+					None,
+					None,
+					operation_id,
+				);
+			},
 		};
 		if parent.st_dev as u64 != parent_dev || parent.st_ino as u64 != parent_ino {
 			unsafe { libc::close(parent_fd) };
-			return darwin_result(false, "not_committed", Some("parent_mismatch"), "preflight", "parent_identity", false, None, None, operation_id);
+			return darwin_result(
+				false,
+				"not_committed",
+				Some("parent_mismatch"),
+				"preflight",
+				"parent_identity",
+				false,
+				None,
+				None,
+				operation_id,
+			);
 		}
 		let before_source = match darwin_named_identity(parent_fd, &source_name, &source, true) {
 			Ok(value) => value,
 			Err(code) => {
 				unsafe { libc::close(parent_fd) };
-				return darwin_result(false, "not_committed", Some(code), "preflight", "source_identity", false, None, None, operation_id);
+				return darwin_result(
+					false,
+					"not_committed",
+					Some(code),
+					"preflight",
+					"source_identity",
+					false,
+					None,
+					None,
+					operation_id,
+				);
 			},
 		};
-		let before_destination = match darwin_named_identity(parent_fd, &destination_name, &destination, true) {
-			Ok(value) => value,
-			Err(code) => {
-				unsafe { libc::close(parent_fd) };
-				return darwin_result(false, "not_committed", Some(code), "preflight", "destination_identity", true, Some((&before_source.0, before_source.1)), None, operation_id);
-			},
-		};
+		let before_destination =
+			match darwin_named_identity(parent_fd, &destination_name, &destination, true) {
+				Ok(value) => value,
+				Err(code) => {
+					unsafe { libc::close(parent_fd) };
+					return darwin_result(
+						false,
+						"not_committed",
+						Some(code),
+						"preflight",
+						"destination_identity",
+						true,
+						Some((&before_source.0, before_source.1)),
+						None,
+						operation_id,
+					);
+				},
+			};
 		if source.dev == destination.dev && source.ino == destination.ino {
 			unsafe { libc::close(parent_fd) };
-			return darwin_result(false, "not_committed", Some("identity_mismatch"), "preflight", "same_object", true, Some((&before_source.0, before_source.1)), Some((&before_destination.0, before_destination.1)), operation_id);
+			return darwin_result(
+				false,
+				"not_committed",
+				Some("identity_mismatch"),
+				"preflight",
+				"same_object",
+				true,
+				Some((&before_source.0, before_source.1)),
+				Some((&before_destination.0, before_destination.1)),
+				operation_id,
+			);
 		}
 		const RENAME_SWAP: u32 = 0x0000_0002;
 		const RENAME_NOFOLLOW_ANY: u32 = 0x0000_0010;
@@ -5243,13 +5383,33 @@ pub(crate) mod platform {
 		};
 		if swapped != 0 {
 			let code = std::io::Error::last_os_error().raw_os_error();
-			let state = if matches!(code, Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP | libc::EOPNOTSUPP | libc::EACCES | libc::EPERM | libc::EXDEV)) {
-				"not_committed"
-			} else {
-				"committed_unproven"
-			};
+			let state =
+				if matches!(
+					code,
+					Some(
+						libc::ENOSYS
+							| libc::EINVAL | libc::ENOTSUP
+							| libc::EOPNOTSUPP
+							| libc::EACCES | libc::EPERM
+							| libc::EXDEV
+					)
+				) {
+					"not_committed"
+				} else {
+					"committed_unproven"
+				};
 			unsafe { libc::close(parent_fd) };
-			return darwin_result(false, state, Some(darwin_exchange_error(code.unwrap_or(libc::EIO)),), "exchange", "renameatx_np_failed", false, Some((&before_source.0, before_source.1)), Some((&before_destination.0, before_destination.1)), operation_id);
+			return darwin_result(
+				false,
+				state,
+				Some(darwin_exchange_error(code.unwrap_or(libc::EIO))),
+				"exchange",
+				"renameatx_np_failed",
+				false,
+				Some((&before_source.0, before_source.1)),
+				Some((&before_destination.0, before_destination.1)),
+				operation_id,
+			);
 		}
 		let after_destination = darwin_named_identity(parent_fd, &destination_name, &source, false);
 		let after_source = darwin_named_identity(parent_fd, &source_name, &destination, false);
@@ -5257,15 +5417,45 @@ pub(crate) mod platform {
 			(Ok(source), Ok(destination)) => (source, destination),
 			_ => {
 				unsafe { libc::close(parent_fd) };
-				return darwin_result(false, "committed_unproven", Some("identity_mismatch"), "post_exchange", "identity_proof_failed", false, None, None, operation_id);
+				return darwin_result(
+					false,
+					"committed_unproven",
+					Some("identity_mismatch"),
+					"post_exchange",
+					"identity_proof_failed",
+					false,
+					None,
+					None,
+					operation_id,
+				);
 			},
 		};
 		let synced = unsafe { libc::fsync(parent_fd) } == 0;
 		unsafe { libc::close(parent_fd) };
 		if !synced {
-			return darwin_result(false, "committed_unproven", Some("durability_failed"), "parent_fsync", "parent_fsync_failed", false, Some((&after_source.0, after_source.1)), Some((&after_destination.0, after_destination.1)), operation_id);
+			return darwin_result(
+				false,
+				"committed_unproven",
+				Some("durability_failed"),
+				"parent_fsync",
+				"parent_fsync_failed",
+				false,
+				Some((&after_source.0, after_source.1)),
+				Some((&after_destination.0, after_destination.1)),
+				operation_id,
+			);
 		}
-		darwin_result(true, "committed_durable", None, "complete", "none", true, Some((&after_source.0, after_source.1)), Some((&after_destination.0, after_destination.1)), operation_id)
+		darwin_result(
+			true,
+			"committed_durable",
+			None,
+			"complete",
+			"none",
+			true,
+			Some((&after_source.0, after_source.1)),
+			Some((&after_destination.0, after_destination.1)),
+			operation_id,
+		)
 	}
 }
 
