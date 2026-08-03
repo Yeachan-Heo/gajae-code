@@ -1,5 +1,6 @@
 const ULTRATEST_TRAILER_PREFIX = "Ultratest-Verified:";
 const ULTRATEST_TRAILER = /^Ultratest-Verified: (?:killed \d+ \/ noted \d+|skip\(no assertion change\))$/u;
+const GIT_CONTEXT_ENVIRONMENT_NAMES = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]);
 
 const ULTRATEST_BLOCK_MESSAGE = [
 	"Ultratest commit gate: staged test changes require mutation verification before an inline commit.",
@@ -29,6 +30,16 @@ interface ParsedInlineCommit {
 interface ShellWords {
 	readonly words: string[];
 	readonly inspectable: boolean;
+}
+
+function gitContextEnvironment(): Record<string, string> {
+	const environment: Record<string, string> = {};
+	for (const [name, value] of Object.entries(process.env)) {
+		if (!name.startsWith("GIT_")) continue;
+		if (!GIT_CONTEXT_ENVIRONMENT_NAMES.has(name)) continue;
+		if (value !== undefined) environment[name] = value;
+	}
+	return environment;
 }
 
 function shellWords(command: string): ShellWords {
@@ -95,7 +106,7 @@ function parseInlineCommit(command: string): ParsedInlineCommit | null {
 	if (!parsed.inspectable) return null;
 	const words = [...parsed.words];
 	let bypass = false;
-	const gitEnvironment: Record<string, string> = {};
+	const gitEnvironment = gitContextEnvironment();
 	while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[0] ?? "")) {
 		const assignment = words.shift();
 		if (!assignment) return null;
@@ -103,7 +114,8 @@ function parseInlineCommit(command: string): ParsedInlineCommit | null {
 		const name = assignment.slice(0, separator);
 		const value = assignment.slice(separator + 1);
 		if (assignment === "GJC_ALLOW_NO_ULTRATEST=1") bypass = true;
-		if (name.startsWith("GIT_")) gitEnvironment[name] = value;
+		if (name.startsWith("GIT_") && !GIT_CONTEXT_ENVIRONMENT_NAMES.has(name)) return null;
+		if (GIT_CONTEXT_ENVIRONMENT_NAMES.has(name)) gitEnvironment[name] = value;
 	}
 	if (words.length !== 4) return null;
 	if (words[0] !== "git" || words[1] !== "commit") return null;
@@ -123,13 +135,29 @@ function isSupportedTestPath(filePath: string): boolean {
 
 function hasStagedTest(cwd: string, gitEnvironment: Readonly<Record<string, string>>): boolean | null {
 	try {
-		const result = Bun.spawnSync(["git", "diff", "--cached", "--name-only", "--diff-filter=ACDMRTUXB", "-z", "--"], {
-			cwd,
-			env: { ...process.env, ...gitEnvironment },
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "ignore",
-		});
+		const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_")));
+		const result = Bun.spawnSync(
+			[
+				"git",
+				"--no-pager",
+				"-c",
+				"core.fsmonitor=false",
+				"diff",
+				"--no-ext-diff",
+				"--cached",
+				"--name-only",
+				"--diff-filter=ACDMRTUXB",
+				"-z",
+				"--",
+			],
+			{
+				cwd,
+				env: { ...environment, ...gitEnvironment },
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "ignore",
+			},
+		);
 		if (result.exitCode !== 0) return null;
 		return result.stdout.toString().split("\0").filter(Boolean).some(isSupportedTestPath);
 	} catch (error) {

@@ -40,6 +40,15 @@ function gitWithEnvironment(cwd: string, args: string[], env: Record<string, str
 	return result.stdout.toString().trim();
 }
 
+async function pathExists(filePath: string): Promise<boolean> {
+	try {
+		await fs.access(filePath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function writeActiveSkill(cwd: string, skill: "team" | "ultratest" = "ultratest"): Promise<void> {
 	const now = new Date().toISOString();
 	await fs.mkdir(sessionStateDir(cwd, sessionId), { recursive: true });
@@ -211,6 +220,46 @@ describe("ultratest commit gate", () => {
 			`GIT_INDEX_FILE=${alternateIndex} git commit -m "test: alternate index"`,
 		);
 		expect(alternateIndexDecision.blocked).toBe(true);
+	});
+
+	it("does not execute a helper delivered by unsupported Git configuration assignments", async () => {
+		const cwd = await createFixture();
+		const marker = path.join(cwd, "fsmonitor-invoked");
+		const helper = path.join(cwd, "fsmonitor-helper.sh");
+		await Bun.write(helper, `#!/bin/sh\ntouch "${marker}"\n`);
+		await fs.chmod(helper, 0o755);
+
+		const decision = await mutationDecision(
+			cwd,
+			`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=${helper} git commit -m "test: injected fsmonitor"`,
+		);
+
+		expect(await pathExists(marker)).toBe(false);
+		expect(decision.blocked).toBe(false);
+	});
+
+	it("does not create trace output for unsupported Git environment assignments", async () => {
+		const cwd = await createFixture();
+		const trace = path.join(cwd, "trace.json");
+
+		const decision = await mutationDecision(cwd, `GIT_TRACE2_EVENT=${trace} git commit -m "test: trace output"`);
+
+		expect(await pathExists(trace)).toBe(false);
+		expect(decision.blocked).toBe(false);
+	});
+
+	it("suppresses repository-configured helpers during staged-test inspection", async () => {
+		const cwd = await createFixture();
+		const marker = path.join(cwd, "fsmonitor-invoked");
+		const helper = path.join(cwd, "fsmonitor-helper.sh");
+		await Bun.write(helper, `#!/bin/sh\ntouch "${marker}"\n`);
+		await fs.chmod(helper, 0o755);
+		git(cwd, ["config", "core.fsmonitor", helper]);
+
+		const decision = await mutationDecision(cwd, 'git commit -m "test: local fsmonitor"');
+
+		expect(decision.blocked).toBe(true);
+		expect(await pathExists(marker)).toBe(false);
 	});
 
 	it("fails open for nonliteral, operator, and ambiguous commit forms", async () => {
