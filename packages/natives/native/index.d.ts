@@ -7,8 +7,40 @@
  * consumers can import them portably; the native controller itself is built
  * only on macOS.
  */
+export interface ComputerInputAction {
+  action: "screenshot" | "click" | "double_click" | "move" | "drag" | "scroll" | "type" | "keypress" | "wait"
+  x?: number
+  y?: number
+  toX?: number
+  toY?: number
+  scrollX?: number
+  scrollY?: number
+  button?: string
+  text?: string
+  keys?: Array<string>
+  ms?: number
+  timeoutMs?: number
+  timeoutGroup?: number
+}
+
+export interface ComputerBatchStepResult {
+  index: number
+  action: string
+  screenshot?: ComputerScreenshot
+}
+
+export interface ComputerBatchResult {
+  results: Array<ComputerBatchStepResult>
+  failureCode?: string
+  failureIndex?: number
+  failureMessage?: string
+  primaryFailureCode?: string
+  primaryFailureMessage?: string
+}
+
 export declare class ComputerController {
   constructor()
+  executeBatch(expectedEpoch: number | undefined | null, actions: Array<ComputerInputAction>, timeoutMs?: number | undefined | null, signal?: unknown): Promise<ComputerBatchResult>
   screenshot(): ComputerScreenshot
   click(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
   doubleClick(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void

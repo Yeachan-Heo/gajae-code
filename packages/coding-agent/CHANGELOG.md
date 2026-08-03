@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Side-effecting native macOS computer input now restores the global cursor after releasing held input on success, cancellation, supervisor rejection, and action failure. Batches containing input execute in one serialized native capture-to-restore transaction, while screenshot/wait-only operations remain cursor-neutral; capture/restore failures are reported distinctly without masking the primary action error, and global focus behavior remains unchanged (#3642).
 - Composer Bash policy rejections now identify the active provider surface and direct Cursor Composer models to their native repository tools, enabling the agent runtime's bounded automatic recovery instead of leaving a blocked shell attempt as a terminal turn.
 - The `AgentSession retry fallback > invalidates an auth-failed managed credential` test now uses a stored credential instead of a runtime-key override, matching the pin-guard behavior added in #3724 where `--api-key`/`--credential` pinned keys are never invalidated; the shared test fixture installed runtime keys as plumbing, which silently tripped the new guard and blocked the auth invalidation path.
 - The Extension Control Center inspector no longer crashes when a narrow two-column layout leaves its preview pane fewer than two columns wide.

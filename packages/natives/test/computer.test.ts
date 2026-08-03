@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 
 const isMacOS = process.platform === "darwin";
 
@@ -18,6 +19,56 @@ type NativeComputerModule = {
 async function loadNativeComputerModule(): Promise<NativeComputerModule> {
 	return (await import("../native/index.js")) as unknown as NativeComputerModule;
 }
+const indexDtsPath = path.join(import.meta.dir, "..", "native", "index.d.ts");
+
+async function declaration(name: string): Promise<string> {
+	const dts = await Bun.file(indexDtsPath).text();
+	const matches = dts.match(new RegExp(`^export interface ${name} \\{[\\s\\S]*?^\\}`, "gm")) ?? [];
+	expect(matches).toHaveLength(1);
+	return matches[0]!;
+}
+
+describe("ComputerController declaration", () => {
+	it("has one strict declaration for each native batch DTO", async () => {
+		expect(await declaration("ComputerInputAction")).toBe(`export interface ComputerInputAction {
+  action: "screenshot" | "click" | "double_click" | "move" | "drag" | "scroll" | "type" | "keypress" | "wait"
+  x?: number
+  y?: number
+  toX?: number
+  toY?: number
+  scrollX?: number
+  scrollY?: number
+  button?: string
+  text?: string
+  keys?: Array<string>
+  ms?: number
+  timeoutMs?: number
+  timeoutGroup?: number
+}`);
+		expect(await declaration("ComputerBatchStepResult")).toBe(`export interface ComputerBatchStepResult {
+  index: number
+  action: string
+  screenshot?: ComputerScreenshot
+}`);
+		expect(await declaration("ComputerBatchResult")).toBe(`export interface ComputerBatchResult {
+  results: Array<ComputerBatchStepResult>
+  failureCode?: string
+  failureIndex?: number
+  failureMessage?: string
+  primaryFailureCode?: string
+  primaryFailureMessage?: string
+}`);
+
+		const dts = await Bun.file(indexDtsPath).text();
+		expect(dts).toMatch(
+			/export declare class ComputerController \{[\s\S]*?executeBatch\(expectedEpoch: number \| undefined \| null, actions: Array<ComputerInputAction>, timeoutMs\?: number \| undefined \| null, signal\?: unknown\): Promise<ComputerBatchResult>/,
+		);
+		const screenshot = dts.match(/^export interface ComputerScreenshot \{[\s\S]*?^\}/m)?.[0];
+		expect(screenshot).toMatch(/\n {2}captureId: number\n/);
+		expect(screenshot).not.toMatch(/\n {2}captureId: string\n/);
+		expect(dts).not.toContain("One native batch step. Field names deliberately mirror");
+	});
+});
 
 describe.if(isMacOS)("ComputerController napi binding", () => {
 	it("exists with expected methods", async () => {
@@ -25,6 +76,7 @@ describe.if(isMacOS)("ComputerController napi binding", () => {
 		const controller = new ComputerController();
 		expect(controller).toBeInstanceOf(ComputerController);
 		for (const method of [
+			"executeBatch",
 			"screenshot",
 			"click",
 			"doubleClick",

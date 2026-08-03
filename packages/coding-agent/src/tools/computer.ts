@@ -99,7 +99,7 @@ export interface ComputerScreenshotDetails {
 	originX?: number;
 	originY?: number;
 	displayEpoch?: number;
-	captureId?: string;
+	captureId?: number;
 	pngBytes?: number;
 	path?: string;
 }
@@ -119,12 +119,50 @@ export interface ComputerToolDetails {
 	keys?: string[];
 	ms?: number;
 	screenshot?: ComputerScreenshotDetails;
+	primaryError?: { code: string; message: string };
 	supervisor?: string;
 	steps?: ComputerToolDetails[];
 	meta?: OutputMeta;
 }
 
+type NativeBatchAction = {
+	action: "screenshot" | "click" | "double_click" | "move" | "drag" | "scroll" | "type" | "keypress" | "wait";
+	x?: number;
+	y?: number;
+	toX?: number;
+	toY?: number;
+	scrollX?: number;
+	scrollY?: number;
+	button?: string;
+	text?: string;
+	keys?: string[];
+	ms?: number;
+	timeoutMs?: number;
+	timeoutGroup?: number;
+};
+
+type NativeBatchStepResult = {
+	index: number;
+	action: string;
+	screenshot?: NativeScreenshot;
+};
+
+type NativeBatchResult = {
+	results: NativeBatchStepResult[];
+	failureCode?: string;
+	failureIndex?: number;
+	failureMessage?: string;
+	primaryFailureCode?: string;
+	primaryFailureMessage?: string;
+};
+
 type NativeController = {
+	executeBatch?: (
+		expectedEpoch: number | undefined,
+		actions: NativeBatchAction[],
+		timeoutMs?: number,
+		signal?: AbortSignal,
+	) => Promise<NativeBatchResult> | NativeBatchResult;
 	screenshot?: () => Promise<NativeScreenshot> | NativeScreenshot;
 	click?: (expectedEpoch: number | undefined, x: number, y: number, button?: string) => void;
 	doubleClick?: (expectedEpoch: number | undefined, x: number, y: number, button?: string) => void;
@@ -145,7 +183,7 @@ type NativeScreenshot = {
 	originX?: number;
 	originY?: number;
 	displayEpoch?: number;
-	captureId?: string;
+	captureId?: number;
 };
 
 export type ComputerControllerFactory = () => NativeController;
@@ -298,6 +336,10 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 				if (batchResult.failedStep) {
 					details.code = batchResult.failedStep.code;
 					details.message = batchResult.failedStep.message;
+					if (batchResult.primaryError) {
+						details.primaryError = batchResult.primaryError;
+						details.message += ` Primary failure: ${batchResult.primaryError.code}: ${batchResult.primaryError.message}`;
+					}
 					if (batchResult.screenshotSource !== undefined) {
 						await persistScreenshotFallback(batchResult.screenshotSource, details.screenshot, this.session);
 					}
@@ -572,6 +614,64 @@ interface BatchDispatchResult {
 	screenshot?: ComputerScreenshotDetails;
 	screenshotSource?: unknown;
 	failedStep?: { code: string; message: string };
+	primaryError?: { code: string; message: string };
+}
+
+interface BatchWireStep {
+	action: NativeBatchAction;
+	userIndex?: number;
+	finalScreenshot?: boolean;
+}
+
+function nativeBatchAction(params: SingleComputerParams, timeoutMs: number | undefined): NativeBatchAction {
+	const actionTimeoutMs = stepTimeoutFromParams(params, timeoutMs);
+	switch (params.action) {
+		case "screenshot":
+			return { action: "screenshot", timeoutMs: actionTimeoutMs };
+		case "click":
+		case "double_click":
+		case "move":
+			return {
+				action: params.action,
+				x: params.x,
+				y: params.y,
+				button: params.button,
+				timeoutMs: actionTimeoutMs,
+			};
+		case "drag":
+			return {
+				action: "drag",
+				x: params.x,
+				y: params.y,
+				toX: params.to_x,
+				toY: params.to_y,
+				button: params.button,
+				timeoutMs: actionTimeoutMs,
+			};
+		case "scroll":
+			return {
+				action: "scroll",
+				x: params.x,
+				y: params.y,
+				scrollX: params.scroll_x,
+				scrollY: params.scroll_y,
+				timeoutMs: actionTimeoutMs,
+			};
+		case "type":
+			return { action: "type", text: params.text, timeoutMs: actionTimeoutMs };
+		case "keypress":
+			return { action: "keypress", keys: params.keys, timeoutMs: actionTimeoutMs };
+		case "wait":
+			return { action: "wait", ms: capWaitMs(params.ms, actionTimeoutMs), timeoutMs: actionTimeoutMs };
+	}
+}
+
+function mapNativeBatchFailure(
+	code: string,
+	message: string | undefined,
+	hotkey?: string,
+): { code: string; message: string } {
+	return mapComputerError({ code, message: message ?? `${code}: Computer batch failed.` }, hotkey);
 }
 
 async function dispatchBatchComputerActions(
@@ -585,58 +685,93 @@ async function dispatchBatchComputerActions(
 	signal?: AbortSignal,
 	deadline?: ComputerDeadline,
 ): Promise<BatchDispatchResult> {
-	const steps: ComputerToolDetails[] = [];
-	let lastScreenshot: ComputerScreenshotDetails | undefined;
-	let lastScreenshotSource: unknown;
-	let context = initialContext;
-	for (const single of actions) {
-		const stepDetails = detailsFromParams(single);
-		try {
-			throwIfAborted(signal);
-			assertComputerDeadline(deadline);
-			const stepTimeoutMs = stepTimeoutFromParams(single, timeoutMs);
-			const stepDeadline = createComputerDeadline(stepTimeoutMs, deadline);
-			let result = await dispatchComputerAction(controller, single, stepDeadline, context, signal);
-			if (single.action !== "screenshot" && (single.include_screenshot === true || autoScreenshot)) {
-				result = await captureScreenshot(controller, stepDeadline, signal);
-			}
+	if (!controller.executeBatch) missingNativeMethod("batch", "executeBatch");
 
-			const screenshot = normalizeScreenshot(result);
-			if (screenshot) {
-				stepDetails.screenshot = screenshot;
-				lastScreenshot = screenshot;
-				lastScreenshotSource = result;
-				context = screenshot;
-			}
-			stepDetails.status = "success";
-			stepDetails.message = describeComputerSuccess(stepDetails);
-		} catch (error) {
-			if (error instanceof ToolAbortError) throw error;
-			const mapped = mapComputerError(error, hotkey);
-			stepDetails.status = mapped.code === COMPUTER_DISABLED_CODE ? "disabled" : "error";
-			stepDetails.code = mapped.code;
-			stepDetails.message = mapped.message;
-			steps.push(stepDetails);
-			return {
-				steps,
-				screenshot: lastScreenshot,
-				screenshotSource: lastScreenshotSource,
-				failedStep: { code: mapped.code, message: mapped.message },
-			};
+	const steps = actions.map(detailsFromParams);
+	const wireSteps: BatchWireStep[] = [];
+	for (const [userIndex, action] of actions.entries()) {
+		const nativeAction = { ...nativeBatchAction(action, timeoutMs), timeoutGroup: userIndex };
+		wireSteps.push({ action: nativeAction, userIndex });
+		if (action.action !== "screenshot" && (action.include_screenshot === true || autoScreenshot)) {
+			wireSteps.push({
+				action: {
+					action: "screenshot",
+					timeoutMs: nativeAction.timeoutMs,
+					timeoutGroup: nativeAction.timeoutGroup,
+				},
+				userIndex,
+			});
 		}
-		steps.push(stepDetails);
 	}
 	if (includeBatchScreenshot) {
-		lastScreenshotSource = await captureScreenshot(controller, deadline, signal);
-		lastScreenshot = normalizeScreenshot(lastScreenshotSource) ?? lastScreenshot;
+		wireSteps.push({ action: { action: "screenshot", timeoutMs }, finalScreenshot: true });
 	}
-	return { steps, screenshot: lastScreenshot, screenshotSource: lastScreenshotSource };
+
+	throwIfAborted(signal);
+	assertComputerDeadline(deadline);
+	const nativeTimeoutMs = remainingComputerTimeoutMs(deadline);
+	const nativeResult = await controller.executeBatch(
+		expectedEpochFromContext(initialContext),
+		wireSteps.map(step => step.action),
+		nativeTimeoutMs,
+		signal,
+	);
+	let lastScreenshot: ComputerScreenshotDetails | undefined;
+	let lastScreenshotSource: unknown;
+	let lastUserIndex = -1;
+	for (const result of nativeResult.results) {
+		const wireStep = wireSteps[result.index];
+		if (!wireStep) continue;
+		if (wireStep.userIndex !== undefined) lastUserIndex = Math.max(lastUserIndex, wireStep.userIndex);
+		const screenshot = normalizeScreenshot(result);
+		if (screenshot) {
+			lastScreenshot = screenshot;
+			lastScreenshotSource = result.screenshot;
+			if (wireStep.userIndex !== undefined) steps[wireStep.userIndex]!.screenshot = screenshot;
+		}
+	}
+	if (!nativeResult.failureCode) {
+		throwIfAborted(signal);
+		assertComputerDeadline(deadline);
+		for (const step of steps) step.message = describeComputerSuccess(step);
+		return { steps, screenshot: lastScreenshot, screenshotSource: lastScreenshotSource };
+	}
+
+	const mapped = mapNativeBatchFailure(nativeResult.failureCode, nativeResult.failureMessage, hotkey);
+	const failedWireStep = wireSteps[nativeResult.failureIndex ?? nativeResult.results.length];
+	const primaryError =
+		nativeResult.primaryFailureCode === undefined
+			? undefined
+			: {
+					code: nativeResult.primaryFailureCode,
+					message: nativeResult.primaryFailureMessage ?? "Computer batch failed.",
+				};
+	if (failedWireStep?.userIndex !== undefined) {
+		const failed = steps[failedWireStep.userIndex]!;
+		failed.status = mapped.code === COMPUTER_DISABLED_CODE ? "disabled" : "error";
+		failed.code = mapped.code;
+		failed.message = mapped.message;
+		lastUserIndex = Math.max(lastUserIndex, failedWireStep.userIndex);
+	}
+	for (const [index, step] of steps.entries()) {
+		if (index > lastUserIndex) break;
+		if (!step.message) step.message = describeComputerSuccess(step);
+	}
+	return {
+		steps: lastUserIndex >= 0 ? steps.slice(0, lastUserIndex + 1) : [],
+		screenshot: lastScreenshot,
+		screenshotSource: lastScreenshotSource,
+		failedStep: mapped,
+		primaryError,
+	};
 }
 
 function stepTimeoutFromParams(params: SingleComputerParams, batchTimeoutMs: number | undefined): number | undefined {
 	if (params.timeout === undefined) return batchTimeoutMs;
 	const timeoutSeconds = clampTimeout("computer", params.timeout);
-	return timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
+	const stepTimeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
+	if (stepTimeoutMs === undefined || batchTimeoutMs === undefined) return stepTimeoutMs ?? batchTimeoutMs;
+	return Math.min(stepTimeoutMs, batchTimeoutMs);
 }
 
 function detailsFromParams(params: ComputerParams): ComputerToolDetails {
@@ -821,6 +956,9 @@ function mapComputerError(error: unknown, hotkey?: string): { code: string; mess
 			"The host needs screen-recording or accessibility permission. Ask the user to grant it.",
 		COMPUTER_DISABLED:
 			"The computer tool is disabled or unsupported. Do not retry without enabling it on Apple Silicon macOS.",
+		COMPUTER_SCREENSHOT_FAILED: "Capture failed. Check screen-recording permission and retry the screenshot.",
+		COMPUTER_CURSOR_RESTORE_FAILED:
+			"Input may have completed, but the cursor could not be restored. Stop and ask the user to inspect the desktop before retrying.",
 	};
 	const hint = recoveryHints[code];
 	const message = hint ? `${code}: ${reason} ${hint}` : `${code}: ${reason}`;
@@ -832,6 +970,7 @@ interface ComputerAuditRecord {
 	action: ComputerActionName;
 	status: "success" | "error" | "disabled";
 	code?: string;
+	primaryError?: { code: string; message: string };
 	x?: number;
 	y?: number;
 	toX?: number;
@@ -853,6 +992,7 @@ function auditRecordFromDetails(details: ComputerToolDetails): ComputerAuditReco
 		status: details.status,
 	};
 	if (details.code) record.code = details.code;
+	if (details.primaryError) record.primaryError = details.primaryError;
 	if (details.x !== undefined) record.x = details.x;
 	if (details.y !== undefined) record.y = details.y;
 	if (details.toX !== undefined) record.toX = details.toX;

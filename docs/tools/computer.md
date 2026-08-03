@@ -53,10 +53,10 @@ The model action object uses an exact snake_case discriminated schema. CamelCase
 
 - Capture and coordinates cover only the primary display. The tool has no PID or window target.
 - Click, move, drag, scroll, type, and keypress are global, unscoped input; the current focus and macOS determine where they go.
-- Coordinate actions warp the hardware cursor and do not restore its prior position.
-- Do not use the desktop manually while a side-effecting action or batch runs; concurrent use is unsafe.
-- `screenshot` is read-only, and `wait` posts no input.
-- The kill switch gates future input, but it does not isolate the desktop or restore cursor position or focus.
+- A side-effecting action captures the global cursor once and restores it after held input is released. A batch containing input owns one native capture-to-restore transaction across all ordered input, wait, and screenshot steps.
+- Do not use the desktop manually while a side-effecting action or batch runs; concurrent use is unsafe, and restoration can overwrite cursor movement made during the transaction.
+- `screenshot` is read-only, and `wait` posts no input. Screenshot/wait-only batches do not move or restore the cursor.
+- The kill switch gates future input, but it does not isolate the desktop or restore application focus. Cursor restoration does not target or reactivate any PID or window.
 
 ## Errors
 
@@ -66,11 +66,15 @@ Stable computer error codes include:
 - `COMPUTER_SUSPENDED`
 - `COMPUTER_SUPERVISOR_NOT_LIVE`
 - `COMPUTER_PERMISSION_REQUIRED`
+- `COMPUTER_SCREENSHOT_FAILED` (including missing Screen Recording permission)
 - `COMPUTER_DISPLAY_STALE`
 - `COMPUTER_COORD_INVALID`
 - `COMPUTER_CANCELLED`
+- `COMPUTER_CURSOR_CAPTURE_FAILED`
+- `COMPUTER_CURSOR_RESTORE_FAILED`
+- `COMPUTER_TRANSACTION_FAILED`
 
-TS handles settings/platform exposure and UX mapping. Native `execute_action` remains the side-effect authority for supervisor state, permissions, display freshness, coordinate validation, cancellation, and release-all behavior.
+TS handles settings/platform exposure, UX mapping, screenshot persistence, and audit output. Native execution remains the side-effect authority for supervisor state, permissions, display freshness, coordinate validation, cancellation, release-all behavior, and the serialized cursor capture/restore transaction. Whole batches cross the native boundary once; TypeScript does not perform cursor cleanup.
 
 ## Rendering
 
