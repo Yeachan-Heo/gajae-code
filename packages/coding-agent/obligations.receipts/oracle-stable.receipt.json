@@ -9,7 +9,7 @@
 	],
 	"cwd": ".",
 	"exitCode": 0,
-	"treeHash": "083f368de02ff4f4374fa97ae57569c2e0f46e091691b11904579d1966d15c91",
+	"treeHash": "bcdbc2c51c22b68730aa406679ae976b524b775f8cdf20adb99679ecd5ff2ad4",
 	"artifacts": [
 		{
 			"path": "obligations.artifacts/oracle-stable/stdout.txt",
