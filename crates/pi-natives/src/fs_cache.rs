@@ -9,7 +9,8 @@
 //! - `FS_SCAN_CACHE_TTL_MS`       – default `1000`
 //! - `FS_SCAN_EMPTY_RECHECK_MS`   – default `200`
 //! - `FS_SCAN_CACHE_MAX_ENTRIES`   – default `16`
-//! - `FS_SCAN_CACHE_MAX_BYTES`     – default `134217728` (128 MiB); `0` disables caching
+//! - `FS_SCAN_CACHE_MAX_BYTES`     – default `134217728` (128 MiB); `0`
+//!   disables caching
 
 use std::{
 	borrow::Cow,
@@ -146,10 +147,7 @@ fn approx_entries_bytes(entries: &[GlobMatch]) -> usize {
 type ScanCache = DashMap<CacheKey, CacheEntry>;
 
 fn cached_bytes_total(cache: &ScanCache) -> usize {
-	cache
-		.iter()
-		.map(|entry| entry.value().approx_bytes)
-		.sum()
+	cache.iter().map(|entry| entry.value().approx_bytes).sum()
 }
 
 /// Evict oldest entries until both the entry-count and byte budgets hold.
