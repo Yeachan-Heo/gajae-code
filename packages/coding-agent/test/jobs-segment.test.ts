@@ -145,4 +145,17 @@ describe("jobs status-line segment", () => {
 		const rendered = Bun.stripANSI(component.render(120).join("\n"));
 		expect(rendered).toContain("job running");
 	});
+
+	test("status line drops the legacy job count when the jobs segment is hidden", () => {
+		const component = new StatusLineComponent(makeStatusLineSession([{ id: "task-1", type: "task" }]));
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: ["cost"],
+			showSkillHud: false,
+		});
+
+		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		expect(rendered).not.toContain("job running");
+	});
 });

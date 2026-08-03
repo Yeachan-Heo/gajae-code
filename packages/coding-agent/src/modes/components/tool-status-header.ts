@@ -806,8 +806,13 @@ export class StatusLineComponent implements Component {
 		}
 		right.push(...actionHints.map(hint => hint.content));
 
-		const runningBackgroundJobs =
-			this.session.getAsyncJobSnapshot()?.running.filter(job => job.metadata?.monitor !== true).length ?? 0;
+		// Background (non-monitor) jobs are part of the `jobs` widget, so honor its
+		// placement: hiding the `jobs` segment must hide this counter too.
+		const jobsSegmentVisible =
+			effectiveSettings.leftSegments.includes("jobs") || effectiveSettings.rightSegments.includes("jobs");
+		const runningBackgroundJobs = jobsSegmentVisible
+			? (this.session.getAsyncJobSnapshot()?.running.filter(job => job.metadata?.monitor !== true).length ?? 0)
+			: 0;
 		if (runningBackgroundJobs > 0) {
 			const icon = theme.icon.agents ? `${theme.icon.agents} ` : "";
 			const label = `${formatCount("job", runningBackgroundJobs)} running`;

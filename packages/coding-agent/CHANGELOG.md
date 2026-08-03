@@ -68,6 +68,9 @@
 - `todo_write` recovery reminders now distinguish rejected payloads from runtime aborts, preserve the available cause, and require durable state reconciliation instead of incorrectly telling the agent to change a valid payload (#3743, #3760).
 - Authority-absent Darwin `appendSync` regression coverage now exercises the replace-based race window (destination mutation during successor staging) instead of the retired in-place `O_APPEND` open path, and documents that ctime-only destination transitions are tolerated by exact replacement.
 - The legacy interactive footer now uses the session manager's cumulative usage index, so completed task and subagent tokens, premium requests, and estimated costs are included exactly once instead of reporting only the parent agent's assistant messages.
+### Fixed
+
+- Hiding the `jobs` status-line segment now also hides the background-job counter. The status line appended a hardcoded `N jobs running` chip after rendering the configured segments, without consulting `statusLine.leftSegments` / `statusLine.rightSegments`, so setting `jobs` to hidden in `/settings` removed only the monitor/cron widget while the async job counter kept rendering with the same icon and color. Every bundled preset keeps `jobs` in `rightSegments`, so default output is unchanged.
 
 ## [0.12.10] - 2026-08-03
 
