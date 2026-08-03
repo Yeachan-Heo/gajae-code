@@ -38,6 +38,7 @@ const DISABLED_MODEL_PROVIDERS = [
 	"kilo",
 	"kimi-code",
 	"litellm",
+	"mara",
 	"minimax",
 	"minimax-cn",
 	"minimax-code",

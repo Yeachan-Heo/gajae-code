@@ -78,9 +78,24 @@ async function tempDir(): Promise<string> {
 async function protectedTempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-protected-"));
 	tempRoots.push(dir);
-	const initialized = Bun.spawnSync(["git", "init", "--quiet"], { cwd: dir, stdout: "pipe", stderr: "pipe" });
+	const initialized = Bun.spawnSync(["git", "init", "--quiet", "--initial-branch=main"], {
+		cwd: dir,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	if (initialized.exitCode !== 0) throw new Error("Unable to initialize protected verifier fixture repository");
 	await Bun.write(path.join(dir, ".gitignore"), ".gjc/\n");
+	// Change-set resolution requires an authoritative integration base, so the
+	// fixture needs a real branch ref rather than an unborn HEAD.
+	for (const argv of [
+		["git", "config", "user.email", "fixture@example.invalid"],
+		["git", "config", "user.name", "Ultragoal Fixture"],
+		["git", "add", "-A"],
+		["git", "commit", "--quiet", "--no-gpg-sign", "-m", "fixture base"],
+	]) {
+		const step = Bun.spawnSync(argv, { cwd: dir, stdout: "pipe", stderr: "pipe" });
+		if (step.exitCode !== 0) throw new Error(`Unable to prepare protected verifier fixture repository: ${argv.join(" ")}`);
+	}
 	return dir;
 }
 
@@ -4203,6 +4218,10 @@ describe("native GJC ultragoal runtime", () => {
 		await startNextUltragoalGoal({ cwd: root });
 		await fs.mkdir(path.join(root, "artifacts"), { recursive: true });
 		await Bun.write(path.join(root, "artifacts", "fake.txt"), "fabricated trivial evidence");
+		// The surface helper always references an adversarial artifact; write it so the
+		// gate reaches the protected-execution binding this test targets instead of
+		// failing earlier on missing adversarial coverage.
+		await Bun.write(path.join(root, "artifacts", "adversarial-report.txt"), "adversarial boundary evidence");
 		const fabricatedGate = JSON.parse(passingQualityGate()) as Record<string, Record<string, unknown>>;
 		fabricatedGate.executorQa = executorQaWithSurface("api/package", [
 			{
@@ -4425,7 +4444,8 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("rejects protected replay records unrelated to asserted verification commands", async () => {
-		const unmatchedRoot = await tempDir();
+		// Needs a real repository: the protected gate fixture snapshots a tree hash.
+		const unmatchedRoot = await protectedTempDir();
 		const unmatchedPlan = await createUltragoalPlan({ cwd: unmatchedRoot, brief: "Required gate\nPass the gate." });
 		unmatchedPlan.goals[0]!.supersedable = false;
 		await writePlan(unmatchedRoot, unmatchedPlan);
@@ -4452,7 +4472,7 @@ describe("native GJC ultragoal runtime", () => {
 		expect(unmatched.status).toBe(1);
 		expect(unmatched.stderr).toContain("no matching live protectedExecution replay");
 
-		const extraRoot = await tempDir();
+		const extraRoot = await protectedTempDir();
 		const extraPlan = await createUltragoalPlan({ cwd: extraRoot, brief: "Required gate\nPass the gate." });
 		extraPlan.goals[0]!.supersedable = false;
 		await writePlan(extraRoot, extraPlan);
