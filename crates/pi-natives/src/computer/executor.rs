@@ -88,11 +88,11 @@ pub enum ExecError {
 	/// A screenshot step could not capture the display.
 	ScreenshotFailed,
 	/// A batch action failed at this zero-based index.
-	ActionFailed { index: usize, source: Box<ExecError> },
+	ActionFailed { index: usize, source: Box<Self> },
 	/// The cursor could not be captured before an input transaction began.
 	CursorCaptureFailed,
 	/// Cursor restoration failed, optionally after an action failure.
-	CursorRestoreFailed { primary: Option<Box<ExecError>> },
+	CursorRestoreFailed { primary: Option<Box<Self>> },
 	/// The process-global input transaction mutex was poisoned.
 	TransactionPoisoned,
 	/// An unexpected panic occurred after cursor capture.
