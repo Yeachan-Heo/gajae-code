@@ -261,6 +261,67 @@ function isActiveChatChild(ctx: InteractiveModeContext, component: Component): b
 	return component === ctx.bashComponent || component === ctx.pythonComponent || component === ctx.streamingComponent;
 }
 
+const pendingBashComponentIdentities = new WeakMap<BashExecutionComponent, object>();
+
+export function associatePendingBashComponent(component: BashExecutionComponent, identity: object): void {
+	pendingBashComponentIdentities.set(component, identity);
+}
+
+function isPersistedBashComponent(
+	ctx: InteractiveModeContext,
+	component: BashExecutionComponent,
+	persistedBashEntryIds: ReadonlySet<string>,
+): boolean {
+	const identity = pendingBashComponentIdentities.get(component);
+	const entryId = identity && ctx.session.getBashExecutionEntryId(identity);
+	return entryId !== undefined && persistedBashEntryIds.has(entryId);
+}
+
+function detachPendingExecutionComponents(
+	ctx: InteractiveModeContext,
+	persistedBashEntryIds: ReadonlySet<string>,
+): BashExecutionComponent[] {
+	const retained: BashExecutionComponent[] = [];
+	for (const component of ctx.pendingBashComponents) {
+		ctx.pendingMessagesContainer.detachChild(component);
+		if (isPersistedBashComponent(ctx, component, persistedBashEntryIds)) {
+			pendingBashComponentIdentities.delete(component);
+			if (ctx.bashComponent === component) ctx.bashComponent = undefined;
+			continue;
+		}
+		retained.push(component);
+	}
+	const activeComponent = ctx.bashComponent;
+	if (activeComponent && isPersistedBashComponent(ctx, activeComponent, persistedBashEntryIds)) {
+		if (ctx.pendingMessagesContainer.children.includes(activeComponent)) {
+			ctx.pendingMessagesContainer.detachChild(activeComponent);
+		}
+		if (ctx.chatContainer.children.includes(activeComponent)) {
+			ctx.chatContainer.detachChild(activeComponent);
+		}
+		pendingBashComponentIdentities.delete(activeComponent);
+		ctx.bashComponent = undefined;
+	}
+	return retained;
+}
+
+function restorePendingExecutionComponents(ctx: InteractiveModeContext, components: BashExecutionComponent[]): void {
+	ctx.pendingBashComponents = components;
+	for (const component of components) ctx.pendingMessagesContainer.addChild(component);
+}
+function detachPendingPythonComponents(ctx: InteractiveModeContext): EvalExecutionComponent[] {
+	const components = ctx.pendingPythonComponents.filter(component =>
+		ctx.pendingMessagesContainer.children.includes(component),
+	);
+	for (const component of components) ctx.pendingMessagesContainer.detachChild(component);
+	return components;
+}
+
+function restorePendingPythonComponents(ctx: InteractiveModeContext, components: EvalExecutionComponent[]): void {
+	ctx.pendingPythonComponents = components;
+	for (const component of components) ctx.pendingMessagesContainer.addChild(component);
+}
+
 function getChatChildTime(component: Component): number {
 	return chatChildAddedAt.get(component) ?? Date.now();
 }
@@ -898,18 +959,26 @@ export class UiHelpers {
 	renderInitialMessages(prebuiltContext?: SessionContext, options: RenderInitialMessagesOptions = {}): void {
 		// This path is used to rebuild the visible chat transcript (e.g. after custom/debug UI).
 		// Clear existing rendered chat first to avoid duplicating the full session in the container.
+		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
+		// A persisted execution owns its transcript position. Retire only its matching
+		// live component; still-running executions remain on the pending surface.
+		const persistedBashEntryIds = new Set(
+			context.messages
+				.filter(message => message.role === "bashExecution")
+				.map(message => getSessionMessageEntryId(message))
+				.filter((entryId): entryId is string => entryId !== undefined),
+		);
+		const pendingBashComponents = detachPendingExecutionComponents(this.ctx, persistedBashEntryIds);
+		const pendingPythonComponents = detachPendingPythonComponents(this.ctx);
 		const preservedChatChildren = options.preserveExistingChat ? this.ctx.chatContainer.children : undefined;
 		this.ctx.chatContainer.clear();
 		this.ctx.pendingMessagesContainer.clear();
-		this.ctx.pendingBashComponents = [];
-		this.ctx.pendingPythonComponents = [];
-
-		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.
-		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
 		this.ctx.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: true,
 		});
+		restorePendingExecutionComponents(this.ctx, pendingBashComponents);
+		restorePendingPythonComponents(this.ctx, pendingPythonComponents);
 
 		// Show compaction info if session was compacted
 		const allEntries = this.ctx.sessionManager.getEntries();
@@ -979,6 +1048,8 @@ export class UiHelpers {
 	}
 
 	updatePendingMessagesDisplay(): void {
+		const pendingBashComponents = detachPendingExecutionComponents(this.ctx, new Set());
+		const pendingPythonComponents = detachPendingPythonComponents(this.ctx);
 		this.ctx.pendingMessagesContainer.clear();
 		const queuedMessages = this.ctx.session.getQueuedMessages() as QueuedMessages;
 
@@ -1015,6 +1086,8 @@ export class UiHelpers {
 				this.ctx.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 			}
 		}
+		restorePendingExecutionComponents(this.ctx, pendingBashComponents);
+		restorePendingPythonComponents(this.ctx, pendingPythonComponents);
 	}
 
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
@@ -1237,16 +1310,18 @@ export class UiHelpers {
 		}
 	}
 
-	/** Move pending bash components from pending area to chat */
+	/** Move completed pending Bash components from the pending area to chat. */
 	flushPendingBashComponents(): void {
-		// Move (detach, not dispose) the live execution components from the pending
-		// area into the chat transcript — they are reused instances, so a disposing
-		// removeChild() would tear them down before re-adding.
+		const retained: BashExecutionComponent[] = [];
 		for (const component of this.ctx.pendingBashComponents) {
+			if (component.isRunning) {
+				retained.push(component);
+				continue;
+			}
 			this.ctx.pendingMessagesContainer.detachChild(component);
 			addChatChild(this.ctx, component);
 		}
-		this.ctx.pendingBashComponents = [];
+		this.ctx.pendingBashComponents = retained;
 		for (const component of this.ctx.pendingPythonComponents) {
 			this.ctx.pendingMessagesContainer.detachChild(component);
 			addChatChild(this.ctx, component);

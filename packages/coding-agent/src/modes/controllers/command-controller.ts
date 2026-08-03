@@ -54,7 +54,7 @@ import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
-import { prepareTranscriptRebuild } from "../utils/ui-helpers";
+import { associatePendingBashComponent, prepareTranscriptRebuild } from "../utils/ui-helpers";
 
 function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
 	ctx.chatContainer.addChild(new Spacer(1));
@@ -1143,46 +1143,41 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		const bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		const displayIdentity = {};
+		this.ctx.bashComponent = bashComponent;
 
 		if (isDeferred) {
-			this.ctx.pendingMessagesContainer.addChild(this.ctx.bashComponent);
-			this.ctx.pendingBashComponents.push(this.ctx.bashComponent);
+			associatePendingBashComponent(bashComponent, displayIdentity);
+			this.ctx.pendingMessagesContainer.addChild(bashComponent);
+			this.ctx.pendingBashComponents.push(bashComponent);
 		} else {
-			this.ctx.chatContainer.addChild(this.ctx.bashComponent);
+			this.ctx.chatContainer.addChild(bashComponent);
 		}
 		this.ctx.ui.requestRender();
 
 		try {
-			const result = await this.ctx.session.executeBash(
-				command,
-				chunk => {
-					if (this.ctx.bashComponent) {
-						this.ctx.bashComponent.appendOutput(chunk);
-					}
-				},
-				{ excludeFromContext },
-			);
+			const result = await this.ctx.session.executeBash(command, chunk => bashComponent.appendOutput(chunk), {
+				excludeFromContext,
+				displayIdentity,
+			});
 
-			if (this.ctx.bashComponent) {
-				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
-				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
-					output: result.output,
-					truncation: meta?.truncation,
-				});
-			}
+			const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
+			bashComponent.setComplete(result.exitCode, result.cancelled, {
+				output: result.output,
+				truncation: meta?.truncation,
+			});
 		} catch (error) {
-			if (this.ctx.bashComponent) {
-				this.ctx.bashComponent.setComplete(undefined, false);
-			}
+			bashComponent.setComplete(undefined, false);
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
-		const bashComponent = this.ctx.bashComponent;
-		if (isDeferred && bashComponent && this.ctx.pendingBashComponents.includes(bashComponent)) {
+		const pendingIndex = this.ctx.pendingBashComponents.indexOf(bashComponent);
+		if (isDeferred && !this.ctx.session.isStreaming && pendingIndex !== -1) {
 			this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+			this.ctx.pendingBashComponents.splice(pendingIndex, 1);
+			this.ctx.chatContainer.addChild(bashComponent);
 		}
-
-		this.ctx.bashComponent = undefined;
+		if (this.ctx.bashComponent === bashComponent) this.ctx.bashComponent = undefined;
 		this.ctx.ui.requestRender();
 	}
 

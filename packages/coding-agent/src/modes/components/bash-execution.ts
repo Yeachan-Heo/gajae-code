@@ -78,6 +78,9 @@ export class BashExecutionComponent extends Container {
 		this.#contentContainer.addChild(this.#headerText);
 		this.#contentContainer.addChild(this.#loader);
 	}
+	get isRunning(): boolean {
+		return this.#status === "running";
+	}
 
 	/**
 	 * Set whether the output is expanded (shows full output) or collapsed (preview only).
