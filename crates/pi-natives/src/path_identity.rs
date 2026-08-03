@@ -987,7 +987,7 @@ pub fn open_darwin_replacement_auth(
 	{
 		let handle = platform::open_darwin_replacement_auth(Path::new(&parent_path), &lock_name)
 			.map_err(napi::Error::from_reason)?;
-		return Ok(DarwinReplacementAuth { inner: Mutex::new(Some(handle)) });
+		Ok(DarwinReplacementAuth { inner: Mutex::new(Some(handle)) })
 	}
 	#[cfg(not(target_os = "macos"))]
 	{
@@ -1042,7 +1042,7 @@ pub fn exchange_darwin_managed_file(
 				operation_id,
 			};
 		};
-		return platform::exchange_darwin_managed_file(
+		platform::exchange_darwin_managed_file(
 			handle,
 			Path::new(&parent_path),
 			parent_dev,
@@ -1052,7 +1052,7 @@ pub fn exchange_darwin_managed_file(
 			&expected_source,
 			&expected_destination,
 			&operation_id,
-		);
+		)
 	}
 	#[cfg(not(target_os = "macos"))]
 	{
@@ -4997,7 +4997,7 @@ pub(crate) mod platform {
 		}
 		NativeDarwinReplacementIdentity {
 			dev: BigInt::from(stat.st_dev as u64),
-			ino: BigInt::from(stat.st_ino as u64),
+			ino: BigInt::from(stat.st_ino),
 			nlink: BigInt::from(stat.st_nlink as u64),
 			size: BigInt::from(stat.st_size as u64),
 			mtime_ns: BigInt::from(stat_mtime_ns(stat) as i64),
@@ -5045,21 +5045,24 @@ pub(crate) mod platform {
 		if parent.st_dev as u64 != handle.parent_dev || parent.st_ino as u64 != handle.parent_ino {
 			return Err("identity_mismatch");
 		}
+		// SAFETY: zero is valid initialized storage for the `fstatat` output.
 		let mut lock: libc::stat = unsafe { std::mem::zeroed() };
-		// SAFETY: parent_fd, lock name, and output storage are valid.
 		let lock_name =
 			CString::new("darwin-replacement-admission.lock").map_err(|_| "invalid_request")?;
+		// SAFETY: parent_fd, lock name, and output storage are valid.
 		if unsafe {
 			libc::fstatat(handle.parent_fd, lock_name.as_ptr(), &mut lock, libc::AT_SYMLINK_NOFOLLOW)
 		} != 0
 		{
 			return Err("migration_busy");
 		}
+		// SAFETY: querying the effective user ID has no preconditions.
+		let effective_uid = unsafe { libc::geteuid() };
 		if lock.st_dev as u64 != handle.lock_dev
 			|| lock.st_ino as u64 != handle.lock_ino
 			|| lock.st_mode & libc::S_IFMT != libc::S_IFREG
 			|| lock.st_nlink != 1
-			|| lock.st_uid != unsafe { libc::geteuid() }
+			|| lock.st_uid != effective_uid
 			|| lock.st_mode & 0o077 != 0
 		{
 			return Err("migration_busy");
@@ -5082,7 +5085,9 @@ pub(crate) mod platform {
 		}
 		let requested_name = darwin_component(lock_name)?;
 		let (parent_fd, parent) = darwin_parent_fd(parent_path)?;
+		// SAFETY: zero is valid initialized storage for the `fstatat` output.
 		let mut lock_before: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd, requested name, and output storage are valid.
 		let existed = unsafe {
 			libc::fstatat(
 				parent_fd,
@@ -5091,6 +5096,7 @@ pub(crate) mod platform {
 				libc::AT_SYMLINK_NOFOLLOW,
 			)
 		} == 0;
+		// SAFETY: parent_fd is live and the component name remains valid for the call.
 		let lock_fd = unsafe {
 			libc::openat(
 				parent_fd,
@@ -5100,16 +5106,21 @@ pub(crate) mod platform {
 			)
 		};
 		if lock_fd < 0 {
+			// SAFETY: this branch owns the live parent descriptor exactly once.
 			unsafe { libc::close(parent_fd) };
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
-		let mut lock = unsafe { std::mem::zeroed() };
+		// SAFETY: zero is valid initialized storage for the `fstat` output.
+		let mut lock: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: lock_fd and output storage are valid.
 		let valid = unsafe { libc::fstat(lock_fd, &mut lock) } == 0
 			&& lock.st_mode & libc::S_IFMT == libc::S_IFREG
-			&& lock.st_nlink == 1
-			&& lock.st_uid == unsafe { libc::geteuid() }
-			&& lock.st_mode & 0o077 == 0;
+			&& lock.st_nlink == 1;
+		// SAFETY: querying the effective user ID has no preconditions.
+		let effective_uid = unsafe { libc::geteuid() };
+		let valid = valid && lock.st_uid == effective_uid && lock.st_mode & 0o077 == 0;
 		if !valid {
+			// SAFETY: this branch owns both live descriptors exactly once.
 			unsafe {
 				libc::close(lock_fd);
 				libc::close(parent_fd);
@@ -5120,17 +5131,20 @@ pub(crate) mod platform {
 		// lock.
 		if unsafe { flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
 			let code = std::io::Error::last_os_error().raw_os_error();
+			// SAFETY: this branch owns both live descriptors exactly once.
 			unsafe {
 				libc::close(lock_fd);
 				libc::close(parent_fd);
 			}
 			return Err(match code {
 				Some(libc::EAGAIN) => "migration_busy",
-				Some(libc::EACCES) | Some(libc::EPERM) => "permission_denied",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
 				_ => "io_error",
 			});
 		}
+		// SAFETY: the live parent descriptor binds the newly created lock entry.
 		if !existed && unsafe { libc::fsync(parent_fd) } != 0 {
+			// SAFETY: this branch owns both live descriptors exactly once.
 			unsafe {
 				libc::close(lock_fd);
 				libc::close(parent_fd);
@@ -5141,7 +5155,7 @@ pub(crate) mod platform {
 			lock_fd,
 			parent_fd,
 			parent_dev: parent.st_dev as u64,
-			parent_ino: parent.st_ino as u64,
+			parent_ino: parent.st_ino,
 			lock_dev: lock.st_dev as u64,
 			lock_ino: lock.st_ino as u64,
 		};
@@ -5156,15 +5170,19 @@ pub(crate) mod platform {
 		expected: &DarwinExpectedIdentity,
 		verify_timestamps: bool,
 	) -> Result<(libc::stat, [u8; 32]), &'static str> {
+		// SAFETY: zero is valid initialized storage for the `fstatat` output.
 		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd, component name, and output storage are valid.
 		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
 			!= 0
 		{
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
+		// SAFETY: querying the effective user ID has no preconditions.
+		let effective_uid = unsafe { libc::geteuid() };
 		if stat.st_mode & libc::S_IFMT != libc::S_IFREG
 			|| stat.st_nlink != 1
-			|| stat.st_uid != unsafe { libc::geteuid() }
+			|| stat.st_uid != effective_uid
 			|| stat.st_mode & 0o077 != 0
 			|| stat.st_dev as u64 != expected.dev
 			|| stat.st_ino as u64 != expected.ino
@@ -5184,7 +5202,7 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(target_os = "macos")]
-	fn darwin_exchange_error(error: i32) -> &'static str {
+	const fn darwin_exchange_error(error: i32) -> &'static str {
 		match error {
 			libc::ENOSYS | libc::EINVAL | libc::ENOTSUP | libc::EOPNOTSUPP => "atomic_unavailable",
 			libc::EACCES | libc::EPERM => "permission_denied",
@@ -5306,7 +5324,8 @@ pub(crate) mod platform {
 				);
 			},
 		};
-		if parent.st_dev as u64 != parent_dev || parent.st_ino as u64 != parent_ino {
+		if parent.st_dev as u64 != parent_dev || parent.st_ino != parent_ino {
+			// SAFETY: this branch owns the live parent descriptor exactly once.
 			unsafe { libc::close(parent_fd) };
 			return darwin_result(
 				false,
@@ -5323,6 +5342,7 @@ pub(crate) mod platform {
 		let before_source = match darwin_named_identity(parent_fd, &source_name, &source, true) {
 			Ok(value) => value,
 			Err(code) => {
+				// SAFETY: this error branch owns the live parent descriptor exactly once.
 				unsafe { libc::close(parent_fd) };
 				return darwin_result(
 					false,
@@ -5341,6 +5361,7 @@ pub(crate) mod platform {
 			match darwin_named_identity(parent_fd, &destination_name, &destination, true) {
 				Ok(value) => value,
 				Err(code) => {
+					// SAFETY: this error branch owns the live parent descriptor exactly once.
 					unsafe { libc::close(parent_fd) };
 					return darwin_result(
 						false,
@@ -5356,6 +5377,7 @@ pub(crate) mod platform {
 				},
 			};
 		if source.dev == destination.dev && source.ino == destination.ino {
+			// SAFETY: this branch owns the live parent descriptor exactly once.
 			unsafe { libc::close(parent_fd) };
 			return darwin_result(
 				false,
@@ -5398,6 +5420,7 @@ pub(crate) mod platform {
 				} else {
 					"committed_unproven"
 				};
+			// SAFETY: this error branch owns the live parent descriptor exactly once.
 			unsafe { libc::close(parent_fd) };
 			return darwin_result(
 				false,
@@ -5413,22 +5436,20 @@ pub(crate) mod platform {
 		}
 		let after_destination = darwin_named_identity(parent_fd, &destination_name, &source, false);
 		let after_source = darwin_named_identity(parent_fd, &source_name, &destination, false);
-		let (after_source, after_destination) = match (after_source, after_destination) {
-			(Ok(source), Ok(destination)) => (source, destination),
-			_ => {
-				unsafe { libc::close(parent_fd) };
-				return darwin_result(
-					false,
-					"committed_unproven",
-					Some("identity_mismatch"),
-					"post_exchange",
-					"identity_proof_failed",
-					false,
-					None,
-					None,
-					operation_id,
-				);
-			},
+		let (Ok(after_source), Ok(after_destination)) = (after_source, after_destination) else {
+			// SAFETY: this error branch owns the live parent descriptor exactly once.
+			unsafe { libc::close(parent_fd) };
+			return darwin_result(
+				false,
+				"committed_unproven",
+				Some("identity_mismatch"),
+				"post_exchange",
+				"identity_proof_failed",
+				false,
+				None,
+				None,
+				operation_id,
+			);
 		};
 		// SAFETY: the verified parent descriptor and component-bound predecessor name
 		// remain live under the held Darwin replacement admission.
