@@ -44,8 +44,9 @@ async function pathExists(filePath: string): Promise<boolean> {
 	try {
 		await fs.access(filePath);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
+		throw error;
 	}
 }
 
@@ -220,6 +221,23 @@ describe("ultratest commit gate", () => {
 			`GIT_INDEX_FILE=${alternateIndex} git commit -m "test: alternate index"`,
 		);
 		expect(alternateIndexDecision.blocked).toBe(true);
+
+		const primaryWorktree = await createFixture("src/example.ts");
+		git(primaryWorktree, ["commit", "-m", "test: worktree baseline"]);
+		const linkedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ultratest-linked-worktree-"));
+		tempRoots.push(linkedRoot);
+		const linkedWorktree = path.join(linkedRoot, "worktree");
+		git(primaryWorktree, ["worktree", "add", "-q", "-b", path.basename(linkedRoot), linkedWorktree]);
+		await Bun.write(path.join(linkedWorktree, "src", "linked.test.ts"), "export const linked = true;\n");
+		git(linkedWorktree, ["add", "src/linked.test.ts"]);
+		const linkedGitDir = git(linkedWorktree, ["rev-parse", "--path-format=absolute", "--git-dir"]);
+		const commonDir = git(linkedWorktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+
+		const linkedWorktreeDecision = await mutationDecision(
+			primaryWorktree,
+			`GIT_DIR=${linkedGitDir} GIT_COMMON_DIR=${commonDir} GIT_WORK_TREE=${linkedWorktree} git commit -m "test: linked worktree"`,
+		);
+		expect(linkedWorktreeDecision.blocked).toBe(true);
 	});
 
 	it("does not execute a helper delivered by unsupported Git configuration assignments", async () => {

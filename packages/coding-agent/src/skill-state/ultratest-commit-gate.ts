@@ -1,6 +1,6 @@
 const ULTRATEST_TRAILER_PREFIX = "Ultratest-Verified:";
 const ULTRATEST_TRAILER = /^Ultratest-Verified: (?:killed \d+ \/ noted \d+|skip\(no assertion change\))$/u;
-const GIT_CONTEXT_ENVIRONMENT_NAMES = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]);
+const GIT_CONTEXT_ENVIRONMENT_NAMES = new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]);
 
 const ULTRATEST_BLOCK_MESSAGE = [
 	"Ultratest commit gate: staged test changes require mutation verification before an inline commit.",
