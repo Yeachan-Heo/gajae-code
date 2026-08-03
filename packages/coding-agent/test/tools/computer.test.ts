@@ -368,7 +368,9 @@ describe("computer tool dispatch", () => {
 
 			expect(result.isError).toBe(true);
 			expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
-			expect(textOf(result)).toContain(`ComputerController.${testCase.method} is unavailable`);
+			expect(textOf(result)).toContain(
+				`ComputerController.${testCase.name === "screenshot" ? "screenshot" : "executeBatch"} is unavailable`,
+			);
 		}
 	});
 
@@ -400,11 +402,7 @@ describe("computer tool dispatch", () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
 		const calls: string[] = [];
-		setComputerControllerFactoryForTests(() => ({
-			click: () => {
-				calls.push("click");
-			},
-		}));
+		setComputerControllerFactoryForTests(() => ({}));
 		const tool = new ComputerTool(
 			createSession(Settings.isolated({ "computer.enabled": true, "computer.autoScreenshot": true })),
 		);
@@ -965,6 +963,66 @@ describe("computer tool dispatch", () => {
 			}),
 		]);
 	});
+	it("does not report unexecuted prefix steps when native preflight fails later", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: () => ({
+				results: [],
+				failureCode: "COMPUTER_PERMISSION_REQUIRED",
+				failureIndex: 2,
+				failureMessage: "COMPUTER_PERMISSION_REQUIRED: accessibility permission is required",
+			}),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("preflight-prefix", {
+			action: "batch",
+			actions: [{ action: "screenshot" }, { action: "wait", ms: 10 }, { action: "click", x: 1, y: 2 }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.steps).toEqual([
+			expect.objectContaining({
+				action: "click",
+				code: "COMPUTER_PERMISSION_REQUIRED",
+				status: "error",
+			}),
+		]);
+	});
+
+	it("routes a single input through native batch and retains restoration primary failure", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let legacyClickCalls = 0;
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: (_expectedEpoch, actions, timeoutMs, signal) => {
+				expect(actions).toEqual([expect.objectContaining({ action: "click", x: 1, y: 2, timeoutGroup: 0 })]);
+				expect(timeoutMs).toBeGreaterThan(0);
+				expect(signal).toBeInstanceOf(AbortSignal);
+				return {
+					results: [],
+					failureCode: "COMPUTER_CURSOR_RESTORE_FAILED",
+					failureIndex: 0,
+					failureMessage: "COMPUTER_CURSOR_RESTORE_FAILED: restore failed",
+					primaryFailureCode: "COMPUTER_COORD_INVALID",
+					primaryFailureMessage: "COMPUTER_COORD_INVALID: coordinates out of bounds",
+				};
+			},
+			click: () => {
+				legacyClickCalls += 1;
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const controller = new AbortController();
+
+		const result = await tool.execute("single-restore", { action: "click", x: 1, y: 2 }, controller.signal);
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CURSOR_RESTORE_FAILED");
+		expect(result.details?.primaryError?.code).toBe("COMPUTER_COORD_INVALID");
+		expect(legacyClickCalls).toBe(0);
+	});
 	it("times out slow single-action native promises instead of reporting success", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
@@ -1051,7 +1109,7 @@ describe("computer tool dispatch", () => {
 	it("fails closed when executeBatch is unavailable", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
-		setComputerControllerFactoryForTests(() => ({ click: () => undefined }));
+		setComputerControllerFactoryForTests(() => ({}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
 		const result = await tool.execute("missing-batch", {
 			action: "batch",

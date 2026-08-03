@@ -221,7 +221,7 @@ const COMPUTER_INLINE_SCREENSHOT_PROVIDER_MAX_BYTES = 5 * 1024 * 1024;
 const COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY = 70;
 
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
-	controllerFactory = factory ?? createNativeComputerController;
+	controllerFactory = factory ? () => withLegacyBatchAdapterForTests(factory()) : createNativeComputerController;
 }
 
 export function setComputerPlatformForTests(platform: NodeJS.Platform | undefined): void {
@@ -355,6 +355,57 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					details.message = describeComputerSuccess(details);
 				}
 				const image = await inlineImageContentFromNativeResult(batchResult.screenshotSource, details, this.session);
+				await writeComputerAuditLog(this.session, details);
+				return image
+					? toolResult(details)
+							.content([{ type: "text", text: details.message }, image])
+							.done()
+					: toolResult(details).text(details.message).done();
+			}
+			if (params.action !== "screenshot") {
+				const singleResult = await dispatchBatchComputerActions(
+					controller,
+					[params],
+					timeoutMs,
+					hotkey,
+					latestScreenshotContexts.get(this.session),
+					false,
+					Boolean(this.session.settings.get("computer.autoScreenshot")),
+					signal,
+					deadline,
+				);
+				if (singleResult.screenshot) {
+					details.screenshot = singleResult.screenshot;
+					rememberLatestScreenshot(this.session, singleResult.screenshot);
+				}
+				if (singleResult.failedStep) {
+					details.status = singleResult.failedStep.code === COMPUTER_DISABLED_CODE ? "disabled" : "error";
+					details.code = singleResult.failedStep.code;
+					details.message = singleResult.failedStep.message;
+					if (singleResult.primaryError) {
+						details.primaryError = singleResult.primaryError;
+						details.message += ` Primary failure: ${singleResult.primaryError.code}: ${singleResult.primaryError.message}`;
+					}
+					if (singleResult.screenshotSource !== undefined) {
+						await persistScreenshotFallback(singleResult.screenshotSource, details.screenshot, this.session);
+					}
+					await writeComputerAuditLog(this.session, details);
+					return {
+						...toolResult(details).text(`${details.code}: ${details.message}`).done(),
+						isError: true,
+					};
+				}
+				details.status = "success";
+				details.message = describeComputerSuccess(details);
+				if (singleResult.screenshotSource !== undefined) {
+					await persistScreenshotFallback(singleResult.screenshotSource, details.screenshot, this.session);
+					details.message = describeComputerSuccess(details);
+				}
+				const image = await inlineImageContentFromNativeResult(
+					singleResult.screenshotSource,
+					details,
+					this.session,
+				);
 				await writeComputerAuditLog(this.session, details);
 				return image
 					? toolResult(details)
@@ -551,6 +602,85 @@ async function runComputerOperation<T>(
 	}
 }
 
+function withLegacyBatchAdapterForTests(controller: NativeController): NativeController {
+	if (
+		controller.executeBatch ||
+		(!controller.click &&
+			!controller.doubleClick &&
+			!controller.move &&
+			!controller.drag &&
+			!controller.scroll &&
+			!controller.type &&
+			!controller.keypress &&
+			!controller.wait)
+	) {
+		return controller;
+	}
+	return {
+		...controller,
+		executeBatch: async (expectedEpoch, actions, _timeoutMs, signal) => {
+			const results: NativeBatchStepResult[] = [];
+			for (const [index, action] of actions.entries()) {
+				throwIfAborted(signal);
+				switch (action.action) {
+					case "screenshot":
+						if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
+						results.push({ index, action: "screenshot", screenshot: await controller.screenshot() });
+						break;
+					case "click":
+						if (!controller.click) missingNativeMethod("click", "click");
+						controller.click(expectedEpoch, action.x!, action.y!, action.button ?? "left");
+						results.push({ index, action: "click" });
+						break;
+					case "double_click":
+						if (!controller.doubleClick) missingNativeMethod("double_click", "doubleClick");
+						controller.doubleClick(expectedEpoch, action.x!, action.y!, action.button ?? "left");
+						results.push({ index, action: "double_click" });
+						break;
+					case "move":
+						if (!controller.move) missingNativeMethod("move", "move");
+						controller.move(expectedEpoch, action.x!, action.y!);
+						results.push({ index, action: "move" });
+						break;
+					case "drag":
+						if (!controller.drag) missingNativeMethod("drag", "drag");
+						controller.drag(
+							expectedEpoch,
+							action.x!,
+							action.y!,
+							action.toX!,
+							action.toY!,
+							action.button ?? "left",
+						);
+						results.push({ index, action: "drag" });
+						break;
+					case "scroll":
+						if (!controller.scroll) missingNativeMethod("scroll", "scroll");
+						controller.scroll(expectedEpoch, action.x!, action.y!, action.scrollX!, action.scrollY!);
+						results.push({ index, action: "scroll" });
+						break;
+					case "type":
+						if (!controller.type) missingNativeMethod("type", "type");
+						controller.type(undefined, action.text!);
+						results.push({ index, action: "type" });
+						break;
+					case "keypress":
+						if (!controller.keypress) missingNativeMethod("keypress", "keypress");
+						controller.keypress(undefined, action.keys!);
+						results.push({ index, action: "keypress" });
+						break;
+					case "wait":
+						if (!controller.wait) missingNativeMethod("wait", "wait");
+						controller.wait(undefined, action.ms!);
+						results.push({ index, action: "wait" });
+						break;
+				}
+			}
+			return { results };
+		},
+	};
+}
+
 function dispatchComputerAction(
 	controller: NativeController,
 	params: SingleComputerParams,
@@ -718,11 +848,11 @@ async function dispatchBatchComputerActions(
 	);
 	let lastScreenshot: ComputerScreenshotDetails | undefined;
 	let lastScreenshotSource: unknown;
-	let lastUserIndex = -1;
+	const completedUserIndices = new Set<number>();
 	for (const result of nativeResult.results) {
 		const wireStep = wireSteps[result.index];
 		if (!wireStep) continue;
-		if (wireStep.userIndex !== undefined) lastUserIndex = Math.max(lastUserIndex, wireStep.userIndex);
+		if (wireStep.userIndex !== undefined) completedUserIndices.add(wireStep.userIndex);
 		const screenshot = normalizeScreenshot(result);
 		if (screenshot) {
 			lastScreenshot = screenshot;
@@ -751,14 +881,21 @@ async function dispatchBatchComputerActions(
 		failed.status = mapped.code === COMPUTER_DISABLED_CODE ? "disabled" : "error";
 		failed.code = mapped.code;
 		failed.message = mapped.message;
-		lastUserIndex = Math.max(lastUserIndex, failedWireStep.userIndex);
 	}
-	for (const [index, step] of steps.entries()) {
-		if (index > lastUserIndex) break;
-		if (!step.message) step.message = describeComputerSuccess(step);
+	for (const index of completedUserIndices) {
+		const step = steps[index];
+		if (step && !step.message && step.status === "success") {
+			step.message = describeComputerSuccess(step);
+		}
 	}
+	const reportedIndices = new Set(completedUserIndices);
+	if (failedWireStep?.userIndex !== undefined) reportedIndices.add(failedWireStep.userIndex);
+	const reportedSteps = [...reportedIndices]
+		.sort((left, right) => left - right)
+		.map(index => steps[index]!)
+		.filter(Boolean);
 	return {
-		steps: lastUserIndex >= 0 ? steps.slice(0, lastUserIndex + 1) : [],
+		steps: reportedSteps,
 		screenshot: lastScreenshot,
 		screenshotSource: lastScreenshotSource,
 		failedStep: mapped,
