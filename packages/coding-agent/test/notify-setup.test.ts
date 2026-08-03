@@ -1738,6 +1738,58 @@ test("CLI setup falls back to the code path when the durable state cannot be rea
 	expect(blockedReads).toBeGreaterThan(0);
 });
 
+test("CLI setup reports an undecided outcome when a failed commit leaves the state unreadable", async () => {
+	// `commitAtomicBatch` can persist and still throw, so a throw from inside the commit plus an
+	// unreadable durable state is genuinely undecided. Asserting either wording would be a guess.
+	const settings = setupSettings({
+		"notifications.enabled": false,
+		"notifications.telegram.botToken": "prior-token",
+		"notifications.telegram.chatId": "prior-chat",
+	});
+	let committed = false;
+	const readSnapshot = settings.getNotificationSettingsSnapshot.bind(settings);
+	Object.defineProperty(settings, "getNotificationSettingsSnapshot", {
+		configurable: true,
+		writable: true,
+		value: () => {
+			if (committed) throw new Error("settings snapshot unavailable");
+			return readSnapshot();
+		},
+	});
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (): Promise<CasReceipt> => {
+			committed = true;
+			throw new Error("commit failed after writing");
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{ action: "setup", rawArgs: [] },
+			{
+				settings,
+				fetchImpl,
+				setupToken: token,
+				setupChatId: "999",
+				setupInteractive: false,
+				setupPreflight: {},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(committed).toBe(true);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("may or may not have been saved");
+	expect(stderr).toContain("notify status");
+	expect(stderr).not.toContain("Unable to persist and activate");
+	expect(`${stdout}\n${stderr}`).not.toContain(token);
+});
+
 describe("notify daemon-internal lightweight startup", () => {
 	function tempAgentDir(): string {
 		return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-daemon-agent-"));

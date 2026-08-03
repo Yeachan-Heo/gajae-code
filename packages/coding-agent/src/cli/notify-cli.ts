@@ -457,6 +457,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		process.stdout.write(`Using provided chat id ${result.chatId} (non-interactive).\n`);
 	}
 	let settingsCommitted = false;
+	let commitAttempted = false;
 	try {
 		const proposedIdentity = deps.setupPreflight
 			? proposedIdentityFromSetupPreflight(deps.setupPreflight, token.trim(), result.chatId)
@@ -480,6 +481,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 			{ path: "notifications.telegram.enabled", op: "set", value: true },
 		];
 		if (deps.setupRedact ?? cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
+		commitAttempted = true;
 		const receipt = await settings.commitAtomicBatch(patches);
 		settingsCommitted = true;
 		const activationMarker = createTelegramActivationMarker({
@@ -539,7 +541,17 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		// commit itself — must not claim the settings were not persisted, or the operator
 		// walks away believing Telegram is off while the daemon is armed for that token.
 		// Observed state wins; the code-path flag is only the fallback for an unreadable read.
-		const persisted = telegramIntentIsPersisted(settings, token.trim(), result.chatId) ?? settingsCommitted;
+		const observed = telegramIntentIsPersisted(settings, token.trim(), result.chatId);
+		const persisted = observed ?? settingsCommitted;
+		// A commit that was entered and then failed, whose durable state is also unreadable,
+		// is genuinely undecided: `commitAtomicBatch` can persist and still throw. Claiming
+		// either outcome would be a guess, so say so and point at the authoritative check.
+		if (!persisted && observed === undefined && commitAttempted) {
+			throw new Error(
+				"Telegram notification settings may or may not have been saved, and the stored configuration could not be read; " +
+					`run \`gjc notify status\` before retrying: ${detail}`,
+			);
+		}
 		throw new Error(
 			persisted
 				? `Telegram notification settings were saved, but activation or recovery failed: ${detail}`

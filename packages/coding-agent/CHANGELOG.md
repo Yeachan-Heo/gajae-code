@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the new bot token and chat id are already on disk. The wording now follows the durable configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own (#3761).
+- A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the durable configuration already carries the attempted bot token, chat id, and enabled state. The wording now follows the stored configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own. A commit that was entered and then failed while the stored configuration is also unreadable is reported as undecided, pointing at `notify status`, instead of guessing either outcome (#3761).
 
 ## [0.12.11] - 2026-08-03
 
