@@ -8,7 +8,7 @@
 	],
 	"cwd": ".",
 	"exitCode": 0,
-	"treeHash": "9b76ea36007e4bad0f364b2f58a0d3ca88b37c3127511a6d685b537ccadf770b",
+	"treeHash": "083f368de02ff4f4374fa97ae57569c2e0f46e091691b11904579d1966d15c91",
 	"artifacts": [
 		{
 			"path": "obligations.artifacts/oracle-experimental/stdout.txt",
