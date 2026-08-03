@@ -162,7 +162,13 @@ describe("provider onboarding setup core", () => {
 		expect(result.compatibility).toBe("openai");
 		expect(result.preset).toBe("alibaba-token-plan");
 		expect(result.presetName).toBe("Alibaba Token Plan");
-		expect(result.modelIds).toEqual(["qwen3.8-max-preview", "glm-5.2", "deepseek-v4-pro"]);
+		expect(result.modelIds).toEqual([
+			"qwen3.8-max",
+			"qwen3.8-max-preview",
+			"glm-5.2",
+			"deepseek-v4-pro",
+			"deepseek-v4-flash-0731",
+		]);
 		expect(result.credentialSource).toBe("env");
 
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as { providers?: Record<string, unknown> };
@@ -173,9 +179,11 @@ describe("provider onboarding setup core", () => {
 			apiKeyEnv: "ALIBABA_TOKEN_PLAN_API_KEY",
 			compat: { supportsDeveloperRole: false },
 			models: [
+				{ id: "qwen3.8-max", api: "openai-completions" },
 				{ id: "qwen3.8-max-preview", api: "openai-responses" },
 				{ id: "glm-5.2", api: "openai-completions" },
 				{ id: "deepseek-v4-pro", api: "openai-completions" },
+				{ id: "deepseek-v4-flash-0731", api: "openai-completions" },
 			],
 		});
 		expect(findProviderPreset("alibaba")?.id).toBe("alibaba-token-plan");
@@ -195,15 +203,21 @@ describe("provider onboarding setup core", () => {
 		authStorage.setRuntimeApiKey("alibaba-token-plan", "test-key");
 		try {
 			const registry = new ModelRegistry(authStorage, modelsPath);
-			const qwen = registry.find("alibaba-token-plan", "qwen3.8-max-preview");
+			const qwenGa = registry.find("alibaba-token-plan", "qwen3.8-max");
+			const qwenPreview = registry.find("alibaba-token-plan", "qwen3.8-max-preview");
 			const glm = registry.find("alibaba-token-plan", "glm-5.2");
-			const deepseek = registry.find("alibaba-token-plan", "deepseek-v4-pro");
-			if (!qwen || !glm || !deepseek) throw new Error("Expected Alibaba Token Plan models to load");
+			const deepseekPro = registry.find("alibaba-token-plan", "deepseek-v4-pro");
+			const deepseekFlash = registry.find("alibaba-token-plan", "deepseek-v4-flash-0731");
+			if (!qwenGa || !qwenPreview || !glm || !deepseekPro || !deepseekFlash) {
+				throw new Error("Expected Alibaba Token Plan models to load");
+			}
 
-			expect(qwen.api).toBe("openai-responses");
+			expect(qwenGa.api).toBe("openai-completions");
+			expect(qwenPreview.api).toBe("openai-responses");
 			expect(glm.api).toBe("openai-completions");
-			expect(deepseek.api).toBe("openai-completions");
-			for (const model of [qwen, glm, deepseek]) {
+			expect(deepseekPro.api).toBe("openai-completions");
+			expect(deepseekFlash.api).toBe("openai-completions");
+			for (const model of [qwenGa, qwenPreview, glm, deepseekPro]) {
 				expect(model.reasoning).toBe(true);
 				expect(getSupportedEfforts(model)).toEqual([
 					Effort.Minimal,
@@ -215,11 +229,13 @@ describe("provider onboarding setup core", () => {
 				const compat = model.compat;
 				expect(compat && "supportsDeveloperRole" in compat ? compat.supportsDeveloperRole : undefined).toBe(false);
 			}
-			expect(clampThinkingLevelForModel(qwen, Effort.XHigh)).toBe(Effort.XHigh);
-			expect(clampThinkingLevelForModel(qwen, Effort.Medium)).toBe(Effort.Medium);
-			expect(clampThinkingLevelForModel(qwen, Effort.Low)).toBe(Effort.Low);
+			expect(getSupportedEfforts(deepseekFlash)).toEqual([Effort.Low, Effort.High, Effort.Max]);
+			expect(clampThinkingLevelForModel(qwenGa, Effort.XHigh)).toBe(Effort.XHigh);
+			expect(clampThinkingLevelForModel(qwenGa, Effort.Medium)).toBe(Effort.Medium);
+			expect(clampThinkingLevelForModel(qwenGa, Effort.Low)).toBe(Effort.Low);
 			expect(clampThinkingLevelForModel(glm, Effort.High)).toBe(Effort.High);
-			expect(clampThinkingLevelForModel(deepseek, Effort.XHigh)).toBe(Effort.XHigh);
+			expect(clampThinkingLevelForModel(deepseekPro, Effort.XHigh)).toBe(Effort.XHigh);
+			expect(clampThinkingLevelForModel(deepseekFlash, Effort.Max)).toBe(Effort.Max);
 
 			const sessionStub = {
 				model: undefined,

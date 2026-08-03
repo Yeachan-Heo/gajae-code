@@ -38,6 +38,7 @@
 ### Added
 
 - `/login anthropic --manual` pairs by pasting the authorization code Anthropic shows in the browser instead of waiting on a `localhost:54545` callback the browser cannot reach. Complete it with `/login <code>`. Use it when gjc runs over SSH, in a container, or on a headless host; the default `/login anthropic` still uses the loopback callback. The flag is resolved before the paste fallback, so it is never mistaken for an authorization code, and providers without a paste-a-code redirect reject it explicitly instead of silently falling back.
+- The Alibaba Token Plan provider preset now installs GA `qwen3.8-max` through Chat Completions and includes the bundled `deepseek-v4-flash-0731` model. Existing built-in Alibaba model profiles remain on `qwen3.8-max-preview` while both Qwen variants coexist.
 
 ### Fixed
 
