@@ -5430,7 +5430,28 @@ pub(crate) mod platform {
 				);
 			},
 		};
+		// SAFETY: the verified parent descriptor and component-bound predecessor name
+		// remain live under the held Darwin replacement admission.
+		if unsafe { libc::unlinkat(parent_fd, source_name.as_ptr(), 0) } != 0 {
+			let code = security_code(&std::io::Error::last_os_error());
+			// SAFETY: this error branch owns the live parent descriptor exactly once.
+			unsafe { libc::close(parent_fd) };
+			return darwin_result(
+				false,
+				"committed_unproven",
+				Some(code),
+				"predecessor_cleanup",
+				"unlink_failed",
+				false,
+				Some((&after_source.0, after_source.1)),
+				Some((&after_destination.0, after_destination.1)),
+				operation_id,
+			);
+		}
+		// SAFETY: the live parent descriptor binds both the exchange and predecessor
+		// unlink.
 		let synced = unsafe { libc::fsync(parent_fd) } == 0;
+		// SAFETY: this path owns the live parent descriptor exactly once.
 		unsafe { libc::close(parent_fd) };
 		if !synced {
 			return darwin_result(

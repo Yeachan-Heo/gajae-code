@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 describe("Darwin managed replacement", () => {
-	it("atomically replaces an existing managed transcript while retaining its predecessor", () => {
+	it("atomically replaces an existing managed transcript without retaining predecessor artifacts", () => {
 		if (process.platform !== "darwin") return;
 		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-darwin-managed-replace-"));
 		tempDirectories.push(temporaryDirectory);
@@ -29,11 +29,16 @@ describe("Darwin managed replacement", () => {
 		store.replaceExpected("session.jsonl", Buffer.from("after\n"), expected);
 
 		expect(fs.readFileSync(transcript, "utf8")).toBe("after\n");
-		const predecessors = fs
-			.readdirSync(root.canonicalPath)
-			.filter(entry => entry.startsWith(".session.jsonl.") && entry.endsWith(".replacement"));
-		expect(predecessors).toHaveLength(1);
-		expect(fs.readFileSync(path.join(root.canonicalPath, predecessors[0]), "utf8")).toBe("before\n");
+		expect(
+			fs
+				.readdirSync(root.canonicalPath)
+				.some(
+					entry =>
+						entry.includes(".replacement") ||
+						entry.startsWith(".gjc-darwin-replacement-") ||
+						entry === ".gjc-managed-session-internal",
+				),
+		).toBe(false);
 	});
 	it("rejects append while the Darwin replacement admission is held", () => {
 		if (process.platform !== "darwin") return;

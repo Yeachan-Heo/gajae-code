@@ -5,17 +5,18 @@ import * as path from "node:path";
 import {
 	applyOwnerOnlyFdSecurity,
 	applyOwnerOnlyPathSecurity,
+	type DarwinReplacementAuth,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
 	exactRestore,
 	exactUnlink,
-	linkNoReplacePath,
 	exchangeDarwinManagedFile,
+	linkNoReplacePath,
 	type NativeDarwinReplacementIdentity,
 	type NativeDarwinReplacementResult,
-	openDarwinReplacementAuth,
 	type NativeDirectoryTreeSnapshot,
 	type NativeOwnerOnlySecurityResult,
+	openDarwinReplacementAuth,
 	openRecoveryFsRoot,
 	type RecoveryFsRoot,
 	renameNoReplacePath,
@@ -57,6 +58,16 @@ export class ManagedPublishError extends Error {
 		this.name = "ManagedPublishError";
 		this.classification = classification;
 		this.diagnostic = formatNativePublishDiagnostic(outcome);
+	}
+}
+export class ManagedDarwinReplacementError extends Error {
+	readonly code = "managed_replace_failed";
+	readonly nativeResult: NativeDarwinReplacementResult;
+
+	constructor(nativeResult: NativeDarwinReplacementResult) {
+		super(`managed_replace_${nativeResult.state}:${nativeResult.code ?? nativeResult.reason}`);
+		this.name = "ManagedDarwinReplacementError";
+		this.nativeResult = nativeResult;
 	}
 }
 
@@ -148,7 +159,6 @@ export type ManagedStorageFailure =
 	| "atomic_unavailable"
 	| "durability_not_provable"
 	| "migration_retired"
-	| "retention_bound_exceeded"
 	| "managed_storage_unsupported";
 
 export interface ManagedStorageLock {
@@ -336,67 +346,6 @@ export interface ManagedDirectoryRoot {
 	readonly dev: bigint;
 	readonly ino: bigint;
 }
-/**
- * Trusted Darwin replacement metadata. It contains no descriptor or pathname
- * authority; every operation revalidates the bound directory before admission.
- */
-export interface ManagedDarwinReplacementContext {
-	readonly rootPath: string;
-	readonly rootDev: bigint;
-	readonly rootIno: bigint;
-	readonly directoryPath: string;
-	readonly directoryDev: bigint;
-	readonly directoryIno: bigint;
-	readonly replacementDirectory: string;
-	readonly lockName: "darwin-replacement-admission.lock";
-}
-
-export function createManagedDarwinReplacementContext(
-	root: ManagedDirectoryRoot,
-	directory: string,
-): ManagedDarwinReplacementContext | undefined {
-	if (process.platform !== "darwin") return undefined;
-	assertManagedDirectoryRoot(root);
-	managedRelativePath(root, directory);
-	const resolved = path.resolve(directory);
-	const stat = fs.lstatSync(resolved, { bigint: true });
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Managed replacement directory is unsafe");
-	return Object.freeze({
-		rootPath: root.canonicalPath,
-		rootDev: root.dev,
-		rootIno: root.ino,
-		directoryPath: resolved,
-		directoryDev: stat.dev,
-		directoryIno: stat.ino,
-		replacementDirectory: path.join(resolved, ".gjc-managed-session-internal", "replacements"),
-		lockName: "darwin-replacement-admission.lock" as const,
-	});
-}
-
-function deriveManagedDarwinReplacementContext(
-	context: ManagedDarwinReplacementContext | undefined,
-	root: ManagedDirectoryRoot,
-	directory: string,
-): ManagedDarwinReplacementContext | undefined {
-	if (!context || process.platform !== "darwin") return undefined;
-	if (
-		context.rootPath !== root.canonicalPath ||
-		context.rootDev !== root.dev ||
-		context.rootIno !== root.ino
-	)
-		throw new Error("Managed Darwin replacement root binding changed");
-	const resolved = path.resolve(directory);
-	managedRelativePath(root, resolved);
-	const stat = fs.lstatSync(resolved, { bigint: true });
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Managed Darwin replacement directory is unsafe");
-	return Object.freeze({
-		...context,
-		directoryPath: resolved,
-		directoryDev: stat.dev,
-		directoryIno: stat.ino,
-		replacementDirectory: path.join(resolved, ".gjc-managed-session-internal", "replacements"),
-	});
-}
 
 /**
  * Establish the first managed directory beneath a potentially shared ancestor.
@@ -499,6 +448,18 @@ function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): read
 	if (path.isAbsolute(relative) || relative.split(path.sep).includes(".."))
 		throw new Error(`Managed path escapes configured root: ${pathname}`);
 	return relative.split(path.sep);
+}
+function openManagedDarwinReplacementAuth(
+	root: ManagedDirectoryRoot,
+	directory: string,
+): DarwinReplacementAuth | undefined {
+	if (process.platform !== "darwin") return undefined;
+	assertManagedDirectoryRoot(root);
+	managedRelativePath(root, directory);
+	const resolved = path.resolve(directory);
+	const stat = fs.lstatSync(resolved, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Managed replacement directory is unsafe");
+	return openDarwinReplacementAuth(resolved, "darwin-replacement-admission.lock");
 }
 
 const PROCESS_START_ID = randomUUID();
@@ -605,7 +566,6 @@ export class ManagedSessionDescendantStore {
 	/** Logical profile root inherited by nested managed session destinations. */
 	readonly #profileAgentDir: string;
 	readonly #subtreeRoot: ManagedDirectoryRoot;
-	readonly #darwinContext: ManagedDarwinReplacementContext | undefined;
 
 	constructor(
 		root: ManagedDirectoryRoot,
@@ -613,7 +573,6 @@ export class ManagedSessionDescendantStore {
 		retained?: { authority: RecoveryFsRoot; authorityBaseDir: string },
 		policy?: ManagedSessionSecurityPolicy,
 		profileAgentDir?: string,
-		darwinContext?: ManagedDarwinReplacementContext,
 	) {
 		managedRelativePath(root, baseDir);
 
@@ -633,8 +592,6 @@ export class ManagedSessionDescendantStore {
 				ino: BigInt(captured.snapshot.rootIno),
 			});
 			this.#authority = retained.authority;
-			this.#darwinContext = deriveManagedDarwinReplacementContext(darwinContext, root, this.#baseDir);
-			if (darwinContext && !this.#darwinContext) throw new Error("Managed Darwin replacement authority unavailable");
 			this.#assertBound();
 
 			return;
@@ -643,8 +600,6 @@ export class ManagedSessionDescendantStore {
 		ensureManagedDirectory(this.#baseDir, root, this.#policy);
 		const subtreeStat = fs.lstatSync(this.#baseDir, { bigint: true });
 		this.#subtreeRoot = Object.freeze({ canonicalPath: this.#baseDir, dev: subtreeStat.dev, ino: subtreeStat.ino });
-		this.#darwinContext = deriveManagedDarwinReplacementContext(darwinContext, root, this.#baseDir);
-		if (darwinContext && !this.#darwinContext) throw new Error("Managed Darwin replacement authority unavailable");
 		if (process.platform === "linux") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
 			const authority = openRecoveryFsRoot(this.#baseDir);
@@ -682,38 +637,12 @@ export class ManagedSessionDescendantStore {
 	get profileAgentDir(): string {
 		return this.#profileAgentDir;
 	}
-	get darwinReplacementContext(): ManagedDarwinReplacementContext | undefined {
-		return this.#darwinContext;
-	}
-
-	/**
-	 * Derive a fresh context for a trusted child directory. The child identity is
-	 * captured here, never inferred from a caller pathname.
-	 */
-	deriveDarwinReplacementContext(directory: string): ManagedDarwinReplacementContext | undefined {
-		this.#assertBound();
-		const resolved = path.resolve(directory);
-		if (resolved !== this.#baseDir && !resolved.startsWith(`${this.#baseDir}${path.sep}`)) {
-			throw new Error("Managed Darwin replacement child escaped retained store");
-		}
-		const relative = path.relative(this.#baseDir, resolved);
-		const child = this.ensureDirectory(relative);
-		if (!this.#darwinContext) return undefined;
-		return deriveManagedDarwinReplacementContext(this.#darwinContext, this.#root, child.canonicalPath);
-	}
 
 	deriveSubtree(relativePath: string): ManagedSessionDescendantStore {
 		const child = this.ensureDirectory(relativePath);
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority)
-			return new ManagedSessionDescendantStore(
-				this.#root,
-				resolved,
-				undefined,
-				this.#policy,
-				this.#profileAgentDir,
-				deriveManagedDarwinReplacementContext(this.#darwinContext, this.#root, resolved),
-			);
+			return new ManagedSessionDescendantStore(this.#root, resolved, undefined, this.#policy, this.#profileAgentDir);
 		const retainedChild = this.#authority.retainManagedDirectory(
 			this.#relative(resolved),
 			child.dev.toString(),
@@ -728,7 +657,6 @@ export class ManagedSessionDescendantStore {
 			},
 			this.#policy,
 			this.#profileAgentDir,
-			deriveManagedDarwinReplacementContext(this.#darwinContext, this.#root, resolved),
 		);
 	}
 
@@ -1085,8 +1013,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	#openDarwinReplacementAuth(directory: string): { close(): void } | undefined {
-		const context = createManagedDarwinReplacementContext(this.#root, directory);
-		return context ? openDarwinReplacementAuth(directory, context.lockName) : undefined;
+		return openManagedDarwinReplacementAuth(this.#root, directory);
 	}
 	#relative(resolved: string): string {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
@@ -1847,45 +1774,6 @@ export function publishManagedFileNoReplaceSync(
 	if (failure !== undefined) throw failure;
 }
 
-type DarwinReplacementReceiptState =
-	| "reserved"
-	| "prepared"
-	| "swap_intent"
-	| "retained_predecessor"
-	| "committed_durable"
-	| "committed_unproven"
-	| "abandoned";
-
-type DarwinReplacementReceipt = {
-	version: 1;
-	sequence: number;
-	operationId: string;
-	state: DarwinReplacementReceiptState;
-	parentDev: string;
-	parentIno: string;
-	sourceName: string;
-	destinationName: string;
-	source: NativeDarwinReplacementIdentity | null;
-	destination: NativeDarwinReplacementIdentity | null;
-	result: {
-		state: string;
-		code: string | null;
-		phase: string;
-		reason: string;
-		parentFsync: boolean;
-	};
-};
-
-const DARWIN_RECEIPT_STATES = new Set<DarwinReplacementReceiptState>([
-	"reserved",
-	"prepared",
-	"swap_intent",
-	"retained_predecessor",
-	"committed_durable",
-	"committed_unproven",
-	"abandoned",
-]);
-
 function isDarwinIdentity(value: unknown): value is NativeDarwinReplacementIdentity {
 	if (!value || typeof value !== "object") return false;
 	const record = value as Record<string, unknown>;
@@ -1902,10 +1790,7 @@ function isDarwinIdentity(value: unknown): value is NativeDarwinReplacementIdent
 	);
 }
 
-function validateDarwinReplacementResult(
-	value: unknown,
-	operationId: string,
-): NativeDarwinReplacementResult {
+function validateDarwinReplacementResult(value: unknown, operationId: string): NativeDarwinReplacementResult {
 	const malformed = (): NativeDarwinReplacementResult => ({
 		ok: false,
 		state: "committed_unproven",
@@ -1920,21 +1805,13 @@ function validateDarwinReplacementResult(
 	if (
 		Object.keys(record).some(
 			key =>
-				![
-					"ok",
-					"state",
-					"code",
-					"phase",
-					"reason",
-					"parentFsync",
-					"source",
-					"destination",
-					"operationId",
-				].includes(key),
+				!["ok", "state", "code", "phase", "reason", "parentFsync", "source", "destination", "operationId"].includes(
+					key,
+				),
 		) ||
 		typeof record.ok !== "boolean" ||
-		(typeof record.state !== "string" ||
-			!["not_committed", "committed_durable", "committed_unproven"].includes(record.state)) ||
+		typeof record.state !== "string" ||
+		!["not_committed", "committed_durable", "committed_unproven"].includes(record.state) ||
 		(record.code !== undefined && record.code !== null && typeof record.code !== "string") ||
 		typeof record.phase !== "string" ||
 		typeof record.reason !== "string" ||
@@ -1946,107 +1823,14 @@ function validateDarwinReplacementResult(
 		return malformed();
 	}
 	const result = value as NativeDarwinReplacementResult;
-	if (result.state === "committed_durable" && (!result.ok || result.parentFsync !== true || !result.source || !result.destination)) {
+	if (
+		result.state === "committed_durable" &&
+		(!result.ok || result.parentFsync !== true || !result.source || !result.destination)
+	) {
 		return malformed();
 	}
 	if (result.ok && result.state !== "committed_durable") return malformed();
 	return result;
-}
-
-
-function darwinReceiptPath(context: ManagedDarwinReplacementContext, operationId: string, sequence: number): string {
-	return path.join(context.replacementDirectory, `.gjc-darwin-replacement-${operationId}-${sequence}.json`);
-}
-
-function parseDarwinReceipt(pathname: string): DarwinReplacementReceipt {
-	const parsed: unknown = JSON.parse(fs.readFileSync(pathname, "utf8"));
-	if (!parsed || typeof parsed !== "object") throw new Error("managed_replace_receipt_invalid");
-	const record = parsed as Record<string, unknown>;
-	if (
-		Object.keys(record).length !== 11 ||
-		record.version !== 1 ||
-		typeof record.sequence !== "number" ||
-		!Number.isSafeInteger(record.sequence) ||
-		typeof record.operationId !== "string" ||
-		!DARWIN_RECEIPT_STATES.has(record.state as DarwinReplacementReceiptState) ||
-		typeof record.parentDev !== "string" ||
-		typeof record.parentIno !== "string" ||
-		typeof record.sourceName !== "string" ||
-		typeof record.destinationName !== "string" ||
-		(record.source !== null && !isDarwinReceiptIdentity(record.source)) ||
-		(record.destination !== null && !isDarwinReceiptIdentity(record.destination)) ||
-		!record.result ||
-		typeof record.result !== "object"
-	)
-		throw new Error("managed_replace_receipt_invalid");
-	const result = record.result as Record<string, unknown>;
-	if (
-		Object.keys(result).length !== 5 ||
-		typeof result.state !== "string" ||
-		(result.code !== null && typeof result.code !== "string") ||
-		typeof result.phase !== "string" ||
-		typeof result.reason !== "string" ||
-		typeof result.parentFsync !== "boolean"
-	)
-		throw new Error("managed_replace_receipt_invalid");
-	return record as unknown as DarwinReplacementReceipt;
-}
-
-function isDarwinReceiptIdentity(value: unknown): boolean {
-	if (!value || typeof value !== "object") return false;
-	const record = value as Record<string, unknown>;
-	return (
-		Object.keys(record).length === 7 &&
-		typeof record.dev === "string" &&
-		/^(0|[1-9][0-9]*)$/.test(record.dev) &&
-		typeof record.ino === "string" &&
-		/^(0|[1-9][0-9]*)$/.test(record.ino) &&
-		typeof record.nlink === "string" &&
-		/^(0|[1-9][0-9]*)$/.test(record.nlink) &&
-		typeof record.size === "string" &&
-		/^(0|[1-9][0-9]*)$/.test(record.size) &&
-		typeof record.mtimeNs === "string" &&
-		/^(0|[1-9][0-9]*)$/.test(record.mtimeNs) &&
-		typeof record.ctimeNs === "string" &&
-		/^(0|[1-9][0-9]*)$/.test(record.ctimeNs) &&
-		typeof record.sha256 === "string" &&
-		/^[0-9a-f]{64}$/.test(record.sha256)
-	);
-}
-
-function validateDarwinReplacementReceipts(context: ManagedDarwinReplacementContext): string[] {
-	if (!fs.existsSync(context.replacementDirectory)) return [];
-	const paths = fs
-		.readdirSync(context.replacementDirectory)
-		.filter(name => name.startsWith(".gjc-darwin-replacement-") && name.endsWith(".json"))
-		.map(name => path.join(context.replacementDirectory, name));
-	for (const receiptPath of paths) parseDarwinReceipt(receiptPath);
-	return paths;
-}
-
-function appendDarwinReplacementReceipt(
-	context: ManagedDarwinReplacementContext,
-	root: ManagedDirectoryRoot,
-	policy: ManagedSessionSecurityPolicy,
-	receipt: Omit<DarwinReplacementReceipt, "version" | "sequence">,
-): void {
-	ensureManagedDirectory(context.replacementDirectory, root, policy);
-	const existing = validateDarwinReplacementReceipts(context);
-	const record: DarwinReplacementReceipt = {
-		version: 1,
-		sequence: existing.length + 1,
-		...receipt,
-	};
-	const receiptPath = darwinReceiptPath(context, receipt.operationId, record.sequence);
-	publishManagedFileNoReplaceSync(
-		receiptPath,
-		Buffer.from(
-			`${JSON.stringify(record, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
-		),
-		root,
-		policy,
-	);
-	fsyncDirectory(context.replacementDirectory);
 }
 
 /** Replace one managed regular file while retaining the secured staging fd through publication. */
@@ -2088,8 +1872,9 @@ export function replaceManagedFileSync(
 			throw new Error("managed_replace_exact_unavailable");
 		}
 		if (process.platform === "darwin" && expectedDestination) {
-			const context = createManagedDarwinReplacementContext(root, parent);
-			if (!context) throw new Error("managed_replace_exact_unavailable");
+			preserveStaging = true;
+			const auth = openManagedDarwinReplacementAuth(root, parent);
+			if (!auth) throw new Error("managed_replace_exact_unavailable");
 			const operationId = randomUUID();
 			const parentIdentity = fs.lstatSync(parent, { bigint: true });
 			const sourceName = path.basename(staging);
@@ -2112,46 +1897,8 @@ export function replaceManagedFileSync(
 				ctimeNs: expectedDestination.ctimeNs,
 				sha256: expectedDestination.sha256,
 			};
-			const appendReceipt = (
-				state: DarwinReplacementReceiptState,
-				result: DarwinReplacementReceipt["result"],
-			): void =>
-				appendDarwinReplacementReceipt(context, root, policy, {
-					operationId,
-					state,
-					parentDev: parentIdentity.dev.toString(),
-					parentIno: parentIdentity.ino.toString(),
-					sourceName,
-					destinationName,
-					source,
-					destination: target,
-					result,
-				});
-			appendReceipt("reserved", {
-				state: "not_committed",
-				code: null,
-				phase: "reservation",
-				reason: "none",
-				parentFsync: false,
-			});
-			appendReceipt("prepared", {
-				state: "not_committed",
-				code: null,
-				phase: "staging",
-				reason: "none",
-				parentFsync: false,
-			});
-			appendReceipt("swap_intent", {
-				state: "committed_unproven",
-				code: null,
-				phase: "exchange",
-				reason: "pending",
-				parentFsync: false,
-			});
-			const auth = openDarwinReplacementAuth(parent, context.lockName);
-			let result: NativeDarwinReplacementResult;
 			try {
-				result = validateDarwinReplacementResult(
+				const result = validateDarwinReplacementResult(
 					exchangeDarwinManagedFile(
 						auth,
 						parent,
@@ -2165,28 +1912,12 @@ export function replaceManagedFileSync(
 					),
 					operationId,
 				);
+				if (result.state !== "committed_durable") {
+					throw new ManagedDarwinReplacementError(result);
+				}
 			} finally {
 				auth.close();
 			}
-			appendReceipt(result.state === "committed_durable" ? "committed_durable" : "committed_unproven", {
-				state: result.state,
-				code: result.code ?? null,
-				phase: result.phase,
-				reason: result.reason,
-				parentFsync: result.parentFsync,
-			});
-			if (result.state !== "committed_durable") {
-				preserveStaging = true;
-				throw new Error(`managed_replace_${result.state}:${result.code ?? result.reason}`);
-			}
-			appendReceipt("retained_predecessor", {
-				state: result.state,
-				code: null,
-				phase: "retained_predecessor",
-				reason: "none",
-				parentFsync: result.parentFsync,
-			});
-			preserveStaging = true;
 		} else if (process.platform === "win32" && expectedDestination) {
 			const parentIdentity = fs.lstatSync(parent, { bigint: true });
 			const replaced = exactReplacePath(
@@ -2294,9 +2025,8 @@ export function replaceManagedFileSync(
 				}
 			}
 		} else if (process.platform === "darwin") {
-			const context = createManagedDarwinReplacementContext(root, parent);
-			if (!context) throw new Error("managed_replace_exact_unavailable");
-			darwinNoExpectedAuth = openDarwinReplacementAuth(parent, context.lockName);
+			darwinNoExpectedAuth = openManagedDarwinReplacementAuth(root, parent);
+			if (!darwinNoExpectedAuth) throw new Error("managed_replace_exact_unavailable");
 			fs.renameSync(staging, destination);
 		} else fs.renameSync(staging, destination);
 		if (process.platform !== "darwin" || !expectedDestination) assertFence?.();
