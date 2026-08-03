@@ -2921,9 +2921,9 @@ describe("telegram daemon", () => {
 		// generation 40 hardens exact Bash process-tree ownership. Generation 38
 		// also adds durable Telegram provider-intent admission without changing
 		// the wire protocol.
-		// generation 41 applies first-class provider-settings admission to Telegram
+		// generation 42 applies first-class provider-settings admission to Telegram
 		// lifecycle controls.
-		expect(DAEMON_GENERATION).toBe(41);
+		expect(DAEMON_GENERATION).toBe(42);
 	});
 	test.each([
 		"1",
