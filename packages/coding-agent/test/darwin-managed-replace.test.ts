@@ -33,8 +33,10 @@ describe("Darwin managed replacement", () => {
 		);
 
 		expect(fs.readFileSync(transcript, "utf8")).toBe("after\n");
-		expect(
-			fs.readdirSync(root.canonicalPath).some(entry => entry.includes(".replacement")),
-		).toBe(true);
+		const predecessors = fs
+			.readdirSync(root.canonicalPath)
+			.filter(entry => entry.startsWith(".session.jsonl.") && entry.endsWith(".replacement"));
+		expect(predecessors).toHaveLength(1);
+		expect(fs.readFileSync(path.join(root.canonicalPath, predecessors[0]), "utf8")).toBe("before\n");
 	});
 });
