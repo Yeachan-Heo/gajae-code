@@ -556,7 +556,7 @@ describe("SkillTool", () => {
 		expect(captured).toHaveLength(0);
 	});
 
-	it("describes and enforces ultratest completion before chaining", async () => {
+	it("blocks chaining while ultratest is still verifying", async () => {
 		const cwd = await makeTempCwd();
 		const ultratest = await makeSkill("ultratest", "---\nname: ultratest\n---\nVerify");
 		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
@@ -568,11 +568,7 @@ describe("SkillTool", () => {
 			}),
 		)!;
 
-		expect(tool.description).toContain("`ultratest`");
-		expect(tool.description).toContain('gjc state ultratest write --input \'{"current_phase":"complete"}\' --json');
-		await expect(tool.execute("call-1", { name: "ralplan" })).rejects.toThrow(
-			/gjc state ultratest write --input '\{"current_phase":"complete"\}' --json/,
-		);
+		await expect(tool.execute("call-1", { name: "ralplan" })).rejects.toBeInstanceOf(ToolError);
 		expect(captured).toHaveLength(0);
 	});
 

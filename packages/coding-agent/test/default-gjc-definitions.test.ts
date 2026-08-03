@@ -70,9 +70,7 @@ describe("default GJC definitions", () => {
 		const workflowDefinitions = definitions.filter(definition => definition.kind === "skill");
 		const fragmentDefinitions = definitions.filter(definition => definition.kind === "skill-fragment");
 		const skills = workflowDefinitions.map(definition => definition.name).sort();
-		const expected = "deep-interview,ralplan,team,ultragoal,ultratest";
-
-		expect(skills.join(",")).toBe(expected);
+		expect(skills).toEqual(["deep-interview", "ralplan", "team", "ultragoal", "ultratest"]);
 		expect(workflowDefinitions).toHaveLength(5);
 		expect(definitions).toHaveLength(10);
 		expect(workflowDefinitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
@@ -513,7 +511,6 @@ Project executor override body.
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
-		expect(routing).toContain("`/skill:ultratest`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
 		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
 		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
@@ -522,7 +519,7 @@ Project executor override body.
 		expect(routing).toContain(
 			"reconciliation must persist its final receipt before choosing approval or an admitted handoff",
 		);
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(11);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 

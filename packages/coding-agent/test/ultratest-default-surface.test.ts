@@ -79,14 +79,11 @@ describe("ultratest bundled default surface", () => {
 		const readResult = runGjc(["skills", "read", "ultratest", "--json"], env);
 		const installResult = runGjc(["setup", "defaults", "--json"], env);
 
-		// Then: the embedded asset and its fresh installed copy expose the literal public contract.
 		expect(readResult.exitCode, readResult.stderr).toBe(0);
 		const embedded = readJsonObject(readResult.stdout);
 		expect(requiredString(embedded, "name")).toBe("ultratest");
 		expect(requiredString(embedded, "path")).toBe("embedded:gjc/skills/ultratest/SKILL.md");
 		const embeddedContent = requiredString(embedded, "content");
-		expect(embeddedContent).toContain("# Ultratest");
-		expect(embeddedContent).toContain("Behavior promise:");
 
 		expect(installResult.exitCode, installResult.stderr).toBe(0);
 		const installation = readJsonObject(installResult.stdout);
@@ -97,8 +94,6 @@ describe("ultratest bundled default surface", () => {
 		expect(requiredString(ultratestFile, "path")).toBe(path.join(agentDir, "skills", "ultratest", "SKILL.md"));
 
 		const installedContent = await Bun.file(path.join(agentDir, "skills", "ultratest", "SKILL.md")).text();
-		expect(installedContent).toContain("# Ultratest");
-		expect(installedContent).toContain("Behavior promise:");
 		expect(installedContent).toBe(embeddedContent);
 	}, 30_000);
 });

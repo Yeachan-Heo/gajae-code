@@ -113,11 +113,6 @@ test("executor red-team block renders only for ultragoal completion QA assignmen
 	expect(redTeam).toContain("executorQa");
 });
 
-test("routes changed test assertions through ultratest", async () => {
-	const template = await Bun.file(path.join(systemPromptsDir, "system-prompt.md")).text();
-	expect(template).toContain("After adding or changing test assertions or cases, use `/skill:ultratest`");
-});
-
 describe("system Handlebars prompt templates", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();

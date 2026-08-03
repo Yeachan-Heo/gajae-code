@@ -110,10 +110,11 @@ gjc state ultratest write --input '{"current_phase":"complete","receipt":{"behav
 
 The commit gate only runs while Ultratest is active. It blocks inspectable
 inline `git commit -m/--message` commands when a supported test file is staged
-and the message has no `Ultratest-Verified:` trailer. It fails open for commit
-forms it cannot inspect. Treat `GJC_ALLOW_NO_ULTRATEST=1` as a conscious
-bypass, not routine cleanup. For an eligible commit, add exactly one trailer in
-this form:
+and the message does not end in exactly one documented `Ultratest-Verified:`
+trailer. It fails open for commit forms it cannot inspect. Treat
+`GJC_ALLOW_NO_ULTRATEST=1` as a conscious bypass, not routine cleanup. For an
+eligible commit, add exactly one trailer as the final nonblank line in this
+form:
 
 ```text
 Ultratest-Verified: killed <n> / noted <n>

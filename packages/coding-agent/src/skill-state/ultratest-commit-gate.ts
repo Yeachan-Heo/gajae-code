@@ -1,9 +1,9 @@
-const ULTRATEST_TRAILER =
-	/^Ultratest-Verified:\s+(?:killed\s+\d+\s*\/\s*noted\s+\d+|skip\(no assertion change\))\s*$/mu;
+const ULTRATEST_TRAILER_PREFIX = "Ultratest-Verified:";
+const ULTRATEST_TRAILER = /^Ultratest-Verified: (?:killed \d+ \/ noted \d+|skip\(no assertion change\))$/u;
 
 const ULTRATEST_BLOCK_MESSAGE = [
 	"Ultratest commit gate: staged test changes require mutation verification before an inline commit.",
-	"Run `ultratest`, restore every mutation before committing, then add one of these trailers to the inline commit message:",
+	"Run `ultratest`, restore every mutation before committing, then end the inline commit message with exactly one of these trailers:",
 	"Ultratest-Verified: killed <n> / noted <n>",
 	"Ultratest-Verified: skip(no assertion change)",
 ].join("\n");
@@ -133,7 +133,13 @@ function hasStagedTest(cwd: string): boolean | null {
 export function getUltratestCommitGateDecision(input: UltratestCommitGateInput): UltratestCommitGateDecision | null {
 	const commit = parseInlineCommit(input.command);
 	if (!commit) return null;
-	if (commit.bypass || ULTRATEST_TRAILER.test(commit.message)) {
+	const messageLines = commit.message.split(/\r?\n/u);
+	const trailers = messageLines.filter(line => line.startsWith(ULTRATEST_TRAILER_PREFIX));
+	const lastNonEmptyLine = messageLines.findLast(line => line.trim().length > 0);
+	if (
+		commit.bypass ||
+		(trailers.length === 1 && trailers[0] === lastNonEmptyLine && ULTRATEST_TRAILER.test(trailers[0] ?? ""))
+	) {
 		return { blocked: false, command: input.command };
 	}
 	const stagedTest = hasStagedTest(input.cwd);

@@ -108,6 +108,36 @@ describe("ultratest commit gate", () => {
 		}
 	});
 
+	it("blocks an inline commit with two valid Ultratest-Verified trailer lines", async () => {
+		const cwd = await createFixture();
+		const decision = await mutationDecision(
+			cwd,
+			'git commit -m "test: add verification\n\nUltratest-Verified: killed 3 / noted 1\nUltratest-Verified: skip(no assertion change)"',
+		);
+
+		expect(decision.blocked).toBe(true);
+	});
+
+	it("blocks an inline commit with a valid and malformed Ultratest-Verified trailer line", async () => {
+		const cwd = await createFixture();
+		const decision = await mutationDecision(
+			cwd,
+			'git commit -m "test: add verification\n\nUltratest-Verified: killed 3 / noted 1\nUltratest-Verified: focused gate"',
+		);
+
+		expect(decision.blocked).toBe(true);
+	});
+
+	it("blocks an inline commit with text after an otherwise valid Ultratest-Verified trailer", async () => {
+		const cwd = await createFixture();
+		const decision = await mutationDecision(
+			cwd,
+			'git commit -m "test: add verification\n\nUltratest-Verified: killed 3 / noted 1\nFollow-up detail"',
+		);
+
+		expect(decision.blocked).toBe(true);
+	});
+
 	it("blocks an inline commit with an incomplete Ultratest-Verified trailer", async () => {
 		const cwd = await createFixture();
 		const decision = await mutationDecision(

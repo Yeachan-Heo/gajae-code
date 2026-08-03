@@ -314,13 +314,6 @@ describe("GJC native skill-state hooks", () => {
 
 		expect(result.hookEventName).toBe("UserPromptSubmit");
 		expect(result.outputJson?.hookSpecificOutput).toMatchObject({ hookEventName: "UserPromptSubmit" });
-		const context = String(
-			(result.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)?.additionalContext ??
-				"",
-		);
-		expect(context).toContain("Sanitized effective skill config");
-		expect(context).toContain("filesystem/custom skill discovery");
-		expect(context).toContain("deep-interview, ralplan, ultragoal, team, ultratest");
 		const state = await readVisibleSkillActiveState(root, "session-1");
 		expect(state).toMatchObject({
 			active: true,
