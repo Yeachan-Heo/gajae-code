@@ -29,24 +29,60 @@ describe("injectImageGenerationModels", () => {
 });
 
 describe("injectAlibabaTokenPlanModels", () => {
-	it("adds the DeepSeek V4 Flash 0731 fallback exactly once", () => {
+	it("pins the Qwen3.8 variants and DeepSeek fallback exactly once", () => {
 		const models: Model[] = [];
 
 		injectAlibabaTokenPlanModels(models);
-		models[0]!.name = "raw discovery name";
-		models[0]!.reasoning = false;
+		for (const model of models) {
+			model.name = "raw discovery name";
+			model.reasoning = false;
+			if (model.id === "qwen3.8-max") model.api = "openai-responses";
+			if (model.id === "qwen3.8-max-preview") {
+				model.api = "openai-completions";
+				model.input = ["text", "image"];
+				model.maxTokens = 131_072;
+			}
+		}
 		injectAlibabaTokenPlanModels(models);
 
-		expect(models).toEqual([
-			expect.objectContaining({
-				id: "deepseek-v4-flash-0731",
-				name: "DeepSeek V4 Flash 0731",
-				api: "openai-completions",
-				provider: "alibaba-token-plan",
-				reasoning: true,
-				contextWindow: 1_000_000,
-				maxTokens: 384_000,
-			}),
-		]);
+		expect(models).toHaveLength(3);
+		expect(models).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "qwen3.8-max",
+					name: "Qwen3.8 Max",
+					api: "openai-completions",
+					provider: "alibaba-token-plan",
+					reasoning: true,
+					input: ["text", "image"],
+					contextWindow: 1_000_000,
+					maxTokens: 131_072,
+					compat: expect.objectContaining({
+						supportsReasoningEffort: true,
+						thinkingFormat: "qwen",
+						reasoningEffortMap: { minimal: "low", high: "xhigh", max: "xhigh" },
+					}),
+				}),
+				expect.objectContaining({
+					id: "qwen3.8-max-preview",
+					name: "Qwen3.8 Max Preview",
+					api: "openai-responses",
+					provider: "alibaba-token-plan",
+					reasoning: true,
+					input: ["text"],
+					contextWindow: 1_000_000,
+					maxTokens: 65_536,
+				}),
+				expect.objectContaining({
+					id: "deepseek-v4-flash-0731",
+					name: "DeepSeek V4 Flash 0731",
+					api: "openai-completions",
+					provider: "alibaba-token-plan",
+					reasoning: true,
+					contextWindow: 1_000_000,
+					maxTokens: 384_000,
+				}),
+			]),
+		);
 	});
 });

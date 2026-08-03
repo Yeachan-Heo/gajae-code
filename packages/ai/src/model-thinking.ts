@@ -1,7 +1,7 @@
 import { CODEX_GPT_5_6_CONTEXT_CAP, isCodexGpt56Tier, isCodexProductTransport } from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
 import { resolveOpenAICompat } from "./providers/openai-completions-compat";
-import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
+import type { Api, Model as ApiModel, OpenAICompat, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
 /** User-facing thinking levels, ordered least to most intensive. */
@@ -201,6 +201,10 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
 		const source = models[index]!;
+		if (source.provider === "alibaba-token-plan" && source.id === "qwen3.8-max") {
+			source.reasoning = true;
+			source.name = "Qwen3.8 Max";
+		}
 		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
 			source.reasoning = true;
 			source.name = "DeepSeek V4 Flash 0731";
@@ -445,6 +449,25 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	if (model.provider === "zai" && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
 	}
+	if (model.api === "openai-completions" && model.provider === "alibaba-token-plan" && model.id === "qwen3.8-max") {
+		const compat = model.compat as OpenAICompat | undefined;
+		model.input = ["text", "image"];
+		model.contextWindow = 1_000_000;
+		model.maxTokens = 131_072;
+		model.compat = {
+			...(compat ?? {}),
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			thinkingFormat: "qwen",
+			reasoningEffortMap: {
+				...(compat?.reasoningEffortMap ?? {}),
+				minimal: "low",
+				high: "xhigh",
+				max: "xhigh",
+			},
+			reasoningContentField: "reasoning_content",
+		};
+	}
 	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
 		model.contextWindow = 1_000_000;
 		model.maxTokens = 384_000;
@@ -638,6 +661,9 @@ function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model
 	}
 	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
 		return DEEPSEEK_V4_FLASH_0731_EFFORTS;
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "qwen3.8-max") {
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}
 	switch (parsedModel.family) {
 		case "openai":

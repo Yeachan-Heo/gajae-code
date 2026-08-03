@@ -1409,7 +1409,18 @@ function buildParams(
 		params.thinking = { type: enabled ? "enabled" : "disabled" };
 	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen" && model.reasoning) {
 		// Qwen uses top-level enable_thinking: boolean
-		params.enable_thinking = !!options?.reasoning && !options?.disableReasoning;
+		const reasoningEffort = options?.reasoning;
+		const reasoningEnabled = reasoningEffort !== undefined && !options?.disableReasoning;
+		params.enable_thinking = reasoningEnabled;
+		if (
+			reasoningEnabled &&
+			reasoningEffort !== undefined &&
+			compat.supportsReasoningEffort &&
+			model.provider === "alibaba-token-plan" &&
+			(model.id === "qwen3.8-max" || model.id === "qwen3.8-max-preview")
+		) {
+			params.reasoning_effort = mapReasoningEffort(reasoningEffort, compat.reasoningEffortMap) as Effort;
+		}
 	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
 		params.chat_template_kwargs = {
 			enable_thinking: !!options?.reasoning && !options?.disableReasoning,

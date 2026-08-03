@@ -42,7 +42,7 @@ function captureResponsesPayload(
 
 function captureCompletionsPayload(
 	model: Model<"openai-completions">,
-	reasoning: "high" | "xhigh" | "max",
+	reasoning: "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
 ): Promise<Record<string, unknown>> {
 	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
 	streamOpenAICompletions(model, testContext, {
@@ -54,7 +54,8 @@ function captureCompletionsPayload(
 	return promise;
 }
 
-const qwen = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
+const qwenPreview = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
+const qwenGa = getBundledModel("alibaba-token-plan", "qwen3.8-max") as Model<"openai-completions">;
 const glm = getBundledModel("alibaba-token-plan", "glm-5.2") as Model<"openai-completions">;
 const deepseek = getBundledModel("alibaba-token-plan", "deepseek-v4-flash-0731") as Model<"openai-completions">;
 
@@ -65,11 +66,27 @@ describe("Alibaba Token Plan reasoning request parameters", () => {
 	});
 	it("sends locked Qwen efforts verbatim as Responses reasoning.effort", async () => {
 		for (const effort of ["medium", "low", "xhigh"] as const) {
-			const payload = await captureResponsesPayload(qwen, effort);
+			const payload = await captureResponsesPayload(qwenPreview, effort);
 
 			expect(payload.reasoning).toEqual({ effort, summary: "auto" });
 			expect(payload.include).toEqual(["reasoning.encrypted_content"]);
 			expect(payload.reasoning_effort).toBeUndefined();
+		}
+	});
+
+	it("sends Qwen3.8 Max GA enable_thinking with its mapped Chat reasoning effort", async () => {
+		for (const [effort, expected] of [
+			["minimal", "low"],
+			["medium", "medium"],
+			["high", "xhigh"],
+			["xhigh", "xhigh"],
+			["max", "xhigh"],
+		] as const) {
+			const payload = await captureCompletionsPayload(qwenGa, effort);
+
+			expect(payload.enable_thinking).toBe(true);
+			expect(payload.reasoning_effort).toBe(expected);
+			expect(payload.thinking).toBeUndefined();
 		}
 	});
 

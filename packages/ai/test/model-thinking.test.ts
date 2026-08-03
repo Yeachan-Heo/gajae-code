@@ -41,6 +41,22 @@ describe("thinking control modes", () => {
 });
 
 describe("model thinking metadata", () => {
+	it("exposes Alibaba Qwen3.8 Max GA's normalized efforts through xhigh", () => {
+		const model = createModel({
+			id: "qwen3.8-max",
+			api: "openai-completions",
+			provider: "alibaba-token-plan",
+		});
+
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.XHigh,
+		});
+		expect(requireSupportedEffort(model, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(() => requireSupportedEffort(model, Effort.Max)).toThrow(/not supported/);
+	});
+
 	it("exposes Alibaba DeepSeek V4 Flash's documented low/high/max efforts", () => {
 		const model = createModel({
 			id: "deepseek-v4-flash-0731",
@@ -203,6 +219,42 @@ describe("model thinking metadata", () => {
 });
 
 describe("generated model policies", () => {
+	it("corrects stale Alibaba Qwen3.8 Max GA discovery metadata", () => {
+		const models: Model<Api>[] = [
+			createModel({
+				id: "qwen3.8-max",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: false,
+			}),
+		];
+		models[0]!.name = "stale discovery name";
+		models[0]!.contextWindow = 222_000;
+		models[0]!.maxTokens = 8_900;
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]).toMatchObject({
+			name: "Qwen3.8 Max",
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_000_000,
+			maxTokens: 131_072,
+			compat: {
+				supportsDeveloperRole: false,
+				supportsReasoningEffort: true,
+				thinkingFormat: "qwen",
+				reasoningEffortMap: { minimal: "low", high: "xhigh", max: "xhigh" },
+				reasoningContentField: "reasoning_content",
+			},
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.XHigh,
+			},
+		});
+	});
+
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {
 		const models: Model<Api>[] = [
 			createModel({
