@@ -2,12 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Native shared filesystem scans now enforce strict per-scan entry and retained-byte limits before allocating or caching results, return whole-scan errors instead of partial prefixes, share immutable snapshots without full-vector clones, and prevent stale in-flight scans from repopulating invalidated or TTL-expired cache entries. Cache retention remains compatible with #3774's 128 MiB default and zero-byte cache bypass, is bounded by both key count and aggregate bytes, and includes symlink-following behavior in cache identity (#3769).
+
 ## [0.12.10] - 2026-08-03
 
 ### Fixed
 
 - Linux retained publish receipts now report the actual `linkat` or `mkdirat` fallback primitive, and a staging `unlinkat` failure after `linkat` publication is reported as committed-but-unproven with bounded errno evidence instead of as a retry-safe pre-mutation failure (#3746).
-- The native `fs_cache` scan cache is now bounded by an approximate byte budget in addition to its entry count. A single scan result larger than the budget is not cached at all, and storing a result evicts the oldest entries until the retained set fits; `FS_SCAN_CACHE_MAX_BYTES` (default `134217728`, 128 MiB) tunes it and `0` disables caching entirely. Previously 16 cached entries could each hold an arbitrarily large directory listing, so scanning a few huge trees pinned unbounded native memory for the process lifetime (#3774).
 
 ## [0.12.8] - 2026-08-02
 ### Fixed
