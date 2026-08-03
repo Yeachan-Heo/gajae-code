@@ -15,5 +15,6 @@ export function initialPhaseForSkill(skill: CanonicalGjcWorkflowSkill | string):
 	if (skill === "ultragoal") return "goal-planning";
 	if (skill === "ralplan") return "planner";
 	if (skill === "team") return "starting";
+	if (skill === "ultratest") return "verifying";
 	return "planning";
 }

@@ -29,7 +29,7 @@ type MetadataViolation = {
 
 const repoRoot = process.cwd();
 
-const expectedBundledWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+const expectedBundledWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal", "ultratest"] as const;
 const expectedBundledRoleAgents = ["architect", "critic", "executor", "planner"] as const;
 const expectedPackageScope = "@gajae-code/";
 const expectedCliBins = ["gjc", "gjc-stats"] as const;

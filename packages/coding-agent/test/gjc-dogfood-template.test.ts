@@ -2,10 +2,10 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
-const expectedWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal"];
+const expectedWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal", "ultratest"];
 
 describe("GJC dogfood skill template", () => {
-	it("documents local override installation without changing the default workflow surface", async () => {
+	it("documents local override installation alongside the five default workflows", async () => {
 		const template = await Bun.file(path.join(repoRoot, "docs", "gjc-dogfood-skill-template.md")).text();
 		const defaultSkillsDir = path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills");
 		const defaultSkillEntries = await Array.fromAsync(new Bun.Glob("*/SKILL.md").scan(defaultSkillsDir));
@@ -21,7 +21,8 @@ describe("GJC dogfood skill template", () => {
 			"Install into the user-level scan location (`~/.gjc/agent/skills/`, not `~/.gjc/skills/`):",
 		);
 		expect(template).toContain("<project>/.gjc/skills/gjc-dogfood/SKILL.md");
-		expect(template).toContain("The live issue has no comment approving a fifth bundled default workflow skill");
+		expect(template).toContain("GJC already bundles five default workflow skills");
+		expect(template).toContain("`ultratest` for mutation verification after assertion changes");
 		expect(template).toContain("Use when running or reviewing work through GJC sessions");
 		expect(template).toContain("gjc --tmux --worktree <branch-like-name>");
 		expect(template).toContain("Do not pass filesystem paths to `--worktree`");

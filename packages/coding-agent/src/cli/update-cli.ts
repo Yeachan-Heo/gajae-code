@@ -730,7 +730,7 @@ export async function runUpdateCommand(
 
 /**
  * Refresh opted-in on-disk default workflow skill copies after a successful
- * update. The four default skills ship embedded in the binary, so most users
+ * update. The five default skills ship embedded in the binary, so most users
  * need nothing here. But users who ran `gjc setup defaults` have on-disk copies
  * under the agent dir that shadow the embedded defaults; those would otherwise
  * go stale after an update. Only rewrite files that already exist and differ —

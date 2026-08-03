@@ -388,7 +388,7 @@ process.exitCode = await child.exited;`;
 
 			expect(result.exitCode, stderr).toBe(0);
 			const payload = JSON.parse(stdout) as { written?: number; targetRoot?: string };
-			expect(payload.written).toBe(9);
+			expect(payload.written).toBe(10);
 			expect(payload.targetRoot).toContain(path.join(home, ".gjc", "agent"));
 		} finally {
 			await fs.rm(home, { recursive: true, force: true });

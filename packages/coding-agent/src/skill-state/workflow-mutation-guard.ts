@@ -12,6 +12,7 @@ import { LocalProtocolHandler, resolveLocalUrlToPath } from "../internal-urls/lo
 import { resolveToCwd } from "../tools/path-utils";
 import { ToolError } from "../tools/tool-errors";
 import { listActiveSkills, readVisibleSkillActiveState, type SkillActiveEntry } from "./active-state";
+import { getUltratestCommitGateDecision } from "./ultratest-commit-gate";
 import {
 	type CanonicalGjcWorkflowSkill,
 	sanctionedWorkflowStateCommand,
@@ -312,6 +313,25 @@ async function getActivePlanningSkill(
 	const phase = String(modeState.current_phase ?? current.phase ?? "").trim();
 	if (!isBlockingPlanningPhase(current.skill, phase)) return null;
 	return { skill: current.skill, phase };
+}
+
+async function isUltratestActive(
+	cwd: string,
+	sessionId?: string,
+	threadId?: string,
+	context?: WorkflowGuardContext,
+): Promise<boolean> {
+	const guardContext = context ?? (await readWorkflowGuardContext(cwd, { sessionId, threadId }));
+	const resolvedSessionId = guardContext.sessionId;
+	if (!resolvedSessionId || !guardContext.activeState) return false;
+	const entries = listActiveSkills(guardContext.activeState).filter(entry =>
+		entryMatchesContext(entry, resolvedSessionId, threadId),
+	);
+	if (entries.length === 0) return false;
+	const current = resolveCurrentWorkflowEntry(entries, safeString(guardContext.activeState.skill).trim());
+	if (current.skill !== "ultratest") return false;
+	const modeState = guardContext.modeStates.get("ultratest") ?? null;
+	return modeState?.active === true && modeStateMatchesContext(modeState, resolvedSessionId, threadId);
 }
 
 function normalizePosix(value: string): string {
@@ -1053,7 +1073,7 @@ function blockedWorkflowStateSkill(cwd: string, rawPath: string): CanonicalGjcWo
 	if (generatedRoot === "specs" || generatedRoot === "plans") return null;
 	if (generatedRoot !== "state") return null;
 	const fileName = segments.at(-1) ?? "";
-	for (const skillName of ["deep-interview", "ralplan", "ultragoal", "team"] as const) {
+	for (const skillName of ["deep-interview", "ralplan", "ultragoal", "team", "ultratest"] as const) {
 		if (fileName === workflowModeStateFileName(skillName)) return skillName;
 	}
 	if (fileName === "skill-active-state.json") return "deep-interview";
@@ -1197,6 +1217,15 @@ export async function getWorkflowMutationDecision(
 	input: WorkflowMutationGuardInput,
 ): Promise<WorkflowMutationDecision> {
 	if (!BLOCKED_TOOL_NAMES.has(input.tool.name)) return { blocked: false, targets: [] };
+	if (
+		input.tool.name === "bash" &&
+		(await isUltratestActive(input.cwd, input.sessionId, input.threadId, input.guardContext))
+	) {
+		const record = getRecord(input.args);
+		const command = safeString(record?.command);
+		const commitDecision = getUltratestCommitGateDecision({ cwd: input.cwd, command });
+		if (commitDecision) return { ...commitDecision, targets: [] };
+	}
 	const targets = extractTargets(input.tool, input.args);
 	if (input.tool.name !== "bash" && input.enforceWorkflowState !== false && hasBlockedGjcTarget(input.cwd, targets)) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);

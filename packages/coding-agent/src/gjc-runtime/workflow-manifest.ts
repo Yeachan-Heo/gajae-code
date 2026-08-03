@@ -527,6 +527,20 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		hudFields: ["current_phase", "team_name", "workers", "task_counts", "phase", "integration"],
 		graphLabel: "Team",
 	}),
+	ultratest: manifest({
+		skill: "ultratest",
+		states: ["verifying", "reported", "complete"],
+		terminalStates: ["complete"],
+		transitions: [
+			{ from: "verifying", to: "reported", verb: "write" },
+			{ from: "verifying", to: "complete", verb: "write" },
+			{ from: "reported", to: "complete", verb: "write" },
+		],
+		verbs: [...stateVerbs(), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
+		retention: [STATE_RETENTION, REPORT_RETENTION, PRUNE_RETENTION, FORCE_RETENTION],
+		hudFields: ["current_phase", "report_path", "verified", "killed", "noted"],
+		graphLabel: "Ultratest",
+	}),
 };
 
 export function getSkillManifest(skill: CanonicalGjcWorkflowSkill): SkillManifest {

@@ -89,7 +89,7 @@ Required rebrand/default-surface gates after workflow-definition changes:
 
 ## Public workflow surface
 
-GJC exposes exactly five default workflow skills (`deep-interview`, `ralplan`, `ultragoal`, `team`, `ultratest`; bundled at `packages/coding-agent/src/defaults/gjc/skills/`) and exactly four role agents (`executor`, `architect`, `planner`, `critic`; bundled at `packages/coding-agent/src/prompts/agents/`). Do not add, document, install, or route to additional defaults without an explicit product decision and gate update.
+GJC exposes exactly five default workflow skills (`deep-interview`, `ralplan`, `ultragoal`, `team`, `ultratest`; bundled at `packages/coding-agent/src/defaults/gjc/skills/`) and exactly four role agents (`executor`, `architect`, `planner`, `critic`; bundled at `packages/coding-agent/src/prompts/agents/`). `ultratest` is the intentional fifth bundled default, added by explicit user request. Do not add, document, install, or route to additional defaults without an explicit product decision and gate update.
 
 - Do not commit repo-visible `.gjc` default definitions; runtime `.gjc` discovery covers local overrides.
 - Runtime state, plans, specs, and ledgers belong under `.gjc/`.

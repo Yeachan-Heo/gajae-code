@@ -189,6 +189,30 @@ export const WORKFLOW_COMMAND_REF_BLOCKS: readonly CommandRefBlock[] = [
 			"When the team task-set completes OR the user requests return to planning/persistence, mark team ready for handoff.",
 		],
 	},
+	{
+		skill: "ultratest",
+		blockId: "state",
+		sourcePath: skillPath("ultratest"),
+		renderOrder: 10,
+		markers: { start: "<!-- gjc:cmdref:start state -->", end: "<!-- gjc:cmdref:end state -->" },
+		commands: [
+			{
+				tokens: ["gjc", "state", "ultratest", "write", "--input", `'{"current_phase":"complete"}'`, "--json"],
+				rendered: `gjc state ultratest write --input '{"current_phase":"complete"}' --json`,
+				visibility: "public",
+				includeWhen: "implemented-only",
+				note: "Records completion after mutation verification and exact restoration.",
+			},
+		],
+		examples: [
+			{
+				label: "completion state write",
+				bytes: '```\ngjc state ultratest write --input \'{"current_phase":"complete"}\' --json\n```',
+			},
+		],
+		aliasesAndBridges: [],
+		notes: ["Record the report only after every temporary mutation has been restored."],
+	},
 ] as const;
 
 export function listCommandRefBlocks(skill?: CanonicalGjcWorkflowSkill): CommandRefBlock[] {

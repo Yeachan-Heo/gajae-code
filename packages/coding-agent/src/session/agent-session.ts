@@ -8367,7 +8367,7 @@ export class AgentSession {
 		// workflow skills can always call it.
 		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
 		const sessionId = this.sessionManager.getSessionId();
-		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team)
+		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team, ultratest)
 		// own their `.gjc/state/skill-active-state.json` row through the
 		// `gjc state handoff` and `gjc state clear` runtime verbs. The prompt
 		// observer must not overwrite an existing row (that clobbered handoff

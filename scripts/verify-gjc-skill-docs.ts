@@ -51,7 +51,8 @@ function collectCommandRefs(file: string, content: string): CommandRef[] {
 	const lines = content.split("\n");
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] ?? "";
-		const commandPattern = /\bgjc\s+(?:state\s+)?(deep-interview|ralplan|ultragoal|team)\s+([a-z][a-z0-9-]*)\b/gu;
+		const commandPattern =
+			/\bgjc\s+(?:state\s+)?(deep-interview|ralplan|ultragoal|team|ultratest)\s+([a-z][a-z0-9-]*)\b/gu;
 		for (const match of line.matchAll(commandPattern)) {
 			const skill = match[1];
 			if (!isSkill(skill)) continue;

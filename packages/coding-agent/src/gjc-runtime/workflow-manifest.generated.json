@@ -95,7 +95,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "mode",
         "type": "enum"
@@ -171,7 +172,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "skill",
         "type": "enum"
@@ -623,7 +625,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "mode",
         "type": "enum"
@@ -699,7 +702,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "skill",
         "type": "enum"
@@ -1018,7 +1022,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "mode",
         "type": "enum"
@@ -1094,7 +1099,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "skill",
         "type": "enum"
@@ -1510,7 +1516,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "mode",
         "type": "enum"
@@ -1586,7 +1593,8 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "team",
+          "ultratest"
         ],
         "name": "skill",
         "type": "enum"
@@ -1969,6 +1977,238 @@
       {
         "name": "quality-gate",
         "surface": "command-positional"
+      },
+      {
+        "name": "graph",
+        "planned": true,
+        "surface": "state-action"
+      },
+      {
+        "name": "prune",
+        "planned": true,
+        "surface": "state-action"
+      },
+      {
+        "name": "migrate",
+        "planned": true,
+        "surface": "state-action"
+      },
+      {
+        "name": "force-overwrite",
+        "planned": true,
+        "surface": "state-action"
+      }
+    ]
+  },
+  "ultratest": {
+    "canonicalOverrides": [],
+    "graphLabel": "Ultratest",
+    "hudFields": [
+      "current_phase",
+      "report_path",
+      "verified",
+      "killed",
+      "noted"
+    ],
+    "initialState": "verifying",
+    "phaseLock": [],
+    "retention": [
+      {
+        "category": "state",
+        "keep": 1
+      },
+      {
+        "category": "report",
+        "maxAgeDays": 30
+      },
+      {
+        "category": "prune/delete",
+        "maxAgeDays": 30
+      },
+      {
+        "category": "force",
+        "maxAgeDays": 90
+      }
+    ],
+    "skill": "ultratest",
+    "states": [
+      {
+        "id": "verifying",
+        "initial": true
+      },
+      {
+        "id": "reported"
+      },
+      {
+        "id": "complete",
+        "terminal": true
+      }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
+    ],
+    "terminalStates": [
+      "complete"
+    ],
+    "transitions": [
+      {
+        "from": "verifying",
+        "to": "reported",
+        "verb": "write"
+      },
+      {
+        "from": "verifying",
+        "to": "complete",
+        "verb": "write"
+      },
+      {
+        "from": "reported",
+        "to": "complete",
+        "verb": "write"
+      }
+    ],
+    "typedArgs": [
+      {
+        "appliesToVerbs": [
+          "write",
+          "api"
+        ],
+        "name": "input",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "read",
+          "write",
+          "clear",
+          "contract",
+          "handoff",
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "team",
+          "ultratest"
+        ],
+        "name": "mode",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "read",
+          "write",
+          "clear",
+          "contract",
+          "handoff",
+          "doctor",
+          "kickoff",
+          "write-spec",
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
+        ],
+        "name": "session-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "thread-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "turn-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "handoff"
+        ],
+        "name": "to",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write"
+        ],
+        "name": "replace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "team",
+          "ultratest"
+        ],
+        "name": "skill",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "name": "json",
+        "type": "boolean"
+      }
+    ],
+    "verbs": [
+      {
+        "name": "read",
+        "surface": "state-action"
+      },
+      {
+        "name": "write",
+        "surface": "state-action"
+      },
+      {
+        "name": "clear",
+        "surface": "state-action"
+      },
+      {
+        "name": "contract",
+        "surface": "state-action"
+      },
+      {
+        "name": "handoff",
+        "surface": "state-action"
+      },
+      {
+        "name": "doctor",
+        "surface": "state-action"
       },
       {
         "name": "graph",
