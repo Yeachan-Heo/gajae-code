@@ -6,6 +6,7 @@ import { updateMCPServer } from "../../../runtime-mcp/config-writer";
 import type { MCPServerConfig } from "../../../runtime-mcp/types";
 import { AuthStorage } from "../../../session/auth-storage";
 import { createAppServerRuntime } from "../../create-app-server";
+import { stableValidators } from "../../protocol-source/schema-validators.generated";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => JSON.parse(new TextDecoder().decode(value)) as Record<string, unknown>;
@@ -832,6 +833,55 @@ test("MCP-WIRE-012 production app-server reload removes a deleted MCP source", a
 		expect(service.manager.getSource("fixture")).toBeUndefined();
 		await connection.process(enc('{"id":3,"method":"mcpServerStatus/list","params":{}}'));
 		expect(responseFor(frames, 3)).toMatchObject({ id: 3, result: { data: [] } });
+	} finally {
+		await connection.close().catch(() => {});
+		await runtime.close().catch(() => {});
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("MCP-WIRE-022 production app-server status projects cached MCP schemas through outbound validation", async () => {
+	const root = mkdtempSync("/tmp/gjc-mcp-wire-status-");
+	const fixture = writeStdioFixture(root);
+	writeFileSync(
+		path.join(root, ".mcp.json"),
+		JSON.stringify({
+			mcpServers: { fixture: { type: "stdio", command: process.execPath, args: [fixture] } },
+		}),
+	);
+	const service = createMcpAppServerService({ cwd: root, agentDir: root });
+	const runtime = createAppServerRuntime({}, undefined, { mcpService: service });
+	const frames: Record<string, unknown>[] = [];
+	const connection = runtime.createConnection(frame => {
+		frames.push(dec(frame));
+	});
+	try {
+		await initialize(connection, frames);
+		await service.discover();
+		const cachedSchema = service.manager.getConnection("fixture")?.tools?.[0]?.inputSchema;
+		if (!cachedSchema) throw new Error("Connected fixture did not cache its tool schema");
+		expect(Object.getOwnPropertySymbols(cachedSchema)).not.toHaveLength(0);
+
+		const validate = stableValidators.clientRequestResults["mcpServerStatus/list"];
+		expect(validate).toBeDefined();
+		for (const [id, params] of [
+			[2, {}],
+			[3, { detail: "full" }],
+			[4, { detail: "toolsAndAuthOnly" }],
+		] as const) {
+			await connection.process(enc(JSON.stringify({ id, method: "mcpServerStatus/list", params })));
+			const frame = responseFor(frames, id);
+			expect(frame.error).toBeUndefined();
+			expect(validate?.(frame.result)).toBe(true);
+			expect(frame.result).toMatchObject({
+				data: [
+					{
+						name: "fixture",
+						tools: { one: { name: "one", inputSchema: { type: "object" } } },
+					},
+				],
+			});
+		}
 	} finally {
 		await connection.close().catch(() => {});
 		await runtime.close().catch(() => {});

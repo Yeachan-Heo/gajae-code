@@ -14,6 +14,51 @@ function record(value: unknown): value is RecordValue {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Project MCP values into plain JSON before the app-server's outbound validator.
+ * MCP tool schemas are normalized for the agent and carry non-enumerable symbol
+ * stamps; this boundary deliberately copies only enumerable data properties.
+ */
+function projectWireJson(value: unknown, seen = new WeakSet<object>()): unknown {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value !== "object") return undefined;
+	if (seen.has(value)) return undefined;
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			const result: unknown[] = [];
+			for (let index = 0; index < value.length; index++) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+				const projected =
+					descriptor?.enumerable && "value" in descriptor ? projectWireJson(descriptor.value, seen) : undefined;
+				result.push(projected === undefined ? null : projected);
+			}
+			return result;
+		}
+		const result: RecordValue = {};
+		for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+			if (!descriptor.enumerable || !("value" in descriptor)) continue;
+			const projected = projectWireJson(descriptor.value, seen);
+			if (projected !== undefined)
+				Object.defineProperty(result, key, {
+					value: projected,
+					enumerable: true,
+					writable: true,
+					configurable: true,
+				});
+		}
+		return result;
+	} finally {
+		seen.delete(value);
+	}
+}
+
+function projectWireObject(value: RecordValue): RecordValue {
+	const projected = projectWireJson(value);
+	return record(projected) ? projected : {};
+}
+
 function service(context?: HandlerContext): McpAppServerService | undefined {
 	return context?.mcpService;
 }
@@ -48,7 +93,7 @@ export const mcpServerStatusListHandler: MethodHandler = async (params, context)
 	if (limit !== undefined && limit !== null && (!Number.isInteger(limit) || (limit as number) < 0)) return invalid();
 	if (detail !== undefined && detail !== null && detail !== "full" && detail !== "toolsAndAuthOnly") return invalid();
 	const mcp = manager(context);
-	if (!mcp) return { ok: true, result: { data: [] } };
+	if (!mcp) return { ok: true, result: projectWireObject({ data: [] }) };
 
 	const names = mcp.getAllServerNames().sort();
 	const start = cursor === undefined || cursor === null || cursor === "" ? 0 : Number.parseInt(cursor, 10);
@@ -106,7 +151,7 @@ export const mcpServerStatusListHandler: MethodHandler = async (params, context)
 	);
 	const result: RecordValue = { data };
 	if (start + selected.length < names.length) result.nextCursor = String(start + selected.length);
-	return { ok: true, result };
+	return { ok: true, result: projectWireObject(result) };
 };
 
 /** Reload configured MCP servers through the runtime-owned lifecycle service. */
@@ -147,7 +192,7 @@ export const mcpServerToolCallHandler: MethodHandler = async (params, context) =
 		const tools = await listTools(conn);
 		if (!tools.some(tool => tool.name === params.tool)) return notFound();
 		const result = await callTool(conn, params.tool, (args ?? {}) as Record<string, unknown>);
-		return { ok: true, result };
+		return { ok: true, result: projectWireJson(result) };
 	} catch {
 		return internal();
 	}
@@ -160,7 +205,7 @@ export const mcpServerResourceReadHandler: MethodHandler = async (params, contex
 	if (!connection(params.server, context)) return notFound();
 	try {
 		const result = await mcp?.readServerResource(params.server, params.uri);
-		return result === undefined ? notFound() : { ok: true, result };
+		return result === undefined ? notFound() : { ok: true, result: projectWireJson(result) };
 	} catch {
 		return internal();
 	}

@@ -248,8 +248,8 @@ export const supportManifestOverrides: Record<string, SupportManifestOverride> =
 	"mcpServerStatus/list": laneRow(
 		"mcpServerStatusListHandler",
 		"suites/mcp-handlers.ts",
-		["MCP-001 status lists a real connected server and inventory"],
-		"Status is projected from the live MCPManager connections.",
+		["MCP-WIRE-022 production app-server status projects cached MCP schemas through outbound validation"],
+		"Status projects live MCP manager connections through a JSON-clean DTO before outbound validation, including cached tool schemas and both detail modes.",
 	),
 	"mcpServer/tool/call": laneRow(
 		"mcpServerToolCallHandler",
