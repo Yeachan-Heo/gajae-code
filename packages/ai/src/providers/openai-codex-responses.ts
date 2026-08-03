@@ -555,10 +555,12 @@ function getCodexServiceTierCostMultiplier(
 
 function resolveCodexCostServiceTier(res: unknown, req?: unknown): ServiceTier | "default" | undefined {
 	switch (res) {
+		case "auto":
+		case "default":
 		case "flex":
-			return "flex";
+		case "scale":
 		case "priority":
-			return "priority";
+			return res;
 		default:
 			if (req === "flex" || req === "priority") {
 				return req;
