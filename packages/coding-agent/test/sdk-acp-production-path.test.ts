@@ -278,6 +278,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 											{ name: "ralplan", description: "Build a consensus plan" },
 											{ name: "ultragoal", description: "Execute durable goals" },
 											{ name: "team", description: "Run parallel workers" },
+											{ name: "ultratest", description: "Verify changed test defenses" },
 										]
 									: frame.query === "session.metadata"
 										? [{ sessionId: "owned-session", name: "MCP List Request", cwd }]
@@ -526,7 +527,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const availableCommands = updates.find(update => update.update.sessionUpdate === "available_commands_update")
 		?.update as { availableCommands?: Array<{ name: string }> };
 	expect(availableCommands.availableCommands?.map(command => command.name)).toEqual(
-		expect.arrayContaining(["skill:deep-interview", "skill:ralplan", "skill:ultragoal", "skill:team"]),
+		expect.arrayContaining([
+			"skill:deep-interview",
+			"skill:ralplan",
+			"skill:ultragoal",
+			"skill:team",
+			"skill:ultratest",
+		]),
 	);
 	const listedOwned = await bounded(agent.listSessions({ cwd }), "list owned session");
 	expect(listedOwned.sessions).toEqual([

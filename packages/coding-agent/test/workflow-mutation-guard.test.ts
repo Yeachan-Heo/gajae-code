@@ -57,7 +57,7 @@ async function writeActiveDeepInterview(cwd: string, sessionId = "session-a", ph
 
 async function writeActiveSkill(
 	cwd: string,
-	skill: "deep-interview" | "ralplan" | "ultragoal" | "team",
+	skill: "deep-interview" | "ralplan" | "ultragoal" | "team" | "ultratest",
 	phase: string,
 	sessionId = "session-a",
 ): Promise<void> {
@@ -175,7 +175,7 @@ describe("workflow mutation guard", () => {
 				tool("write"),
 				{ path: ".gjc/_session-session-a/state/skill-active-state.json", content: "{}" },
 			],
-			...(["deep-interview", "ralplan", "ultragoal", "team"] as const).map(
+			...(["deep-interview", "ralplan", "ultragoal", "team", "ultratest"] as const).map(
 				skill =>
 					[
 						`write ${skill}`,
@@ -183,7 +183,7 @@ describe("workflow mutation guard", () => {
 						{ path: `.gjc/state/sessions/session-a/${skill}-state.json`, content: "{}" },
 					] as [string, AgentTool, unknown],
 			),
-			...(["deep-interview", "ralplan", "ultragoal", "team"] as const).map(
+			...(["deep-interview", "ralplan", "ultragoal", "team", "ultratest"] as const).map(
 				skill =>
 					[
 						`write generated ${skill}`,

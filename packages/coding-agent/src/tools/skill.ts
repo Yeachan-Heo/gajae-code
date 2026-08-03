@@ -12,8 +12,9 @@
  *
  * Canonical workflow chaining is refused unless the caller's `current_phase` is
  * in `{complete, completed, handoff, failed, cancelled, canceled, inactive}`.
- * The agent declares readiness either by writing `current_phase: "handoff"` to
- * its mode-state or by running the handoff verb directly.
+ * The agent declares readiness either by writing a terminal phase to its
+ * mode-state or by running the handoff verb directly. `ultratest` uses
+ * `current_phase: "complete"` rather than a manual handoff phase.
  */
 
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
@@ -138,8 +139,12 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill)) {
 				const phase = (this.#session.getActiveSkillPhase?.() ?? "running").trim().toLowerCase();
 				if (!TERMINAL_PHASES.has(phase)) {
+					const finalizationCommand =
+						activeSkill === "ultratest"
+							? 'gjc state ultratest write --input \'{"current_phase":"complete"}\' --json'
+							: `gjc state ${activeSkill} write --input '{"current_phase":"handoff"}' --json`;
 					throw new ToolError(
-						`skill tool: refusing to chain from "${activeSkill}" (phase=${phase}) into "${requestedName}". Finalize the current skill (gjc state ${activeSkill} write --input '{"current_phase":"handoff"}' --json) or run gjc state ${activeSkill} handoff --to ${requestedName} --json directly before chaining.`,
+						`skill tool: refusing to chain from "${activeSkill}" (phase=${phase}) into "${requestedName}". Finalize the current skill (${finalizationCommand}) before chaining.`,
 					);
 				}
 				const cwd = this.#session.cwd;

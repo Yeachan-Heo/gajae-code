@@ -96,16 +96,27 @@ describe("ultratest commit gate", () => {
 		expect(decision.blocked).toBe(true);
 	});
 
-	it("allows an inline commit with an Ultratest-Verified trailer", async () => {
+	it("allows documented Ultratest-Verified trailer forms", async () => {
+		for (const trailer of [
+			"Ultratest-Verified: killed 3 / noted 1",
+			"Ultratest-Verified: skip(no assertion change)",
+		]) {
+			const cwd = await createFixture();
+			const decision = await mutationDecision(cwd, `git commit -m "test: add verification\n\n${trailer}"`);
+
+			expect(decision.blocked).toBe(false);
+		}
+	});
+
+	it("blocks an inline commit with an incomplete Ultratest-Verified trailer", async () => {
 		const cwd = await createFixture();
 		const decision = await mutationDecision(
 			cwd,
 			'git commit -m "test: add verification\n\nUltratest-Verified: focused gate"',
 		);
 
-		expect(decision.blocked).toBe(false);
+		expect(decision.blocked).toBe(true);
 	});
-
 	it("blocks --message commits and Python test changes", async () => {
 		const messageFlagFixture = await createFixture();
 		const messageFlagDecision = await mutationDecision(
@@ -163,7 +174,7 @@ describe("ultratest commit gate", () => {
 		expect(decision.blocked).toBe(false);
 	});
 
-	it("allows an unverified inline commit when a staged test deletion is the only change", async () => {
+	it("blocks an unverified inline commit when a staged test deletion is the only change", async () => {
 		const cwd = await createFixture();
 		git(cwd, ["commit", "-m", "test: fixture baseline"]);
 		git(cwd, ["rm", "src/example.test.ts"]);
@@ -171,6 +182,6 @@ describe("ultratest commit gate", () => {
 
 		const decision = await mutationDecision(cwd, 'git commit -m "test: remove verification"');
 
-		expect(decision.blocked).toBe(false);
+		expect(decision.blocked).toBe(true);
 	});
 });

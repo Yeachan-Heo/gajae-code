@@ -30,6 +30,7 @@ import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import {
 	compareSkillKeywordMatches,
 	GJC_SKILL_KEYWORD_DEFINITIONS,
+	GJC_WORKFLOW_SKILLS,
 	type GjcWorkflowSkill,
 	isGjcWorkflowSkill,
 } from "./skill-keywords";
@@ -45,6 +46,7 @@ export interface EffectiveSkillConfigInput {
 
 const SANITIZED_CONFIG_VALUE_LIMIT = 80;
 const DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD = 0.05;
+const GJC_WORKFLOW_ACTIVATION_NAMES = GJC_WORKFLOW_SKILLS.join(", ");
 
 function sanitizeConfigValue(value: string): string {
 	const compact = value.replace(/[\r\n\t]+/g, " ").trim();
@@ -64,7 +66,13 @@ function formatBoolean(name: string, value: boolean | undefined): string {
 export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillConfigInput | undefined): string {
 	if (!input || input.unavailableReason) {
 		const reason = input?.unavailableReason ? sanitizeConfigValue(input.unavailableReason) : "not available";
-		return `Sanitized effective skill config unavailable (${reason}); bundled GJC workflow activation remains available for deep-interview, ralplan, ultragoal, team.`;
+		return (
+			"Sanitized effective skill config unavailable (" +
+			reason +
+			"); bundled GJC workflow activation remains available for " +
+			GJC_WORKFLOW_ACTIVATION_NAMES +
+			"."
+		);
 	}
 
 	const settings = input.skillsSettings ?? {};
@@ -76,7 +84,9 @@ export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillC
 	const customDirectoryCount = countNonEmptyStrings(settings.customDirectories);
 
 	return [
-		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, team.",
+		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly " +
+			GJC_WORKFLOW_ACTIVATION_NAMES +
+			".",
 		`Skill discovery booleans: ${[
 			formatBoolean("enabled", settings.enabled),
 			formatBoolean("enableSkillCommands", settings.enableSkillCommands),

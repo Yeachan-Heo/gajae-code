@@ -3,7 +3,7 @@ import { getSkillManifest } from "../../src/gjc-runtime/workflow-manifest";
 
 describe("workflow manifest phase sets", () => {
 	it("preserves the resolved phase memberships for every workflow skill", () => {
-		for (const skill of ["deep-interview", "ralplan", "ultragoal", "team"] as const) {
+		for (const skill of ["deep-interview", "ralplan", "ultragoal", "team", "ultratest"] as const) {
 			expect(getSkillManifest(skill).stopReleasingPhases).toEqual([
 				"complete",
 				"completed",

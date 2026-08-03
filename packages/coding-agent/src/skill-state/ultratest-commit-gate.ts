@@ -1,4 +1,5 @@
-const ULTRATEST_TRAILER = /^Ultratest-Verified:\s*\S.*$/mu;
+const ULTRATEST_TRAILER =
+	/^Ultratest-Verified:\s+(?:killed\s+\d+\s*\/\s*noted\s+\d+|skip\(no assertion change\))\s*$/mu;
 
 const ULTRATEST_BLOCK_MESSAGE = [
 	"Ultratest commit gate: staged test changes require mutation verification before an inline commit.",
@@ -115,7 +116,7 @@ function isSupportedTestPath(filePath: string): boolean {
 
 function hasStagedTest(cwd: string): boolean | null {
 	try {
-		const result = Bun.spawnSync(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMRTUXB", "-z", "--"], {
+		const result = Bun.spawnSync(["git", "diff", "--cached", "--name-only", "--diff-filter=ACDMRTUXB", "-z", "--"], {
 			cwd,
 			stdin: "ignore",
 			stdout: "pipe",

@@ -235,12 +235,32 @@ describe("GJC native skill-state hooks", () => {
 	}
 
 	it("detects only the public GJC workflow skill surface", () => {
-		expect(detectSkillKeywords("$deep-interview then $team").map(match => match.skill)).toEqual([
+		expect(detectSkillKeywords("$deep-interview then $team then $ultratest").map(match => match.skill)).toEqual([
 			"deep-interview",
 			"team",
+			"ultratest",
 		]);
 		expect(detectSkillKeywords("$autopilot deep interview")).toEqual([]);
 		expect(detectSkillKeywords("please run a consensus plan")[0]?.skill).toBe("ralplan");
+	});
+
+	it("activates ultratest from the public keyword with its verification phase", async () => {
+		const root = await cwd();
+		const result = await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultratest verify the changed assertions",
+				cwd: root,
+				sessionId: "session-ultratest",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		expect(result.hookEventName).toBe("UserPromptSubmit");
+		const state = await readVisibleSkillActiveState(root, "session-ultratest");
+		expect(state).toMatchObject({ active: true, skill: "ultratest", phase: "verifying" });
+		const modeState = await Bun.file(modeStatePath(root, "session-ultratest", "ultratest")).json();
+		expect(modeState).toMatchObject({ active: true, current_phase: "verifying" });
 	});
 
 	it("UserPromptSubmit adds advisory answer-only context for question-only prompts", async () => {
@@ -300,7 +320,7 @@ describe("GJC native skill-state hooks", () => {
 		);
 		expect(context).toContain("Sanitized effective skill config");
 		expect(context).toContain("filesystem/custom skill discovery");
-		expect(context).toContain("deep-interview, ralplan, ultragoal, team");
+		expect(context).toContain("deep-interview, ralplan, ultragoal, team, ultratest");
 		const state = await readVisibleSkillActiveState(root, "session-1");
 		expect(state).toMatchObject({
 			active: true,

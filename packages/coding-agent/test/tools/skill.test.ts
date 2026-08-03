@@ -556,6 +556,26 @@ describe("SkillTool", () => {
 		expect(captured).toHaveLength(0);
 	});
 
+	it("describes and enforces ultratest completion before chaining", async () => {
+		const cwd = await makeTempCwd();
+		const ultratest = await makeSkill("ultratest", "---\nname: ultratest\n---\nVerify");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const captured: CapturedSend[] = [];
+		const tool = SkillTool.createIf(
+			createSession(cwd, [ultratest, ralplan], captured, {
+				getActiveSkillState: () => ({ skill: "ultratest", session_id: "s1" }),
+				getActiveSkillPhase: () => "verifying",
+			}),
+		)!;
+
+		expect(tool.description).toContain("`ultratest`");
+		expect(tool.description).toContain('gjc state ultratest write --input \'{"current_phase":"complete"}\' --json');
+		await expect(tool.execute("call-1", { name: "ralplan" })).rejects.toThrow(
+			/gjc state ultratest write --input '\{"current_phase":"complete"\}' --json/,
+		);
+		expect(captured).toHaveLength(0);
+	});
+
 	it("chains successfully when caller phase is 'handoff' and atomically updates state", async () => {
 		const cwd = await makeTempCwd();
 		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");

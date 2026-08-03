@@ -61,6 +61,18 @@ export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = 
 		guidance: "Activate GJC ultragoal durable goal workflow",
 	},
 	{
+		keyword: "$ultratest",
+		skill: "ultratest",
+		priority: 8,
+		guidance: "Activate GJC ultratest verification workflow",
+	},
+	{
+		keyword: "ultratest",
+		skill: "ultratest",
+		priority: 8,
+		guidance: "Activate GJC ultratest verification workflow",
+	},
+	{
 		keyword: "$team",
 		skill: "team",
 		priority: 8,
