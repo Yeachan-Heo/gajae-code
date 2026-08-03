@@ -32,6 +32,7 @@ import { computeIrcSplitWidths, getIrcSidebarSemanticToken } from "../components
 import type { IrcObservationRecord } from "../irc-observation-ledger";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
+import { emitHostStatus } from "../utils/host-status";
 import { consumeInjectedOptimisticSignature } from "../utils/injected-user-submission";
 import { parseIrcMessage } from "../utils/irc-message";
 import { ringTerminalBell } from "../utils/terminal-bell";
@@ -298,6 +299,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		emitHostStatus("working");
 		this.ctx.promptSuggestion?.onAgentStart();
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
@@ -924,6 +926,7 @@ export class EventController {
 		this.ctx.updateEditorBorderColor();
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
+		emitHostStatus("finished");
 		this.sendCompletionNotification();
 		this.ctx.promptSuggestion?.onAgentEnd();
 	}
