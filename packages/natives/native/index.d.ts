@@ -21,8 +21,8 @@ export declare class ComputerController {
 }
 
 /**
- * Darwin-only persistent kernel replacement admission. The descriptor is opaque
- * to JavaScript and remains held until `close` or process teardown.
+ * Darwin-only persistent kernel replacement admission. The descriptor is
+ * opaque to JavaScript and remains held until `close` or process teardown.
  */
 export declare class DarwinReplacementAuth {
   close(): void
