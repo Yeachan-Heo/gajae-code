@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+gjc-config = { path = "../gjc-config" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

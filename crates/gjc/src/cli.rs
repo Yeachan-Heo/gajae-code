@@ -6,6 +6,8 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+use crate::config_cmd::{self, ConfigAction};
+
 #[derive(Parser)]
 #[command(name = "gjc", version, about = "gajae-code coding agent")]
 pub struct Cli {
@@ -23,8 +25,11 @@ pub enum Command {
 	Run,
 	/// Serve the Agent Client Protocol over stdio.
 	Acp,
-	/// Print resolved configuration as JSON.
-	Config,
+	/// Inspect configuration (list, get, path).
+	Config {
+		#[command(subcommand)]
+		action: ConfigAction,
+	},
 }
 
 #[allow(clippy::unused_async, reason = "stubs; ported subsystems will await")]
@@ -32,6 +37,6 @@ pub async fn run(cli: Cli) -> Result<()> {
 	match cli.command.unwrap_or(Command::Run) {
 		Command::Run => bail!("not yet ported: interactive session (phase: agent core)"),
 		Command::Acp => bail!("not yet ported: ACP server (phase: agent core)"),
-		Command::Config => bail!("not yet ported: config resolution (phase 0)"),
+		Command::Config { action } => config_cmd::run(&action),
 	}
 }

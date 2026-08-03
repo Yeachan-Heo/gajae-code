@@ -38,7 +38,37 @@ export const JSON_SCHEMA_OUTPUTS = [
 		path: "schemas/models.schema.json",
 		schema: createModelsJsonSchema(),
 	},
+	{
+		path: "schemas/settings-flat.json",
+		schema: createFlatSettingsSchema(),
+	},
 ] as const;
+
+/**
+ * Flat settings table consumed by the Rust `gjc-config` crate (see
+ * docs/roadmap/full-conversion-to-rust.md). Preserves SETTINGS_SCHEMA
+ * definition order and the exact fields the read-side CLI needs:
+ * type, default, enum values, ui description/tab.
+ */
+function createFlatSettingsSchema(): JsonSchemaObject {
+	const settings: Record<string, JsonSchemaObject> = {};
+	for (const [settingPath, definition] of Object.entries(SETTINGS_SCHEMA) as Array<[string, SettingDefinition]>) {
+		const entry: JsonSchemaObject = { type: definition.type };
+		if ("default" in definition && definition.default !== undefined) entry.default = definition.default;
+		if ("values" in definition) entry.values = definition.values;
+		if ("ui" in definition && definition.ui) {
+			entry.description = definition.ui.description;
+			entry.tab = definition.ui.tab;
+		}
+		settings[settingPath] = entry;
+	}
+	return {
+		$id: "https://gajae.ai/schemas/settings-flat.json",
+		description:
+			"Flat settings table for the Rust gjc-config crate. Generated from packages/coding-agent/src/config/settings-schema.ts.",
+		settings,
+	};
+}
 
 function createConfigJsonSchema(): JsonSchemaObject {
 	const root: JsonSchemaObject = {

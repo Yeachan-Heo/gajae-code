@@ -6,6 +6,7 @@
 //! background jobs, TS plugins/extensions) runs as a subprocess.
 
 mod cli;
+mod config_cmd;
 
 use anyhow::Result;
 use clap::Parser;

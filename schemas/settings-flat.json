@@ -1,0 +1,2232 @@
+{
+	"$id": "https://gajae.ai/schemas/settings-flat.json",
+	"description": "Flat settings table for the Rust gjc-config crate. Generated from packages/coding-agent/src/config/settings-schema.ts.",
+	"settings": {
+		"lastChangelogVersion": {
+			"type": "string"
+		},
+		"auth.broker.url": {
+			"type": "string"
+		},
+		"auth.broker.token": {
+			"type": "string"
+		},
+		"session.directoryMigration": {
+			"type": "enum",
+			"default": "copy-retain",
+			"values": [
+				"copy-retain",
+				"disabled"
+			]
+		},
+		"sdk.promptDeadlineMs": {
+			"type": "number",
+			"default": 1800000
+		},
+		"notifications.enabled": {
+			"type": "boolean",
+			"default": false
+		},
+		"notifications.telegram.enabled": {
+			"type": "boolean"
+		},
+		"notifications.telegram.botToken": {
+			"type": "string"
+		},
+		"notifications.telegram.chatId": {
+			"type": "string"
+		},
+		"notifications.telegram.activation": {
+			"type": "record",
+			"default": {}
+		},
+		"notifications.telegram.btw.enabled": {
+			"type": "boolean",
+			"default": true
+		},
+		"notifications.telegram.streaming.enabled": {
+			"type": "boolean",
+			"default": true
+		},
+		"notifications.telegram.sound": {
+			"type": "enum",
+			"default": "all",
+			"values": [
+				"all",
+				"important",
+				"none"
+			],
+			"description": "Choose which Telegram notifications play a sound.",
+			"tab": "notifications"
+		},
+		"notifications.telegram.rich.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Format Telegram notifications with rich message content.",
+			"tab": "notifications"
+		},
+		"notifications.telegram.richDraft.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Include rich draft updates in Telegram notifications.",
+			"tab": "notifications"
+		},
+		"notifications.telegram.toolActivity.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Send Telegram updates for tool starts and completions.",
+			"tab": "notifications"
+		},
+		"notifications.telegram.topics.nameTemplate": {
+			"type": "string"
+		},
+		"notifications.discord.enabled": {
+			"type": "boolean"
+		},
+		"notifications.discord.botToken": {
+			"type": "string"
+		},
+		"notifications.discord.applicationId": {
+			"type": "string"
+		},
+		"notifications.discord.guildId": {
+			"type": "string"
+		},
+		"notifications.discord.parentChannelId": {
+			"type": "string"
+		},
+		"notifications.slack.enabled": {
+			"type": "boolean"
+		},
+		"notifications.slack.botToken": {
+			"type": "string"
+		},
+		"notifications.slack.appToken": {
+			"type": "string"
+		},
+		"notifications.slack.workspaceId": {
+			"type": "string"
+		},
+		"notifications.slack.channelId": {
+			"type": "string"
+		},
+		"notifications.slack.authorizedUserId": {
+			"type": "string"
+		},
+		"notifications.redact": {
+			"type": "boolean",
+			"default": false,
+			"description": "Redact sensitive content before notifications are delivered.",
+			"tab": "notifications"
+		},
+		"notifications.verbosity": {
+			"type": "string",
+			"default": "lean",
+			"description": "Choose concise or detailed notification messages.",
+			"tab": "notifications"
+		},
+		"notifications.sessionScope": {
+			"type": "string",
+			"default": "all",
+			"description": "Send notifications from all sessions or only the primary session.",
+			"tab": "notifications"
+		},
+		"notifications.daemon.idleTimeoutMs": {
+			"type": "number",
+			"default": 60000
+		},
+		"notifications.terminalBell": {
+			"type": "boolean",
+			"default": false,
+			"description": "Emit a BEL character for local terminal notifications. Windows Terminal may keep BEL silent depending on profile/system sound settings; use completion.notifyCommand for a PowerShell Console.Beep workaround.",
+			"tab": "interaction"
+		},
+		"notifications.bellOnComplete": {
+			"type": "boolean",
+			"default": true,
+			"description": "Ring the terminal bell when an agent turn completes",
+			"tab": "interaction"
+		},
+		"notifications.bellOnApproval": {
+			"type": "boolean",
+			"default": true,
+			"description": "Ring the terminal bell when a plan or approval prompt needs attention",
+			"tab": "interaction"
+		},
+		"notifications.bellOnAsk": {
+			"type": "boolean",
+			"default": true,
+			"description": "Ring the terminal bell when an ask/user-input prompt needs attention",
+			"tab": "interaction"
+		},
+		"autoResume": {
+			"type": "boolean",
+			"default": false,
+			"description": "Automatically resume the most recent session in the current directory",
+			"tab": "interaction"
+		},
+		"power.preventIdleSleep": {
+			"type": "boolean",
+			"default": true,
+			"description": "caffeinate -i: keep the system awake while a session is open",
+			"tab": "interaction"
+		},
+		"power.preventSystemSleep": {
+			"type": "boolean",
+			"default": false,
+			"description": "caffeinate -s: block all system sleep while on AC power",
+			"tab": "interaction"
+		},
+		"power.declareUserActive": {
+			"type": "boolean",
+			"default": false,
+			"description": "caffeinate -u: keep the display lit and treat the user as active",
+			"tab": "interaction"
+		},
+		"power.preventDisplaySleep": {
+			"type": "boolean",
+			"default": false,
+			"description": "caffeinate -d: keep the display from idle-sleeping while a session is open",
+			"tab": "interaction"
+		},
+		"shellPath": {
+			"type": "string"
+		},
+		"extensions": {
+			"type": "array",
+			"default": []
+		},
+		"marketplace.autoUpdate": {
+			"type": "enum",
+			"default": "off",
+			"values": [
+				"off",
+				"notify",
+				"auto"
+			]
+		},
+		"enabledModels": {
+			"type": "array",
+			"default": []
+		},
+		"disabledProviders": {
+			"type": "array",
+			"default": []
+		},
+		"disabledExtensions": {
+			"type": "array",
+			"default": []
+		},
+		"modelRoles": {
+			"type": "record",
+			"default": {}
+		},
+		"modelProfile.default": {
+			"type": "string",
+			"description": "Model profile applied automatically at startup",
+			"tab": "model"
+		},
+		"session.resumeModelBehavior": {
+			"type": "enum",
+			"default": "keepSessionModel",
+			"values": [
+				"keepSessionModel",
+				"useCurrentDefault",
+				"ask"
+			],
+			"description": "When resuming a session: keep the model that session last used, switch to the currently configured default model, or ask (TUI only; falls back to keeping the session's model in headless/CLI resume).",
+			"tab": "model"
+		},
+		"modelTags": {
+			"type": "record",
+			"default": {}
+		},
+		"modelProviderOrder": {
+			"type": "array",
+			"default": []
+		},
+		"cycleOrder": {
+			"type": "array",
+			"default": [
+				"default"
+			]
+		},
+		"gjc.deepInterview.ambiguityThreshold": {
+			"type": "number",
+			"default": 0.05
+		},
+		"gjc.ralplan.autoHandoff": {
+			"type": "enum",
+			"default": "off",
+			"values": [
+				"off",
+				"ultragoal",
+				"team"
+			]
+		},
+		"gjc.ralplan.maxIterations": {
+			"type": "number",
+			"default": 5
+		},
+		"gjc.ralplan.maxReviewPassesPerLane": {
+			"type": "number",
+			"default": 1
+		},
+		"theme.dark": {
+			"type": "string",
+			"default": "red-claw",
+			"description": "Theme used when terminal has dark background",
+			"tab": "appearance"
+		},
+		"theme.light": {
+			"type": "string",
+			"default": "blue-crab",
+			"description": "Theme used when terminal has light background",
+			"tab": "appearance"
+		},
+		"symbolPreset": {
+			"type": "enum",
+			"default": "unicode",
+			"values": [
+				"unicode",
+				"nerd",
+				"ascii"
+			],
+			"description": "Icon/symbol style",
+			"tab": "appearance"
+		},
+		"colorBlindMode": {
+			"type": "boolean",
+			"default": false,
+			"description": "Use blue instead of green for diff additions",
+			"tab": "appearance"
+		},
+		"statusLine.preset": {
+			"type": "enum",
+			"default": "default",
+			"values": [
+				"default",
+				"default-usage",
+				"minimal",
+				"compact",
+				"full",
+				"nerd",
+				"ascii",
+				"custom"
+			],
+			"description": "Pre-built status line configurations",
+			"tab": "appearance"
+		},
+		"statusLine.separator": {
+			"type": "enum",
+			"default": "slash",
+			"values": [
+				"powerline",
+				"powerline-thin",
+				"slash",
+				"pipe",
+				"block",
+				"none",
+				"ascii"
+			],
+			"description": "Style of separators between segments",
+			"tab": "appearance"
+		},
+		"statusLine.sessionAccent": {
+			"type": "boolean",
+			"default": true,
+			"description": "Use the session name color for the editor border and status line gap",
+			"tab": "appearance"
+		},
+		"pet.mode": {
+			"type": "enum",
+			"default": "off",
+			"values": [
+				"off",
+				"red",
+				"blue"
+			],
+			"description": "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+			"tab": "appearance"
+		},
+		"statusLine.maxRows": {
+			"type": "number",
+			"default": 1,
+			"description": "Maximum rows for the status line. When greater than 1, overflowing segments wrap onto additional rows instead of being dropped.",
+			"tab": "appearance"
+		},
+		"tools.artifactSpillThreshold": {
+			"type": "number",
+			"default": 50,
+			"description": "Tool output above this size is saved as an artifact; tail is kept inline",
+			"tab": "tools"
+		},
+		"tools.preAdmissionArtifactSpill": {
+			"type": "boolean",
+			"default": false,
+			"description": "Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
+			"tab": "tools"
+		},
+		"tools.readArtifactSpillThreshold": {
+			"type": "number",
+			"default": 256,
+			"description": "Explicit large reads above this combined size are saved as an artifact with a bounded head-and-tail snippet inline. Bare reads, directories, and converted-document receipts remain inline.",
+			"tab": "tools"
+		},
+		"tools.fileMentionInlineBytes": {
+			"type": "number",
+			"default": 10,
+			"description": "Inline byte cap for auto-read `@path` file mentions, aligned with the 10 KiB bare-read receipt so incidental mentions stay within the same bounded context budget. The full file is still available via the read tool.",
+			"tab": "tools"
+		},
+		"tools.artifactTailBytes": {
+			"type": "number",
+			"default": 20,
+			"description": "Amount of tail content kept inline when output spills to artifact",
+			"tab": "tools"
+		},
+		"tools.artifactHeadBytes": {
+			"type": "number",
+			"default": 20,
+			"description": "Amount of head content kept inline alongside the tail when output spills to artifact (middle elision). 0 disables — keep tail only.",
+			"tab": "tools"
+		},
+		"tools.outputMaxColumns": {
+			"type": "number",
+			"default": 768,
+			"description": "Per-line byte cap for streaming tool outputs (bash, ssh, python, js eval) and `read`. Lines wider than this are ellipsis-truncated; remaining bytes up to the next newline are dropped. 0 disables.",
+			"tab": "tools"
+		},
+		"tools.artifactTailLines": {
+			"type": "number",
+			"default": 500,
+			"description": "Maximum lines of tail content kept inline when output spills to artifact",
+			"tab": "tools"
+		},
+		"tools.maxInlineResultBytes": {
+			"type": "number",
+			"default": 0,
+			"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+			"tab": "tools"
+		},
+		"statusLine.showHookStatus": {
+			"type": "boolean",
+			"default": false
+		},
+		"statusLine.showSkillHud": {
+			"type": "boolean",
+			"default": true
+		},
+		"statusLine.showActionHints": {
+			"type": "boolean",
+			"default": true,
+			"description": "Show contextual keyboard shortcuts in the composer placeholder",
+			"tab": "appearance"
+		},
+		"statusLine.leftSegments": {
+			"type": "array",
+			"default": []
+		},
+		"statusLine.rightSegments": {
+			"type": "array",
+			"default": []
+		},
+		"statusLine.segmentOptions": {
+			"type": "record",
+			"default": {}
+		},
+		"terminal.showImages": {
+			"type": "boolean",
+			"default": true,
+			"description": "Render images inline in terminal",
+			"tab": "appearance"
+		},
+		"images.autoResize": {
+			"type": "boolean",
+			"default": true,
+			"description": "Resize large images to 2000x2000 max for better model compatibility",
+			"tab": "appearance"
+		},
+		"images.blockImages": {
+			"type": "boolean",
+			"default": false,
+			"description": "Prevent images from being sent to LLM providers",
+			"tab": "appearance"
+		},
+		"tui.maxInlineImageColumns": {
+			"type": "number",
+			"default": 100
+		},
+		"tui.maxInlineImageRows": {
+			"type": "number",
+			"default": 20
+		},
+		"tui.hyperlinks": {
+			"type": "enum",
+			"default": "auto",
+			"values": [
+				"off",
+				"auto",
+				"always"
+			],
+			"description": "Wrap file paths in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
+			"tab": "appearance"
+		},
+		"display.tabWidth": {
+			"type": "number",
+			"default": 3
+		},
+		"display.shimmer": {
+			"type": "enum",
+			"default": "classic",
+			"values": [
+				"classic",
+				"kitt",
+				"disabled"
+			],
+			"description": "Animation style for working/loading messages",
+			"tab": "appearance"
+		},
+		"display.showTokenUsage": {
+			"type": "boolean",
+			"default": false,
+			"description": "Show per-turn token usage on assistant messages",
+			"tab": "appearance"
+		},
+		"showHardwareCursor": {
+			"type": "boolean",
+			"default": true,
+			"description": "Show terminal cursor for IME support",
+			"tab": "appearance"
+		},
+		"clearOnShrink": {
+			"type": "boolean",
+			"default": false,
+			"description": "Clear empty rows when content shrinks (may cause flicker)",
+			"tab": "appearance"
+		},
+		"defaultThinkingLevel": {
+			"type": "enum",
+			"default": "high",
+			"values": [
+				"off",
+				"minimal",
+				"low",
+				"medium",
+				"high",
+				"xhigh",
+				"max"
+			],
+			"description": "Reasoning depth for thinking-capable models",
+			"tab": "model"
+		},
+		"hideThinkingBlock": {
+			"type": "boolean",
+			"default": false,
+			"description": "Hide thinking blocks in assistant responses",
+			"tab": "model"
+		},
+		"repeatToolDescriptions": {
+			"type": "boolean",
+			"default": false,
+			"description": "Render full tool descriptions in the system prompt instead of a tool name list",
+			"tab": "model"
+		},
+		"temperature": {
+			"type": "number",
+			"default": -1,
+			"description": "Sampling temperature (0 = deterministic, 1 = creative, -1 = provider default)",
+			"tab": "model"
+		},
+		"topP": {
+			"type": "number",
+			"default": -1,
+			"description": "Nucleus sampling cutoff (0-1, -1 = provider default)",
+			"tab": "model"
+		},
+		"topK": {
+			"type": "number",
+			"default": -1,
+			"description": "Sample from top-K tokens (-1 = provider default)",
+			"tab": "model"
+		},
+		"minP": {
+			"type": "number",
+			"default": -1,
+			"description": "Minimum probability threshold (0-1, -1 = provider default)",
+			"tab": "model"
+		},
+		"presencePenalty": {
+			"type": "number",
+			"default": -1,
+			"description": "Penalty for introducing already-present tokens (-1 = provider default)",
+			"tab": "model"
+		},
+		"repetitionPenalty": {
+			"type": "number",
+			"default": -1,
+			"description": "Penalty for repeated tokens (-1 = provider default)",
+			"tab": "model"
+		},
+		"serviceTier": {
+			"type": "enum",
+			"default": "none",
+			"values": [
+				"none",
+				"auto",
+				"default",
+				"flex",
+				"scale",
+				"priority",
+				"openai-only",
+				"claude-only"
+			],
+			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
+			"tab": "model"
+		},
+		"task.serviceTier": {
+			"type": "enum",
+			"default": "inherit",
+			"values": [
+				"inherit",
+				"none",
+				"auto",
+				"default",
+				"flex",
+				"scale",
+				"priority",
+				"openai-only",
+				"claude-only"
+			],
+			"description": "Service tier applied to task-tool subagents only. \"inherit\" copies the main session tier; any explicit value overrides it for subagents without touching the main session.",
+			"tab": "tasks"
+		},
+		"fallback.maxAttempts": {
+			"type": "number",
+			"default": 3
+		},
+		"retry.enabled": {
+			"type": "boolean",
+			"default": true
+		},
+		"retry.maxRetries": {
+			"type": "number",
+			"default": 3,
+			"description": "Maximum retry attempts on API errors",
+			"tab": "model"
+		},
+		"retry.baseDelayMs": {
+			"type": "number",
+			"default": 2000
+		},
+		"retry.maxDelayMs": {
+			"type": "number",
+			"default": 300000,
+			"description": "Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
+			"tab": "model"
+		},
+		"retry.requestMaxRetries": {
+			"type": "number",
+			"default": 5,
+			"description": "Maximum provider request retries before a stream is established. Counts retries, not the first attempt. Set to 0 to disable provider request retries.",
+			"tab": "model"
+		},
+		"retry.streamMaxRetries": {
+			"type": "number",
+			"default": 5,
+			"description": "Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
+			"tab": "model"
+		},
+		"retry.streamFirstEventTimeoutMs": {
+			"type": "number",
+			"default": 100000,
+			"description": "Maximum wait for the first provider stream event, in ms. Set to 0 to disable the watchdog.",
+			"tab": "model"
+		},
+		"retry.fallbackChains": {
+			"type": "record",
+			"default": {}
+		},
+		"retry.fallbackRevertPolicy": {
+			"type": "enum",
+			"default": "cooldown-expiry",
+			"values": [
+				"cooldown-expiry",
+				"never"
+			],
+			"description": "When to return to the primary model after a fallback",
+			"tab": "model"
+		},
+		"mouse.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection.",
+			"tab": "interaction"
+		},
+		"steeringMode": {
+			"type": "enum",
+			"default": "one-at-a-time",
+			"values": [
+				"all",
+				"one-at-a-time"
+			],
+			"description": "How to process queued messages while agent is working",
+			"tab": "interaction"
+		},
+		"followUpMode": {
+			"type": "enum",
+			"default": "one-at-a-time",
+			"values": [
+				"all",
+				"one-at-a-time"
+			],
+			"description": "How to drain follow-up messages after a turn completes",
+			"tab": "interaction"
+		},
+		"interruptMode": {
+			"type": "enum",
+			"default": "immediate",
+			"values": [
+				"immediate",
+				"wait"
+			],
+			"description": "When steering messages interrupt tool execution",
+			"tab": "interaction"
+		},
+		"busyPromptMode": {
+			"type": "enum",
+			"default": "steer",
+			"values": [
+				"steer",
+				"queue"
+			],
+			"description": "What a submitted prompt does while the agent is busy: queue normal chat for the next turn, or steer to interrupt the active turn",
+			"tab": "interaction"
+		},
+		"doubleEscapeAction": {
+			"type": "enum",
+			"default": "tree",
+			"values": [
+				"branch",
+				"tree",
+				"none"
+			],
+			"description": "Action when pressing Escape twice with empty editor",
+			"tab": "interaction"
+		},
+		"treeFilterMode": {
+			"type": "enum",
+			"default": "default",
+			"values": [
+				"default",
+				"no-tools",
+				"user-only",
+				"labeled-only",
+				"all"
+			],
+			"description": "Default filter mode when opening the session tree",
+			"tab": "interaction"
+		},
+		"autocompleteMaxVisible": {
+			"type": "number",
+			"default": 5,
+			"description": "Max visible items in autocomplete dropdown (3-20)",
+			"tab": "interaction"
+		},
+		"emojiAutocomplete": {
+			"type": "boolean",
+			"default": true,
+			"description": "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
+			"tab": "interaction"
+		},
+		"promptSuggestions": {
+			"type": "boolean",
+			"default": false,
+			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+			"tab": "interaction"
+		},
+		"startup.quiet": {
+			"type": "boolean",
+			"default": false,
+			"description": "Skip welcome screen and startup status messages",
+			"tab": "interaction"
+		},
+		"startup.welcomeBannerMode": {
+			"type": "enum",
+			"default": "auto",
+			"values": [
+				"auto",
+				"unicode",
+				"square",
+				"ascii"
+			],
+			"description": "Logo style for the startup welcome screen",
+			"tab": "interaction"
+		},
+		"startup.checkUpdate": {
+			"type": "boolean",
+			"default": true,
+			"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
+			"tab": "interaction"
+		},
+		"starReminder.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Show the interactive GitHub star reminder when gh is authenticated",
+			"tab": "interaction"
+		},
+		"collapseChangelog": {
+			"type": "boolean",
+			"default": false,
+			"description": "Show condensed changelog after updates",
+			"tab": "interaction"
+		},
+		"completion.notify": {
+			"type": "enum",
+			"default": "on",
+			"values": [
+				"on",
+				"off"
+			],
+			"description": "Notify when the agent completes",
+			"tab": "interaction"
+		},
+		"completion.notifyCommand": {
+			"type": "string",
+			"default": "",
+			"description": "Optional user-level shell command to run when an agent turn completes; receives GJC_NOTIFICATION_* environment variables. On Windows, this can call PowerShell [Console]::Beep when terminal BEL is silent.",
+			"tab": "interaction"
+		},
+		"ask.timeout": {
+			"type": "number",
+			"default": 0,
+			"description": "Auto-select recommended option after timeout (0 to disable)",
+			"tab": "interaction"
+		},
+		"ask.notify": {
+			"type": "enum",
+			"default": "on",
+			"values": [
+				"on",
+				"off"
+			],
+			"description": "Notify when ask tool is waiting for input",
+			"tab": "interaction"
+		},
+		"stt.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable speech-to-text input via microphone",
+			"tab": "interaction"
+		},
+		"stt.language": {
+			"type": "string",
+			"default": "en"
+		},
+		"stt.modelName": {
+			"type": "enum",
+			"default": "base.en",
+			"values": [
+				"tiny",
+				"tiny.en",
+				"base",
+				"base.en",
+				"small",
+				"small.en",
+				"medium",
+				"medium.en",
+				"large"
+			],
+			"description": "Whisper model size (larger = more accurate but slower)",
+			"tab": "interaction"
+		},
+		"contextPromotion.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Promote to a larger-context model on context overflow instead of compacting (off by default; opt in to enable)",
+			"tab": "context"
+		},
+		"compaction.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Automatically compact context when it gets too large",
+			"tab": "context"
+		},
+		"compaction.strategy": {
+			"type": "enum",
+			"default": "context-full",
+			"values": [
+				"context-full",
+				"handoff",
+				"off"
+			],
+			"description": "Choose in-place context-full maintenance, auto-handoff, or disable auto maintenance (off)",
+			"tab": "context"
+		},
+		"compaction.thresholdPercent": {
+			"type": "number",
+			"default": -1,
+			"description": "Percent threshold for context maintenance; set to Default to use legacy reserve-based behavior",
+			"tab": "context"
+		},
+		"compaction.thresholdTokens": {
+			"type": "number",
+			"default": -1,
+			"description": "Fixed token limit for context maintenance; overrides percentage if set",
+			"tab": "context"
+		},
+		"compaction.handoffSaveToDisk": {
+			"type": "boolean",
+			"default": false,
+			"description": "Save auto-triggered handoff documents as session artifacts (resolvable artifact:// URIs); manual /handoff does not save",
+			"tab": "context"
+		},
+		"compaction.handoffPromptExtension": {
+			"type": "string",
+			"default": "",
+			"description": "Extra guidance appended to the default handoff-generation prompt for both manual /handoff and auto-handoff. It supplements, and never replaces, the built-in safety- and continuity-critical instructions.",
+			"tab": "context"
+		},
+		"compaction.remoteEnabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Use remote compaction endpoints when available instead of local summarization",
+			"tab": "context"
+		},
+		"compaction.reserveTokens": {
+			"type": "number",
+			"default": 16384
+		},
+		"compaction.keepRecentTokens": {
+			"type": "number",
+			"default": 20000
+		},
+		"compaction.autoContinue": {
+			"type": "boolean",
+			"default": true
+		},
+		"compaction.remoteEndpoint": {
+			"type": "string"
+		},
+		"compaction.maintenancePruningEnabled": {
+			"type": "boolean",
+			"default": false
+		},
+		"compaction.maintenancePruningMinSavingsTokens": {
+			"type": "number",
+			"default": 8000
+		},
+		"compaction.idleEnabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Compact context while idle when token count exceeds threshold",
+			"tab": "context"
+		},
+		"compaction.idleThresholdTokens": {
+			"type": "number",
+			"default": 200000,
+			"description": "Token count above which idle compaction triggers",
+			"tab": "context"
+		},
+		"compaction.idleTimeoutSeconds": {
+			"type": "number",
+			"default": 300,
+			"description": "Seconds to wait while idle before compacting",
+			"tab": "context"
+		},
+		"branchSummary.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Prompt to summarize when leaving a branch",
+			"tab": "context"
+		},
+		"branchSummary.reserveTokens": {
+			"type": "number",
+			"default": 16384
+		},
+		"memories.enabled": {
+			"type": "boolean",
+			"default": false
+		},
+		"memories.maxRolloutsPerStartup": {
+			"type": "number",
+			"default": 64
+		},
+		"memories.maxRolloutAgeDays": {
+			"type": "number",
+			"default": 30
+		},
+		"memories.minRolloutIdleHours": {
+			"type": "number",
+			"default": 12
+		},
+		"memories.threadScanLimit": {
+			"type": "number",
+			"default": 300
+		},
+		"memories.maxRawMemoriesForGlobal": {
+			"type": "number",
+			"default": 200
+		},
+		"memories.stage1Concurrency": {
+			"type": "number",
+			"default": 8
+		},
+		"memories.stage1LeaseSeconds": {
+			"type": "number",
+			"default": 120
+		},
+		"memories.stage1RetryDelaySeconds": {
+			"type": "number",
+			"default": 120
+		},
+		"memories.phase2LeaseSeconds": {
+			"type": "number",
+			"default": 180
+		},
+		"memories.phase2RetryDelaySeconds": {
+			"type": "number",
+			"default": 180
+		},
+		"memories.phase2HeartbeatSeconds": {
+			"type": "number",
+			"default": 30
+		},
+		"memories.rolloutPayloadPercent": {
+			"type": "number",
+			"default": 0.7
+		},
+		"memories.phase1InputTokenLimit": {
+			"type": "number",
+			"default": 4000
+		},
+		"memories.fallbackTokenLimit": {
+			"type": "number",
+			"default": 16000
+		},
+		"memories.summaryInjectionTokenLimit": {
+			"type": "number",
+			"default": 5000
+		},
+		"memory.backend": {
+			"type": "enum",
+			"default": "off",
+			"values": [
+				"off",
+				"local",
+				"hindsight"
+			],
+			"description": "Off, local memory pipeline, or Hindsight remote memory",
+			"tab": "memory"
+		},
+		"hindsight.apiUrl": {
+			"type": "string",
+			"default": "http://localhost:8888",
+			"description": "Hindsight server URL (Cloud or self-hosted)",
+			"tab": "memory"
+		},
+		"hindsight.apiToken": {
+			"type": "string"
+		},
+		"hindsight.bankId": {
+			"type": "string",
+			"description": "Memory bank identifier (default: project name)",
+			"tab": "memory"
+		},
+		"hindsight.bankIdPrefix": {
+			"type": "string"
+		},
+		"hindsight.scoping": {
+			"type": "enum",
+			"default": "per-project-tagged",
+			"values": [
+				"global",
+				"per-project",
+				"per-project-tagged"
+			],
+			"description": "global = one shared bank; per-project = isolated bank per cwd; per-project-tagged = shared bank with project tags so global + project memories merge on recall",
+			"tab": "memory"
+		},
+		"hindsight.bankMission": {
+			"type": "string"
+		},
+		"hindsight.retainMission": {
+			"type": "string"
+		},
+		"hindsight.autoRecall": {
+			"type": "boolean",
+			"default": true,
+			"description": "Recall memories on the first turn of each session",
+			"tab": "memory"
+		},
+		"hindsight.autoRetain": {
+			"type": "boolean",
+			"default": true,
+			"description": "Retain transcript every N turns and at session boundaries",
+			"tab": "memory"
+		},
+		"hindsight.retainMode": {
+			"type": "enum",
+			"default": "full-session",
+			"values": [
+				"full-session",
+				"last-turn"
+			],
+			"description": "full-session = upsert one document per session, last-turn = chunked",
+			"tab": "memory"
+		},
+		"hindsight.retainEveryNTurns": {
+			"type": "number",
+			"default": 3
+		},
+		"hindsight.retainOverlapTurns": {
+			"type": "number",
+			"default": 2
+		},
+		"hindsight.retainContext": {
+			"type": "string",
+			"default": "gjc"
+		},
+		"hindsight.recallBudget": {
+			"type": "enum",
+			"default": "mid",
+			"values": [
+				"low",
+				"mid",
+				"high"
+			]
+		},
+		"hindsight.recallMaxTokens": {
+			"type": "number",
+			"default": 1024
+		},
+		"hindsight.recallContextTurns": {
+			"type": "number",
+			"default": 1
+		},
+		"hindsight.recallMaxQueryChars": {
+			"type": "number",
+			"default": 800
+		},
+		"hindsight.recallTypes": {
+			"type": "array",
+			"default": [
+				"world",
+				"experience"
+			]
+		},
+		"hindsight.debug": {
+			"type": "boolean",
+			"default": false
+		},
+		"hindsight.mentalModelsEnabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Read curated reflect summaries (mental models) into developer instructions at boot. Loads existing models on the bank — does not write. Pair with hindsight.mentalModelAutoSeed to also auto-create the built-in seed set.",
+			"tab": "memory"
+		},
+		"hindsight.mentalModelAutoSeed": {
+			"type": "boolean",
+			"default": true,
+			"description": "At session start, create any built-in mental models (project-conventions, project-decisions, user-preferences) that do not yet exist on the bank.",
+			"tab": "memory"
+		},
+		"hindsight.mentalModelRefreshIntervalMs": {
+			"type": "number",
+			"default": 300000
+		},
+		"hindsight.mentalModelMaxRenderChars": {
+			"type": "number",
+			"default": 16000
+		},
+		"ttsr.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Time Traveling Stream Rules: interrupt agent when output matches patterns",
+			"tab": "context"
+		},
+		"ttsr.contextMode": {
+			"type": "enum",
+			"default": "discard",
+			"values": [
+				"discard",
+				"keep"
+			],
+			"description": "What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
+			"tab": "context"
+		},
+		"ttsr.interruptMode": {
+			"type": "enum",
+			"default": "always",
+			"values": [
+				"never",
+				"prose-only",
+				"tool-only",
+				"always"
+			],
+			"description": "When to interrupt mid-stream vs inject warning after completion",
+			"tab": "context"
+		},
+		"ttsr.repeatMode": {
+			"type": "enum",
+			"default": "once",
+			"values": [
+				"once",
+				"after-gap"
+			],
+			"description": "How rules can repeat: once per session or after a message gap",
+			"tab": "context"
+		},
+		"ttsr.repeatGap": {
+			"type": "number",
+			"default": 10,
+			"description": "Messages before a rule can trigger again",
+			"tab": "context"
+		},
+		"edit.mode": {
+			"type": "enum",
+			"default": "hashline",
+			"values": [
+				"apply_patch",
+				"hashline",
+				"patch",
+				"replace",
+				"vim"
+			],
+			"description": "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
+			"tab": "editing"
+		},
+		"edit.fuzzyMatch": {
+			"type": "boolean",
+			"default": true,
+			"description": "Accept high-confidence fuzzy matches for whitespace differences",
+			"tab": "editing"
+		},
+		"edit.fuzzyThreshold": {
+			"type": "number",
+			"default": 0.95,
+			"description": "Similarity threshold for fuzzy matches",
+			"tab": "editing"
+		},
+		"edit.streamingAbort": {
+			"type": "boolean",
+			"default": false,
+			"description": "Abort streaming edit tool calls when patch preview fails",
+			"tab": "editing"
+		},
+		"edit.hashlineAutoDropPureInsertDuplicates": {
+			"type": "boolean",
+			"default": false,
+			"description": "Drop 2+ pure-insert payload lines that duplicate adjacent file context",
+			"tab": "editing"
+		},
+		"edit.blockAutoGenerated": {
+			"type": "boolean",
+			"default": true,
+			"description": "Prevent editing of files that appear to be auto-generated (protoc, sqlc, swagger, etc.)",
+			"tab": "editing"
+		},
+		"readLineNumbers": {
+			"type": "boolean",
+			"default": false,
+			"description": "Prepend line numbers to read tool output by default",
+			"tab": "editing"
+		},
+		"readHashLines": {
+			"type": "boolean",
+			"default": true,
+			"description": "Include line hashes in read output for hashline edit mode (LINE+ID|content)",
+			"tab": "editing"
+		},
+		"read.defaultLimit": {
+			"type": "number",
+			"default": 300,
+			"description": "Default collection/selection limit for read operations; bare local receipts use the separate 50-line / 10 KiB receipt budgets",
+			"tab": "editing"
+		},
+		"read.receiptBudgetLines": {
+			"type": "number",
+			"default": 50,
+			"description": "Maximum lines included in a bare read receipt before a selector footer is shown",
+			"tab": "editing"
+		},
+		"read.receiptBudgetBytes": {
+			"type": "number",
+			"default": 10,
+			"description": "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
+			"tab": "editing"
+		},
+		"read.truncation": {
+			"type": "enum",
+			"default": "last",
+			"values": [
+				"head",
+				"last",
+				"both"
+			],
+			"description": "Configured default direction for routes that support directional truncation; bare local and archive reads use this value (factory default: last), while explicit truncation always wins",
+			"tab": "editing"
+		},
+		"read.summaryMaxBytes": {
+			"type": "number",
+			"default": 20,
+			"description": "Maximum UTF-8 size for a structural read summary before additional units are elided",
+			"tab": "editing"
+		},
+		"read.summarize.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Return structural code summaries when read is called without an explicit selector",
+			"tab": "editing"
+		},
+		"read.summarize.prose": {
+			"type": "boolean",
+			"default": false,
+			"description": "Return structural summaries for Markdown and plain text reads",
+			"tab": "editing"
+		},
+		"read.summarize.minBodyLines": {
+			"type": "number",
+			"default": 4,
+			"description": "Minimum multiline body or literal length before read summaries collapse it",
+			"tab": "editing"
+		},
+		"read.summarize.minCommentLines": {
+			"type": "number",
+			"default": 6,
+			"description": "Minimum multiline block comment length before read summaries collapse it",
+			"tab": "editing"
+		},
+		"read.toolResultPreview": {
+			"type": "boolean",
+			"default": false,
+			"description": "Render read tool results inline in the transcript instead of summary rows",
+			"tab": "editing"
+		},
+		"lsp.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the lsp tool for language server protocol",
+			"tab": "editing"
+		},
+		"lsp.formatOnWrite": {
+			"type": "boolean",
+			"default": false,
+			"description": "Automatically format code files using LSP after writing",
+			"tab": "editing"
+		},
+		"lsp.diagnosticsOnWrite": {
+			"type": "boolean",
+			"default": true,
+			"description": "Return LSP diagnostics after writing code files",
+			"tab": "editing"
+		},
+		"lsp.diagnosticsOnEdit": {
+			"type": "boolean",
+			"default": false,
+			"description": "Return LSP diagnostics after editing code files",
+			"tab": "editing"
+		},
+		"bashInterceptor.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Block shell commands that have dedicated tools",
+			"tab": "editing"
+		},
+		"bashInterceptor.patterns": {
+			"type": "array",
+			"default": [
+				{
+					"pattern": "^\\s*(cat|head|tail|less|more)\\s+",
+					"tool": "read",
+					"message": "Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files."
+				},
+				{
+					"pattern": "^\\s*(grep|rg|ripgrep|ag|ack)\\s+",
+					"tool": "search",
+					"message": "Use the `search` tool instead of grep/rg. It respects .gitignore and provides structured output."
+				},
+				{
+					"pattern": "^\\s*(find|fd|locate)\\s+.*(-name|-iname|-type|--type|-glob)",
+					"tool": "find",
+					"message": "Use the `find` tool instead of find/fd. It respects .gitignore and is faster for glob patterns."
+				},
+				{
+					"pattern": "^\\s*sed\\s+(-i|--in-place)",
+					"tool": "edit",
+					"message": "Use the `edit` tool instead of sed -i. It provides diff preview and fuzzy matching."
+				},
+				{
+					"pattern": "^\\s*perl\\s+.*-[pn]?i",
+					"tool": "edit",
+					"message": "Use the `edit` tool instead of perl -i. It provides diff preview and fuzzy matching."
+				},
+				{
+					"pattern": "^\\s*awk\\s+.*-i\\s+inplace",
+					"tool": "edit",
+					"message": "Use the `edit` tool instead of awk -i inplace. It provides diff preview and fuzzy matching."
+				},
+				{
+					"pattern": "^\\s*(echo|printf|cat\\s*<<)\\s+.*[^|]>\\s*\\S",
+					"tool": "write",
+					"message": "Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation."
+				}
+			]
+		},
+		"bash.stripTrailingHeadTail": {
+			"type": "boolean",
+			"default": true,
+			"description": "Silently drop trailing `| head`/`| tail` pipes from single-line bash commands. Output is already truncated automatically.",
+			"tab": "editing"
+		},
+		"shellMinimizer.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Compress verbose shell output (git, npm, cargo, etc.) before returning it to the agent",
+			"tab": "editing"
+		},
+		"shellMinimizer.settingsPath": {
+			"type": "string"
+		},
+		"shellMinimizer.only": {
+			"type": "array",
+			"default": []
+		},
+		"shellMinimizer.except": {
+			"type": "array",
+			"default": []
+		},
+		"shellMinimizer.maxCaptureBytes": {
+			"type": "number",
+			"default": 4194304
+		},
+		"eval.py": {
+			"type": "boolean",
+			"default": true,
+			"description": "Allow the eval tool to dispatch to the IPython kernel",
+			"tab": "editing"
+		},
+		"eval.js": {
+			"type": "boolean",
+			"default": true,
+			"description": "Allow the eval tool to dispatch to the in-process JavaScript runtime",
+			"tab": "editing"
+		},
+		"python.kernelMode": {
+			"type": "enum",
+			"default": "session",
+			"values": [
+				"session",
+				"per-call"
+			],
+			"description": "Whether to keep IPython kernel alive across calls",
+			"tab": "editing"
+		},
+		"todo.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the todo_write tool for task tracking",
+			"tab": "tools"
+		},
+		"todo.reminders": {
+			"type": "boolean",
+			"default": true,
+			"description": "Remind agent to complete todos before stopping",
+			"tab": "tools"
+		},
+		"todo.reminders.max": {
+			"type": "number",
+			"default": 3,
+			"description": "Maximum reminders to complete todos before giving up",
+			"tab": "tools"
+		},
+		"todo.eager": {
+			"type": "boolean",
+			"default": false,
+			"description": "Automatically create a comprehensive todo list after the first message",
+			"tab": "tools"
+		},
+		"find.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the find tool for file searching",
+			"tab": "tools"
+		},
+		"search.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the search tool for content searching",
+			"tab": "tools"
+		},
+		"search.contextBefore": {
+			"type": "number",
+			"default": 1,
+			"description": "Lines of context before each search match",
+			"tab": "tools"
+		},
+		"search.contextAfter": {
+			"type": "number",
+			"default": 3,
+			"description": "Lines of context after each search match",
+			"tab": "tools"
+		},
+		"astGrep.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the ast_grep tool for structural AST search",
+			"tab": "tools"
+		},
+		"astEdit.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the ast_edit tool for structural AST rewrites",
+			"tab": "tools"
+		},
+		"irc.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable agent-to-agent IRC messaging via the irc tool",
+			"tab": "tools"
+		},
+		"irc.sidebar.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the IRC message sidebar (opens with the toggle key; starts closed)",
+			"tab": "tools"
+		},
+		"renderMermaid.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable the render_mermaid tool for Mermaid-to-ASCII rendering",
+			"tab": "tools"
+		},
+		"debug.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the debug tool for DAP-based debugging",
+			"tab": "tools"
+		},
+		"calc.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable the calculator tool for basic calculations",
+			"tab": "tools"
+		},
+		"recipe.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the recipe tool when a justfile / package.json / Cargo.toml / Makefile / Taskfile is present",
+			"tab": "tools"
+		},
+		"checkpoint.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable the checkpoint and rewind tools for context checkpointing",
+			"tab": "tools"
+		},
+		"skill.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the skill tool so the agent can chain into another available skill on its next turn",
+			"tab": "tools"
+		},
+		"fetch.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Allow the read tool to fetch and process URLs",
+			"tab": "tools"
+		},
+		"web.insaneFallback": {
+			"type": "boolean",
+			"default": false,
+			"description": "Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
+			"tab": "tools"
+		},
+		"github.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable the github tool (op-based dispatch for repository, issue, pull request, diff, search, checkout, push, and Actions watch workflows)",
+			"tab": "tools"
+		},
+		"github.cache.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Cache rendered issue/PR view output in ~/.gjc/cache/github-cache.db so repeated reads are free",
+			"tab": "tools"
+		},
+		"github.cache.softTtlSec": {
+			"type": "number",
+			"default": 300,
+			"description": "Within this window, cached issue/PR view rows are returned directly. Default 5 minutes.",
+			"tab": "tools"
+		},
+		"github.cache.hardTtlSec": {
+			"type": "number",
+			"default": 604800,
+			"description": "Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
+			"tab": "tools"
+		},
+		"web_search.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the web_search tool for web searching",
+			"tab": "tools"
+		},
+		"web_search.provider": {
+			"type": "enum",
+			"default": "auto",
+			"values": [
+				"auto",
+				"duckduckgo",
+				"insane",
+				"exa",
+				"brave",
+				"jina",
+				"kimi",
+				"zai",
+				"anthropic",
+				"perplexity",
+				"gemini",
+				"codex",
+				"xai",
+				"tavily",
+				"parallel",
+				"kagi",
+				"synthetic",
+				"searxng"
+			]
+		},
+		"web_search.fallback": {
+			"type": "array",
+			"default": [],
+			"description": "Ordered fallback web search providers after the active model native provider",
+			"tab": "tools"
+		},
+		"web_search.timeout": {
+			"type": "number",
+			"default": 300,
+			"description": "Hard timeout in seconds for a single web search request (default 300)",
+			"tab": "tools"
+		},
+		"browser.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable the browser tool (Ulixee Hero)",
+			"tab": "tools"
+		},
+		"browser.headless": {
+			"type": "boolean",
+			"default": true,
+			"description": "Launch browser in headless mode (disable to show browser UI)",
+			"tab": "tools"
+		},
+		"browser.screenshotDir": {
+			"type": "string",
+			"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)",
+			"tab": "tools"
+		},
+		"browser.profileReuse": {
+			"type": "string",
+			"default": "auto",
+			"description": "'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+			"tab": "tools"
+		},
+		"browser.geo.timezone": {
+			"type": "string",
+			"description": "Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection.",
+			"tab": "tools"
+		},
+		"browser.geo.locale": {
+			"type": "string",
+			"description": "Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region.",
+			"tab": "tools"
+		},
+		"browser.gc.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Automatically reclaim idle, unheld GJC-managed headless/spawned browser tabs.",
+			"tab": "tools"
+		},
+		"browser.gc.idleMs": {
+			"type": "number",
+			"default": 300000,
+			"description": "Evict headless/spawned tabs idle longer than this many milliseconds.",
+			"tab": "tools"
+		},
+		"browser.gc.rssLimitMb": {
+			"type": "number",
+			"default": 1536,
+			"description": "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
+			"tab": "tools"
+		},
+		"resourceGc.sweepIntervalMs": {
+			"type": "number",
+			"default": 30000,
+			"description": "How often the resource GC sweeps browser tabs and stale screenshot directories.",
+			"tab": "tools"
+		},
+		"memoryGuard.enabled": {
+			"type": "boolean",
+			"default": false
+		},
+		"memoryGuard.checkIntervalMs": {
+			"type": "number",
+			"default": 30000
+		},
+		"memoryGuard.gcThresholdPercent": {
+			"type": "number",
+			"default": 70
+		},
+		"memoryGuard.restartThresholdPercent": {
+			"type": "number",
+			"default": 85
+		},
+		"memoryGuard.restartThresholdWindowMs": {
+			"type": "number",
+			"default": 90000
+		},
+		"memoryGuard.cooldownMs": {
+			"type": "number",
+			"default": 600000
+		},
+		"memoryGuard.parentReserveMb": {
+			"type": "number",
+			"default": 1024
+		},
+		"memoryGuard.policyLimitMb": {
+			"type": "number",
+			"default": 0
+		},
+		"computer.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable the macOS computer tool for this session. Off by default.",
+			"tab": "tools"
+		},
+		"computer.alwaysOn": {
+			"type": "boolean",
+			"default": false,
+			"description": "Keep the macOS computer tool callable without per-session enablement.",
+			"tab": "tools"
+		},
+		"computer.autoScreenshot": {
+			"type": "boolean",
+			"default": false,
+			"description": "Automatically request bounded screenshots after computer actions when supported.",
+			"tab": "tools"
+		},
+		"computer.screenshotMaxBytes": {
+			"type": "number",
+			"default": 5000000,
+			"description": "Maximum screenshot payload size for computer action results.",
+			"tab": "tools"
+		},
+		"computer.killSwitchHotkey": {
+			"type": "string",
+			"default": "Control+Option+Command+Escape",
+			"description": "Native stop/suspend hotkey shown to users for computer-use sessions.",
+			"tab": "tools"
+		},
+		"computer.auditLog.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Persist audit records for enabled computer-use actions.",
+			"tab": "tools"
+		},
+		"computer.screenshotGc.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Delete stale computer-use screenshot fallback directories on disk.",
+			"tab": "tools"
+		},
+		"computer.screenshotGc.staleMs": {
+			"type": "number",
+			"default": 43200000,
+			"description": "Remove screenshot fallback directories whose mtime is older than this many milliseconds.",
+			"tab": "tools"
+		},
+		"computer.screenshotGc.scanIntervalMs": {
+			"type": "number",
+			"default": 1800000,
+			"description": "Minimum interval between os.tmpdir scans for stale screenshot directories.",
+			"tab": "tools"
+		},
+		"tools.intentTracing": {
+			"type": "boolean",
+			"default": true,
+			"description": "Ask the agent to describe the intent of each tool call before executing it",
+			"tab": "tools"
+		},
+		"tools.maxTimeout": {
+			"type": "number",
+			"default": 0,
+			"description": "Maximum timeout in seconds the agent can set for any tool (0 = no limit)",
+			"tab": "tools"
+		},
+		"async.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Enable async bash commands and background task execution",
+			"tab": "tools"
+		},
+		"async.maxJobs": {
+			"type": "number",
+			"default": 100
+		},
+		"async.pollWaitDuration": {
+			"type": "enum",
+			"default": "30s",
+			"values": [
+				"5s",
+				"10s",
+				"30s",
+				"1m",
+				"5m"
+			],
+			"description": "How long the poll tool waits for background job updates before returning the current state",
+			"tab": "tools"
+		},
+		"bash.autoBackground.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Automatically background long-running bash commands and deliver the result later",
+			"tab": "tools"
+		},
+		"bash.autoBackground.thresholdMs": {
+			"type": "number",
+			"default": 60000
+		},
+		"tools.discoveryMode": {
+			"type": "enum",
+			"default": "all",
+			"values": [
+				"off",
+				"all"
+			],
+			"description": "Hide non-essential built-in tools behind a search tool to save tokens.",
+			"tab": "tools"
+		},
+		"tools.essentialOverride": {
+			"type": "array",
+			"default": [],
+			"description": "Override the always-loaded built-in tools (default: read, bash, edit, write, search, find). Leave empty to use defaults.",
+			"tab": "tools"
+		},
+		"mcp.enableProjectConfig": {
+			"type": "boolean",
+			"default": false
+		},
+		"mcp.discoveryMode": {
+			"type": "boolean",
+			"default": false
+		},
+		"mcp.discoveryDefaultServers": {
+			"type": "array",
+			"default": []
+		},
+		"mcp.notifications": {
+			"type": "boolean",
+			"default": false
+		},
+		"mcp.notificationDebounceMs": {
+			"type": "number",
+			"default": 500
+		},
+		"tasksPane.defaultVisible": {
+			"type": "boolean",
+			"default": false,
+			"description": "Open the unified tasks pane when the interactive UI starts",
+			"tab": "tasks"
+		},
+		"plan.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable plan mode for read-only exploration and planning before execution",
+			"tab": "tasks"
+		},
+		"goal.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Enable per-session goal mode and the hidden goal tool",
+			"tab": "tasks"
+		},
+		"goal.statusInFooter": {
+			"type": "boolean",
+			"default": true,
+			"description": "Show goal usage alongside the goal indicator in the status line",
+			"tab": "tasks"
+		},
+		"goal.continuationModes": {
+			"type": "array",
+			"default": [
+				"interactive"
+			],
+			"description": "Run modes where active goals may auto-continue between turns",
+			"tab": "tasks"
+		},
+		"task.isolation.mode": {
+			"type": "enum",
+			"default": "none",
+			"values": [
+				"none",
+				"auto",
+				"apfs",
+				"btrfs",
+				"zfs",
+				"reflink",
+				"overlayfs",
+				"projfs",
+				"block-clone",
+				"rcopy"
+			],
+			"description": "Isolation backend for subagents. \"auto\" lets the native PAL pick the best available backend (CoW-aware filesystems, then overlayfs/ProjFS, then a git worktree / recursive-copy fallback).",
+			"tab": "tasks"
+		},
+		"task.isolation.merge": {
+			"type": "enum",
+			"default": "patch",
+			"values": [
+				"patch",
+				"branch"
+			],
+			"description": "How isolated task changes are integrated (patch apply or branch merge)",
+			"tab": "tasks"
+		},
+		"task.isolation.commits": {
+			"type": "enum",
+			"default": "generic",
+			"values": [
+				"generic",
+				"ai"
+			],
+			"description": "Commit message style for nested repo changes (generic or AI-generated)",
+			"tab": "tasks"
+		},
+		"task.eager": {
+			"type": "boolean",
+			"default": false,
+			"description": "Encourage the agent to delegate work to subagents unless changes are trivial",
+			"tab": "tasks"
+		},
+		"task.simple": {
+			"type": "enum",
+			"default": "default",
+			"values": [
+				"default",
+				"schema-free",
+				"independent"
+			],
+			"description": "How much shared structure the task tool accepts (default, schema-free, or independent)",
+			"tab": "tasks"
+		},
+		"task.maxConcurrency": {
+			"type": "number",
+			"default": 8,
+			"description": "Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
+			"tab": "tasks"
+		},
+		"task.enableLsp": {
+			"type": "boolean",
+			"default": false,
+			"description": "Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
+			"tab": "tasks"
+		},
+		"task.forkContext.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Allow explicitly opted-in subagents to start from a sanitized snapshot of parent context when both the agent and task item also opt in.",
+			"tab": "tasks"
+		},
+		"task.forkContext.maxMessages": {
+			"type": "number",
+			"default": 50,
+			"description": "Maximum parent messages copied into an explicitly opted-in subagent fork-context seed.",
+			"tab": "tasks"
+		},
+		"task.forkContext.maxTokens": {
+			"type": "number",
+			"default": 0,
+			"description": "Approximate token cap for explicit full fork-context seeds. 0 uses 15% of the target model context window, with a 15k fallback when the window is unknown.",
+			"tab": "tasks"
+		},
+		"task.maxRecursionDepth": {
+			"type": "number",
+			"default": 2,
+			"description": "How many levels deep subagents can spawn their own subagents",
+			"tab": "tasks"
+		},
+		"task.maxRuntimeMs": {
+			"type": "number",
+			"default": 0,
+			"description": "Hard wall-clock limit per subagent (ms). 0 disables it. Defense-in-depth against provider-side stream hangs that escape the inference-layer watchdog; triggers a normal subagent abort with a 'timed out' reason.",
+			"tab": "tasks"
+		},
+		"task.disabledAgents": {
+			"type": "array",
+			"default": []
+		},
+		"task.agentModelOverrides": {
+			"type": "record",
+			"default": {}
+		},
+		"tasks.todoClearDelay": {
+			"type": "number",
+			"default": 60,
+			"description": "How long to wait before removing completed/abandoned tasks from the list",
+			"tab": "tasks"
+		},
+		"skills.enabled": {
+			"type": "boolean",
+			"default": false
+		},
+		"skills.enableSkillCommands": {
+			"type": "boolean",
+			"default": true
+		},
+		"skills.enableCodexUser": {
+			"type": "boolean",
+			"default": false
+		},
+		"skills.enableClaudeUser": {
+			"type": "boolean",
+			"default": false
+		},
+		"skills.enableClaudeProject": {
+			"type": "boolean",
+			"default": false
+		},
+		"skills.enablePiUser": {
+			"type": "boolean",
+			"default": false
+		},
+		"skills.enablePiProject": {
+			"type": "boolean",
+			"default": false
+		},
+		"skills.customDirectories": {
+			"type": "array",
+			"default": []
+		},
+		"skills.ignoredSkills": {
+			"type": "array",
+			"default": []
+		},
+		"skills.includeSkills": {
+			"type": "array",
+			"default": []
+		},
+		"commands.enableClaudeUser": {
+			"type": "boolean",
+			"default": false
+		},
+		"commands.enableClaudeProject": {
+			"type": "boolean",
+			"default": false
+		},
+		"commands.enableOpencodeUser": {
+			"type": "boolean",
+			"default": false
+		},
+		"commands.enableOpencodeProject": {
+			"type": "boolean",
+			"default": false
+		},
+		"secrets.enabled": {
+			"type": "boolean",
+			"default": false,
+			"description": "Obfuscate secrets before sending to AI providers",
+			"tab": "providers"
+		},
+		"providers.webSearch": {
+			"type": "enum",
+			"default": "auto",
+			"values": [
+				"auto",
+				"duckduckgo",
+				"insane",
+				"exa",
+				"brave",
+				"jina",
+				"kimi",
+				"zai",
+				"perplexity",
+				"anthropic",
+				"gemini",
+				"codex",
+				"xai",
+				"tavily",
+				"kagi",
+				"synthetic",
+				"parallel",
+				"searxng"
+			],
+			"description": "Provider for web search tool",
+			"tab": "providers"
+		},
+		"providers.image": {
+			"type": "enum",
+			"default": "auto",
+			"values": [
+				"auto",
+				"openai",
+				"gemini",
+				"openrouter",
+				"antigravity",
+				"alibaba",
+				"custom"
+			],
+			"description": "Provider and model for image generation tool",
+			"tab": "providers"
+		},
+		"providers.imageModel": {
+			"type": "string",
+			"description": "Override the default image generation model for the selected provider",
+			"tab": "providers"
+		},
+		"providers.imageCustomUrl": {
+			"type": "string",
+			"description": "Base URL for custom OpenAI-compatible image endpoint",
+			"tab": "providers"
+		},
+		"providers.imageCustomKey": {
+			"type": "string",
+			"description": "API key for custom OpenAI-compatible image endpoint",
+			"tab": "providers"
+		},
+		"providers.imageCustomKeyEnv": {
+			"type": "string",
+			"description": "Environment variable name holding the API key for custom image endpoint",
+			"tab": "providers"
+		},
+		"providers.kimiApiFormat": {
+			"type": "enum",
+			"default": "anthropic",
+			"values": [
+				"openai",
+				"anthropic"
+			],
+			"description": "API format for Kimi Code provider",
+			"tab": "providers"
+		},
+		"providers.openaiWebsockets": {
+			"type": "enum",
+			"default": "auto",
+			"values": [
+				"auto",
+				"off",
+				"on"
+			],
+			"description": "Websocket policy for OpenAI Codex models (auto uses model defaults, on forces, off disables)",
+			"tab": "providers"
+		},
+		"providers.parallelFetch": {
+			"type": "boolean",
+			"default": true,
+			"description": "Use Parallel extract API for URL fetching when credentials are available",
+			"tab": "providers"
+		},
+		"provider.appendOnlyContext": {
+			"type": "enum",
+			"default": "auto",
+			"values": [
+				"auto",
+				"on",
+				"off"
+			],
+			"description": "Cache system prompt + tool specs and keep an append-only message log so provider prefix caches (DeepSeek, Anthropic) hit at maximum rate. Auto enables for DeepSeek.",
+			"tab": "providers"
+		},
+		"exa.enabled": {
+			"type": "boolean",
+			"default": true,
+			"description": "Master toggle for all Exa search tools",
+			"tab": "providers"
+		},
+		"exa.enableSearch": {
+			"type": "boolean",
+			"default": true,
+			"description": "Basic search, deep search, code search, crawl",
+			"tab": "providers"
+		},
+		"exa.enableResearcher": {
+			"type": "boolean",
+			"default": false,
+			"description": "AI-powered deep research tasks",
+			"tab": "providers"
+		},
+		"exa.enableWebsets": {
+			"type": "boolean",
+			"default": false,
+			"description": "Webset management and enrichment tools",
+			"tab": "providers"
+		},
+		"searxng.endpoint": {
+			"type": "string",
+			"description": "Self-hosted search base URL",
+			"tab": "providers"
+		},
+		"searxng.token": {
+			"type": "string"
+		},
+		"searxng.basicUsername": {
+			"type": "string"
+		},
+		"searxng.basicPassword": {
+			"type": "string"
+		},
+		"searxng.categories": {
+			"type": "string"
+		},
+		"searxng.language": {
+			"type": "string"
+		},
+		"commit.mapReduceEnabled": {
+			"type": "boolean",
+			"default": true
+		},
+		"commit.mapReduceMinFiles": {
+			"type": "number",
+			"default": 4
+		},
+		"commit.mapReduceMaxFileTokens": {
+			"type": "number",
+			"default": 50000
+		},
+		"commit.mapReduceTimeoutMs": {
+			"type": "number",
+			"default": 120000
+		},
+		"commit.mapReduceMaxConcurrency": {
+			"type": "number",
+			"default": 5
+		},
+		"commit.changelogMaxDiffChars": {
+			"type": "number",
+			"default": 120000
+		},
+		"thinkingBudgets.minimal": {
+			"type": "number",
+			"default": 1024
+		},
+		"thinkingBudgets.low": {
+			"type": "number",
+			"default": 2048
+		},
+		"thinkingBudgets.medium": {
+			"type": "number",
+			"default": 8192
+		},
+		"thinkingBudgets.high": {
+			"type": "number",
+			"default": 16384
+		},
+		"thinkingBudgets.xhigh": {
+			"type": "number",
+			"default": 32768
+		},
+		"thinkingBudgets.max": {
+			"type": "number",
+			"default": 65536
+		}
+	}
+}
