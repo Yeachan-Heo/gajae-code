@@ -9,6 +9,7 @@
 //! - `FS_SCAN_CACHE_TTL_MS`       – default `1000`
 //! - `FS_SCAN_EMPTY_RECHECK_MS`   – default `200`
 //! - `FS_SCAN_CACHE_MAX_ENTRIES`   – default `16`
+//! - `FS_SCAN_CACHE_MAX_BYTES`     – default `134217728` (128 MiB); `0` disables caching
 
 use std::{
 	borrow::Cow,
@@ -66,6 +67,8 @@ env_uint! {
 	static EMPTY_RECHECK_MS: u64 = "FS_SCAN_EMPTY_RECHECK_MS" or 200 => [0, u64::MAX];
 	// Configured maximum number of cache entries.
 	static MAX_CACHE_ENTRIES: usize = "FS_SCAN_CACHE_MAX_ENTRIES" or 16 => [0, usize::MAX];
+	// Configured maximum total approximate bytes retained by the cache.
+	static MAX_CACHE_BYTES: usize = "FS_SCAN_CACHE_MAX_BYTES" or 134_217_728 => [0, usize::MAX];
 }
 
 env_uint! {
@@ -119,8 +122,9 @@ pub struct ScanOptions {
 
 #[derive(Clone)]
 struct CacheEntry {
-	created_at: Instant,
-	entries:    Vec<GlobMatch>,
+	created_at:   Instant,
+	entries:      Vec<GlobMatch>,
+	approx_bytes: usize,
 }
 
 static FS_CACHE: LazyLock<DashMap<CacheKey, CacheEntry>> = LazyLock::new(DashMap::new);
@@ -133,15 +137,62 @@ pub struct ScanResult {
 	pub cache_age_ms: u64,
 }
 
-fn evict_oldest() {
-	if FS_CACHE.len() > *MAX_CACHE_ENTRIES
-		&& let Some(oldest_key) = FS_CACHE
+/// Approximate native memory retained by a cached scan result.
+fn approx_entries_bytes(entries: &[GlobMatch]) -> usize {
+	let paths_bytes: usize = entries.iter().map(|entry| entry.path.len()).sum();
+	std::mem::size_of_val(entries) + paths_bytes
+}
+
+type ScanCache = DashMap<CacheKey, CacheEntry>;
+
+fn cached_bytes_total(cache: &ScanCache) -> usize {
+	cache
+		.iter()
+		.map(|entry| entry.value().approx_bytes)
+		.sum()
+}
+
+/// Evict oldest entries until both the entry-count and byte budgets hold.
+fn evict_to_budget(cache: &ScanCache, max_entries: usize, max_bytes: usize) {
+	loop {
+		let over_entries = cache.len() > max_entries;
+		let over_bytes = cached_bytes_total(cache) > max_bytes;
+		if !over_entries && !over_bytes {
+			return;
+		}
+		let Some(oldest_key) = cache
 			.iter()
 			.min_by_key(|entry| entry.value().created_at)
 			.map(|entry| entry.key().clone())
-	{
-		FS_CACHE.remove(&oldest_key);
+		else {
+			return;
+		};
+		cache.remove(&oldest_key);
 	}
+}
+
+/// Store a scan result unless its approximate size alone exceeds the byte
+/// budget; oversized results are served uncached to bound native memory.
+/// A zero byte budget disables scan-result caching entirely.
+fn store_in_cache(
+	cache: &ScanCache,
+	key: CacheKey,
+	created_at: Instant,
+	entries: &[GlobMatch],
+	max_entries: usize,
+	max_bytes: usize,
+) {
+	let approx_bytes = approx_entries_bytes(entries);
+	if max_bytes == 0 || approx_bytes > max_bytes {
+		return;
+	}
+	cache.insert(key, CacheEntry { created_at, entries: entries.to_vec(), approx_bytes });
+	evict_to_budget(cache, max_entries, max_bytes);
+}
+
+/// Store a scan result in the global cache under the configured budgets.
+fn store_scan_result(key: CacheKey, created_at: Instant, entries: &[GlobMatch]) {
+	store_in_cache(&FS_CACHE, key, created_at, entries, *MAX_CACHE_ENTRIES, *MAX_CACHE_BYTES);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -478,8 +529,7 @@ pub fn get_or_scan(
 	}
 
 	let entries = collect_entries(root, options, ct)?;
-	FS_CACHE.insert(key, CacheEntry { created_at: now, entries: entries.clone() });
-	evict_oldest();
+	store_scan_result(key, now, &entries);
 	Ok(ScanResult { entries, cache_age_ms: 0 })
 }
 
@@ -506,8 +556,7 @@ pub fn force_rescan(
 	let entries = collect_entries(root, options, ct)?;
 	if store {
 		let now = Instant::now();
-		FS_CACHE.insert(key, CacheEntry { created_at: now, entries: entries.clone() });
-		evict_oldest();
+		store_scan_result(key, now, &entries);
 	}
 	Ok(entries)
 }
@@ -832,5 +881,102 @@ mod tests {
 			.expect("full scan includes file");
 		assert!(full_file.mtime.is_some(), "full scan should include mtime");
 		assert_eq!(full_file.size, Some(2.0));
+	}
+
+	fn cache_key(name: &str) -> super::CacheKey {
+		super::CacheKey {
+			root:              PathBuf::from(name),
+			include_hidden:    false,
+			use_gitignore:     false,
+			skip_node_modules: true,
+			detail:            super::ScanDetail::Minimal,
+		}
+	}
+
+	fn glob_match(path: &str) -> super::GlobMatch {
+		super::GlobMatch {
+			path:      path.to_string(),
+			file_type: super::FileType::File,
+			mtime:     None,
+			size:      None,
+		}
+	}
+
+	#[test]
+	fn approx_entries_bytes_accounts_struct_and_path_bytes() {
+		let entries = vec![glob_match("a/b.txt"), glob_match("cc/dd.txt")];
+		let expected =
+			2 * std::mem::size_of::<super::GlobMatch>() + "a/b.txt".len() + "cc/dd.txt".len();
+		assert_eq!(super::approx_entries_bytes(&entries), expected);
+		assert_eq!(super::approx_entries_bytes(&[]), 0);
+	}
+
+	#[test]
+	fn store_in_cache_skips_results_larger_than_byte_budget() {
+		let cache = super::ScanCache::new();
+		let entries = vec![glob_match("big.txt")];
+		let budget = super::approx_entries_bytes(&entries) - 1;
+		let now = std::time::Instant::now();
+		super::store_in_cache(&cache, cache_key("/big"), now, &entries, 16, budget);
+		assert!(cache.is_empty(), "oversized result must be served uncached");
+
+		// At exactly the budget the result is cached.
+		super::store_in_cache(&cache, cache_key("/big"), now, &entries, 16, budget + 1);
+		assert_eq!(cache.len(), 1);
+	}
+
+	#[test]
+	fn store_in_cache_evicts_oldest_when_over_byte_budget() {
+		let cache = super::ScanCache::new();
+		let entries = vec![glob_match("file.txt")];
+		let per_entry = super::approx_entries_bytes(&entries);
+		// Budget fits two cached scans but not three.
+		let budget = per_entry * 2;
+		let base = std::time::Instant::now();
+		super::store_in_cache(&cache, cache_key("/a"), base, &entries, 16, budget);
+		let later = base + Duration::from_millis(1);
+		super::store_in_cache(&cache, cache_key("/b"), later, &entries, 16, budget);
+		let latest = base + Duration::from_millis(2);
+		super::store_in_cache(&cache, cache_key("/c"), latest, &entries, 16, budget);
+
+		assert_eq!(cache.len(), 2, "byte budget should cap retained scans");
+		assert!(!cache.contains_key(&cache_key("/a")), "oldest entry should be evicted first");
+		assert!(cache.contains_key(&cache_key("/b")));
+		assert!(cache.contains_key(&cache_key("/c")));
+		assert!(super::cached_bytes_total(&cache) <= budget);
+	}
+
+	#[test]
+	fn store_in_cache_still_enforces_entry_count_budget() {
+		let cache = super::ScanCache::new();
+		let entries = vec![glob_match("file.txt")];
+		let base = std::time::Instant::now();
+		for i in 0..4 {
+			let created_at = base + Duration::from_millis(i);
+			super::store_in_cache(
+				&cache,
+				cache_key(&format!("/root-{i}")),
+				created_at,
+				&entries,
+				2,
+				usize::MAX,
+			);
+		}
+		assert_eq!(cache.len(), 2, "entry-count budget should still apply");
+		assert!(cache.contains_key(&cache_key("/root-2")));
+		assert!(cache.contains_key(&cache_key("/root-3")));
+	}
+
+	#[test]
+	fn store_in_cache_zero_byte_budget_disables_caching() {
+		let cache = super::ScanCache::new();
+		let now = std::time::Instant::now();
+		// Even an empty (zero-byte) result must not be cached at a zero budget.
+		super::store_in_cache(&cache, cache_key("/empty"), now, &[], 16, 0);
+		assert!(cache.is_empty(), "zero byte budget should disable caching");
+
+		let entries = vec![glob_match("file.txt")];
+		super::store_in_cache(&cache, cache_key("/nonempty"), now, &entries, 16, 0);
+		assert!(cache.is_empty(), "zero byte budget should disable caching");
 	}
 }
