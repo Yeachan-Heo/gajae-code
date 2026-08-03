@@ -349,6 +349,43 @@ test("interactive continuation activates --mpreset from cached models without bl
 	expect(session.model?.provider).toBe("profile-provider");
 	expect(session.model?.id).toBe("default");
 });
+test("interactive continuation applies cached default and --mpreset profiles before background refresh", async () => {
+	const session = fakeSession();
+	const registry = fakeRegistry([
+		{
+			name: "default-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium" },
+			source: "user",
+		},
+		{
+			name: "cached-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:high" },
+			source: "user",
+		},
+	]);
+
+	await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": "default-profile" }),
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: "cached-profile" },
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: "continue-tail",
+	});
+
+	expect(registry.refreshCalls).toEqual([]);
+	expect(registry.refreshInBackgroundCalls).toEqual(["online-if-uncached"]);
+	expect(
+		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+	).toEqual(["profile-provider/default:medium", "profile-provider/default:high"]);
+});
 
 test("interactive continuation refreshes online only when cached --mpreset resolution fails", async () => {
 	const session = fakeSession();

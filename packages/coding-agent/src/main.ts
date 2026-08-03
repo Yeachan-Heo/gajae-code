@@ -438,35 +438,40 @@ async function applyStartupModelProfilesWithPolicy(
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
 	const defaultProfile = args.settings.get("modelProfile.default");
-	const preferCachedMpreset =
-		args.preferCachedModels === true && !defaultProfile && args.parsedArgs.mpreset !== undefined;
-	if (defaultProfile || (args.parsedArgs.mpreset && !preferCachedMpreset)) {
-		await args.modelRegistry.refresh("online-if-uncached");
-	}
-
-	if (defaultProfile) {
-		await applyProfile(defaultProfile, false, {
-			thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
-				? args.settings.get("defaultThinkingLevel")
-				: undefined,
-		});
-	}
-	if (args.parsedArgs.mpreset) {
-		if (preferCachedMpreset) {
-			let applied: boolean;
-			let refreshedOnline = false;
-			try {
-				applied = await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
-			} catch (error) {
-				if (error instanceof ModelProfileCredentialError) throw error;
-				await args.modelRegistry.refresh("online-if-uncached");
-				refreshedOnline = true;
-				applied = await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
-			}
-			if (applied && !refreshedOnline) args.modelRegistry.refreshInBackground();
-		} else {
-			await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
+	const preferCachedProfiles = args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined;
+	const applyConfiguredProfiles = async (): Promise<boolean> => {
+		let applied = true;
+		if (defaultProfile) {
+			applied =
+				(await applyProfile(defaultProfile, false, {
+					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
+						? args.settings.get("defaultThinkingLevel")
+						: undefined,
+				})) && applied;
 		}
+		if (args.parsedArgs.mpreset) {
+			applied = (await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true)) && applied;
+		}
+		return applied;
+	};
+
+	if (preferCachedProfiles) {
+		let applied: boolean;
+		let refreshedOnline = false;
+		try {
+			applied = await applyConfiguredProfiles();
+		} catch (error) {
+			if (error instanceof ModelProfileCredentialError) throw error;
+			await args.modelRegistry.refresh("online-if-uncached");
+			refreshedOnline = true;
+			applied = await applyConfiguredProfiles();
+		}
+		if (applied && !refreshedOnline) args.modelRegistry.refreshInBackground();
+	} else {
+		if (defaultProfile || args.parsedArgs.mpreset) {
+			await args.modelRegistry.refresh("online-if-uncached");
+		}
+		await applyConfiguredProfiles();
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
