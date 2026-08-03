@@ -40,21 +40,30 @@ Existing Rust head start (~66K lines): `pi-natives` (fs/search/edit/PTY backends
 Each phase ends with the binary passing its gate (see Verification) and the
 corresponding TS code deleted or demoted to subprocess.
 
-### Phase 0 — Contract & skeleton (in progress)
+### Phase 0 — Contract & skeleton (done for the read side)
 
 - [x] `crates/gjc` host binary: tokio + clap skeleton (`run`, `acp`, `config`)
-- [ ] `gjc-config` crate: serde types generated/hand-derived from
-      `schemas/config.schema.json`; loader with the same precedence rules
-      (project `.gjc/` → user config dir → env)
-- [ ] `gjc-session` crate: read/write the existing session file format
-      byte-compatibly; golden-file tests against real `.gjc` session trees
-- [ ] Gate: `gjc config` output diffs clean against the Bun CLI on real configs
+- [x] `gjc-config` crate: settings table generated from `SETTINGS_SCHEMA`
+      (`schemas/settings-flat.json`, drift-checked by `generate-json-schemas.ts
+      --check`); dirs/env-file ports with Bun-identical precedence and trust
+      guards; read-only settings resolution (write path stays Bun-side)
+- [x] `gjc-session` crate: read the existing managed v2 session store
+      (scope digest parity vectors, binding files, loss-free JSONL
+      round-trips verified against a real store); write path stays Bun-side
+- [x] Gate: `gjc config list|list --json|get|path` byte-identical to the Bun
+      CLI on real configs
 
 ### Phase 1 — Foundations
 
-- [ ] Port `packages/utils` + `packages/stats` → `gjc-util`, `gjc-stats`
-- [ ] Convert `pi-natives` from NAPI exports to a plain lib (`panic = "abort"`
-      note in root `Cargo.toml` becomes obsolete once NAPI is gone)
+- [x] Port `packages/utils` + `packages/stats` foundations → `gjc-util`
+      (format/spawn-env/snowflake/mime), `gjc-stats` (user-metrics with TS
+      parity vectors); skipped modules and rationale are listed in each
+      crate's lib.rs docs
+- [x] `pi-natives` core/facade split started: NAPI-free `pi-natives-core`
+      established (glob_util, hashline, linediff migrated; TS parity
+      vectors); `crates/gjc` consumes it with zero napi in its tree.
+      Remaining modules migrate module-by-module; the `panic = "abort"`
+      note in root `Cargo.toml` becomes obsolete only when NAPI is gone
 - [ ] Logging/telemetry plumbing (tracing)
 
 ### Phase 2 — AI provider layer (`packages/ai`, 142K)

@@ -1,0 +1,16 @@
+[package]
+name = "pi-natives-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "NAPI-free core of pi-natives; consumed by both the NAPI facade and the gjc Rust host"
+
+[dependencies]
+globset = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[lints]
+workspace = true

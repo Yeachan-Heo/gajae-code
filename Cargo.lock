@@ -1271,6 +1271,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gjc-config",
+ "pi-natives-core",
  "serde",
  "serde_json",
  "tokio",
@@ -2516,6 +2517,7 @@ dependencies = [
  "phf 0.13.1",
  "pi-ast",
  "pi-iso",
+ "pi-natives-core",
  "pi-shell",
  "portable-pty",
  "rayon",
@@ -2533,6 +2535,14 @@ dependencies = [
  "unicode-width",
  "windows-sys 0.61.2",
  "winreg 0.56.0",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "pi-natives-core"
+version = "0.12.10"
+dependencies = [
+ "globset",
  "xxhash-rust",
 ]
 

@@ -34,6 +34,7 @@ napi-derive.workspace = true
 parking_lot.workspace = true
 phf.workspace = true
 pi-ast.workspace = true
+pi-natives-core = { path = "../pi-natives-core" }
 pi-iso.workspace = true
 pi-shell.workspace = true
 portable-pty.workspace = true
