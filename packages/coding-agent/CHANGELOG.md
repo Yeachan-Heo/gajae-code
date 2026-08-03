@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Interactive turns now emit a host-terminal status marker (OSC 777 `notify;Terax;gjc;<event>`) when `TERAX_TERMINAL` is set, so a hosting terminal can follow working/attention/finished without polling. Silent in every other terminal.
+
 ## [0.12.10] - 2026-08-03
 
 ### Added

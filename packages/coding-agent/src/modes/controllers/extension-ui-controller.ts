@@ -40,6 +40,7 @@ import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
+import { emitHostStatus } from "../utils/host-status";
 import { applyInjectedUserSubmission } from "../utils/injected-user-submission";
 import { classifyHookSelectorBellEvent, ringTerminalBell } from "../utils/terminal-bell";
 import { prepareTranscriptRebuild } from "../utils/ui-helpers";
@@ -1258,6 +1259,7 @@ export class ExtensionUiController {
 			computeBudget();
 
 		ringTerminalBell(classifyHookSelectorBellEvent(title));
+		emitHostStatus("attention");
 
 		this.ctx.hookSelector = new HookSelectorComponent(
 			title,
