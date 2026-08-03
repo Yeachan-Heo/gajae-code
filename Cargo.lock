@@ -1265,6 +1265,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "gjc"
+version = "0.12.10"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "gjc-config"
+version = "0.12.10"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "gjc-sdk"
 version = "0.12.15"
 dependencies = [

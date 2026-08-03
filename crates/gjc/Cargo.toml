@@ -1,0 +1,23 @@
+[package]
+name = "gjc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "gajae-code: single-binary coding agent runtime (Bun-free host)"
+
+[[bin]]
+name = "gjc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
