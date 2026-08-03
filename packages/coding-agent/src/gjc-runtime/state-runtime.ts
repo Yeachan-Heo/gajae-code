@@ -217,6 +217,17 @@ async function inferModeFromActiveState(
 	return canonical ?? undefined;
 }
 
+async function assertUltratestInvocationResolved(cwd: string, sessionId: string): Promise<void> {
+	const state = await readVisibleSkillActiveState(cwd, sessionId);
+	const resolved = listActiveSkills(state).some(entry => entry.skill === "ultratest" && entry.active === true);
+	if (!resolved) {
+		throw new StateCommandError(
+			2,
+			"gjc state ultratest requires a resolved /skill:ultratest invocation from an explicitly installed skill",
+		);
+	}
+}
+
 function stateDirFor(cwd: string, sessionId: string): string {
 	return sessionStateDir(cwd, sessionId);
 }
@@ -1218,6 +1229,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			2,
 			"gjc state write requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
+	if (mode === "ultratest") await assertUltratestInvocationResolved(cwd, sessionId);
 
 	if (mode === "deep-interview") {
 		try {
@@ -1568,6 +1580,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 	if (callee === caller) {
 		throw new StateCommandError(2, `gjc state handoff: --to must differ from caller (both are "${caller}")`);
 	}
+	if (callee === "ultratest") await assertUltratestInvocationResolved(cwd, sessionId);
 
 	const callerPath = modeStateFile(cwd, caller, sessionId);
 	const calleePath = calleeIsWorkflow ? modeStateFile(cwd, callee, sessionId) : undefined;

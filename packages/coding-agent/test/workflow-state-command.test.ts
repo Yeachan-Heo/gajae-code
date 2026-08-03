@@ -5,16 +5,15 @@ import * as path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
-const workflowSkills = ["deep-interview", "ralplan", "ultragoal", "team", "ultratest"] as const;
+const defaultWorkflowSkills = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
 function sessionStateDir(cwd: string, sessionId: string): string {
 	return path.join(cwd, ".gjc", `_session-${encodeURIComponent(sessionId).replaceAll(".", "%2E")}`, "state");
 }
-const initialPhases: Record<(typeof workflowSkills)[number], string> = {
+const initialPhases: Record<(typeof defaultWorkflowSkills)[number], string> = {
 	"deep-interview": "interviewing",
 	ralplan: "planner",
 	ultragoal: "goal-planning",
 	team: "starting",
-	ultratest: "verifying",
 };
 
 async function withTempCwd<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
@@ -38,7 +37,7 @@ function runState(cwd: string, args: string[]) {
 describe("gjc state workflow command", () => {
 	it("writes readable canonical state and receipt for workflow skills through documented invocation", async () => {
 		await withTempCwd(async cwd => {
-			for (const skill of workflowSkills) {
+			for (const skill of defaultWorkflowSkills) {
 				const result = runState(cwd, [
 					"write",
 					"--session-id",
@@ -84,6 +83,49 @@ describe("gjc state workflow command", () => {
 			}
 		});
 	}, 30_000);
+
+	it("rejects direct ultratest state writes before a resolved skill invocation seeds the session", async () => {
+		await withTempCwd(async cwd => {
+			const sessionId = "session-ultratest-direct";
+			const result = runState(cwd, [
+				"ultratest",
+				"write",
+				"--session-id",
+				sessionId,
+				"--input",
+				JSON.stringify({ current_phase: "verifying" }),
+				"--json",
+			]);
+
+			expect(result.exitCode, result.stderr.toString()).toBe(2);
+			expect(await Bun.file(path.join(sessionStateDir(cwd, sessionId), "ultratest-state.json")).exists()).toBe(
+				false,
+			);
+		});
+	}, 20_000);
+
+	it("rejects a default workflow handoff that would activate unseeded ultratest state", async () => {
+		await withTempCwd(async cwd => {
+			const sessionId = "session-ultratest-handoff";
+			const seedCaller = runState(cwd, [
+				"ralplan",
+				"write",
+				"--session-id",
+				sessionId,
+				"--input",
+				JSON.stringify({ current_phase: "handoff" }),
+				"--json",
+			]);
+			expect(seedCaller.exitCode, seedCaller.stderr.toString()).toBe(0);
+
+			const result = runState(cwd, ["ralplan", "handoff", "--session-id", sessionId, "--to", "ultratest", "--json"]);
+
+			expect(result.exitCode, result.stderr.toString()).toBe(2);
+			expect(await Bun.file(path.join(sessionStateDir(cwd, sessionId), "ultratest-state.json")).exists()).toBe(
+				false,
+			);
+		});
+	}, 20_000);
 
 	it("rejects stale workflow phases without force", async () => {
 		await withTempCwd(async cwd => {
