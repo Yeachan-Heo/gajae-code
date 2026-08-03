@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the new bot token and chat id are already on disk. The wording now follows the durable configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own (#3761).
+
 ## [0.12.11] - 2026-08-03
 
 ### Fixed
@@ -31,7 +35,6 @@
 - Dead-owner notification recovery now preserves a machine-readable transition block, marker-age diagnostics, and safe force-recovery guidance without weakening ownership proofs (#3762).
 - Detached SDK session hosts no longer outlive the broker that spawned them. A host whose broker died without teardown (crash, `SIGKILL`, restart without `--close-session-hosts`) previously stayed resident forever, holding its session's memory — hundreds of MB per orphan. Each host now polls the broker discovery publication and, after a bounded grace period with no live broker, disposes itself through the same graceful teardown a `SIGTERM` takes. A replacement broker resets the window, so hosts still survive ordinary broker restarts, and a transient discovery read failure is treated as ambiguity rather than proof of orphanhood.
 - Syntax highlighting now recognizes special filenames such as `CMakeLists.txt`, `Dockerfile.*`, `Makefile`, and `.env.*` before generic filename extensions.
-- A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the new bot token and chat id are already on disk. The wording now follows the durable configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own (#3761).
 
 ## [0.12.8] - 2026-08-02
 ### Added
