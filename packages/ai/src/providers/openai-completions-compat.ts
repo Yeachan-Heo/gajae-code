@@ -71,6 +71,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		/(^|\/)anthropic\//i.test(model.id);
 	const isAlibaba = baseUrl.includes("dashscope");
 	const isQwen = model.id.toLowerCase().includes("qwen");
+	const isAlibabaTokenPlanQwen38Max = provider === "alibaba-token-plan" && model.id === "qwen3.8-max";
 	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
 	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
 	// upstream model is reachable through many OpenAI-compat hosts (api.deepseek.com, Deepinfra,
@@ -199,6 +200,12 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 								minimal: "none",
 							} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
 						: {};
+	if (isAlibabaTokenPlanQwen38Max) {
+		// Token Plan's GA Chat endpoint accepts low/medium/xhigh rather than the OpenAI aliases.
+		reasoningEffortMap.minimal = "low";
+		reasoningEffortMap.high = "xhigh";
+		reasoningEffortMap.max = "xhigh";
+	}
 
 	return {
 		supportsStore: !isNonStandard,

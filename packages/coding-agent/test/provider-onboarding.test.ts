@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { clampThinkingLevelForModel, Effort, getSupportedEfforts } from "@gajae-code/ai";
+import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
+import type { Context, Model } from "@gajae-code/ai/types";
 import { getAgentDbPath, getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { parseSetupArgs } from "../src/cli/setup-cli";
@@ -27,6 +29,23 @@ const originalAgentDir = getAgentDir();
 async function tempModelsPath(): Promise<string> {
 	tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-onboarding-"));
 	return path.join(tempRoot, "models.yml");
+}
+
+function captureCompletionsPayload(
+	model: Model<"openai-completions">,
+	reasoning: "minimal" | "high" | "max",
+): Promise<Record<string, unknown>> {
+	const controller = new AbortController();
+	controller.abort();
+	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+	const context: Context = { messages: [{ role: "user", content: "hello", timestamp: 0 }] };
+	streamOpenAICompletions(model, context, {
+		apiKey: "test-key",
+		signal: controller.signal,
+		reasoning,
+		onPayload: payload => resolve(payload as Record<string, unknown>),
+	});
+	return promise;
 }
 
 afterEach(async () => {
@@ -217,6 +236,15 @@ describe("provider onboarding setup core", () => {
 			expect(glm.api).toBe("openai-completions");
 			expect(deepseekPro.api).toBe("openai-completions");
 			expect(deepseekFlash.api).toBe("openai-completions");
+			for (const [effort, expected] of [
+				["minimal", "low"],
+				["high", "xhigh"],
+				["max", "xhigh"],
+			] as const) {
+				const payload = await captureCompletionsPayload(qwenGa as Model<"openai-completions">, effort);
+				expect(payload.enable_thinking).toBe(true);
+				expect(payload.reasoning_effort).toBe(expected);
+			}
 			for (const model of [qwenGa, qwenPreview, glm, deepseekPro]) {
 				expect(model.reasoning).toBe(true);
 				expect(getSupportedEfforts(model)).toEqual([
