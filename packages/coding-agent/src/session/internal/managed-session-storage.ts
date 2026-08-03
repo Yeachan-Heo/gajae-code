@@ -1013,8 +1013,7 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
-		const context = createManagedDarwinReplacementContext(this.#root, path.dirname(resolved));
-		const auth = context ? openDarwinReplacementAuth(path.dirname(resolved), context.lockName) : undefined;
+		const auth = this.#openDarwinReplacementAuth(path.dirname(resolved));
 		try {
 			let existing = this.readExpected(relativePath);
 			if (!existing) throw new Error("managed_append_missing");
@@ -1085,6 +1084,10 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#openDarwinReplacementAuth(directory: string): { close(): void } | undefined {
+		const context = createManagedDarwinReplacementContext(this.#root, directory);
+		return context ? openDarwinReplacementAuth(directory, context.lockName) : undefined;
+	}
 	#relative(resolved: string): string {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
 	}
@@ -1228,27 +1231,33 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
-			const removed = exactUnlink(this.#resolve(relativePath), {
-				dev: expected.identity.dev,
-				ino: expected.identity.ino,
-				size: BigInt(expected.identity.size),
-				mtimeNs: expected.identity.mtimeNs,
-				sha256: expected.identity.sha256,
-				quarantineName: `.gjc-remove-${process.pid}-${randomUUID()}`,
-			});
-			if (
-				!removed.ok &&
-				!(
-					removed.code === "cleanup_pending" &&
-					(removed.detachedPath ??
-						removed.retainedSuccessorPath ??
-						removed.retainedPlaceholderPath ??
-						removed.retainedUnknownPath) !== undefined
+			const resolved = this.#resolve(relativePath);
+			const auth = this.#openDarwinReplacementAuth(path.dirname(resolved));
+			try {
+				const removed = exactUnlink(resolved, {
+					dev: expected.identity.dev,
+					ino: expected.identity.ino,
+					size: BigInt(expected.identity.size),
+					mtimeNs: expected.identity.mtimeNs,
+					sha256: expected.identity.sha256,
+					quarantineName: `.gjc-remove-${process.pid}-${randomUUID()}`,
+				});
+				if (
+					!removed.ok &&
+					!(
+						removed.code === "cleanup_pending" &&
+						(removed.detachedPath ??
+							removed.retainedSuccessorPath ??
+							removed.retainedPlaceholderPath ??
+							removed.retainedUnknownPath) !== undefined
+					)
 				)
-			)
-				throw new Error(removed.code ?? "managed_remove_failed");
-			this.#assertBound();
-			return;
+					throw new Error(removed.code ?? "managed_remove_failed");
+				this.#assertBound();
+				return;
+			} finally {
+				auth?.close();
+			}
 		}
 		const removed = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).removeManaged(
 			this.#relative(this.#resolve(relativePath)),
@@ -1290,16 +1299,21 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return existing.data;
 		}
-		let snapshot: ManagedFileSnapshot;
+		const auth = this.#openDarwinReplacementAuth(path.dirname(resolved));
 		try {
-			snapshot = captureManagedFileNoFollow(resolved);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-			throw error;
+			let snapshot: ManagedFileSnapshot;
+			try {
+				snapshot = captureManagedFileNoFollow(resolved);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			}
+			await unlinkManagedFileVerified(resolved, snapshot.identity);
+			this.#assertBound();
+			return snapshot.bytes;
+		} finally {
+			auth?.close();
 		}
-		await unlinkManagedFileVerified(resolved, snapshot.identity);
-		this.#assertBound();
-		return snapshot.bytes;
 	}
 
 	/** Remove one managed descendant through retained authority when it exists. */

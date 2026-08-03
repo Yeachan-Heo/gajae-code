@@ -52,4 +52,23 @@ describe("Darwin managed replacement", () => {
 			auth.close();
 		}
 	});
+	it("rejects removal while the Darwin replacement admission is held", () => {
+		if (process.platform !== "darwin") return;
+		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-darwin-managed-remove-"));
+		tempDirectories.push(temporaryDirectory);
+		const root = prepareManagedDirectoryRoot(temporaryDirectory);
+		const store = new ManagedSessionDescendantStore(root, root.canonicalPath);
+		const transcript = path.join(root.canonicalPath, "session.jsonl");
+		store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+		const expected = store.readExpected("session.jsonl");
+		if (!expected) throw new Error("managed transcript was not published");
+
+		const auth = openDarwinReplacementAuth(root.canonicalPath, "darwin-replacement-admission.lock");
+		try {
+			expect(() => store.removeExpected("session.jsonl", expected)).toThrow("migration_busy");
+			expect(fs.readFileSync(transcript, "utf8")).toBe("before\n");
+		} finally {
+			auth.close();
+		}
+	});
 });
