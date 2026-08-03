@@ -1790,71 +1790,75 @@ function registerInteractiveAnswerSource(
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
 	presentationArbiter: PresentationArbiter,
 ): () => void {
-	return registerAskAnswerSource(id, {
-		awaitAnswer(question, options, signal) {
-			const result = this.awaitAnswerRequest?.({ question, options, interaction: "selector", controls: [] }, signal);
-			if (!result) return Promise.resolve(undefined);
-			return result.then(answer => {
-				if (!answer || typeof answer === "string") return answer;
-				return answer.interaction.kind === "value" ? answer.interaction.value : undefined;
-			});
-		},
-		awaitAnswerRequest(request: AskAnswerRequest, signal?: AbortSignal): Promise<AskAnswerSourceResult> {
-			if (signal?.aborted) return Promise.resolve(undefined);
-			const presentationId = `interactive:${crypto.randomUUID()}`;
-			return new Promise<AskAnswerSourceResult>(resolve => {
-				let settled = false;
-				const settle = (result: AskAnswerSourceResult) => {
-					if (settled) return;
-					settled = true;
-					resolve(result);
-				};
-				const pending: PendingInteractiveAsk = {
-					resolve: settle,
-					options: request.options,
-					controls: request.controls,
-					retireForDirectControl: () => presentationArbiter.retireForDirectControl(presentationId),
-					reissue: () => {
-						if (!pending.actionId) return false;
-						presentationArbiter.reissueAfterFailure(pending.actionId);
-						return true;
-					},
-					complete: actionId => presentationArbiter.completeInteractive(presentationId, actionId),
-					completeDirect: () => presentationArbiter.completeDirect(presentationId),
-					fail: actionId => presentationArbiter.completeInteractive(presentationId, actionId),
-				};
-				presentationArbiter.retain({
-					gateId: presentationId,
-					sessionId: id,
-					question: request.question,
-					options: request.options,
-					controls: request.controls,
-					recommendedIndex: request.recommendedIndex,
-					// The ask tool owns the multi-select loop and re-issues one request per
-					// toggle; carrying its selection here is what makes the toggle visible
-					// on a remote transport instead of an identical repeated prompt.
-					multi: request.multi === true,
-					allowEmpty: false,
-					selectedOptions: [...(request.selectedOptions ?? [])],
-					onActivated: (actionId, lease) => {
-						if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
-							pendingInteractive.delete(pending.actionId);
-						pending.actionId = actionId;
-						pendingInteractive.set(actionId, pending);
-						void lease;
-					},
-					onClosed: () => {
-						if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
-							pendingInteractive.delete(pending.actionId);
-						settle(undefined);
-					},
+	return registerAskAnswerSource(
+		id,
+		{
+			awaitAnswer(question, options, signal) {
+				const result = this.awaitAnswerRequest?.({ question, options, interaction: "selector", controls: [] }, signal);
+				if (!result) return Promise.resolve(undefined);
+				return result.then(answer => {
+					if (!answer || typeof answer === "string") return answer;
+					return answer.interaction.kind === "value" ? answer.interaction.value : undefined;
 				});
-				signal?.addEventListener("abort", () => {
-					presentationArbiter.cancel(presentationId, "interactive_abort");
+			},
+			awaitAnswerRequest(request: AskAnswerRequest, signal?: AbortSignal): Promise<AskAnswerSourceResult> {
+				if (signal?.aborted) return Promise.resolve(undefined);
+				const presentationId = `interactive:${crypto.randomUUID()}`;
+				return new Promise<AskAnswerSourceResult>(resolve => {
+					let settled = false;
+					const settle = (result: AskAnswerSourceResult) => {
+						if (settled) return;
+						settled = true;
+						resolve(result);
+					};
+					const pending: PendingInteractiveAsk = {
+						resolve: settle,
+						options: request.options,
+						controls: request.controls,
+						retireForDirectControl: () => presentationArbiter.retireForDirectControl(presentationId),
+						reissue: () => {
+							if (!pending.actionId) return false;
+							presentationArbiter.reissueAfterFailure(pending.actionId);
+							return true;
+						},
+						complete: actionId => presentationArbiter.completeInteractive(presentationId, actionId),
+						completeDirect: () => presentationArbiter.completeDirect(presentationId),
+						fail: actionId => presentationArbiter.completeInteractive(presentationId, actionId),
+					};
+					presentationArbiter.retain({
+						gateId: presentationId,
+						sessionId: id,
+						question: request.question,
+						options: request.options,
+						controls: request.controls,
+						recommendedIndex: request.recommendedIndex,
+						// The ask tool owns the multi-select loop and re-issues one request per
+						// toggle; carrying its selection here is what makes the toggle visible
+						// on a remote transport instead of an identical repeated prompt.
+						multi: request.multi === true,
+						allowEmpty: false,
+						selectedOptions: [...(request.selectedOptions ?? [])],
+						onActivated: (actionId, lease) => {
+							if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
+								pendingInteractive.delete(pending.actionId);
+							pending.actionId = actionId;
+							pendingInteractive.set(actionId, pending);
+							void lease;
+						},
+						onClosed: () => {
+							if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
+								pendingInteractive.delete(pending.actionId);
+							settle(undefined);
+						},
+					});
+					signal?.addEventListener("abort", () => {
+						presentationArbiter.cancel(presentationId, "interactive_abort");
+					});
 				});
-			});
+			},
 		},
-	});
+		"interactive",
+	);
 }
 
 /** Extract the session id from a `<timestamp>_<uuid>.jsonl` session file path. */
@@ -3667,6 +3671,7 @@ export function createNotificationsExtension(
 					createSdkUiAskAnswerSource(
 						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
 					),
+					"protocol",
 				);
 				return;
 			}
