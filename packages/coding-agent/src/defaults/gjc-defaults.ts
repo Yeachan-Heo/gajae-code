@@ -13,8 +13,9 @@ import ultragoalSkill from "./gjc/skills/ultragoal/SKILL.md" with { type: "text"
 import validationBatchContractsFragment from "./gjc/skills/ultragoal/validation-batch-contracts.md" with {
 	type: "text",
 };
+import ultratestSkill from "./gjc/skills/ultratest/SKILL.md" with { type: "text" };
 
-export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal", "ultratest"] as const;
 export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
 export type DefaultGjcDefinitionKind = "skill" | "skill-fragment";
 export type EmbeddedDefaultGjcSkill = {
@@ -92,6 +93,7 @@ const DEFAULT_GJC_DEFINITIONS: readonly DefaultGjcDefinition[] = [
 	{ kind: "skill", name: "ralplan", relativePath: "skills/ralplan/SKILL.md", content: ralplanSkill },
 	{ kind: "skill", name: "team", relativePath: "skills/team/SKILL.md", content: teamSkill },
 	{ kind: "skill", name: "ultragoal", relativePath: "skills/ultragoal/SKILL.md", content: ultragoalSkill },
+	{ kind: "skill", name: "ultratest", relativePath: "skills/ultratest/SKILL.md", content: ultratestSkill },
 	{
 		kind: "skill-fragment",
 		parentSkillName: "deep-interview",
