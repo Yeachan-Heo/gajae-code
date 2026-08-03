@@ -4,7 +4,7 @@ This document defines the shared native filesystem scan collector and cache impl
 
 ## Safety policy
 
-The shared scan path has finite per-scan and process-cache ownership budgets. The safety controls are parsed strictly before a walker or cache is accessed:
+The shared scan path has finite per-scan logical retained-capacity and process-cache ownership budgets. The safety controls are parsed strictly before a walker or cache is accessed:
 
 | Variable | Default | Accepted range |
 | --- | ---: | ---: |
@@ -43,21 +43,32 @@ Each snapshot is keyed by all traversal and metadata dimensions:
 
 Consumers with different symlink-following or metadata requirements therefore cannot alias each other's snapshots.
 
+Current native consumers deliberately use different symlink policies:
+
+| Consumer | `follow_links` |
+| --- | --- |
+| glob discovery | `false` |
+| fuzzy find (`fd.rs`) | `true` |
+| AST candidate discovery | `false` |
+| cached grep discovery | `false` |
+
+Fuzzy find therefore never shares a snapshot with those non-following consumers, even when root, hidden-file, ignore, `node_modules`, and detail settings otherwise match. Any new consumer must treat `follow_links` as a required cache-partition dimension rather than inheriting another consumer's snapshot.
+
 ## Bounded collection
 
 `ignore::WalkBuilder` visitors admit candidates through one per-scan mutex-owned collector. Visitor-local unbounded vectors and post-walk flattening are prohibited.
 
 Admission is transactional:
 
-1. Compute a conservative path charge from the borrowed relative path before allocating its owned string.
-2. Reserve the logical entry, path bytes, and one physically charged vector slot under the collector lock using checked arithmetic.
-3. Grow vector capacity geometrically within the configured entry and byte budgets. Live provisional slot claims prevent concurrent visitors from spending the same capacity.
+1. Compute a conservative path charge from the borrowed relative path before attempting to allocate its owned string.
+2. Reserve the logical entry and path bytes, then precharge the requested vector-capacity growth under the collector lock using checked arithmetic.
+3. Request geometric vector growth only when the requested target fits the configured logical entry and retained-capacity budgets. Live provisional slot claims prevent concurrent visitors from spending the same capacity.
 4. Allocate the normalized forward-slash path fallibly while retaining the collector lock. This serializes ownership transfer and avoids an extra lock round-trip on the small-directory hot path.
-5. Commit only while the collector has no terminal error. A failed candidate rolls back its logical/path/slot claims; capacity still owned by the vector remains charged.
+5. Reconcile the actual vector and string capacities returned by the allocator. Commit only while the collector has no terminal error and those retained capacities fit the budget. A failed candidate rolls back its logical/path/slot claims; capacity still owned by the vector remains charged until the failed collector is discarded.
 
 The first configuration, cancellation, arithmetic, reservation, or budget error is write-once. Once present, later visitors cannot commit. The whole collector is discarded after walker join, so callers, callbacks, AST reads, and the cache never receive a prefix. Successful entries are sorted in place before the vector becomes immutable.
 
-Retained snapshot accounting includes vector capacity and every path string's capacity, not only logical lengths. The scan budget covers collector-owned entries; consumer-derived allocations such as AST parse trees, grep result payloads, callback queues, and fuzzy-score buffers remain separate ownership domains.
+Retained snapshot accounting includes vector capacity and every path string's capacity, not only logical lengths. `try_reserve_exact` avoids deliberate speculative over-allocation, but Rust permits the allocator to return more capacity than requested. The collector can observe and reject that excess only after the allocation returns; vector reallocation can also transiently own both the old and new buffers. `FS_SCAN_MAX_BYTES` therefore strictly bounds the accounted retained capacity of a successful snapshot, not allocator metadata, transient heap allocation, or process RSS at the allocation instant. The scan budget covers collector-owned entries; consumer-derived allocations such as AST parse trees, grep result payloads, callback queues, and fuzzy-score buffers remain separate ownership domains.
 
 ## Cache publication and eviction
 
@@ -102,4 +113,5 @@ A new shared-scan consumer must:
 - State is process-local and is not persisted across restarts.
 - The cache stores complete scan snapshots, not final tool results.
 - Per-scan limits bound each concurrent shared scan; they are not a process-wide admission controller.
+- `FS_SCAN_MAX_BYTES` is a logical successful-snapshot retained-capacity budget, not a hard allocator-footprint, transient-allocation, or RSS ceiling.
 - Uncached directory grep is intentionally streaming and does not use this collector/cache ownership model.

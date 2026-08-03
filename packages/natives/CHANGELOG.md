@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Native shared filesystem scans now enforce strict per-scan entry and retained-byte limits before allocating or caching results, return whole-scan errors instead of partial prefixes, share immutable snapshots without full-vector clones, and prevent stale in-flight scans from repopulating invalidated or TTL-expired cache entries. Cache retention remains compatible with #3774's 128 MiB default and zero-byte cache bypass, is bounded by both key count and aggregate bytes, and includes symlink-following behavior in cache identity (#3769).
+- Native shared filesystem scans now enforce strict per-scan entry and successful-snapshot retained-capacity budgets, precharge logical ownership before allocation requests, reject allocator-granted excess with whole-scan errors instead of partial prefixes, share immutable snapshots without full-vector clones, and prevent stale in-flight scans from repopulating invalidated or TTL-expired cache entries. The byte budget does not claim a hard allocator or transient RSS ceiling. Cache retention remains compatible with #3774's 128 MiB default and zero-byte cache bypass, is bounded by both key count and aggregate bytes, and includes symlink-following behavior in cache identity (#3769).
 
 ## [0.12.10] - 2026-08-03
 

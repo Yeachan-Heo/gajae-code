@@ -1,10 +1,16 @@
 //! Bounded shared filesystem scans for native discovery tools.
 //!
 //! Provides complete-or-error directory snapshots with:
-//! - Strict per-scan entry and retained-byte budgets
+//! - Strict per-scan entry and successful-snapshot retained-capacity budgets
 //! - Immutable `Arc` snapshots and aggregate cache budgets
 //! - Generation-safe publication and explicit mutation invalidation
 //! - Global TTL and empty-result recheck policy
+//!
+//! `FS_SCAN_MAX_BYTES` is a logical ownership budget, not a hard allocator or
+//! RSS-peak limit. Allocation requests are precharged, then the actual `Vec`
+//! and `String` capacities returned by the allocator are reconciled. A scan is
+//! discarded if those retained capacities exceed the budget, but an allocator
+//! may transiently grant more memory before that check can run.
 //!
 //! # Policy configuration (environment overrides)
 //! - `FS_SCAN_MAX_ENTRIES`         – default `250000`
@@ -855,6 +861,10 @@ impl CollectorState {
 
 		self.charged_bytes = precharged_bytes;
 		let additional = requested_target - self.entries.len();
+		// `try_reserve_exact` avoids deliberate speculative growth, but the
+		// allocator may still grant more capacity than requested. The precharge
+		// bounds the logical request; the reconciliation below decides whether the
+		// returned capacity is admissible for a successful snapshot.
 		if self.entries.try_reserve_exact(additional).is_err() {
 			let Some(rolled_back_bytes) = self.charged_bytes.checked_sub(additional_bytes) else {
 				self.fail(scan_limit_error(
