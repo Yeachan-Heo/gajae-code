@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { openDarwinReplacementAuth } from "@gajae-code/natives";
 import {
 	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
@@ -33,5 +34,22 @@ describe("Darwin managed replacement", () => {
 			.filter(entry => entry.startsWith(".session.jsonl.") && entry.endsWith(".replacement"));
 		expect(predecessors).toHaveLength(1);
 		expect(fs.readFileSync(path.join(root.canonicalPath, predecessors[0]), "utf8")).toBe("before\n");
+	});
+	it("rejects append while the Darwin replacement admission is held", () => {
+		if (process.platform !== "darwin") return;
+		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-darwin-managed-append-"));
+		tempDirectories.push(temporaryDirectory);
+		const root = prepareManagedDirectoryRoot(temporaryDirectory);
+		const store = new ManagedSessionDescendantStore(root, root.canonicalPath);
+		const transcript = path.join(root.canonicalPath, "session.jsonl");
+		store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+
+		const auth = openDarwinReplacementAuth(root.canonicalPath, "darwin-replacement-admission.lock");
+		try {
+			expect(() => store.appendSync("session.jsonl", Buffer.from("append\n"))).toThrow("migration_busy");
+			expect(fs.readFileSync(transcript, "utf8")).toBe("before\n");
+		} finally {
+			auth.close();
+		}
 	});
 });
