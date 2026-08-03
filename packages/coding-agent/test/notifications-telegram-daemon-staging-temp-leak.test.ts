@@ -8,7 +8,6 @@ import {
 	daemonPaths,
 	NOTIFICATION_LEAK_ARTIFACT_GRACE_MS,
 	reapStaleNotificationArtifacts,
-	registerNotificationRoot,
 	type TelegramDaemonFs,
 } from "../src/sdk/bus/telegram-daemon";
 
@@ -25,22 +24,6 @@ function isolatedSettings(agentDir: string): Settings {
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	}) as Settings;
-}
-
-/** Wrap the real fs so publishing `roots` fails the way a locked/denied rename does. */
-function renameFailingFs(rootsPath: string): TelegramDaemonFs {
-	const base = fs.promises as unknown as TelegramDaemonFs;
-	return {
-		...base,
-		rename: async (oldPath: string, newPath: string): Promise<void> => {
-			if (path.resolve(newPath) === path.resolve(rootsPath)) {
-				const error = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
-				error.code = "EPERM";
-				throw error;
-			}
-			await base.rename(oldPath, newPath);
-		},
-	};
 }
 
 /**
@@ -69,17 +52,16 @@ function pastGraceWindow(): number {
 	return Date.now() + NOTIFICATION_LEAK_ARTIFACT_GRACE_MS + 60_000;
 }
 
-/** Drive a publication failure so the writer abandons one staging temp on disk. */
-async function leakOneStagingTemp(agentDir: string, sessionId: string): Promise<void> {
+/**
+ * Create a crash-orphaned publication temp directly. A failed writer-owned
+ * rename is no longer a valid fixture because writeJsonAtomic cleans its temp
+ * after a pre-rename failure; a crash can still leave this staged file behind.
+ */
+async function leakOneStagingTemp(agentDir: string): Promise<void> {
 	const paths = daemonPaths(agentDir);
-	await expect(
-		registerNotificationRoot({
-			settings: isolatedSettings(agentDir),
-			cwd: agentDir,
-			sessionId,
-			fs: renameFailingFs(paths.roots),
-		}),
-	).rejects.toThrow(/EPERM/);
+	await fs.promises.mkdir(paths.dir, { recursive: true, mode: 0o700 });
+	const tmp = `${paths.roots}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+	await fs.promises.writeFile(tmp, "{}\n", { mode: 0o600 });
 }
 
 function agentDirWithNotifications(): string {
@@ -92,7 +74,7 @@ test("the notification reaper detaches dead-publisher staging temps without clai
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
-	for (let attempt = 0; attempt < 3; attempt++) await leakOneStagingTemp(agentDir, `session-${attempt}`);
+	for (let attempt = 0; attempt < 3; attempt++) await leakOneStagingTemp(agentDir);
 	// Precondition: publication really did abandon its staged temps.
 	expect(stagingTempFiles(paths.dir)).toHaveLength(3);
 
@@ -121,7 +103,7 @@ test("the notification reaper leaves a staging temp younger than the grace windo
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
-	await leakOneStagingTemp(agentDir, "session-fresh");
+	await leakOneStagingTemp(agentDir);
 	const [fresh] = stagingTempFiles(paths.dir);
 	expect(fresh).toBeString();
 
@@ -163,7 +145,7 @@ test("a staging temp whose publisher is still alive is never reaped, however old
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
-	await leakOneStagingTemp(agentDir, "session-live");
+	await leakOneStagingTemp(agentDir);
 	const [staged] = stagingTempFiles(paths.dir);
 	expect(staged).toBeString();
 	// The abandoned temp names this test process; the default liveness probe sees
@@ -184,7 +166,7 @@ test("a staging temp is retained when publisher liveness is indeterminate", asyn
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
-	await leakOneStagingTemp(agentDir, "session-unknown");
+	await leakOneStagingTemp(agentDir);
 	const [staged] = stagingTempFiles(paths.dir);
 	expect(staged).toBeString();
 
@@ -228,7 +210,7 @@ test("a dead publisher's staging temp stays retained under stable exact authorit
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
-	await leakOneStagingTemp(agentDir, "session-dead");
+	await leakOneStagingTemp(agentDir);
 	const [staged] = stagingTempFiles(paths.dir);
 	expect(staged).toBeString();
 	const file = path.join(paths.dir, staged!);
@@ -291,7 +273,7 @@ test("a staging temp replaced between identity capture and delete is not removed
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-staging-leak-"));
 	const paths = daemonPaths(agentDir);
 
-	await leakOneStagingTemp(agentDir, "session-aba");
+	await leakOneStagingTemp(agentDir);
 	const [staged] = stagingTempFiles(paths.dir);
 	expect(staged).toBeString();
 	const file = path.join(paths.dir, staged!);
