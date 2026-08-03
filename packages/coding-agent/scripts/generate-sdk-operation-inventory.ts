@@ -66,6 +66,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:closeWriterStrict": "internal ACP lifecycle teardown plumbing, not a user-facing control seam",
 	"agent_session:disposeChildSubprocesses": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:waitForIdle": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:extendStartupTurnBarrier":
+		"internal CLI startup-readiness fence composition, not a user-facing SDK control seam",
 	"agent_session:awaitPendingContextTransformations":
 		"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 	"agent_session:drainAsyncJobDeliveriesForAcp": "internal accessor/plumbing, not a user-facing control seam",
