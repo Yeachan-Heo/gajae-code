@@ -3,9 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	captureManagedFileNoFollow,
+	ManagedSessionDescendantStore,
 	prepareManagedDirectoryRoot,
-	replaceManagedFileSync,
 } from "../src/session/internal/managed-session-storage";
 
 const tempDirectories: string[] = [];
@@ -20,17 +19,13 @@ describe("Darwin managed replacement", () => {
 		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-darwin-managed-replace-"));
 		tempDirectories.push(temporaryDirectory);
 		const root = prepareManagedDirectoryRoot(temporaryDirectory);
+		const store = new ManagedSessionDescendantStore(root, root.canonicalPath);
 		const transcript = path.join(root.canonicalPath, "session.jsonl");
-		fs.writeFileSync(transcript, "before\n", { mode: 0o600 });
+		store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+		const expected = store.readExpected("session.jsonl");
+		if (!expected) throw new Error("managed transcript was not published");
 
-		replaceManagedFileSync(
-			transcript,
-			Buffer.from("after\n"),
-			root,
-			"default",
-			undefined,
-			captureManagedFileNoFollow(transcript).identity,
-		);
+		store.replaceExpected("session.jsonl", Buffer.from("after\n"), expected);
 
 		expect(fs.readFileSync(transcript, "utf8")).toBe("after\n");
 		const predecessors = fs

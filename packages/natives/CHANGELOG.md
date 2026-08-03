@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added Darwin native replacement admission and exact-exchange APIs for descriptor-bound managed-session transcript rewrites.
+
+### Changed
 
 ### Fixed
 

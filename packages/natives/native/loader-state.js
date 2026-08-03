@@ -418,7 +418,7 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}
-	if (ctx.platformTag.startsWith("darwin-")) {
+	if (ctx.platformTag?.startsWith("darwin-")) {
 		const darwinCapabilities = [
 			["DarwinReplacementAuth", bindings.DarwinReplacementAuth],
 			["openDarwinReplacementAuth", bindings.openDarwinReplacementAuth],

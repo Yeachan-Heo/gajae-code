@@ -1013,70 +1013,76 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
-		let existing = this.readExpected(relativePath);
-		if (!existing) throw new Error("managed_append_missing");
-		if (this.#authority) {
-			const appended = this.#authority.appendManaged(
-				this.#relative(resolved),
-				bytes,
-				existing.identity.dev.toString(),
-				existing.identity.ino.toString(),
-				existing.identity.size.toString(),
-				existing.identity.mtimeNs.toString(),
-				existing.identity.ctimeNs.toString(),
-				existing.identity.sha256,
-			);
-			if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-			this.#assertBound();
-			return;
-		}
-		// On Darwin, the first write-append open can change only ctime (e.g. com.apple.provenance)
-		// while leaving dev/ino/size/mtime/content intact. Allow one bounded refresh+retry for that
-		// transition only; any other identity change or a second ctime transition stays fail-closed.
-		// See https://github.com/Yeachan-Heo/gajae-code/issues/2944
-		let fd: number | undefined;
-		let darwinCtimeRefreshConsumed = false;
+		const context = createManagedDarwinReplacementContext(this.#root, path.dirname(resolved));
+		const auth = context ? openDarwinReplacementAuth(path.dirname(resolved), context.lockName) : undefined;
 		try {
-			for (;;) {
-				fd = fs.openSync(resolved, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
-				const before = identity(fs.fstatSync(fd, { bigint: true }));
-				if (!sameIdentity(before, existing.identity)) {
-					const allowDarwinCtimeRefresh =
-						process.platform === "darwin" &&
-						!darwinCtimeRefreshConsumed &&
-						isCtimeOnlyIdentityMismatch(before, existing.identity);
-					if (!allowDarwinCtimeRefresh) throw new Error("identity_mismatch");
-					fs.closeSync(fd);
-					fd = undefined;
-					darwinCtimeRefreshConsumed = true;
-					const original = existing;
-					const refreshed = this.readExpected(relativePath);
-					if (
-						!refreshed ||
-						!sameStableIdentityIgnoringCtime(refreshed.identity, original.identity) ||
-						refreshed.identity.sha256 !== original.identity.sha256 ||
-						!refreshed.bytes.equals(original.bytes)
-					) {
-						throw new Error("identity_mismatch");
-					}
-					existing = refreshed;
-					continue;
-				}
-				secureFileDescriptor(resolved, fd, "verify");
-				let offset = 0;
-				while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
-				fs.fsyncSync(fd);
-				secureFileDescriptor(resolved, fd, "verify");
-				const after = identity(fs.fstatSync(fd, { bigint: true }));
-				const named = identity(fs.lstatSync(resolved, { bigint: true }));
-				if (!sameIdentity(after, named) || after.dev !== before.dev || after.ino !== before.ino)
-					throw new Error("identity_mismatch");
-				break;
+			let existing = this.readExpected(relativePath);
+			if (!existing) throw new Error("managed_append_missing");
+			if (this.#authority) {
+				const appended = this.#authority.appendManaged(
+					this.#relative(resolved),
+					bytes,
+					existing.identity.dev.toString(),
+					existing.identity.ino.toString(),
+					existing.identity.size.toString(),
+					existing.identity.mtimeNs.toString(),
+					existing.identity.ctimeNs.toString(),
+					existing.identity.sha256,
+				);
+				if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
+				this.#assertBound();
+				return;
 			}
+			// On Darwin, the first write-append open can change only ctime (e.g. com.apple.provenance)
+			// while leaving dev/ino/size/mtime/content intact. Allow one bounded refresh+retry for that
+			// transition only; any other identity change or a second ctime transition stays fail-closed.
+			// See https://github.com/Yeachan-Heo/gajae-code/issues/2944
+			let fd: number | undefined;
+			let darwinCtimeRefreshConsumed = false;
+			try {
+				for (;;) {
+					fd = fs.openSync(resolved, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
+					const before = identity(fs.fstatSync(fd, { bigint: true }));
+					if (!sameIdentity(before, existing.identity)) {
+						const allowDarwinCtimeRefresh =
+							process.platform === "darwin" &&
+							!darwinCtimeRefreshConsumed &&
+							isCtimeOnlyIdentityMismatch(before, existing.identity);
+						if (!allowDarwinCtimeRefresh) throw new Error("identity_mismatch");
+						fs.closeSync(fd);
+						fd = undefined;
+						darwinCtimeRefreshConsumed = true;
+						const original = existing;
+						const refreshed = this.readExpected(relativePath);
+						if (
+							!refreshed ||
+							!sameStableIdentityIgnoringCtime(refreshed.identity, original.identity) ||
+							refreshed.identity.sha256 !== original.identity.sha256 ||
+							!refreshed.bytes.equals(original.bytes)
+						) {
+							throw new Error("identity_mismatch");
+						}
+						existing = refreshed;
+						continue;
+					}
+					secureFileDescriptor(resolved, fd, "verify");
+					let offset = 0;
+					while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+					fs.fsyncSync(fd);
+					secureFileDescriptor(resolved, fd, "verify");
+					const after = identity(fs.fstatSync(fd, { bigint: true }));
+					const named = identity(fs.lstatSync(resolved, { bigint: true }));
+					if (!sameIdentity(after, named) || after.dev !== before.dev || after.ino !== before.ino)
+						throw new Error("identity_mismatch");
+					break;
+				}
+			} finally {
+				if (fd !== undefined) fs.closeSync(fd);
+			}
+			this.#assertBound();
 		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
+			auth?.close();
 		}
-		this.#assertBound();
 	}
 
 	#relative(resolved: string): string {
@@ -1933,18 +1939,6 @@ function validateDarwinReplacementResult(
 	return result;
 }
 
-function darwinIdentityPayload(identity: NativeDarwinReplacementIdentity | null): unknown {
-	if (!identity) return null;
-	return {
-		dev: identity.dev.toString(),
-		ino: identity.ino.toString(),
-		nlink: identity.nlink.toString(),
-		size: identity.size.toString(),
-		mtimeNs: identity.mtimeNs.toString(),
-		ctimeNs: identity.ctimeNs.toString(),
-		sha256: identity.sha256,
-	};
-}
 
 function darwinReceiptPath(context: ManagedDarwinReplacementContext, operationId: string, sequence: number): string {
 	return path.join(context.replacementDirectory, `.gjc-darwin-replacement-${operationId}-${sequence}.json`);
@@ -2041,17 +2035,6 @@ function appendDarwinReplacementReceipt(
 	fsyncDirectory(context.replacementDirectory);
 }
 
-function darwinExpectedIdentity(snapshot: ManagedFileSnapshot): NativeDarwinReplacementIdentity {
-	return {
-		dev: snapshot.identity.dev,
-		ino: snapshot.identity.ino,
-		nlink: snapshot.identity.nlink,
-		size: BigInt(snapshot.identity.size),
-		mtimeNs: snapshot.identity.mtimeNs,
-		ctimeNs: snapshot.identity.ctimeNs,
-		sha256: snapshot.identity.sha256,
-	};
-}
 /** Replace one managed regular file while retaining the secured staging fd through publication. */
 export function replaceManagedFileSync(
 	destination: string,
@@ -2067,6 +2050,7 @@ export function replaceManagedFileSync(
 	let fd: number | undefined;
 	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
 	let preserveStaging = false;
+	let darwinNoExpectedAuth: { close(): void } | undefined;
 	try {
 		fd = fs.openSync(
 			staging,
@@ -2295,8 +2279,13 @@ export function replaceManagedFileSync(
 					);
 				}
 			}
+		} else if (process.platform === "darwin") {
+			const context = createManagedDarwinReplacementContext(root, parent);
+			if (!context) throw new Error("managed_replace_exact_unavailable");
+			darwinNoExpectedAuth = openDarwinReplacementAuth(parent, context.lockName);
+			fs.renameSync(staging, destination);
 		} else fs.renameSync(staging, destination);
-		assertFence?.();
+		if (process.platform !== "darwin" || !expectedDestination) assertFence?.();
 		assertManagedDirectoryRoot(root);
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
@@ -2310,6 +2299,7 @@ export function replaceManagedFileSync(
 		fsyncDirectory(parent);
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
+		darwinNoExpectedAuth?.close();
 		if (stagedIdentity && !preserveStaging) {
 			try {
 				const named = fs.lstatSync(staging, { bigint: true });

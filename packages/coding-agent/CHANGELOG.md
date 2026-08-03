@@ -41,6 +41,8 @@
 - The model selector's assignment menu now shows the model each role currently resolves to (`Set as EXECUTOR (Executor) — now: anthropic/claude-haiku-4-5`), distinguishing an unset default, a role that inherits the default, and a configured-but-unresolvable selector. Previously the role rows were unlabeled, so the only way to learn a role's model was to scan the whole 800+ entry model list for role badges.
 - Standalone `AGENTS.md` ancestor discovery now bounds directory traversal, per-file reads, and aggregate instruction bytes while surfacing content-free omission warnings (#3722).
 
+- The SDK operation inventory now classifies the local-only `/import-session` seam as a locked exclusion and regenerates the committed matrix, fixing the shard-5 `accepts the committed generated matrix` gate failure introduced by the Codex import command (#3714).
+- Managed transcript rewrites on macOS now use the Darwin native exact-replacement path instead of failing with `managed_replace_exact_unavailable`; successful exchanges retain the predecessor for recovery evidence.
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31
