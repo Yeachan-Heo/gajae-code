@@ -58,6 +58,7 @@
 - Slack Web API requests now use form encoding instead of JSON, preventing thread reconciliation through `conversations.replies` from failing with `invalid_arguments`.
 
 - Managed replacement cleanup now migrates version-one receipts from earlier releases and recovers canonical exchange placeholders left by interrupted cleanup, so a stale receipt cannot permanently block the next managed session mutation with `managed_replace_cleanup_receipt_invalid`.
+- ACP and other headless clients that advertise `elicitation.form` no longer stop receiving `elicitation/create` requests after the notifications extension activates. The interactive answer source previously registered after the protocol source and won by registration order; answer sources now use a fixed protocol-over-interactive priority instead of registration order.
 
 ## [0.12.11] - 2026-08-03
 
