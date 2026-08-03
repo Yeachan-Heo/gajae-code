@@ -22,6 +22,7 @@ import * as agentsModule from "@gajae-code/coding-agent/task/agents";
 import * as discoveryModule from "@gajae-code/coding-agent/task/discovery";
 import * as eventBusModule from "@gajae-code/coding-agent/utils/event-bus";
 import { Snowflake } from "@gajae-code/utils";
+import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
 function createUsage(): Usage {
 	return {
@@ -311,6 +312,68 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		}
 		expectAssistantReplayMetadataSanitized(persistedAssistant);
 		await openedSessionManager.close();
+	});
+
+	it("batches managed persistence while sanitizing multiple stale Responses-family assistant messages on open", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-managed-open-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const assistantTexts = ["First stale managed assistant", "Second stale managed assistant"];
+		const destination = SessionManager.managedDestination(tempDir, path.join(tempDir, "agent"));
+		const persistedSessionManager = SessionManager.create(tempDir, destination);
+		for (const assistantText of assistantTexts) {
+			persistedSessionManager.appendMessage(createStaleAssistantMessage(assistantText));
+		}
+		await persistedSessionManager.flush();
+		const sessionFile = persistedSessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Expected persisted managed session file");
+		}
+		await persistedSessionManager.close();
+
+		const appendSync = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendSync");
+		let openedSessionManager: SessionManager | undefined;
+		try {
+			const opened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = opened;
+			const persistedAssistantEntries = assistantTexts.map(assistantText =>
+				findPersistedMessageEntry(opened, "assistant", assistantText),
+			);
+			for (const persistedAssistantEntry of persistedAssistantEntries) {
+				const { message } = persistedAssistantEntry;
+				if (message.role !== "assistant") {
+					throw new Error("Expected persisted managed assistant message");
+				}
+				expectAssistantReplayMetadataSanitized(message);
+			}
+
+			expect(appendSync).toHaveBeenCalledTimes(1);
+			await opened.close();
+			openedSessionManager = undefined;
+
+			const reopened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = reopened;
+			for (const assistantText of assistantTexts) {
+				const { message } = findPersistedMessageEntry(reopened, "assistant", assistantText);
+				if (message.role !== "assistant") {
+					throw new Error("Expected reopened managed assistant message");
+				}
+				expectAssistantReplayMetadataSanitized(message);
+			}
+			expect(appendSync).toHaveBeenCalledTimes(1);
+
+			const patchRecords = fs
+				.readFileSync(sessionFile, "utf8")
+				.split("\n")
+				.filter(record => record.includes('"type":"entry_patch"'));
+			expect(patchRecords).toHaveLength(assistantTexts.length);
+			expect(patchRecords.join("\n")).not.toContain("enc_stale");
+			expect(patchRecords.map(record => (JSON.parse(record) as { entryId?: string }).entryId)).toEqual(
+				persistedAssistantEntries.map(({ id }) => id),
+			);
+		} finally {
+			await openedSessionManager?.close();
+			appendSync.mockRestore();
+		}
 	});
 
 	it("sanitizes stale assistant replay metadata when forking a persisted session", async () => {
