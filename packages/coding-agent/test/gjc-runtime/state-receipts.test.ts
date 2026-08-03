@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+import { ensureWorkflowSkillActivationState } from "../../src/hooks/skill-state";
 import { initialPhaseForSkill } from "../../src/skill-state/initial-phase";
 import { buildWorkflowStateReceipt } from "../../src/skill-state/workflow-state-contract";
 
@@ -128,10 +129,10 @@ describe("G5 gjc state receipts", () => {
 });
 
 describe("workflow receipt path contract", () => {
-	it("uses session-layout receipt paths for every workflow mode", async () => {
+	it("uses session-layout receipt paths for each direct default workflow mode", async () => {
 		await withTempCwd(async cwd => {
 			const sessionId = "receipt-session.id";
-			for (const skill of ["deep-interview", "ralplan", "ultragoal", "team", "ultratest"] as const) {
+			for (const skill of ["deep-interview", "ralplan", "ultragoal", "team"] as const) {
 				const result = await runNativeStateCommand(
 					[
 						"write",
@@ -162,6 +163,46 @@ describe("workflow receipt path contract", () => {
 				await expect(fs.stat(statePath)).resolves.toBeDefined();
 				await expect(fs.stat(storagePath)).resolves.toBeDefined();
 			}
+		});
+	});
+
+	it("uses session-layout receipt paths after an opt-in workflow activation is resolved", async () => {
+		await withTempCwd(async cwd => {
+			const sessionId = "receipt-session-opt-in.id";
+			const seeded = await ensureWorkflowSkillActivationState({
+				cwd,
+				skill: "ultratest",
+				sessionId,
+			});
+			expect(seeded).toMatchObject({ active: true, skill: "ultratest" });
+
+			const result = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"ultratest",
+					"--session-id",
+					sessionId,
+					"--input",
+					JSON.stringify({ current_phase: initialPhaseForSkill("ultratest") }),
+				],
+				cwd,
+			);
+			expect(result.status).toBe(0);
+			const cli = JSON.parse(result.stdout ?? "{}") as Record<string, unknown>;
+			const storagePath = modeStatePath(cwd, sessionId, "ultratest");
+			const activePath = path.join(path.dirname(storagePath), "skill-active-state.json");
+			const state = await readJson(storagePath);
+			const receipt = state.receipt as Record<string, unknown>;
+			const statePath = receipt.state_path as string;
+			const checksum = receipt.content_sha256 as Record<string, unknown>;
+
+			expect(path.normalize(cli.state_path as string)).toBe(path.normalize(receipt.state_path as string));
+			expect(path.normalize(receipt.state_path as string)).toBe(path.normalize(activePath));
+			expect(path.normalize(receipt.storage_path as string)).toBe(path.normalize(storagePath));
+			expect(path.normalize(checksum.covered_path as string)).toBe(path.normalize(receipt.storage_path as string));
+			await expect(fs.stat(statePath)).resolves.toBeDefined();
+			await expect(fs.stat(storagePath)).resolves.toBeDefined();
 		});
 	});
 

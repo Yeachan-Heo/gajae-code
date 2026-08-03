@@ -597,6 +597,48 @@ describe("SkillTool", () => {
 		expect(rp?.active).toBe(true);
 		expect(rp?.handoff_from).toBe("deep-interview");
 	});
+
+	it("chains from a terminal native workflow into loaded ultratest and preserves the handoff lineage", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nInterview");
+		const ultratest = await makeSkill("ultratest", "---\nname: ultratest\n---\nVerify");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ultratest], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ultratest" });
+
+		expect(result.details?.name).toBe("ultratest");
+		expect(captured).toHaveLength(1);
+		const caller = await readModeState(cwd, "deep-interview", "s1");
+		expect(caller).toMatchObject({ active: false, current_phase: "handoff", handoff_to: "ultratest" });
+		const callee = await readModeState(cwd, "ultratest", "s1");
+		expect(callee).toMatchObject({ active: true, handoff_from: "deep-interview" });
+	});
+
+	it("cleans up pre-seeded ultratest activation when the terminal caller mode-state is missing", async () => {
+		const cwd = await makeTempCwd();
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nInterview");
+		const ultratest = await makeSkill("ultratest", "---\nname: ultratest\n---\nVerify");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ultratest], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await expect(tool.execute("call-1", { name: "ultratest" })).rejects.toThrow(/handoff failed/);
+
+		expect(captured).toHaveLength(0);
+		const target = await readModeState(cwd, "ultratest", "s1");
+		expect(target).toMatchObject({ active: false, current_phase: "complete" });
+		expect(await readActiveEntry(cwd, "ultratest", "s1")).toBeNull();
+	});
+
 	it("chains from a native workflow skill into a runtime skill and demotes the caller", async () => {
 		const cwd = await makeTempCwd();
 		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");

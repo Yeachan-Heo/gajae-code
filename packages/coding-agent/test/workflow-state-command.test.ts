@@ -86,21 +86,24 @@ describe("gjc state workflow command", () => {
 
 	it("rejects direct ultratest state writes before a resolved skill invocation seeds the session", async () => {
 		await withTempCwd(async cwd => {
-			const sessionId = "session-ultratest-direct";
-			const result = runState(cwd, [
-				"ultratest",
-				"write",
-				"--session-id",
-				sessionId,
-				"--input",
-				JSON.stringify({ current_phase: "verifying" }),
-				"--json",
-			]);
+			for (const forceArgs of [[], ["--force"]] as const) {
+				const sessionId = `session-ultratest-direct-${forceArgs.length ? "force" : "ordinary"}`;
+				const result = runState(cwd, [
+					"ultratest",
+					"write",
+					"--session-id",
+					sessionId,
+					"--input",
+					JSON.stringify({ current_phase: "verifying" }),
+					"--json",
+					...forceArgs,
+				]);
 
-			expect(result.exitCode, result.stderr.toString()).toBe(2);
-			expect(await Bun.file(path.join(sessionStateDir(cwd, sessionId), "ultratest-state.json")).exists()).toBe(
-				false,
-			);
+				expect(result.exitCode, result.stderr.toString()).toBe(2);
+				expect(await Bun.file(path.join(sessionStateDir(cwd, sessionId), "ultratest-state.json")).exists()).toBe(
+					false,
+				);
+			}
 		});
 	}, 20_000);
 
@@ -118,12 +121,23 @@ describe("gjc state workflow command", () => {
 			]);
 			expect(seedCaller.exitCode, seedCaller.stderr.toString()).toBe(0);
 
-			const result = runState(cwd, ["ralplan", "handoff", "--session-id", sessionId, "--to", "ultratest", "--json"]);
+			for (const forceArgs of [[], ["--force"]] as const) {
+				const result = runState(cwd, [
+					"ralplan",
+					"handoff",
+					"--session-id",
+					sessionId,
+					"--to",
+					"ultratest",
+					"--json",
+					...forceArgs,
+				]);
 
-			expect(result.exitCode, result.stderr.toString()).toBe(2);
-			expect(await Bun.file(path.join(sessionStateDir(cwd, sessionId), "ultratest-state.json")).exists()).toBe(
-				false,
-			);
+				expect(result.exitCode, result.stderr.toString()).toBe(2);
+				expect(await Bun.file(path.join(sessionStateDir(cwd, sessionId), "ultratest-state.json")).exists()).toBe(
+					false,
+				);
+			}
 		});
 	}, 20_000);
 

@@ -26,9 +26,14 @@ import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gj
 import { findRuntimeSkillByName } from "../extensibility/runtime-skill-discovery";
 import { buildSkillPromptMessage } from "../extensibility/skills";
 import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
+import { ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import skillDescription from "../prompts/tools/skill.md" with { type: "text" };
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
-import { isCanonicalGjcWorkflowSkill } from "../skill-state/active-state";
+import {
+	isCanonicalGjcWorkflowSkill,
+	listActiveSkills,
+	readVisibleSkillActiveState,
+} from "../skill-state/active-state";
 import type { ToolSession } from ".";
 import { ToolError } from "./tool-errors";
 
@@ -151,14 +156,34 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				}
 				const cwd = this.#session.cwd;
 				const sessionId = activeState?.session_id?.trim();
+				let seededUltratest = false;
+				if (skill.name === "ultratest") {
+					const visibleState = await readVisibleSkillActiveState(cwd, sessionId);
+					const alreadyActive = listActiveSkills(visibleState).some(
+						entry => entry.skill === "ultratest" && entry.active === true,
+					);
+					if (!alreadyActive) {
+						await ensureWorkflowSkillActivationState({ cwd, skill: skill.name, sessionId });
+						seededUltratest = true;
+					}
+				}
 				const handoffArgs = ["handoff", "--mode", activeSkill, "--to", requestedName, "--json"];
 				if (sessionId) {
 					handoffArgs.push("--session-id", sessionId);
 				}
 				const handoff = await runNativeStateCommand(handoffArgs, cwd);
 				if (handoff.status !== 0) {
+					let cleanupDetail = "";
+					if (seededUltratest) {
+						const clearArgs = ["clear", "--mode", "ultratest", "--force", "--json"];
+						if (sessionId) clearArgs.push("--session-id", sessionId);
+						const cleanup = await runNativeStateCommand(clearArgs, cwd);
+						if (cleanup.status !== 0) {
+							cleanupDetail = `; cleanup failed (status=${cleanup.status}): ${(cleanup.stderr ?? "").trim() || "no detail"}`;
+						}
+					}
 					throw new ToolError(
-						`skill tool: handoff failed (status=${handoff.status}): ${(handoff.stderr ?? "").trim() || "no detail"}`,
+						`skill tool: handoff failed (status=${handoff.status}): ${(handoff.stderr ?? "").trim() || "no detail"}${cleanupDetail}`,
 					);
 				}
 			}

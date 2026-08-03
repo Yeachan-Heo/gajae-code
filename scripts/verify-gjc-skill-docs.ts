@@ -10,7 +10,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { DEFAULT_GJC_DEFINITION_NAMES } from "../packages/coding-agent/src/defaults/gjc-defaults";
 import { listVerbs } from "../packages/coding-agent/src/gjc-runtime/workflow-manifest";
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../packages/coding-agent/src/skill-state/canonical-skills";
 
@@ -18,6 +17,8 @@ const repoRoot = path.join(import.meta.dir, "..");
 const skillsRoot = path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills");
 const ultratestTemplate = path.join(repoRoot, "docs", "ultratest-skill-template.md");
 const skills = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+
+const BUNDLED_DEFAULT_GJC_SKILL_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
 
 interface CommandRef {
 	file: string;
@@ -93,7 +94,7 @@ function main(): void {
 	const commandRefs: CommandRef[] = [];
 	const mutationRefs: MutationRef[] = [];
 
-	for (const skill of DEFAULT_GJC_DEFINITION_NAMES) {
+	for (const skill of BUNDLED_DEFAULT_GJC_SKILL_NAMES) {
 		const file = path.join(skillsRoot, skill, "SKILL.md");
 		const content = fs.readFileSync(file, "utf8");
 		commandRefs.push(...collectCommandRefs(file, content));
@@ -105,7 +106,7 @@ function main(): void {
 
 	const drift = commandRefs.filter(ref => !ref.valid);
 	console.log(
-		`gjc skill docs verifier - scanned ${DEFAULT_GJC_DEFINITION_NAMES.length} bundled skills and ${path.relative(repoRoot, ultratestTemplate)}`,
+		`gjc skill docs verifier - scanned ${BUNDLED_DEFAULT_GJC_SKILL_NAMES.length} bundled skills and ${path.relative(repoRoot, ultratestTemplate)}`,
 	);
 	console.log(`Found ${commandRefs.length} gjc command reference(s).`);
 	console.log(`Found ${mutationRefs.length} direct .gjc shell mutation example(s).\n`);
