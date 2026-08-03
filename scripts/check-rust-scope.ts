@@ -58,6 +58,36 @@ const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 		packageName: "brush-builtins",
 		rationale: "Vendored Rust shell builtin dependency for the native shell boundary.",
 	},
+	{
+		dir: "crates/gjc",
+		packageName: "gjc",
+		rationale: "Rust host binary for the full conversion to Rust (docs/roadmap/full-conversion-to-rust.md).",
+	},
+	{
+		dir: "crates/gjc-config",
+		packageName: "gjc-config",
+		rationale: "Config-directory resolution and settings loading for the Rust host (roadmap phase 0).",
+	},
+	{
+		dir: "crates/gjc-session",
+		packageName: "gjc-session",
+		rationale: "Read-only session-store access for the Rust host (roadmap phase 0).",
+	},
+	{
+		dir: "crates/gjc-util",
+		packageName: "gjc-util",
+		rationale: "Foundation helpers ported from packages/utils for the Rust host (roadmap phase 1).",
+	},
+	{
+		dir: "crates/gjc-stats",
+		packageName: "gjc-stats",
+		rationale: "Usage-stats pure logic ported from packages/stats for the Rust host (roadmap phase 1).",
+	},
+	{
+		dir: "crates/pi-natives-core",
+		packageName: "pi-natives-core",
+		rationale: "NAPI-free core of pi-natives shared by the NAPI facade and the Rust host (roadmap phase 1).",
+	},
 ] as const;
 
 const ALLOWED_NON_CRATE_RUST_FILES = new Set(["packages/coding-agent/test/fixtures/chunk-edit-indent.rs"]);

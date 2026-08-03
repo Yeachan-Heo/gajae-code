@@ -5,10 +5,16 @@
     { "id": "stats", "name": "@gajae-code/stats", "dir": "packages/stats", "nativeConsumer": false, "nativeProducer": false }
   ],
   "cargo": [
+    { "id": "gjc", "name": "gjc", "manifestPath": "crates/gjc/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "gjc-config", "name": "gjc-config", "manifestPath": "crates/gjc-config/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "gjc-sdk", "name": "gjc-sdk", "manifestPath": "crates/gjc-sdk/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "gjc-session", "name": "gjc-session", "manifestPath": "crates/gjc-session/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "gjc-stats", "name": "gjc-stats", "manifestPath": "crates/gjc-stats/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "gjc-util", "name": "gjc-util", "manifestPath": "crates/gjc-util/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-ast", "name": "pi-ast", "manifestPath": "crates/pi-ast/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-iso", "name": "pi-iso", "manifestPath": "crates/pi-iso/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-natives", "name": "pi-natives", "manifestPath": "crates/pi-natives/Cargo.toml", "supported": true, "nativeAddonSource": true },
+    { "id": "pi-natives-core", "name": "pi-natives-core", "manifestPath": "crates/pi-natives-core/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-shell", "name": "pi-shell", "manifestPath": "crates/pi-shell/Cargo.toml", "supported": true, "nativeAddonSource": false }
   ],
   "emergency": {
