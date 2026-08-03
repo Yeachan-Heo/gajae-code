@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The legacy interactive footer now uses the session manager's cumulative usage index, so completed task and subagent tokens, premium requests, and estimated costs are included exactly once instead of reporting only the parent agent's assistant messages.
+
 ## [0.12.10] - 2026-08-03
 
 ### Added

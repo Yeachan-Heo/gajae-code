@@ -15,7 +15,43 @@ import type { AgentSession } from "@gajae-code/coding-agent/session/agent-sessio
 import { type TUI, visibleWidth } from "@gajae-code/tui";
 import { StatusLineComponent } from "../../../src/modes/components/tool-status-header";
 
-function createFooterSession(): AgentSession {
+interface FooterUsageStatistics {
+	readonly input: number;
+	readonly output: number;
+	readonly cacheRead: number;
+	readonly cacheWrite: number;
+	readonly premiumRequests: number;
+	readonly cost: number;
+}
+
+const DEFAULT_FOOTER_USAGE: FooterUsageStatistics = {
+	input: 1234,
+	output: 567,
+	cacheRead: 89,
+	cacheWrite: 12,
+	premiumRequests: 0,
+	cost: 0.123,
+};
+
+function createFooterSession(
+	usageStatistics: FooterUsageStatistics = DEFAULT_FOOTER_USAGE,
+	getEntries: () => readonly unknown[] = () => [
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				usage: {
+					input: 1234,
+					output: 567,
+					cacheRead: 89,
+					cacheWrite: 12,
+					cost: { total: 0.123 },
+					premiumRequests: 0,
+				},
+			},
+		},
+	],
+): AgentSession {
 	return {
 		state: {
 			messages: [],
@@ -24,30 +60,8 @@ function createFooterSession(): AgentSession {
 		sessionManager: {
 			getSessionName: () => "forge-session",
 			getSessionId: () => "session-123456",
-			getUsageStatistics: () => ({
-				input: 1234,
-				output: 567,
-				cacheRead: 89,
-				cacheWrite: 12,
-				premiumRequests: 0,
-				cost: 0.123,
-			}),
-			getEntries: () => [
-				{
-					type: "message",
-					message: {
-						role: "assistant",
-						usage: {
-							input: 1234,
-							output: 567,
-							cacheRead: 89,
-							cacheWrite: 12,
-							cost: { total: 0.123 },
-							premiumRequests: 0,
-						},
-					},
-				},
-			],
+			getUsageStatistics: () => usageStatistics,
+			getEntries,
 		},
 		getContextUsage: () => ({
 			tokens: 85_000,
@@ -282,6 +296,35 @@ describe("redesigned interactive shell chrome", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(72);
 		}
+	});
+
+	it("renders cumulative parent and task usage in the legacy footer exactly once", () => {
+		const footer = new FooterComponent(
+			createFooterSession({
+				input: 4000,
+				output: 6000,
+				cacheRead: 8000,
+				cacheWrite: 10_000,
+				premiumRequests: 3,
+				cost: 4,
+			}),
+		);
+		const rendered = Bun.stripANSI(footer.render(160).join("\n"));
+
+		expect(rendered).toContain("↑4K ↓6K R8K W10K");
+		expect(rendered).toContain("$4.000 ★ 3");
+		expect(rendered.match(/\$4\.000/g)).toHaveLength(1);
+	});
+
+	it("uses the session usage aggregate without rescanning legacy task entries", () => {
+		const footer = new FooterComponent(
+			createFooterSession(DEFAULT_FOOTER_USAGE, () => {
+				throw new Error("Footer must not rescan persisted entries");
+			}),
+		);
+		const rendered = Bun.stripANSI(footer.render(160).join("\n"));
+
+		expect(rendered).toContain("↑1.2K ↓567 R89 W12 $0.123");
 	});
 
 	it("keeps public status presets on the GJC identity", () => {
