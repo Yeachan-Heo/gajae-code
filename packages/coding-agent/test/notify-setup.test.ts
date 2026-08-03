@@ -1601,6 +1601,46 @@ test("CLI setup reports a save when the durable identity landed before the failu
 	expect(getNotificationConfig(settings)).toMatchObject({ enabled: true, botToken: token, chatId: "999" });
 });
 
+test("CLI setup reports a persistence failure when the identity was already present but disabled", async () => {
+	// The same token and chat id can already sit in a disabled configuration. A commit that fails
+	// before enabling Telegram has persisted nothing new, so identity alone must not read as saved.
+	const settings = setupSettings({
+		"notifications.enabled": false,
+		"notifications.telegram.botToken": token,
+		"notifications.telegram.chatId": "999",
+	});
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (): Promise<CasReceipt> => {
+			throw new Error("could not persist");
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{ action: "setup", rawArgs: [] },
+			{
+				settings,
+				fetchImpl,
+				setupToken: token,
+				setupChatId: "999",
+				setupInteractive: false,
+				setupPreflight: {},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("Unable to persist and activate Telegram notification settings");
+	expect(stderr).not.toContain("settings were saved");
+	expect(`${stdout}\n${stderr}`).not.toContain(token);
+	expect(getNotificationConfig(settings)).toMatchObject({ enabled: false });
+});
+
 describe("notify daemon-internal lightweight startup", () => {
 	function tempAgentDir(): string {
 		return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-daemon-agent-"));

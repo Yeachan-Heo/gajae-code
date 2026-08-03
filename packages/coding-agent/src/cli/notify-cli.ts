@@ -538,7 +538,8 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		// raised after the durable write landed — including one raised from inside the
 		// commit itself — must not claim the settings were not persisted, or the operator
 		// walks away believing Telegram is off while the daemon is armed for that token.
-		const persisted = settingsCommitted || telegramIdentityIsPersisted(settings, token.trim(), result.chatId);
+		// Observed state wins; the code-path flag is only the fallback for an unreadable read.
+		const persisted = telegramIntentIsPersisted(settings, token.trim(), result.chatId) ?? settingsCommitted;
 		throw new Error(
 			persisted
 				? `Telegram notification settings were saved, but activation or recovery failed: ${detail}`
@@ -551,16 +552,20 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 }
 
 /**
- * Whether the durable settings already carry the Telegram identity this setup run
- * attempted to write. Used to describe a setup failure by observed state instead of by
- * how far the code path got, so the reported wording can never contradict `notify status`.
+ * Whether the durable settings already carry the Telegram intent this setup run attempted to
+ * write: the same identity *and* the enabled state it would have produced. Matching the token
+ * and chat id alone is not enough — a previously disabled configuration can already hold both,
+ * and a commit that fails before enabling Telegram has persisted nothing new.
+ *
+ * Returns `undefined` when the durable state cannot be observed, so the caller can fall back
+ * instead of reporting a state nobody read.
  */
-function telegramIdentityIsPersisted(settings: Settings, botToken: string, chatId: string): boolean {
+function telegramIntentIsPersisted(settings: Settings, botToken: string, chatId: string): boolean | undefined {
 	try {
 		const cfg = getNotificationConfig(settings);
-		return cfg.botToken === botToken && cfg.chatId === chatId;
+		return cfg.enabled === true && cfg.botToken === botToken && cfg.chatId === chatId;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
