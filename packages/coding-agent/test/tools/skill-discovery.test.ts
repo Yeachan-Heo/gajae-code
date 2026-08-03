@@ -163,9 +163,9 @@ describe("SkillDiscoveryTool", () => {
 		}
 	});
 
-	it("does not return bundled built-in skills or grow the core prompt catalog", async () => {
+	it("discovers an opt-in ultratest project skill while suppressing ralplan", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-builtins-suppressed-"));
-		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "ultratest", "Project verification workflow");
 		await makeSkill(
 			path.join(cwd, ".gjc", "skills"),
 			"ralplan",
@@ -173,6 +173,37 @@ describe("SkillDiscoveryTool", () => {
 			"Should be suppressed.",
 		);
 		const settings = runtimeSkillSettings();
+		const tool = new SkillDiscoveryTool(createSession(cwd, { settings }));
+		const result = await tool.execute("call", {});
+		const details = result.details;
+		if (!details) throw new Error("expected runtime skill discovery details");
+		const names = details.candidates.map(candidate => candidate.name);
+		expect(names).toContain("ultratest");
+		expect(names).not.toContain("ralplan");
+		expect(result.details?.candidates.find(candidate => candidate.name === "ralplan")).toBeUndefined();
+	});
+
+	it("invokes an opt-in ultratest project skill by exact name", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-opt-in-ultratest-"));
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "ultratest", "Project verification workflow");
+		const settings = runtimeSkillSettings();
+		const sent: Array<{ content: string; details?: unknown }> = [];
+		const invocation = await new SkillTool(
+			createSession(cwd, {
+				skills: [],
+				settings,
+				sendCustomMessage: async message => {
+					sent.push({ content: String(message.content), details: message.details });
+				},
+			}),
+		).execute("call", { name: "ultratest" });
+
+		expect(invocation.details).toMatchObject({ name: "ultratest" });
+		expect(sent).toHaveLength(1);
+	});
+
+	it("does not add a discovered runtime skill to the core prompt catalog", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-runtime-prompt-catalog-"));
 		const builtInSkill: Skill = {
 			name: "ralplan",
 			description: "Built-in planning workflow",
@@ -180,34 +211,23 @@ describe("SkillDiscoveryTool", () => {
 			baseDir: "embedded:gjc/skills/ralplan",
 			source: "embedded",
 		};
-
-		const tool = new SkillDiscoveryTool(createSession(cwd, { skills: [builtInSkill], settings }));
-		const result = await tool.execute("call", {});
-		const details = result.details;
-		expect(details).toBeDefined();
-		const names = details!.candidates.map(candidate => candidate.name);
-		expect(names).toContain("project-helper");
-		expect(names).not.toContain("ralplan");
-		expect(result.details?.candidates.find(candidate => candidate.name === "ralplan")).toBeUndefined();
+		const runtimeSkill: Skill = {
+			name: "project-helper",
+			description: "Project helper skill",
+			filePath: path.join(cwd, ".gjc", "skills", "project-helper", "SKILL.md"),
+			baseDir: path.join(cwd, ".gjc", "skills", "project-helper"),
+			source: "runtime:project",
+		};
 
 		const prompt = await buildSystemPrompt({
 			cwd,
 			customPrompt: "base instructions",
-			skills: [
-				builtInSkill,
-				{
-					name: "project-helper",
-					description: "Project helper skill",
-					filePath: path.join(cwd, ".gjc", "skills", "project-helper", "SKILL.md"),
-					baseDir: path.join(cwd, ".gjc", "skills", "project-helper"),
-					source: "runtime:project",
-				},
-			],
+			skills: [builtInSkill, runtimeSkill],
 			contextFiles: [],
 			workspaceTree: { rootPath: cwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
 		});
 		const joined = prompt.systemPrompt.join("\n");
-		expect(joined).not.toContain("Project helper skill");
+		expect(joined).not.toContain(runtimeSkill.description);
 		expect(joined).not.toContain('<skill name="project-helper">');
 	});
 

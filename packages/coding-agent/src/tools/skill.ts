@@ -8,7 +8,9 @@
  * workflow skills, the tool first runs the native state handoff so workflow
  * mode-state and `skill-active-state.json` transition atomically. Runtime
  * project/user skills have no native workflow mode-state, so they are dispatched
- * directly and tracked by the prompt observer instead.
+ * directly and tracked by the prompt observer instead. An explicitly installed
+ * canonical workflow (including opt-in workflows) still activates native state
+ * when its resolved skill prompt reaches AgentSession.
  *
  * Canonical workflow chaining is refused unless the caller's `current_phase` is
  * in `{complete, completed, handoff, failed, cancelled, canceled, inactive}`.

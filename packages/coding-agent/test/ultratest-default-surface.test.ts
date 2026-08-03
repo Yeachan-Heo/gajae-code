@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseFrontmatter } from "@gajae-code/utils";
 
 const tempRoots: string[] = [];
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -66,8 +67,18 @@ afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
 
-describe("ultratest bundled default surface", () => {
-	it("reads and installs the ultratest bundled skill through the public CLI", async () => {
+describe("ultratest opt-in surface", () => {
+	it("extracts a reusable skill body with only supported routing frontmatter", async () => {
+		const template = await Bun.file(path.join(repoRoot, "docs", "ultratest-skill-template.md")).text();
+		const bodyMarker = template.indexOf("\n---\n");
+		if (bodyMarker < 0) throw new Error("expected reusable skill body marker");
+		const parsed = parseFrontmatter(template.slice(bodyMarker + 1));
+
+		expect(Object.keys(parsed.frontmatter).sort()).toEqual(["description", "name"]);
+		expect(parsed.frontmatter.name).toBe("ultratest");
+	}, 30_000);
+
+	it("omits ultratest from the source CLI skill list", async () => {
 		// Given: an isolated GJC home and agent-config directory.
 		const root = await makeTempRoot();
 		const home = path.join(root, "home");
@@ -75,25 +86,46 @@ describe("ultratest bundled default surface", () => {
 		await fs.mkdir(home);
 		const env = { ...process.env, GJC_CODING_AGENT_DIR: agentDir, HOME: home };
 
-		// When: the public skill-inspection and default-install commands run from source.
+		// When: the public skills list runs from source.
+		const listResult = runGjc(["skills", "list", "--json"], env);
+
+		// Then: no bundled ultratest entry is exposed.
+		expect(listResult.exitCode, listResult.stderr).toBe(0);
+		const listedSkills = requiredRecords(readJsonObject(listResult.stdout), "skills");
+		expect(listedSkills.some(skill => requiredString(skill, "name") === "ultratest")).toBe(false);
+	}, 30_000);
+
+	it("rejects ultratest as an embedded skill read target", async () => {
+		// Given: an isolated GJC home and agent-config directory.
+		const root = await makeTempRoot();
+		const home = path.join(root, "home");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(home);
+		const env = { ...process.env, GJC_CODING_AGENT_DIR: agentDir, HOME: home };
+
+		// When: an embedded skill read is requested by exact name.
 		const readResult = runGjc(["skills", "read", "ultratest", "--json"], env);
+
+		// Then: the source CLI rejects the non-default asset.
+		expect(readResult.exitCode).not.toBe(0);
+	}, 30_000);
+
+	it("does not install ultratest with default definitions", async () => {
+		// Given: an isolated GJC home and agent-config directory.
+		const root = await makeTempRoot();
+		const home = path.join(root, "home");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(home);
+		const env = { ...process.env, GJC_CODING_AGENT_DIR: agentDir, HOME: home };
+
+		// When: default definitions are installed from source.
 		const installResult = runGjc(["setup", "defaults", "--json"], env);
 
-		expect(readResult.exitCode, readResult.stderr).toBe(0);
-		const embedded = readJsonObject(readResult.stdout);
-		expect(requiredString(embedded, "name")).toBe("ultratest");
-		expect(requiredString(embedded, "path")).toBe("embedded:gjc/skills/ultratest/SKILL.md");
-		const embeddedContent = requiredString(embedded, "content");
-
+		// Then: no ultratest asset is reported or materialized.
 		expect(installResult.exitCode, installResult.stderr).toBe(0);
 		const installation = readJsonObject(installResult.stdout);
 		expect(requiredString(installation, "targetRoot")).toBe(agentDir);
-		const ultratestFile = requiredRecords(installation, "files").find(file => file.name === "ultratest");
-		if (!ultratestFile) throw new Error("setup defaults did not report ultratest");
-		expect(requiredString(ultratestFile, "status")).toBe("written");
-		expect(requiredString(ultratestFile, "path")).toBe(path.join(agentDir, "skills", "ultratest", "SKILL.md"));
-
-		const installedContent = await Bun.file(path.join(agentDir, "skills", "ultratest", "SKILL.md")).text();
-		expect(installedContent).toBe(embeddedContent);
+		expect(requiredRecords(installation, "files").some(file => file.name === "ultratest")).toBe(false);
+		await expect(fs.stat(path.join(agentDir, "skills", "ultratest", "SKILL.md"))).rejects.toThrow();
 	}, 30_000);
 });

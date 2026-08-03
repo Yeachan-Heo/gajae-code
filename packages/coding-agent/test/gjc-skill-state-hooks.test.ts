@@ -234,33 +234,47 @@ describe("GJC native skill-state hooks", () => {
 		});
 	}
 
-	it("detects only the public GJC workflow skill surface", () => {
+	it("detects only the four default GJC workflow skills", () => {
 		expect(detectSkillKeywords("$deep-interview then $team then $ultratest").map(match => match.skill)).toEqual([
 			"deep-interview",
 			"team",
-			"ultratest",
 		]);
 		expect(detectSkillKeywords("$autopilot deep interview")).toEqual([]);
 		expect(detectSkillKeywords("please run a consensus plan")[0]?.skill).toBe("ralplan");
 	});
 
-	it("activates ultratest from the public keyword with its verification phase", async () => {
+	it("does not activate ultratest state from unqualified prompt text", async () => {
 		const root = await cwd();
 		const result = await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "$ultratest verify the changed assertions",
+				userPrompt: "ultratest",
 				cwd: root,
-				sessionId: "session-ultratest",
+				sessionId: "session-ultratest-plain",
 			},
 			{ effectiveSkillConfig: testEffectiveSkillConfig },
 		);
 
 		expect(result.hookEventName).toBe("UserPromptSubmit");
-		const state = await readVisibleSkillActiveState(root, "session-ultratest");
-		expect(state).toMatchObject({ active: true, skill: "ultratest", phase: "verifying" });
-		const modeState = await Bun.file(modeStatePath(root, "session-ultratest", "ultratest")).json();
-		expect(modeState).toMatchObject({ active: true, current_phase: "verifying" });
+		expect(await readVisibleSkillActiveState(root, "session-ultratest-plain")).toBeNull();
+		await expect(fs.stat(modeStatePath(root, "session-ultratest-plain", "ultratest"))).rejects.toThrow();
+	});
+
+	it("does not activate ultratest state from an explicit skill token", async () => {
+		const root = await cwd();
+		const result = await dispatchGjcNativeSkillHook(
+			{
+				hookEventName: "UserPromptSubmit",
+				userPrompt: "$ultratest",
+				cwd: root,
+				sessionId: "session-ultratest-explicit",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		expect(result.hookEventName).toBe("UserPromptSubmit");
+		expect(await readVisibleSkillActiveState(root, "session-ultratest-explicit")).toBeNull();
+		await expect(fs.stat(modeStatePath(root, "session-ultratest-explicit", "ultratest"))).rejects.toThrow();
 	});
 
 	it("UserPromptSubmit adds advisory answer-only context for question-only prompts", async () => {

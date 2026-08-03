@@ -8367,12 +8367,12 @@ export class AgentSession {
 		// workflow skills can always call it.
 		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
 		const sessionId = this.sessionManager.getSessionId();
-		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team, ultratest)
-		// own their `.gjc/state/skill-active-state.json` row through the
+		// Canonical GJC workflows own their `.gjc/state/skill-active-state.json`
+		// row through the
 		// `gjc state handoff` and `gjc state clear` runtime verbs. The prompt
 		// observer must not overwrite an existing row (that clobbered handoff
 		// lineage `handoff_from`/`handoff_at` and desynced the HUD). But a fresh
-		// `/skill:<name>` invocation has no row yet, so seed `.gjc/state`
+		// resolved `/skill:<name>` invocation has no row yet, so seed `.gjc/state`
 		// idempotently here: `ensureWorkflowSkillActivationState` writes the
 		// initial mode-state + active row only when the skill is not already
 		// active, so the mutation guard and Stop hook engage immediately instead

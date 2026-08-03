@@ -169,6 +169,11 @@ const KEYWORD_PATTERNS = GJC_SKILL_KEYWORD_DEFINITIONS.map(definition => ({
 	...definition,
 	pattern: keywordToPattern(definition.keyword),
 }));
+const EXPLICIT_GJC_WORKFLOW_SKILLS = new Set(
+	GJC_SKILL_KEYWORD_DEFINITIONS.filter(definition => definition.keyword.startsWith("$")).map(
+		definition => definition.skill,
+	),
+);
 
 function parseExplicitSkillInvocations(text: string): {
 	matches: SkillKeywordMatch[];
@@ -183,7 +188,11 @@ function parseExplicitSkillInvocations(text: string): {
 		sawExplicitLikeInvocation = true;
 		const token = match[1] ?? "";
 		const normalized = token.startsWith("gjc:") ? token.slice(4) : token;
-		if (isGjcWorkflowSkill(normalized) && !seenSkills.has(normalized)) {
+		if (
+			isGjcWorkflowSkill(normalized) &&
+			EXPLICIT_GJC_WORKFLOW_SKILLS.has(normalized) &&
+			!seenSkills.has(normalized)
+		) {
 			seenSkills.add(normalized);
 			matches.push({
 				keyword: match[0],

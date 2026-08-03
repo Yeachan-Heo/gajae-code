@@ -71,7 +71,6 @@ Gajae-Code (`gjc`) is an external coding-agent harness. It runs from the reposit
 
 ```text
 deep-interview -> ralplan -> ultragoal
-                         ├─ ultratest after test assertions change
                          └─ optional team execution when parallel tmux workers help
 ```
 
@@ -191,7 +190,6 @@ Inside a GJC session, use the public workflow surface:
 /skill:ralplan build and critique the implementation plan
 gjc ultragoal create-goals --brief-file <approved-plan>
 gjc ultragoal complete-goals
-/skill:ultratest verify changed test assertions with mutation evidence
 ```
 
 Add `gjc team ...` only when coordinated tmux workers materially help.
@@ -201,13 +199,12 @@ Add `gjc team ...` only when coordinated tmux workers materially help.
 - **Interview before guessing**: `deep-interview` turns vague requests into concrete requirements.
 - **Plan before mutation**: `ralplan` reviews the approach before code changes.
 - **Execute with evidence**: `ultragoal` tracks goals, revisions, checks, and completion evidence.
-- **Prove changed tests**: `ultratest` uses mutation evidence to verify changed test assertions.
 - **Parallelize when useful**: `team` coordinates tmux-backed workers for larger tasks.
 - **Stay external and reviewable**: run from a chosen repo or worktree without patching another agent runtime.
 
 ## Workflow surface
 
-Gajae-Code ships five default workflow skills:
+Gajae-Code ships four default workflow skills:
 
 | Skill            | What it does                                                          |
 | ---------------- | --------------------------------------------------------------------- |
@@ -215,7 +212,6 @@ Gajae-Code ships five default workflow skills:
 | `ralplan`        | Builds and critiques an implementation plan before mutation.          |
 | `ultragoal`      | Tracks goals through execution, revision, verification, and evidence. |
 | `team`           | Coordinates tmux-backed workers when parallel execution is worth it.  |
-| `ultratest`      | Verifies changed test assertions with mutation evidence.               |
 
 And four bundled role agents:
 
@@ -238,7 +234,9 @@ gjc skills read ralplan
 gjc setup defaults --check
 ```
 
-`gjc setup defaults` installs the five bundled GJC workflow skills into your user `.gjc` directory and preserves existing local files by default. If `--check` reports missing or different files, compare the embedded copy with `gjc skills read <name>` first; use `gjc setup defaults --force` only when you intentionally want to replace local default workflow skill files.
+`gjc setup defaults` installs the four bundled GJC workflow skills into your user `.gjc` directory and preserves existing local files by default. If `--check` reports missing or different files, compare the embedded copy with `gjc skills read <name>` first; use `gjc setup defaults --force` only when you intentionally want to replace local default workflow skill files.
+
+`ultratest` is an explicit opt-in workflow for proving changed test assertions with mutation evidence. Copy the reusable body from [`docs/ultratest-skill-template.md`](docs/ultratest-skill-template.md) into a discovered project or user skill directory, enable that discovery scope, then invoke it only as `/skill:ultratest`.
 
 ## Works beside your existing agent or bot
 

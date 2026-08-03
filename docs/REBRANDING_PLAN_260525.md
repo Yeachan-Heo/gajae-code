@@ -18,7 +18,7 @@ The default-visible product should read as **gajae-code / GJC**, not legacy upst
 3. **Semantic color integrity** — Brand red/coral/shell colors must stay distinct from error, warning, and diff-removal semantics.
 4. **Readable fallbacks** — Truecolor, 256-color, Unicode, Nerd Font, ASCII, narrow terminal, and imperfect-font modes must remain usable.
 5. **Audit-friendly exports** — HTML exports and docs use GJC header/accent/metadata branding without making transcript content decorative or hard to review.
-6. **Visible workflow minimization** — Default repo-shipped visible skills/workflows remain limited to `deep-interview`, `ralplan`, `team`, `ultragoal`, and `ultratest`.
+6. **Visible workflow minimization** — Default repo-shipped visible skills/workflows remain limited to `deep-interview`, `ralplan`, `team`, and `ultragoal`.
 
 ## Scope
 

@@ -1,6 +1,6 @@
 # GJC dogfood local skill template
 
-Issue #93 requested a gaebal-gajae/operator dogfood skill. GJC already bundles five default workflow skills (`deep-interview`, `ralplan`, `team`, `ultragoal`, and `ultratest`); this remains a local operator template rather than another default workflow. Operators can copy it into a user or project override when they want GJC-first session guidance.
+Issue #93 requested a gaebal-gajae/operator dogfood skill. The live issue has no comment approving a fifth bundled default workflow skill, so this stays a local template instead of changing the default workflow surface. Operators can copy it into a user or project override when they want GJC-first session guidance.
 
 The installable skill body is everything from the first frontmatter marker down; the frontmatter must be the **first line** of the installed file or the skill scan silently skips it (the scan requires a parsed `description`). Install into the user-level scan location (`~/.gjc/agent/skills/`, not `~/.gjc/skills/`):
 
@@ -51,7 +51,7 @@ Use GJC first for coding, review, planning, and follow-up sessions. Treat OMX as
 ## During work
 
 - Keep session names and branch names issue-scoped.
-- Prefer GJC workflow skills only when they fit: `deep-interview` for unclear requirements, `ralplan` for planning, `ultragoal` for durable ledgers, `team` for coordinated tmux execution, and `ultratest` for mutation verification after assertion changes.
+- Prefer GJC workflow skills only when they fit: `deep-interview` for unclear requirements, `ralplan` for planning, `ultragoal` for durable ledgers, and `team` for coordinated tmux execution.
 - Keep evidence in the session: issue reads, focused tests/checks, screenshots only when visual behavior matters, and PR URLs.
 - When GJC is weaker than OMX, finish the urgent work with the smallest safe fallback and file a gajae-code follow-up issue with the missing capability, exact command/session context, expected behavior, and evidence.
 

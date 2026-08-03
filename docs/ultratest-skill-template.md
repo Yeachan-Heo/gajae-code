@@ -1,3 +1,27 @@
+# Ultratest opt-in skill template
+
+`ultratest` is a canonical GJC workflow with native verification state and a commit gate, but it is not bundled, returned by embedded `gjc skills list/read`, or installed by `gjc setup defaults`. Opt in by copying the reusable body below; there is no separate installer command.
+
+For one repository, copy the body from the first frontmatter marker into `<project>/.gjc/skills/ultratest/SKILL.md`, then enable project discovery:
+
+```sh
+mkdir -p .gjc/skills/ultratest
+sed -n '/^---$/,$p' docs/ultratest-skill-template.md > .gjc/skills/ultratest/SKILL.md
+gjc config set skills.enabled true
+gjc config set skills.enablePiProject true
+```
+
+For the current user, copy it to `~/.gjc/agent/skills/ultratest/SKILL.md`, then enable user discovery:
+
+```sh
+mkdir -p ~/.gjc/agent/skills/ultratest
+sed -n '/^---$/,$p' docs/ultratest-skill-template.md > ~/.gjc/agent/skills/ultratest/SKILL.md
+gjc config set skills.enabled true
+gjc config set skills.enablePiUser true
+```
+
+After copying, use `skill_discovery` to confirm the selected scope finds `ultratest`, then invoke it as `/skill:ultratest`. Plain `ultratest` text and `$ultratest` do not activate native state.
+
 ---
 name: ultratest
 description: Verify an added or changed test assertion with a small, evidence-backed mutation loop. Use after test-case, fixture, or assertion changes when a passing test needs proof against realistic regressions; skip pure naming, formatting, or move-only refactors that do not alter a behavior claim.

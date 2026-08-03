@@ -7,8 +7,10 @@ import { getBundledModel } from "@gajae-code/ai";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { Settings } from "../src/config/settings";
+import { loadSkills } from "../src/extensibility/skills";
 import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
 import { activeEntryPath, modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
+import { ModeStateSchema, readGjcJson } from "../src/gjc-runtime/state-schema";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
@@ -24,6 +26,8 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 import { getSkillActiveStatePaths, syncSkillActiveState } from "../src/skill-state/active-state";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
+
+const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 
 function attachTerminalController(emitter: WorkflowGateEmitter): void {
 	emitter.registerGateTerminalController?.({
@@ -270,6 +274,65 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await session.dispose();
 		}
 	});
+	it("seeds verifying state when SkillTool resolves an installed ultratest skill through AgentSession", async () => {
+		const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-opt-in-ultratest-session-"));
+		tempDirs.push(tempDir);
+		const skillDir = path.join(tempDir, ".gjc", "skills", "ultratest");
+		await fs.promises.mkdir(skillDir, { recursive: true });
+		const template = await Bun.file(path.join(repoRoot, "docs", "ultratest-skill-template.md")).text();
+		const bodyMarker = template.indexOf("\n---\n");
+		if (bodyMarker < 0) throw new Error("expected reusable skill body marker");
+		await Bun.write(path.join(skillDir, "SKILL.md"), template.slice(bodyMarker + 1));
+		const settings = Settings.isolated({
+			"skill.enabled": true,
+			"skills.enabled": true,
+			"skills.enablePiProject": true,
+			"skills.enablePiUser": false,
+		});
+		const installedSkills = await loadSkills({
+			cwd: tempDir,
+			enabled: true,
+			enablePiProject: true,
+			enablePiUser: false,
+		});
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: installedSkills.skills,
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const skillTool = session.getToolByName("skill");
+			if (!skillTool) throw new Error("expected skill tool");
+			await skillTool.execute("call-ultratest", { name: "ultratest" });
+			const resolvedSkillMessage = session.agent.state.messages.at(-1);
+			if (resolvedSkillMessage?.role !== "custom") {
+				throw new Error("expected resolved skill prompt message");
+			}
+			session.agent.emitExternalEvent({ type: "message_start", message: resolvedSkillMessage });
+			const statePath = modeStatePath(tempDir, session.sessionId, "ultratest");
+			let modeState = await readGjcJson(statePath, ModeStateSchema);
+			for (let attempt = 0; attempt < 20 && modeState?.ok !== true; attempt += 1) {
+				await Bun.sleep(1);
+				modeState = await readGjcJson(statePath, ModeStateSchema);
+			}
+			expect(modeState).toMatchObject({
+				ok: true,
+				value: { active: true, current_phase: "verifying", skill: "ultratest" },
+			});
+		} finally {
+			await session.dispose();
+		}
+	}, 15_000);
 	it("restores ask for durable workflow state without carrying it into a fresh session", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-resume-"));
 		tempDirs.push(tempDir);
