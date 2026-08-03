@@ -153,6 +153,34 @@ describe("SettingsList", () => {
 		expect(rendered).toContain("Memory Backend");
 		expect(rendered).not.toContain("Theme");
 	});
+	it("activates the filtered item at its filtered index, not its original index", () => {
+		const changes: Array<[string, string]> = [];
+		const list = new SettingsList(
+			[
+				{ id: "memory", label: "Memory Backend", currentValue: "local", values: ["local", "off"] },
+				{ id: "theme", label: "Theme", currentValue: "dark", values: ["dark", "light"] },
+			],
+			5,
+			testTheme,
+			(id, newValue) => {
+				changes.push([id, newValue]);
+			},
+			() => {
+				throw new Error("cancel should not be called");
+			},
+		);
+
+		// "theme" is index 1 in the unfiltered list but index 0 once filtered.
+		for (const character of "theme") list.handleInput(character);
+		const filtered = Bun.stripANSI(list.render(80).join("\n"));
+		expect(filtered).toContain("Theme");
+		expect(filtered).not.toContain("Memory Backend");
+		expect(filtered).toContain("Enter to change");
+
+		list.handleInput("\n");
+
+		expect(changes).toEqual([["theme", "light"]]);
+	});
 
 	it("clears search before cancelling the settings list", () => {
 		let cancelCount = 0;

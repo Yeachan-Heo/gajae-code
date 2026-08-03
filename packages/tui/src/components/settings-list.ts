@@ -207,7 +207,7 @@ export class SettingsList implements Component {
 		// Add hint
 		lines.push("");
 		const hint = this.#searchQuery
-			? "  Type to search · Backspace to edit · Esc to clear"
+			? "  Type to search · Enter to change · Backspace to edit · Esc to clear"
 			: "  Type to search · Enter/Space to change · Esc to cancel";
 		lines.push(truncateToWidth(this.#theme.hint(hint), width));
 
