@@ -18,7 +18,6 @@ clap = { workspace = true }
 gjc-config = { path = "../gjc-config" }
 # NAPI-free core of pi-natives; first tool consumers land with the phase 4 ports.
 pi-natives-core = { path = "../pi-natives-core" }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 

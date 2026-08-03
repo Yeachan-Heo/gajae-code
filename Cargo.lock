@@ -1272,7 +1272,6 @@ dependencies = [
  "clap",
  "gjc-config",
  "pi-natives-core",
- "serde",
  "serde_json",
  "tokio",
 ]
