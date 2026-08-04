@@ -2,6 +2,8 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { InternalUrlRouter } from "../../src/internal-urls";
+import { ArtifactManager } from "../../src/session/artifacts";
 import { MemoryBlobStore } from "../../src/session/blob-store";
 import { SessionManager } from "../../src/session/session-manager";
 
@@ -54,6 +56,40 @@ describe("non-persistent session artifacts", () => {
 		const root = session.getArtifactManager()!.dir;
 		await session.close();
 		expect(await pathExists(root)).toBe(false);
+	});
+
+	it("claims unique numeric IDs across managers sharing one root and resolves each URI exactly", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-artifact-shared-root-"));
+		try {
+			const first = new ArtifactManager(root);
+			const second = new ArtifactManager(root);
+
+			// Initialize both counters against the same artifact-free root before either
+			// manager claims an ID. The pre-fix implementation then deterministically
+			// published both tool types under numeric ID 0.
+			await first.replaceNamed("first.seed", "first");
+			await second.replaceNamed("second.seed", "second");
+
+			const firstId = await first.save("first manager payload", "bash");
+			const secondId = await second.save("second manager payload", "read");
+			expect(firstId).toBe("0");
+			expect(secondId).toBe("1");
+
+			const context = {
+				cwd: root,
+				getArtifactsDir: () => root,
+				getAuthorizedArtifactsDirs: () => [root],
+			};
+			const firstResolved = await InternalUrlRouter.instance().resolve(`artifact://${firstId}`, context);
+			const secondResolved = await InternalUrlRouter.instance().resolve(`artifact://${secondId}`, context);
+			expect(firstResolved.content).toBe("first manager payload");
+			expect(secondResolved.content).toBe("second manager payload");
+			expect(firstResolved.sourcePath).toBe(path.join(root, "0.bash.log"));
+			expect(secondResolved.sourcePath).toBe(path.join(root, "1.read.log"));
+		} finally {
+			InternalUrlRouter.resetForTests();
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("removes its ephemeral root on terminal closeStrict", async () => {

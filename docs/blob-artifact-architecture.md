@@ -70,21 +70,22 @@ No session-local counter is used.
 
 ## Artifact IDs: session-local monotonic integer
 
-`ArtifactManager` scans existing `*.log` artifact files on first use to find max existing numeric ID and sets `nextId = max + 1`.
+`ArtifactManager` scans existing `*.log` artifacts and hidden `.artifact-id-{id}` claims on first use to find the next numeric candidate. Every allocation atomically publishes its claim before exposing the ID; a competing manager or process that loses the no-replace publication retries the next candidate. Claims remain with the artifact root, so abandoned path reservations consume an ID instead of allowing later reuse or ambiguous resolution.
 
 Allocation behavior:
 
 - file format: `{id}.{toolType}.log`
-- IDs are sequential strings (`"0"`, `"1"`, ...)
-- resume does not overwrite existing artifacts because scan happens before allocation.
+- claim format: `.artifact-id-{id}`
+- IDs are sequential strings (`"0"`, `"1"`, ...) when uncontended; collisions can leave safe gaps,
+- resume and same-root multi-manager allocation do not overwrite or create duplicate numeric IDs because claims are scanned and atomically published.
 
-If artifact directory is missing, scanning yields empty list and allocation starts from `0`.
+If the artifact directory is missing, scanning yields empty state and allocation first attempts `0`.
 
 ## Agent output IDs (`agent://`)
 
 `AgentOutputManager` allocates IDs for subagent outputs as `<index>-<requestedId>` (optionally nested under parent prefix, e.g. `0-Parent.1-Child`). It scans existing `.md` files on initialization to continue from the next index on resume.
 
-A subagent adopts its parent's `ArtifactManager` (`SessionManager.adoptArtifactManager`), so the whole agent tree — including nested subagents whose own session file lives inside the shared root — writes `<outputId>.md` into one directory and one ID space. The task tool treats that adopted manager as authoritative when the session file is contained in the manager's directory; a manager unrelated to the session's roots is rejected as foreign.
+A subagent adopts its parent's `ArtifactManager` (`SessionManager.adoptArtifactManager`), so the whole agent tree — including nested subagents whose own session file lives inside the shared root — writes `<outputId>.md` into one directory and one ID space. The task tool accepts that manager only when the live `ToolSession` proves the exact manager relationship through `isArtifactManagerAuthorized`; `SessionManager` authorizes only its current created, ephemeral, or explicitly adopted manager by object identity. Pathname or session-file containment is never authority, and unrelated or cross-session manager instances are rejected even when their paths are lexically nested.
 
 ## Persistence dataflow
 

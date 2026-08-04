@@ -13,6 +13,7 @@ import {
 	ensureManagedDirectory,
 	type ManagedSessionDescendantStore,
 	publishManagedFileNoReplace,
+	publishManagedFileNoReplaceSync,
 } from "./internal/managed-session-storage";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
@@ -79,6 +80,7 @@ export class ArtifactManager {
 	readonly #store: ManagedSessionDescendantStore | undefined;
 	#dirCreated = false;
 	#initialized: Promise<void> | undefined;
+	#initializedComplete = false;
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
@@ -127,6 +129,38 @@ export class ArtifactManager {
 	#filename(id: string, toolType: string): string {
 		if (!/^[a-zA-Z0-9_-]+$/.test(toolType)) throw new Error("Unsafe artifact tool type");
 		return `${id}.${toolType}.log`;
+	}
+
+	#claimFilename(id: number): string {
+		return `.artifact-id-${id}`;
+	}
+
+	async #claimNextId(): Promise<number> {
+		while (true) {
+			const id = this.#nextId++;
+			try {
+				await this.#publish("", this.#claimFilename(id));
+				return id;
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
+			}
+		}
+	}
+
+	#claimNextIdSync(): number {
+		if (!this.#initializedComplete)
+			throw new Error("ArtifactManager must be initialized before synchronous allocation");
+		while (true) {
+			const id = this.#nextId++;
+			try {
+				const filename = this.#claimFilename(id);
+				if (this.#store) this.#store.publishNoReplaceSync(filename, new Uint8Array());
+				else publishManagedFileNoReplaceSync(path.join(this.#dir, filename), new Uint8Array());
+				return id;
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
+			}
+		}
 	}
 
 	async #publish(content: string, filename: string): Promise<void> {
@@ -250,22 +284,24 @@ export class ArtifactManager {
 		const files = await this.listFiles();
 		let maxId = -1;
 		for (const file of files) {
-			// Files are named: {id}.{toolType}.log
-			const match = file.match(/^(\d+)\..*\.log$/);
+			// Published artifacts are `{id}.{toolType}.log`; hidden claim files reserve
+			// the numeric namespace across independent managers and processes.
+			const match = file.match(/^(\d+)\..*\.log$/) ?? file.match(/^\.artifact-id-(\d+)$/);
 			if (match) {
-				const id = parseInt(match[1], 10);
+				const id = Number.parseInt(match[1], 10);
 				if (id > maxId) maxId = id;
 			}
 		}
 		this.#nextId = maxId + 1;
+		this.#initializedComplete = true;
 	}
 
 	/**
-	 * Atomically allocate next artifact ID.
-	 * IDs are sequential within the session.
+	 * Atomically claim the next artifact ID after this manager has been initialized.
+	 * Prefer `allocatePath` or `save`; this synchronous seam exists for pruning callbacks.
 	 */
 	allocateId(): number {
-		return this.#nextId++;
+		return this.#claimNextIdSync();
 	}
 
 	/**
@@ -276,7 +312,7 @@ export class ArtifactManager {
 	 */
 	async allocatePath(toolType: string): Promise<{ id: string; path?: string }> {
 		await this.#ensureDir();
-		const id = String(this.allocateId());
+		const id = String(await this.#claimNextId());
 		if (this.#store) return { id };
 		return { id, path: path.join(this.#dir, this.#filename(id, toolType)) };
 	}
@@ -288,7 +324,7 @@ export class ArtifactManager {
 	 */
 	async save(content: string, toolType: string, options: ArtifactSaveOptions = {}): Promise<string> {
 		await this.#ensureDir();
-		const id = String(this.allocateId());
+		const id = String(await this.#claimNextId());
 		const maxBytes = Math.max(0, options.maxBytes ?? DEFAULT_ARTIFACT_MAX_BYTES);
 		const contentBytes = Buffer.byteLength(content, "utf-8");
 		const published =
