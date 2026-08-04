@@ -629,6 +629,7 @@ describe("notifications config", () => {
 					await expect(
 						runDaemonInternal(["--agent-dir", agentDir, "--owner-id", "owner"], {
 							SettingsImpl: { init: async () => settings },
+							loadInstallationHostId: async () => "test-host",
 							DaemonImpl: UnexpectedDaemon,
 						}),
 					).rejects.toThrow("gjc_notify_daemon_invalid_configuration");

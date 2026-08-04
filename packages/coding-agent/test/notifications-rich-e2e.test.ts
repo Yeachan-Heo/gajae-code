@@ -27,12 +27,7 @@ import * as path from "node:path";
 import { NotificationServer } from "../../natives/native/index.js";
 import { Settings } from "../src/config/settings";
 import { markdownToTelegramHtml, splitTelegramHtml, TELEGRAM_PARSE_MODE } from "../src/sdk/bus/html-format";
-import {
-	type BotApi,
-	registerNotificationRoot,
-	type TelegramDaemonFs,
-	TelegramNotificationDaemon,
-} from "../src/sdk/bus/telegram-daemon";
+import { type BotApi, registerNotificationRoot, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -433,7 +428,6 @@ async function connectRealPipeline(
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
-			fs: fs.promises as unknown as TelegramDaemonFs,
 			pidAlive: () => true,
 			...(rich ? { rich } : {}),
 		});

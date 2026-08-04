@@ -27,7 +27,7 @@ async function makeTemp(): Promise<string> {
 
 async function writeInfo(
 	lockDir: string,
-	info: { pid: number; timestamp: number; start_time?: string },
+	info: { pid: number; timestamp: number; start_time?: string; owner_host_id?: string },
 ): Promise<void> {
 	await fs.mkdir(lockDir, { recursive: true });
 	await fs.writeFile(
@@ -189,6 +189,28 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		).rejects.toThrow("Failed to release file lock: missing.");
 	});
 });
+describe("host-qualified file lock publication", () => {
+	test("ignores interrupted pending publication directories", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		await fs.mkdir(`${lockedFile}.lock.pending.interrupted`, { recursive: true });
+		await fs.writeFile(path.join(`${lockedFile}.lock.pending.interrupted`, "info"), "{");
+
+		let acquired = false;
+		await withFileLock(
+			lockedFile,
+			async () => {
+				acquired = true;
+				expect(await fs.exists(`${lockedFile}.lock`)).toBe(true);
+			},
+			{ ownerHostId: "test-host", retries: 1, retryDelayMs: 1 },
+		);
+
+		expect(acquired).toBe(true);
+		expect(await fs.exists(`${lockedFile}.lock.pending.interrupted`)).toBe(true);
+		expect(await fs.exists(`${lockedFile}.lock`)).toBe(false);
+	});
+});
 describe("file lock cleanup failure handling (#2478)", () => {
 	test("does not reap a stale lock when its metadata read fails unexpectedly", async () => {
 		const base = await makeTemp();
@@ -314,6 +336,25 @@ describe("fileLocksGcAdapter.prune TOCTOU (#606)", () => {
 		expect(outcome.removed).toBe(true);
 		expect(outcome.skipped).toBeUndefined();
 		expect(await fs.exists(lockDir)).toBe(false);
+	});
+	test("never prunes a foreign host-qualified lock from local PID evidence", async () => {
+		const base = await makeTemp();
+		const spoolDir = path.join(base, "spool");
+		const lockDir = path.join(spoolDir, "state.json.lock");
+		await writeInfo(lockDir, {
+			pid: DEAD_PID,
+			timestamp: Date.now() - 10_000,
+			owner_host_id: "foreign-host",
+		});
+		const probe = vi.fn<GcPidProbe>(() => ({ status: "dead" }));
+		const outcome = await fileLocksGcAdapter.prune(deadLockRecord(lockDir), ctxWith(spoolDir, probe));
+
+		expect(outcome).toEqual({
+			removed: false,
+			skipped: "host_qualified_lock_requires_owner_reclamation",
+		});
+		expect(await fs.exists(lockDir)).toBe(true);
+		expect(probe).not.toHaveBeenCalled();
 	});
 
 	test("fails closed when a live owner reclaims the stale lock between probe and unlink", async () => {

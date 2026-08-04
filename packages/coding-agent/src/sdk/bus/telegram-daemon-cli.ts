@@ -14,6 +14,8 @@ import {
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
 	type DaemonState,
+	FilesystemTopicRegistryCasAuthority,
+	loadInstallationHostId,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
 	type TelegramDaemonOptions,
@@ -45,6 +47,8 @@ export interface RunDaemonInternalDeps {
 	clearInterval?: (timer: Timer) => void;
 	/** Reads persisted daemon ownership state; defaults to the real reader. */
 	readDaemonState?: (settings: Settings) => Promise<DaemonState | undefined>;
+	/** Loads the verified machine-local identity; injectable so daemon tests do not touch the host. */
+	loadInstallationHostId?: () => Promise<string>;
 }
 
 /** Ownership-watchdog cadence while the daemon process is running. */
@@ -231,6 +235,11 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
 	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
+	const installationHostId = await (deps.loadInstallationHostId ?? loadInstallationHostId)();
+	const topicRegistryAuthority = new FilesystemTopicRegistryCasAuthority(
+		path.join(daemonPaths(resolvedAgentDir).dir, "telegram-topics.json"),
+		{ installationHostId },
+	);
 	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? TelegramNotificationDaemon;
 	const readState = deps.readDaemonState ?? readDaemonState;
 	const daemon = new Daemon({
@@ -247,6 +256,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
 		control: createDaemonControlHooks(settings as Settings),
+		topicRegistryAuthority,
+		installationHostId,
 	});
 	// Signals are a process concern: install them at the daemon-internal boundary,
 	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.

@@ -313,7 +313,21 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-cas.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-telegram-daemon-self-heal.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-staging-temp-leak.test.ts"
 			]
 		},
 		{
@@ -356,6 +370,13 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/notifications-topic-registry.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-topic-settle-fence-epoch.test.ts"
 			]
 		},
 		{
