@@ -9,6 +9,16 @@
 import * as fs from "node:fs";
 
 const KNOWN_SINK_PEER_CLOSED_CODES = new Set(["EPIPE", "ERR_STREAM_DESTROYED"]);
+/**
+ * Errno codes that mean the process's own stdout sink has gone away because
+ * the peer (terminal emulator, pager, pipe reader, or pty) was torn down. On
+ * macOS a torn-down pty slave produces `EIO`; a closed fd produces `EBADF`;
+ * a closed pipe produces `EPIPE`. All three are the same benign condition:
+ * the terminal disconnected.
+ *
+ * Mirrors `CLOSED_STDERR_ERROR_CODES` in `safe-stderr.ts`; keep in sync.
+ */
+const PROCESS_STDOUT_PEER_CLOSED_CODES = new Set(["EIO", "EPIPE", "EBADF"]);
 
 type ErrorProperty = "code" | "fd" | "syscall";
 
@@ -70,9 +80,10 @@ export function isBrokenPipeError(error: unknown): boolean {
 }
 
 /**
- * A classifier for process-level stdout `EPIPE` errors. Its direct-write
- * evidence is private to each factory instance, so only the owner that
- * intercepted `process.stdout.write` can mark an error for this classifier.
+ * A classifier for process-level stdout peer-closed errors (`EPIPE`, `EIO`,
+ * `EBADF`). Its direct-write evidence is private to each factory instance, so
+ * only the owner that intercepted `process.stdout.write` can mark an error
+ * for this classifier.
  */
 export interface ProcessStdoutEpipeClassifier {
 	markDirectProcessStdoutWriteError(error: unknown): void;
@@ -109,7 +120,8 @@ export function createProcessStdoutEpipeClassifier(): ProcessStdoutEpipeClassifi
 			if (!isObjectLike(error)) return false;
 
 			const code = readErrorProperty(error, "code");
-			if (!code.available || code.value !== "EPIPE") return false;
+			if (!code.available || typeof code.value !== "string" || !PROCESS_STDOUT_PEER_CLOSED_CODES.has(code.value))
+				return false;
 
 			if (directProcessStdoutWriteErrors.has(error)) return true;
 

@@ -287,3 +287,27 @@ describe("postmortem process stdout EPIPE policy", () => {
 		expectOrdinaryFatal(rejection, "Unhandled Rejection", "fixture: genuine rejected fatal error");
 	}, 15_000);
 });
+
+describe("postmortem process stdout closed-stream family (EIO/EBADF, issue #3810)", () => {
+	it("exits quietly with 141 for an attributed stdout EIO (pty torn down)", async () => {
+		const result = await runScenario("stdout-fd-eio-unhandled-rejection");
+
+		expect(result.exitCode).toBe(141);
+		expect(result.stderr).not.toContain("[Unhandled Rejection]");
+		expect(result.stderr).not.toContain("EIO");
+	}, 15_000);
+
+	it("exits quietly with 141 for an attributed stdout EBADF (fd gone)", async () => {
+		const result = await runScenario("stdout-fd-ebadf-unhandled-rejection");
+
+		expect(result.exitCode).toBe(141);
+		expect(result.stderr).not.toContain("[Unhandled Rejection]");
+		expect(result.stderr).not.toContain("EBADF");
+	}, 15_000);
+
+	it("keeps a non-stdout EIO fatal — only stdout's own sink is benign", async () => {
+		const result = await runScenario("non-stdout-eio-fatal");
+
+		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: non-stdout EIO stays fatal");
+	}, 15_000);
+});
