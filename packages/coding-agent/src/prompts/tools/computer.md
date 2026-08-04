@@ -9,6 +9,7 @@
 - Native execution remains supervisor-gated. If the stop/suspend supervisor is unavailable, stale, suspended, permissioned off, display-stale, or cancelled, the action fails closed with a `COMPUTER_*` code. Coordinate actions carry the latest known screenshot display epoch when one is available so display-topology changes fail with `COMPUTER_DISPLAY_STALE`.
 - Respect the user's stop/suspend request immediately. Do not loop desktop actions after a stop/suspend/error.
 - The user can stop or suspend the session at any time with the configured kill-switch hotkey (default `Control+Option+Command+Escape`). If you see `COMPUTER_CANCELLED` or `COMPUTER_SUPERVISOR_NOT_LIVE`, stop and wait for the user.
+- Native side-effecting actions restore the global cursor after releasing held input. An input batch owns one serialized native capture-to-restore transaction across its ordered steps. This does not restore application focus or isolate input to a PID/window, and concurrent manual cursor movement can be overwritten.
 
 ## Coordinate contract
 
@@ -68,7 +69,11 @@ Run a focused sequence in one batch — screenshot first, then act, so coordinat
 - `COMPUTER_COORD_INVALID`: the coordinate was outside the latest screenshot bounds. Capture a fresh screenshot and re-derive coordinates.
 - `COMPUTER_DISPLAY_STALE`: the display changed since the screenshot. Capture a fresh screenshot before acting.
 - `COMPUTER_SUPERVISOR_NOT_LIVE` / `COMPUTER_SUSPENDED` / `COMPUTER_CANCELLED`: stop acting and wait for the user.
-- `COMPUTER_PERMISSION_REQUIRED`: the host needs screen-recording or accessibility permission. Ask the user to grant it.
+- `COMPUTER_PERMISSION_REQUIRED`: Accessibility permission is required for input. Ask the user to grant it.
+- `COMPUTER_SCREENSHOT_FAILED`: screen capture failed, commonly because Screen Recording permission is missing. Ask the user to grant it before retrying.
 - `COMPUTER_DISABLED`: the tool is disabled or the host is unsupported. Do not retry.
+- `COMPUTER_CURSOR_CAPTURE_FAILED`: no input was sent because the original cursor position could not be captured.
+- `COMPUTER_CURSOR_RESTORE_FAILED`: input may have completed, but cursor restoration failed. Stop and ask the user to inspect the desktop before retrying; a retained primary error describes any action failure.
+- `COMPUTER_TRANSACTION_FAILED`: native input cleanup could not be trusted. Stop and ask the user to inspect the desktop before retrying.
 
 After any error, resume with a fresh screenshot rather than guessing.

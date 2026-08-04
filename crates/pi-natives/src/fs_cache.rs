@@ -104,9 +104,19 @@ fn parse_limit_value(
 	let Some(value) = value else {
 		return Ok(default);
 	};
-	let parsed = value.parse::<u128>().map_err(|_| {
+	if value.starts_with(['+', '-']) {
+		return Err(format!(
+			"FS_SCAN_CONFIG_INVALID name={name} reason=signed value={} min={min} max={max}",
+			bounded_value(value)
+		));
+	}
+	let parsed = value.parse::<u128>().map_err(|error| {
+		let reason = match error.kind() {
+			std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => "overflow",
+			_ => "malformed",
+		};
 		format!(
-			"FS_SCAN_CONFIG_INVALID name={name} reason=malformed value={} min={min} max={max}",
+			"FS_SCAN_CONFIG_INVALID name={name} reason={reason} value={} min={min} max={max}",
 			bounded_value(value)
 		)
 	})?;
@@ -827,15 +837,40 @@ impl CollectorState {
 				.unwrap_or(policy.max_entries)
 				.min(policy.max_entries)
 		};
-		let requested_target = growth_target.max(minimum_target);
-		if requested_target > policy.max_entries {
+		if minimum_target > policy.max_entries {
 			self.fail(scan_limit_error(
 				root,
 				"reserve",
 				"entries",
 				policy.max_entries,
-				&requested_target.to_string(),
+				&minimum_target.to_string(),
 			));
+			return Err(());
+		}
+		let desired_target = growth_target.max(minimum_target);
+		let Some(available_bytes) = policy.max_bytes.checked_sub(self.charged_bytes) else {
+			self.fail(scan_limit_error(
+				root,
+				"reserve",
+				"bytes",
+				policy.max_bytes,
+				&self.charged_bytes.to_string(),
+			));
+			return Err(());
+		};
+		let affordable_additional_slots = available_bytes / size_of::<GlobMatch>();
+		let affordable_target = self
+			.charged_capacity_slots
+			.saturating_add(affordable_additional_slots)
+			.min(policy.max_entries);
+		let requested_target = desired_target.min(affordable_target);
+		if requested_target < minimum_target {
+			let attempted_bytes = minimum_target
+				.checked_sub(self.charged_capacity_slots)
+				.and_then(|slots| slots.checked_mul(size_of::<GlobMatch>()))
+				.and_then(|bytes| self.charged_bytes.checked_add(bytes))
+				.map_or_else(|| "overflow".to_string(), |bytes| bytes.to_string());
+			self.fail(scan_limit_error(root, "reserve", "bytes", policy.max_bytes, &attempted_bytes));
 			return Err(());
 		}
 
@@ -848,16 +883,6 @@ impl CollectorState {
 			self.fail(scan_limit_error(root, "reserve", "bytes", policy.max_bytes, "overflow"));
 			return Err(());
 		};
-		if precharged_bytes > policy.max_bytes {
-			self.fail(scan_limit_error(
-				root,
-				"reserve",
-				"bytes",
-				policy.max_bytes,
-				&precharged_bytes.to_string(),
-			));
-			return Err(());
-		}
 
 		self.charged_bytes = precharged_bytes;
 		let additional = requested_target - self.entries.len();
@@ -1629,7 +1654,8 @@ mod tests {
 
 		for (value, reason) in [
 			("nope", "malformed"),
-			("-1", "malformed"),
+			("-1", "signed"),
+			("+10", "signed"),
 			("0", "zero"),
 			("9", "below_min"),
 			("21", "above_max"),
@@ -1643,6 +1669,11 @@ mod tests {
 		let overflow = (usize::MAX as u128 + 1).to_string();
 		let error = super::parse_limit_value("LIMIT", Some(&overflow), 17, 10, usize::MAX, false)
 			.expect_err("usize overflow must fail");
+		assert!(error.contains("reason=overflow"), "{error}");
+
+		let beyond_u128 = "9".repeat(128);
+		let error = super::parse_limit_value("LIMIT", Some(&beyond_u128), 17, 10, usize::MAX, false)
+			.expect_err("u128 overflow must fail");
 		assert!(error.contains("reason=overflow"), "{error}");
 
 		let unicode = "가".repeat(256);
@@ -1684,28 +1715,38 @@ mod tests {
 				.is_ok()
 		);
 		assert!(capacity_probe.charged_capacity_slots >= 64);
-		let exact_bytes = capacity_probe.charged_bytes;
+		let geometric_bytes = capacity_probe.charged_bytes;
 
+		let mut geometric = collector();
+		assert!(
+			geometric
+				.begin_candidate(root, path, policy(64, geometric_bytes))
+				.is_ok()
+		);
+		assert_eq!(geometric.charged_bytes, geometric_bytes);
+		assert_eq!(geometric.charged_capacity_slots, capacity_probe.charged_capacity_slots);
+
+		let minimum_bytes = path_bytes + std::mem::size_of::<super::GlobMatch>();
 		let mut exact = collector();
 		assert!(
 			exact
-				.begin_candidate(root, path, policy(64, exact_bytes))
+				.begin_candidate(root, path, policy(64, minimum_bytes))
 				.is_ok()
 		);
-		assert_eq!(exact.charged_bytes, exact_bytes);
-		assert_eq!(exact.charged_capacity_slots, capacity_probe.charged_capacity_slots);
+		assert_eq!(exact.charged_bytes, minimum_bytes);
+		assert_eq!(exact.charged_capacity_slots, 1);
 
-		let mut one_over = collector();
+		let mut one_under = collector();
 		assert!(
-			one_over
-				.begin_candidate(root, path, policy(64, exact_bytes - 1))
+			one_under
+				.begin_candidate(root, path, policy(64, minimum_bytes - 1))
 				.is_err()
 		);
-		assert_eq!(one_over.reserved_entries, 0, "failed admission rolls back logical count");
-		assert_eq!(one_over.charged_bytes, 0, "failed admission rolls back path charge");
-		assert_eq!(one_over.claimed_slots, 0);
+		assert_eq!(one_under.reserved_entries, 0, "failed admission rolls back logical count");
+		assert_eq!(one_under.charged_bytes, 0, "failed admission rolls back path charge");
+		assert_eq!(one_under.claimed_slots, 0);
 		assert!(
-			one_over
+			one_under
 				.terminal
 				.as_deref()
 				.is_some_and(|error| error.contains("dimension=bytes"))
@@ -1738,6 +1779,58 @@ mod tests {
 		assert!(
 			state.charged_capacity_slots >= max_entries,
 			"reserve_exact must receive requested_target - entries.len()"
+		);
+	}
+
+	#[test]
+	fn provisional_claim_barrier_uses_affordable_tail_capacity() {
+		let mut capacity_probe = Vec::with_capacity(8);
+		capacity_probe.push(glob_match("a"));
+		let old_capacity = capacity_probe.capacity();
+		let new_state = || {
+			let mut entries = Vec::with_capacity(old_capacity);
+			entries.push(glob_match("a"));
+			let charged_bytes =
+				old_capacity * std::mem::size_of::<super::GlobMatch>() + entries[0].path.capacity();
+			(
+				super::CollectorState {
+					charged_bytes,
+					reserved_entries: 1,
+					claimed_slots: old_capacity - 1,
+					charged_capacity_slots: old_capacity,
+					entries,
+					terminal: None,
+				},
+				charged_bytes,
+			)
+		};
+		let one_slot_bytes = std::mem::size_of::<super::GlobMatch>();
+
+		let (mut exact, charged_bytes) = new_state();
+		exact
+			.claim_slot(Path::new("/root"), policy(old_capacity * 2, charged_bytes + one_slot_bytes))
+			.expect("the minimum required tail slot must be admitted");
+		assert_eq!(exact.claimed_slots, old_capacity);
+		assert_eq!(exact.charged_capacity_slots, old_capacity + 1);
+		assert_eq!(exact.charged_bytes, charged_bytes + one_slot_bytes);
+
+		let (mut one_under, charged_bytes) = new_state();
+		assert!(
+			one_under
+				.claim_slot(
+					Path::new("/root"),
+					policy(old_capacity * 2, charged_bytes + one_slot_bytes - 1),
+				)
+				.is_err()
+		);
+		assert_eq!(one_under.claimed_slots, old_capacity - 1);
+		assert_eq!(one_under.charged_capacity_slots, old_capacity);
+		assert_eq!(one_under.charged_bytes, charged_bytes);
+		assert!(
+			one_under
+				.terminal
+				.as_deref()
+				.is_some_and(|error| error.contains("dimension=bytes"))
 		);
 	}
 

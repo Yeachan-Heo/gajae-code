@@ -1,10 +1,13 @@
 /**
- * Regression for https://github.com/Yeachan-Heo/gajae-code/issues/2944
+ * Regression for https://github.com/Yeachan-Heo/gajae-code/issues/2944 and the
+ * Darwin durability path from #3760.
  *
- * On Darwin, the first O_WRONLY|O_APPEND open of a managed transcript can change
- * only ctime (write-provenance / com.apple.provenance) while leaving dev, ino,
- * size, mtime, and content unchanged. appendSync must accept a single bounded
- * refresh+retry for that case and stay fail-closed for real races.
+ * Platforms without a retained native root authority (Darwin today) no longer
+ * append managed transcripts in place. `appendSync` replaces the exact captured
+ * file so a short write cannot leave a malformed JSONL tail. That path must:
+ * - fail closed when the destination mutates between capture and exchange
+ * - tolerate ctime-only destination transitions (write provenance / chmod)
+ * - never apply the request when identity verification rejects the predecessor
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -51,30 +54,38 @@ async function createStore(options?: { withoutNativeAuthority?: boolean }): Prom
 	return { root, store, filePath: path.join(root, relativePath), relativePath };
 }
 
-function isWriteAppendOpen(_file: fs.PathLike, flags: fs.OpenMode | undefined): boolean {
+function isStagingCreateOpen(file: fs.PathLike, flags: fs.OpenMode | undefined): boolean {
 	if (typeof flags !== "number") return false;
+	const create = (flags & fs.constants.O_CREAT) !== 0;
+	const exclusive = (flags & fs.constants.O_EXCL) !== 0;
 	const write = (flags & fs.constants.O_WRONLY) !== 0 || (flags & fs.constants.O_RDWR) !== 0;
-	const append = (flags & fs.constants.O_APPEND) !== 0;
-	return write && append;
+	const pathname = typeof file === "string" ? file : file.toString();
+	return create && exclusive && write && path.basename(pathname).includes(".replacement");
 }
 
-function installWriteOpenHook(
-	targetPath: string,
+/**
+ * Mutate the destination while replace-based append is staging the successor.
+ * Staging is created with O_CREAT|O_EXCL before exactReplace validates the
+ * predecessor, which is the race window the durability path must fail closed on.
+ */
+function installStagingCreateHook(
+	destinationPath: string,
 	hook: (pathname: string) => void,
 	options?: { maxCalls?: number },
 ): { calls: number } {
 	const state = { calls: 0 };
 	const maxCalls = options?.maxCalls ?? Number.POSITIVE_INFINITY;
 	const realOpenSync = fs.openSync.bind(fs);
+	const destinationDir = path.dirname(destinationPath);
 	vi.spyOn(fs, "openSync").mockImplementation(((
 		file: fs.PathLike,
 		flags?: fs.OpenMode | undefined,
 		mode?: fs.Mode | undefined,
 	) => {
 		const pathname = typeof file === "string" ? file : file.toString();
-		if (pathname === targetPath && isWriteAppendOpen(file, flags) && state.calls < maxCalls) {
+		if (path.dirname(pathname) === destinationDir && isStagingCreateOpen(file, flags) && state.calls < maxCalls) {
 			state.calls += 1;
-			hook(pathname);
+			hook(destinationPath);
 		}
 		return realOpenSync(file, flags as never, mode as never);
 	}) as typeof fs.openSync);
@@ -88,12 +99,12 @@ function bumpCtimeOnly(pathname: string): void {
 }
 
 describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
-	it("rejects size mutation between capture and write-open without appending the request", async () => {
+	it("rejects size mutation between capture and replace without applying the request", async () => {
 		const { store, filePath, relativePath } = await createStore({ withoutNativeAuthority: true });
 		const beforeBytes = fs.readFileSync(filePath);
 		const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m-race" })}\n`, "utf8");
 
-		const openState = installWriteOpenHook(
+		const openState = installStagingCreateHook(
 			filePath,
 			pathname => {
 				fs.appendFileSync(pathname, "stale-race\n");
@@ -110,42 +121,34 @@ describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
 });
 
 describe.skipIf(process.platform !== "darwin")(
-	"ManagedSessionDescendantStore.appendSync Darwin ctime-only refresh (#2944)",
+	"ManagedSessionDescendantStore.appendSync Darwin ctime-only tolerance (#2944/#3760)",
 	() => {
-		it("accepts a one-time ctime-only transition before write-open and appends exactly once", async () => {
+		it("appends successfully when only ctime advanced before replace", async () => {
 			const { store, filePath, relativePath } = await createStore();
 			const beforeBytes = fs.readFileSync(filePath);
 			const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m1" })}\n`, "utf8");
 
-			// One-shot ctime bump on the first write-append open only.
-			const openState = installWriteOpenHook(
-				filePath,
-				pathname => {
-					bumpCtimeOnly(pathname);
-				},
-				{ maxCalls: 1 },
-			);
-
+			bumpCtimeOnly(filePath);
 			store.appendSync(relativePath, record);
 
-			expect(openState.calls).toBe(1);
 			const afterBytes = fs.readFileSync(filePath);
 			expect(afterBytes.equals(Buffer.concat([beforeBytes, record]))).toBe(true);
 			expect(afterBytes.toString("utf8").trimEnd().split("\n")).toHaveLength(2);
 		});
 
-		it("rejects a second ctime-only transition after the single bounded refresh", async () => {
+		it("still fails closed when the destination mutates during staging", async () => {
 			const { store, filePath, relativePath } = await createStore();
 			const beforeBytes = fs.readFileSync(filePath);
 			const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m3" })}\n`, "utf8");
 
-			// Every write-append open bumps ctime → refresh once, then fail closed.
-			installWriteOpenHook(filePath, pathname => {
-				bumpCtimeOnly(pathname);
+			installStagingCreateHook(filePath, pathname => {
+				fs.appendFileSync(pathname, "ctime-cover-race\n");
 			});
 
 			expect(() => store.appendSync(relativePath, record)).toThrow("identity_mismatch");
-			expect(fs.readFileSync(filePath).equals(beforeBytes)).toBe(true);
+			const after = fs.readFileSync(filePath, "utf8");
+			expect(after.startsWith(beforeBytes.toString("utf8"))).toBe(true);
+			expect(after.includes('"id":"m3"')).toBe(false);
 		});
 
 		it("documents that same-mode chmod can change only ctime on this host", async () => {
@@ -159,8 +162,7 @@ describe.skipIf(process.platform !== "darwin")(
 			expect(Number(after.size)).toBe(captured.identity.size);
 			expect(after.mtimeNs).toBe(captured.identity.mtimeNs);
 			// Some hosts/FS configurations may not advance ctime for a no-op mode rewrite;
-			// the openSync-hook tests above still cover the repair path deterministically when
-			// ctime does move. Soft-assert here so CI hosts without the delta do not fail.
+			// the replace-path race tests still cover fail-closed mutation detection.
 			if (after.ctimeNs === captured.identity.ctimeNs) return;
 			expect(after.ctimeNs).not.toBe(captured.identity.ctimeNs);
 		});

@@ -63,9 +63,11 @@ visible-width-aligned column capped at 30 cells, two spaces, then a truncated
 value. The selected row uses the themed cursor; unselected rows reserve two
 spaces. It centers the selected item inside its `maxVisible` window, reports
 scroll position as `(current/total)`, places a blank row before the selected
-item description, and ends with the dim
-`Enter/Space to change · Esc to cancel` hint. Hosts that need stable height
-reserve fixed description rows; the status-line custom editor reserves two.
+item description, and ends with a dim keyboard hint. Printable text starts a
+case-insensitive label search shown above the list; Backspace removes one
+grapheme, and Escape clears a non-empty search before a later Escape cancels
+the list. Hosts that need stable height reserve fixed description rows; the
+status-line custom editor reserves two.
 
 Submenus are a content replacement, not a modal overlay: a bold accent title,
 optional muted description, optional preview, a spacer, a select/list control,
@@ -82,8 +84,9 @@ empty space and list density for an operational setup flow.
 ### Focus, cursor, keyboard, and input behavior
 
 - Up/Down wrap within selector lists. Enter and Space activate the current
-  action. Escape follows the current component's cancel path before the parent
-  is allowed to close.
+  action. Printable text filters settings by label. Escape first clears an
+  active filter, then follows the current component's cancel path before the
+  parent is allowed to close.
 - The parent routes Tab/Left/Right to the tab bar except while a text input is
   active. Text entry owns arrow keys and Tab in that state.
 - `Input` has a visible `> ` prompt, a zero-width hardware cursor marker only

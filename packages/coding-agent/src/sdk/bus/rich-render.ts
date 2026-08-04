@@ -124,8 +124,9 @@ export async function deliverRichActionWithFallback(
 			const fallbackId = await htmlFallback();
 			return { messageId: fallbackId, usedRich: false, usedFallback: true };
 		}
-		const candidate = (res as { result?: { message_id?: unknown } } | null)?.result?.message_id;
-		if (validMessageId(candidate)) return { messageId: candidate, usedRich: true, usedFallback: false };
+		const candidate = (res as { ok?: unknown; result?: { message_id?: unknown } } | null)?.result?.message_id;
+		if ((res as { ok?: unknown } | null)?.ok === true && validMessageId(candidate))
+			return { messageId: candidate, usedRich: true, usedFallback: false };
 		log?.warn("notifications: sendRichMessage(action) outcome ambiguous; not falling back to HTML");
 	} catch (err) {
 		const failure = err instanceof Error ? err.message : String(err);

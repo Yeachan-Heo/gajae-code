@@ -17,6 +17,7 @@ import {
 	setKittyTransmitWriter,
 	setTerminalImageProtocol,
 	shouldUseViewportRepaintForHost,
+	shouldUseViewportRepaintForTerminal,
 	TERMINAL,
 	Text,
 	TUI,
@@ -1909,5 +1910,29 @@ describe("registered viewport anchor", () => {
 		} finally {
 			tui.stop();
 		}
+	});
+
+	// A terminal that reports `isProcessTerminal: false` has answered the
+	// capability question. Platform identity is only a fallback for hosts that
+	// cannot answer, so win32 must not promote such a terminal onto the
+	// viewport-repaint path — doing so suppresses durable history replay and
+	// leaves contracted rows behind as duplicates.
+	it.each([
+		{ label: "explicit process terminal", isProcessTerminal: true, expected: true },
+		{ label: "explicit non-process terminal", isProcessTerminal: false, expected: false },
+		{ label: "unreported capability", isProcessTerminal: undefined, expected: true },
+	])("resolves the win32 viewport-repaint gate for an $label", ({ isProcessTerminal, expected }) => {
+		expect(shouldUseViewportRepaintForTerminal(isProcessTerminal, {}, "win32")).toBe(expected);
+	});
+
+	it("keeps non-win32 hosts off the viewport-repaint path regardless of capability", () => {
+		for (const isProcessTerminal of [false, undefined] as const) {
+			expect(shouldUseViewportRepaintForTerminal(isProcessTerminal, {}, "linux")).toBe(false);
+		}
+		expect(shouldUseViewportRepaintForTerminal(true, {}, "linux")).toBe(true);
+	});
+
+	it("still honors explicit Windows Terminal markers for a non-process terminal", () => {
+		expect(shouldUseViewportRepaintForTerminal(false, { WT_SESSION: "1" }, "win32")).toBe(true);
 	});
 });

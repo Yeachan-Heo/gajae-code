@@ -14,6 +14,7 @@
  * Dependency-free: uses global `fetch` and `WebSocket` (Bun/Node 22+).
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import {
 	bold,
@@ -85,18 +86,27 @@ export interface CallbackRoute {
 	sessionId: string;
 	actionId: string;
 	answer: TelegramCallbackAnswer;
+	/** Durable audit metadata only; never sufficient to route a callback after restart. */
+	chatId?: string;
+	messageId?: number;
+	ownerId?: string;
+	generation?: number;
 }
 
 export interface SerializedAliasTable {
-	version: 1;
+	version: 1 | 2;
 	next: number;
 	routes: Record<string, CallbackRoute>;
 }
 
 export interface AliasTable {
+	allocate(isReserved?: (alias: string) => boolean): string;
+	activate(alias: string, route: CallbackRoute): boolean;
 	put(route: CallbackRoute): string;
 	get(alias: string): CallbackRoute | undefined;
+	update(alias: string, patch: Partial<CallbackRoute>): boolean;
 	delete(alias: string): boolean;
+	clear(): void;
 	serialize(): SerializedAliasTable;
 	load(json: unknown): void;
 	entries(): Array<[string, CallbackRoute]>;
@@ -112,7 +122,11 @@ function isCallbackRoute(value: unknown): value is CallbackRoute {
 			typeof route.answer === "number" ||
 			(typeof route.answer === "object" &&
 				route.answer !== null &&
-				(route.answer as { controlId?: unknown }).controlId === "navigation_forward"))
+				(route.answer as { controlId?: unknown }).controlId === "navigation_forward")) &&
+		(route.chatId === undefined || typeof route.chatId === "string") &&
+		(route.messageId === undefined || (Number.isSafeInteger(route.messageId) && route.messageId > 0)) &&
+		(route.ownerId === undefined || typeof route.ownerId === "string") &&
+		(route.generation === undefined || (Number.isSafeInteger(route.generation) && route.generation >= 0))
 	);
 }
 
@@ -121,24 +135,46 @@ export function createAliasTable(): AliasTable {
 	let next = 1;
 	const routes = new Map<string, CallbackRoute>();
 	return {
-		put(route) {
+		allocate(isReserved) {
 			let alias: string;
 			do {
-				alias = `a${(next++).toString(36)}`;
-			} while (routes.has(alias));
+				// `b1_` is intentionally disjoint from every legacy sequential `aN`
+				// token, including accepted keyboards lost before their old daemon
+				// could persist them.
+				alias = `b1_${crypto.randomBytes(18).toString("base64url")}`;
+			} while (routes.has(alias) || isReserved?.(alias) === true);
+			next++;
 			if (Buffer.byteLength(alias, "utf8") > 64) throw new Error("callback alias exceeded Telegram limit");
+			return alias;
+		},
+		activate(alias, route) {
+			if (routes.has(alias) || Buffer.byteLength(alias, "utf8") > 64 || !isCallbackRoute(route)) return false;
 			routes.set(alias, { ...route });
+			return true;
+		},
+		put(route) {
+			const alias = this.allocate();
+			if (!this.activate(alias, route)) throw new Error("callback alias activation failed");
 			return alias;
 		},
 		get(alias) {
 			const route = routes.get(alias);
 			return route ? { ...route } : undefined;
 		},
+		update(alias, patch) {
+			const route = routes.get(alias);
+			if (!route) return false;
+			routes.set(alias, { ...route, ...patch });
+			return true;
+		},
 		delete(alias) {
 			return routes.delete(alias);
 		},
+		clear() {
+			routes.clear();
+		},
 		serialize() {
-			return { version: 1, next, routes: Object.fromEntries(routes.entries()) };
+			return { version: 2, next, routes: Object.fromEntries(routes.entries()) };
 		},
 		load(json) {
 			routes.clear();

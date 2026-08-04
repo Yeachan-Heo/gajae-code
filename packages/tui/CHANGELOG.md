@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.11] - 2026-08-03
+
 ## [0.12.10] - 2026-08-03
 ### Fixed
 
@@ -20,6 +22,7 @@
 - Restored the `isProcessTerminal`/`shouldUseViewportRepaintForHost` gate on the width-change viewport-repaint intercept so plain terminals (non-multiplexer, non-process-terminal) use `fullRender` for width changes instead of an unconditional viewport repaint. The #3684 chain removed this gate, causing lossless Korean/CJK prose wrapping to break at narrow widths because the viewport repaint only painted the visible rows without committing the full transcript to scrollback (#1979).
 - Restored the `fullRender` fallback for the `firstChanged < viewportTop` branch on non-viewport-repaint hosts, so above-viewport mutations replay the full frame instead of silently viewport-repainting.
 - Propagated IME cursor write failure from `#writeRenderBufferAndReanchorImeCursor` so callers detect terminal detach when the deferred cursor write fails after the shared frame commits.
+- The win32 viewport-repaint fallback no longer outranks a terminal that reports `isProcessTerminal: false`. Platform identity exists to recognize Windows console hosts that cannot report the capability, so a terminal that has answered now decides; previously every non-process terminal on Windows (embedders, pipes, the render regression suite) inherited viewport-repaint semantics, suppressed durable history replay, and left contracted rows behind as duplicates.
 
 ## [0.12.7] - 2026-07-31
 

@@ -431,6 +431,28 @@ export function shouldUseViewportRepaintForHost(
 }
 
 /**
+ * Viewport-repaint host gate resolved against a terminal's reported capability.
+ *
+ * `includeNativeWindows` exists so a Windows console host that cannot report
+ * `isProcessTerminal` is still recognized from platform identity. It is a
+ * fallback, so it must not outrank a terminal that has answered: a terminal
+ * reporting `false` is not a native console host, and letting win32 override it
+ * gives every non-process terminal on Windows — embedders, pipes, and the
+ * render regression suite — viewport-repaint semantics. Those hosts then never
+ * replay durable history, so contracted rows survive as duplicates.
+ */
+export function shouldUseViewportRepaintForTerminal(
+	isProcessTerminal: boolean | undefined,
+	env: Record<string, string | undefined> = Bun.env,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	return shouldUseViewportRepaintForHost(env, platform, {
+		includeNativeWindows: isProcessTerminal !== false,
+		includeProcessTerminal: isProcessTerminal === true,
+	});
+}
+
+/**
  * Options for overlay positioning and sizing.
  * Values can be absolute numbers or percentage strings (e.g., "50%").
  */
@@ -1939,6 +1961,11 @@ export class TUI extends Container {
 		this.#forcedRenderQueued = false;
 	}
 
+	/** Host gate for viewport-repaint decisions, resolved against this terminal. */
+	#viewportRepaintHost(): boolean {
+		return shouldUseViewportRepaintForTerminal(this.terminal.isProcessTerminal);
+	}
+
 	/**
 	 * Viewport-repaint-aware resize render request.
 	 *
@@ -1962,13 +1989,7 @@ export class TUI extends Container {
 		this.#lastObservedWidth = observedWidth;
 		const heightChanged = this.#previousHeight !== this.terminal.rows;
 		if (widthChanged) this.#scheduleWidthSettleRedraw();
-		this.requestRender(
-			heightChanged &&
-				!shouldUseViewportRepaintForHost(Bun.env, process.platform, {
-					includeProcessTerminal: this.terminal.isProcessTerminal === true,
-				}),
-			"resize",
-		);
+		this.requestRender(heightChanged && !this.#viewportRepaintHost(), "resize");
 	}
 
 	/**
@@ -3564,10 +3585,7 @@ export class TUI extends Container {
 			return;
 		}
 		// Helper to clear scrollback and viewport and render all new lines
-		const shouldPreserveScrollbackOnFullClear =
-			shouldUseViewportRepaintForHost(Bun.env, process.platform, {
-				includeProcessTerminal: this.terminal.isProcessTerminal === true,
-			}) || this.#legacyMultiplexerFullRender;
+		const shouldPreserveScrollbackOnFullClear = this.#viewportRepaintHost() || this.#legacyMultiplexerFullRender;
 		let viewportRepaint: (
 			reason: string,
 			targetViewportTopOrAllowPastLiveBottom?: number | boolean,
@@ -3763,9 +3781,7 @@ export class TUI extends Container {
 			fullRender(true, "width settled", true);
 			return;
 		}
-		const useViewportRepaintPath = shouldUseViewportRepaintForHost(Bun.env, process.platform, {
-			includeProcessTerminal: this.terminal.isProcessTerminal === true,
-		});
+		const useViewportRepaintPath = this.#viewportRepaintHost();
 		const widthReflowRequired =
 			this.#previousWidth > 0 &&
 			rawLines.some(

@@ -14,7 +14,7 @@
     },
     "packages/agent": {
       "name": "@gajae-code/agent-core",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "dependencies": {
         "@gajae-code/ai": "catalog:",
         "@gajae-code/natives": "catalog:",
@@ -29,7 +29,7 @@
     },
     "packages/ai": {
       "name": "@gajae-code/ai",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "bin": {
         "pi-ai": "./src/cli.ts",
       },
@@ -47,14 +47,14 @@
     },
     "packages/bridge-client": {
       "name": "@gajae-code/bridge-client",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "devDependencies": {
         "@types/bun": "catalog:",
       },
     },
     "packages/coding-agent": {
       "name": "@gajae-code/coding-agent",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "bin": {
         "gjc": "bin/gjc.js",
       },
@@ -95,7 +95,7 @@
     },
     "packages/gajae-code": {
       "name": "gajae-code",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "bin": {
         "gjc": "bin/gjc.js",
       },
@@ -105,7 +105,7 @@
     },
     "packages/natives": {
       "name": "@gajae-code/natives",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "devDependencies": {
         "@napi-rs/cli": "catalog:",
         "@types/bun": "catalog:",
@@ -121,23 +121,23 @@
     },
     "packages/natives-darwin-arm64": {
       "name": "@gajae-code/natives-darwin-arm64",
-      "version": "0.12.10",
+      "version": "0.12.11",
     },
     "packages/natives-darwin-x64": {
       "name": "@gajae-code/natives-darwin-x64",
-      "version": "0.12.10",
+      "version": "0.12.11",
     },
     "packages/natives-linux-arm64": {
       "name": "@gajae-code/natives-linux-arm64",
-      "version": "0.12.10",
+      "version": "0.12.11",
     },
     "packages/natives-linux-x64": {
       "name": "@gajae-code/natives-linux-x64",
-      "version": "0.12.10",
+      "version": "0.12.11",
     },
     "packages/natives-win32-x64": {
       "name": "@gajae-code/natives-win32-x64",
-      "version": "0.12.10",
+      "version": "0.12.11",
     },
     "packages/orchestration-token-benchmark": {
       "name": "@gajae-code/orchestration-token-benchmark",
@@ -148,7 +148,7 @@
     },
     "packages/stats": {
       "name": "@gajae-code/stats",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "bin": {
         "gjc-stats": "./src/index.ts",
       },
@@ -173,7 +173,7 @@
     },
     "packages/tui": {
       "name": "@gajae-code/tui",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "@gajae-code/utils": "catalog:",
@@ -214,7 +214,7 @@
     },
     "packages/utils": {
       "name": "@gajae-code/utils",
-      "version": "0.12.10",
+      "version": "0.12.11",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "beautiful-mermaid": "catalog:",
@@ -237,19 +237,19 @@
     "@biomejs/biome": "2.5.2",
     "@bufbuild/protobuf": "^2.12.0",
     "@bufbuild/protoc-gen-es": "^2.12.0",
-    "@gajae-code/agent-core": "0.12.10",
-    "@gajae-code/ai": "0.12.10",
-    "@gajae-code/bridge-client": "0.12.10",
-    "@gajae-code/coding-agent": "0.12.10",
-    "@gajae-code/natives": "0.12.10",
-    "@gajae-code/natives-darwin-arm64": "0.12.10",
-    "@gajae-code/natives-darwin-x64": "0.12.10",
-    "@gajae-code/natives-linux-arm64": "0.12.10",
-    "@gajae-code/natives-linux-x64": "0.12.10",
-    "@gajae-code/natives-win32-x64": "0.12.10",
-    "@gajae-code/stats": "0.12.10",
-    "@gajae-code/tui": "0.12.10",
-    "@gajae-code/utils": "0.12.10",
+    "@gajae-code/agent-core": "0.12.11",
+    "@gajae-code/ai": "0.12.11",
+    "@gajae-code/bridge-client": "0.12.11",
+    "@gajae-code/coding-agent": "0.12.11",
+    "@gajae-code/natives": "0.12.11",
+    "@gajae-code/natives-darwin-arm64": "0.12.11",
+    "@gajae-code/natives-darwin-x64": "0.12.11",
+    "@gajae-code/natives-linux-arm64": "0.12.11",
+    "@gajae-code/natives-linux-x64": "0.12.11",
+    "@gajae-code/natives-win32-x64": "0.12.11",
+    "@gajae-code/stats": "0.12.11",
+    "@gajae-code/tui": "0.12.11",
+    "@gajae-code/utils": "0.12.11",
     "@mozilla/readability": "^0.6.0",
     "@napi-rs/cli": "3.6.2",
     "@opentelemetry/api": "^1.9.0",
@@ -508,7 +508,7 @@
 
     "@napi-rs/tar-win32-x64-msvc": ["@napi-rs/tar-win32-x64-msvc@1.1.1", "", { "os": "win32", "cpu": "x64" }, "sha512-yJsB2IsrODQVLKbm2Fg1nHiVRbEj49mSPbj4x7JPZWJI0jGVPjohE2Sif0FBbx8OxsVoUODvS0BwksZZ8jl/OA=="],
 
-    "@napi-rs/wasm-runtime": ["@napi-rs/wasm-runtime@1.2.1", "", { "dependencies": { "@tybys/wasm-util": "^0.10.3" }, "peerDependencies": { "@emnapi/core": "^1.7.1 || ^2.0.0-alpha.3", "@emnapi/runtime": "^1.7.1 || ^2.0.0-alpha.3" } }, "sha512-KjZdi8Q1wh89gsVmghvbrMgWl6ZWmRmHV6wjB7/g4Zf0dyO+hH3neZUtuDNPO00qq5YE5RITVWvrIZKRaAmzGQ=="],
+    "@napi-rs/wasm-runtime": ["@napi-rs/wasm-runtime@1.2.2", "", { "dependencies": { "@tybys/wasm-util": "^0.10.3" }, "peerDependencies": { "@emnapi/core": "^1.7.1 || ^2.0.0-alpha.3", "@emnapi/runtime": "^1.7.1 || ^2.0.0-alpha.3" } }, "sha512-JfB4kuJQjaoHuCTseIINHtHWeJnvgEcxjwA5t/Y00ZgaOO1Crz3fjT/p8kT28zA/Caz7oiUMn3d6H2yOVCVwuw=="],
 
     "@napi-rs/wasm-tools": ["@napi-rs/wasm-tools@1.1.0", "", { "optionalDependencies": { "@napi-rs/wasm-tools-android-arm-eabi": "1.1.0", "@napi-rs/wasm-tools-android-arm64": "1.1.0", "@napi-rs/wasm-tools-darwin-arm64": "1.1.0", "@napi-rs/wasm-tools-darwin-x64": "1.1.0", "@napi-rs/wasm-tools-freebsd-x64": "1.1.0", "@napi-rs/wasm-tools-linux-arm64-gnu": "1.1.0", "@napi-rs/wasm-tools-linux-arm64-musl": "1.1.0", "@napi-rs/wasm-tools-linux-x64-gnu": "1.1.0", "@napi-rs/wasm-tools-linux-x64-musl": "1.1.0", "@napi-rs/wasm-tools-wasm32-wasi": "1.1.0", "@napi-rs/wasm-tools-win32-arm64-msvc": "1.1.0", "@napi-rs/wasm-tools-win32-ia32-msvc": "1.1.0", "@napi-rs/wasm-tools-win32-x64-msvc": "1.1.0" } }, "sha512-VjHyKEqXAwYZK+HY7iJctYvRm3TFEbaQxeZwvAG1QRkoo1a39phMY8J6x9tUEqJI03W6MysB8F2jacI6wvcx+w=="],
 
@@ -858,7 +858,7 @@
 
     "inherits": ["inherits@2.0.4", "", {}, "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ=="],
 
-    "ip-address": ["ip-address@10.3.1", "", {}, "sha512-1e9d3kb97NHJTIJDZW9rKqW2h6+dFa50Dy0fpPSMQp2ADje5gvKsXmdiK6dwY5t76TaTt5+P5N1Y/LoToIxP6g=="],
+    "ip-address": ["ip-address@10.4.0", "", {}, "sha512-oSK96Grm3aP6OrS263xVxbNDGVL7rzBtYdpGqlDG8iQdoenDoTs/nkki+DflYbAEE8Xl6o5YxhxlrKvI3nqKXQ=="],
 
     "is-fullwidth-code-point": ["is-fullwidth-code-point@3.0.0", "", {}, "sha512-zymm5+u+sCsSWyD9qNaejV3DFvhCKclKdizYaJUuHA83RLjb7nSuGnddCHGv0hk+KY7BMAlsWeK4Ueg6EV6XQg=="],
 

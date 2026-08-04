@@ -1554,6 +1554,242 @@ test("CLI setup reports atomic persistence failure without an enabled success me
 	});
 });
 
+test("CLI setup reports a save when the durable identity landed before the failure", async () => {
+	// Regression for the field failure in #3761: the commit applies the new identity and then
+	// throws, so the code path never reaches its `settingsCommitted` flag while `notify status`
+	// already reports the new bot. The wording must follow the durable state, not the flag.
+	const settings = setupSettings({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "prior-token",
+		"notifications.telegram.chatId": "prior-chat",
+	});
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
+			for (const patch of patches) {
+				if (patch.op === "set") settings.set(patch.path, patch.value as never);
+				else settings.unset(patch.path);
+			}
+			throw new Error("Telegram daemon provisional ownership could not be retired safely");
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{ action: "setup", rawArgs: [] },
+			{
+				settings,
+				fetchImpl,
+				setupToken: token,
+				setupChatId: "999",
+				setupInteractive: false,
+				setupPreflight: {},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("settings were saved, but activation or recovery failed");
+	expect(stderr).not.toContain("Unable to persist");
+	expect(`${stdout}\n${stderr}`).not.toContain(token);
+	expect(stdout).not.toContain("Notifications enabled.");
+	// The reported wording matches what a follow-up `notify status` would show.
+	expect(getNotificationConfig(settings)).toMatchObject({ enabled: true, botToken: token, chatId: "999" });
+});
+
+test("CLI setup reports a persistence failure when the identity was already present but disabled", async () => {
+	// The same token and chat id can already sit in a disabled configuration. A commit that fails
+	// before enabling Telegram has persisted nothing new, so identity alone must not read as saved.
+	const settings = setupSettings({
+		"notifications.enabled": false,
+		"notifications.telegram.botToken": token,
+		"notifications.telegram.chatId": "999",
+	});
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (): Promise<CasReceipt> => {
+			throw new Error("could not persist");
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{ action: "setup", rawArgs: [] },
+			{
+				settings,
+				fetchImpl,
+				setupToken: token,
+				setupChatId: "999",
+				setupInteractive: false,
+				setupPreflight: {},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("Unable to persist and activate Telegram notification settings");
+	expect(stderr).not.toContain("settings were saved");
+	expect(`${stdout}\n${stderr}`).not.toContain(token);
+	expect(getNotificationConfig(settings)).toMatchObject({ enabled: false });
+});
+
+test("CLI setup reports a persistence failure when only the Telegram provider flag is missing", async () => {
+	// Global notifications can already be on with the same identity while the Telegram provider
+	// itself is disabled. `notify setup` writes both flags, so a commit that fails before the
+	// provider flag lands has persisted nothing new — status would still show Telegram off.
+	const settings = setupSettings({
+		"notifications.enabled": true,
+		"notifications.telegram.enabled": false,
+		"notifications.telegram.botToken": token,
+		"notifications.telegram.chatId": "999",
+	});
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (): Promise<CasReceipt> => {
+			throw new Error("could not persist");
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{ action: "setup", rawArgs: [] },
+			{
+				settings,
+				fetchImpl,
+				setupToken: token,
+				setupChatId: "999",
+				setupInteractive: false,
+				setupPreflight: {},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("Unable to persist and activate Telegram notification settings");
+	expect(stderr).not.toContain("settings were saved");
+	expect(`${stdout}\n${stderr}`).not.toContain(token);
+	expect(getNotificationConfig(settings).telegram?.enabled).not.toBe(true);
+});
+
+test("CLI setup falls back to the code path when the durable state cannot be read", async () => {
+	// An unreadable durable state must not silently read as "not persisted": the commit landed,
+	// so the code-path flag is the only remaining evidence and it says the settings were saved.
+	const settings = setupSettings({
+		"notifications.enabled": false,
+		"notifications.telegram.botToken": "prior-token",
+		"notifications.telegram.chatId": "prior-chat",
+	});
+	let committed = false;
+	let blockedReads = 0;
+	const readSnapshot = settings.getNotificationSettingsSnapshot.bind(settings);
+	Object.defineProperty(settings, "getNotificationSettingsSnapshot", {
+		configurable: true,
+		writable: true,
+		value: () => {
+			if (committed) {
+				blockedReads += 1;
+				throw new Error("settings snapshot unavailable");
+			}
+			return readSnapshot();
+		},
+	});
+	const commit = settings.commitAtomicBatch.bind(settings);
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
+			const receipt = await commit(patches);
+			committed = true;
+			return receipt;
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	await expect(
+		captureOutput(() =>
+			runNotifyCommand(
+				{ action: "setup", rawArgs: [] },
+				{
+					settings,
+					fetchImpl,
+					setupToken: token,
+					setupChatId: "999",
+					setupInteractive: false,
+					setupPreflight: NO_DAEMON_PREFLIGHT,
+					ensureTelegramDaemon: async () => {
+						throw new Error("daemon readiness failed");
+					},
+				},
+			),
+		),
+	).rejects.toThrow("settings were saved, but activation or recovery failed");
+	// Proves the wording came from the code-path fallback, not from a readable durable state.
+	expect(blockedReads).toBeGreaterThan(0);
+});
+
+test("CLI setup reports an undecided outcome when a failed commit leaves the state unreadable", async () => {
+	// `commitAtomicBatch` can persist and still throw, so a throw from inside the commit plus an
+	// unreadable durable state is genuinely undecided. Asserting either wording would be a guess.
+	const settings = setupSettings({
+		"notifications.enabled": false,
+		"notifications.telegram.botToken": "prior-token",
+		"notifications.telegram.chatId": "prior-chat",
+	});
+	let committed = false;
+	const readSnapshot = settings.getNotificationSettingsSnapshot.bind(settings);
+	Object.defineProperty(settings, "getNotificationSettingsSnapshot", {
+		configurable: true,
+		writable: true,
+		value: () => {
+			if (committed) throw new Error("settings snapshot unavailable");
+			return readSnapshot();
+		},
+	});
+	Object.defineProperty(settings, "commitAtomicBatch", {
+		configurable: true,
+		writable: true,
+		value: async (): Promise<CasReceipt> => {
+			committed = true;
+			throw new Error("commit failed after writing");
+		},
+	});
+	const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{ action: "setup", rawArgs: [] },
+			{
+				settings,
+				fetchImpl,
+				setupToken: token,
+				setupChatId: "999",
+				setupInteractive: false,
+				setupPreflight: {},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(committed).toBe(true);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain("may or may not have been saved");
+	expect(stderr).toContain("notify status");
+	expect(stderr).not.toContain("Unable to persist and activate");
+	expect(`${stdout}\n${stderr}`).not.toContain(token);
+});
+
 describe("notify daemon-internal lightweight startup", () => {
 	function tempAgentDir(): string {
 		return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-daemon-agent-"));

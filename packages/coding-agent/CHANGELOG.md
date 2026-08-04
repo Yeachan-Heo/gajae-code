@@ -1,9 +1,23 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Telegram daemon restart now revokes every persisted callback alias before polling. Reconnecting sessions must replay a pending ask to receive fresh, owner-bound aliases; old controls remain stale, and their keyboards are best-effort terminalized when the original Telegram message id is available. Shutdown now fences new session messages and drains every admitted handler before final callback persistence and ownership release, preventing a successful send racing shutdown from publishing alias state after a successor takes ownership (#3727).
 
 ### Fixed
 
+- A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the durable configuration already carries the attempted bot token, chat id, and enabled state. The wording now follows the stored configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own. A commit that was entered and then failed while the stored configuration is also unreadable is reported as undecided, pointing at `notify status`, instead of guessing either outcome (#3761).
+- Continuing a large managed session on Darwin now batches stale OpenAI Responses replay-metadata patches into one transcript append instead of performing one identity-verified whole-file replacement per patch. Interactive startup also renders before exact MCP connection and explicit `--mpreset` activation, gates every provider turn until both are ready, and refreshes models online only after the UI is usable, preventing `gjc -c` from remaining at `GJC warming workspace` with sustained CPU, multi-gigabyte RSS growth, or avoidable network waits (#3793).
+
+## [0.12.11] - 2026-08-03
+
+### Fixed
+
+- Side-effecting native macOS computer input now restores the global cursor after releasing held input on success, cancellation, supervisor rejection, and action failure. Batches containing input execute in one serialized native capture-to-restore transaction, while screenshot/wait-only operations remain cursor-neutral; capture/restore failures are reported distinctly without masking the primary action error, and global focus behavior remains unchanged (#3642, #3781).
+- Managed session rewrites and authority-absent Darwin appends now use native identity-verified atomic replacement instead of deterministically failing with `managed_replace_exact_unavailable` or risking a torn JSONL tail; uncertain readable outcomes are re-fsynced and carried through ctime-bound strict adoption before recovery reports them durable. This unblocks Darwin compaction and session append durability when retained native authority is absent (#3742, #3760).
+- `todo_write` recovery reminders now distinguish rejected payloads from runtime aborts, preserve the available cause, and require durable state reconciliation instead of incorrectly telling the agent to change a valid payload (#3743, #3760).
+- Authority-absent Darwin `appendSync` regression coverage now exercises the replace-based race window (destination mutation during successor staging) instead of the retired in-place `O_APPEND` open path, and documents that ctime-only destination transitions are tolerated by exact replacement.
 - The legacy interactive footer now uses the session manager's cumulative usage index, so completed task and subagent tokens, premium requests, and estimated costs are included exactly once instead of reporting only the parent agent's assistant messages.
 
 ## [0.12.10] - 2026-08-03
@@ -26,8 +40,9 @@
 - Dead-owner notification recovery now preserves a machine-readable transition block, marker-age diagnostics, and safe force-recovery guidance without weakening ownership proofs (#3762).
 - Detached SDK session hosts no longer outlive the broker that spawned them. A host whose broker died without teardown (crash, `SIGKILL`, restart without `--close-session-hosts`) previously stayed resident forever, holding its session's memory — hundreds of MB per orphan. Each host now polls the broker discovery publication and, after a bounded grace period with no live broker, disposes itself through the same graceful teardown a `SIGTERM` takes. A replacement broker resets the window, so hosts still survive ordinary broker restarts, and a transient discovery read failure is treated as ambiguity rather than proof of orphanhood.
 - Syntax highlighting now recognizes special filenames such as `CMakeLists.txt`, `Dockerfile.*`, `Makefile`, and `.env.*` before generic filename extensions.
-- Managed session rewrites and authority-absent Darwin appends now use native identity-verified atomic replacement instead of deterministically failing with `managed_replace_exact_unavailable` or risking a torn JSONL tail; uncertain readable outcomes are re-fsynced and carried through ctime-bound strict adoption before recovery reports them durable (#3742).
-- `todo_write` recovery reminders now distinguish rejected payloads from runtime aborts, preserve the available cause, and require durable state reconciliation instead of incorrectly telling the agent to change a valid payload (#3743).
+### Changed
+
+- Updated the Cursor Eco, Medium, and Pro profiles from Composer 1.5 to distinct Composer 2.5 tiers: standard throughout for Eco, Fast on execution/review/design roles for Medium, and Fast throughout for Pro. Removed inert generic effort suffixes that the Cursor RPC could not transport.
 
 ## [0.12.8] - 2026-08-02
 ### Added

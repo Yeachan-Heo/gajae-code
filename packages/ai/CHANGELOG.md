@@ -6,6 +6,8 @@
 
 - OpenAI Codex cost estimates now treat an explicit response `service_tier` as authoritative, so a request for priority processing that the provider serves at the default tier is no longer charged the priority multiplier; the requested tier remains the fallback when the terminal response omits the field.
 
+## [0.12.11] - 2026-08-03
+
 ## [0.12.10] - 2026-08-03
 ### Added
 

@@ -8229,20 +8229,26 @@ export class SessionManager {
 		await this.#persistPatch({ type: "header_patch", patch });
 	}
 
-	#appendManagedRecordSync(record: FileEntry | SessionPatchRecord): void {
+	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		const store = this.#managedTranscriptStore();
 		const relativePath = path.basename(this.#sessionFile);
-		store.appendSync(relativePath, Buffer.from(`${JSON.stringify(record)}\n`, "utf8"));
+		const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
+		store.appendSync(relativePath, bytes);
 	}
 
 	async #persistPatch(record: SessionPatchRecord): Promise<void> {
-		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
+		await this.#persistPatches([record]);
+	}
+
+	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
+		if (records.length === 0 || !this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile))
+			return;
 		await this.#queuePersistTask(async () => {
 			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 			if (this.#needsFullRewriteOnNextPersist || !this.#flushed || (header?.version ?? 1) < CURRENT_SESSION_VERSION)
 				return this.#rewriteFileContents();
-			const persistedRecord =
+			const persistedRecords = records.map(record =>
 				record.type === "entry_patch"
 					? (prepareEntryForPersistenceSync(
 							materializeResidentEntryForPersistenceSync(
@@ -8252,14 +8258,17 @@ export class SessionManager {
 							),
 							this.#blobStore,
 						) as unknown as SessionPatchRecord)
-					: record;
+					: record,
+			);
 			if (this.destination.kind === "managed") {
-				this.#appendManagedRecordSync(persistedRecord);
+				this.#appendManagedRecordsSync(persistedRecords);
 				return;
 			}
 			const writer = this.#ensurePersistWriter();
 			if (!writer) return this.#rewriteFileContents();
-			await writer.write(persistedRecord);
+			for (const persistedRecord of persistedRecords) {
+				await writer.write(persistedRecord);
+			}
 		});
 	}
 	_persist(entry: SessionEntry): void {
@@ -8308,7 +8317,7 @@ export class SessionManager {
 					new Map(),
 				);
 				const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
-				this.#appendManagedRecordSync(persistedEntry);
+				this.#appendManagedRecordsSync([persistedEntry]);
 				return;
 			}
 			const writer = this.#ensurePersistWriter();
@@ -9228,9 +9237,7 @@ export class SessionManager {
 
 	async #sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist(): Promise<boolean> {
 		const patches = this.#sanitizeLoadedOpenAIResponsesReplayMetadata();
-		for (const patch of patches) {
-			await this.#persistPatch(patch);
-		}
+		await this.#persistPatches(patches);
 		return patches.length > 0;
 	}
 

@@ -80,6 +80,15 @@ describe("interactive background activity indicator", () => {
 		expect(resolveActivityIndicatorMessage(false, 2, "Working…")).toBe("Background: 2 tasks…");
 		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
 	});
+	it("rejects pending user input when the interactive mode stops", async () => {
+		const input = mode.getUserInput();
+		mode.stop();
+
+		await expect(input).rejects.toMatchObject({
+			message: "Interactive mode stopped",
+			code: "cancelled",
+		});
+	});
 
 	it("keeps owned work visible across foreground end, errors, aborts, completion, and disposal", async () => {
 		const ownerId = session.getAgentId();

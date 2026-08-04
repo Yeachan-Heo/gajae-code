@@ -324,6 +324,180 @@ fn rename_tree_no_replace(
 }
 
 #[cfg(target_os = "linux")]
+/// Replacement exchange for filesystems that implement no `renameat2` rename
+/// flags. `RENAME_EXCHANGE` swaps two names in a single step and nothing in
+/// POSIX does that — but the swap itself is not what a managed replacement
+/// needs. It needs the destination to carry the candidate afterwards and the
+/// displaced object to stay reachable under the candidate name as rollback
+/// evidence, and `linkat(2)` reaches exactly that terminal state without the
+/// destination name ever being absent:
+///
+/// 1. `linkat(destination -> temporary)` gives the displaced object a second
+///    name before anything moves, so it survives the replacement.
+/// 2. `sync_parent(candidate_parent)` makes that rollback name **durable**
+///    before anything is displaced.
+/// 3. `renameat(candidate -> destination)` replaces the destination in one
+///    atomic step. Plain `rename` never unoccupies a name, so no reader can
+///    observe a gap and no concurrent publisher can claim it.
+/// 4. `renameat(temporary -> candidate)` parks the displaced object under the
+///    candidate name, exactly where the exchange would have left it.
+///
+/// Both objects end single-linked as `RENAME_EXCHANGE` leaves them, so every
+/// identity proof the caller runs afterwards is unchanged. Unlike a directory
+/// exchange, which has no window-free emulation at all, this one is exact.
+///
+/// The pre-destructive sync establishes the enforceable fsync-fault invariant:
+/// if the rollback link's parent cannot be synced, the fallback fails before
+/// releasing destination authority or displacing anything. This implementation
+/// does not include a literal power-loss/restart harness, so it does not claim
+/// to prove filesystem-specific crash equivalence to `RENAME_EXCHANGE`; the
+/// deterministic fault tests cover the failure boundary observable here.
+///
+/// The rollback link lives in `candidate_parent` while the replacement lands in
+/// `destination_parent`, so the two directories are synced separately and in
+/// that order. After the destructive rename, publication has committed and the
+/// destination-parent and final candidate-parent sync failures are classified
+/// as committed-but-unproven by their phase.
+///
+/// `release_destination_authority` runs after the rollback-link sync and before
+/// the first rename. By then the displaced object is durably reachable through
+/// the temporary name, and releasing before the rename avoids NFS
+/// silly-renaming a still-open name.
+fn exchange_through_link(
+	candidate_parent: &File,
+	candidate_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+	release_destination_authority: impl FnOnce(),
+) -> Result<(), &'static str> {
+	let temporary = CString::new(format!(
+		".gjc-managed-exchange-{}-{}",
+		std::process::id(),
+		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
+	))
+	.map_err(|_| "io_error")?;
+	// SAFETY: both parents own valid fds and all names are live NUL-terminated
+	// strings for this syscall; flags are 0, so the destination is linked as-is.
+	if unsafe {
+		libc::linkat(
+			destination_parent.as_raw_fd(),
+			destination_name.as_ptr(),
+			candidate_parent.as_raw_fd(),
+			temporary.as_ptr(),
+			0,
+		)
+	} != 0
+	{
+		return Err("io_error");
+	}
+	// Persist the rollback name before anything is displaced. If durability is
+	// unprovable, remove the link and fail before publication.
+	if sync_parent(candidate_parent).is_err() {
+		// SAFETY: the candidate parent fd and temporary name remain valid; this
+		// removes only the link created above.
+		unsafe { libc::unlinkat(candidate_parent.as_raw_fd(), temporary.as_ptr(), 0) };
+		return Err("durability_not_provable");
+	}
+	// The displaced object is now durably reachable; release authority before the
+	// rename so NFS does not silly-rename the still-open destination name.
+	release_destination_authority();
+	// SAFETY: both parents own valid fds and both names are live NUL-terminated
+	// strings for this syscall.
+	if unsafe {
+		libc::renameat(
+			candidate_parent.as_raw_fd(),
+			candidate_name.as_ptr(),
+			destination_parent.as_raw_fd(),
+			destination_name.as_ptr(),
+		)
+	} != 0
+	{
+		// Nothing was published. Drop the rollback link so the namespace is left
+		// exactly as it was found.
+		// SAFETY: the candidate parent fd and temporary name remain valid; this
+		// removes only the link created above.
+		unsafe { libc::unlinkat(candidate_parent.as_raw_fd(), temporary.as_ptr(), 0) };
+		return Err("io_error");
+	}
+	// Publication has committed. Persist the destination-parent mutation before
+	// moving the rollback name; a sync failure is committed-but-unproven.
+	if sync_parent(destination_parent).is_err() {
+		return Err("destination_parent_sync_failed");
+	}
+	// SAFETY: the candidate parent fd and both names remain valid for this syscall.
+	if unsafe {
+		libc::renameat(
+			candidate_parent.as_raw_fd(),
+			temporary.as_ptr(),
+			candidate_parent.as_raw_fd(),
+			candidate_name.as_ptr(),
+		)
+	} != 0
+	{
+		// The replacement committed. The displaced object remains reachable under
+		// the durable temporary name, so do not delete it.
+		return Err("rollback_unavailable");
+	}
+	// Settle the final rollback name's parent so the terminal namespace is durable.
+	if sync_parent(candidate_parent).is_err() {
+		return Err("candidate_parent_sync_failed");
+	}
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Exchange a verified candidate with the destination it replaces. Prefers the
+/// atomic `renameat2(RENAME_EXCHANGE)` primitive and falls back to
+/// `exchange_through_link` when the filesystem does not implement rename flags
+/// (see `rename_flags_unsupported`).
+fn exchange_managed_replacement(
+	candidate_parent: &File,
+	candidate_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+	release_destination_authority: impl FnOnce(),
+) -> Result<(), &'static str> {
+	#[cfg(test)]
+	if let Some(Some(code)) = take_retained_publish_fault(true) {
+		return if rename_flags_unsupported(Some(code)) {
+			exchange_through_link(
+				candidate_parent,
+				candidate_name,
+				destination_parent,
+				destination_name,
+				release_destination_authority,
+			)
+		} else {
+			Err("io_error")
+		};
+	}
+	// SAFETY: retained parents and validated names make exchange atomic.
+	if unsafe {
+		libc::syscall(
+			libc::SYS_renameat2,
+			candidate_parent.as_raw_fd(),
+			candidate_name.as_ptr(),
+			destination_parent.as_raw_fd(),
+			destination_name.as_ptr(),
+			libc::RENAME_EXCHANGE,
+		)
+	} == 0
+	{
+		return Ok(());
+	}
+	if !rename_flags_unsupported(std::io::Error::last_os_error().raw_os_error()) {
+		return Err("io_error");
+	}
+	exchange_through_link(
+		candidate_parent,
+		candidate_name,
+		destination_parent,
+		destination_name,
+		release_destination_authority,
+	)
+}
+
+#[cfg(target_os = "linux")]
 /// No-overwrite publish of a regular file. Prefers the atomic
 /// `renameat2(RENAME_NOREPLACE)` primitive and falls back to `linkat(2)` when
 /// the filesystem does not implement rename flags (see
@@ -2352,7 +2526,6 @@ fn replace_managed(
 	expected_ctime_ns: &str,
 	expected_sha256: &str,
 ) -> Result<RecoveryFsResult, &'static str> {
-	use std::os::fd::AsRawFd;
 	let recovery_parent = recovery_directory(root, recovery)?;
 	let authorized = open_existing(root, relative_path, false)?;
 	if !same_expected(
@@ -2390,20 +2563,24 @@ fn replace_managed(
 	let candidate_parent = recovery_parent;
 	let candidate_name = CString::new(candidate).map_err(|_| "io_error")?;
 	let (destination_parent, destination_name) = open_parent(root, relative_path)?;
-	// SAFETY: retained parents and validated names make exchange atomic.
-	if unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			candidate_parent.as_raw_fd(),
-			candidate_name.as_ptr(),
-			destination_parent.as_raw_fd(),
-			destination_name.as_ptr(),
-			libc::RENAME_EXCHANGE,
-		)
-	} != 0
-	{
-		return Err("io_error");
-	}
+	// The descriptor proving the destination's identity is held across the
+	// exchange, matching the authority `renameat2` would have carried. On the
+	// link fallback it is released between the rollback link and the rename that
+	// displaces the destination: NFS silly-renames a still-open name that a
+	// rename displaces, which would leave the displaced object double-linked and
+	// fail the `st_nlink == 1` proof re-run against it below. Releasing there
+	// costs no provability, because the object is already reachable through the
+	// fallback's temporary name, and the checks below re-prove it from the
+	// candidate name against the identity verified before publication.
+	exchange_managed_replacement(
+		&candidate_parent,
+		&candidate_name,
+		&destination_parent,
+		&destination_name,
+		move || {
+			drop(authorized);
+		},
+	)?;
 	let verified =
 		(|| -> Result<(RecoveryFsIdentity, RecoveryFsIdentity, File, File), &'static str> {
 			let displaced = open_existing(
@@ -3903,6 +4080,276 @@ mod tests {
 		assert!(
 			!temporary.0.join("staged-tree").exists(),
 			"canonical tree name removed after detach"
+		);
+	}
+
+	/// `replace_managed` reaches `RENAME_EXCHANGE` directly. Without a fallback
+	/// every managed replacement fails on a mount that implements no rename
+	/// flags, and that is an ordinary in-session path — the session transcript
+	/// rewrite (`#persistPatch` / `#rewriteFile`) goes through it — not a
+	/// migration-only one.
+	#[test]
+	fn managed_replace_falls_back_to_linkat_when_rename_flags_unsupported() {
+		for unsupported in [libc::EINVAL, libc::ENOSYS] {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			let original = b"original-transcript";
+			let identity = managed_file(&root, "transcript", original);
+			let replacement = b"rewritten-transcript";
+
+			// Force the renameat2(RENAME_EXCHANGE) primitive to report the flag as
+			// unavailable, exactly as an NFS mount does with EINVAL.
+			set_retained_publish_faults([RetainedPublishFault::Rename(unsupported)]);
+			let result = replace_managed(
+				&root,
+				None,
+				"transcript",
+				replacement,
+				&identity.dev,
+				&identity.ino,
+				&identity.size,
+				&identity.mtime_ns,
+				&identity.ctime_ns,
+				&file_digest(original),
+			)
+			.expect("replacement must not fail on a filesystem without rename flags");
+
+			assert!(result.ok, "link fallback must publish (errno {unsupported}): {:?}", result.code);
+			assert_eq!(
+				fs::read(temporary.0.join("transcript")).expect("published transcript"),
+				replacement,
+				"the destination must carry the replacement contents"
+			);
+			let published = fs::metadata(temporary.0.join("transcript")).expect("published metadata");
+			assert_eq!(
+				std::os::unix::fs::MetadataExt::nlink(&published),
+				1,
+				"the published replacement is single-linked, matching an exchange"
+			);
+
+			// The exchange leaves the displaced object under the candidate name as
+			// rollback evidence; the fallback must reach the same terminal state.
+			let displaced = fs::read_dir(temporary.0.join(".gjc-recovery"))
+				.expect("recovery directory")
+				.filter_map(Result::ok)
+				.find(|entry| {
+					entry
+						.file_name()
+						.to_string_lossy()
+						.starts_with(".gjc-managed-replace-")
+				})
+				.expect("displaced object retained under the candidate name");
+			assert_eq!(
+				fs::read(displaced.path()).expect("displaced contents"),
+				original,
+				"the displaced object must still hold the replaced contents"
+			);
+			assert_eq!(
+				std::os::unix::fs::MetadataExt::nlink(
+					&fs::metadata(displaced.path()).expect("displaced metadata")
+				),
+				1,
+				"the displaced object is single-linked, matching an exchange"
+			);
+			// The fallback's temporary name is an implementation detail and must not
+			// survive a successful replacement.
+			assert!(
+				!fs::read_dir(temporary.0.join(".gjc-recovery"))
+					.expect("recovery directory")
+					.filter_map(Result::ok)
+					.any(|entry| entry
+						.file_name()
+						.to_string_lossy()
+						.starts_with(".gjc-managed-exchange-")),
+				"no temporary exchange name may survive"
+			);
+		}
+	}
+
+	/// The ordering that makes the fallback safe on NFS, pinned
+	/// deterministically on any filesystem: the displaced object must already
+	/// be reachable through the rollback link when authority is released, and
+	/// the destination must not yet have been replaced.
+	#[test]
+	fn replacement_fallback_releases_authority_between_rollback_link_and_rename() {
+		let temporary = TempDir::new();
+		let parent = temporary.root();
+		fs::write(temporary.0.join("destination"), b"old").expect("seed destination");
+		fs::write(temporary.0.join("candidate"), b"new").expect("seed candidate");
+		let candidate_name = CString::new("candidate").expect("candidate name");
+		let destination_name = CString::new("destination").expect("destination name");
+
+		let observed = Cell::new(None);
+		exchange_through_link(&parent, &candidate_name, &parent, &destination_name, || {
+			let rollback = fs::read_dir(&temporary.0)
+				.expect("read parent")
+				.filter_map(Result::ok)
+				.any(|entry| {
+					entry
+						.file_name()
+						.to_string_lossy()
+						.starts_with(".gjc-managed-exchange-")
+				});
+			let destination =
+				fs::read(temporary.0.join("destination")).expect("destination still present");
+			observed.set(Some((rollback, destination == b"old")));
+		})
+		.expect("link exchange");
+
+		assert_eq!(
+			observed.get(),
+			Some((true, true)),
+			"authority must be released once the displaced object has a rollback link and before the \
+			 destination is replaced"
+		);
+		assert_eq!(fs::read(temporary.0.join("destination")).expect("destination"), b"new");
+		assert_eq!(fs::read(temporary.0.join("candidate")).expect("candidate"), b"old");
+	}
+
+	/// The crash boundary. A three-step emulation is only equivalent to
+	/// `RENAME_EXCHANGE` if the displaced object can never lose its last name,
+	/// so the rollback link must be durable *before* anything is displaced.
+	/// When that durability cannot be proven the call must fail closed with
+	/// nothing published, rather than commit a replacement whose rollback
+	/// evidence might never reach the disk.
+	#[test]
+	fn replacement_fallback_fails_closed_when_the_rollback_link_is_not_durable() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let identity = managed_file(&root, "transcript", original);
+
+		// Force the exchange primitive to report the flag as unavailable, then fail
+		// the rollback link's parent sync — the boundary between the link and the
+		// destructive rename.
+		set_retained_publish_faults([
+			RetainedPublishFault::Rename(libc::EINVAL),
+			RetainedPublishFault::Sync(Some(libc::EIO)),
+		]);
+		let failure = match replace_managed(
+			&root,
+			None,
+			"transcript",
+			b"rewritten-transcript",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		) {
+			Ok(_) => panic!("an unprovable rollback link must not publish"),
+			Err(code) => code,
+		};
+
+		assert_eq!(failure, "durability_not_provable");
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("destination"),
+			original,
+			"nothing may be displaced when the rollback link is not durable"
+		);
+		assert!(
+			!fs::read_dir(temporary.0.join(".gjc-recovery"))
+				.expect("recovery directory")
+				.filter_map(Result::ok)
+				.any(|entry| entry
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".gjc-managed-exchange-")),
+			"the unprovable rollback link must be removed"
+		);
+	}
+
+	/// Cross-parent post-publication sync failures retain their phase-specific
+	/// classification and never discard the displaced recovery evidence.
+	#[test]
+	fn replacement_fallback_classifies_cross_parent_sync_failures() {
+		let temporary = TempDir::new();
+		let source_parent_path = temporary.0.join("recovery");
+		let destination_parent_path = temporary.0.join("destination");
+		fs::create_dir_all(&source_parent_path).expect("create recovery parent");
+		fs::create_dir_all(&destination_parent_path).expect("create destination parent");
+		fs::write(source_parent_path.join("candidate"), b"new").expect("seed candidate");
+		fs::write(destination_parent_path.join("destination"), b"old").expect("seed destination");
+		let source_parent = File::open(&source_parent_path).expect("open recovery parent");
+		let destination_parent =
+			File::open(&destination_parent_path).expect("open destination parent");
+		let candidate_name = CString::new("candidate").expect("candidate name");
+		let destination_name = CString::new("destination").expect("destination name");
+
+		set_retained_publish_faults([
+			RetainedPublishFault::Sync(None),
+			RetainedPublishFault::Sync(Some(libc::EIO)),
+		]);
+		let destination_error = exchange_through_link(
+			&source_parent,
+			&candidate_name,
+			&destination_parent,
+			&destination_name,
+			|| {},
+		)
+		.expect_err("destination-parent sync failure must be reported");
+		assert_eq!(destination_error, "destination_parent_sync_failed");
+		assert_eq!(fs::read(destination_parent_path.join("destination")).unwrap(), b"new");
+		assert!(
+			fs::read_dir(&source_parent_path)
+				.unwrap()
+				.filter_map(Result::ok)
+				.any(|entry| entry
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".gjc-managed-exchange-")),
+			"rollback evidence must remain after destination sync failure"
+		);
+
+		fs::write(source_parent_path.join("candidate"), b"new").expect("reseeding candidate");
+		fs::write(destination_parent_path.join("destination"), b"old")
+			.expect("reseeding destination");
+		set_retained_publish_faults([
+			RetainedPublishFault::Sync(None),
+			RetainedPublishFault::Sync(None),
+			RetainedPublishFault::Sync(Some(libc::EACCES)),
+		]);
+		let candidate_error = exchange_through_link(
+			&source_parent,
+			&candidate_name,
+			&destination_parent,
+			&destination_name,
+			|| {},
+		)
+		.expect_err("candidate-parent sync failure must be reported");
+		assert_eq!(candidate_error, "candidate_parent_sync_failed");
+		assert_eq!(fs::read(destination_parent_path.join("destination")).unwrap(), b"new");
+		assert_eq!(fs::read(source_parent_path.join("candidate")).unwrap(), b"old");
+	}
+
+	/// A replacement that cannot publish must leave the namespace exactly as it
+	/// was found, including the rollback link the fallback created.
+	#[test]
+	fn replacement_fallback_removes_its_rollback_link_when_the_rename_fails() {
+		let temporary = TempDir::new();
+		let parent = temporary.root();
+		fs::write(temporary.0.join("destination"), b"old").expect("seed destination");
+		let candidate_name = CString::new("absent-candidate").expect("candidate name");
+		let destination_name = CString::new("destination").expect("destination name");
+
+		exchange_through_link(&parent, &candidate_name, &parent, &destination_name, || {})
+			.expect_err("replacing from an absent candidate must fail");
+
+		assert_eq!(
+			fs::read(temporary.0.join("destination")).expect("destination"),
+			b"old",
+			"a failed replacement must leave the destination untouched"
+		);
+		assert!(
+			!fs::read_dir(&temporary.0)
+				.expect("read parent")
+				.filter_map(Result::ok)
+				.any(|entry| entry
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".gjc-managed-exchange-")),
+			"a failed replacement must not leave its rollback link behind"
 		);
 	}
 }

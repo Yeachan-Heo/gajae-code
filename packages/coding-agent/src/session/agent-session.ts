@@ -610,6 +610,8 @@ export interface AgentSessionConfig {
 	discoveryMode?: "off" | "mcp-only" | "all";
 	/** MCP tool names to activate for the current session when discovery mode is enabled. */
 	initialSelectedMCPToolNames?: string[];
+	/** Keep persisted MCP names until a deferred exact catalog becomes available. */
+	preserveUnavailableInitialMCPToolSelection?: boolean;
 	/** Built-in discoverable tool names restored for the current all-discovery session. */
 	initialSelectedDiscoveredBuiltinToolNames?: string[];
 	/** Discoverable built-ins active for configured or explicit reasons independently of persisted discovery selection. */
@@ -656,6 +658,8 @@ export interface AgentSessionConfig {
 	 * process-global manager **MUST NOT** dispose it on their own teardown.
 	 */
 	ownedMcpManager?: MCPManager;
+	/** Optional startup dependency that must settle before the first provider turn. */
+	startupTurnBarrier?: Promise<void>;
 	/** Optional fork-context seed used to initialize a child session before its first prompt. */
 	forkContextSeed?: ForkContextSeed;
 	/** Optional provider state override. Fork-context children should omit this by default. */
@@ -1947,6 +1951,7 @@ export class AgentSession {
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	readonly #ownedMcpManager: MCPManager | undefined;
+	#startupTurnBarrier: Promise<void> | undefined;
 	#pendingPythonMessages: PythonExecutionMessage[] = [];
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
@@ -2269,10 +2274,23 @@ export class AgentSession {
 		next.ready.resolve();
 	}
 
+	async #awaitStartupTurnBarrier(): Promise<void> {
+		const barrier = this.#startupTurnBarrier;
+		if (!barrier) return;
+		await barrier;
+		if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrier = undefined;
+	}
+	extendStartupTurnBarrier(barrier: Promise<void>): void {
+		const current = this.#startupTurnBarrier;
+		this.#startupTurnBarrier = current ? Promise.all([current, barrier]).then(() => {}) : barrier;
+		void this.#startupTurnBarrier.catch(() => {});
+	}
+
 	async #withSessionAdmission<T>(
 		kind: SessionAdmissionKind,
 		body: (lease: SessionAdmissionLease) => Promise<T>,
 	): Promise<T> {
+		if (kind === "prompt") await this.#awaitStartupTurnBarrier();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
@@ -2601,6 +2619,7 @@ export class AgentSession {
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
+		this.#startupTurnBarrier = config.startupTurnBarrier;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -2661,6 +2680,8 @@ export class AgentSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
+				await this.#awaitStartupTurnBarrier();
+				if (this.#isDisposed) return;
 				if (messages.length === 1) {
 					await this.agent.prompt(first, this.#managedFallbackPromptOptions());
 				} else {
@@ -2723,7 +2744,7 @@ export class AgentSession {
 			config.initialDiscoveredBuiltinToolSelectionIsExplicit === true
 				? this.#selectRestorableDiscoveredBuiltinToolNames(config.initialPersistedDiscoveredBuiltinToolNames ?? [])
 				: undefined;
-		this.#pruneSelectedMCPToolNames();
+		if (!config.preserveUnavailableInitialMCPToolSelection) this.#pruneSelectedMCPToolNames();
 		const persistInitialMCPToolSelection =
 			config.persistInitialMCPToolSelection === true && config.initialMCPToolSelectionIsExplicit !== false;
 		const persistInitialDiscoveredBuiltinToolSelection =
@@ -3376,6 +3397,9 @@ export class AgentSession {
 
 	getAgentId(): string | undefined {
 		return this.#agentId;
+	}
+	get isDisposed(): boolean {
+		return this.#isDisposed;
 	}
 
 	registerToolSessionCleanup(cleanup: () => Promise<void> | void): () => void {
@@ -4643,6 +4667,11 @@ export class AgentSession {
 						}
 						return true;
 					};
+					if (!canContinue()) {
+						settleLease();
+						return;
+					}
+					await this.#awaitStartupTurnBarrier();
 					if (!canContinue()) {
 						settleLease();
 						return;
@@ -6834,6 +6863,12 @@ export class AgentSession {
 				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
 					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
 				);
+				if (this.#isDisposed) {
+					if (generation === this.#baseSystemPromptGeneration) {
+						this.#pendingAppliedToolSignature = undefined;
+					}
+					return;
+				}
 				if (generation === this.#baseSystemPromptGeneration) {
 					this.#baseSystemPrompt = built.systemPrompt;
 					this.agent.setSystemPrompt(this.#baseSystemPrompt);
@@ -7319,6 +7354,8 @@ export class AgentSession {
 		if (!canContinuePersistedHistory(this.agent.state.messages)) {
 			throw new Error("Cannot continue from persisted message history");
 		}
+		await this.#awaitStartupTurnBarrier();
+		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		try {

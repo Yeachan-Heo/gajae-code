@@ -276,33 +276,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "cursor-eco",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:low",
-			executor: "cursor/composer-1.5:minimal",
-			planner: "cursor/composer-1.5:low",
-			critic: "cursor/composer-1.5:medium",
-			architect: "cursor/composer-1.5:high",
+			default: "cursor/composer-2.5",
+			executor: "cursor/composer-2.5",
+			planner: "cursor/composer-2.5",
+			critic: "cursor/composer-2.5",
+			architect: "cursor/composer-2.5",
 		},
 	},
 	{
 		name: "cursor-medium",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:medium",
-			executor: "cursor/composer-1.5:low",
-			planner: "cursor/composer-1.5:medium",
-			critic: "cursor/composer-1.5:high",
-			architect: "cursor/composer-1.5:xhigh",
+			default: "cursor/composer-2.5",
+			executor: "cursor/composer-2.5-fast",
+			planner: "cursor/composer-2.5",
+			critic: "cursor/composer-2.5-fast",
+			architect: "cursor/composer-2.5-fast",
 		},
 	},
 	{
 		name: "cursor-pro",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:xhigh",
-			executor: "cursor/composer-1.5:medium",
-			planner: "cursor/composer-1.5:high",
-			critic: "cursor/composer-1.5:xhigh",
-			architect: "cursor/composer-1.5:xhigh",
+			default: "cursor/composer-2.5-fast",
+			executor: "cursor/composer-2.5-fast",
+			planner: "cursor/composer-2.5-fast",
+			critic: "cursor/composer-2.5-fast",
+			architect: "cursor/composer-2.5-fast",
 		},
 	},
 	{
@@ -661,6 +661,22 @@ describe("built-in model profile catalog", () => {
 			planner: "grok-build/grok-composer-2.5-fast",
 			critic: "grok-build/grok-composer-2.5-fast",
 		});
+	});
+
+	test("Cursor tiers use distinct current model IDs without inert effort suffixes", () => {
+		const eco = builtinMapping("cursor-eco");
+		const medium = builtinMapping("cursor-medium");
+		const pro = builtinMapping("cursor-pro");
+
+		expect(new Set(Object.values(eco))).toEqual(new Set(["cursor/composer-2.5"]));
+		expect(medium).not.toEqual(eco);
+		expect(pro).not.toEqual(medium);
+		expect(medium.executor).toBe("cursor/composer-2.5-fast");
+		expect(medium.critic).toBe("cursor/composer-2.5-fast");
+		expect(new Set(Object.values(pro))).toEqual(new Set(["cursor/composer-2.5-fast"]));
+		for (const mapping of [eco, medium, pro]) {
+			for (const selector of Object.values(mapping)) expect(selector).not.toContain(":");
+		}
 	});
 
 	test("built-in minimax profiles resolve to minimax-m3 and never minimax-v3 (issue #656)", () => {

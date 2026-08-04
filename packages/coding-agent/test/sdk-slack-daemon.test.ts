@@ -1073,12 +1073,14 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const root = await daemon.postRoot("session", "root");
 			await daemon.notify("session", "question", "event-1");
 			await daemon.start();
-			fake.handler?.(messageEnvelope("first", "event-1", root.rootTs!));
-			for (let attempt = 0; attempt < 100 && injected.length === 0; attempt++) await Bun.sleep(1);
+			const firstHandler = fake.handler;
+			expect(firstHandler).toBeDefined();
+			await firstHandler!(messageEnvelope("first", "event-1", root.rootTs!));
 			await daemon.stop();
 			await daemon.start();
-			fake.handler?.(messageEnvelope("redelivery", "event-1", root.rootTs!));
-			for (let attempt = 0; attempt < 100 && !fake.acks.includes("redelivery"); attempt++) await Bun.sleep(1);
+			const redeliveryHandler = fake.handler;
+			expect(redeliveryHandler).toBeDefined();
+			await redeliveryHandler!(messageEnvelope("redelivery", "event-1", root.rootTs!));
 			expect(fake.acks).toEqual(["first", "redelivery"]);
 			expect(injected).toHaveLength(1);
 			expect(fake.stops).toBe(1);
