@@ -16,36 +16,36 @@ cp packages/coding-agent/examples/extensions/pirate.ts .gjc/extensions/
 
 ### Enable the Ouroboros `ooo` bridge
 
-Install the latest [Q00/ouroboros](https://github.com/Q00/ouroboros/releases/latest) release first. The integration is verified against Ouroboros `v0.50.7`; use that release or newer. The preferred setup command selects GJC, configures the GJC runtime, and installs Ouroboros's managed GJC bridge:
+Install the version-pinned Ouroboros `v0.50.7` MCP profile, then configure its GJC runtime:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | bash
+uv tool install 'ouroboros-ai[mcp]==0.50.7'
 ouroboros setup --runtime gjc
 ```
 
-That managed bridge is sufficient by itself. It routes `ooo interview` through `ouroboros dispatch --runtime gjc`, which uses Ouroboros's shared MCP handler composition. GJC does not implement the Ouroboros MCP workflow.
+`pipx install 'ouroboros-ai[mcp]==0.50.7'` is the equivalent pipx installation. Do not pipe a mutable branch installer into a shell. Pin source audits to commit `cb658aa819bfabafecbbe91bc36327f10691171b`. The [v0.50.7 release](https://github.com/Q00/ouroboros/releases/tag/v0.50.7) publishes `ouroboros_ai-0.50.7-py3-none-any.whl` with SHA-256 `df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4`; verify downloaded release assets before installing them.
 
-As a GJC-owned manual alternative, install this shipped example for your user account with one command:
-
-```bash
-mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions" && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ooo-bridge.ts"
-```
-
-Or enable the example only for the current project:
+Ouroboros setup installs its own managed bridge. Replace that file with this GJC bridge, which preserves the interview session across ordinary follow-up answers. Download the example from immutable GJC commit `857748424fce4c98111d68ecf595bbada16c1059` and verify it before installation:
 
 ```bash
-mkdir -p .gjc/extensions && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o .gjc/extensions/ooo-bridge.ts
+curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/857748424fce4c98111d68ecf595bbada16c1059/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
+shasum -a 256 /tmp/gjc-ooo-bridge.ts
+mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge" && cp /tmp/gjc-ooo-bridge.ts "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge/index.ts"
 ```
 
-Use either the Ouroboros-managed bridge or the manual example, not both. Start a new GJC session after installation, then enter:
+The `shasum` output must match `7f469917b8f1813430bae9e4d849047aa647eba513a45159e2ad6fb6f22a5c89` before the copy.
+
+For a project-only installation, copy the same verified file to `.gjc/extensions/ouroboros-ooo-bridge/index.ts`. Start a new GJC session after installation, then enter:
 
 ```text
 ooo interview "I want to build a task management CLI"
 ```
 
-The example sends the complete input as one argument to `ouroboros dispatch --runtime gjc`. A missing or misconfigured `ouroboros` executable produces an error notification for that `ooo` input without preventing GJC from starting or handling ordinary prompts. Exit code `78` explicitly passes the input back to normal GJC processing.
+The first question is rendered in GJC. While that interview remains active, ordinary interactive input is sent as the answer with the same Ouroboros session ID; completion clears the correlation and returns subsequent ordinary prompts to GJC. Other `ooo ...` commands continue through `ouroboros dispatch --runtime gjc`, including exit-code `78` pass-through.
 
-This external path is separate from GJC's native `/skill:deep-interview`: the native skill runs GJC's bundled interview workflow, while `ooo interview` delegates to the installed Ouroboros runtime and its MCP-backed skill dispatcher.
+Set `OUROBOROS_CLI=/absolute/path/to/ouroboros` when the executable is outside `PATH`. Missing executable, MCP startup, and dispatch failures produce an error notification for the claimed input without preventing GJC startup or ordinary prompts.
+
+This external path is separate from GJC's native `/skill:deep-interview`: the native skill runs GJC's bundled interview workflow, while `ooo interview` delegates to the installed Ouroboros MCP interview tool.
 
 ## Examples
 

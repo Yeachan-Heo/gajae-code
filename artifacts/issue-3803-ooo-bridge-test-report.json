@@ -5,18 +5,29 @@
   "baseline": {
     "gjcBase": "a8fa63a599e9fa3d0189e48bfce778a36353ccdd",
     "ouroborosRelease": "v0.50.7",
-    "ouroborosCommit": "cb658aa819bfabafecbbe91bc36327f10691171b"
+    "ouroborosCommit": "cb658aa819bfabafecbbe91bc36327f10691171b",
+    "ouroborosWheelSha256": "df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4"
   },
   "verification": [
     {
-      "command": "bun test packages/coding-agent/test/ooo-bridge-extension-contract.test.ts packages/coding-agent/test/ooo-bridge-runner-redteam.test.ts packages/coding-agent/test/extensions-discovery.test.ts",
+      "command": "bun test packages/coding-agent/test/ooo-bridge-extension-contract.test.ts packages/coding-agent/test/ooo-bridge-runner-redteam.test.ts packages/coding-agent/test/ooo-bridge-installed-flow.test.ts packages/coding-agent/test/extensions-discovery.test.ts",
       "status": "passed",
-      "result": "60 pass, 0 fail, 161 expect() calls"
+      "result": "62 pass, 0 fail, 178 expect() calls"
     },
     {
       "command": "bun --cwd=packages/coding-agent run check",
       "status": "passed",
-      "result": "Biome checked 2509 files; TypeScript noEmit completed successfully"
+      "result": "Biome checked 2511 files; TypeScript noEmit completed successfully"
+    },
+    {
+      "command": "bun run check:public-sync",
+      "status": "passed",
+      "result": "Public docs/site/version surfaces are in sync"
+    },
+    {
+      "command": "bun run generate-docs-index",
+      "status": "passed",
+      "result": "Embedded docs index regenerated with 120 documents"
     },
     {
       "command": "git diff --check",
@@ -26,19 +37,29 @@
   ],
   "adversarialCases": [
     {
-      "id": "missing-ouroboros",
+      "id": "visible-success-output",
       "status": "passed",
-      "evidence": "A missing executable error is notified and the matching ooo interview input remains handled instead of falling through to the model."
+      "evidence": "Successful bridge stdout is returned as handled text and rendered as a visible interactive custom message."
+    },
+    {
+      "id": "correlated-interview-continuation",
+      "status": "passed",
+      "evidence": "The installed example starts ouroboros_interview once, sends the next ordinary input with the returned session_id as answer, renders completion, closes the MCP connection, and stops claiming ordinary input."
+    },
+    {
+      "id": "compatible-cli-override",
+      "status": "passed",
+      "evidence": "OUROBOROS_CLI selects the executable for both ouroboros mcp serve --runtime gjc and non-interview dispatch."
+    },
+    {
+      "id": "immutable-install-guidance",
+      "status": "passed",
+      "evidence": "Documentation pins Ouroboros v0.50.7 and source commit, publishes the release wheel digest, and downloads the GJC example from an exact commit with its own SHA-256."
     },
     {
       "id": "unsupported-dispatch",
       "status": "passed",
-      "evidence": "Exit code 78 remains pass-through."
-    },
-    {
-      "id": "exact-runtime-binding",
-      "status": "passed",
-      "evidence": "The shipped example registers one input handler and dispatches ooo interview as ouroboros argv: dispatch, --runtime, gjc, full input."
+      "evidence": "Exit code 78 remains pass-through for non-interview exact-prefix dispatch."
     }
   ]
 }

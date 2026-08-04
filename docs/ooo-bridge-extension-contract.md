@@ -25,69 +25,64 @@ The extension runner already treats `InputEventResult.handled === true` as termi
 
 ## Dispatch and result semantics
 
-`createOuroborosOooBridge()` is a small specialization of `createExactPrefixCommandBridge()`:
+`createOuroborosOooBridge()` has two bounded paths:
 
-- command: `ouroboros`
-- arguments: `dispatch`, `--runtime`, `gjc`, then the full submitted input text
-- recursion guard variable: the Ouroboros bridge recursion-depth environment variable
+- `ooo interview [topic]` starts `ouroboros_interview` through a lazily connected `ouroboros mcp serve --runtime gjc` stdio server.
+- While that interview is active, subsequent ordinary interactive input is claimed as an answer with the same `session_id`. A completed result clears the correlation and closes the MCP connection.
+- Other exact-prefix `ooo ...` commands run `ouroboros dispatch --runtime gjc <full-input>` through `createExactPrefixCommandBridge()`.
+- `OUROBOROS_CLI` overrides the executable for both paths; otherwise the command is `ouroboros`.
 
-- continue/pass-through exit code: `78`
+Successful handled text is returned as `{ handled: true, text }`. The interactive input controller renders that text as a visible custom message before clearing the composer, so the first interview question, continuation questions, completion result, and successful non-interview command output reach the user.
 
-Exit-code mapping:
+Command-dispatch exit mapping remains:
 
 | Dispatch result | GJC input result |
 | --- | --- |
-| `0` | `{ handled: true }`; do not send input to the model. |
+| `0` | `{ handled: true, text? }`; render non-empty stdout (or stderr when stdout is empty) and do not send the input to the model. |
 | `78` | `{}`; continue/pass-through so GJC processes the input normally. |
 | any other non-zero | Surface an extension error notification using stderr, then stdout, then a generic exit-code message, and return `{ handled: true }`; the failed `ooo` command is terminal and is not sent to the model. |
 
+MCP interview errors are notified and handled. A non-terminal response must contain a valid `interview_*` session ID in MCP `_meta` (with the visible `Session ...` text accepted as a compatibility fallback); otherwise the bridge fails closed instead of accepting an uncorrelated answer.
+
 ## Recursion guard
 
-Before dispatch, the helper increments the Ouroboros bridge recursion-depth environment variable and restores its previous value after dispatch finishes. A current numeric depth of `0` or `1` is dispatchable, which preserves concurrent independent interactive inputs while marking child dispatcher processes with depth `1`. A current numeric depth greater than `1`, or any non-empty non-numeric value, returns `{}` without dispatching.
-
-This means the bridge allows exactly one inherited bridge-marked dispatcher level and blocks recursive re-entry from deeper bridge-marked children. The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
+Before command dispatch, the exact-prefix helper increments the Ouroboros bridge recursion-depth environment variable and restores its previous value after dispatch finishes. A current numeric depth of `0` or `1` is dispatchable. A current numeric depth greater than `1`, or any non-empty non-numeric value, returns `{}` without dispatching. The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
 
 ## Installation and discovery
 
-### Supported Ouroboros baseline and MCP ownership
+### Pinned Ouroboros baseline
 
-This path is verified against the current GJC `dev` bridge contract and [Q00/ouroboros `v0.50.7`](https://github.com/Q00/ouroboros/releases/tag/v0.50.7), the latest release when this integration was shipped. Use `v0.50.7` or a newer release and check the [latest release](https://github.com/Q00/ouroboros/releases/latest) for current upstream requirements.
-
-Install and configure Ouroboros using its current upstream GJC setup:
+This path is verified against [Q00/ouroboros `v0.50.7`](https://github.com/Q00/ouroboros/releases/tag/v0.50.7). Install its MCP profile at the exact version, then configure GJC:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | bash
+uv tool install 'ouroboros-ai[mcp]==0.50.7'
 ouroboros setup --runtime gjc
 ```
 
-In `v0.50.7`, that setup selects GJC as Ouroboros's runtime and LLM backend, installs an Ouroboros-managed GJC bridge, and installs its GJC capability guide. The managed bridge invokes `ouroboros dispatch --runtime gjc`; the GJC example in this repository binds the same runtime flag. Ouroboros's dispatcher then uses its shared MCP handler composition. GJC does not implement the Ouroboros MCP workflow or protocol lifecycle.
+`pipx install 'ouroboros-ai[mcp]==0.50.7'` is equivalent. Do not pipe a mutable branch installer into a shell. Pin source audits to commit `cb658aa819bfabafecbbe91bc36327f10691171b`. The release asset `ouroboros_ai-0.50.7-py3-none-any.whl` has SHA-256 `df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4`; compare a downloaded asset with that digest before installation.
 
-### One-command manual enablement
+### Verified GJC bridge installation
 
-The preferred `ouroboros setup --runtime gjc` path already installs a managed bridge. As a GJC-owned alternative, install the shipped example for the current user:
-
-```bash
-mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions" && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ooo-bridge.ts"
-```
-
-Or enable the example only in the current project:
+Ouroboros setup installs its own managed GJC bridge. Replace it with the GJC bridge from immutable commit `857748424fce4c98111d68ecf595bbada16c1059`, whose example file has SHA-256 `7f469917b8f1813430bae9e4d849047aa647eba513a45159e2ad6fb6f22a5c89`:
 
 ```bash
-mkdir -p .gjc/extensions && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o .gjc/extensions/ooo-bridge.ts
+curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/857748424fce4c98111d68ecf595bbada16c1059/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
+shasum -a 256 /tmp/gjc-ooo-bridge.ts
+mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge" && cp /tmp/gjc-ooo-bridge.ts "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge/index.ts"
 ```
 
-Use either the Ouroboros-managed bridge or the manual example, not both. Start a new GJC session after installation. Then run:
+The `shasum` output must match the published example digest before the copy. For project-only installation, copy the same verified file to `.gjc/extensions/ouroboros-ooo-bridge/index.ts`. Start a new GJC session after installation, then run:
 
 ```text
 ooo interview "I want to build a task management CLI"
 ```
 
-The example dispatches `ouroboros dispatch --runtime gjc <full-input>`, passing the complete input as one argument. If `ouroboros` is missing, cannot start, times out, or returns a non-zero code other than `78`, GJC shows an error notification and treats only that matching `ooo` input as handled. Extension discovery, GJC startup, and ordinary prompts continue to work. Exit code `78` deliberately passes the original input through to normal GJC processing.
+Set `OUROBOROS_CLI=/absolute/path/to/ouroboros` when the executable is outside `PATH`.
 
 ### Native interview versus external Ouroboros interview
 
 - `/skill:deep-interview` is GJC's bundled native interview workflow. It includes Ouroboros-inspired behavior but does not invoke the external CLI.
-- `ooo interview` is an external integration. With this example enabled, GJC invokes `ouroboros dispatch --runtime gjc` with the complete input, and the installed Ouroboros runtime owns its MCP-backed skill dispatch and interview flow.
+- `ooo interview` is the external integration. It calls Ouroboros's MCP interview tool, renders each question in GJC, correlates ordinary answers by Ouroboros session ID, and stops claiming input when the interview completes.
 
 The canonical install location is the agent extensions directory discovered by the native GJC provider:
 

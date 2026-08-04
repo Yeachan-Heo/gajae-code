@@ -15,7 +15,6 @@ interface OuroborosOooBridgeOptions {
 }
 
 interface InterviewState {
-	connection: MCPServerConnection;
 	sessionId: string;
 }
 
@@ -29,6 +28,10 @@ function interviewArgument(text: string): string | undefined {
 		return text.slice(INTERVIEW_COMMAND.length).trim();
 	}
 	return undefined;
+}
+
+function isOooCommand(text: string): boolean {
+	return text === "ooo" || text.startsWith("ooo ") || text.startsWith("ooo\t");
 }
 
 function resultText(result: MCPToolCallResult): string {
@@ -62,6 +65,7 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 	const invoke = options.callTool ?? callTool;
 	const disconnect = options.disconnect ?? disconnectServer;
 	let interview: InterviewState | undefined;
+	let activeConnection: MCPServerConnection | undefined;
 	let pendingConnection: Promise<MCPServerConnection> | undefined;
 
 	const commandBridge = createExactPrefixCommandBridge({
@@ -71,7 +75,7 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 	});
 
 	async function connection(ctx: ExtensionContext): Promise<MCPServerConnection> {
-		if (interview) return interview.connection;
+		if (activeConnection) return activeConnection;
 		pendingConnection ??= connect("ouroboros-ooo-bridge", {
 			type: "stdio",
 			command: resolveOuroborosCommand(),
@@ -79,16 +83,18 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 			cwd: ctx.cwd,
 		});
 		try {
-			return await pendingConnection;
+			activeConnection = await pendingConnection;
+			return activeConnection;
 		} finally {
 			pendingConnection = undefined;
 		}
 	}
 
 	async function closeInterview(): Promise<void> {
-		const active = interview;
+		const connectionToClose = activeConnection;
 		interview = undefined;
-		if (active) await disconnect(active.connection);
+		activeConnection = undefined;
+		if (connectionToClose) await disconnect(connectionToClose);
 	}
 
 	async function runInterview(text: string, ctx: ExtensionContext): Promise<InputEventResult> {
@@ -111,7 +117,7 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 			const sessionId = resultSessionId(result, output);
 			if (!resultCompleted(result)) {
 				if (!sessionId) throw new Error("Ouroboros interview response did not include a session ID");
-				interview = { connection: activeConnection, sessionId };
+				interview = { sessionId };
 			} else {
 				await closeInterview();
 			}
@@ -126,7 +132,7 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 	return async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
 		if (event.source !== undefined && event.source !== "interactive") return {};
 		const argument = interviewArgument(event.text);
-		if (argument !== undefined || (interview && !event.text.startsWith("ooo"))) {
+		if (argument !== undefined || (interview && !isOooCommand(event.text))) {
 			return runInterview(event.text, ctx);
 		}
 		return commandBridge(event, ctx);

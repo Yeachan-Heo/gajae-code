@@ -8,7 +8,7 @@
 
 ### Added
 
-- Added a copy-installable `ooo` bridge example and current Ouroboros setup guidance so `ooo interview` delegates through `ouroboros dispatch --runtime gjc` to the installed runtime's MCP-backed skill dispatcher without adding a mandatory GJC dependency (#3803).
+- Added a verified, copy-installable `ooo` bridge example: `ooo interview` now renders Ouroboros MCP questions in GJC, correlates ordinary follow-up answers by interview session ID until completion, honors `OUROBOROS_CLI`, and leaves other `ooo ...` commands on the existing dispatch/pass-through contract (#3803).
 
 ### Fixed
 
