@@ -3000,6 +3000,117 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 	disposePriorAnswerSource();
 });
 
+test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-ui-provider-notify-priority-${Date.now()}`;
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+	const messages: Array<{ message: string; level: string }> = [];
+	const sessionContext = {
+		...context(cwd, sessionId),
+		ui: { notify: (message: string, level: string) => messages.push({ message, level }) },
+	};
+	process.env.GJC_NOTIFICATIONS = "0";
+	start(sessionContext, undefined, () => {}, false, commands);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	expect(getAskAnswerSource(sessionId)).toBeUndefined();
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "ui",
+			connectionId,
+			capability: "ui",
+			definitions: [],
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "ui"),
+		"UI provider registration",
+	);
+	process.env.GJC_NOTIFICATIONS = "1";
+	await commands.get("notify")!.handler("on", sessionContext);
+	expect(messages).toEqual([{ message: "Notifications enabled for this session.", level: "info" }]);
+
+	const protocolAnswer = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{ question: "Choose the protocol answer", options: ["First", "Second"], interaction: "selector", controls: [] },
+		new AbortController().signal,
+	);
+	await waitFor(() => frames.some(frame => frame.type === "reverse_request"), "protocol elicitation request");
+	const protocolRequest = frames.find(frame => frame.type === "reverse_request")!;
+	expect(protocolRequest).toMatchObject({
+		payload: {
+			method: "ui.elicit",
+			payload: { mode: "form", message: "Choose the protocol answer" },
+		},
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: protocolRequest.id,
+			connectionId,
+			leaseId: protocolRequest.leaseId,
+			ok: true,
+			result: { action: "accept", content: { value: "option:1" } },
+		}),
+	);
+	expect(await protocolAnswer).toBe("Second");
+
+	await closeSocket(socket);
+	const fallbackFrames: Record<string, unknown>[] = [];
+	const fallbackSocket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(fallbackSocket);
+	fallbackSocket.addEventListener("message", event => fallbackFrames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		fallbackSocket.addEventListener("open", () => resolve(), { once: true });
+		fallbackSocket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const fallbackAnswer = getAskAnswerSource(sessionId)!.awaitAnswer("Choose the interactive fallback", [
+		"Continue",
+		"Stop",
+	]);
+	await waitFor(
+		() => fallbackFrames.some(frame => frame.type === "action_needed" && frame.kind === "ask"),
+		"interactive fallback presentation",
+	);
+	const fallbackAction = fallbackFrames.find(frame => frame.type === "action_needed" && frame.kind === "ask")!;
+	fallbackSocket.send(
+		JSON.stringify({
+			type: "control_command",
+			sessionId,
+			token: endpoint.token,
+			requestId: "interactive-fallback-answer",
+			command: {
+				type: "control_request",
+				id: "interactive-fallback-answer",
+				operation: "ask.answer",
+				input: { id: fallbackAction.id, answer: 0 },
+				idempotencyKey: "interactive-fallback-answer",
+			},
+		}),
+	);
+	await waitFor(
+		() =>
+			fallbackFrames.some(
+				frame => frame.type === "control_command_result" && frame.requestId === "interactive-fallback-answer",
+			),
+		"interactive fallback answer",
+	);
+	expect(await fallbackAnswer).toBe("Continue");
+	expect(frames.filter(frame => frame.type === "reverse_request")).toHaveLength(1);
+});
+
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
 	dirs.push(cwd);
