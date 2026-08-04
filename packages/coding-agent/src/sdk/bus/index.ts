@@ -3234,6 +3234,26 @@ export function shouldAwaitNotificationStartup(event: {
 	return event.type !== "session_switch" || event.transition?.origin !== INTERACTIVE_SELECTOR_RESUME_ORIGIN;
 }
 
+/**
+ * Best-effort, bounded description of a reverse-provider response for error
+ * messages. Strings pass through; other values are JSON-serialized and capped
+ * at 500 chars; non-serializable values (circular structures, throwing getters)
+ * fall back to a safe, never-throwing tag so the diagnostic itself never throws.
+ */
+export function describeProviderResponse(value: unknown): string {
+	let text: string;
+	if (typeof value === "string") {
+		text = value;
+	} else {
+		try {
+			const stringified = JSON.stringify(value);
+			text = typeof stringified === "string" ? stringified : Object.prototype.toString.call(value);
+		} catch {
+			text = Object.prototype.toString.call(value);
+		}
+	}
+	return text.length > 500 ? `${text.slice(0, 500)}…` : text;
+}
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -3645,7 +3665,9 @@ export function createNotificationsExtension(
 						signal,
 					);
 					if (!result || typeof result !== "object")
-						throw new Error("permission provider returned an invalid response");
+						throw new Error(
+							`permission provider returned an invalid response: ${describeProviderResponse(result)}`,
+						);
 					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
 					if (response.outcome === "cancelled") return { outcome: "cancelled" };
 					if (response.outcome === "selected" && typeof response.optionId === "string")
@@ -3656,7 +3678,7 @@ export function createNotificationsExtension(
 								? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
 								: {}),
 						};
-					throw new Error("permission provider returned an invalid response");
+					throw new Error(`permission provider returned an invalid response: ${describeProviderResponse(result)}`);
 				});
 				return;
 			}
@@ -3692,7 +3714,7 @@ export function createNotificationsExtension(
 						typeof result !== "object" ||
 						typeof (result as { content?: unknown }).content !== "string"
 					)
-						throw new Error("fs provider returned an invalid read response");
+						throw new Error(`fs provider returned an invalid read response: ${describeProviderResponse(result)}`);
 					return (result as { content: string }).content;
 				},
 				async writeTextFile(params) {
