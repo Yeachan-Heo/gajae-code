@@ -281,9 +281,11 @@ describe("ooo bridge extension contract", () => {
 			pi: { createOuroborosOooBridge },
 		} as unknown as ExtensionAPI);
 
-		expect(registrations).toHaveLength(1);
-		expect(registrations[0]?.event).toBe("input");
-		const handler = registrations[0]?.handler as ExtensionHandler<InputEvent, InputEventResult>;
+		expect(registrations.map(registration => registration.event)).toEqual(["input", "session_switch"]);
+		const handler = registrations.find(registration => registration.event === "input")?.handler as ExtensionHandler<
+			InputEvent,
+			InputEventResult
+		>;
 		const ctx = context();
 
 		expect(await handler(input("ooo interview Build a CLI", "interactive"), ctx)).toEqual({
@@ -298,7 +300,7 @@ describe("ooo bridge extension contract", () => {
 				args: ["mcp", "serve", "--runtime", "gjc"],
 				cwd: ctx.cwd,
 			},
-			{ signal: undefined },
+			{ signal: expect.any(AbortSignal) },
 		);
 		expect(callSpy).toHaveBeenCalledWith(
 			connection,
@@ -307,7 +309,7 @@ describe("ooo bridge extension contract", () => {
 				cwd: ctx.cwd,
 				initial_context: "Build a CLI",
 			},
-			{ signal: undefined },
+			{ signal: expect.any(AbortSignal) },
 		);
 	});
 
@@ -383,7 +385,7 @@ describe("ooo bridge extension contract", () => {
 		expect(invoke.mock.calls[2]?.[2]).toEqual({ cwd: ctx.cwd, initial_context: "Fresh" });
 	});
 
-	it("bypasses built-in controls while preserving ordinary interview answers", async () => {
+	it("bypasses UI controls, resets session controls, and preserves ordinary answers", async () => {
 		const connection = { name: "controls" } as MCPServerConnection;
 		const invoke = vi
 			.fn<typeof runtimeMcpModule.callTool>()
@@ -392,28 +394,38 @@ describe("ooo bridge extension contract", () => {
 				_meta: { session_id: "interview_controls", phase: "start" },
 			})
 			.mockResolvedValueOnce({
-				content: [{ type: "text", text: "Interview completed. Session ID: interview_controls" }],
-				_meta: { session_id: "interview_controls", phase: "complete", completed: true },
+				content: [{ type: "text", text: "Session interview_fresh_controls\n\nChoose again?" }],
+				_meta: { session_id: "interview_fresh_controls", phase: "start" },
+			})
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Interview completed. Session ID: interview_fresh_controls" }],
+				_meta: { session_id: "interview_fresh_controls", phase: "complete", completed: true },
 			});
+		const disconnect = vi.fn(async () => {});
 		const handler = createOuroborosOooBridge({
 			connect: vi.fn(async () => connection),
 			callTool: invoke,
-			disconnect: vi.fn(async () => {}),
+			disconnect,
 		});
 		const ctx = context();
 
 		await handler(input("ooo interview Controls", "interactive"), ctx);
-		for (const control of ["/exit", "/quit", "/new", "/clear", ".", "c"]) {
+		for (const control of ["/help", ".", "c"]) {
 			expect(await handler(input(control, "interactive"), ctx)).toEqual({});
 		}
 		expect(invoke).toHaveBeenCalledTimes(1);
+		expect(await handler(input("/clear", "interactive"), ctx)).toEqual({});
+		expect(disconnect).toHaveBeenCalledWith(connection);
+		expect(await handler(input("ordinary prompt", "interactive"), ctx)).toEqual({});
+
+		await handler(input("ooo interview Fresh controls", "interactive"), ctx);
 		expect(await handler(input("Linux", "interactive"), ctx)).toEqual({
 			handled: true,
-			text: "Interview completed. Session ID: interview_controls",
+			text: "Interview completed. Session ID: interview_fresh_controls",
 		});
-		expect(invoke.mock.calls[1]?.[2]).toEqual({
+		expect(invoke.mock.calls[2]?.[2]).toEqual({
 			cwd: ctx.cwd,
-			session_id: "interview_controls",
+			session_id: "interview_fresh_controls",
 			answer: "Linux",
 		});
 	});

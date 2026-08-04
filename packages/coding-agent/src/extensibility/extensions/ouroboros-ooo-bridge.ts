@@ -18,6 +18,11 @@ interface InterviewState {
 	sessionId: string;
 }
 
+interface OuroborosOooBridgeHandler {
+	(event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult>;
+	reset(): Promise<void>;
+}
+
 function resolveOuroborosCommand(): string {
 	return process.env[OUROBOROS_CLI_ENV]?.trim() || "ouroboros";
 }
@@ -36,6 +41,10 @@ function isOooCommand(text: string): boolean {
 
 function isBuiltInControlInput(text: string): boolean {
 	return text === "." || text === "c" || text.startsWith("/");
+}
+
+function resetsInterviewState(text: string): boolean {
+	return /^\/(?:clear|drop|exit|new|quit)(?:\s|$)/.test(text);
 }
 
 function resultText(result: MCPToolCallResult): string {
@@ -64,14 +73,17 @@ function resultCompleted(result: MCPToolCallResult): boolean {
 	return meta.completed === true || meta.phase === "complete";
 }
 
-export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}) {
+export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}): OuroborosOooBridgeHandler {
 	const connect = options.connect ?? connectToServer;
 	const invoke = options.callTool ?? callTool;
 	const disconnect = options.disconnect ?? disconnectServer;
 	let interview: InterviewState | undefined;
+	let interviewCaptureActive = false;
 	let activeConnection: MCPServerConnection | undefined;
 	let pendingConnection: Promise<MCPServerConnection> | undefined;
+	let activeOperationAbort: AbortController | undefined;
 	let lifecycleGeneration = 0;
+	let operationTail: Promise<void> = Promise.resolve();
 
 	const commandBridge = createExactPrefixCommandBridge({
 		prefix: "ooo",
@@ -96,6 +108,10 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 
 	async function resetInterview(): Promise<void> {
 		lifecycleGeneration++;
+		interviewCaptureActive = false;
+		const operationAbort = activeOperationAbort;
+		activeOperationAbort = undefined;
+		operationAbort?.abort(new Error("Ouroboros interview reset"));
 		const connectionToClose = activeConnection;
 		interview = undefined;
 		activeConnection = undefined;
@@ -135,13 +151,17 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 	}
 
 	async function runInterview(text: string, ctx: ExtensionContext): Promise<InputEventResult> {
+		const operationAbort = new AbortController();
+		activeOperationAbort = operationAbort;
+		const operationSignal = ctx.signal ? AbortSignal.any([ctx.signal, operationAbort.signal]) : operationAbort.signal;
+		const operationContext: ExtensionContext = { ...ctx, signal: operationSignal };
 		const generation = lifecycleGeneration;
 		const abortHandler = () => {
 			void resetInterview();
 		};
 		ctx.signal?.addEventListener("abort", abortHandler, { once: true });
 		try {
-			const interviewConnection = await connection(ctx, generation);
+			const interviewConnection = await connection(operationContext, generation);
 			const commandArgument = interviewArgument(text);
 			const args: Record<string, unknown> = { cwd: ctx.cwd };
 			if (interview) {
@@ -152,8 +172,8 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 				args.initial_context = commandArgument ?? "";
 			}
 
-			const result = await invoke(interviewConnection, INTERVIEW_TOOL, args, { signal: ctx.signal });
-			assertCurrent(generation, ctx.signal);
+			const result = await invoke(interviewConnection, INTERVIEW_TOOL, args, { signal: operationSignal });
+			assertCurrent(generation, operationSignal);
 			const output = resultText(result);
 			if (result.isError) throw new Error(output || "Ouroboros interview failed");
 
@@ -174,16 +194,40 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 			return { handled: true };
 		} finally {
 			ctx.signal?.removeEventListener("abort", abortHandler);
+			if (activeOperationAbort === operationAbort) activeOperationAbort = undefined;
 		}
 	}
 
-	return async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
+	function enqueueInterview(
+		text: string,
+		ctx: ExtensionContext,
+		explicitInterview: boolean,
+	): Promise<InputEventResult> {
+		const operation = operationTail.then(async () => {
+			if (!explicitInterview && !interviewCaptureActive && !interview) return { handled: true };
+			return runInterview(text, ctx);
+		});
+		operationTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation;
+	}
+
+	const handler = async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
 		if (event.source !== undefined && event.source !== "interactive") return {};
-		if (isBuiltInControlInput(event.text)) return {};
+		if (isBuiltInControlInput(event.text)) {
+			if (resetsInterviewState(event.text)) await resetInterview();
+			return {};
+		}
 		const argument = interviewArgument(event.text);
-		if (argument !== undefined || (interview && !isOooCommand(event.text))) {
-			return runInterview(event.text, ctx);
+		const explicitInterview = argument !== undefined;
+		if (explicitInterview) interviewCaptureActive = true;
+		if (explicitInterview || ((interviewCaptureActive || interview) && !isOooCommand(event.text))) {
+			return enqueueInterview(event.text, ctx, explicitInterview);
 		}
 		return commandBridge(event, ctx);
 	};
+
+	return Object.assign(handler, { reset: resetInterview });
 }

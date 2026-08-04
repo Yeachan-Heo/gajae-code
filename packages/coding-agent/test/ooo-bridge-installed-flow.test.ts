@@ -3,12 +3,19 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
+import { Agent } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
 import { loadExtensions } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { InputController } from "../src/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "../src/modes/types";
 import type { MCPServerConnection, MCPToolCallResult } from "../src/runtime-mcp";
 import * as runtimeMcpModule from "../src/runtime-mcp";
+import { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { SessionManager } from "../src/session/session-manager";
 
 function result(text: string, meta: Record<string, unknown>): MCPToolCallResult {
 	return {
@@ -21,6 +28,7 @@ describe("installed ooo bridge flow", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		delete process.env.OUROBOROS_CLI;
+		delete process.env.GJC_NO_TITLE;
 	});
 
 	it("renders the first question, correlates the next answer, and renders termination", async () => {
@@ -108,6 +116,160 @@ describe("installed ooo bridge flow", () => {
 		expect(callSpy).toHaveBeenCalledTimes(2);
 	});
 
+	it("claims a second InputController submission while interview startup is pending", async () => {
+		const connection = { name: "startup-overlap" } as MCPServerConnection;
+		const startup = Promise.withResolvers<MCPToolCallResult>();
+		const answer = Promise.withResolvers<MCPToolCallResult>();
+		vi.spyOn(runtimeMcpModule, "connectToServer").mockResolvedValue(connection);
+		const callSpy = vi
+			.spyOn(runtimeMcpModule, "callTool")
+			.mockImplementationOnce(() => startup.promise)
+			.mockImplementationOnce(() => answer.promise);
+		vi.spyOn(runtimeMcpModule, "disconnectServer").mockResolvedValue();
+		const examplePath = path.resolve(import.meta.dirname, "../examples/extensions/ooo-bridge.ts");
+		const loaded = await loadExtensions([examplePath], "/tmp/ooo-startup-overlap");
+		const runner = new ExtensionRunner(
+			loaded.extensions,
+			loaded.runtime,
+			"/tmp/ooo-startup-overlap",
+			{} as never,
+			{} as never,
+		);
+		const editor = {} as InteractiveModeContext["editor"];
+		const onInputCallback = vi.fn();
+		const ctx = {
+			session: { extensionRunner: runner, isStreaming: false, isCompacting: false, queuedMessageCount: 0 },
+			pendingImages: [],
+			hasActiveBtw: () => false,
+			editor,
+			addMessageToChat: vi.fn(() => []),
+			flushPendingBashComponents: vi.fn(),
+			onInputCallback,
+			ui: { requestRender: vi.fn() },
+		} as unknown as InteractiveModeContext;
+		const controller = new InputController(ctx);
+		const composer = { ownsComposer: false, editor };
+
+		const firstSubmit = controller.submitText("ooo interview Slow startup", composer);
+		await Bun.sleep(0);
+		const secondSubmit = controller.submitText("Linux", composer);
+		let secondSettled = false;
+		void secondSubmit.then(() => {
+			secondSettled = true;
+		});
+		await Bun.sleep(10);
+		expect(callSpy).toHaveBeenCalledTimes(1);
+		expect(secondSettled).toBe(false);
+		expect(onInputCallback).not.toHaveBeenCalled();
+
+		startup.resolve(
+			result("Session interview_startup_overlap\n\nWhich platform?", {
+				session_id: "interview_startup_overlap",
+				phase: "start",
+			}),
+		);
+		await firstSubmit;
+		await Bun.sleep(0);
+		expect(callSpy).toHaveBeenCalledTimes(2);
+		expect(callSpy.mock.calls[1]?.[2]).toEqual({
+			cwd: "/tmp/ooo-startup-overlap",
+			session_id: "interview_startup_overlap",
+			answer: "Linux",
+		});
+
+		answer.resolve(
+			result("Interview completed. Session ID: interview_startup_overlap", {
+				session_id: "interview_startup_overlap",
+				phase: "complete",
+				completed: true,
+			}),
+		);
+		await secondSubmit;
+		expect(onInputCallback).not.toHaveBeenCalled();
+	});
+
+	it("resets bridge state through AgentSession switch and InputController clear control paths", async () => {
+		process.env.GJC_NO_TITLE = "1";
+		const connection = { name: "session-controls" } as MCPServerConnection;
+		vi.spyOn(runtimeMcpModule, "connectToServer").mockResolvedValue(connection);
+		const callSpy = vi
+			.spyOn(runtimeMcpModule, "callTool")
+			.mockResolvedValueOnce(
+				result("Session interview_before_new\n\nOld question?", {
+					session_id: "interview_before_new",
+					phase: "start",
+				}),
+			)
+			.mockResolvedValueOnce(
+				result("Session interview_before_clear\n\nAnother question?", {
+					session_id: "interview_before_clear",
+					phase: "start",
+				}),
+			);
+		const disconnectSpy = vi.spyOn(runtimeMcpModule, "disconnectServer").mockResolvedValue();
+		const examplePath = path.resolve(import.meta.dirname, "../examples/extensions/ooo-bridge.ts");
+		const loaded = await loadExtensions([examplePath], "/tmp/ooo-session-controls");
+		const runner = new ExtensionRunner(
+			loaded.extensions,
+			loaded.runtime,
+			"/tmp/ooo-session-controls",
+			{} as never,
+			{} as never,
+		);
+		const authStorage = await AuthStorage.create(":memory:");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const sessionManager = SessionManager.inMemory("/tmp/ooo-session-controls");
+		const settings = Settings.isolated();
+		const session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings,
+			modelRegistry,
+			extensionRunner: runner,
+		});
+		try {
+			const editor = { setText: vi.fn(), addToHistory: vi.fn() } as unknown as InteractiveModeContext["editor"];
+			const onInputCallback = vi.fn();
+			const ctx = {
+				session,
+				sessionManager,
+				settings,
+				pendingImages: [],
+				hasActiveBtw: () => false,
+				editor,
+				addMessageToChat: vi.fn(() => []),
+				flushPendingBashComponents: vi.fn(),
+				onInputCallback,
+				handleClearCommand: () => session.newSession(),
+				handleContextClearCommand: async () => {
+					await session.clearContext();
+				},
+				startPendingSubmission: ({ text }: { text: string }) => ({ text, cancelled: false, started: false }),
+				ui: { requestRender: vi.fn() },
+			} as unknown as InteractiveModeContext;
+			const controller = new InputController(ctx);
+			const composer = { ownsComposer: false, editor };
+
+			await controller.submitText("ooo interview Before new", composer);
+			await session.newSession();
+			await controller.submitText("ordinary after new", composer);
+			expect(onInputCallback).toHaveBeenCalledTimes(1);
+			expect(callSpy).toHaveBeenCalledTimes(1);
+
+			await controller.submitText("ooo interview Before clear", composer);
+			await controller.submitText("/clear", composer);
+			await controller.submitText("ordinary after clear", composer);
+			expect(onInputCallback).toHaveBeenCalledTimes(2);
+			expect(callSpy).toHaveBeenCalledTimes(2);
+			expect(disconnectSpy).toHaveBeenCalledTimes(2);
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
+
 	it.skipIf(process.platform !== "linux" || process.arch !== "x64")(
 		"loads the copied one-file extension from a compiled binary without peer node_modules",
 		async () => {
@@ -152,7 +314,12 @@ describe("installed ooo bridge flow", () => {
 					new Response(run.stderr).text(),
 				]);
 				expect(runExit, stderr).toBe(0);
-				expect(JSON.parse(stdout)).toEqual({ errors: [], extensionCount: 1, handlerCount: 1 });
+				expect(JSON.parse(stdout)).toEqual({
+					errors: [],
+					extensionCount: 1,
+					handlerCount: 1,
+					sessionSwitchHandlerCount: 1,
+				});
 			} finally {
 				await fs.rm(root, { recursive: true, force: true });
 			}

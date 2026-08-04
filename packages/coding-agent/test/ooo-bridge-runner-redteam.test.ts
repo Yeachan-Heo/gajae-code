@@ -143,4 +143,66 @@ describe("ooo bridge runner red-team", () => {
 		expect(await runner.emitInput("ordinary prompt", undefined, "interactive")).toEqual({});
 		expect(invoke).toHaveBeenCalledTimes(1);
 	});
+
+	it("serializes overlapping continuation answers for one interview session", async () => {
+		const connection = { name: "serialized-answers" } as MCPServerConnection;
+		const firstAnswer = Promise.withResolvers<MCPToolCallResult>();
+		const secondAnswer = Promise.withResolvers<MCPToolCallResult>();
+		const invoke = vi
+			.fn<
+				(
+					_connection: MCPServerConnection,
+					_tool: string,
+					_args?: Record<string, unknown>,
+					_options?: MCPRequestOptions,
+				) => Promise<MCPToolCallResult>
+			>()
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Session interview_serial\n\nFirst question?" }],
+				_meta: { session_id: "interview_serial", phase: "start" },
+			})
+			.mockImplementationOnce(() => firstAnswer.promise)
+			.mockImplementationOnce(() => secondAnswer.promise);
+		const runner = runnerWith(
+			createOuroborosOooBridge({
+				connect: vi.fn(async () => connection),
+				callTool: invoke,
+				disconnect: vi.fn(async () => {}),
+			}),
+		);
+
+		await runner.emitInput("ooo interview Serialize", undefined, "interactive");
+		const first = runner.emitInput("first answer", undefined, "interactive");
+		await Bun.sleep(0);
+		const second = runner.emitInput("second answer", undefined, "interactive");
+		await Bun.sleep(10);
+		expect(invoke).toHaveBeenCalledTimes(2);
+		expect(invoke.mock.calls[1]?.[2]).toEqual({
+			cwd: "/tmp",
+			session_id: "interview_serial",
+			answer: "first answer",
+		});
+
+		firstAnswer.resolve({
+			content: [{ type: "text", text: "Session interview_serial\n\nSecond question?" }],
+			_meta: { session_id: "interview_serial", phase: "answer" },
+		});
+		await first;
+		await Bun.sleep(0);
+		expect(invoke).toHaveBeenCalledTimes(3);
+		expect(invoke.mock.calls[2]?.[2]).toEqual({
+			cwd: "/tmp",
+			session_id: "interview_serial",
+			answer: "second answer",
+		});
+
+		secondAnswer.resolve({
+			content: [{ type: "text", text: "Interview completed. Session ID: interview_serial" }],
+			_meta: { session_id: "interview_serial", phase: "complete", completed: true },
+		});
+		expect(await second).toEqual({
+			handled: true,
+			text: "Interview completed. Session ID: interview_serial",
+		});
+	});
 });
