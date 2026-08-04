@@ -719,6 +719,101 @@ describe("task no-session output refs", () => {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	it("settles a live detached task before resume retires its captured artifact root", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-detached-task-resume-"));
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		const asyncManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(asyncManager);
+		let runtime: AgentSession | undefined;
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+			if (!model) throw new Error("Expected bundled test model");
+			authStorage.setRuntimeApiKey("anthropic", "test-key");
+			const owner = SessionManager.inMemory(cwd, new FileSessionStorage());
+			runtime = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model, systemPrompt: ["Test"], tools: [] },
+				}),
+				sessionManager: owner,
+				settings: Settings.isolated(),
+				modelRegistry: new ModelRegistry(authStorage, path.join(cwd, "models.yml")),
+				agentId: "owner",
+			});
+			expect(await owner.saveArtifact("predecessor artifact", "bash")).toBe("0");
+			const predecessorManager = owner.getArtifactManager()!;
+			const predecessorRoot = predecessorManager.dir;
+			const lateWriteFinished = Promise.withResolvers<void>();
+			const lateWriteObservedRoot = Promise.withResolvers<boolean>();
+			const jobId = asyncManager.register(
+				"task",
+				"detached predecessor task",
+				async ({ signal }) => {
+					if (!signal.aborted)
+						await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+					lateWriteObservedRoot.resolve(await pathExists(predecessorRoot));
+					await Bun.write(path.join(predecessorRoot, "late-task.md"), "settled before retirement");
+					lateWriteFinished.resolve();
+					return "cancelled";
+				},
+				{
+					id: "detached-predecessor-job",
+					ownerId: "owner",
+					metadata: { subagent: { id: "detached-child", agent: "executor", agentSource: "bundled" } },
+				},
+			);
+			asyncManager.registerSubagentRecord({
+				subagentId: "detached-child",
+				ownerId: "owner",
+				currentJobId: jobId,
+				historicalJobIds: [],
+				status: "running",
+				sessionFile: null,
+				resumable: true,
+			});
+
+			const targetFile = path.join(cwd, "detached-target.jsonl");
+			await Bun.write(
+				targetFile,
+				`${JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: "detached-target",
+					timestamp: "2026-08-04T00:00:00.000Z",
+					cwd,
+				})}\n${JSON.stringify({
+					type: "message",
+					id: "detached-target-message",
+					parentId: null,
+					timestamp: "2026-08-04T00:00:01.000Z",
+					message: { role: "user", content: "successor", timestamp: 1 },
+				})}\n`,
+			);
+
+			expect(await runtime.switchSession(targetFile)).toBe(true);
+			await lateWriteFinished.promise;
+			expect(await lateWriteObservedRoot.promise).toBe(true);
+			await waitForPathRemoval(predecessorRoot);
+			expect(await pathExists(predecessorRoot)).toBe(false);
+			await Bun.sleep(25);
+			expect(await pathExists(predecessorRoot)).toBe(false);
+			expect(asyncManager.getSubagentRecord("detached-child")).toBeUndefined();
+			expect(asyncManager.getJob(jobId)?.status).not.toBe("running");
+			expect(owner.isArtifactManagerAuthorized(predecessorManager)).toBe(false);
+			const successorManager = owner.getArtifactManager();
+			expect(successorManager).toBeTruthy();
+			expect(successorManager!.dir).toBe(targetFile.slice(0, -6));
+			expect(await Bun.file(path.join(successorManager!.dir, "late-task.md")).exists()).toBe(false);
+			expect(await owner.saveArtifact("successor artifact", "bash")).toBe("0");
+		} finally {
+			if (runtime) await runtime.dispose();
+			await asyncManager.dispose({ timeoutMs: 100 });
+			AsyncJobManager.setInstance(undefined);
+			authStorage.close();
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 	it("retires a task-first fallback on resume and restores the persisted artifact root", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(

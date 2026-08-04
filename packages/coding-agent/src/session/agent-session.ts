@@ -184,7 +184,7 @@ import {
 } from "@gajae-code/utils";
 
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
-import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
+import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager, type OwnerSubagentShutdownLease } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -16371,6 +16371,10 @@ export class AgentSession {
 			onTransitionMutationStarted?: () => void;
 		},
 	): Promise<boolean> {
+		let ownerShutdownManager: AsyncJobManager | undefined;
+		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
+		let ownerShutdownInitialSessionId: string | undefined;
+		let ownerShutdownFinished = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -16391,9 +16395,61 @@ export class AgentSession {
 			}
 			options?.onTransitionMutationStarted?.();
 
-			this.#disconnectFromAgent();
-			await this.abort();
+			const asyncManager = AsyncJobManager.instance();
+			const ownerId = this.#agentId;
+			const lease =
+				switchingToDifferentSession && asyncManager && ownerId
+					? asyncManager.beginOwnerSubagentShutdown(ownerId)
+					: undefined;
+			if (switchingToDifferentSession && asyncManager && ownerId && !lease) {
+				this.emitNotice(
+					"error",
+					"Cannot switch sessions while owned subagent cleanup is already in progress.",
+					"switch-session-subagent-cleanup",
+				);
+				return false;
+			}
+			if (lease && asyncManager && ownerId) {
+				ownerShutdownManager = asyncManager;
+				ownerShutdownLease = lease;
+				ownerShutdownInitialSessionId = this.sessionManager.getSessionId();
+				try {
+					asyncManager.runOwnerProducerCleanupsStrict({ ownerId });
+					await this.abort();
+					if (this.isCompacting) {
+						this.abortCompaction();
+						while (this.isCompacting) await Bun.sleep(10);
+					}
+					const proof = await asyncManager.cancelAndProveOwnerSubagents(lease);
+					if (!proof.confirmed) {
+						this.emitNotice(
+							"error",
+							"Unable to confirm owned subagent cleanup; session was not switched. Wait for or inspect remaining subagents, then retry /resume.",
+							"switch-session-subagent-cleanup",
+						);
+						asyncManager.finishOwnerSubagentShutdown(lease, "release");
+						ownerShutdownFinished = true;
+						return false;
+					}
+				} catch {
+					this.emitNotice(
+						"error",
+						"Unable to confirm owned subagent cleanup; session was not switched. Wait for or inspect remaining subagents, then retry /resume.",
+						"switch-session-subagent-cleanup",
+					);
+					asyncManager.finishOwnerSubagentShutdown(lease, "release");
+					ownerShutdownFinished = true;
+					return false;
+				}
+				if (!(await asyncManager.waitForOwnerInFlightDeliveries(ownerId)))
+					throw new Error("Owned async deliveries did not settle before session switch.");
+				if (!(await asyncManager.cancelAndSettleOwnerJobs(ownerId)))
+					throw new Error("Owned async jobs did not settle before session switch.");
+			} else {
+				await this.abort();
+			}
 
+			this.#disconnectFromAgent();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flush();
 			const previousSessionState = this.sessionManager.captureState();
@@ -16614,6 +16670,12 @@ export class AgentSession {
 				throw error;
 			}
 		} finally {
+			if (ownerShutdownManager && ownerShutdownLease && !ownerShutdownFinished) {
+				ownerShutdownManager.finishOwnerSubagentShutdown(
+					ownerShutdownLease,
+					this.sessionManager.getSessionId() !== ownerShutdownInitialSessionId ? "commit" : "release",
+				);
+			}
 			this.#endSessionTransition();
 		}
 	}
