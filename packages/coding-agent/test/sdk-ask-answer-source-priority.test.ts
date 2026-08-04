@@ -90,6 +90,32 @@ describe("ask answer source priority", () => {
 		}
 	});
 
+	it("keeps a protocol source ahead of a legacy two-argument interactive registration", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-ask-source-priority-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(tempDir),
+			settings: Settings.isolated(),
+			hasUI: true,
+		});
+
+		try {
+			const protocol = { awaitAnswer: async () => undefined };
+			const legacyInteractive = { awaitAnswer: async () => undefined };
+			const disposeProtocol = registerAskAnswerSource(session.sessionId, protocol, "protocol");
+			const disposeLegacyInteractive = registerAskAnswerSource(session.sessionId, legacyInteractive);
+
+			expect(getAskAnswerSource(session.sessionId)).toBe(protocol);
+			disposeProtocol();
+			expect(getAskAnswerSource(session.sessionId)).toBe(legacyInteractive);
+			disposeLegacyInteractive();
+		} finally {
+			await session.dispose?.();
+		}
+	});
+
 	it("selects the most recently registered protocol source", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-ask-source-priority-"));
 		tempDirs.push(tempDir);
