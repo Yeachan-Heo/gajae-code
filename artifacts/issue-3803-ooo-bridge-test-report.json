@@ -3,18 +3,18 @@
   "kind": "api-package-test-report",
   "issue": 3803,
   "baseline": {
-    "gjcBase": "c6c4c474a462d1c5db3aa58dbb23a2310364bef9",
+    "gjcBase": "9477947f8b89b74bf3efcc4c1bf7c4591a0558ec",
     "ouroborosRelease": "v0.50.7",
     "ouroborosCommit": "cb658aa819bfabafecbbe91bc36327f10691171b",
     "ouroborosWheelSha256": "df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4",
-    "standaloneBridgeCommit": "4b07ee81675d16b81fd5eeb9645042d8fc307c3a",
+    "standaloneBridgeCommit": "4311fefd49e9c6781c4d1111b8dd3f758e7d8974",
     "standaloneBridgeSha256": "2b0e1e25ac145331f112da629076875542db6f6e63c3c17adcd6770a4dcaf7bd"
   },
   "verification": [
     {
       "command": "bun test packages/coding-agent/test/ooo-bridge-extension-contract.test.ts packages/coding-agent/test/ooo-bridge-runner-redteam.test.ts packages/coding-agent/test/ooo-bridge-installed-flow.test.ts packages/coding-agent/test/extensions-discovery.test.ts packages/coding-agent/test/extensions-runner.test.ts",
       "status": "passed",
-      "result": "100 pass, 0 fail, 293 expect() calls"
+      "result": "100 pass, 0 fail, 295 expect() calls"
     },
     {
       "command": "bun --cwd=packages/coding-agent run check",
@@ -38,6 +38,11 @@
     }
   ],
   "adversarialCases": [
+    {
+      "id": "queued-explicit-generation-fence",
+      "status": "passed",
+      "evidence": "Deferred MCP operations hold queued explicit interview starts while actual AgentSession session_switch and InputController /clear resets advance the lifecycle generation; predecessor entries settle handled without issuing another MCP call."
+    },
     {
       "id": "session-switch-disposal",
       "status": "passed",

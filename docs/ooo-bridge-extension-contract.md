@@ -48,7 +48,7 @@ Runner timeout aborts the handler context signal. The bridge passes that signal 
 
 Slash-prefixed UI commands bypass interview capture. The bare continue controls `.` and `c` also remain GJC controls; other ordinary text remains a valid interview answer.
 
-The installed example also registers `session_switch` disposal because GJC reuses one `ExtensionRunner` across `/new`, `/drop`, resume, and fork transitions. Session-changing input controls reset immediately, including `/clear`, and the lifecycle hook covers identity changes initiated outside the input path. Interview startup and continuation calls share one FIFO operation chain: a second submission during startup is claimed and waits for the session ID, while overlapping answers issue one MCP call at a time against the latest settled state.
+The installed example also registers `session_switch` disposal because GJC reuses one `ExtensionRunner` across `/new`, `/drop`, resume, and fork transitions. Session-changing input controls reset immediately, including `/clear`, and the lifecycle hook covers identity changes initiated outside the input path. Interview startup and continuation calls share one FIFO operation chain: a second submission during startup is claimed and waits for the session ID, while overlapping answers issue one MCP call at a time against the latest settled state. Every queue entry is bound to the lifecycle generation at submission, so resets consume predecessor-generation entries—including explicit `ooo interview` starts—without calling MCP in the successor session.
 
 ## Recursion guard
 
@@ -69,10 +69,10 @@ ouroboros setup --runtime gjc
 
 ### Verified GJC bridge installation
 
-Ouroboros setup installs its own managed GJC bridge. Replace it with the standalone GJC bridge from immutable commit `4b07ee81675d16b81fd5eeb9645042d8fc307c3a`, whose example file has SHA-256 `2b0e1e25ac145331f112da629076875542db6f6e63c3c17adcd6770a4dcaf7bd`:
+Ouroboros setup installs its own managed GJC bridge. Replace it with the standalone GJC bridge from immutable commit `4311fefd49e9c6781c4d1111b8dd3f758e7d8974`, whose example file has SHA-256 `2b0e1e25ac145331f112da629076875542db6f6e63c3c17adcd6770a4dcaf7bd`:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/4b07ee81675d16b81fd5eeb9645042d8fc307c3a/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
+curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/4311fefd49e9c6781c4d1111b8dd3f758e7d8974/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
 shasum -a 256 /tmp/gjc-ooo-bridge.ts
 mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge" && cp /tmp/gjc-ooo-bridge.ts "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge/index.ts"
 ```
