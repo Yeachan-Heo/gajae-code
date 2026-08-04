@@ -8,6 +8,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { CustomTool } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 import { createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
+import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, logger, Snowflake, setAgentDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
@@ -229,6 +230,53 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.dispose();
 		}
 	});
+
+	it(
+		"keeps deferred MCP startup and tool use alive across a logical session transition",
+		async () => {
+			authStorage.setRuntimeApiKey("openai", "test-key");
+			const configPath = path.join(tempDir, "deferred-transition-mcp.json");
+			const discovery = Promise.withResolvers<MCPLoadResult>();
+			vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementation(async () => await discovery.promise);
+			const execute = vi.fn(async () => ({
+				content: [{ type: "text" as const, text: "transition tool executed" }],
+			}));
+			const deferredTool = { ...createMcpCustomTool("mcp__transition_lookup", "exact", "lookup"), execute };
+
+			const { session, startDeferredMcpConfig } = await createAgentSession({
+				...createIsolatedSessionOptions(),
+				mcpConfigPath: configPath,
+				deferMcpConfigStartup: true,
+			});
+			const taskFallbackRoot = path.join(tempDir, "task-fallback-artifacts");
+			const taskFallbackManager = new ArtifactManager(taskFallbackRoot);
+			expect(await taskFallbackManager.save("task predecessor", "task")).toBe("0");
+			session.sessionManager.adoptArtifactManager(taskFallbackManager);
+			let transitionCleanupCount = 0;
+			session.registerToolSessionTransitionCleanup(() => {
+				transitionCleanupCount++;
+				session.sessionManager.releaseArtifactManager(taskFallbackManager);
+				fs.rmSync(taskFallbackRoot, { recursive: true, force: true });
+			});
+			try {
+				expect(await session.newSession()).toBe(true);
+				expect(transitionCleanupCount).toBe(1);
+				expect(fs.existsSync(taskFallbackRoot)).toBe(false);
+				const startup = startDeferredMcpConfig!();
+				discovery.resolve(createMcpLoadResult([deferredTool]));
+				await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+				expect(session.getActiveToolNames()).toContain("mcp__transition_lookup");
+
+				const activeTool = session.agent.state.tools.find(tool => tool.name === "mcp__transition_lookup");
+				expect(activeTool).toBeTruthy();
+				await activeTool!.execute("transition-call", { query: "after new session" });
+				expect(execute).toHaveBeenCalledTimes(1);
+			} finally {
+				await session.dispose();
+			}
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 	it("reports deferred MCP startup failures generically", async () => {
 		const configPath = path.join(tempDir, "private-deferred-mcp.json");
 		const discovery = Promise.withResolvers<MCPLoadResult>();

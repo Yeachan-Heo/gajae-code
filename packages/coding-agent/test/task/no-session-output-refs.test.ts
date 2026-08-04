@@ -450,15 +450,24 @@ describe("task no-session output refs", () => {
 			if (!model) throw new Error("Expected bundled test model");
 			authStorage.setRuntimeApiKey("anthropic", "test-key");
 			const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
-			let rejectSwitch = true;
+			const owner = SessionManager.inMemory(cwd, new FileSessionStorage());
+			let hookSession: TestToolSession | undefined;
+			let hookFallbackManager: ArtifactManager | undefined;
+			let hookFallbackRoot: string | undefined;
+			let hookObservation:
+				| { rootExists: boolean; fallbackAuthorized: boolean; currentManager: ArtifactManager | null }
+				| undefined;
 			const extensionRunner = {
 				hasHandlers: vi.fn(() => false),
 				emit: vi.fn(async (event: { type: string }) => {
-					if (event.type === "session_switch" && rejectSwitch)
-						throw new Error("injected post-load switch failure");
+					if (event.type !== "session_switch" || !hookSession || !hookFallbackManager || !hookFallbackRoot) return;
+					hookObservation = {
+						rootExists: await pathExists(hookFallbackRoot),
+						fallbackAuthorized: owner.isArtifactManagerAuthorized(hookFallbackManager),
+						currentManager: hookSession.getArtifactManager?.() ?? null,
+					};
 				}),
 			} as unknown as ExtensionRunner;
-			const owner = SessionManager.inMemory(cwd, new FileSessionStorage());
 			runtime = new AgentSession({
 				agent: new Agent({
 					getApiKey: () => "test-key",
@@ -472,6 +481,7 @@ describe("task no-session output refs", () => {
 
 			let transitionCleanupCount = 0;
 			const session = createSession(null, `task-first-resume-${Snowflake.next()}`);
+			hookSession = session;
 			session.getArtifactManager = () => owner.getArtifactManager();
 			session.isArtifactManagerAuthorized = candidate => owner.isArtifactManagerAuthorized(candidate);
 			session.adoptArtifactManager = manager => owner.adoptArtifactManager(manager);
@@ -480,8 +490,12 @@ describe("task no-session output refs", () => {
 				const manager = owner.getArtifactManager();
 				return manager ? [manager.dir] : [];
 			};
+			let disposalCleanupCount = 0;
+			runtime.registerToolSessionCleanup(() => {
+				disposalCleanupCount++;
+			});
 			session.registerSessionCleanup = cleanup =>
-				runtime!.registerToolSessionCleanup(async () => {
+				runtime!.registerToolSessionTransitionCleanup(async () => {
 					transitionCleanupCount++;
 					await cleanup();
 				});
@@ -512,17 +526,25 @@ describe("task no-session output refs", () => {
 			expect(await fallbackManager!.save("task predecessor artifact", "task")).toBe("0");
 			expect(await owner.saveArtifact("parent predecessor artifact", "bash")).toBe("1");
 			const fallbackRoot = fallbackManager!.dir;
+			hookFallbackManager = fallbackManager!;
+			hookFallbackRoot = fallbackRoot;
 
-			await expect(runtime.switchSession(targetFile)).rejects.toThrow("injected post-load switch failure");
+			const ensureOnDisk = vi
+				.spyOn(owner, "ensureOnDisk")
+				.mockRejectedValueOnce(new Error("injected pre-commit failure"));
+			await expect(runtime.switchSession(targetFile)).rejects.toThrow("injected pre-commit failure");
+			ensureOnDisk.mockRestore();
 			expect(transitionCleanupCount).toBe(0);
+			expect(disposalCleanupCount).toBe(0);
 			expect(await pathExists(fallbackRoot)).toBe(true);
 			expect(owner.getArtifactManager()).toBe(fallbackManager);
 			expect(owner.isArtifactManagerAuthorized(fallbackManager!)).toBe(true);
 			expect(session.getArtifactManager?.()).toBe(fallbackManager);
 
-			rejectSwitch = false;
 			expect(await runtime.switchSession(targetFile)).toBe(true);
 			expect(await pathExists(fallbackRoot)).toBe(false);
+			expect(transitionCleanupCount).toBe(1);
+			expect(disposalCleanupCount).toBe(0);
 			const resumedManager = owner.getArtifactManager();
 			expect(resumedManager).toBeTruthy();
 			expect(resumedManager).not.toBe(fallbackManager);
@@ -530,6 +552,11 @@ describe("task no-session output refs", () => {
 			expect(owner.isArtifactManagerAuthorized(fallbackManager!)).toBe(false);
 			expect(owner.isArtifactManagerAuthorized(resumedManager!)).toBe(true);
 			expect(session.getArtifactManager?.()).toBe(resumedManager);
+			expect(hookObservation).toEqual({
+				rootExists: false,
+				fallbackAuthorized: false,
+				currentManager: resumedManager,
+			});
 
 			const context = {
 				cwd,
@@ -544,7 +571,9 @@ describe("task no-session output refs", () => {
 				"persisted after resume",
 			);
 
+			expect(disposalCleanupCount).toBe(0);
 			await runtime.dispose();
+			expect(disposalCleanupCount).toBe(1);
 			runtime = undefined;
 			const reopened = await SessionManager.open(targetFile, cwd);
 			try {

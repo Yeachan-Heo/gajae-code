@@ -1971,6 +1971,7 @@ export class AgentSession {
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
+	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
@@ -3406,6 +3407,23 @@ export class AgentSession {
 		if (this.#isDisposed) throw new Error("Cannot register tool cleanup after session disposal has started.");
 		this.#toolSessionCleanups.add(cleanup);
 		return () => this.#toolSessionCleanups.delete(cleanup);
+	}
+
+	registerToolSessionTransitionCleanup(cleanup: () => Promise<void> | void): () => void {
+		if (this.#isDisposed)
+			throw new Error("Cannot register tool transition cleanup after session disposal has started.");
+		this.#toolSessionTransitionCleanups.add(cleanup);
+		return () => this.#toolSessionTransitionCleanups.delete(cleanup);
+	}
+
+	async #runToolSessionTransitionCleanups(): Promise<void> {
+		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
+		this.#toolSessionTransitionCleanups.clear();
+		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
+		for (const result of results) {
+			if (result.status === "rejected")
+				logger.warn("Tool session transition cleanup failed", { error: String(result.reason) });
+		}
 	}
 
 	async #runToolSessionCleanups(): Promise<void> {
@@ -6036,6 +6054,7 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
+		await this.#runToolSessionTransitionCleanups();
 		await this.#runToolSessionCleanups();
 		// Only disconnect the MCP manager THIS session owns (top-level sessions that
 		// connected plugin-bundle MCP servers). Subagents and callers that merely
@@ -10220,7 +10239,7 @@ export class AgentSession {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
-				await this.#runToolSessionCleanups();
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -10290,7 +10309,7 @@ export class AgentSession {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
-				await this.#runToolSessionCleanups();
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -10458,7 +10477,7 @@ export class AgentSession {
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
-				await this.#runToolSessionCleanups();
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -12216,7 +12235,7 @@ export class AgentSession {
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
 				committed = true;
-				await this.#runToolSessionCleanups();
+				await this.#runToolSessionTransitionCleanups();
 				this.agent.reset();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -16405,6 +16424,7 @@ export class AgentSession {
 				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
+			let transitionCleanupCommitted = false;
 
 			try {
 				await this.sessionManager.setSessionFile(sessionPath);
@@ -16507,6 +16527,10 @@ export class AgentSession {
 					this.#resetIrcRosterDeliveryState();
 				}
 
+				if (switchingToDifferentSession) {
+					await this.#runToolSessionTransitionCleanups();
+					transitionCleanupCommitted = true;
+				}
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
 				// teardown. The previous runtime waits for those continuations to settle;
@@ -16515,7 +16539,8 @@ export class AgentSession {
 					this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
 				// session_switch is the post-commit identity signal. SDK authority and
 				// other identity-bound integrations must not observe the successor until
-				// messages, model state, MCP selections, and the agent subscription are live.
+				// messages, model state, MCP selections, the agent subscription, and
+				// session-scoped tool cleanup are complete.
 				if (this.#extensionRunner) {
 					await this.#extensionRunner.emit({
 						type: "session_switch",
@@ -16524,9 +16549,9 @@ export class AgentSession {
 						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
-				if (switchingToDifferentSession) await this.#runToolSessionCleanups();
 				return true;
 			} catch (error) {
+				if (transitionCleanupCommitted) throw error;
 				this.sessionManager.restoreState(previousSessionState);
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
@@ -16637,7 +16662,7 @@ export class AgentSession {
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
-				await this.#runToolSessionCleanups();
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
