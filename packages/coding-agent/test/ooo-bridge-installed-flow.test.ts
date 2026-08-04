@@ -188,10 +188,12 @@ describe("installed ooo bridge flow", () => {
 		expect(onInputCallback).not.toHaveBeenCalled();
 	});
 
-	it("resets bridge state through AgentSession switch and InputController clear control paths", async () => {
+	it("drops queued explicit starts across AgentSession switch and InputController clear resets", async () => {
 		process.env.GJC_NO_TITLE = "1";
 		const connection = { name: "session-controls" } as MCPServerConnection;
 		vi.spyOn(runtimeMcpModule, "connectToServer").mockResolvedValue(connection);
+		const pendingBeforeSwitch = Promise.withResolvers<MCPToolCallResult>();
+		const pendingBeforeClear = Promise.withResolvers<MCPToolCallResult>();
 		const callSpy = vi
 			.spyOn(runtimeMcpModule, "callTool")
 			.mockResolvedValueOnce(
@@ -200,12 +202,14 @@ describe("installed ooo bridge flow", () => {
 					phase: "start",
 				}),
 			)
+			.mockImplementationOnce(() => pendingBeforeSwitch.promise)
 			.mockResolvedValueOnce(
 				result("Session interview_before_clear\n\nAnother question?", {
 					session_id: "interview_before_clear",
 					phase: "start",
 				}),
-			);
+			)
+			.mockImplementationOnce(() => pendingBeforeClear.promise);
 		const disconnectSpy = vi.spyOn(runtimeMcpModule, "disconnectServer").mockResolvedValue();
 		const examplePath = path.resolve(import.meta.dirname, "../examples/extensions/ooo-bridge.ts");
 		const loaded = await loadExtensions([examplePath], "/tmp/ooo-session-controls");
@@ -253,16 +257,40 @@ describe("installed ooo bridge flow", () => {
 			const composer = { ownsComposer: false, editor };
 
 			await controller.submitText("ooo interview Before new", composer);
+			const answerBeforeSwitch = controller.submitText("pending answer before new", composer);
+			await Bun.sleep(0);
+			const queuedExplicitBeforeSwitch = controller.submitText("ooo interview queued before new", composer);
+			await Bun.sleep(10);
+			expect(callSpy).toHaveBeenCalledTimes(2);
 			await session.newSession();
+			pendingBeforeSwitch.resolve(
+				result("Session interview_before_new\n\nStale successor question?", {
+					session_id: "interview_before_new",
+					phase: "answer",
+				}),
+			);
+			await Promise.all([answerBeforeSwitch, queuedExplicitBeforeSwitch]);
+			expect(callSpy).toHaveBeenCalledTimes(2);
 			await controller.submitText("ordinary after new", composer);
 			expect(onInputCallback).toHaveBeenCalledTimes(1);
-			expect(callSpy).toHaveBeenCalledTimes(1);
 
 			await controller.submitText("ooo interview Before clear", composer);
+			const answerBeforeClear = controller.submitText("pending answer before clear", composer);
+			await Bun.sleep(0);
+			const queuedExplicitBeforeClear = controller.submitText("ooo interview queued before clear", composer);
+			await Bun.sleep(10);
+			expect(callSpy).toHaveBeenCalledTimes(4);
 			await controller.submitText("/clear", composer);
+			pendingBeforeClear.resolve(
+				result("Session interview_before_clear\n\nStale clear question?", {
+					session_id: "interview_before_clear",
+					phase: "answer",
+				}),
+			);
+			await Promise.all([answerBeforeClear, queuedExplicitBeforeClear]);
+			expect(callSpy).toHaveBeenCalledTimes(4);
 			await controller.submitText("ordinary after clear", composer);
 			expect(onInputCallback).toHaveBeenCalledTimes(2);
-			expect(callSpy).toHaveBeenCalledTimes(2);
 			expect(disconnectSpy).toHaveBeenCalledTimes(2);
 		} finally {
 			await session.dispose();

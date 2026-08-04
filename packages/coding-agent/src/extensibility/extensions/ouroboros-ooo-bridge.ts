@@ -203,7 +203,9 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 		ctx: ExtensionContext,
 		explicitInterview: boolean,
 	): Promise<InputEventResult> {
+		const submissionGeneration = lifecycleGeneration;
 		const operation = operationTail.then(async () => {
+			if (submissionGeneration !== lifecycleGeneration) return { handled: true };
 			if (!explicitInterview && !interviewCaptureActive && !interview) return { handled: true };
 			return runInterview(text, ctx);
 		});
