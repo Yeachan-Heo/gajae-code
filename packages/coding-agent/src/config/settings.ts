@@ -150,10 +150,28 @@ const LOCAL_NOTIFICATION_SETTING_PATHS = new Set(
 	[...LOCAL_NOTIFICATION_SETTING_KEYS].map(key => `notifications.${key}`),
 );
 
+const USER_GLOBAL_CONTEXT_SETTING_KEYS = new Set(["userGlobalAgentsPrecedence", "homeRootAgents"]);
+
 function isNotificationSettingsPath(path: string): boolean {
 	return (
 		(path === "notifications" || path.startsWith("notifications.")) && !LOCAL_NOTIFICATION_SETTING_PATHS.has(path)
 	);
+}
+
+function stripProjectUserGlobalContextSettings(value: unknown): { value: unknown; rejected: boolean } {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { value, rejected: false };
+
+	let rejected = false;
+	const localContext: Record<string, unknown> = {};
+	for (const [contextKey, contextValue] of Object.entries(value)) {
+		if (USER_GLOBAL_CONTEXT_SETTING_KEYS.has(contextKey)) {
+			rejected = true;
+		} else {
+			localContext[contextKey] = contextValue;
+		}
+	}
+
+	return { value: Object.keys(localContext).length > 0 ? localContext : undefined, rejected };
 }
 
 function isAtomicSettingsPath(path: string): boolean {
@@ -1245,11 +1263,14 @@ export class Settings implements NotificationSettingsReader {
 			let merged: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level !== "project") continue;
-				const { settings, rejectedNotifications } = this.#stripProjectNotificationSettings(
+				const { settings, rejectedNotifications, rejectedUserGlobalContext } = this.#stripProjectLocalOnlySettings(
 					item.data as RawSettings,
 				);
 				if (rejectedNotifications) {
 					logger.warn("Settings: ignoring project notification settings", { path: item.path });
+				}
+				if (rejectedUserGlobalContext) {
+					logger.warn("Settings: ignoring project user-global AGENTS.md settings", { path: item.path });
 				}
 				merged = this.#deepMerge(merged, settings);
 			}
@@ -1997,11 +2018,13 @@ export class Settings implements NotificationSettingsReader {
 		}
 	}
 
-	#stripProjectNotificationSettings(settings: RawSettings): {
+	#stripProjectLocalOnlySettings(settings: RawSettings): {
 		settings: RawSettings;
 		rejectedNotifications: boolean;
+		rejectedUserGlobalContext: boolean;
 	} {
 		let rejectedNotifications = false;
+		let rejectedUserGlobalContext = false;
 		const sanitized: RawSettings = {};
 		for (const [key, value] of Object.entries(settings)) {
 			if (key === "notifications" && value && typeof value === "object" && !Array.isArray(value)) {
@@ -2020,9 +2043,19 @@ export class Settings implements NotificationSettingsReader {
 				rejectedNotifications = true;
 				continue;
 			}
+			if (key === "context") {
+				const stripped = stripProjectUserGlobalContextSettings(value);
+				if (stripped.rejected) rejectedUserGlobalContext = true;
+				if (stripped.value !== undefined) sanitized[key] = stripped.value;
+				continue;
+			}
+			if (key === "context.userGlobalAgentsPrecedence" || key === "context.homeRootAgents") {
+				rejectedUserGlobalContext = true;
+				continue;
+			}
 			sanitized[key] = value;
 		}
-		return { settings: sanitized, rejectedNotifications };
+		return { settings: sanitized, rejectedNotifications, rejectedUserGlobalContext };
 	}
 
 	#deepMerge(base: RawSettings, overrides: RawSettings): RawSettings {

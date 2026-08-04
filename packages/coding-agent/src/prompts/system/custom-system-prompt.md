@@ -9,6 +9,10 @@
 <project>
 ## Context
 <instructions>
+Follow the context files below for all tasks. Later files have higher precedence when context files conflict.
+{{#if userGlobalAgentsOverride}}
+User-global AGENTS.md is configured as an override and has the highest context-file precedence.
+{{/if}}
 {{#list contextFiles join="\n"}}
 <file path="{{path}}">
 {{content}}

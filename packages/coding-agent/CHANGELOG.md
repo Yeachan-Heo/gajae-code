@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- User-global AGENTS.md context precedence is now configurable with `context.userGlobalAgentsPrecedence: fallback | override`, and `~/AGENTS.md` can be loaded only through the user-owned `context.homeRootAgents` opt-in. Project settings cannot force either control, and home-root `AGENTS.md` discovered by ancestor walking is filtered unless the opt-in is enabled.
+
 ## [0.12.11] - 2026-08-03
 
 ### Fixed

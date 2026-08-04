@@ -11,6 +11,12 @@ Package-specific references:
 - [DEVELOPMENT](./DEVELOPMENT.md)
 - [RenderMermaid guide](../../docs/render-mermaid.md)
 
+## User-global AGENTS.md context
+
+GJC loads `~/.gjc/agent/AGENTS.md` as user-global context. By default it is fallback guidance: project `AGENTS.md` files render later and win conflicts. Set `context.userGlobalAgentsPrecedence: override` to make user-global AGENTS.md win context-file conflicts while still staying below system/developer instructions.
+
+`~/AGENTS.md` is not loaded by default. Set `context.homeRootAgents: true` to opt in to that home-root file as user-global context.
+
 ## External lifecycle notifications
 
 GJC already exposes public lifecycle events through the extension/hook event contract. External notification integrations for Discord, Hermes, clawhip, or similar channels should be opt-in and subscribe to these events instead of scraping transcripts or logs:
