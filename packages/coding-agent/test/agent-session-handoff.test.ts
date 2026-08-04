@@ -35,6 +35,13 @@ describe("AgentSession handoff", () => {
 		throw new Error("Timed out waiting for handoff maintenance observation");
 	}
 
+	async function waitForAbort(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return;
+		const aborted = Promise.withResolvers<void>();
+		signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+		await aborted.promise;
+	}
+
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-handoff-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
@@ -158,8 +165,7 @@ describe("AgentSession handoff", () => {
 			"task",
 			"handoff predecessor task",
 			async ({ signal }) => {
-				if (!signal.aborted)
-					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await waitForAbort(signal);
 				await Bun.write(path.join(fallbackRoot, "late-task.md"), "settled before handoff cleanup");
 				order.push("late-write");
 				return "cancelled";

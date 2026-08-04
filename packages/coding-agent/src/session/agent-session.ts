@@ -1972,6 +1972,7 @@ export class AgentSession {
 	#disposePromise: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
+	readonly #deferredOwnerShutdownFinalizations = new Set<Promise<void>>();
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
@@ -3498,6 +3499,39 @@ export class AgentSession {
 		} finally {
 			manager.finishOwnerSubagentShutdown(lease, committed ? "commit" : "release");
 		}
+	}
+
+	#scheduleDeferredOwnerShutdownFinalization(
+		manager: AsyncJobManager,
+		lease: OwnerSubagentShutdownLease,
+		ownerId: string,
+	): void {
+		const finalization = (async () => {
+			while (!this.#isDisposed) {
+				try {
+					manager.runOwnerProducerCleanupsStrict({ ownerId });
+					const proof = await manager.cancelAndProveOwnerSubagents(lease);
+					if (!proof.confirmed) throw new Error(`owner_subagent_${proof.reason}`);
+					if (!(await manager.waitForOwnerInFlightDeliveries(ownerId)))
+						throw new Error("owner_delivery_settlement_timeout");
+					if (!(await manager.cancelAndSettleOwnerJobs(ownerId))) throw new Error("owner_job_settlement_timeout");
+					if (this.#isDisposed) break;
+					this.sessionManager.retireEphemeralArtifactsAfterTransition();
+					await this.#runToolSessionTransitionCleanups();
+					manager.finishOwnerSubagentShutdown(lease, "commit");
+					return;
+				} catch (error) {
+					logger.warn("Deferred owner shutdown finalization retry failed", {
+						ownerId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					await Bun.sleep(25);
+				}
+			}
+			manager.finishOwnerSubagentShutdown(lease, "release");
+		})();
+		this.#deferredOwnerShutdownFinalizations.add(finalization);
+		void finalization.finally(() => this.#deferredOwnerShutdownFinalizations.delete(finalization));
 	}
 
 	#suppressOwnAsyncJobDeliveries(): void {
@@ -6065,6 +6099,7 @@ export class AgentSession {
 		// the session that owns the manager goes on to dispose it (which itself
 		// nukes any leftover jobs and pending deliveries).
 		this.#cancelOwnAsyncJobs();
+		await Promise.allSettled(this.#deferredOwnerShutdownFinalizations);
 		const ownedAsyncManager = this.#ownedAsyncJobManager;
 		if (ownedAsyncManager) {
 			const drained = await ownedAsyncManager.dispose({ timeoutMs: 3_000 });
@@ -16594,6 +16629,7 @@ export class AgentSession {
 						} catch (error) {
 							ownerShutdownSettled = false;
 							ownerShutdownFinalizationDeferred = true;
+							this.#scheduleDeferredOwnerShutdownFinalization(ownerShutdownManager, ownerShutdownLease, ownerId);
 							this.#suppressOwnAsyncJobDeliveries();
 							this.emitNotice(
 								"error",

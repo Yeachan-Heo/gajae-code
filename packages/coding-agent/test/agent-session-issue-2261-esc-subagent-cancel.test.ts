@@ -16,6 +16,29 @@ import { TempDir } from "@gajae-code/utils";
 const CLEANUP_NOTICE =
 	"Unable to confirm owned subagent cleanup; session was not replaced. Wait for or inspect remaining subagents, then retry /new.";
 
+async function waitForAbort(signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
+	const aborted = Promise.withResolvers<void>();
+	signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+	await aborted.promise;
+}
+
+async function pathExists(target: string): Promise<boolean> {
+	return fs.stat(target).then(
+		() => true,
+		() => false,
+	);
+}
+
+async function waitForCondition(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await predicate()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error("Timed out waiting for condition");
+}
+
 describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -68,7 +91,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			"task",
 			"cooperative child",
 			async ({ signal }) => {
-				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await waitForAbort(signal);
 				return "cancelled";
 			},
 			{
@@ -254,7 +277,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			"task",
 			"generic",
 			async ({ signal }) => {
-				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await waitForAbort(signal);
 				return "cancelled";
 			},
 			{ ownerId: "owner" },
@@ -284,8 +307,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			"task",
 			"copied transcript predecessor",
 			async ({ signal }) => {
-				if (!signal.aborted)
-					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await waitForAbort(signal);
 				return "predecessor completion";
 			},
 			{
@@ -331,8 +353,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			"task",
 			"rollback-preserved owner job",
 			async ({ signal }) => {
-				if (!signal.aborted)
-					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await waitForAbort(signal);
 				return "cancelled after validated retry";
 			},
 			{ ownerId: "owner" },
@@ -359,25 +380,64 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 	it.each([
 		"proof",
 		"settlement",
-	] as const)("publishes and reconnects the successor when post-validation owner %s times out", async failure => {
+	] as const)("eventually finalizes the successor after post-validation owner %s timeout", async failure => {
 		const ownerManager = installOwnerManager();
 		const previousFile = session.sessionFile;
 		if (!previousFile) throw new Error("Expected a persisted predecessor session");
 		await sessionManager.ensureOnDisk();
 		const copiedFile = path.join(tempDir.path(), `${failure}-timeout-successor.jsonl`);
 		await Bun.write(copiedFile, Bun.file(previousFile));
+		const fallbackRoot = await fs.mkdtemp(path.join(tempDir.path(), `${failure}-resume-fallback-`));
+		const fallbackManager = new ArtifactManager(fallbackRoot);
+		sessionManager.adoptArtifactManager(fallbackManager);
+		session.registerToolSessionTransitionCleanup(async () => {
+			sessionManager.releaseArtifactManager(fallbackManager);
+			await fs.rm(fallbackRoot, { recursive: true, force: true });
+		});
+		const retryAllowed = Promise.withResolvers<void>();
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = ownerManager.register(
+			"task",
+			"foreign deferred cleanup job",
+			async () => foreignGate.promise,
+			{
+				ownerId: "foreign",
+			},
+		);
 		if (failure === "proof") {
-			vi.spyOn(ownerManager, "cancelAndProveOwnerSubagents").mockResolvedValue({
-				ownerId: "owner",
-				leaseId: "forced-timeout",
-				confirmed: false,
-				reason: "deadline_exceeded",
-				targets: [],
-				terminalIds: [],
-				unresolvedIds: ["stuck"],
+			let calls = 0;
+			vi.spyOn(ownerManager, "cancelAndProveOwnerSubagents").mockImplementation(async lease => {
+				calls += 1;
+				if (calls === 1) {
+					return {
+						ownerId: "owner",
+						leaseId: lease.id,
+						confirmed: false,
+						reason: "deadline_exceeded",
+						targets: [],
+						terminalIds: [],
+						unresolvedIds: ["stuck"],
+					};
+				}
+				await retryAllowed.promise;
+				return {
+					ownerId: "owner",
+					leaseId: lease.id,
+					confirmed: true,
+					reason: "confirmed",
+					targets: [],
+					terminalIds: [],
+					unresolvedIds: [],
+				};
 			});
 		} else {
-			vi.spyOn(ownerManager, "cancelAndSettleOwnerJobs").mockResolvedValue(false);
+			let calls = 0;
+			vi.spyOn(ownerManager, "cancelAndSettleOwnerJobs").mockImplementation(async () => {
+				calls += 1;
+				if (calls === 1) return false;
+				await retryAllowed.promise;
+				return true;
+			});
 		}
 		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
 		const appendMessage = vi.spyOn(sessionManager, "appendMessage");
@@ -386,16 +446,42 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			if (event.type === "notice") notices.push(event.message);
 		});
 
-		await expect(session.switchSession(copiedFile)).resolves.toBe(true);
-		expect(session.sessionFile).toBe(copiedFile);
-		expect(finishShutdown).not.toHaveBeenCalled();
-		expect(ownerManager.beginOwnerSubagentShutdown("owner")).toBeUndefined();
-		expect(notices.some(message => message.includes("Successor session is active"))).toBe(true);
-		session.agent.emitExternalEvent({
-			type: "message_end",
-			message: { role: "user", content: "successor remains connected", timestamp: Date.now() },
-		});
-		expect(appendMessage).toHaveBeenCalledWith(expect.objectContaining({ content: "successor remains connected" }));
+		try {
+			await expect(session.switchSession(copiedFile)).resolves.toBe(true);
+			expect(session.sessionFile).toBe(copiedFile);
+			expect(finishShutdown).not.toHaveBeenCalled();
+			expect(ownerManager.beginOwnerSubagentShutdown("owner")).toBeUndefined();
+			expect(await pathExists(fallbackRoot)).toBe(true);
+			expect(notices.some(message => message.includes("Successor session is active"))).toBe(true);
+			session.agent.emitExternalEvent({
+				type: "message_end",
+				message: { role: "user", content: "successor remains connected", timestamp: Date.now() },
+			});
+			expect(appendMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ content: "successor remains connected" }),
+			);
+		} finally {
+			retryAllowed.resolve();
+		}
+		await waitForCondition(() => finishShutdown.mock.calls.some(call => call[1] === "commit"));
+		await waitForCondition(async () => !(await pathExists(fallbackRoot)));
+		expect(sessionManager.isArtifactManagerAuthorized(fallbackManager)).toBe(false);
+		expect(ownerManager.getJob(foreignJobId)?.status).toBe("running");
+		const successorJobId = ownerManager.register(
+			"bash",
+			"successor owner job",
+			async () => "successor job complete",
+			{
+				ownerId: "owner",
+			},
+		);
+		await ownerManager.getJob(successorJobId)?.promise;
+		expect(ownerManager.getJob(successorJobId)?.status).toBe("completed");
+		await expect(session.newSession()).resolves.toBe(true);
+		expect(finishShutdown.mock.calls.filter(call => call[1] === "commit")).toHaveLength(2);
+		expect(ownerManager.getJob(foreignJobId)?.status).toBe("running");
+		foreignGate.resolve("foreign complete");
+		await ownerManager.getJob(foreignJobId)?.promise;
 	});
 
 	it("settles detached owner jobs before fork and branch artifact retirement", async () => {
@@ -412,8 +498,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			"task",
 			"fork predecessor task",
 			async ({ signal }) => {
-				if (!signal.aborted)
-					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await waitForAbort(signal);
 				await Bun.write(path.join(fallbackRoot, "late-task.md"), "settled before fork cleanup");
 				order.push("late-write");
 				return "cancelled";

@@ -1304,7 +1304,7 @@ export class AsyncJobManager {
 				lease.targets.map(target => target.subagentId),
 			);
 		}
-		if (state.phase === "proved" && state.proof) return state.proof;
+		if (state.phase === "proved" && state.proof?.confirmed) return state.proof;
 		state.phase = "proving";
 		const settled = new Set<string>();
 		const promises: Promise<void>[] = [];

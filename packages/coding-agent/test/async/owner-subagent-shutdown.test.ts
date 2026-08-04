@@ -10,12 +10,19 @@ function makeManager(maxRunningJobs = 4): AsyncJobManager {
 	return new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs, retentionMs: 60_000 });
 }
 
+async function waitForAbort(signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
+	const aborted = Promise.withResolvers<void>();
+	signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+	await aborted.promise;
+}
+
 function registerCooperativeSubagent(manager: AsyncJobManager, subagentId: string, ownerId: string): string {
 	const jobId = manager.register(
 		"task",
 		subagentId,
 		async ({ signal }): Promise<string> => {
-			await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			await waitForAbort(signal);
 			return "cancelled cooperatively";
 		},
 		{
@@ -169,6 +176,48 @@ describe("owner subagent shutdown leases", () => {
 		manager.finishOwnerSubagentShutdown(lease, "release");
 		gate.resolve();
 		await manager.waitForAll();
+		await manager.dispose();
+	});
+
+	test("retries an unconfirmed shutdown proof after the backing job settles", async () => {
+		const manager = makeManager();
+		const gate = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"task",
+			"retry-proof",
+			async () => {
+				await gate.promise;
+				return "settled";
+			},
+			{
+				ownerId: "owner-a",
+				metadata: { subagent: { id: "retry-proof", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord({
+			subagentId: "retry-proof",
+			ownerId: "owner-a",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: true,
+		});
+		const lease = manager.beginOwnerSubagentShutdown("owner-a")!;
+		expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 })).toMatchObject({
+			confirmed: false,
+			reason: "deadline_exceeded",
+		});
+		gate.resolve();
+		await manager.getJob(jobId)?.promise;
+		expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 100 })).toMatchObject({
+			confirmed: true,
+			unresolvedIds: [],
+		});
+		manager.finishOwnerSubagentShutdown(lease, "commit");
+		const laterLease = manager.beginOwnerSubagentShutdown("owner-a");
+		expect(laterLease).toBeDefined();
+		manager.finishOwnerSubagentShutdown(laterLease!, "release");
 		await manager.dispose();
 	});
 
@@ -423,7 +472,7 @@ describe("owner subagent shutdown leases", () => {
 			"task",
 			"unrecorded",
 			async ({ signal }): Promise<string> => {
-				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await waitForAbort(signal);
 				return "cancelled";
 			},
 			{
