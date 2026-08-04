@@ -925,6 +925,8 @@ export class TUI extends Container {
 	// showHardwareCursor=false but cursor is shown for IME anchoring (macOS).
 	#imeCursorActive = false;
 	#clearOnShrink = $pickflag("GJC_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK");
+	#synchronizedOutputBegin = "";
+	#synchronizedOutputEnd = "";
 
 	// Default-on: reuse the previous normalized off-screen prefix and only normalize/diff the
 	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical;
@@ -1019,6 +1021,9 @@ export class TUI extends Container {
 		this.terminal = terminal;
 		this.#legacyMultiplexerFullRender =
 			isMultiplexerSession(Bun.env) && envIsEnabled(Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER);
+		const synchronizedOutputEnabled = $flag("GJC_TUI_SYNCHRONIZED_OUTPUT", true);
+		this.#synchronizedOutputBegin = synchronizedOutputEnabled ? "\x1b[?2026h" : "";
+		this.#synchronizedOutputEnd = synchronizedOutputEnabled ? "\x1b[?2026l" : "";
 		if (showHardwareCursor !== undefined) {
 			this.#showHardwareCursor = showHardwareCursor;
 		}
@@ -1691,6 +1696,10 @@ export class TUI extends Container {
 
 	#writeTerminal(data: string, deferRenderFailure = false): boolean {
 		return this.#guardTerminalOperation(() => this.terminal.write(data), !deferRenderFailure);
+	}
+
+	#frameSynchronizedOutput(payload: string): string {
+		return `${this.#synchronizedOutputBegin}${payload}${this.#synchronizedOutputEnd}`;
 	}
 
 	#hideCursor(): boolean {
@@ -3156,7 +3165,7 @@ export class TUI extends Container {
 					{ top: transcriptLineCount, bottom: transcriptLineCount + suffixLineCount },
 				]
 			: [{ top: nextViewportTop, bottom: nextViewportTop + height }];
-		let buffer = `\x1b[?2026h${deletePlan.output}`;
+		let buffer = deletePlan.output;
 		buffer += "\x1b[H";
 		const committedTranscriptRows: Array<number | null> = [];
 		for (let screenRow = 0; screenRow < height; screenRow++) {
@@ -3196,7 +3205,7 @@ export class TUI extends Container {
 			cursorToRow = cursor.toRow;
 		}
 		buffer += cursorSeq;
-		buffer += "\x1b[?2026l";
+		buffer = this.#frameSynchronizedOutput(buffer);
 		let contentWritten = false;
 		const writeSucceeded = this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length, () => {
 			contentWritten = true;
@@ -3609,7 +3618,7 @@ export class TUI extends Container {
 				[],
 				clear,
 			);
-			let buffer = `\x1b[?2026h${deletePlan.output}`; // Begin synchronized output
+			let buffer = deletePlan.output;
 			// Skip clearing scrollback (3J) in hosts where clear/replay can snap the
 			// native viewport away from the live prompt (tmux/screen, Windows ConPTY) —
 			// unless the caller explicitly needs history erased (the settled width
@@ -3627,7 +3636,7 @@ export class TUI extends Container {
 			const cursorRow = Math.max(0, newLines.length - 1);
 			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, cursorRow);
 			buffer += seq;
-			buffer += "\x1b[?2026l"; // End synchronized output
+			buffer = this.#frameSynchronizedOutput(buffer);
 			if (
 				!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
 					this.#cursorRow = cursorRow;
@@ -3827,7 +3836,9 @@ export class TUI extends Container {
 					.slice(0, this.#restartDurableLineCount)
 					.every((line, index) => line === this.#restartDurableRawLines[index]);
 			if (restartAppendProven && rawLines.length > this.#restartDurableLineCount) {
-				const appendBuffer = `\x1b[?2026h${newLines.slice(this.#restartDurableLineCount).join("\r\n")}\x1b[?2026l`;
+				const appendBuffer = this.#frameSynchronizedOutput(
+					newLines.slice(this.#restartDurableLineCount).join("\r\n"),
+				);
 				if (!this.#writeTerminal(appendBuffer)) return;
 				// The append already reached native scrollback. Advance both the live
 				// frontier and the retained restart baseline before the viewport write:
@@ -4073,7 +4084,7 @@ export class TUI extends Container {
 				const deletePlan = this.#kittyPlacementDeletePlan(previousKittyPlacementSpans, nextKittyPlacementSpans, [
 					{ top: firstChanged, bottom: lastChanged + 1 },
 				]);
-				let buffer = `\x1b[?2026h${deletePlan.output}`;
+				let buffer = deletePlan.output;
 				// Move to end of new content (clamp to 0 for empty content)
 				const targetRow = Math.max(0, newLines.length - 1);
 				const lineDiff = computeLineDiff(targetRow);
@@ -4101,7 +4112,7 @@ export class TUI extends Container {
 				}
 				const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, targetRow);
 				buffer += seq;
-				buffer += "\x1b[?2026l";
+				buffer = this.#frameSynchronizedOutput(buffer);
 				if (
 					!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
 						this.#cursorRow = targetRow;
@@ -4242,7 +4253,7 @@ export class TUI extends Container {
 		const deletePlan = this.#kittyPlacementDeletePlan(previousKittyPlacementSpans, nextKittyPlacementSpans, [
 			{ top: firstChanged, bottom: lastChanged + 1 },
 		]);
-		let buffer = `\x1b[?2026h${deletePlan.output}`; // Begin synchronized output
+		let buffer = deletePlan.output;
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const nativeScrollbackAdmission =
 			appendedLines &&
@@ -4357,7 +4368,7 @@ export class TUI extends Container {
 
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, finalCursorRow);
 		buffer += seq;
-		buffer += "\x1b[?2026l"; // End synchronized output
+		buffer = this.#frameSynchronizedOutput(buffer);
 
 		if ($pickflag("GJC_TUI_DEBUG", "PI_TUI_DEBUG")) {
 			const debugDir = "/tmp/tui";
@@ -4506,7 +4517,7 @@ export class TUI extends Container {
 			// DECSC/DECRC keep the hardware cursor stable; the dedicated
 			// synchronized block prevents visible tearing while the overlay
 			// area is cleared and redrawn.
-			const overlayBuffer = `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
+			const overlayBuffer = this.#frameSynchronizedOutput(`\x1b7${overlay}\x1b8`);
 			// Overlay delivery is outside shared transcript ownership. The
 			// shared write has already committed even when this exempt write
 			// fails, so do not make callers retry the shared bytes.

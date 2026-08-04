@@ -492,3 +492,107 @@ describe("multiplexer resize replay storm regression", () => {
 		});
 	});
 });
+
+describe("synchronized output compatibility framing", () => {
+	const begin = "\x1b[?2026h";
+	const end = "\x1b[?2026l";
+	const original = Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT;
+
+	afterEach(() => {
+		if (original === undefined) delete Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT;
+		else Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT = original;
+	});
+
+	async function capture(value: string | undefined): Promise<{ writes: string[]; steps: Record<string, string[]> }> {
+		if (value === undefined) delete Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT;
+		else Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT = value;
+
+		const term = new VirtualTerminal(40, 8, { isProcessTerminal: true });
+		const tui = new TUI(term, true, { widthSettleMs: 0 });
+		const text = new Text("first", 1, 0);
+		const steps: Record<string, string[]> = {};
+		let writeOffset = 0;
+		tui.addChild(text);
+
+		const record = async (name: string, action: () => void): Promise<void> => {
+			action();
+			await term.waitForRender();
+			const writes = term.getWriteLog();
+			steps[name] = writes.slice(writeOffset);
+			writeOffset = writes.length;
+		};
+
+		try {
+			await record("full", () => tui.start());
+			await record("differential", () => {
+				text.setText("second");
+				tui.requestRender(false, "test.synchronized-output-differential");
+			});
+			await record("deletion", () => {
+				text.setText("");
+				tui.requestRender(false, "test.synchronized-output-delete");
+			});
+			await record("restart-base", () => {
+				text.setText("restart base");
+				tui.requestRender(false, "test.synchronized-output-restart-base");
+			});
+			tui.stop();
+			tui.addChild(new Text("restart suffix", 1, 0));
+			await record("restart", () => tui.start());
+			await record("viewport", () => term.resize(40, 7));
+			tui.setPostRenderEmitter(() => "\x1b[?25l");
+			await record("overlay", () => {
+				text.setText("overlay frame");
+				tui.requestRender(false, "test.synchronized-output-overlay");
+			});
+			return { writes: term.getWriteLog(), steps };
+		} finally {
+			tui.stop();
+		}
+	}
+
+	function stripFraming(write: string): string {
+		if (write.startsWith(begin) && write.endsWith(end)) {
+			return write.slice(begin.length, -end.length);
+		}
+		return write;
+	}
+
+	it("keeps every renderer context framed and preserves write boundaries when disabled", async () => {
+		const enabled = await capture(undefined);
+		const disabled = await capture("0");
+
+		for (const context of ["full", "differential", "deletion", "restart", "viewport"]) {
+			expect(enabled.steps[context]?.some(write => write.startsWith(begin) && write.endsWith(end))).toBe(true);
+			expect(disabled.steps[context]?.some(write => write.includes(begin) || write.includes(end))).toBe(false);
+		}
+		expect(enabled.steps.overlay).toHaveLength(2);
+		expect(enabled.steps.overlay?.every(write => write.startsWith(begin) && write.endsWith(end))).toBe(true);
+		expect(disabled.steps.overlay).toHaveLength(2);
+		expect(disabled.steps.overlay?.some(write => write.includes(begin) || write.includes(end))).toBe(false);
+		expect(disabled.writes.length).toBe(enabled.writes.length);
+		expect(enabled.writes.map(stripFraming)).toEqual(disabled.writes);
+	});
+
+	it("samples the opt-out once when the TUI is constructed", async () => {
+		delete Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT;
+		const enabledTerm = new VirtualTerminal(40, 8);
+		const enabledTui = new TUI(enabledTerm, true, { widthSettleMs: 0 });
+		Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT = "0";
+		enabledTui.addChild(new Text("enabled", 1, 0));
+		enabledTui.start();
+		await enabledTerm.waitForRender();
+		expect(enabledTerm.getWriteLog().some(write => write.includes(begin))).toBe(true);
+		enabledTui.stop();
+
+		Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT = "0";
+		const disabledTerm = new VirtualTerminal(40, 8);
+		const disabledTui = new TUI(disabledTerm, true, { widthSettleMs: 0 });
+		delete Bun.env.GJC_TUI_SYNCHRONIZED_OUTPUT;
+		disabledTui.addChild(new Text("disabled", 1, 0));
+		disabledTui.start();
+		await disabledTerm.waitForRender();
+		expect(disabledTerm.getWriteLog().some(write => write.includes(begin) || write.includes(end))).toBe(false);
+		disabledTui.stop();
+	});
+});

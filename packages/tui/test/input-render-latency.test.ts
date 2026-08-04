@@ -126,7 +126,7 @@ describe("keyboard input render latency under streaming load", () => {
 		await h.term.waitForRender();
 
 		const samples: number[] = [];
-		for (let k = 0; k < 12; k++) {
+		for (let k = 0; k < 30; k++) {
 			await hotRender(h);
 			h.tui.requestRender(false, "stream.next");
 			const t0 = performance.now();

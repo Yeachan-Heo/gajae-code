@@ -1,0 +1,349 @@
+{
+  "schemaVersion": 1,
+  "kind": "tui-byobu-pty-capture-report",
+  "issue": 3798,
+  "platform": "darwin-arm64",
+  "multiplexer": {
+    "byobuBackend": "tmux",
+    "tmuxClientsObserved": [
+      "204x43",
+      "145x56",
+      "61x22"
+    ]
+  },
+  "loaderStableGeometry": {
+    "paneSize": "100x30",
+    "warmupSeconds": 1,
+    "captureSeconds": 10,
+    "maxTransactions": 126,
+    "enabledObservedTransactions": 122,
+    "optOutObservedTransactions": 0,
+    "historyDurationSeconds": 60,
+    "historyBefore": 0,
+    "historyAfter": 0,
+    "historyDelta": 0,
+    "verdict": "passed",
+    "stableAttribution": "single Loader with constant logical text; fixed 100x30 pane; no overlay, input, resize, or model activity",
+    "callbackAndRenderUnitEvidence": "loader.test.ts fake timers separately count scheduler callbacks and loader-originated requestRender calls"
+  },
+  "synchronizedOutputAB": {
+    "defaultEnabled": true,
+    "optOut": "GJC_TUI_SYNCHRONIZED_OUTPUT=0",
+    "enabledBalanced": true,
+    "optOutSequenceCount": 0,
+    "automatedByteIdentityEvidence": "resize-replay-storm.test.ts compares identical write count/order and payload after exact wrapper stripping",
+    "verdict": "passed"
+  },
+  "resizeOnly": {
+    "sequence": [
+      "204x43",
+      "145x56",
+      "61x22"
+    ],
+    "transcriptLineCount": 120,
+    "historyBeforeBurst": 90,
+    "historyAfterSettle": 98,
+    "burstHistoryDelta": 8,
+    "allowedBurstHistoryDelta": 142,
+    "stabilizationSecondsBeforeObservation": 2,
+    "observationSeconds": 30,
+    "stableHistoryDelta": 0,
+    "stableWriteByteDelta": 0,
+    "finalPaneSize": "61x22",
+    "verdict": "passed",
+    "perResizeObservations": [
+      {
+        "geometry": "204x43",
+        "synchronizedFrames": 2,
+        "writeByteDelta": 35394,
+        "historyBefore": 90,
+        "historyAfter": 77,
+        "interpretation": "one immediate viewport repaint plus one settled-width replay"
+      },
+      {
+        "geometry": "145x56",
+        "synchronizedFrames": 2,
+        "writeByteDelta": 27857,
+        "historyBefore": 77,
+        "historyAfter": 64,
+        "interpretation": "one immediate viewport repaint plus one settled-width replay"
+      },
+      {
+        "geometry": "61x22",
+        "synchronizedFrames": 2,
+        "writeByteDelta": 10489,
+        "historyBefore": 64,
+        "historyAfter": 98,
+        "interpretation": "one immediate viewport repaint plus one settled-width replay"
+      }
+    ],
+    "eventCapture": {
+      "sha256": "52e33411e70164b45718ea2f62c9b6927bdf67138e28c8eefb5d61b9ff593085",
+      "byteCount": 87205,
+      "validUtf8": true,
+      "replacementCharacterCount": 0,
+      "containsTerminalControlCodes": true,
+      "prefixBase64": "G1s/MjAyNmggaXNzdWUtMzc5OCBzdGF0aWMgdHJhbnNjcmlwdCBsaW5lIDAwMSDigJQg7ZWc6riAIOKckyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgG1swbQ0KIGlzc3VlLTM3OTggc3RhdGljIHRyYW5zY3JpcHQgbGluZSAwMDIg4oCUIO2VnOq4gCDinJMgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIBtbMG0NCiBpc3N1ZS0zNzk4IHN0YXRpYyB0cmFucw==",
+      "suffixBase64": "ICAgICAgICAgICAgICAbWzBtDQogaXNzdWUtMzc5OCBzdGF0aWMgdHJhbnNjcmlwdCBsaW5lIDExOCDigJQg7ZWc6riAIOKckyAgICAgICAgICAgICAgG1swbQ0KIGlzc3VlLTM3OTggc3RhdGljIHRyYW5zY3JpcHQgbGluZSAxMTkg4oCUIO2VnOq4gCDinJMgICAgICAgICAgICAgIBtbMG0NCiBpc3N1ZS0zNzk4IHN0YXRpYyB0cmFuc2NyaXB0IGxpbmUgMTIwIOKAlCDtlZzquIAg4pyTICAgICAgICAgICAgICAbWzBtG1swIHEbWz8yNWwbWz8yMDI2bA=="
+    }
+  },
+  "inputLatency": {
+    "sampleCount": 30,
+    "limitP95Ms": 150,
+    "limitMaxMs": 500,
+    "limitBaselineRatio": 1.5,
+    "networkRtt": "not applicable; same-host detached Byobu/tmux validation",
+    "verdict": "passed",
+    "liveByobuTmux": {
+      "multiplexer": "byobu 7.15 with tmux 3.7b backend",
+      "paneSize": "100x30",
+      "candidate": {
+        "command": "GJC_TUI_WRITE_LOG=/tmp/gjc-3798-input-live.log GJC_TUI_SYNCHRONIZED_OUTPUT=1 bun /tmp/gjc-3798-byobu-harness.ts input 60000",
+        "controller": "bun /tmp/gjc-3798-input-controller.ts gjc3798-input:0.0 /tmp/gjc-3798-input-live.log",
+        "p50Ms": 8.501917,
+        "p95Ms": 10.923417,
+        "maxMs": 17.886292,
+        "historyBefore": 0,
+        "historyAfter": 0,
+        "writeLogSha256": "a5d055a5abaf65ac630205316a3ba4be331d36c3a52c62542accd81083917495",
+        "writeLogByteCount": 6147,
+        "samplesMs": [
+          7.096792,
+          7.27475,
+          7.275708,
+          7.296333,
+          7.31625,
+          7.347333,
+          7.36,
+          7.415042,
+          7.431875,
+          7.499375,
+          7.5705,
+          8.10125,
+          8.344,
+          8.393083,
+          8.405125,
+          8.501917,
+          8.522125,
+          8.620875,
+          8.819875,
+          8.8775,
+          8.891333,
+          8.899667,
+          8.921083,
+          9.115833,
+          9.387042,
+          9.518541,
+          9.543959,
+          9.78125,
+          10.923417,
+          17.886292
+        ]
+      },
+      "upstreamDevBaseline": {
+        "head": "55f13956042b8ed74d2279ca7d8bce6519502502",
+        "command": "GJC_TUI_WRITE_LOG=/tmp/gjc-3798-input-baseline.log GJC_TUI_SYNCHRONIZED_OUTPUT=1 bun /tmp/gjc-3798-byobu-baseline-harness.ts 60000",
+        "controller": "bun /tmp/gjc-3798-input-controller.ts gjc3798-baseline:0.0 /tmp/gjc-3798-input-baseline.log",
+        "p50Ms": 7.870167,
+        "p95Ms": 10.179125,
+        "maxMs": 12.000208,
+        "historyBefore": 0,
+        "historyAfter": 0,
+        "writeLogSha256": "d2f56dba8c4a5a0815cfd0dff32442745fdba0ace3b658d1e8c810873d46fda0",
+        "writeLogByteCount": 4725,
+        "samplesMs": [
+          7.074292,
+          7.085583,
+          7.232625,
+          7.309042,
+          7.310083,
+          7.320583,
+          7.425709,
+          7.431875,
+          7.475541,
+          7.51125,
+          7.573042,
+          7.613958,
+          7.615833,
+          7.656416,
+          7.818375,
+          7.870167,
+          7.929291,
+          7.977459,
+          8.025792,
+          8.116166,
+          8.117125,
+          8.200292,
+          8.22025,
+          8.672875,
+          8.808666,
+          8.9115,
+          9.146541,
+          9.487583,
+          10.179125,
+          12.000208
+        ],
+        "setup": [
+          "disposable detached worktree at upstream/dev",
+          "bun install --frozen-lockfile --force",
+          "bun --cwd=packages/natives run build"
+        ],
+        "productSourceChanges": "none",
+        "cleanup": "disposable baseline worktree removed after capture"
+      },
+      "candidateToBaselineP95Ratio": 1.073119,
+      "measurement": "each literal key was sent with tmux send-keys; latency ended at the first synchronous ProcessTerminal write-log size increase"
+    },
+    "virtualTerminal": {
+      "command": "bun test packages/tui/test/input-render-latency.test.ts",
+      "candidateP50Ms": 1.38,
+      "candidateP95Ms": 2.24,
+      "candidateMaxMs": 2.51,
+      "upstreamDevP50Ms": 1.41,
+      "upstreamDevP95Ms": 2.05,
+      "upstreamDevMaxMs": 2.09,
+      "candidateToBaselineP95Ratio": 1.093,
+      "additionalCandidateP95Ms": [
+        2.04,
+        1.45,
+        1.65,
+        2.4
+      ]
+    }
+  },
+  "osc11": {
+    "multiplexer": "byobu 7.15 with tmux 3.7b backend",
+    "paneSize": "100x30",
+    "deterministicEvidence": "terminal-appearance.test.ts covers DA1-negative, queued Mode 2031, delayed DA1 after positive OSC, and late OSC",
+    "liveNoPushNegativeDa1": {
+      "command": "bun /tmp/gjc-3798-byobu-harness.ts osc 8000",
+      "injectedReplies": [
+        "DA1 ESC[?1;2c after startup query"
+      ],
+      "postReplyObservationSeconds": 7,
+      "osc11QueryCount": 1,
+      "da1QueryCount": 1,
+      "sha256": "b23b3e4c2d562f4f807da2c1bc200d92506fcf2b092e0bb313d20468c94d0399",
+      "byteCount": 796,
+      "validUtf8": true,
+      "replacementCharacterCount": 0,
+      "containsTerminalControlCodes": true,
+      "verdict": "passed"
+    },
+    "liveMode2031Recovery": {
+      "command": "bun /tmp/gjc-3798-byobu-harness.ts osc 8000",
+      "rawCapturePath": "packages/tui/artifacts/issue-3798-osc-mode.pty",
+      "rawCaptureFormat": "combined active-harness pane output and timestamped raw injected-input events",
+      "queryCountDerivation": "exact byte counts over the PANE_OUTPUT section: OSC 11 query ESC]11;?BEL and DA1 query ESC[c",
+      "paneOutputByteCount": 407,
+      "injectedInputEventCount": 4,
+      "injectedReplies": [
+        "Mode 2031 ESC[?997;1n while startup query was pending",
+        "negative DA1 ESC[?1;2c after debounce",
+        "OSC 11 rgb:0000/0000/0000 BEL response to the retained follow-up",
+        "DA1 ESC[?1;2c closing the successful follow-up"
+      ],
+      "postReplyObservationSeconds": 7,
+      "osc11QueryCount": 2,
+      "da1QueryCount": 2,
+      "sha256": "133f18c0a281348809dde97b2845a0f0e2b2b4e50b99961385eabfcef824a71f",
+      "byteCount": 1140,
+      "validUtf8": true,
+      "replacementCharacterCount": 0,
+      "containsTerminalControlCodes": true,
+      "verdict": "passed"
+    },
+    "liveAttribution": "fixed geometry, ProcessTerminal-only harness, raw tmux pipe-pane capture; no Loader, Editor, resize, overlay, model, or network activity",
+    "verdict": "passed"
+  },
+  "iosValidation": {
+    "status": "pending",
+    "issueCloseAllowed": false,
+    "visibleFixClaimAllowed": false
+  },
+  "captures": {
+    "enabled": {
+      "sha256": "fe41b7653913226da06a9897501210b09bce6cfb35601d69e0eda82b3ecbe04e",
+      "byteCount": 16847,
+      "validUtf8": true,
+      "replacementCharacterCount": 0,
+      "synchronizedBeginCount": 122,
+      "synchronizedEndCount": 122,
+      "containsTerminalControlCodes": true,
+      "prefixBase64": "G1s/MjAyNmgNG1sySyDioLggaXNzdWUtMzc5OCBzdGFibGUgbG9hZGVyICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIBtbMG0bWzAgcRtbPzI1bBtbPzIwMjZsG1s/MjAyNmgNG1sySyDioLwgaXNzdWUtMzc5OCBzdGFibGUgbG9hZGVyICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIBtbMA==",
+      "suffixBase64": "YWJsZSBsb2FkZXIgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgG1swbRtbMCBxG1s/MjVsG1s/MjAyNmwbWz8yMDI2aA0bWzJLIOKgvCBpc3N1ZS0zNzk4IHN0YWJsZSBsb2FkZXIgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgG1swbRtbMCBxG1s/MjVsG1s/MjAyNmwbWzFCDQobWzAgcQ=="
+    },
+    "disabled": {
+      "sha256": "83162abe8e99655875ba5474449c29f15f811408b938f6b622ffc02b42849975",
+      "byteCount": 14773,
+      "validUtf8": true,
+      "replacementCharacterCount": 0,
+      "synchronizedBeginCount": 0,
+      "synchronizedEndCount": 0,
+      "containsTerminalControlCodes": true,
+      "prefixBase64": "DRtbMksg4qC4IGlzc3VlLTM3OTggc3RhYmxlIGxvYWRlciAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAbWzBtG1swIHEbWz8yNWwNG1sySyDioLwgaXNzdWUtMzc5OCBzdGFibGUgbG9hZGVyICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIBtbMG0bWzAgcRtbPzI1bA0bWzJLIOKgtCBpcw==",
+      "suffixBase64": "bA0bWzJLIOKguSBpc3N1ZS0zNzk4IHN0YWJsZSBsb2FkZXIgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgG1swbRtbMCBxG1s/MjVsDRtbMksg4qC4IGlzc3VlLTM3OTggc3RhYmxlIGxvYWRlciAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAbWzBtG1swIHEbWz8yNWwbWzFCDQobWzAgcQ=="
+    },
+    "resize": {
+      "sha256": "52e33411e70164b45718ea2f62c9b6927bdf67138e28c8eefb5d61b9ff593085",
+      "byteCount": 87205,
+      "validUtf8": true,
+      "replacementCharacterCount": 0,
+      "synchronizedBeginCount": 7,
+      "synchronizedEndCount": 7,
+      "containsTerminalControlCodes": true,
+      "prefixBase64": "G1s/MjAyNmggaXNzdWUtMzc5OCBzdGF0aWMgdHJhbnNjcmlwdCBsaW5lIDAwMSDigJQg7ZWc6riAIOKckyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgG1swbQ0KIGlzc3VlLTM3OTggc3RhdGljIHRyYW5zY3JpcHQgbGluZSAwMDIg4oCUIO2VnOq4gCDinJMgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIBtbMG0NCiBpc3N1ZS0zNzk4IHN0YXRpYyB0cmFucw==",
+      "suffixBase64": "ICAgICAgICAgICAgICAbWzBtDQogaXNzdWUtMzc5OCBzdGF0aWMgdHJhbnNjcmlwdCBsaW5lIDExOCDigJQg7ZWc6riAIOKckyAgICAgICAgICAgICAgG1swbQ0KIGlzc3VlLTM3OTggc3RhdGljIHRyYW5zY3JpcHQgbGluZSAxMTkg4oCUIO2VnOq4gCDinJMgICAgICAgICAgICAgIBtbMG0NCiBpc3N1ZS0zNzk4IHN0YXRpYyB0cmFuc2NyaXB0IGxpbmUgMTIwIOKAlCDtlZzquIAg4pyTICAgICAgICAgICAgICAbWzBtG1swIHEbWz8yNWwbWz8yMDI2bA=="
+    }
+  },
+  "candidateBinding": {
+    "baseHead": "f4c6b8cb14a157741dc6c31a82b77ff111235eb0",
+    "branch": "fix/issue-3798-ios-byobu-tui",
+    "sourceAndTestsDiffSha256": "801af968dbe0e2a21abc743b643acd2a60dd0e10cef36f50304fc03ecb6b6e8b",
+    "hashScope": "git diff --binary excluding this evidence artifact to avoid a self-referential hash"
+  },
+  "qualityGateEvidence": {
+    "focusedTests": {
+      "command": "bun test terminal-appearance resize-replay-storm render-regressions render-commit input-render-redteam input-render-latency loader animation-scheduler animation-scheduler-redteam",
+      "passed": 182,
+      "failed": 0
+    },
+    "expandedBlockerTests": {
+      "command": "bun test loader terminal-appearance resize-replay-storm render-commit",
+      "passed": 52,
+      "failed": 0
+    },
+    "tuiCheck": {
+      "command": "bun --cwd=packages/tui run check",
+      "status": "passed"
+    },
+    "codingAgentCheck": {
+      "command": "bun --cwd=packages/coding-agent run check",
+      "status": "passed"
+    },
+    "fullTuiSuite": {
+      "command": "bun --cwd=packages/tui run test",
+      "passed": 1059,
+      "failed": 1,
+      "failure": "render-helper-counts.test.ts expected 0 received 4",
+      "terminalRerun": "1059 passed; 1 pre-existing failure; 8310 expectations; input p95 1.72 ms (n=30)"
+    },
+    "upstreamBaselineFailure": {
+      "head": "f4c6b8cb14a157741dc6c31a82b77ff111235eb0",
+      "command": "bun test packages/tui/test/render-helper-counts.test.ts --test-name-pattern reuses normalized line widths",
+      "result": "expected 0 received 4",
+      "classification": "pre-existing current-upstream failure"
+    },
+    "failureInvariantMatrix": {
+      "command": "bun test packages/tui/test/render-commit.test.ts",
+      "passed": 6,
+      "failed": 0,
+      "coverage": [
+        "shared-write failure commits no generation and emits no overlay in enabled/disabled modes",
+        "IME failure preserves shared commit in enabled/disabled modes",
+        "standalone IME cursor remains unwrapped",
+        "overlay failure preserves shared commit and later render causes no replay in enabled/disabled modes"
+      ]
+    }
+  }
+}

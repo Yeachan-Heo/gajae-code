@@ -1,9 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { TUI } from "@gajae-code/tui";
-import { Loader } from "@gajae-code/tui/components/loader";
+import { __loaderPerfCounters, Loader } from "@gajae-code/tui/components/loader";
 import { visibleWidth } from "@gajae-code/tui/utils";
+import { __animationSchedulerTestHooks } from "../src/animation-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
+afterEach(() => {
+	vi.useRealTimers();
+	__animationSchedulerTestHooks.reset();
+	__loaderPerfCounters.reset();
+});
 describe("Loader component", () => {
 	it("clamps rendered lines to terminal width", async () => {
 		const term = new VirtualTerminal(1, 4);
@@ -117,6 +123,62 @@ describe("Loader component", () => {
 		expect(loaderRequests).toBe(2); // "| Working#1" differs -> still repaints
 
 		loader.stop();
+		tui.stop();
+	});
+
+	it("bounds time-dependent animation callbacks and render requests to the 80ms cadence", () => {
+		vi.useFakeTimers();
+		const term = new VirtualTerminal(40, 4);
+		const tui = new TUI(term);
+		let colorTick = 0;
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => `${text}#${colorTick++}`,
+			"Working",
+			["|"],
+			{
+				timeDependentColor: true,
+			},
+		);
+
+		expect(__loaderPerfCounters.renderRequests).toBe(1);
+		vi.advanceTimersByTime(1000);
+
+		expect(__loaderPerfCounters.callbackInvocations).toBeLessThanOrEqual(13);
+		expect(__loaderPerfCounters.renderRequests).toBeLessThanOrEqual(14);
+
+		const beforeMessage = __loaderPerfCounters.renderRequests;
+		loader.setMessage("Immediate");
+		expect(__loaderPerfCounters.renderRequests).toBe(beforeMessage + 1);
+
+		loader.dispose();
+		const callbacksAfterDispose = __loaderPerfCounters.callbackInvocations;
+		const requestsAfterDispose = __loaderPerfCounters.renderRequests;
+		vi.advanceTimersByTime(1000);
+		expect(__loaderPerfCounters.callbackInvocations).toBe(callbacksAfterDispose);
+		expect(__loaderPerfCounters.renderRequests).toBe(requestsAfterDispose);
+		expect(__loaderPerfCounters.liveIntervals).toBe(0);
+		tui.stop();
+	});
+	it("deduplicates unchanged output while callbacks remain bounded", () => {
+		vi.useFakeTimers();
+		const tui = new TUI(new VirtualTerminal(40, 4));
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => text,
+			"Working",
+			["|"],
+		);
+
+		expect(__loaderPerfCounters.renderRequests).toBe(1);
+		vi.advanceTimersByTime(1000);
+
+		expect(__loaderPerfCounters.callbackInvocations).toBeLessThanOrEqual(13);
+		expect(__loaderPerfCounters.renderRequests).toBe(1);
+
+		loader.dispose();
 		tui.stop();
 	});
 });

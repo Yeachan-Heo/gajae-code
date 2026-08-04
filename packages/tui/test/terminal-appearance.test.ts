@@ -329,6 +329,122 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 
 		terminal.stop();
 	});
+	it("stops polling after DA1 proves OSC 11 unsupported", () => {
+		vi.useFakeTimers();
+		const { terminal, received, queryCount } = setupTerminal();
+
+		process.stdin.emit("data", "\x1b[?1;2c");
+		process.stdin.emit("data", "x");
+		vi.advanceTimersByTime(6000);
+
+		expect(queryCount()).toBe(1);
+		expect(received).toContain("x");
+		terminal.stop();
+	});
+	it("stops a periodic query after negative DA1", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+
+		vi.advanceTimersByTime(2000);
+		expect(queryCount()).toBe(2);
+
+		process.stdin.emit("data", "\x1b[?1;2c");
+		vi.advanceTimersByTime(6000);
+
+		expect(queryCount()).toBe(2);
+		terminal.stop();
+	});
+
+	it("promotes queued Mode 2031 over a periodic poll before delayed DA1", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		vi.advanceTimersByTime(2000);
+		expect(queryCount()).toBe(1);
+
+		process.stdin.emit("data", "\x1b[?997;1n");
+		vi.advanceTimersByTime(100);
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		expect(queryCount()).toBe(2);
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		expect(terminal.appearance).toBe("dark");
+
+		vi.advanceTimersByTime(6000);
+		expect(queryCount()).toBe(2);
+		terminal.stop();
+	});
+
+	it("preserves exactly one queued Mode 2031 query after negative DA1", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+
+		process.stdin.emit("data", "\x1b[?997;1n");
+		vi.advanceTimersByTime(100);
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		expect(queryCount()).toBe(2);
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		expect(terminal.appearance).toBe("dark");
+
+		vi.advanceTimersByTime(6000);
+		expect(queryCount()).toBe(2);
+		terminal.stop();
+	});
+
+	it("keeps one queued follow-up when positive OSC arrives before delayed DA1", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		vi.advanceTimersByTime(2000);
+		expect(queryCount()).toBe(1);
+
+		process.stdin.emit("data", "\x1b[?1;2c");
+		expect(queryCount()).toBe(2);
+
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		expect(terminal.appearance).toBe("dark");
+		terminal.stop();
+	});
+
+	it("swallows a late OSC reply after negative DA1 without reviving polling", () => {
+		vi.useFakeTimers();
+		const { terminal, received, queryCount } = setupTerminal();
+		const appearances: string[] = [];
+		terminal.onAppearanceChange(appearance => appearances.push(appearance));
+
+		process.stdin.emit("data", "\x1b[?1;2c");
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		vi.advanceTimersByTime(6000);
+
+		expect(queryCount()).toBe(1);
+		expect(appearances).toEqual([]);
+		expect(terminal.appearance).toBeUndefined();
+		expect(received).toEqual([]);
+		terminal.stop();
+	});
+	it("recovers one queued Mode 2031 query after the watchdog expires", () => {
+		vi.useFakeTimers();
+		const { terminal, received, queryCount } = setupTerminal();
+
+		process.stdin.emit("data", "\x1b[?997;1n");
+		vi.advanceTimersByTime(100);
+		vi.advanceTimersByTime(1000);
+
+		expect(queryCount()).toBe(2);
+		process.stdin.emit("data", "x");
+		expect(received).toContain("x");
+
+		process.stdin.emit("data", "\x1b[?1;2c");
+		vi.advanceTimersByTime(6000);
+		expect(queryCount()).toBe(2);
+		terminal.stop();
+	});
 });
 
 describe("ProcessTerminal raw-Buffer stdin (issue #454)", () => {

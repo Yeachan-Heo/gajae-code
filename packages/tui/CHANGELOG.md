@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Bounded loader animation scheduling to 80 ms, stopped OSC 11 polling after DA1 proves the query unsupported while preserving Mode 2031 recovery, and added the default-on `GJC_TUI_SYNCHRONIZED_OUTPUT=0` compatibility opt-out for terminal parsers that mishandle synchronized-output framing. Real iOS-client validation remains pending for #3798.
 
 ## [0.12.11] - 2026-08-03
 

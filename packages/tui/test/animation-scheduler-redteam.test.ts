@@ -40,16 +40,16 @@ describe("G010 shared animation scheduler red-team", () => {
 			},
 		);
 
-		expect(__animationSchedulerTestHooks.getRegistrantCount(80)).toBe(20);
-		expect(__animationSchedulerTestHooks.getActiveTimerCount()).toBe(2);
+		expect(__animationSchedulerTestHooks.getRegistrantCount(80)).toBe(21);
+		expect(__animationSchedulerTestHooks.getActiveTimerCount()).toBe(1);
 		expect(__animationSchedulerTestHooks.getActiveTimerCount(80)).toBe(1);
-		expect(__animationSchedulerTestHooks.getActiveTimerCount(16)).toBe(1);
+		expect(__animationSchedulerTestHooks.getActiveTimerCount(16)).toBe(0);
 
 		for (const loader of defaults) loader.stop();
 
-		expect(__animationSchedulerTestHooks.getRegistrantCount(80)).toBe(0);
-		expect(__animationSchedulerTestHooks.getActiveTimerCount(80)).toBe(0);
-		expect(__animationSchedulerTestHooks.getRegistrantCount(16)).toBe(1);
+		expect(__animationSchedulerTestHooks.getRegistrantCount(80)).toBe(1);
+		expect(__animationSchedulerTestHooks.getActiveTimerCount(80)).toBe(1);
+		expect(__animationSchedulerTestHooks.getRegistrantCount(16)).toBe(0);
 		expect(__animationSchedulerTestHooks.getActiveTimerCount()).toBe(1);
 
 		animated.stop();
@@ -99,7 +99,7 @@ describe("G010 shared animation scheduler red-team", () => {
 		expect(__animationSchedulerTestHooks.getActiveTimerCount()).toBe(0);
 	});
 
-	it("CADENCE: default repaints at 80ms, time-dependent at 16ms, both spinner frames advance only every 80ms", () => {
+	it("CADENCE: default and time-dependent loaders repaint and advance frames only every 80ms", () => {
 		vi.useFakeTimers();
 		const defaultUi = makeUi();
 		const animatedUi = makeUi();
@@ -131,19 +131,19 @@ describe("G010 shared animation scheduler red-team", () => {
 
 		vi.advanceTimersByTime(16);
 		expect(defaultUi.requestRender.mock.calls.length).toBe(initialDefaultRequests);
-		expect(animatedUi.requestRender.mock.calls.length).toBe(initialAnimatedRequests + 1);
+		expect(animatedUi.requestRender.mock.calls.length).toBe(initialAnimatedRequests);
 		expect(defaultFrames.at(-1)).toBe("A");
 		expect(animatedFrames.at(-1)).toBe("A");
 
 		vi.advanceTimersByTime(64);
 		expect(defaultUi.requestRender.mock.calls.length).toBe(initialDefaultRequests + 1);
-		expect(animatedUi.requestRender.mock.calls.length).toBe(initialAnimatedRequests + 5);
+		expect(animatedUi.requestRender.mock.calls.length).toBe(initialAnimatedRequests + 1);
 		expect(defaultFrames.at(-1)).toBe("B");
 		expect(animatedFrames.at(-1)).toBe("B");
 
 		vi.advanceTimersByTime(16);
 		expect(defaultUi.requestRender.mock.calls.length).toBe(initialDefaultRequests + 1);
-		expect(animatedUi.requestRender.mock.calls.length).toBe(initialAnimatedRequests + 6);
+		expect(animatedUi.requestRender.mock.calls.length).toBe(initialAnimatedRequests + 1);
 		expect(defaultFrames.at(-1)).toBe("B");
 		expect(animatedFrames.at(-1)).toBe("B");
 
@@ -238,7 +238,7 @@ describe("G010 shared animation scheduler red-team", () => {
 			},
 		);
 
-		expect(handles).toHaveLength(2);
+		expect(handles).toHaveLength(1);
 		for (const handle of handles) expect(handle.unref).toHaveBeenCalledTimes(1);
 
 		defaultLoader.dispose();
