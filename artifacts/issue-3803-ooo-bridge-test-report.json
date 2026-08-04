@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "issue": 3803,
+  "baseline": {
+    "gjcBase": "a8fa63a599e9fa3d0189e48bfce778a36353ccdd",
+    "ouroborosRelease": "v0.50.7",
+    "ouroborosCommit": "cb658aa819bfabafecbbe91bc36327f10691171b"
+  },
+  "verification": [
+    {
+      "command": "bun test packages/coding-agent/test/ooo-bridge-extension-contract.test.ts packages/coding-agent/test/ooo-bridge-runner-redteam.test.ts packages/coding-agent/test/extensions-discovery.test.ts",
+      "status": "passed",
+      "result": "60 pass, 0 fail, 161 expect() calls"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run check",
+      "status": "passed",
+      "result": "Biome checked 2509 files; TypeScript noEmit completed successfully"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "result": "No whitespace errors"
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "missing-ouroboros",
+      "status": "passed",
+      "evidence": "A missing executable error is notified and the matching ooo interview input remains handled instead of falling through to the model."
+    },
+    {
+      "id": "unsupported-dispatch",
+      "status": "passed",
+      "evidence": "Exit code 78 remains pass-through."
+    },
+    {
+      "id": "exact-runtime-binding",
+      "status": "passed",
+      "evidence": "The shipped example registers one input handler and dispatches ooo interview as ouroboros argv: dispatch, --runtime, gjc, full input."
+    }
+  ]
+}

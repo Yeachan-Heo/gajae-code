@@ -28,7 +28,7 @@ The extension runner already treats `InputEventResult.handled === true` as termi
 `createOuroborosOooBridge()` is a small specialization of `createExactPrefixCommandBridge()`:
 
 - command: `ouroboros`
-- arguments: `dispatch`, then the full submitted input text
+- arguments: `dispatch`, `--runtime`, `gjc`, then the full submitted input text
 - recursion guard variable: the Ouroboros bridge recursion-depth environment variable
 
 - continue/pass-through exit code: `78`
@@ -48,6 +48,46 @@ Before dispatch, the helper increments the Ouroboros bridge recursion-depth envi
 This means the bridge allows exactly one inherited bridge-marked dispatcher level and blocks recursive re-entry from deeper bridge-marked children. The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
 
 ## Installation and discovery
+
+### Supported Ouroboros baseline and MCP ownership
+
+This path is verified against the current GJC `dev` bridge contract and [Q00/ouroboros `v0.50.7`](https://github.com/Q00/ouroboros/releases/tag/v0.50.7), the latest release when this integration was shipped. Use `v0.50.7` or a newer release and check the [latest release](https://github.com/Q00/ouroboros/releases/latest) for current upstream requirements.
+
+Install and configure Ouroboros using its current upstream GJC setup:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | bash
+ouroboros setup --runtime gjc
+```
+
+In `v0.50.7`, that setup selects GJC as Ouroboros's runtime and LLM backend, installs an Ouroboros-managed GJC bridge, and installs its GJC capability guide. The managed bridge invokes `ouroboros dispatch --runtime gjc`; the GJC example in this repository binds the same runtime flag. Ouroboros's dispatcher then uses its shared MCP handler composition. GJC does not implement the Ouroboros MCP workflow or protocol lifecycle.
+
+### One-command manual enablement
+
+The preferred `ouroboros setup --runtime gjc` path already installs a managed bridge. As a GJC-owned alternative, install the shipped example for the current user:
+
+```bash
+mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions" && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ooo-bridge.ts"
+```
+
+Or enable the example only in the current project:
+
+```bash
+mkdir -p .gjc/extensions && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o .gjc/extensions/ooo-bridge.ts
+```
+
+Use either the Ouroboros-managed bridge or the manual example, not both. Start a new GJC session after installation. Then run:
+
+```text
+ooo interview "I want to build a task management CLI"
+```
+
+The example dispatches `ouroboros dispatch --runtime gjc <full-input>`, passing the complete input as one argument. If `ouroboros` is missing, cannot start, times out, or returns a non-zero code other than `78`, GJC shows an error notification and treats only that matching `ooo` input as handled. Extension discovery, GJC startup, and ordinary prompts continue to work. Exit code `78` deliberately passes the original input through to normal GJC processing.
+
+### Native interview versus external Ouroboros interview
+
+- `/skill:deep-interview` is GJC's bundled native interview workflow. It includes Ouroboros-inspired behavior but does not invoke the external CLI.
+- `ooo interview` is an external integration. With this example enabled, GJC invokes `ouroboros dispatch --runtime gjc` with the complete input, and the installed Ouroboros runtime owns its MCP-backed skill dispatch and interview flow.
 
 The canonical install location is the agent extensions directory discovered by the native GJC provider:
 

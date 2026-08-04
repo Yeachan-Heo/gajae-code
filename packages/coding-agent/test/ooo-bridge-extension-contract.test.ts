@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { ImageContent } from "@gajae-code/ai";
+import type { ExtensionAPI } from "@gajae-code/coding-agent";
 import type { ExecResult } from "@gajae-code/coding-agent/exec/exec";
+import * as execCommandModule from "@gajae-code/coding-agent/exec/exec";
 import {
 	createExactPrefixCommandBridge,
 	createOuroborosOooBridge,
@@ -9,6 +11,7 @@ import {
 	OOO_BRIDGE_RECURSION_ENV,
 	OOO_BRIDGE_TIMEOUT_ENV,
 } from "@gajae-code/coding-agent/extensibility/extensions";
+import activateOooBridge from "../examples/extensions/ooo-bridge";
 
 function input(text: string, source?: InputEvent["source"], images?: ImageContent[]): InputEvent {
 	return { type: "input", text, source, images } as InputEvent;
@@ -146,6 +149,26 @@ describe("ooo bridge extension contract", () => {
 		expect(notifySpy).toHaveBeenCalledWith("dispatch failed", "error");
 	});
 
+	it("handles a missing ouroboros executable without passing the input to the model", async () => {
+		const dispatcher = { run: async () => Promise.reject(new Error('Executable not found in $PATH: "ouroboros"')) };
+		const notifyTarget = { notify: (_message: string, _type?: "info" | "warning" | "error") => {} };
+		const notifySpy = vi.spyOn(notifyTarget, "notify");
+		const handler = createExactPrefixCommandBridge({
+			prefix: "ooo",
+			command: "ouroboros",
+			args: ["dispatch"],
+			dispatch: dispatcher.run,
+		});
+
+		expect(
+			await handler(input("ooo interview", "interactive"), {
+				...context(),
+				ui: notifyTarget,
+			} as ExtensionContext),
+		).toEqual({ handled: true });
+		expect(notifySpy).toHaveBeenCalledWith('Executable not found in $PATH: "ouroboros"', "error");
+	});
+
 	it("dispatch exception or timeout is handled and notified instead of falling through", async () => {
 		process.env[OOO_BRIDGE_TIMEOUT_ENV] = "5";
 		const dispatcher = { run: async () => Promise.reject(new Error("handler timed out after 5ms")) };
@@ -236,6 +259,32 @@ describe("ooo bridge extension contract", () => {
 			["dispatch", "ooo one"],
 			["dispatch", "ooo two"],
 		]);
+	});
+
+	it("ships an example that registers ooo interview on the input bridge", async () => {
+		const registrations: Array<{ event: string; handler: unknown }> = [];
+		activateOooBridge({
+			on(event: string, handler: unknown): void {
+				registrations.push({ event, handler });
+			},
+		} as unknown as ExtensionAPI);
+
+		expect(registrations).toHaveLength(1);
+		expect(registrations[0]?.event).toBe("input");
+
+		const execSpy = vi.spyOn(execCommandModule, "execCommand").mockResolvedValue({
+			stdout: "",
+			stderr: "",
+			code: 0,
+			killed: false,
+		});
+		const handler = registrations[0]?.handler as ReturnType<typeof createOuroborosOooBridge>;
+		const ctx = context();
+
+		expect(await handler(input("ooo interview", "interactive"), ctx)).toEqual({ handled: true });
+		expect(execSpy).toHaveBeenCalledWith("ouroboros", ["dispatch", "--runtime", "gjc", "ooo interview"], ctx.cwd, {
+			timeout: undefined,
+		});
 	});
 
 	it("canonical ouroboros helper uses the same exact-prefix contract", async () => {

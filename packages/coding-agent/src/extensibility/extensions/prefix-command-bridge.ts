@@ -123,6 +123,6 @@ export function createOuroborosOooBridge() {
 	return createExactPrefixCommandBridge({
 		prefix: "ooo",
 		command: "ouroboros",
-		args: ["dispatch"],
+		args: ["dispatch", "--runtime", "gjc"],
 	});
 }

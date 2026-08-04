@@ -14,6 +14,39 @@ mkdir -p .gjc/extensions
 cp packages/coding-agent/examples/extensions/pirate.ts .gjc/extensions/
 ```
 
+### Enable the Ouroboros `ooo` bridge
+
+Install the latest [Q00/ouroboros](https://github.com/Q00/ouroboros/releases/latest) release first. The integration is verified against Ouroboros `v0.50.7`; use that release or newer. The preferred setup command selects GJC, configures the GJC runtime, and installs Ouroboros's managed GJC bridge:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | bash
+ouroboros setup --runtime gjc
+```
+
+That managed bridge is sufficient by itself. It routes `ooo interview` through `ouroboros dispatch --runtime gjc`, which uses Ouroboros's shared MCP handler composition. GJC does not implement the Ouroboros MCP workflow.
+
+As a GJC-owned manual alternative, install this shipped example for your user account with one command:
+
+```bash
+mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions" && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ooo-bridge.ts"
+```
+
+Or enable the example only for the current project:
+
+```bash
+mkdir -p .gjc/extensions && curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/dev/packages/coding-agent/examples/extensions/ooo-bridge.ts -o .gjc/extensions/ooo-bridge.ts
+```
+
+Use either the Ouroboros-managed bridge or the manual example, not both. Start a new GJC session after installation, then enter:
+
+```text
+ooo interview "I want to build a task management CLI"
+```
+
+The example sends the complete input as one argument to `ouroboros dispatch --runtime gjc`. A missing or misconfigured `ouroboros` executable produces an error notification for that `ooo` input without preventing GJC from starting or handling ordinary prompts. Exit code `78` explicitly passes the input back to normal GJC processing.
+
+This external path is separate from GJC's native `/skill:deep-interview`: the native skill runs GJC's bundled interview workflow, while `ooo interview` delegates to the installed Ouroboros runtime and its MCP-backed skill dispatcher.
+
 ## Examples
 
 ### Custom Tools & API
@@ -39,10 +72,11 @@ cp packages/coding-agent/examples/extensions/pirate.ts .gjc/extensions/
 
 ### External Dependencies
 
-| Extension         | Description                                                               |
-| ----------------- | ------------------------------------------------------------------------- |
-| `chalk-logger.ts` | Uses chalk from parent node_modules (demonstrates jiti module resolution) |
-| `with-deps/`      | Extension with its own package.json and dependencies                      |
+| Extension         | Description                                                                  |
+| ----------------- | ---------------------------------------------------------------------------- |
+| `chalk-logger.ts` | Uses chalk from parent node_modules (demonstrates jiti module resolution)    |
+| `ooo-bridge.ts`   | Opt-in `ooo ...` input bridge to the installed Ouroboros CLI and MCP runtime |
+| `with-deps/`      | Extension with its own package.json and dependencies                         |
 
 ## Writing Extensions
 
