@@ -19256,14 +19256,16 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 
 		releaseSend.resolve({ ok: true, result: { message_id: 7 } });
 		await handlerPersistStarted.promise;
-		let joined = false;
+		const joinedSettled = Promise.withResolvers<boolean>();
 		const joinedEffect = effects.join(100).then(value => {
-			joined = value;
+			joinedSettled.resolve(value);
 			return value;
 		});
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(joined).toBe(false);
+		const beforeRelease = await Promise.race([
+			joinedSettled.promise.then(() => "joined" as const),
+			Promise.resolve("persistence-held" as const),
+		]);
+		expect(beforeRelease).toBe("persistence-held");
 
 		releaseHandlerPersist.resolve();
 		await expect(joinedEffect).resolves.toBe(true);
