@@ -4847,6 +4847,7 @@ export class SessionManager {
 	#ephemeralArtifactManager: ArtifactManager | null = null;
 	#ephemeralArtifactDir: string | null = null;
 	#ephemeralArtifactInit: Promise<ArtifactManager | null> | null = null;
+	#ephemeralArtifactCleanups = new Set<Promise<void>>();
 	readonly #blobStore: BlobStore;
 	#residentTextBlobStore: BlobStore = new MemoryBlobStore();
 	#residentImageBlobStore: BlobStore;
@@ -5440,7 +5441,7 @@ export class SessionManager {
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = false;
-		this.#discardEphemeralArtifacts();
+
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
@@ -5472,6 +5473,7 @@ export class SessionManager {
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
+			this.#retireEphemeralArtifacts();
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
@@ -5678,6 +5680,7 @@ export class SessionManager {
 				managedTransition?.adopt();
 				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 				this.#commitResidentTextStoreTransition(prepared);
+				this.#retireEphemeralArtifacts();
 			} catch (error) {
 				managedTransition?.rollback();
 				this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
@@ -6136,11 +6139,12 @@ export class SessionManager {
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
-		this.#discardEphemeralArtifacts();
+
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
 		this.#commitResidentTextStoreTransition(transition);
+		this.#retireEphemeralArtifacts();
 		stage.committed = true;
 		this.#preparedNewSessions.delete(stage);
 	}
@@ -6951,6 +6955,7 @@ export class SessionManager {
 		const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 		this.#applyFreshSessionMetadata(fresh);
 		this.#commitResidentTextStoreTransition(prepared);
+		this.#retireEphemeralArtifacts();
 		if (writeBreadcrumb && fresh.sessionFile) writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 		return fresh.sessionFile;
 	}
@@ -7673,6 +7678,8 @@ export class SessionManager {
 				this.#flushed = true;
 			}
 		});
+		this.#retireEphemeralArtifacts();
+		await this.#drainEphemeralArtifactCleanups();
 		this.#releaseResidentTextStore();
 		this.#releaseOwnedManagedAuthority();
 		if (this.#persistError) throw this.#persistError;
@@ -7732,6 +7739,12 @@ export class SessionManager {
 		// close leaves the session live for a genuine retry.
 		if (!this.#persistWriter) {
 			this.#releaseResidentTextStore();
+			this.#retireEphemeralArtifacts();
+			try {
+				await this.#drainEphemeralArtifactCleanups();
+			} catch (error) {
+				outcome = { kind: "close_unknown", error: toError(error) };
+			}
 		}
 		return outcome;
 	}
@@ -8020,6 +8033,15 @@ export class SessionManager {
 		this.#adoptedArtifactManager = manager;
 	}
 
+	/** Prove manager authority by exact object identity, never by pathname shape. */
+	isArtifactManagerAuthorized(manager: ArtifactManager): boolean {
+		return (
+			manager === this.#adoptedArtifactManager ||
+			manager === this.#artifactManager ||
+			manager === this.#ephemeralArtifactManager
+		);
+	}
+
 	/**
 	 * Returns the ArtifactManager this session writes through. Lazily creates
 	 * one bound to the current session file unless an external manager was
@@ -8096,26 +8118,52 @@ export class SessionManager {
 	 * Returns null when the directory cannot be created; callers then report no artifact.
 	 */
 	async #ensureEphemeralArtifactManager(): Promise<ArtifactManager | null> {
-		this.#ephemeralArtifactInit ??= fs.promises
-			.mkdtemp(path.join(os.tmpdir(), "gjc-session-artifacts-"))
-			.then(dir => {
-				this.#ephemeralArtifactDir = dir;
-				this.#ephemeralArtifactManager = new ArtifactManager(dir);
-				return this.#ephemeralArtifactManager;
-			})
-			.catch(() => null);
-		const manager = await this.#ephemeralArtifactInit;
-		if (!manager) this.#ephemeralArtifactInit = null;
+		if (!this.#ephemeralArtifactInit) {
+			let init: Promise<ArtifactManager | null>;
+			init = fs.promises
+				.mkdtemp(path.join(os.tmpdir(), "gjc-session-artifacts-"))
+				.then(async dir => {
+					const manager = new ArtifactManager(dir);
+					if (this.#ephemeralArtifactInit !== init) {
+						await fs.promises.rm(dir, { recursive: true, force: true });
+						return null;
+					}
+					this.#ephemeralArtifactDir = dir;
+					this.#ephemeralArtifactManager = manager;
+					return manager;
+				})
+				.catch(() => null);
+			this.#ephemeralArtifactInit = init;
+		}
+		const init = this.#ephemeralArtifactInit;
+		const manager = await init;
+		if (!manager && this.#ephemeralArtifactInit === init) this.#ephemeralArtifactInit = null;
 		return manager;
 	}
 
-	/** Unbind and remove the ephemeral store; the successor session owns its own artifacts. */
-	#discardEphemeralArtifacts(): void {
+	/** Unbind the active ephemeral root only after a successor transition commits. */
+	#retireEphemeralArtifacts(): void {
 		const dir = this.#ephemeralArtifactDir;
+		const init = this.#ephemeralArtifactInit;
+		if (!dir && !init) return;
 		this.#ephemeralArtifactManager = null;
 		this.#ephemeralArtifactDir = null;
 		this.#ephemeralArtifactInit = null;
-		if (dir) void fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+		const cleanup = (async () => {
+			const initialized = await init;
+			const cleanupDir = dir ?? initialized?.dir;
+			if (cleanupDir) await fs.promises.rm(cleanupDir, { recursive: true, force: true });
+		})();
+		void cleanup.catch(() => {});
+		this.#ephemeralArtifactCleanups.add(cleanup);
+	}
+
+	async #drainEphemeralArtifactCleanups(): Promise<void> {
+		while (this.#ephemeralArtifactCleanups.size > 0) {
+			const pending = Array.from(this.#ephemeralArtifactCleanups);
+			this.#ephemeralArtifactCleanups.clear();
+			await Promise.all(pending);
+		}
 	}
 
 	/**
@@ -9832,6 +9880,7 @@ export class SessionManager {
 		);
 		manager.#applyFreshSessionMetadata(fresh);
 		manager.#commitResidentTextStoreTransition(transition);
+		manager.#retireEphemeralArtifacts();
 		if (fresh.sessionFile) writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		await manager.#rewriteFile();
@@ -9934,6 +9983,7 @@ export class SessionManager {
 			const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			manager.#applyFreshSessionMetadata(fresh);
 			manager.#commitResidentTextStoreTransition(transition);
+			manager.#retireEphemeralArtifacts();
 			writeTerminalBreadcrumb(manager.cwd, resolved);
 			await manager.#rewriteFile();
 			manager.#flushed = true;
@@ -10125,6 +10175,7 @@ export class SessionManager {
 			);
 			manager.#applyFreshSessionMetadata(fresh);
 			manager.#commitResidentTextStoreTransition(transition);
+			manager.#retireEphemeralArtifacts();
 			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 			const beforeWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
 			if ("kind" in beforeWrite) {

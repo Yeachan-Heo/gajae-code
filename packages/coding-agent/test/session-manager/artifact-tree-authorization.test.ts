@@ -47,6 +47,8 @@ describe("SessionManager artifact tree adoption (runtime boundary)", () => {
 		// The fix derives authorized dirs from `getArtifactManager()?.dir`, not
 		// `getArtifactsDir()`. Confirm that path is identical for parent and child.
 		expect(child.getArtifactManager()?.dir).toBe(parentManager!.dir);
+		expect(parent.isArtifactManagerAuthorized(parentManager!)).toBe(true);
+		expect(child.isArtifactManagerAuthorized(parentManager!)).toBe(true);
 	});
 
 	it("gives sibling subagents (independent adoptions of the same manager) the same authorized directory", () => {
@@ -88,5 +90,7 @@ describe("SessionManager artifact tree adoption (runtime boundary)", () => {
 		const unrelated = SessionManager.create(tempDir, SessionManager.explicitDestination(unrelatedDir));
 
 		expect(treeRoot.getArtifactManager()?.dir).not.toBe(unrelated.getArtifactManager()?.dir);
+		expect(treeRoot.isArtifactManagerAuthorized(unrelated.getArtifactManager()!)).toBe(false);
+		expect(unrelated.isArtifactManagerAuthorized(treeRoot.getArtifactManager()!)).toBe(false);
 	});
 });

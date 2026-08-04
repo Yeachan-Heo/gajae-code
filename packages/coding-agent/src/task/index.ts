@@ -485,10 +485,12 @@ interface SessionLifetimeArtifactsState {
 	originalGetArtifactsDir?: ToolSession["getArtifactsDir"];
 	originalGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
 	originalGetArtifactManager?: ToolSession["getArtifactManager"];
+	originalIsArtifactManagerAuthorized?: ToolSession["isArtifactManagerAuthorized"];
 	originalAgentOutputManager?: AgentOutputManager;
 	installedGetArtifactsDir?: ToolSession["getArtifactsDir"];
 	installedGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
 	installedGetArtifactManager?: ToolSession["getArtifactManager"];
+	installedIsArtifactManagerAuthorized?: ToolSession["isArtifactManagerAuthorized"];
 	installedAgentOutputManager?: AgentOutputManager;
 }
 
@@ -570,24 +572,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	/**
 	 * The artifact store shared by this whole agent tree, when the session proves
-	 * one. A subagent adopts its parent's `ArtifactManager`, so the manager's dir
-	 * is the parent's artifact root rather than this session's own root; the
-	 * subagent session file living inside that root is the containment proof.
-	 * A manager unrelated to this session's roots is foreign and rejected.
+	 * the exact manager relationship. Path containment is not authority: an
+	 * unrelated manager can choose a lexically nested root or session filename.
 	 */
 	#sharedArtifactStore(): { dir: string; manager: ArtifactManager } | null {
 		const manager = this.session.getArtifactManager?.() ?? null;
-		if (!manager) return null;
-		const dir = path.resolve(manager.dir);
-		const sessionArtifactsDir = this.session.getArtifactsDir?.();
-		if (sessionArtifactsDir && path.resolve(sessionArtifactsDir) === dir) return { dir, manager };
-		// Lexical containment only: the subagent session file is usually allocated
-		// but not yet created, so a realpath-based check would fail spuriously.
-		const sessionFile = this.session.getSessionFile();
-		if (!sessionFile) return null;
-		const relative = path.relative(dir, path.resolve(sessionFile));
-		if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
-		return { dir, manager };
+		if (!manager || this.session.isArtifactManagerAuthorized?.(manager) !== true) return null;
+		return { dir: path.resolve(manager.dir), manager };
 	}
 
 	/**
@@ -648,6 +639,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		state.originalGetArtifactsDir = this.session.getArtifactsDir;
 		state.originalGetAuthorizedArtifactsDirs = this.session.getAuthorizedArtifactsDirs;
 		state.originalGetArtifactManager = this.session.getArtifactManager;
+		state.originalIsArtifactManagerAuthorized = this.session.isArtifactManagerAuthorized;
 		state.originalAgentOutputManager = this.session.agentOutputManager;
 
 		state.installedGetArtifactsDir = () => state.originalGetArtifactsDir?.() ?? dir;
@@ -663,6 +655,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return dirs;
 		};
 		state.installedGetArtifactManager = () => manager;
+		state.installedIsArtifactManagerAuthorized = candidate =>
+			candidate === manager || state.originalIsArtifactManagerAuthorized?.(candidate) === true;
 		if (owned || !this.session.agentOutputManager) {
 			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null, {
 				parentPrefix: owned ? state.outputPrefix : undefined,
@@ -682,6 +676,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
 				if (this.session.getArtifactManager === state.installedGetArtifactManager)
 					this.session.getArtifactManager = state.originalGetArtifactManager;
+				if (this.session.isArtifactManagerAuthorized === state.installedIsArtifactManagerAuthorized)
+					this.session.isArtifactManagerAuthorized = state.originalIsArtifactManagerAuthorized;
 				if (this.session.agentOutputManager === state.installedAgentOutputManager)
 					this.session.agentOutputManager = state.originalAgentOutputManager;
 				sessionLifetimeArtifacts.delete(this.session);
@@ -715,6 +711,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		this.session.getArtifactsDir = state.installedGetArtifactsDir;
 		this.session.getAuthorizedArtifactsDirs = state.installedGetAuthorizedArtifactsDirs;
 		this.session.getArtifactManager = state.installedGetArtifactManager;
+		this.session.isArtifactManagerAuthorized = state.installedIsArtifactManagerAuthorized;
 		if (state.installedAgentOutputManager) this.session.agentOutputManager = state.installedAgentOutputManager;
 		return true;
 	}

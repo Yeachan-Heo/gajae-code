@@ -11,6 +11,7 @@ import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent } from "../../src/session/agent-session";
 import { ArtifactManager } from "../../src/session/artifacts";
+import { SessionManager } from "../../src/session/session-manager";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
@@ -228,6 +229,7 @@ describe("task no-session output refs", () => {
 		const session = createSession(path.join(parentRoot, "0-Child.jsonl"), `nested-${Snowflake.next()}`);
 		session.getArtifactsDir = () => null;
 		session.getArtifactManager = () => parentManager;
+		session.isArtifactManagerAuthorized = manager => manager === parentManager;
 
 		try {
 			const resultText = await runDetachedTask(await TaskTool.create(session));
@@ -337,6 +339,65 @@ describe("task no-session output refs", () => {
 		await session.disposeSession();
 		expect(session.getArtifactManager?.()).toBe(foreignManager);
 		await fs.rm(foreignRoot, { recursive: true, force: true });
+	});
+
+	it("reuses an authorized ephemeral manager and preserves one numeric artifact ID space", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("shared ephemeral manager output")),
+		);
+		const owner = SessionManager.inMemory("/tmp");
+		expect(await owner.saveArtifact("before task", "bash")).toBe("0");
+		const manager = owner.getArtifactManager()!;
+		const root = manager.dir;
+		const session = createSession(null, `ephemeral-manager-${Snowflake.next()}`);
+		session.getArtifactManager = () => owner.getArtifactManager();
+		session.isArtifactManagerAuthorized = candidate => owner.isArtifactManagerAuthorized(candidate);
+
+		const resultText = await runDetachedTask(await TaskTool.create(session));
+		const outputId = matchAgentOutputId(resultText, "NoSession")?.[1];
+		expect(outputId).toBeTruthy();
+		expect(await Bun.file(path.join(root, `${outputId}.md`)).exists()).toBe(true);
+		expect(session.getArtifactsDir?.()).toBeNull();
+		expect(session.getArtifactManager?.()).toBe(manager);
+		expect(await owner.saveArtifact("after task", "bash")).toBe("1");
+		expect((await fs.readdir(root)).filter(name => /^\d+\..*\.log$/.test(name)).sort()).toEqual([
+			"0.bash.log",
+			"1.bash.log",
+		]);
+
+		await session.disposeSession();
+		await owner.close();
+		expect(
+			await fs.stat(root).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+
+	it("rejects a lexically nested foreign manager without exact session proof", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("foreign manager rejection output")),
+		);
+		const foreignRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-lexical-foreign-"));
+		const foreignManager = new ArtifactManager(foreignRoot);
+		const sessionFile = path.join(foreignRoot, "0-Child.jsonl");
+		const session = createSession(sessionFile, `lexical-foreign-${Snowflake.next()}`);
+		session.getArtifactsDir = () => null;
+		session.getArtifactManager = () => foreignManager;
+		session.isArtifactManagerAuthorized = () => false;
+		try {
+			const resultText = await runDetachedTask(await TaskTool.create(session));
+			const outputId = matchAgentOutputId(resultText, "NoSession")?.[1];
+			expect(outputId).toBeTruthy();
+			expect(await Bun.file(path.join(foreignRoot, `${outputId}.md`)).exists()).toBe(false);
+			expect(await Bun.file(path.join(sessionFile.slice(0, -6), `${outputId}.md`)).exists()).toBe(true);
+		} finally {
+			await session.disposeSession();
+			await fs.rm(foreignRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("does not allocate durable output when session cleanup is unavailable", async () => {

@@ -1,8 +1,16 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { MemoryBlobStore } from "../../src/session/blob-store";
 import { SessionManager } from "../../src/session/session-manager";
+
+async function pathExists(target: string): Promise<boolean> {
+	return fs.stat(target).then(
+		() => true,
+		() => false,
+	);
+}
 
 describe("non-persistent session artifacts", () => {
 	it("writes artifacts to a lazily created temp directory and reads them back from disk", async () => {
@@ -28,7 +36,8 @@ describe("non-persistent session artifacts", () => {
 		expect(second).toBe("1");
 		expect(path.dirname((await session.getArtifactPath(second!))!)).toBe(manager!.dir);
 
-		await fs.rm(manager!.dir, { recursive: true, force: true });
+		await session.close();
+		expect(await pathExists(manager!.dir)).toBe(false);
 	});
 
 	it("allocates one shared temp directory under concurrent saves", async () => {
@@ -42,7 +51,44 @@ describe("non-persistent session artifacts", () => {
 		expect(new Set(paths.map(p => path.dirname(p!))).size).toBe(1);
 		expect(await Bun.file(paths[0]!).text()).toStartWith("payload ");
 
-		await fs.rm(session.getArtifactManager()!.dir, { recursive: true, force: true });
+		const root = session.getArtifactManager()!.dir;
+		await session.close();
+		expect(await pathExists(root)).toBe(false);
+	});
+
+	it("removes its ephemeral root on terminal closeStrict", async () => {
+		const session = SessionManager.inMemory();
+		await session.saveArtifact("terminal", "bash");
+		const root = session.getArtifactManager()!.dir;
+
+		expect(await session.closeStrict()).toEqual({ kind: "closed" });
+		expect(await pathExists(root)).toBe(false);
+	});
+
+	it("preserves the restored live session artifacts when a fresh transition fails", async () => {
+		const session = SessionManager.inMemory();
+		const id = await session.saveArtifact("live predecessor artifact", "bash");
+		const manager = session.getArtifactManager()!;
+		const root = manager.dir;
+		const artifactPath = await session.getArtifactPath(id!);
+		const prepared = await session.prepareNewSession();
+		session.appendPreparedCustomMessageEntry(prepared, "large", "x".repeat(2 * 1024 * 1024), true);
+		const putSync = spyOn(MemoryBlobStore.prototype, "putSync").mockImplementation(() => {
+			throw new Error("injected fresh transition failure");
+		});
+		try {
+			expect(() => session.commitPreparedNewSession(prepared)).toThrow("injected fresh transition failure");
+		} finally {
+			putSync.mockRestore();
+		}
+
+		expect(session.getArtifactManager()).toBe(manager);
+		expect(await Bun.file(artifactPath!).text()).toBe("live predecessor artifact");
+		expect(await pathExists(root)).toBe(true);
+
+		await session.discardPreparedNewSession(prepared);
+		await session.close();
+		expect(await pathExists(root)).toBe(false);
 	});
 	it("prefers the session artifact directory when the session is persisted", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ephemeral-artifacts-"));
