@@ -16430,6 +16430,7 @@ export class AgentSession {
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				if (switchingToDifferentSession) this.sessionManager.stageAdoptedArtifactManagerForTransition();
 				// The successor identity is already rotated in the manager but not yet
 				// published; gate its local:// root before publication so the agent,
 				// workflow-gate emitter, and hooks cannot resolve against an ungated

@@ -8041,6 +8041,11 @@ export class SessionManager {
 		if (this.#adoptedArtifactManager === manager) this.#adoptedArtifactManager = null;
 	}
 
+	/** Temporarily release adopted authority while an outer transition validates its successor. */
+	stageAdoptedArtifactManagerForTransition(): void {
+		this.#adoptedArtifactManager = null;
+	}
+
 	/** Prove manager authority by exact object identity, never by pathname shape. */
 	isArtifactManagerAuthorized(manager: ArtifactManager): boolean {
 		return (

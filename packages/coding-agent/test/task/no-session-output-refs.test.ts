@@ -4,12 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel, type Message } from "@gajae-code/ai";
-import { Snowflake } from "@gajae-code/utils";
+import { getAgentDir, Snowflake, setAgentDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../src/async";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
-import { InternalUrlRouter } from "../../src/internal-urls";
+import * as internalUrls from "../../src/internal-urls";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import { AgentSession, type AgentSessionEvent } from "../../src/session/agent-session";
@@ -22,6 +22,8 @@ import * as discoveryModule from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 import { EventBus } from "../../src/utils/event-bus";
+
+const { InternalUrlRouter } = internalUrls;
 
 const TEST_AGENT: AgentDefinition = {
 	name: "executor",
@@ -512,6 +514,92 @@ describe("task no-session output refs", () => {
 		} finally {
 			if (runtime) await runtime.dispose();
 			authStorage.close();
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("stages task fallback authority for managed legacy-local resume and restores it on rollback", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-task-first-resume-"));
+		const agentDir = path.join(cwd, "agent");
+		const originalAgentDir = getAgentDir();
+		setAgentDir(agentDir);
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		let runtime: AgentSession | undefined;
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model");
+			authStorage.setRuntimeApiKey("anthropic", "test-key");
+			const destination = SessionManager.managedDestination(cwd, agentDir);
+			const target = SessionManager.create(cwd, destination);
+			target.appendMessage({ role: "user", content: "managed target", timestamp: 1 });
+			await target.ensureOnDisk();
+			const targetFile = target.getSessionFile();
+			if (!targetFile) throw new Error("Expected managed target session file");
+			const targetSessionId = target.getSessionId();
+			const targetLocalRoot = internalUrls.resolveLocalRoot({
+				isManagedDestination: () => true,
+				getSessionId: () => targetSessionId,
+			});
+			await target.close();
+			const legacyLocalDir = path.join(targetFile.slice(0, -6), "local");
+			await fs.mkdir(legacyLocalDir, { recursive: true });
+			await Bun.write(path.join(legacyLocalDir, "legacy.txt"), "managed legacy payload");
+
+			const owner = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+			const currentFile = owner.getSessionFile();
+			expect(currentFile).toBeTruthy();
+			expect(currentFile).not.toBe(targetFile);
+			runtime = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model, systemPrompt: ["Test"], tools: [] },
+				}),
+				sessionManager: owner,
+				settings: Settings.isolated(),
+				modelRegistry: new ModelRegistry(authStorage, path.join(cwd, "models.yml")),
+			});
+			const fallbackRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-task-fallback-"));
+			const fallbackManager = new ArtifactManager(fallbackRoot);
+			expect(await fallbackManager.save("fallback predecessor", "task")).toBe("0");
+			owner.adoptArtifactManager(fallbackManager);
+			runtime.registerToolSessionTransitionCleanup(async () => {
+				owner.releaseArtifactManager(fallbackManager);
+				await fs.rm(fallbackRoot, { recursive: true, force: true });
+			});
+
+			const readiness = vi
+				.spyOn(internalUrls, "initializeLocalRoot")
+				.mockRejectedValueOnce(new Error("injected managed local-root failure"));
+			await expect(runtime.switchSession(targetFile)).rejects.toThrow("injected managed local-root failure");
+			readiness.mockRestore();
+			expect(owner.getSessionFile()).toBe(currentFile);
+			expect(owner.getArtifactManager()).toBe(fallbackManager);
+			expect(owner.isArtifactManagerAuthorized(fallbackManager)).toBe(true);
+			expect(await fallbackManager.getPath("0")).toBe(path.join(fallbackRoot, "0.task.log"));
+			expect(await Bun.file((await fallbackManager.getPath("0"))!).text()).toBe("fallback predecessor");
+			expect(await pathExists(path.join(targetLocalRoot, ".gjc-local-legacy-migrated-v1"))).toBe(false);
+
+			expect(await runtime.switchSession(targetFile)).toBe(true);
+			expect(await pathExists(fallbackRoot)).toBe(false);
+			expect(owner.isArtifactManagerAuthorized(fallbackManager)).toBe(false);
+			const localPath = internalUrls.resolveLocalUrlToPath("local://legacy.txt", {
+				getArtifactsDir: () => owner.getArtifactsDir(),
+				isManagedDestination: () => owner.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => owner.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => owner.getSessionId(),
+			});
+			expect(await Bun.file(localPath).text()).toBe("managed legacy payload");
+			expect(path.dirname(localPath)).toBe(targetLocalRoot);
+			const migrationMarker = await Bun.file(
+				path.join(path.dirname(localPath), ".gjc-local-legacy-migrated-v1"),
+			).text();
+			expect(["verified\n", "cleanup_pending\n"]).toContain(migrationMarker);
+			expect(migrationMarker).not.toBe("absent\n");
+			expect(path.resolve(localPath)).not.toStartWith(path.resolve(legacyLocalDir));
+		} finally {
+			if (runtime) await runtime.dispose();
+			authStorage.close();
+			setAgentDir(originalAgentDir);
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
