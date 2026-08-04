@@ -688,12 +688,14 @@ export class ExtensionRunner {
 		ext: Extension,
 		timeoutMs: number,
 	): Promise<TResult | undefined> {
-		let timeout: ReturnType<typeof setTimeout> | undefined;
+		let timeout: NodeJS.Timeout | undefined;
+		const abortController = new AbortController();
+		const handlerContext: ExtensionContext = { ...ctx, signal: abortController.signal };
 		try {
 			const timeoutPromise = new Promise<typeof EXTENSION_HANDLER_TIMEOUT>(resolve => {
 				timeout = setTimeout(() => resolve(EXTENSION_HANDLER_TIMEOUT), timeoutMs);
 			});
-			const handlerResult = await Promise.race([Promise.resolve(handler(event, ctx)), timeoutPromise]);
+			const handlerResult = await Promise.race([Promise.resolve(handler(event, handlerContext)), timeoutPromise]);
 			if (timeout !== undefined) {
 				clearTimeout(timeout);
 				timeout = undefined;
@@ -701,6 +703,7 @@ export class ExtensionRunner {
 
 			if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
 				const error = `handler timed out after ${timeoutMs}ms`;
+				abortController.abort(new Error(error));
 				logger.warn("Extension handler timed out", {
 					extensionPath: ext.path,
 					event: event.type,

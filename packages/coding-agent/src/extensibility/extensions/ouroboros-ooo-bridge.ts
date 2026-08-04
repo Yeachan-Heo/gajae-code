@@ -34,6 +34,10 @@ function isOooCommand(text: string): boolean {
 	return text === "ooo" || text.startsWith("ooo ") || text.startsWith("ooo\t");
 }
 
+function isBuiltInControlInput(text: string): boolean {
+	return text === "." || text === "c" || text.startsWith("/");
+}
+
 function resultText(result: MCPToolCallResult): string {
 	return result.content
 		.filter(content => content.type === "text")
@@ -67,6 +71,7 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 	let interview: InterviewState | undefined;
 	let activeConnection: MCPServerConnection | undefined;
 	let pendingConnection: Promise<MCPServerConnection> | undefined;
+	let lifecycleGeneration = 0;
 
 	const commandBridge = createExactPrefixCommandBridge({
 		prefix: "ooo",
@@ -74,32 +79,69 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 		args: ["dispatch", "--runtime", "gjc"],
 	});
 
-	async function connection(ctx: ExtensionContext): Promise<MCPServerConnection> {
-		if (activeConnection) return activeConnection;
-		pendingConnection ??= connect("ouroboros-ooo-bridge", {
-			type: "stdio",
-			command: resolveOuroborosCommand(),
-			args: ["mcp", "serve", "--runtime", "gjc"],
-			cwd: ctx.cwd,
-		});
-		try {
-			activeConnection = await pendingConnection;
-			return activeConnection;
-		} finally {
-			pendingConnection = undefined;
+	function assertCurrent(generation: number, signal: AbortSignal | undefined): void {
+		if (generation !== lifecycleGeneration || signal?.aborted) {
+			throw signal?.reason instanceof Error ? signal.reason : new Error("Ouroboros interview operation cancelled");
 		}
 	}
 
-	async function closeInterview(): Promise<void> {
+	async function disconnectSafely(connection: MCPServerConnection | undefined): Promise<void> {
+		if (!connection) return;
+		try {
+			await disconnect(connection);
+		} catch {
+			// State is already fenced. A dead transport must not keep ordinary input captured.
+		}
+	}
+
+	async function resetInterview(): Promise<void> {
+		lifecycleGeneration++;
 		const connectionToClose = activeConnection;
 		interview = undefined;
 		activeConnection = undefined;
-		if (connectionToClose) await disconnect(connectionToClose);
+		pendingConnection = undefined;
+		await disconnectSafely(connectionToClose);
+	}
+
+	async function connection(ctx: ExtensionContext, generation: number): Promise<MCPServerConnection> {
+		assertCurrent(generation, ctx.signal);
+		if (activeConnection) return activeConnection;
+		const pending =
+			pendingConnection ??
+			connect(
+				"ouroboros-ooo-bridge",
+				{
+					type: "stdio",
+					command: resolveOuroborosCommand(),
+					args: ["mcp", "serve", "--runtime", "gjc"],
+					cwd: ctx.cwd,
+				},
+				{ signal: ctx.signal },
+			);
+		pendingConnection = pending;
+		try {
+			const connected = await pending;
+			try {
+				assertCurrent(generation, ctx.signal);
+			} catch (error) {
+				await disconnectSafely(connected);
+				throw error;
+			}
+			activeConnection = connected;
+			return connected;
+		} finally {
+			if (pendingConnection === pending) pendingConnection = undefined;
+		}
 	}
 
 	async function runInterview(text: string, ctx: ExtensionContext): Promise<InputEventResult> {
+		const generation = lifecycleGeneration;
+		const abortHandler = () => {
+			void resetInterview();
+		};
+		ctx.signal?.addEventListener("abort", abortHandler, { once: true });
 		try {
-			const activeConnection = await connection(ctx);
+			const interviewConnection = await connection(ctx, generation);
 			const commandArgument = interviewArgument(text);
 			const args: Record<string, unknown> = { cwd: ctx.cwd };
 			if (interview) {
@@ -110,7 +152,8 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 				args.initial_context = commandArgument ?? "";
 			}
 
-			const result = await invoke(activeConnection, INTERVIEW_TOOL, args);
+			const result = await invoke(interviewConnection, INTERVIEW_TOOL, args, { signal: ctx.signal });
+			assertCurrent(generation, ctx.signal);
 			const output = resultText(result);
 			if (result.isError) throw new Error(output || "Ouroboros interview failed");
 
@@ -119,18 +162,24 @@ export function createOuroborosOooBridge(options: OuroborosOooBridgeOptions = {}
 				if (!sessionId) throw new Error("Ouroboros interview response did not include a session ID");
 				interview = { sessionId };
 			} else {
-				await closeInterview();
+				await resetInterview();
 			}
 			return output ? { handled: true, text: output } : { handled: true };
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			ctx.ui?.notify(message, "error");
+			await resetInterview();
+			if (!ctx.signal?.aborted) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui?.notify(message, "error");
+			}
 			return { handled: true };
+		} finally {
+			ctx.signal?.removeEventListener("abort", abortHandler);
 		}
 	}
 
 	return async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
 		if (event.source !== undefined && event.source !== "interactive") return {};
+		if (isBuiltInControlInput(event.text)) return {};
 		const argument = interviewArgument(event.text);
 		if (argument !== undefined || (interview && !isOooCommand(event.text))) {
 			return runInterview(event.text, ctx);

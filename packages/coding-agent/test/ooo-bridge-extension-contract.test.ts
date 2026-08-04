@@ -20,10 +20,10 @@ function input(text: string, source?: InputEvent["source"], images?: ImageConten
 	return { type: "input", text, source, images } as InputEvent;
 }
 
-function context(): ExtensionContext {
+function context(notify: (message: string, level: "info" | "warning" | "error") => void = () => {}): ExtensionContext {
 	return {
 		cwd: "/tmp",
-		ui: { notify: () => {} },
+		ui: { notify },
 	} as unknown as ExtensionContext;
 }
 
@@ -278,6 +278,7 @@ describe("ooo bridge extension contract", () => {
 			on(event: string, handler: unknown): void {
 				registrations.push({ event, handler });
 			},
+			pi: { createOuroborosOooBridge },
 		} as unknown as ExtensionAPI);
 
 		expect(registrations).toHaveLength(1);
@@ -289,16 +290,25 @@ describe("ooo bridge extension contract", () => {
 			handled: true,
 			text: "Session interview_abc123\n\nWhat should it build?",
 		});
-		expect(connectSpy).toHaveBeenCalledWith("ouroboros-ooo-bridge", {
-			type: "stdio",
-			command: "/opt/ouroboros/bin/ouroboros",
-			args: ["mcp", "serve", "--runtime", "gjc"],
-			cwd: ctx.cwd,
-		});
-		expect(callSpy).toHaveBeenCalledWith(connection, "ouroboros_interview", {
-			cwd: ctx.cwd,
-			initial_context: "Build a CLI",
-		});
+		expect(connectSpy).toHaveBeenCalledWith(
+			"ouroboros-ooo-bridge",
+			{
+				type: "stdio",
+				command: "/opt/ouroboros/bin/ouroboros",
+				args: ["mcp", "serve", "--runtime", "gjc"],
+				cwd: ctx.cwd,
+			},
+			{ signal: undefined },
+		);
+		expect(callSpy).toHaveBeenCalledWith(
+			connection,
+			"ouroboros_interview",
+			{
+				cwd: ctx.cwd,
+				initial_context: "Build a CLI",
+			},
+			{ signal: undefined },
+		);
 	});
 
 	it("correlates ordinary answers to one interview and stops claiming input after completion", async () => {
@@ -341,6 +351,71 @@ describe("ooo bridge extension contract", () => {
 		expect(disconnect).toHaveBeenCalledWith(connection);
 		expect(await handler(input("normal prompt", "interactive"), ctx)).toEqual({});
 		expect(invoke).toHaveBeenCalledTimes(2);
+	});
+
+	it("clears interview and cached transport after an MCP failure", async () => {
+		const firstConnection = { name: "first" } as MCPServerConnection;
+		const secondConnection = { name: "second" } as MCPServerConnection;
+		const connect = vi.fn(async () => (connect.mock.calls.length === 1 ? firstConnection : secondConnection));
+		const disconnect = vi.fn(async () => {});
+		const invoke = vi
+			.fn<typeof runtimeMcpModule.callTool>()
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Session interview_failure\n\nFirst question?" }],
+				_meta: { session_id: "interview_failure", phase: "start" },
+			})
+			.mockRejectedValueOnce(new Error("dead transport"))
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Session interview_fresh\n\nFresh question?" }],
+				_meta: { session_id: "interview_fresh", phase: "start" },
+			});
+		const handler = createOuroborosOooBridge({ connect, callTool: invoke, disconnect });
+		const notify = vi.fn();
+		const ctx = context(notify);
+
+		await handler(input("ooo interview Initial", "interactive"), ctx);
+		expect(await handler(input("answer", "interactive"), ctx)).toEqual({ handled: true });
+		expect(notify).toHaveBeenCalledWith("dead transport", "error");
+		expect(disconnect).toHaveBeenCalledWith(firstConnection);
+		expect(await handler(input("ordinary prompt", "interactive"), ctx)).toEqual({});
+		await handler(input("ooo interview Fresh", "interactive"), ctx);
+		expect(connect).toHaveBeenCalledTimes(2);
+		expect(invoke.mock.calls[2]?.[2]).toEqual({ cwd: ctx.cwd, initial_context: "Fresh" });
+	});
+
+	it("bypasses built-in controls while preserving ordinary interview answers", async () => {
+		const connection = { name: "controls" } as MCPServerConnection;
+		const invoke = vi
+			.fn<typeof runtimeMcpModule.callTool>()
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Session interview_controls\n\nChoose a target?" }],
+				_meta: { session_id: "interview_controls", phase: "start" },
+			})
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Interview completed. Session ID: interview_controls" }],
+				_meta: { session_id: "interview_controls", phase: "complete", completed: true },
+			});
+		const handler = createOuroborosOooBridge({
+			connect: vi.fn(async () => connection),
+			callTool: invoke,
+			disconnect: vi.fn(async () => {}),
+		});
+		const ctx = context();
+
+		await handler(input("ooo interview Controls", "interactive"), ctx);
+		for (const control of ["/exit", "/quit", "/new", "/clear", ".", "c"]) {
+			expect(await handler(input(control, "interactive"), ctx)).toEqual({});
+		}
+		expect(invoke).toHaveBeenCalledTimes(1);
+		expect(await handler(input("Linux", "interactive"), ctx)).toEqual({
+			handled: true,
+			text: "Interview completed. Session ID: interview_controls",
+		});
+		expect(invoke.mock.calls[1]?.[2]).toEqual({
+			cwd: ctx.cwd,
+			session_id: "interview_controls",
+			answer: "Linux",
+		});
 	});
 
 	it("canonical ouroboros helper uses the same exact-prefix contract", async () => {
