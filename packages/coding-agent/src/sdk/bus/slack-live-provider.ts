@@ -86,6 +86,20 @@ function messages(value: unknown): SlackApiMessage[] {
 		: [];
 }
 
+/**
+ * Slack Web API request bodies must be form encoded. Several read methods —
+ * `conversations.replies` among them — reject `application/json` with
+ * `invalid_arguments`, so JSON encoding breaks root-post reconciliation and
+ * takes the notification daemon down with an uncaught provider error.
+ */
+function formBody(body: Record<string, string | undefined>): string {
+	const parameters = new URLSearchParams();
+	for (const [key, value] of Object.entries(body)) {
+		if (value !== undefined) parameters.set(key, value);
+	}
+	return parameters.toString();
+}
+
 function retryAfterMilliseconds(response: Response, body: SlackApiResponse, maximum: number): number {
 	const header = Number(response.headers.get("retry-after"));
 	const bodyValue = typeof body.retry_after === "number" ? body.retry_after : Number(body.retry_after);
@@ -385,8 +399,11 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 			try {
 				response = await this.#fetch(`${SLACK_API}/${operation}`, {
 					method: "POST",
-					headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=utf-8" },
-					body: JSON.stringify(body),
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+					},
+					body: formBody(body),
 					signal,
 				});
 			} catch {

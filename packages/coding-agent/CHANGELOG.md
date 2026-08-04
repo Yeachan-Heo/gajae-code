@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Slack Web API calls are now form encoded instead of JSON encoded. `conversations.replies` rejects `application/json` with `invalid_arguments`, so the reconciliation lookup that follows an uncertain root post threw an uncaught `SlackProviderError` and killed the notification daemon before it published ownership. Sessions then reported `slack runtime is not ready or attached` and never received a Slack thread, even with valid credentials, scopes, and configuration.
+
 - Telegram daemon restart now revokes every persisted callback alias before polling. Reconnecting sessions must replay a pending ask to receive fresh, owner-bound aliases; old controls remain stale, and their keyboards are best-effort terminalized when the original Telegram message id is available. Shutdown now fences new session messages and drains every admitted handler before final callback persistence and ownership release, preventing a successful send racing shutdown from publishing alias state after a successor takes ownership (#3727).
 - Extension handler timeout signals now preserve lazy, live context accessors instead of eagerly snapshotting them. Model changes made through SDK controls are immediately visible to later context reads, and unused getters can no longer reject lifecycle emission before the runner's extension error boundary (#3817).
 - Direct interactive launches inside tmux now bind automatic window renames to the originating pane's immutable pane/window identities and observed window index. If that binding changes before mutation, GJC preserves every window name instead of renaming whichever window became active (#3808).

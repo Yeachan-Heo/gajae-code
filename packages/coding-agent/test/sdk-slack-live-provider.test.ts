@@ -167,6 +167,34 @@ describe("SlackLiveProvider fake Socket Mode protocol", () => {
 		expect(fixture.requests[0]?.init?.body).toContain("client_msg_id");
 	});
 
+	it("form encodes every Web API request so conversations.replies is not rejected", async () => {
+		const fixture = setup([
+			response({ ok: true, channel: "C1", ts: "1.0", client_msg_id: "client-1" }),
+			response({ ok: true, messages: [] }),
+			response({ ok: true, messages: [{ ts: "2.0", client_msg_id: "client-1" }] }),
+		]);
+		await fixture.provider.postMessage({ channel: "C1", text: "hi there", clientMsgId: "client-1" });
+		await fixture.provider.findMessageByClientMsgId({ channel: "C1", threadTs: "0.0", clientMsgId: "client-1" });
+
+		expect(fixture.requests).toHaveLength(3);
+		for (const request of fixture.requests) {
+			const headers = request.init?.headers as Record<string, string> | undefined;
+			expect(headers?.["Content-Type"]).toBe("application/x-www-form-urlencoded; charset=utf-8");
+			expect(typeof request.init?.body).toBe("string");
+		}
+
+		const post = new URLSearchParams(String(fixture.requests[0]?.init?.body));
+		expect(post.get("channel")).toBe("C1");
+		expect(post.get("text")).toBe("hi there");
+		expect(post.get("client_msg_id")).toBe("client-1");
+		// Absent optional fields must not reach Slack as the literal "undefined".
+		expect(post.has("thread_ts")).toBe(false);
+
+		const replies = new URLSearchParams(String(fixture.requests[2]?.init?.body));
+		expect(replies.get("channel")).toBe("C1");
+		expect(replies.get("ts")).toBe("0.0");
+	});
+
 	it("bounds rate-limit retry and exposes no credential in typed errors", async () => {
 		const fixture = setup([
 			response({ ok: false }, 429, { "retry-after": "120" }),
