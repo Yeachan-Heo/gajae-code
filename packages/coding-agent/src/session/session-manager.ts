@@ -5644,6 +5644,7 @@ export class SessionManager {
 					prepared.dispose();
 					throw error;
 				}
+				this.#retireEphemeralArtifacts();
 				managedTransition?.settle();
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;

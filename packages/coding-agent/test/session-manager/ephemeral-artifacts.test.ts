@@ -5,13 +5,21 @@ import * as path from "node:path";
 import { InternalUrlRouter } from "../../src/internal-urls";
 import { ArtifactManager } from "../../src/session/artifacts";
 import { MemoryBlobStore } from "../../src/session/blob-store";
-import { SessionManager } from "../../src/session/session-manager";
+import { CURRENT_SESSION_VERSION, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
+import { FileSessionStorage } from "../../src/session/session-storage";
 
 async function pathExists(target: string): Promise<boolean> {
 	return fs.stat(target).then(
 		() => true,
 		() => false,
 	);
+}
+
+async function waitForPathRemoval(target: string): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (!(await pathExists(target))) return;
+		await Bun.sleep(5);
+	}
 }
 
 describe("non-persistent session artifacts", () => {
@@ -89,6 +97,74 @@ describe("non-persistent session artifacts", () => {
 		} finally {
 			InternalUrlRouter.resetForTests();
 			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("retires predecessor artifacts only after an existing-session transition commits", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-existing-session-artifacts-"));
+		const predecessor = SessionManager.inMemory(cwd, new FileSessionStorage());
+		try {
+			const targetFile = path.join(cwd, "existing-populated.jsonl");
+			const targetSessionId = "existing-populated-session";
+			const targetMessageId = "existing-message";
+			await Bun.write(
+				targetFile,
+				`${JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: targetSessionId,
+					timestamp: "2026-08-04T00:00:00.000Z",
+					cwd,
+				})}\n${JSON.stringify({
+					type: "message",
+					id: targetMessageId,
+					parentId: null,
+					timestamp: "2026-08-04T00:00:01.000Z",
+					message: { role: "user", content: "persisted resume target", timestamp: 1 },
+				})}\n`,
+			);
+
+			expect(await predecessor.saveArtifact("predecessor zero", "bash")).toBe("0");
+			expect(await predecessor.saveArtifact("predecessor one", "read")).toBe("1");
+			const predecessorManager = predecessor.getArtifactManager()!;
+			const predecessorRoot = predecessorManager.dir;
+			expect((await fs.readdir(predecessorRoot)).sort()).toEqual([
+				".artifact-id-0",
+				".artifact-id-1",
+				"0.bash.log",
+				"1.read.log",
+			]);
+
+			SessionManagerTestHooks.beforeResidentTransitionIndexBuild = () => {
+				throw new Error("injected existing-session transition failure");
+			};
+			await expect(predecessor.setSessionFile(targetFile!)).rejects.toThrow(
+				"injected existing-session transition failure",
+			);
+			expect(predecessor.getArtifactManager()).toBe(predecessorManager);
+			expect(await pathExists(predecessorRoot)).toBe(true);
+			expect(await predecessor.getArtifactPath("0")).toBe(path.join(predecessorRoot, "0.bash.log"));
+
+			SessionManagerTestHooks.beforeResidentTransitionIndexBuild = undefined;
+			await predecessor.setSessionFile(targetFile!);
+			await waitForPathRemoval(predecessorRoot);
+			expect(await pathExists(predecessorRoot)).toBe(false);
+			expect(predecessor.getSessionId()).toBe(targetSessionId);
+			expect(predecessor.getEntry(targetMessageId)).toMatchObject({
+				type: "message",
+				message: { content: "persisted resume target" },
+			});
+
+			const resumedManager = predecessor.getArtifactManager();
+			expect(resumedManager).not.toBe(predecessorManager);
+			expect(resumedManager?.dir).toBe(targetFile!.slice(0, -6));
+			expect(predecessor.isArtifactManagerAuthorized(resumedManager!)).toBe(true);
+			expect(await predecessor.saveArtifact("resumed artifact", "bash")).toBe("0");
+			expect(await Bun.file(path.join(resumedManager!.dir, "0.bash.log")).text()).toBe("resumed artifact");
+		} finally {
+			SessionManagerTestHooks.beforeResidentTransitionIndexBuild = undefined;
+			await predecessor.close();
+			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
 
