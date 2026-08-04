@@ -79,6 +79,15 @@ export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
 const EXTENSION_HANDLER_TIMEOUT = Symbol("extensionHandlerTimeout");
 
 const MAX_PENDING_CREDENTIAL_DISABLED = 32;
+function createHandlerContext(ctx: ExtensionContext, signal: AbortSignal): ExtensionContext {
+	const descriptors = Object.getOwnPropertyDescriptors(ctx);
+	descriptors.signal = {
+		configurable: true,
+		enumerable: true,
+		value: signal,
+	};
+	return Object.defineProperties({}, descriptors) as ExtensionContext;
+}
 
 /**
  * Events handled by the generic emit() method.
@@ -690,7 +699,7 @@ export class ExtensionRunner {
 	): Promise<TResult | undefined> {
 		let timeout: NodeJS.Timeout | undefined;
 		const abortController = new AbortController();
-		const handlerContext: ExtensionContext = { ...ctx, signal: abortController.signal };
+		const handlerContext = createHandlerContext(ctx, abortController.signal);
 		try {
 			const timeoutPromise = new Promise<typeof EXTENSION_HANDLER_TIMEOUT>(resolve => {
 				timeout = setTimeout(() => resolve(EXTENSION_HANDLER_TIMEOUT), timeoutMs);
