@@ -70,26 +70,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and polling dependency chain. Generation 48 uses crash-durable callback
  * receipts, a legacy-disjoint random alias namespace, and exact topic leases.
  * Generation 49 drains every admitted session-message handler before final
- * durable persistence and ownership release. Generation 50 resolves intermediate
- * notifications-directory symlinks before native exact unlink while keeping
- * final-component file symlinks fail-closed under AT_SYMLINK_NOFOLLOW (bounded
- * #3761 multi-account activation repair). Generation 51 adds shared durable
- * topic authority, archive recovery, and requires Telegram's documented error
- * code for idempotent archive settlement. Generation 52 is claimed by the
- * pre-readiness daemon-child exit diagnostics slice (#3761). Generation 53
- * renders multi-select state for ask-tool asks, not only durable workflow
- * gates, and renumbers pre-numbered options exactly once around the selection
- * marker. Generation 54 records owner `stoppedAt` on unclean daemon death
- * (`markDaemonOwnerStopped` + postmortem/finally wiring) so a dead process
- * cannot keep advertising itself as the ready owner (#3965). Generation 55
- * contains a shared-topic-authority outage: a failed lease renewal on the
- * liveness heartbeat and a failed startup registry load are reported instead
- * of escaping to the process-level fatal handler, authority-failure throws
- * preserve their underlying cause, and the compensation fence retry is bounded.
- * Generation 56 moves exact unlink and process-incarnation authority behind
- * lazy native bindings for the startup-cost cut (#3846).
+ * durable persistence and ownership release.
  */
-export const DAEMON_GENERATION = 56;
+export const DAEMON_GENERATION = 50;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
