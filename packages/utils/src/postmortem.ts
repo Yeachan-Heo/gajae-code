@@ -191,7 +191,47 @@ function installProcessStdoutWriteClassifier(): void {
 }
 
 function errorForDiagnostic(reason: unknown): Error {
-	return reason instanceof Error ? reason : new Error(String(reason));
+	if (reason instanceof Error) return reason;
+	// A thrown plain object (e.g. a structured startup-failure shape such as
+	// `{ phase, reason, message }`) would otherwise stringify to
+	// "[object Object]", hiding the actual failure in the crash log and on
+	// stderr. Surface `.message`/`.name` when present, otherwise fall back to a
+	// best-effort JSON snapshot. This runs on the uncaughtException path, where
+	// it must never throw, so every property read and serialization below is
+	// guarded: a throwing getter (or a Proxy get-trap), a circular structure, or
+	// a non-serializable value cannot re-enter the crash path. Arrays keep the
+	// existing `String(reason)` format ("1,2,3") rather than switching to JSON.
+	if (reason !== null && typeof reason === "object" && !Array.isArray(reason)) {
+		const value = reason as Record<string, unknown>;
+		let message: string;
+		try {
+			const msg = value.message;
+			message =
+				typeof msg === "string" && msg.length > 0
+					? msg
+					: (JSON.stringify(reason) ?? "[unserializable thrown object]");
+		} catch {
+			// A throwing getter on `.message` or an unserializable value (a circular
+			// structure) must not escape on the crash path.
+			message = "[unserializable thrown object]";
+		}
+		const error = new Error(message);
+		try {
+			const name = value.name;
+			if (typeof name === "string" && name.length > 0) error.name = name;
+		} catch {
+			// A throwing `.name` getter must not clobber the message above; leave
+			// the default name in place.
+		}
+		return error;
+	}
+	try {
+		return new Error(String(reason));
+	} catch {
+		// `String()` can still throw here — e.g. an array whose element has a
+		// throwing `toString` reaches this branch — so guard it like the rest.
+		return new Error("[unserializable thrown value]");
+	}
 }
 
 // Register signal and error event handlers to trigger cleanup before exit.
