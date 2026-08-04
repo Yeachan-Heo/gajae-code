@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner, loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions";
 import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -21,6 +24,7 @@ describe("AgentSession handoff", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let events: AgentSessionEvent[];
+	let asyncManager: AsyncJobManager | undefined;
 
 	async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
 		const deadline = Date.now() + timeoutMs;
@@ -61,6 +65,7 @@ describe("AgentSession handoff", () => {
 				"compaction.autoContinue": false,
 			}),
 			modelRegistry,
+			agentId: "owner",
 		});
 
 		session.subscribe(event => {
@@ -95,6 +100,8 @@ describe("AgentSession handoff", () => {
 		if (session) {
 			await session.dispose();
 		}
+		if (asyncManager) await asyncManager.dispose({ timeoutMs: 100 });
+		AsyncJobManager.setInstance(undefined);
 		authStorage.close();
 		try {
 			await tempDir.remove();
@@ -133,6 +140,68 @@ describe("AgentSession handoff", () => {
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
 		expect(events.filter(event => event.type === "auto_compaction_end")).toHaveLength(0);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+	});
+
+	it("settles detached owner jobs before handoff artifact retirement", async () => {
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue safely");
+		asyncManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(asyncManager);
+		const fallbackRoot = await fs.mkdtemp(path.join(tempDir.path(), "handoff-fallback-"));
+		const fallbackManager = new ArtifactManager(fallbackRoot);
+		sessionManager.adoptArtifactManager(fallbackManager);
+		session.registerToolSessionTransitionCleanup(async () => {
+			sessionManager.releaseArtifactManager(fallbackManager);
+			await fs.rm(fallbackRoot, { recursive: true, force: true });
+		});
+		const order: string[] = [];
+		const ownerJobId = asyncManager.register(
+			"task",
+			"handoff predecessor task",
+			async ({ signal }) => {
+				if (!signal.aborted)
+					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await Bun.write(path.join(fallbackRoot, "late-task.md"), "settled before handoff cleanup");
+				order.push("late-write");
+				return "cancelled";
+			},
+			{
+				ownerId: "owner",
+				metadata: { subagent: { id: "handoff-child", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		asyncManager.registerSubagentRecord({
+			subagentId: "handoff-child",
+			ownerId: "owner",
+			currentJobId: ownerJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: true,
+		});
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = asyncManager.register("task", "foreign handoff task", async () => foreignGate.promise, {
+			ownerId: "foreign",
+		});
+		const originalSettle = asyncManager.cancelAndSettleOwnerJobs.bind(asyncManager);
+		vi.spyOn(asyncManager, "cancelAndSettleOwnerJobs").mockImplementation(async ownerId => {
+			const settled = await originalSettle(ownerId);
+			order.push("settle");
+			return settled;
+		});
+		const originalCommit = sessionManager.commitPreparedNewSession.bind(sessionManager);
+		vi.spyOn(sessionManager, "commitPreparedNewSession").mockImplementation(prepared => {
+			order.push("commit");
+			originalCommit(prepared);
+		});
+
+		await expect(session.handoff()).resolves.toBeDefined();
+		expect(order).toEqual(["late-write", "settle", "commit"]);
+		expect(await Bun.file(path.join(fallbackRoot, "late-task.md")).exists()).toBe(false);
+		await Bun.sleep(20);
+		expect(await Bun.file(fallbackRoot).exists()).toBe(false);
+		expect(asyncManager.getJob(foreignJobId)?.status).toBe("running");
+		foreignGate.resolve("foreign complete");
+		await asyncManager.getJob(foreignJobId)?.promise;
 	});
 
 	it("does not run auto maintenance after final yield", async () => {

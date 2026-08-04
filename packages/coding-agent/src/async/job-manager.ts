@@ -463,6 +463,7 @@ export class AsyncJobManager {
 	readonly #terminalWaits = new Map<string, TerminalWaitState>();
 	#waitSeq = 0;
 	readonly #publishedTerminalGenerations = new Set<string>();
+	readonly #settledJobIds = new Set<string>();
 	#jobGenerationSeq = 0;
 	readonly #liveHandles = new Map<string, SubagentLiveHandle>();
 	readonly #subagentProgress = new Map<string, AgentProgress>();
@@ -820,6 +821,7 @@ export class AsyncJobManager {
 
 		this.#expireMonitorTombstones();
 		const id = this.#resolveJobId(options?.id);
+		this.#settledJobIds.delete(id);
 		const abortController = new AbortController();
 		const startTime = Date.now();
 
@@ -919,7 +921,9 @@ export class AsyncJobManager {
 				this.#scheduleEviction(id);
 				this.#drainResumeQueue();
 			}
-		})();
+		})().finally(() => {
+			this.#settledJobIds.add(id);
+		});
 
 		this.#jobs.set(id, job);
 		this.#notifyChange();
@@ -1218,6 +1222,8 @@ export class AsyncJobManager {
 			) {
 				continue;
 			}
+			if (job.status === "cancelled" && this.#settledJobIds.has(job.id) && !this.#subagentRecords.has(subagentId))
+				continue;
 			if (!targets.has(subagentId)) {
 				targets.set(subagentId, { subagentId, jobId: job.id, source: "metadata_job" });
 			}
@@ -2064,6 +2070,7 @@ export class AsyncJobManager {
 		this.#purgeTerminalSubagentStateForJob(jobId);
 		const job = this.#jobs.get(jobId);
 		this.#jobs.delete(jobId);
+		this.#settledJobIds.delete(jobId);
 		this.#lifecycles.delete(jobId);
 		this.#lifecyclePhases.delete(jobId);
 		this.#deadLetteredDeliveries.delete(jobId);

@@ -3478,6 +3478,28 @@ export class AgentSession {
 		manager.cancelAll({ ownerId: this.#agentId });
 	}
 
+	async #settleOwnAsyncJobsBeforeArtifactRetirement(): Promise<void> {
+		const ownerId = this.#agentId;
+		const manager = AsyncJobManager.instance();
+		if (!ownerId || !manager) return;
+		const lease = manager.beginOwnerSubagentShutdown(ownerId);
+		if (!lease) throw new Error("Owned async cleanup is already in progress before artifact retirement.");
+		let committed = false;
+		try {
+			manager.runOwnerProducerCleanupsStrict({ ownerId });
+			const proof = await manager.cancelAndProveOwnerSubagents(lease);
+			if (!proof.confirmed)
+				throw new Error("Owned subagent cleanup could not be confirmed before artifact retirement.");
+			if (!(await manager.waitForOwnerInFlightDeliveries(ownerId)))
+				throw new Error("Owned async deliveries did not settle before artifact retirement.");
+			if (!(await manager.cancelAndSettleOwnerJobs(ownerId)))
+				throw new Error("Owned async jobs did not settle before artifact retirement.");
+			committed = true;
+		} finally {
+			manager.finishOwnerSubagentShutdown(lease, committed ? "commit" : "release");
+		}
+	}
+
 	#suppressOwnAsyncJobDeliveries(): void {
 		if (!this.#agentId) return;
 		const manager = AsyncJobManager.instance();
@@ -10476,6 +10498,7 @@ export class AgentSession {
 			}
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.sessionManager.commitPreparedNewSession(prepared);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
@@ -12231,6 +12254,7 @@ export class AgentSession {
 				const successorGateEmitter = this.#constructWorkflowGateEmitter(prepared.sessionId);
 				// Last fallible action: verified local:// readiness from immutable staged options.
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
@@ -12266,7 +12290,6 @@ export class AgentSession {
 				this.#resetIrcRosterDeliveryState();
 				this.#planReferenceSent = false;
 				this.#planReferencePath = "local://PLAN.md";
-				this.#cancelOwnAsyncJobs();
 				// The predecessor's fenced async-job results (queued while the
 				// transition held the delivery fence) belong to the handed-off session,
 				// not the successor. Suppress and drop ONLY the async-result kind so they
@@ -16374,6 +16397,7 @@ export class AgentSession {
 		let ownerShutdownManager: AsyncJobManager | undefined;
 		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
 		let ownerShutdownTransitionCommitted = false;
+		let ownerShutdownFinalizationDeferred = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -16556,21 +16580,35 @@ export class AgentSession {
 				}
 
 				if (switchingToDifferentSession) {
+					let ownerShutdownSettled = true;
+					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
+						try {
+							ownerShutdownManager.runOwnerProducerCleanupsStrict({ ownerId });
+							const proof = await ownerShutdownManager.cancelAndProveOwnerSubagents(ownerShutdownLease);
+							if (!proof.confirmed)
+								throw new Error("Owned subagent cleanup could not be confirmed after successor validation.");
+							if (!(await ownerShutdownManager.waitForOwnerInFlightDeliveries(ownerId)))
+								throw new Error("Owned async deliveries did not settle after successor validation.");
+							if (!(await ownerShutdownManager.cancelAndSettleOwnerJobs(ownerId)))
+								throw new Error("Owned async jobs did not settle after successor validation.");
+						} catch (error) {
+							ownerShutdownSettled = false;
+							ownerShutdownFinalizationDeferred = true;
+							this.#suppressOwnAsyncJobDeliveries();
+							this.emitNotice(
+								"error",
+								`Successor session is active, but predecessor async cleanup did not settle: ${error instanceof Error ? error.message : String(error)}`,
+								"switch-session-subagent-cleanup",
+							);
+						}
+					}
 					transitionCleanupCommitted = true;
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
 					ownerShutdownTransitionCommitted = true;
-					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
-						ownerShutdownManager.runOwnerProducerCleanupsStrict({ ownerId });
-						const proof = await ownerShutdownManager.cancelAndProveOwnerSubagents(ownerShutdownLease);
-						if (!proof.confirmed)
-							throw new Error("Owned subagent cleanup could not be confirmed after successor validation.");
-						if (!(await ownerShutdownManager.waitForOwnerInFlightDeliveries(ownerId)))
-							throw new Error("Owned async deliveries did not settle after successor validation.");
-						if (!(await ownerShutdownManager.cancelAndSettleOwnerJobs(ownerId)))
-							throw new Error("Owned async jobs did not settle after successor validation.");
+					if (ownerShutdownSettled) {
+						this.sessionManager.retireEphemeralArtifactsAfterTransition();
+						await this.#runToolSessionTransitionCleanups();
 					}
-					this.sessionManager.retireEphemeralArtifactsAfterTransition();
-					await this.#runToolSessionTransitionCleanups();
 				}
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
@@ -16651,7 +16689,7 @@ export class AgentSession {
 				throw error;
 			}
 		} finally {
-			if (ownerShutdownManager && ownerShutdownLease) {
+			if (ownerShutdownManager && ownerShutdownLease && !ownerShutdownFinalizationDeferred) {
 				ownerShutdownManager.finishOwnerSubagentShutdown(
 					ownerShutdownLease,
 					ownerShutdownTransitionCommitted ? "commit" : "release",
@@ -16708,6 +16746,7 @@ export class AgentSession {
 				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.sessionManager.commitPreparedNewSession(prepared);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
@@ -16715,7 +16754,6 @@ export class AgentSession {
 			}
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-			this.#cancelOwnAsyncJobs();
 
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();
