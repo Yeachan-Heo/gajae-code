@@ -18,6 +18,7 @@ import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
+import { type ExecutionState, type ReceiptState, reportableReceipt } from "../sdk/receipt-state";
 import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
@@ -138,14 +139,13 @@ interface CoordinatorFinalResponse {
 }
 
 function reportableFinalResponse(response: CoordinatorFinalResponse): boolean {
-	return (
-		(typeof response.text === "string" && response.text.trim().length > 0) ||
-		(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)
-	);
+	return reportableReceipt({ text: response.text, artifactPath: response.artifact_path });
 }
 
 interface RuntimeSessionStatePayload extends CoordinatorSessionState {
 	final_response?: CoordinatorFinalResponse;
+	execution_state?: ExecutionState;
+	receipt_state?: ReceiptState;
 	error?: { code: string; message: string; recoverable: boolean } | null;
 }
 
@@ -175,6 +175,7 @@ type TurnStatus =
 	| "waiting_for_answer"
 	| "completing"
 	| "completed"
+	| "receipt_missing"
 	| "failed"
 	| "cancelled"
 	| "superseded";
@@ -185,6 +186,8 @@ interface TurnRecord {
 	session_id: string;
 	namespace: { profile: string | null; repo: string | null };
 	status: TurnStatus;
+	execution_state?: ExecutionState;
+	receipt_state?: ReceiptState;
 	prompt: { text: string; created_at: string; source: "mcp" | "question_answer" };
 	delivery: {
 		delivered: boolean;
@@ -295,7 +298,13 @@ const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
-const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
+const TERMINAL_TURN_STATUSES = new Set<TurnStatus>([
+	"completed",
+	"receipt_missing",
+	"failed",
+	"cancelled",
+	"superseded",
+]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_EXTERNAL_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/;
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -1541,7 +1550,6 @@ async function markTurnTerminalFromSessionState(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState,
 ): Promise<TurnRecord> {
-	const terminalStatus: TurnStatus = sessionState.state === "errored" ? "failed" : "completed";
 	const runtimeState = sessionState as RuntimeSessionStatePayload;
 	const finalResponse = runtimeState.final_response ?? {
 		text: null,
@@ -1550,6 +1558,16 @@ async function markTurnTerminalFromSessionState(
 		artifact_path: null,
 		truncated: false,
 	};
+	const hasReceipt = reportableFinalResponse(finalResponse);
+	const executionState: ExecutionState =
+		runtimeState.execution_state ?? (sessionState.state === "errored" ? "failed" : "unknown");
+	const receiptState: ReceiptState = runtimeState.receipt_state ?? (hasReceipt ? "present" : "missing");
+	const terminalStatus: TurnStatus =
+		executionState === "failed" || sessionState.state === "errored"
+			? "failed"
+			: hasReceipt && receiptState === "present"
+				? "completed"
+				: "receipt_missing";
 	const timestamp = new Date().toISOString();
 	const resolved: TurnRecord = {
 		...turn,
@@ -1560,6 +1578,8 @@ async function markTurnTerminalFromSessionState(
 			state: "acknowledged",
 		},
 		final_response: finalResponse,
+		execution_state: executionState,
+		receipt_state: receiptState,
 		evidence: reportableFinalResponse(finalResponse)
 			? turn.evidence
 			: [
@@ -1577,7 +1597,13 @@ async function markTurnTerminalFromSessionState(
 						message: sessionState.reason ?? "runtime_errored",
 						recoverable: true,
 					})
-				: null,
+				: terminalStatus === "receipt_missing"
+					? {
+							code: "receipt_missing",
+							message: "Runtime completed without a reportable receipt.",
+							recoverable: true,
+						}
+					: null,
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};

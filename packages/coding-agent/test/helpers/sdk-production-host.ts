@@ -21,6 +21,7 @@ export async function startProductionSdkHost(
 ): Promise<{
 	endpoint: { url: string; token: string };
 	sessionId: string;
+	session: Awaited<ReturnType<typeof createAgentSession>>["session"];
 	observed: Array<{ kind: "control" | "query"; operation: string }>;
 	triggerAsk: (
 		question: string,
@@ -130,6 +131,7 @@ export async function startProductionSdkHost(
 			return {
 				endpoint,
 				sessionId: session.sessionId,
+				session,
 				observed,
 				triggerAsk,
 				triggerGate,

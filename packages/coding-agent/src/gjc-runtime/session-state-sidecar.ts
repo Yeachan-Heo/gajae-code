@@ -5,6 +5,8 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import type { ExecutionState, ReceiptState } from "../sdk/receipt-state";
+import { receiptStateForTerminal } from "../sdk/receipt-state";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
@@ -102,6 +104,8 @@ interface RuntimeStateSidecarPayload {
 	cwd?: unknown;
 	workdir?: unknown;
 	session_file?: unknown;
+	execution_state?: unknown;
+	receipt_state?: unknown;
 	final_response?: { source?: unknown };
 }
 
@@ -341,6 +345,39 @@ function assistantText(assistant: AssistantMessage | undefined): string | null {
 	return text.length > 0 ? text : null;
 }
 
+interface TerminalEventTruth {
+	state: Extract<RuntimeState, "completed" | "errored">;
+	executionState: Extract<ExecutionState, "terminal_ok" | "failed">;
+	receiptState: Extract<ReceiptState, "present" | "missing">;
+	finalResponse: ReturnType<typeof finalResponseForEvent>;
+	error?: { code: string; message: string; recoverable: true };
+}
+
+export function terminalTruthForEvent(event: RuntimeStateEvent): TerminalEventTruth | null {
+	if (event.type !== "agent_end") return null;
+	const assistant = lastAssistant(event.messages);
+	const text = assistantText(assistant);
+	const receiptState = receiptStateForTerminal({ text, artifactPath: null });
+	const failed = assistant?.stopReason === "error" || assistant?.stopReason === "aborted";
+	return {
+		state: failed ? "errored" : "completed",
+		executionState: failed ? "failed" : "terminal_ok",
+		receiptState,
+		finalResponse: finalResponseForEvent(event),
+		...(failed
+			? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true as const } }
+			: receiptState === "missing"
+				? {
+						error: {
+							code: "receipt_missing",
+							message: "GJC agent completed without a reportable receipt",
+							recoverable: true as const,
+						},
+					}
+				: {}),
+	};
+}
+
 function finalResponseForEvent(event: RuntimeStateEvent): {
 	text: string | null;
 	format: "markdown";
@@ -360,10 +397,7 @@ function finalResponseForEvent(event: RuntimeStateEvent): {
 
 export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 	if (event.type === "agent_start" || event.type === "turn_start") return "running";
-	if (event.type === "agent_end") {
-		const assistant = lastAssistant(event.messages);
-		return assistant?.stopReason === "error" ? "errored" : "completed";
-	}
+	if (event.type === "agent_end") return terminalTruthForEvent(event)?.state ?? null;
 	if (event.type === "notice") return null;
 	return null;
 }
@@ -788,6 +822,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
+						const terminal = terminalTruthForEvent(event);
 						const payload = {
 							...basePayload({
 								context,
@@ -800,10 +835,11 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 								sessionId: identity.sessionId,
 							}),
 							...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
-							...(finalResponseForEvent(event) ? { final_response: finalResponseForEvent(event) } : {}),
-							...(state === "errored"
-								? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true } }
-								: {}),
+							...(terminal
+								? { execution_state: terminal.executionState, receipt_state: terminal.receiptState }
+								: { execution_state: state === "running" ? "in_flight" : "unknown", receipt_state: "absent" }),
+							...(terminal?.finalResponse ? { final_response: terminal.finalResponse } : {}),
+							...(terminal?.error ? { error: terminal.error } : {}),
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);

@@ -91,7 +91,7 @@ import {
 	type TerminalSendOutcome,
 } from "./control-drain-lease";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
@@ -1983,6 +1983,7 @@ function sdkQuerySurface(
 	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
+	steerStatusLookup: (clientRef: string) => unknown = () => ({ status: "unknown" }),
 ): SessionSurface {
 	const metadata = () => ({
 		sessionId: id,
@@ -2121,6 +2122,7 @@ function sdkQuerySurface(
 			promptStatusLookup(selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			skillStatusLookup(selector),
+		getSteerStatus: ({ clientRef }: { clientRef: string }) => steerStatusLookup(clientRef),
 		installedQueries: installedOperations(ctx, "query"),
 	};
 }
@@ -2175,9 +2177,14 @@ function sdkControlSurface(
 		) => Promise<void>;
 		noteTransition: (
 			correlation: { commandId: string; turnId: string } | undefined,
-			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+			frame:
+				| { type: "agent_start" }
+				| { type: "agent_end"; finalText?: string }
+				| { type: "agent_failed"; error: unknown; finalText?: string },
 		) => Promise<void>;
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+		reserveSteer?: KindAwareReconciliation["reserveSteer"];
+		settleSteer?: KindAwareReconciliation["settleSteer"];
 	},
 ): ControlSurface & {
 	cancelPendingPreflights(): void;
@@ -2187,6 +2194,22 @@ function sdkControlSurface(
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
 	const bindings = new Set(ctx.sdkBindings?.() ?? []);
+	const lastAssistantText = () => {
+		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const { content } = entry.message;
+			if (typeof content === "string") return content;
+			if (Array.isArray(content))
+				return content
+					.filter(
+						(block): block is { type: "text"; text: string } =>
+							block.type === "text" && typeof block.text === "string",
+					)
+					.map(block => block.text)
+					.join("");
+		}
+		return undefined;
+	};
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
 		if (missingExpectedSessionAudits.has(operation)) return;
@@ -2214,11 +2237,27 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = async (text: string) => {
-		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
-		// control error instead of a false `accepted: true`.
-		await api.sendUserMessage(text, { deliverAs: "steer" });
-		return { commandId: crypto.randomUUID(), accepted: true };
+	const sendSteer = async (text: string, clientRef?: string) => {
+		if (!clientRef) {
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return { commandId: crypto.randomUUID(), accepted: true };
+		}
+		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
+			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
+		const reservation = await skillRecon.reserveSteer(clientRef, text);
+		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
+		try {
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(clientRef, "accepted")),
+			};
+		} catch (error) {
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(clientRef, "rejected", error)),
+			};
+		}
 	};
 	const resolveModel = (id: string) => {
 		const [provider, ...modelId] = id.split("/");
@@ -2403,7 +2442,7 @@ function sdkControlSurface(
 	} = {
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
-		steer: text => sendSteer(text),
+		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
 			const requesterConnectionId = controlRequesterContext.getStore();
@@ -2654,7 +2693,7 @@ function sdkControlSurface(
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
 					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_end" });
+						void skillRecon.noteTransition(correlation, { type: "agent_end", finalText: lastAssistantText() });
 					}
 					return result;
 				},
@@ -2663,7 +2702,11 @@ function sdkControlSurface(
 						if (skillRecon) skillRecon.release(trimmedClientRef);
 						settleReject(error);
 					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+						void skillRecon.noteTransition(correlation, {
+							type: "agent_failed",
+							error,
+							finalText: lastAssistantText(),
+						});
 					}
 					throw error;
 				},
@@ -4036,12 +4079,13 @@ export function createNotificationsExtension(
 			options: { fence?: boolean } = {},
 			extra?: { finalText?: string; error?: { code: string; message: string } },
 		) => {
+			const receiptState = extra?.finalText?.trim() ? "present" : "missing";
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
 			submission.phase = "outcome_claimed";
 			let winner: SdkPromptTerminalOutcome;
 			try {
-				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome);
+				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome, receiptState);
 			} catch (error) {
 				// The claim is the durability boundary: without it nothing may be published
 				// and the endpoint must fail closed so the client rejects exactly once. The
@@ -4182,6 +4226,7 @@ export function createNotificationsExtension(
 				configOverrides,
 				lookupPromptStatus,
 				selector => kindReconciliation.lookup("skill", selector),
+				clientRef => kindReconciliation.lookupSteer(clientRef),
 			),
 			id,
 			revisions,
@@ -4225,6 +4270,8 @@ export function createNotificationsExtension(
 					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
 				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
 				lookup: selector => kindReconciliation.lookup("skill", selector),
+				reserveSteer: kindReconciliation.reserveSteer,
+				settleSteer: kindReconciliation.settleSteer,
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;

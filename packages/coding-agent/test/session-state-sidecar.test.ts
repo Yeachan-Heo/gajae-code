@@ -38,7 +38,7 @@ async function readPayload(stateFile: string): Promise<RuntimePayload> {
 	return JSON.parse(await Bun.file(stateFile).text()) as RuntimePayload;
 }
 
-function assistantEnd(text: string, stopReason: "stop" | "error" = "stop") {
+function assistantEnd(text: string, stopReason: "stop" | "error" | "aborted" = "stop") {
 	return {
 		type: "agent_end",
 		messages: [
@@ -481,6 +481,8 @@ describe("coordinator runtime state sidecar", () => {
 		expect(payload).toMatchObject({
 			session_id: "visible-session",
 			state: "completed",
+			execution_state: "terminal_ok",
+			receipt_state: "present",
 			final_response: {
 				text: "Done from runtime",
 				format: "markdown",
@@ -489,6 +491,53 @@ describe("coordinator runtime state sidecar", () => {
 				truncated: false,
 			},
 		});
+	});
+
+	it("persists textless, whitespace, error, aborted, and partial failure terminal truth", async () => {
+		for (const [name, event, expected] of [
+			[
+				"absent",
+				{ type: "agent_end", messages: [] },
+				{
+					state: "completed",
+					execution_state: "terminal_ok",
+					receipt_state: "missing",
+					error: { code: "receipt_missing" },
+				},
+			],
+			[
+				"whitespace",
+				assistantEnd("   "),
+				{
+					state: "completed",
+					execution_state: "terminal_ok",
+					receipt_state: "missing",
+					error: { code: "receipt_missing" },
+				},
+			],
+			[
+				"error",
+				assistantEnd("", "error"),
+				{ state: "errored", execution_state: "failed", receipt_state: "missing", error: { code: "agent_error" } },
+			],
+			[
+				"aborted",
+				assistantEnd("", "aborted"),
+				{ state: "errored", execution_state: "failed", receipt_state: "missing", error: { code: "agent_error" } },
+			],
+			[
+				"partial",
+				assistantEnd("partial", "error"),
+				{ state: "errored", execution_state: "failed", receipt_state: "present", error: { code: "agent_error" } },
+			],
+		] satisfies Array<[string, Parameters<typeof persistCoordinatorRuntimeStateFromEvent>[0], RuntimePayload]>) {
+			const root = await tempRoot();
+			const stateFile = path.join(root, `${name}.json`);
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = `session-${name}`;
+			await persistCoordinatorRuntimeStateFromEvent(event, { sessionId: "fallback", cwd: root, sessionFile: null });
+			expect(await readPayload(stateFile)).toMatchObject(expected);
+		}
 	});
 
 	it("does not sync-read on the async event path and preserves cached turn state", async () => {

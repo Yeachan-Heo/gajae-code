@@ -742,6 +742,56 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		});
 		expect(queries).toEqual(["Q12", "context.get"]);
 	});
+
+	it("fails closed to receipt_missing when runtime terminal truth has no body", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "prompt-receipt-missing",
+			allow_mutation: true,
+		});
+		await Bun.write(
+			path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "visible-session",
+				state: "completed",
+				execution_state: "terminal_ok",
+				receipt_state: "missing",
+				ready_for_input: true,
+				current_turn_id: sent.turn_id,
+				last_turn_id: sent.turn_id,
+				updated_at: new Date().toISOString(),
+				source: "agent_session_event",
+				live: true,
+				final_response: {
+					text: null,
+					format: "markdown",
+					source: "agent_end",
+					artifact_path: null,
+					truncated: false,
+				},
+			}),
+		);
+		const result = await server.callTool("gjc_coordinator_await_turn", {
+			turn_id: sent.turn_id,
+			timeout_ms: 100,
+			poll_interval_ms: 10,
+		});
+		expect(result).toMatchObject({
+			ok: true,
+			turn: {
+				status: "receipt_missing",
+				execution_state: "terminal_ok",
+				receipt_state: "missing",
+				error: { code: "receipt_missing" },
+			},
+		});
+	});
 	it("uses the generation-bound broker endpoint when a stale local endpoint file is absent", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
