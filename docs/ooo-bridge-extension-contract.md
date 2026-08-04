@@ -44,6 +44,10 @@ Command-dispatch exit mapping remains:
 
 MCP interview errors are notified and handled. A non-terminal response must contain a valid `interview_*` session ID in MCP `_meta` (with the visible `Session ...` text accepted as a compatibility fallback); otherwise the bridge fails closed instead of accepting an uncorrelated answer.
 
+Runner timeout aborts the handler context signal. The bridge passes that signal to MCP connection/tool calls and generation-fences every post-await state mutation, so a late settlement cannot recreate correlation after the runner has fallen through. Any MCP connection or tool failure clears the interview session and cached transport before notifying; a later ordinary prompt therefore passes through, while a new explicit `ooo interview` reconnects cleanly.
+
+Slash-prefixed UI commands bypass interview capture. The bare continue controls `.` and `c` also remain GJC controls; other ordinary text remains a valid interview answer.
+
 ## Recursion guard
 
 Before command dispatch, the exact-prefix helper increments the Ouroboros bridge recursion-depth environment variable and restores its previous value after dispatch finishes. A current numeric depth of `0` or `1` is dispatchable. A current numeric depth greater than `1`, or any non-empty non-numeric value, returns `{}` without dispatching. The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
@@ -63,15 +67,15 @@ ouroboros setup --runtime gjc
 
 ### Verified GJC bridge installation
 
-Ouroboros setup installs its own managed GJC bridge. Replace it with the GJC bridge from immutable commit `c4eb6c9ef23c2c2864796db0227249e8e2984893`, whose example file has SHA-256 `7f469917b8f1813430bae9e4d849047aa647eba513a45159e2ad6fb6f22a5c89`:
+Ouroboros setup installs its own managed GJC bridge. Replace it with the standalone GJC bridge from immutable commit `c2c8e417d97f542c46881df9787baa967da684ed`, whose example file has SHA-256 `a270146136b6443a31aa5073923a9605246abe48a5921fffe1ce0b0aaea37a3f`:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/c4eb6c9ef23c2c2864796db0227249e8e2984893/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
+curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/c2c8e417d97f542c46881df9787baa967da684ed/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
 shasum -a 256 /tmp/gjc-ooo-bridge.ts
 mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge" && cp /tmp/gjc-ooo-bridge.ts "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge/index.ts"
 ```
 
-The `shasum` output must match the published example digest before the copy. For project-only installation, copy the same verified file to `.gjc/extensions/ouroboros-ooo-bridge/index.ts`. Start a new GJC session after installation, then run:
+The `shasum` output must match the published example digest before the copy. The example has no runtime imports: it obtains the bundled bridge helper from the injected extension API, so the copied file works in compiled GJC binaries without extension-local `node_modules`. For project-only installation, copy the same verified file to `.gjc/extensions/ouroboros-ooo-bridge/index.ts`. Start a new GJC session after installation, then run:
 
 ```text
 ooo interview "I want to build a task management CLI"

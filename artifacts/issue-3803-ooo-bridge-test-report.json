@@ -3,21 +3,23 @@
   "kind": "api-package-test-report",
   "issue": 3803,
   "baseline": {
-    "gjcBase": "5c8f10a9a840d8d04a17c5fae54a6b5a961e9f2e",
+    "gjcBase": "df8c91cfa30400a25251776e569191af68cdef16",
     "ouroborosRelease": "v0.50.7",
     "ouroborosCommit": "cb658aa819bfabafecbbe91bc36327f10691171b",
-    "ouroborosWheelSha256": "df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4"
+    "ouroborosWheelSha256": "df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4",
+    "standaloneBridgeCommit": "c2c8e417d97f542c46881df9787baa967da684ed",
+    "standaloneBridgeSha256": "a270146136b6443a31aa5073923a9605246abe48a5921fffe1ce0b0aaea37a3f"
   },
   "verification": [
     {
-      "command": "bun test packages/coding-agent/test/ooo-bridge-extension-contract.test.ts packages/coding-agent/test/ooo-bridge-runner-redteam.test.ts packages/coding-agent/test/ooo-bridge-installed-flow.test.ts packages/coding-agent/test/extensions-discovery.test.ts",
+      "command": "bun test packages/coding-agent/test/ooo-bridge-extension-contract.test.ts packages/coding-agent/test/ooo-bridge-runner-redteam.test.ts packages/coding-agent/test/ooo-bridge-installed-flow.test.ts packages/coding-agent/test/extensions-discovery.test.ts packages/coding-agent/test/extensions-runner.test.ts",
       "status": "passed",
-      "result": "62 pass, 0 fail, 178 expect() calls"
+      "result": "97 pass, 0 fail, 278 expect() calls"
     },
     {
       "command": "bun --cwd=packages/coding-agent run check",
       "status": "passed",
-      "result": "Biome checked 2511 files; TypeScript noEmit completed successfully"
+      "result": "Biome checked 2514 files; TypeScript noEmit completed successfully"
     },
     {
       "command": "bun run check:public-sync",
@@ -37,24 +39,34 @@
   ],
   "adversarialCases": [
     {
-      "id": "visible-success-output",
+      "id": "late-mcp-settlement-fence",
       "status": "passed",
-      "evidence": "Successful bridge stdout is returned as handled text and rendered as a visible interactive custom message."
+      "evidence": "Runner timeout aborts the handler signal, disconnects the MCP transport, and a late question cannot recreate interview state or capture the next ordinary prompt."
     },
     {
-      "id": "correlated-interview-continuation",
+      "id": "dead-transport-release",
       "status": "passed",
-      "evidence": "The installed example starts ouroboros_interview once, sends the next ordinary input with the returned session_id as answer, renders completion, closes the MCP connection, and stops claiming ordinary input."
+      "evidence": "An MCP tool failure clears the interview session and cached connection; ordinary input passes through and a later explicit interview opens a fresh connection."
+    },
+    {
+      "id": "built-in-control-bypass",
+      "status": "passed",
+      "evidence": "Slash-prefixed controls plus bare dot and c bypass active interview capture while an ordinary answer continues the correlated session."
+    },
+    {
+      "id": "compiled-one-file-install",
+      "status": "passed",
+      "evidence": "A real Bun compiled loader loads the copied standalone extension from an isolated directory with no peer node_modules; the extension registers exactly one input handler."
+    },
+    {
+      "id": "visible-correlated-flow",
+      "status": "passed",
+      "evidence": "The installed example renders the first question, sends the next answer with the same session_id, renders completion, disconnects, and returns ordinary prompts to GJC."
     },
     {
       "id": "compatible-cli-override",
       "status": "passed",
-      "evidence": "OUROBOROS_CLI selects the executable for both ouroboros mcp serve --runtime gjc and non-interview dispatch."
-    },
-    {
-      "id": "immutable-install-guidance",
-      "status": "passed",
-      "evidence": "Documentation pins Ouroboros v0.50.7 and source commit, publishes the release wheel digest, and downloads the GJC example from an exact commit with its own SHA-256."
+      "evidence": "OUROBOROS_CLI selects the executable for both MCP serving and non-interview dispatch."
     },
     {
       "id": "unsupported-dispatch",
