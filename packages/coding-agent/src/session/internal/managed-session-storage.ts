@@ -788,23 +788,38 @@ export class ManagedSessionDescendantStore {
 	#detachReplacementCleanupReceipt(receiptPath: string): void {
 		const binding = replacementCleanupReceiptBinding(path.basename(receiptPath));
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
-		const receipt = captureManagedFileNoFollow(receiptPath);
+		// Another process sharing this session directory may retire a receipt after
+		// reconciliation discovers it. A missing receipt means cleanup completed.
+		let receipt: ManagedFileSnapshot;
+		try {
+			receipt = captureManagedFileNoFollow(receiptPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
 		if (receipt.identity.dev !== binding.receipt.dev || receipt.identity.ino !== binding.receipt.ino)
 			throw new Error("managed_replace_cleanup_receipt_invalid");
 		const predecessor = binding.predecessor;
 		const quarantineName = `.gjc-receipt-remove-${receipt.identity.dev.toString(16)}-${receipt.identity.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}`;
-		const detached = exactUnlink(receiptPath, {
-			dev: receipt.identity.dev,
-			ino: receipt.identity.ino,
-			nlink: receipt.identity.nlink,
-			parentDev: this.#subtreeRoot.dev,
-			parentIno: this.#subtreeRoot.ino,
-			size: BigInt(receipt.identity.size),
-			mtimeNs: receipt.identity.mtimeNs,
-			sha256: receipt.identity.sha256,
-			detachOnly: true,
-			quarantineName,
-		});
+		let detached: NativeExactUnlinkResult;
+		try {
+			detached = exactUnlink(receiptPath, {
+				dev: receipt.identity.dev,
+				ino: receipt.identity.ino,
+				nlink: receipt.identity.nlink,
+				parentDev: this.#subtreeRoot.dev,
+				parentIno: this.#subtreeRoot.ino,
+				size: BigInt(receipt.identity.size),
+				mtimeNs: receipt.identity.mtimeNs,
+				sha256: receipt.identity.sha256,
+				detachOnly: true,
+				quarantineName,
+			});
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		if (detached.code === "not_found") return;
 		if (
 			(!detached.ok && detached.code !== "cleanup_pending") ||
 			detached.detachedPath !== path.join(this.#baseDir, quarantineName) ||

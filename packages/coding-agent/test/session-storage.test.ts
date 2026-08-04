@@ -913,6 +913,43 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 		expect(fs.readFileSync(predecessorPath, "utf8")).toBe("retained predecessor\n");
 		expect(fs.readFileSync(path.join(root, "receipt-detached"), "utf8")).toBe("trigger\n");
 	});
+	it("treats a receipt retired by a concurrent owner as already reconciled", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishReceipt(predecessor, JSON.stringify({ arbitrary: "receipt contents are advisory" }));
+		vi.spyOn(native, "exactUnlink").mockImplementationOnce(pathname => {
+			expect(pathname).toBe(receipt);
+			fs.unlinkSync(pathname);
+			return { ok: false, code: "not_found" };
+		});
+
+		replay("concurrent-retirement");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.readFileSync(path.join(root, "concurrent-retirement"), "utf8")).toBe("trigger\n");
+		expect(fs.readFileSync(predecessorPath, "utf8")).toBe("predecessor\n");
+	});
+	it("treats a receipt removed after reconciliation discovery as already reconciled", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishReceipt(predecessor, JSON.stringify({ arbitrary: "receipt contents are advisory" }));
+		const openSync = fs.openSync;
+		vi.spyOn(fs, "openSync").mockImplementation((pathname, flags, mode) => {
+			if (pathname !== receipt) return openSync(pathname, flags, mode);
+			fs.unlinkSync(receipt);
+			const missing = new Error(`ENOENT: no such file or directory, open '${receipt}'`) as NodeJS.ErrnoException;
+			missing.code = "ENOENT";
+			throw missing;
+		});
+
+		replay("concurrent-discovery-retirement");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.readFileSync(path.join(root, "concurrent-discovery-retirement"), "utf8")).toBe("trigger\n");
+		expect(fs.readFileSync(predecessorPath, "utf8")).toBe("predecessor\n");
+	});
 
 	it("recovers a regular-file cleanup placeholder without deleting either quarantined receipt", () => {
 		const predecessorPath = path.join(root, "predecessor");
