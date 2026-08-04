@@ -16374,7 +16374,6 @@ export class AgentSession {
 		let ownerShutdownManager: AsyncJobManager | undefined;
 		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
 		let ownerShutdownTransitionCommitted = false;
-		let ownerShutdownFinished = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -16409,43 +16408,14 @@ export class AgentSession {
 				);
 				return false;
 			}
-			if (lease && asyncManager && ownerId) {
+			if (lease && asyncManager) {
 				ownerShutdownManager = asyncManager;
 				ownerShutdownLease = lease;
-				try {
-					asyncManager.runOwnerProducerCleanupsStrict({ ownerId });
-					await this.abort();
-					if (this.isCompacting) {
-						this.abortCompaction();
-						while (this.isCompacting) await Bun.sleep(10);
-					}
-					const proof = await asyncManager.cancelAndProveOwnerSubagents(lease);
-					if (!proof.confirmed) {
-						this.emitNotice(
-							"error",
-							"Unable to confirm owned subagent cleanup; session was not switched. Wait for or inspect remaining subagents, then retry /resume.",
-							"switch-session-subagent-cleanup",
-						);
-						asyncManager.finishOwnerSubagentShutdown(lease, "release");
-						ownerShutdownFinished = true;
-						return false;
-					}
-				} catch {
-					this.emitNotice(
-						"error",
-						"Unable to confirm owned subagent cleanup; session was not switched. Wait for or inspect remaining subagents, then retry /resume.",
-						"switch-session-subagent-cleanup",
-					);
-					asyncManager.finishOwnerSubagentShutdown(lease, "release");
-					ownerShutdownFinished = true;
-					return false;
-				}
-				if (!(await asyncManager.waitForOwnerInFlightDeliveries(ownerId)))
-					throw new Error("Owned async deliveries did not settle before session switch.");
-				if (!(await asyncManager.cancelAndSettleOwnerJobs(ownerId)))
-					throw new Error("Owned async jobs did not settle before session switch.");
-			} else {
-				await this.abort();
+			}
+			await this.abort();
+			if (this.isCompacting) {
+				this.abortCompaction();
+				while (this.isCompacting) await Bun.sleep(10);
 			}
 
 			this.#disconnectFromAgent();
@@ -16589,6 +16559,16 @@ export class AgentSession {
 					transitionCleanupCommitted = true;
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
 					ownerShutdownTransitionCommitted = true;
+					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
+						ownerShutdownManager.runOwnerProducerCleanupsStrict({ ownerId });
+						const proof = await ownerShutdownManager.cancelAndProveOwnerSubagents(ownerShutdownLease);
+						if (!proof.confirmed)
+							throw new Error("Owned subagent cleanup could not be confirmed after successor validation.");
+						if (!(await ownerShutdownManager.waitForOwnerInFlightDeliveries(ownerId)))
+							throw new Error("Owned async deliveries did not settle after successor validation.");
+						if (!(await ownerShutdownManager.cancelAndSettleOwnerJobs(ownerId)))
+							throw new Error("Owned async jobs did not settle after successor validation.");
+					}
 					this.sessionManager.retireEphemeralArtifactsAfterTransition();
 					await this.#runToolSessionTransitionCleanups();
 				}
@@ -16671,7 +16651,7 @@ export class AgentSession {
 				throw error;
 			}
 		} finally {
-			if (ownerShutdownManager && ownerShutdownLease && !ownerShutdownFinished) {
+			if (ownerShutdownManager && ownerShutdownLease) {
 				ownerShutdownManager.finishOwnerSubagentShutdown(
 					ownerShutdownLease,
 					ownerShutdownTransitionCommitted ? "commit" : "release",

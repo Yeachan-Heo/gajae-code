@@ -5,6 +5,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -311,6 +312,46 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		expect(manager.getDeliveryState({ ownerId: "owner" }).queued).toBe(0);
 		expect(manager.getSubagentRecord("copied-transcript-child")).toBeUndefined();
 		expect(completions).toEqual([]);
+	});
+
+	it("preserves live owner jobs and producer callbacks when successor validation rolls back", async () => {
+		const ownerManager = installOwnerManager();
+		const previousFile = session.sessionFile;
+		if (!previousFile) throw new Error("Expected a persisted predecessor session");
+		await sessionManager.ensureOnDisk();
+		const copiedFile = path.join(tempDir.path(), "fallible-successor.jsonl");
+		await Bun.write(copiedFile, Bun.file(previousFile));
+		let producerCleanupCalls = 0;
+		ownerManager.registerOwnerCleanup("owner", () => {
+			producerCleanupCalls += 1;
+		});
+		const ownerJobId = ownerManager.register(
+			"task",
+			"rollback-preserved owner job",
+			async ({ signal }) => {
+				if (!signal.aborted)
+					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				return "cancelled after validated retry";
+			},
+			{ ownerId: "owner" },
+		);
+		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
+		const validation = vi
+			.spyOn(internalUrls, "initializeLocalRoot")
+			.mockRejectedValueOnce(new Error("injected successor validation failure"));
+
+		await expect(session.switchSession(copiedFile)).rejects.toThrow("injected successor validation failure");
+		expect(session.sessionFile).toBe(previousFile);
+		expect(ownerManager.getJob(ownerJobId)?.status).toBe("running");
+		expect(producerCleanupCalls).toBe(0);
+		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "release");
+
+		validation.mockRestore();
+		await expect(session.switchSession(copiedFile)).resolves.toBe(true);
+		expect(session.sessionFile).toBe(copiedFile);
+		expect(ownerManager.getJob(ownerJobId)?.status).toBe("cancelled");
+		expect(producerCleanupCalls).toBe(1);
+		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "commit");
 	});
 
 	it("fences late same-owner generic admission while leaving foreign jobs isolated", async () => {
