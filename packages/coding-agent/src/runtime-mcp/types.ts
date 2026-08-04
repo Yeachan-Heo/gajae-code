@@ -217,6 +217,8 @@ export type MCPContent = MCPTextContent | MCPImageContent | MCPResourceContent;
 export interface MCPToolCallResult {
 	content: MCPContent[];
 	isError?: boolean;
+	/** MCP result metadata, encoded as `_meta` on the wire. */
+	_meta?: Record<string, unknown>;
 }
 
 // =============================================================================

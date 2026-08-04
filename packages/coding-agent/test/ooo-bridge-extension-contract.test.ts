@@ -2,16 +2,19 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { ImageContent } from "@gajae-code/ai";
 import type { ExtensionAPI } from "@gajae-code/coding-agent";
 import type { ExecResult } from "@gajae-code/coding-agent/exec/exec";
-import * as execCommandModule from "@gajae-code/coding-agent/exec/exec";
 import {
 	createExactPrefixCommandBridge,
 	createOuroborosOooBridge,
 	type ExtensionContext,
+	type ExtensionHandler,
 	type InputEvent,
+	type InputEventResult,
 	OOO_BRIDGE_RECURSION_ENV,
 	OOO_BRIDGE_TIMEOUT_ENV,
 } from "@gajae-code/coding-agent/extensibility/extensions";
 import activateOooBridge from "../examples/extensions/ooo-bridge";
+import type { MCPRequestOptions, MCPServerConnection, MCPToolCallResult } from "../src/runtime-mcp";
+import * as runtimeMcpModule from "../src/runtime-mcp";
 
 function input(text: string, source?: InputEvent["source"], images?: ImageContent[]): InputEvent {
 	return { type: "input", text, source, images } as InputEvent;
@@ -47,15 +50,16 @@ describe("ooo bridge extension contract", () => {
 		vi.restoreAllMocks();
 		delete process.env[OOO_BRIDGE_RECURSION_ENV];
 		delete process.env[OOO_BRIDGE_TIMEOUT_ENV];
+		delete process.env.OUROBOROS_CLI;
 	});
 
-	it("routes exact-prefix ooo input to ouroboros dispatch and handles exit zero", async () => {
-		const { handler, dispatchSpy } = createHandler(0);
+	it("routes exact-prefix ooo input to ouroboros dispatch and returns successful output", async () => {
+		const { handler, dispatchSpy } = createHandler(0, "visible output");
 		const ctx = context();
 
 		const result = await handler(input("ooo status", "interactive"), ctx);
 
-		expect(result).toEqual({ handled: true });
+		expect(result).toEqual({ handled: true, text: "visible output" });
 		expect(dispatchSpy).toHaveBeenCalledWith("ouroboros", ["dispatch", "ooo status"], ctx, { timeout: undefined });
 	});
 
@@ -253,15 +257,22 @@ describe("ooo bridge extension contract", () => {
 			handler(input("ooo two", "interactive"), context()),
 		]);
 
-		expect(first).toEqual({ handled: true });
-		expect(second).toEqual({ handled: true });
+		expect(first).toEqual({ handled: true, text: "ooo one" });
+		expect(second).toEqual({ handled: true, text: "ooo two" });
 		expect(dispatchSpy.mock.calls.map(call => call[1])).toEqual([
 			["dispatch", "ooo one"],
 			["dispatch", "ooo two"],
 		]);
 	});
 
-	it("ships an example that registers ooo interview on the input bridge", async () => {
+	it("ships an example that registers ooo interview through the compatible CLI override", async () => {
+		process.env.OUROBOROS_CLI = "/opt/ouroboros/bin/ouroboros";
+		const connection = { name: "ouroboros-ooo-bridge" } as MCPServerConnection;
+		const connectSpy = vi.spyOn(runtimeMcpModule, "connectToServer").mockResolvedValue(connection);
+		const callSpy = vi.spyOn(runtimeMcpModule, "callTool").mockResolvedValue({
+			content: [{ type: "text", text: "Session interview_abc123\n\nWhat should it build?" }],
+			_meta: { session_id: "interview_abc123", phase: "start" },
+		} as MCPToolCallResult);
 		const registrations: Array<{ event: string; handler: unknown }> = [];
 		activateOooBridge({
 			on(event: string, handler: unknown): void {
@@ -271,20 +282,65 @@ describe("ooo bridge extension contract", () => {
 
 		expect(registrations).toHaveLength(1);
 		expect(registrations[0]?.event).toBe("input");
-
-		const execSpy = vi.spyOn(execCommandModule, "execCommand").mockResolvedValue({
-			stdout: "",
-			stderr: "",
-			code: 0,
-			killed: false,
-		});
-		const handler = registrations[0]?.handler as ReturnType<typeof createOuroborosOooBridge>;
+		const handler = registrations[0]?.handler as ExtensionHandler<InputEvent, InputEventResult>;
 		const ctx = context();
 
-		expect(await handler(input("ooo interview", "interactive"), ctx)).toEqual({ handled: true });
-		expect(execSpy).toHaveBeenCalledWith("ouroboros", ["dispatch", "--runtime", "gjc", "ooo interview"], ctx.cwd, {
-			timeout: undefined,
+		expect(await handler(input("ooo interview Build a CLI", "interactive"), ctx)).toEqual({
+			handled: true,
+			text: "Session interview_abc123\n\nWhat should it build?",
 		});
+		expect(connectSpy).toHaveBeenCalledWith("ouroboros-ooo-bridge", {
+			type: "stdio",
+			command: "/opt/ouroboros/bin/ouroboros",
+			args: ["mcp", "serve", "--runtime", "gjc"],
+			cwd: ctx.cwd,
+		});
+		expect(callSpy).toHaveBeenCalledWith(connection, "ouroboros_interview", {
+			cwd: ctx.cwd,
+			initial_context: "Build a CLI",
+		});
+	});
+
+	it("correlates ordinary answers to one interview and stops claiming input after completion", async () => {
+		const connection = { name: "ouroboros-ooo-bridge" } as MCPServerConnection;
+		const connect = vi.fn(async () => connection);
+		const disconnect = vi.fn(async () => {});
+		const invoke = vi
+			.fn<
+				(
+					_connection: MCPServerConnection,
+					_tool: string,
+					_args?: Record<string, unknown>,
+					_options?: MCPRequestOptions,
+				) => Promise<MCPToolCallResult>
+			>()
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Session interview_roundtrip\n\nWhich platforms?" }],
+				_meta: { session_id: "interview_roundtrip", phase: "start" },
+			})
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "Interview completed. Session ID: interview_roundtrip" }],
+				_meta: { session_id: "interview_roundtrip", phase: "complete", completed: true },
+			});
+		const handler = createOuroborosOooBridge({ connect, callTool: invoke, disconnect });
+		const ctx = context();
+
+		expect(await handler(input("ooo interview Build a CLI", "interactive"), ctx)).toEqual({
+			handled: true,
+			text: "Session interview_roundtrip\n\nWhich platforms?",
+		});
+		expect(await handler(input("Linux and macOS", "interactive"), ctx)).toEqual({
+			handled: true,
+			text: "Interview completed. Session ID: interview_roundtrip",
+		});
+		expect(invoke.mock.calls.map(call => call[2])).toEqual([
+			{ cwd: ctx.cwd, initial_context: "Build a CLI" },
+			{ cwd: ctx.cwd, session_id: "interview_roundtrip", answer: "Linux and macOS" },
+		]);
+		expect(connect).toHaveBeenCalledTimes(1);
+		expect(disconnect).toHaveBeenCalledWith(connection);
+		expect(await handler(input("normal prompt", "interactive"), ctx)).toEqual({});
+		expect(invoke).toHaveBeenCalledTimes(2);
 	});
 
 	it("canonical ouroboros helper uses the same exact-prefix contract", async () => {

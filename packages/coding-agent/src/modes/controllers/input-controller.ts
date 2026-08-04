@@ -822,6 +822,17 @@ export class InputController {
 		if (runner?.hasHandlers("input")) {
 			const result = await runner.emitInput(text, inputImages, "interactive");
 			if (result?.handled) {
+				const handledText = result.text === undefined ? "" : sanitizeText(result.text).trim();
+				if (handledText) {
+					this.ctx.addMessageToChat({
+						role: "custom",
+						customType: "extension-input-result",
+						content: handledText,
+						display: true,
+						timestamp: Date.now(),
+					});
+					this.ctx.ui.requestRender();
+				}
 				if (this.#canModifyComposer(composer)) {
 					this.ctx.editor.setText("");
 				}

@@ -9,6 +9,7 @@ export {
 	loadExtensionFromFactory,
 	loadExtensions,
 } from "./loader";
+export * from "./ouroboros-ooo-bridge";
 export * from "./prefix-command-bridge";
 export * from "./runner";
 // Type guards
