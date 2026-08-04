@@ -76,20 +76,13 @@ import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } fr
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
+import { fetchLatestPackageVersion } from "./utils/npm-registry";
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	try {
-		const response = await fetch("https://registry.npmjs.org/@gajae-code/coding-agent/latest");
-		if (!response.ok) return undefined;
-
-		const data = (await response.json()) as { version?: string };
-		const latestVersion = data.version;
-
-		if (latestVersion && Bun.semver.order(latestVersion, currentVersion) > 0) {
-			return latestVersion;
-		}
-
-		return undefined;
+		// Resolved from npm config so mirrored/firewalled networks are checked too.
+		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent");
+		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;
 	}

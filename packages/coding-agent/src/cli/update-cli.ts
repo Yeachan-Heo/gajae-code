@@ -12,6 +12,12 @@ import { $ } from "bun";
 import chalk from "chalk";
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
+import {
+	DEFAULT_NPM_REGISTRY,
+	fetchLatestPackageVersion,
+	type Installer,
+	type NpmRegistryLookupOptions,
+} from "../utils/npm-registry";
 
 const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 const PACKAGE = "@gajae-code/coding-agent";
@@ -21,6 +27,10 @@ const NPM_MANAGED_PACKAGES = [NPM_WRAPPER_PACKAGE, PACKAGE] as const;
 interface ReleaseInfo {
 	tag: string;
 	version: string;
+	/** Registry the version came from. Release binaries still come from GitHub. */
+	registry: string;
+	/** Config problems that did not stop the lookup but changed its outcome. */
+	warnings: string[];
 }
 
 /** Result from running the installed binary and parsing its reported version. */
@@ -205,21 +215,29 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 /**
  * Get the latest release info from the npm registry.
  * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
+ *
+ * The registry comes from npm config (`npm_config_registry`, `.npmrc`,
+ * `BUN_CONFIG_REGISTRY`) so the check reaches the same place the install does.
+ * Hardcoding the public registry broke every mirrored or firewalled network.
  */
-async function getLatestRelease(): Promise<ReleaseInfo> {
-	const response = await fetch(`https://registry.npmjs.org/${PACKAGE}/latest`);
-	if (!response.ok) {
-		throw new Error(`Failed to fetch release info: ${response.statusText}`);
-	}
-
-	const data = (await response.json()) as { version: string };
-	const version = data.version;
-	const tag = `v${version}`;
+async function getLatestRelease(options?: Installer | NpmRegistryLookupOptions): Promise<ReleaseInfo> {
+	const overrides: NpmRegistryLookupOptions = typeof options === "string" ? { installer: options } : (options ?? {});
+	// The user is deliberately waiting on this command, unlike the startup check.
+	const { version, registry, warnings } = await fetchLatestPackageVersion(PACKAGE, {
+		timeoutMs: 20_000,
+		...overrides,
+	});
 
 	return {
-		tag,
+		tag: `v${version}`,
 		version,
+		registry,
+		warnings,
 	};
+}
+
+export function getLatestReleaseForTest(options: NpmRegistryLookupOptions): Promise<ReleaseInfo> {
+	return getLatestRelease(options);
 }
 
 /**
@@ -376,8 +394,10 @@ function formatBinaryDownloadFailureMessage(
 	url: string,
 	status: string | number,
 	platform: NodeJS.Platform = process.platform,
+	registryNote?: string,
 ): string {
-	return `Download failed for ${binaryName} from ${url}: ${status}.\n${formatManualUpdateInstructions(platform)}`;
+	const note = registryNote ? `\n${registryNote}` : "";
+	return `Download failed for ${binaryName} from ${url}: ${status}.${note}\n${formatManualUpdateInstructions(platform)}`;
 }
 
 export function formatBinaryDownloadFailureMessageForTest(
@@ -385,8 +405,9 @@ export function formatBinaryDownloadFailureMessageForTest(
 	url: string,
 	status: string | number,
 	platform: NodeJS.Platform = process.platform,
+	registryNote?: string,
 ): string {
-	return formatBinaryDownloadFailureMessage(binaryName, url, status, platform);
+	return formatBinaryDownloadFailureMessage(binaryName, url, status, platform, registryNote);
 }
 
 export function buildReleaseBinaryUrlForTest(
@@ -582,10 +603,23 @@ export async function fsyncFileForTest(filePath: string): Promise<void> {
  * Download a release binary to a temp path, throwing a friendly error when the
  * release asset cannot be fetched.
  */
-async function downloadBinaryTo(url: string, tempPath: string, binaryName: string): Promise<void> {
+async function downloadBinaryTo(
+	url: string,
+	tempPath: string,
+	binaryName: string,
+	registryNote?: string,
+): Promise<void> {
 	const response = await fetch(url, { redirect: "follow" });
 	if (!response.ok || !response.body) {
-		throw new Error(formatBinaryDownloadFailureMessage(binaryName, url, response.statusText || response.status));
+		throw new Error(
+			formatBinaryDownloadFailureMessage(
+				binaryName,
+				url,
+				response.statusText || response.status,
+				process.platform,
+				registryNote,
+			),
+		);
 	}
 	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
 	await pipeline(response.body, fileStream);
@@ -640,15 +674,28 @@ export async function runBinaryUpdateFlow(
 }
 
 /**
+ * Describe the registry a version came from, when it is not the public one.
+ *
+ * The binary update path downloads from GitHub release tags, so a version that
+ * only exists on a private mirror produces a bare 404 with nothing linking it
+ * back to the registry that named it.
+ */
+function formatRegistryProvenance(version: string, registry: string | undefined): string | undefined {
+	if (!registry || registry === DEFAULT_NPM_REGISTRY) return undefined;
+	return `Version ${version} was resolved from ${registry}, not ${DEFAULT_NPM_REGISTRY}; a version published only to that registry has no matching GitHub release asset.`;
+}
+
+/**
  * Download a release binary to a target path, replacing an existing file.
  */
-async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
+async function updateViaBinaryAt(targetPath: string, expectedVersion: string, registry?: string): Promise<void> {
 	const binaryName = getBinaryName();
 	const url = buildReleaseBinaryUrl(expectedVersion);
+	const registryNote = formatRegistryProvenance(expectedVersion, registry);
 	console.log(chalk.dim(`Downloading ${binaryName}…`));
 
 	const verification = await runBinaryUpdateFlow(targetPath, url, expectedVersion, {
-		download: (downloadUrl, tempPath) => downloadBinaryTo(downloadUrl, tempPath, binaryName),
+		download: (downloadUrl, tempPath) => downloadBinaryTo(downloadUrl, tempPath, binaryName, registryNote),
 		fsync: fsyncFile,
 		replace: replaceBinaryForUpdate,
 		verifyInstalledVersion: verifyInstalledRuntime,
@@ -665,20 +712,20 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
  * Run the update command.
  */
 export interface UpdateCommandDependencies {
-	getLatestRelease?: () => Promise<ReleaseInfo>;
+	getLatestRelease?: (installer?: Installer) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
-	performUpdate?: (target: UpdateTarget, expectedVersion: string) => Promise<void>;
+	performUpdate?: (target: UpdateTarget, expectedVersion: string, registry?: string) => Promise<void>;
 	refreshInstalledDefaultSkills?: () => Promise<void>;
 	exit?: (code: number) => never;
 }
 
-async function performUpdate(target: UpdateTarget, expectedVersion: string): Promise<void> {
+async function performUpdate(target: UpdateTarget, expectedVersion: string, registry?: string): Promise<void> {
 	if (target.method === "bun") {
 		await updateViaBun(expectedVersion);
 	} else if (target.method === "npm") {
 		await updateViaNpm(target.packageName, expectedVersion);
 	} else {
-		await updateViaBinaryAt(target.path, expectedVersion);
+		await updateViaBinaryAt(target.path, expectedVersion, registry);
 	}
 }
 
@@ -694,13 +741,33 @@ export async function runUpdateCommand(
 
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 
+	// Resolve the install target first so the registry lookup can match the
+	// manager that will actually run: the npm-managed path ignores
+	// BUN_CONFIG_REGISTRY, so preferring it there would make the version check
+	// disagree with the install this command is gating. Failure is not fatal
+	// here — the later resolveTarget() call reports it.
+	let installer: Installer | undefined;
+	let target: UpdateTarget | undefined;
+	try {
+		target = await resolveTarget();
+		installer = target.method === "bun" ? "bun" : target.method === "npm" ? "npm" : undefined;
+	} catch {
+		installer = undefined;
+	}
+
 	let release: ReleaseInfo;
 	try {
-		release = await lookupRelease();
+		release = await lookupRelease(installer);
 	} catch (err) {
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
 		return exit(1);
 	}
+
+	// A config file that exists but could not be read changes which registry
+	// answered; saying so beats a version that quietly came from somewhere else.
+	// `?? []` because UpdateCommandDependencies is a public seam an untyped
+	// consumer can satisfy without the field.
+	for (const warning of release.warnings ?? []) console.warn(chalk.yellow(`Warning: ${warning}`));
 
 	const comparison = compareVersions(release.version, VERSION);
 
@@ -718,8 +785,8 @@ export async function runUpdateCommand(
 	if (opts.check) return;
 
 	try {
-		const target = await resolveTarget();
-		await update(target, release.version);
+		const resolved = target ?? (await resolveTarget());
+		await update(resolved, release.version, release.registry);
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
 		return exit(1);

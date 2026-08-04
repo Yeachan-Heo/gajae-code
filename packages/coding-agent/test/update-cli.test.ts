@@ -10,6 +10,7 @@ import {
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
+	getLatestReleaseForTest,
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
 	resolveUpdateMethodForTest,
@@ -18,6 +19,7 @@ import {
 	runUpdateCommand,
 } from "../src/cli/update-cli";
 import { initTheme } from "../src/modes/theme/theme";
+import { DEFAULT_NPM_REGISTRY } from "../src/utils/npm-registry";
 
 const tempDirs: string[] = [];
 const repoRoot = path.resolve(import.meta.dir, "../../..");
@@ -31,6 +33,52 @@ async function makeTempDir(): Promise<string> {
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
+
+describe("update-cli release lookup", () => {
+	const isolated = {
+		homeDir: "/nonexistent-home",
+		platform: "darwin" as const,
+		readFile: async () => undefined,
+	};
+
+	it("asks the registry configured through npm config instead of the public one", async () => {
+		const requested: string[] = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			lookupEnv: name =>
+				name === "npm_config_registry" ? "https://nexus.example.com/repository/npm-all/" : undefined,
+			fetchImpl: async url => {
+				requested.push(url);
+				return { ok: true, status: 200, statusText: "OK", json: async () => ({ version: "9.9.9" }) };
+			},
+		});
+
+		expect(requested).toEqual(["https://nexus.example.com/repository/npm-all/@gajae-code/coding-agent/latest"]);
+		expect(release).toEqual({
+			tag: "v9.9.9",
+			version: "9.9.9",
+			registry: "https://nexus.example.com/repository/npm-all",
+			warnings: [],
+		});
+	});
+
+	it("surfaces the failing url and status so blocked registries are diagnosable", async () => {
+		const failing = getLatestReleaseForTest({
+			...isolated,
+			lookupEnv: () => undefined,
+			fetchImpl: async () => ({
+				ok: false,
+				status: 503,
+				statusText: "",
+				json: async () => ({}),
+			}),
+		});
+
+		await expect(failing).rejects.toThrow("https://registry.npmjs.org/@gajae-code/coding-agent/latest responded 503");
+	});
+});
+
 describe("update-cli install target detection", () => {
 	it("uses bun update when prioritized gjc is inside bun global bin", () => {
 		const method = resolveUpdateMethodForTest("/Users/test/.bun/bin/gjc", "/Users/test/.bun/bin");
@@ -171,6 +219,31 @@ describe("update-cli binary release assets", () => {
 		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
 	});
 
+	it("points at the mirror that named the version when the GitHub asset is missing", () => {
+		const message = formatBinaryDownloadFailureMessageForTest(
+			"gjc-linux-x64",
+			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64",
+			"Not Found",
+			"linux",
+			"Version 0.2.3 was resolved from https://nexus.example.com/npm, not https://registry.npmjs.org; a version published only to that registry has no matching GitHub release asset.",
+		);
+
+		expect(message).toContain("Download failed for gjc-linux-x64");
+		expect(message).toContain("was resolved from https://nexus.example.com/npm");
+		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
+	});
+
+	it("says nothing about provenance when the public registry named the version", () => {
+		const message = formatBinaryDownloadFailureMessageForTest(
+			"gjc-linux-x64",
+			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64",
+			"Not Found",
+			"linux",
+		);
+
+		expect(message).not.toContain("was resolved from");
+	});
+
 	it("includes actionable guidance when the platform has no release asset", () => {
 		expect(() => buildReleaseBinaryUrlForTest("0.2.3", "freebsd", "x64")).toThrow(
 			"bun install -g @gajae-code/coding-agent@latest",
@@ -301,7 +374,12 @@ describe("update-cli command verification failures", () => {
 				runUpdateCommand(
 					{ force: false, check: false },
 					{
-						getLatestRelease: async () => ({ tag: "v999.0.0", version: "999.0.0" }),
+						getLatestRelease: async () => ({
+							tag: "v999.0.0",
+							version: "999.0.0",
+							registry: DEFAULT_NPM_REGISTRY,
+							warnings: [],
+						}),
 						resolveUpdateTarget: async () => ({ method: "bun" }),
 						performUpdate: async (_target, expectedVersion) => {
 							await runPackageManagerUpdateForTest({
@@ -357,7 +435,12 @@ describe("update-cli command verification failures", () => {
 				runUpdateCommand(
 					{ force: false, check: false },
 					{
-						getLatestRelease: async () => ({ tag: "v999.0.0", version: "999.0.0" }),
+						getLatestRelease: async () => ({
+							tag: "v999.0.0",
+							version: "999.0.0",
+							registry: DEFAULT_NPM_REGISTRY,
+							warnings: [],
+						}),
 						resolveUpdateTarget: async () => ({ method: "bun" }),
 						performUpdate: async (_target, expectedVersion) => {
 							await runPackageManagerUpdateForTest({
