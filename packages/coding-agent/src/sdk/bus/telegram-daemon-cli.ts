@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logger, postmortem } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
@@ -16,7 +16,6 @@ import {
 	type DaemonState,
 	FilesystemTopicRegistryCasAuthority,
 	loadInstallationHostId,
-	markDaemonOwnerStopped,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
 	type TelegramDaemonOptions,
@@ -306,27 +305,6 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const watchdog = schedule(() => void watchdogTick(), OWNER_WATCHDOG_INTERVAL_MS);
 	process.once("SIGTERM", onSignal);
 	process.once("SIGINT", onSignal);
-	// The daemon releases ownership only after a fully quiesced, fully persisted
-	// shutdown. Every other ending - a failed final persist, a signal, an
-	// uncaught error inside a detached async chain - used to leave
-	// `ownershipPhase: "ready"` on disk for a process that no longer exists, and
-	// later readers attached to it. Observed in the field: a daemon wrote one
-	// heartbeat 559 ms after readiness, died on an uncaught topic-registry
-	// error, and was still advertising itself as ready eight hours later.
-	//
-	// `finally` covers a returning or throwing run(); the postmortem hook covers
-	// the fatal paths that call `process.exit()` without unwinding this frame.
-	const recordOwnerStopped = (): Promise<boolean> =>
-		markDaemonOwnerStopped({
-			settings: settings as Settings,
-			ownerId,
-			acquisitionId: ownerId,
-			pid: deps.processPid ?? process.pid,
-			now: deps.now,
-		});
-	const unregisterPostmortem = postmortem.register("telegram-daemon:owner-state", async () => {
-		await recordOwnerStopped();
-	});
 	try {
 		await daemon.run();
 	} finally {
@@ -334,7 +312,5 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		unschedule(watchdog);
 		process.off("SIGTERM", onSignal);
 		process.off("SIGINT", onSignal);
-		unregisterPostmortem();
-		await recordOwnerStopped();
 	}
 }
