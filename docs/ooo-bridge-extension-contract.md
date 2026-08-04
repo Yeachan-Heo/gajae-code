@@ -63,10 +63,10 @@ ouroboros setup --runtime gjc
 
 ### Verified GJC bridge installation
 
-Ouroboros setup installs its own managed GJC bridge. Replace it with the GJC bridge from immutable commit `857748424fce4c98111d68ecf595bbada16c1059`, whose example file has SHA-256 `7f469917b8f1813430bae9e4d849047aa647eba513a45159e2ad6fb6f22a5c89`:
+Ouroboros setup installs its own managed GJC bridge. Replace it with the GJC bridge from immutable commit `c4eb6c9ef23c2c2864796db0227249e8e2984893`, whose example file has SHA-256 `7f469917b8f1813430bae9e4d849047aa647eba513a45159e2ad6fb6f22a5c89`:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/857748424fce4c98111d68ecf595bbada16c1059/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
+curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/c4eb6c9ef23c2c2864796db0227249e8e2984893/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
 shasum -a 256 /tmp/gjc-ooo-bridge.ts
 mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge" && cp /tmp/gjc-ooo-bridge.ts "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge/index.ts"
 ```

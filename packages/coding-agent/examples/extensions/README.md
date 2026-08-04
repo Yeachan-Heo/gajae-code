@@ -25,10 +25,10 @@ ouroboros setup --runtime gjc
 
 `pipx install 'ouroboros-ai[mcp]==0.50.7'` is the equivalent pipx installation. Do not pipe a mutable branch installer into a shell. Pin source audits to commit `cb658aa819bfabafecbbe91bc36327f10691171b`. The [v0.50.7 release](https://github.com/Q00/ouroboros/releases/tag/v0.50.7) publishes `ouroboros_ai-0.50.7-py3-none-any.whl` with SHA-256 `df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4`; verify downloaded release assets before installing them.
 
-Ouroboros setup installs its own managed bridge. Replace that file with this GJC bridge, which preserves the interview session across ordinary follow-up answers. Download the example from immutable GJC commit `857748424fce4c98111d68ecf595bbada16c1059` and verify it before installation:
+Ouroboros setup installs its own managed bridge. Replace that file with this GJC bridge, which preserves the interview session across ordinary follow-up answers. Download the example from immutable GJC commit `c4eb6c9ef23c2c2864796db0227249e8e2984893` and verify it before installation:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/857748424fce4c98111d68ecf595bbada16c1059/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
+curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/c4eb6c9ef23c2c2864796db0227249e8e2984893/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
 shasum -a 256 /tmp/gjc-ooo-bridge.ts
 mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge" && cp /tmp/gjc-ooo-bridge.ts "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge/index.ts"
 ```

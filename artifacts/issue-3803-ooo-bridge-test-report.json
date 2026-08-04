@@ -3,7 +3,7 @@
   "kind": "api-package-test-report",
   "issue": 3803,
   "baseline": {
-    "gjcBase": "a8fa63a599e9fa3d0189e48bfce778a36353ccdd",
+    "gjcBase": "5c8f10a9a840d8d04a17c5fae54a6b5a961e9f2e",
     "ouroborosRelease": "v0.50.7",
     "ouroborosCommit": "cb658aa819bfabafecbbe91bc36327f10691171b",
     "ouroborosWheelSha256": "df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4"
