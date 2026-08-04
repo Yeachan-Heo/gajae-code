@@ -38,7 +38,15 @@ class FakeBotApi {
 	}
 }
 
-function daemonFixture() {
+function crashAtomicFs(): Record<string, unknown> {
+	return {
+		...(fs.promises as unknown as Record<string, unknown>),
+		fsyncFile: async (_file: string) => undefined,
+		fsyncDirectory: async (_directory: string) => undefined,
+	};
+}
+
+async function daemonFixture() {
 	FakeWs.instances = [];
 	let nowMs = 0;
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-daemon-2960-redteam-"));
@@ -61,10 +69,12 @@ function daemonFixture() {
 		botToken: "token",
 		chatId: "42",
 		botApi: bot,
+		fs: crashAtomicFs() as any,
 		WebSocketImpl: FakeWs as never,
 		toolActivity: { enabled: true },
 		now: () => nowMs,
 	});
+	await (daemon as any).loadTopics();
 	return { bot, daemon, advance: (ms: number) => (nowMs += ms) };
 }
 
@@ -97,6 +107,13 @@ async function sendIdentity(daemon: TelegramNotificationDaemon, sessionId = "S")
 		repo: "repo",
 		branch: "branch",
 	});
+	await daemon.handleSessionMessage(daemon.sessions.get(sessionId)!, {
+		type: "turn_stream",
+		sessionId,
+		phase: "finalized",
+		text: "identity ready",
+	});
+	await (daemon as any).flushPool();
 }
 
 function calls(bot: FakeBotApi, method: string) {
@@ -104,7 +121,7 @@ function calls(bot: FakeBotApi, method: string) {
 }
 
 test("#2960 red-team bare connect/drop stays topic-free through orphan grace scans", async () => {
-	const { bot, daemon, advance } = daemonFixture();
+	const { bot, daemon, advance } = await daemonFixture();
 	const socket = await connect(daemon);
 	socket.close();
 	await settle();
@@ -116,18 +133,18 @@ test("#2960 red-team bare connect/drop stays topic-free through orphan grace sca
 });
 
 test("#2960 red-team first user-facing frame creates once and targets the new thread", async () => {
-	const { bot, daemon } = daemonFixture();
+	const { bot, daemon } = await daemonFixture();
 	await connect(daemon);
 	await sendIdentity(daemon);
 	const creates = calls(bot, "createForumTopic");
 	const sends = calls(bot, "sendMessage");
 	expect(creates).toHaveLength(1);
-	expect(sends).toHaveLength(1);
+	expect(sends).toHaveLength(2);
 	expect(sends[0]!.body.message_thread_id).toBe(77);
 });
 
 test("#2960 red-team pre-topic buffered frame flushes once after lazy creation", async () => {
-	const { bot, daemon } = daemonFixture();
+	const { bot, daemon } = await daemonFixture();
 	await connect(daemon);
 	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 		type: "turn_stream",
@@ -145,7 +162,7 @@ test("#2960 red-team pre-topic buffered frame flushes once after lazy creation",
 });
 
 test("#2960 red-team durable-topic reconnect flushes pending frames without recreation", async () => {
-	const { bot, daemon } = daemonFixture();
+	const { bot, daemon } = await daemonFixture();
 	const original = await connect(daemon);
 	await sendIdentity(daemon);
 	original.close();
@@ -159,6 +176,8 @@ test("#2960 red-team durable-topic reconnect flushes pending frames without recr
 		{ type: "turn_stream" },
 	);
 	replacement.dispatchEvent(new Event("open"));
+	await (daemon as any).topicsPersistQueue;
+	await (daemon as any).flushPool();
 	await settle();
 	expect(calls(bot, "createForumTopic")).toHaveLength(0);
 	expect(calls(bot, "sendMessage").filter(call => call.body.text === "reconnect pending")).toHaveLength(1);
@@ -166,12 +185,12 @@ test("#2960 red-team durable-topic reconnect flushes pending frames without recr
 });
 
 test("#2960 red-team identity, ask, and visible tool activity retain lazy creation paths", async () => {
-	const identity = daemonFixture();
+	const identity = await daemonFixture();
 	await connect(identity.daemon);
 	await sendIdentity(identity.daemon);
 	expect(calls(identity.bot, "createForumTopic")).toHaveLength(1);
 
-	const ask = daemonFixture();
+	const ask = await daemonFixture();
 	await connect(ask.daemon);
 	await ask.daemon.handleSessionMessage(ask.daemon.sessions.get("S")!, {
 		type: "action_needed",
@@ -184,7 +203,7 @@ test("#2960 red-team identity, ask, and visible tool activity retain lazy creati
 	await (ask.daemon as any).flushPool();
 	expect(ask.bot.calls.some(call => call.body.message_thread_id === 77)).toBe(true);
 
-	const tool = daemonFixture();
+	const tool = await daemonFixture();
 	await connect(tool.daemon);
 	await tool.daemon.handleSessionMessage(tool.daemon.sessions.get("S")!, {
 		type: "tool_activity",
@@ -205,7 +224,7 @@ test("#2960 red-team identity, ask, and visible tool activity retain lazy creati
 });
 
 test("#2960 red-team frame-free reconnect storm creates zero topics", async () => {
-	const { bot, daemon } = daemonFixture();
+	const { bot, daemon } = await daemonFixture();
 	for (let i = 0; i < 12; i++) {
 		const socket = await connect(daemon, "S");
 		socket.close();

@@ -79,6 +79,7 @@ The setup pairing flow is private-chat only. If setup sees a `group`,
 DM. This is intentional for safe local discovery: group chats must not receive
 session names, action ids, or pending status by accident.
 
+
 Telegram private-chat topics: the managed daemon's per-session delivery uses
 Telegram forum topics (`createForumTopic` + `message_thread_id`). Telegram now
 supports forum topics in **private chats** when the bot owner enables **Threaded

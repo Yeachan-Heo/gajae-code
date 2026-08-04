@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -7,9 +8,11 @@ export interface FileLockOptions {
 	staleMs?: number;
 	retries?: number;
 	retryDelayMs?: number;
+	/** Stable host identity required to safely reclaim locks on a shared volume. */
+	ownerHostId?: string;
 }
 
-const DEFAULT_OPTIONS: Required<FileLockOptions> = {
+const DEFAULT_OPTIONS: Required<Omit<FileLockOptions, "ownerHostId">> = {
 	staleMs: 10_000,
 	retries: 50,
 	retryDelayMs: 100,
@@ -61,8 +64,16 @@ function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, st
 	return currentStartTime === null || currentStartTime === owner.start_time;
 }
 
-function writeLockInfo(lockPath: string): Promise<LockInfo> {
-	const info: LockInfo = { pid: process.pid, start_time: currentProcessStartTime(), timestamp: Date.now() };
+function lockInfo(ownerHostId?: string): LockInfo {
+	return {
+		pid: process.pid,
+		start_time: currentProcessStartTime(),
+		timestamp: Date.now(),
+		...(ownerHostId === undefined ? {} : { owner_host_id: ownerHostId }),
+	};
+}
+
+function writeLockInfo(lockPath: string, info: LockInfo): Promise<LockInfo> {
 	return Bun.write(`${lockPath}/info`, JSON.stringify(info)).then(() => info);
 }
 
@@ -76,17 +87,18 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	}
 
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, timestamp } = parsed as Partial<LockInfo>;
+	const { pid, start_time, timestamp, owner_host_id } = parsed as Partial<LockInfo>;
 	if (
 		typeof pid !== "number" ||
 		!Number.isInteger(pid) ||
 		pid <= 0 ||
 		typeof timestamp !== "number" ||
 		!Number.isFinite(timestamp) ||
-		(start_time !== undefined && (typeof start_time !== "string" || !start_time))
+		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
+		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id))
 	)
 		return null;
-	return { pid, start_time, timestamp };
+	return { pid, start_time, timestamp, owner_host_id };
 }
 
 /** @internal */
@@ -98,7 +110,7 @@ export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOw
 export interface FileLockOwnerToken {
 	pid: number;
 	start_time?: string;
-
+	owner_host_id?: string;
 	timestamp: number;
 }
 
@@ -147,6 +159,7 @@ export async function removeFileLockDirForGc(
 	if (
 		current.pid !== expected.pid ||
 		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
+		current.owner_host_id !== expected.owner_host_id ||
 		current.timestamp !== expected.timestamp
 	) {
 		return "owner_changed";
@@ -187,6 +200,7 @@ function sameStatToken(a: LockDirStatToken, b: LockDirStatToken): boolean {
 async function staleLockSnapshot(
 	lockPath: string,
 	staleMs: number,
+	ownerHostId?: string,
 	startTimeCache?: Map<string, string | null>,
 ): Promise<LockStaleSnapshot> {
 	let info: LockInfo | null;
@@ -199,6 +213,7 @@ async function staleLockSnapshot(
 		if (hasFsCode(error, "EPERM")) return { stale: false };
 		throw error;
 	}
+	if (!info && ownerHostId !== undefined) return { stale: false };
 	if (!info) {
 		try {
 			const stats = await fs.stat(lockPath);
@@ -210,6 +225,10 @@ async function staleLockSnapshot(
 		}
 	}
 
+	// A host-qualified lock may only be reclaimed after proving that its owner is
+	// local. Foreign and malformed host-qualified records fail closed: PID values
+	// and clocks are not meaningful across hosts.
+	if (ownerHostId !== undefined && info.owner_host_id !== ownerHostId) return { stale: false };
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
@@ -239,18 +258,43 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 	}
 }
 
-async function tryAcquireLock(lockPath: string): Promise<LockInfo | null> {
+async function tryAcquireLock(lockPath: string, ownerHostId?: string): Promise<LockInfo | null> {
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
-	try {
-		await fs.mkdir(lockPath);
-		return await writeLockInfo(lockPath);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-			return null;
+	if (ownerHostId === undefined) {
+		try {
+			await fs.mkdir(lockPath);
+			return await writeLockInfo(lockPath, lockInfo());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+			throw error;
 		}
-		throw error;
+	}
+
+	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
+	const owner = lockInfo(ownerHostId);
+	try {
+		await fs.mkdir(pendingPath);
+		await writeLockInfo(pendingPath, owner);
+		try {
+			await fs.rename(pendingPath, lockPath);
+			return owner;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "EEXIST" || code === "ENOTEMPTY") return null;
+			if (code === "EPERM") {
+				try {
+					await fs.stat(lockPath);
+					return null;
+				} catch (statError) {
+					if (!isEnoent(statError)) throw statError;
+				}
+			}
+			throw error;
+		}
+	} finally {
+		await fs.rm(pendingPath, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
 
@@ -259,14 +303,15 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise
 	if (outcome !== "removed") throw new Error(`Failed to release file lock: ${outcome}.`);
 }
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
+	if (options.ownerHostId !== undefined && !options.ownerHostId) throw new Error("ownerHostId must be non-empty");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
-		const owner = await tryAcquireLock(lockPath);
+		const owner = await tryAcquireLock(lockPath, opts.ownerHostId);
 		if (owner) return () => releaseLock(lockPath, owner);
 
-		const stale = await staleLockSnapshot(lockPath, opts.staleMs, contentionStartTimes);
+		const stale = await staleLockSnapshot(lockPath, opts.staleMs, opts.ownerHostId, contentionStartTimes);
 		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
 		await Bun.sleep(opts.retryDelayMs);
 	}

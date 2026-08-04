@@ -2815,6 +2815,7 @@ describe("topic registry reload persistence", () => {
 			topics: {
 				S1: {
 					topicId: "100",
+					topicOrigin: "daemon_created",
 					identitySent: true,
 					name: "repo/main - title",
 					createdAt: 1,

@@ -1,12 +1,12 @@
+import { randomUUID } from "node:crypto";
 /**
  * Per-session forum-topic registry for the threaded session surface.
  *
- * Each GJC session owns one active Telegram forum topic in the paired private
- * DM. The topic is created via `createForumTopic`, reused while the session
- * remains active, and removed from the registry when the daemon deletes it on
- * shutdown. The registry also tracks whether the one-time identity header has
- * already been pinned, so it is sent exactly once per active topic, even across
- * reconnects.
+ * Each GJC session owns one active Telegram forum topic. Remote archive closes
+ * daemon-created topics without deleting their durable records; rotated
+ * successors move inactive records into retained history before creating a new
+ * active authority. The registry also tracks whether the one-time identity
+ * header has already been pinned.
  *
  * State is a plain serialisable map persisted beside the daemon state files;
  * topic creation is injected so this module is pure and unit-testable without a
@@ -14,9 +14,24 @@
  */
 
 /** Persisted record for one session's topic. */
+export type TopicLifecycleState =
+	| "active"
+	| "disconnect_grace"
+	| "archive_pending"
+	| "archive_exhausted"
+	| "inactive"
+	| "legacy_quarantined"
+	/** Read-only input compatibility; normalized to archive_pending during load. */
+	| "delete_pending";
+
+/** Persisted record for one immutable session identity's topic. */
 export interface TopicRecord {
 	/** Telegram forum topic id (message_thread_id). */
 	topicId: string;
+	/** Whether Telegram created this topic for the daemon or it was explicitly adopted from a user. */
+	topicOrigin: "daemon_created" | "user_created";
+	/** Immutable UUID record identity; never derive authority from a title or PID. */
+	sessionUuid?: string;
 	/** Whether the one-time identity header has been sent/pinned. */
 	identitySent: boolean;
 	/** Creation timestamp (ms epoch). */
@@ -41,10 +56,8 @@ export interface TopicRecord {
 	authorityEpoch?: number;
 	/** Immutable authority epoch held when this remote topic create began. */
 	creationLeaseEpoch?: number;
-	/** An uncertain delete fences future creation and inbound routing. */
-	authorityState?: "active" | "delete_pending";
-	/** Provenance for topics created by the user and adopted by GJC. Missing means daemon-created. */
-	topicOrigin?: "user_created";
+	/** Durable non-destructive lifecycle state. */
+	authorityState?: TopicLifecycleState;
 	/** Telegram chat and endpoint authority last proven to use this topic. */
 	chatId?: string;
 	/** Canonical endpoint tuple (URL + token) that currently holds the lease. */
@@ -55,18 +68,70 @@ export interface TopicRecord {
 	endpointGeneration?: number;
 	/** Monotonic authenticated endpoint handoffs; legacy bindings begin at zero. */
 	endpointIncarnation?: number;
+	/** Shared-authority lease owner (installation UUID), heartbeat, and expiry. */
+	leaseOwner?: string;
+	leaseHeartbeatAt?: number;
+	leaseExpiresAt?: number;
+	/** Durable archive initiator; a live foreign owner cannot be displaced. */
+	archiveHostId?: string;
+	/** Authority epoch captured by the archive initiator when it published the fence. */
+	archiveLeaseEpoch?: number;
+	disconnectGraceExpiresAt?: number;
 	/** True when persisted binding fields were present but malformed; recovery must fail closed. */
 	bindingMalformed?: true;
+}
+/** Durable claim published before invoking createForumTopic. */
+export interface TopicCreateClaim {
+	sessionId: string;
+	hostId?: string;
+	leaseOwner?: string;
+	authorityEpoch: number;
+	createdAt: number;
+	binding?: TopicEndpointBinding;
+}
+
+export interface ArchiveJob {
+	sessionId: string;
+	topicId: string;
+	/** Number of archive calls that have returned an ambiguous outcome. */
+	attempt: number;
+	/** First ambiguous result; bounds retry lifetime. */
+	firstAttemptAt?: number;
+	/** Compatibility read for pre-journal snapshots; normalized to `attempt`. */
+	retryCount?: number;
+	backoffMs: number;
+	nextAttemptAt: number;
+	safeDiagnostic?: string;
 }
 
 /** Serialisable shape persisted to disk. */
 export interface TopicRegistryState {
+	/** Writer format. Missing is the quarantined legacy format; future versions fail closed. */
+	version?: 2;
+	/** Monotonically increasing snapshot generation used by shared CAS stores. */
+	registryGeneration?: number;
 	/** sessionId -> record. */
 	topics: Record<string, TopicRecord>;
-	/** Durable deletion epochs retained after a definite delete. */
+	/** Durable lifecycle epochs retained after an archive starts. */
 	fences?: Record<string, number>;
 	/** Closed transport endpoint leases; unchanged endpoint discovery remains fenced across restart. */
 	closedEndpoints?: Record<string, TopicEndpointBinding>;
+	/** Persistent host identity used to distinguish concurrent installations. */
+	installationHostId?: string;
+	/** Bounded durable archive work; no topic record is physically deleted. */
+	archiveJobs?: Record<string, ArchiveJob>;
+	/** Durable create claims. A claim fences concurrent creators before remote I/O. */
+	createClaims?: Record<string, TopicCreateClaim>;
+	/** Retained inactive predecessors keyed by logical session id. */
+	retiredTopics?: Record<string, TopicRecord[]>;
+}
+/**
+ * Shared registry authority. Filesystem atomic rename is sufficient for a single
+ * installation, but it cannot serialize two hosts sharing a state volume.
+ */
+export interface TopicRegistryCasAuthority {
+	read(): Promise<TopicRegistryState | undefined>;
+	compareAndSet(expectedGeneration: number, next: TopicRegistryState): Promise<boolean>;
 }
 
 /** Authenticated runtime binding for a durable topic lease. */
@@ -84,7 +149,7 @@ export type TopicEndpointAuthority =
 	| { state: "ambiguous" };
 
 /** Conditional rollback token for a delete fence publication. */
-export interface TopicDeleteAuthoritySnapshot {
+export interface TopicArchiveAuthoritySnapshot {
 	sessionId: string;
 	topicId?: string;
 	authorityEpoch?: number;
@@ -92,18 +157,6 @@ export interface TopicDeleteAuthoritySnapshot {
 	fenceEpoch?: number;
 	/** Exact fenced record, retained to restore an in-memory tombstone after a failed clear publication. */
 	record?: TopicRecord;
-}
-
-/**
- * Proof that a definite delete was settled in memory and still owes its durable
- * commit. Handed back only by a settlement that actually happened, so a refused
- * settlement structurally cannot be followed by a rollback.
- */
-export interface TopicSettledDelete {
-	sessionId: string;
-	topicId: string;
-	/** Authority epoch proven current when the record was removed. */
-	settledEpoch: number;
 }
 
 function isValidBindingString(value: unknown): value is string {
@@ -147,19 +200,179 @@ function isValidTopicId(value: unknown): value is string {
 		typeof value === "string" && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0
 	);
 }
-
-/**
- * Monotonic epoch successor that saturates instead of leaving the safe-integer
- * range. Past `Number.MAX_SAFE_INTEGER` two distinct generations collapse onto
- * the same IEEE-754 double, which would let a stale settlement clear a newer
- * fence; settlement refuses the saturated value instead of overflowing past it.
- */
 function nextAuthorityEpoch(current: number): number {
 	return current >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : current + 1;
 }
 
 export function emptyTopicRegistryState(): TopicRegistryState {
-	return { topics: {} };
+	return { version: 2, topics: {} };
+}
+/**
+ * Reject snapshots written by a newer daemon. Missing versions are preserved as
+ * evidence but quarantined: legacy records must never route or mutate remotely.
+ */
+export function parseTopicRegistryState(value: unknown): TopicRegistryState | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const state = value as TopicRegistryState;
+	if (state.version !== undefined && state.version !== 2) throw new Error("unsupported future Telegram topic state");
+	if (!state.topics || typeof state.topics !== "object" || Array.isArray(state.topics)) return undefined;
+	if (state.version === undefined) {
+		if (state.registryGeneration !== undefined) throw new Error("malformed Telegram topic state");
+		return parseTopicRegistryState({
+			...state,
+			version: 2,
+			registryGeneration: 0,
+			topics: Object.fromEntries(
+				Object.entries(state.topics).map(([sessionId, record]) => [
+					sessionId,
+					record && typeof record === "object"
+						? {
+								...record,
+								topicOrigin: (record as TopicRecord).topicOrigin ?? "daemon_created",
+								authorityState: "legacy_quarantined",
+							}
+						: record,
+				]),
+			),
+		});
+	}
+
+	const isObject = (candidate: unknown): candidate is Record<string, unknown> =>
+		!!candidate && typeof candidate === "object" && !Array.isArray(candidate);
+	const validTimestamp = (candidate: unknown): candidate is number =>
+		typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0;
+	const validEpoch = (candidate: unknown): candidate is number =>
+		typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0;
+	const validOptionalString = (candidate: unknown): boolean =>
+		candidate === undefined || isValidBindingString(candidate);
+	const validBinding = (candidate: unknown): candidate is TopicEndpointBinding =>
+		isObject(candidate) &&
+		isValidBindingString(candidate.chatId) &&
+		isValidBindingString(candidate.endpointKey) &&
+		isValidBindingString(candidate.endpointDigest) &&
+		(candidate.endpointGeneration === undefined || isValidBindingGeneration(candidate.endpointGeneration));
+	const malformed = (): never => {
+		throw new Error("malformed Telegram topic state");
+	};
+
+	if (
+		(state.registryGeneration !== undefined && !validEpoch(state.registryGeneration)) ||
+		!isObject(state.topics) ||
+		[state.fences, state.closedEndpoints, state.archiveJobs, state.createClaims, state.retiredTopics].some(
+			nested => nested !== undefined && !isObject(nested),
+		)
+	)
+		malformed();
+	for (const [sessionId, raw] of Object.entries(state.topics)) {
+		if (!isValidBindingString(sessionId) || !isObject(raw) || !isValidTopicId(raw.topicId)) malformed();
+		if (typeof raw.identitySent !== "boolean" || !validTimestamp(raw.createdAt)) malformed();
+		if (
+			!validOptionalString(raw.sessionUuid) ||
+			(raw.orphanedAt !== undefined && !validTimestamp(raw.orphanedAt)) ||
+			(raw.name !== undefined && typeof raw.name !== "string") ||
+			(raw.topicOrigin !== "daemon_created" && raw.topicOrigin !== "user_created") ||
+			(raw.nameOwner !== undefined && raw.nameOwner !== "user") ||
+			(raw.nameReconcilePending !== undefined && typeof raw.nameReconcilePending !== "boolean") ||
+			(raw.userNameUpdateId !== undefined && !validEpoch(raw.userNameUpdateId)) ||
+			!validOptionalString(raw.identityKey) ||
+			(raw.replayGeneration !== undefined &&
+				(!Number.isSafeInteger(raw.replayGeneration) || raw.replayGeneration < 1)) ||
+			(raw.replaySeq !== undefined && !validEpoch(raw.replaySeq)) ||
+			(raw.authorityEpoch !== undefined && !validEpoch(raw.authorityEpoch)) ||
+			(raw.creationLeaseEpoch !== undefined && !validEpoch(raw.creationLeaseEpoch)) ||
+			(raw.authorityState !== undefined &&
+				![
+					"active",
+					"disconnect_grace",
+					"archive_pending",
+					"archive_exhausted",
+					"inactive",
+					"legacy_quarantined",
+					"delete_pending",
+				].includes(raw.authorityState as string)) ||
+			!validOptionalString(raw.leaseOwner) ||
+			(raw.leaseHeartbeatAt !== undefined && !validTimestamp(raw.leaseHeartbeatAt)) ||
+			(raw.leaseExpiresAt !== undefined && !validTimestamp(raw.leaseExpiresAt)) ||
+			!validOptionalString(raw.archiveHostId) ||
+			(raw.archiveLeaseEpoch !== undefined && !validEpoch(raw.archiveLeaseEpoch)) ||
+			(raw.disconnectGraceExpiresAt !== undefined && !validTimestamp(raw.disconnectGraceExpiresAt)) ||
+			(raw.bindingMalformed !== undefined && raw.bindingMalformed !== true)
+		)
+			malformed();
+		const leaseFieldCount = [raw.leaseOwner, raw.leaseHeartbeatAt, raw.leaseExpiresAt].filter(
+			value => value !== undefined,
+		).length;
+		if (leaseFieldCount !== 0 && leaseFieldCount !== 3) malformed();
+		if (
+			raw.authorityState === "disconnect_grace"
+				? raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined
+				: raw.disconnectGraceExpiresAt !== undefined
+		)
+			malformed();
+		const hasBinding = hasAnyBinding(raw);
+		const hasArchiveOnlyChatIdentity =
+			(raw.authorityState === "archive_pending" ||
+				raw.authorityState === "archive_exhausted" ||
+				raw.authorityState === "inactive") &&
+			isValidBindingString(raw.chatId) &&
+			raw.endpointKey === undefined &&
+			raw.endpointDigest === undefined &&
+			raw.endpointGeneration === undefined &&
+			raw.endpointIncarnation === undefined;
+		if (
+			hasBinding &&
+			!hasArchiveOnlyChatIdentity &&
+			(!isValidBindingString(raw.chatId) ||
+				!isValidBindingString(raw.endpointKey) ||
+				!isValidBindingString(raw.endpointDigest) ||
+				(raw.endpointGeneration !== undefined && !isValidBindingGeneration(raw.endpointGeneration)) ||
+				(raw.endpointIncarnation !== undefined && !isValidBindingGeneration(raw.endpointIncarnation)))
+		)
+			malformed();
+	}
+	for (const [sessionId, records] of Object.entries(state.retiredTopics ?? {})) {
+		if (!isValidBindingString(sessionId) || !Array.isArray(records)) malformed();
+		for (const [index, record] of records.entries()) {
+			parseTopicRegistryState({
+				version: 2,
+				registryGeneration: 0,
+				topics: { [`${sessionId}:retired:${index}`]: record },
+			});
+		}
+	}
+	for (const [sessionId, epoch] of Object.entries(state.fences ?? {}))
+		if (!isValidBindingString(sessionId) || !validEpoch(epoch)) malformed();
+	for (const [sessionId, claim] of Object.entries(state.createClaims ?? {})) {
+		if (
+			!isValidBindingString(sessionId) ||
+			!isObject(claim) ||
+			claim.sessionId !== sessionId ||
+			!validEpoch(claim.authorityEpoch) ||
+			!validTimestamp(claim.createdAt) ||
+			!validOptionalString(claim.hostId) ||
+			!validOptionalString(claim.leaseOwner) ||
+			(claim.binding !== undefined && !validBinding(claim.binding))
+		)
+			malformed();
+	}
+	for (const [sessionId, job] of Object.entries(state.archiveJobs ?? {})) {
+		if (
+			!isValidBindingString(sessionId) ||
+			!isObject(job) ||
+			job.sessionId !== sessionId ||
+			!isValidTopicId(job.topicId) ||
+			!validEpoch(job.attempt) ||
+			!validEpoch(job.backoffMs) ||
+			!validTimestamp(job.nextAttemptAt) ||
+			(job.firstAttemptAt !== undefined && !validTimestamp(job.firstAttemptAt)) ||
+			(job.retryCount !== undefined && !validEpoch(job.retryCount)) ||
+			(job.safeDiagnostic !== undefined && typeof job.safeDiagnostic !== "string")
+		)
+			malformed();
+	}
+	for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {}))
+		if (!isValidBindingString(sessionId) || !validBinding(binding)) malformed();
+	return state;
 }
 
 /**
@@ -183,8 +396,14 @@ export class TopicRegistry {
 	private readonly creatingBindings = new Map<string, TopicEndpointBinding>();
 	/** Monotonic authority epochs, including deletion fences for absent records. */
 	private readonly epochs = new Map<string, number>();
-	/** Phase-1 settlements awaiting their durable clear; their topic ids stay quarantined. */
-	readonly #settling = new Map<string, { topicId: string; settledEpoch: number; record: TopicRecord }>();
+	/** Archive work is retained and retryable; records are never physically removed. */
+	private readonly archiveJobs = new Map<string, ArchiveJob>();
+	/** Durable pre-create claims; remote creation is forbidden until published. */
+	private readonly createClaims = new Map<string, TopicCreateClaim>();
+	/** Inactive predecessor evidence retained across successor generations. */
+	private readonly retiredTopics = new Map<string, TopicRecord[]>();
+	/** Generation of the last loaded/published snapshot. */
+	private registryGeneration = 0;
 
 	constructor(state: TopicRegistryState = emptyTopicRegistryState()) {
 		this.topics = new Map();
@@ -197,14 +416,75 @@ export class TopicRegistry {
 		this.byTopic.clear();
 		this.#ambiguousTopicIds.clear();
 		this.epochs.clear();
-		this.#settling.clear();
+		this.archiveJobs.clear();
+		this.createClaims.clear();
+		this.retiredTopics.clear();
 		this.load(state);
 	}
 
 	/** Merge serialized state and normalize authority fields from older releases. */
 	load(state: TopicRegistryState): void {
+		for (const [sessionId, records] of Object.entries(state.retiredTopics ?? {}))
+			if (Array.isArray(records))
+				this.retiredTopics.set(
+					sessionId,
+					records.map(record => ({ ...record })),
+				);
+		for (const [sessionId, job] of Object.entries(state.archiveJobs ?? {})) {
+			const attempt =
+				job && Number.isSafeInteger(job.attempt) && job.attempt >= 0
+					? job.attempt
+					: job &&
+							typeof job.retryCount === "number" &&
+							Number.isSafeInteger(job.retryCount) &&
+							job.retryCount >= 0
+						? job.retryCount
+						: undefined;
+			if (
+				job &&
+				job.sessionId === sessionId &&
+				isValidTopicId(job.topicId) &&
+				attempt !== undefined &&
+				Number.isFinite(job.nextAttemptAt)
+			)
+				this.archiveJobs.set(sessionId, {
+					sessionId,
+					topicId: job.topicId,
+					attempt: Math.min(8, attempt),
+					firstAttemptAt:
+						typeof job.firstAttemptAt === "number" && Number.isFinite(job.firstAttemptAt)
+							? job.firstAttemptAt
+							: job.nextAttemptAt,
+					backoffMs:
+						Number.isSafeInteger(job.backoffMs) && job.backoffMs >= 0
+							? Math.min(60_000, job.backoffMs)
+							: Math.min(60_000, 250 * 2 ** Math.min(8, attempt)),
+					nextAttemptAt: job.nextAttemptAt,
+					...(typeof job.safeDiagnostic === "string" ? { safeDiagnostic: job.safeDiagnostic.slice(0, 256) } : {}),
+				});
+		}
+		if (Number.isSafeInteger(state.registryGeneration) && (state.registryGeneration ?? -1) >= 0)
+			this.registryGeneration = Math.max(this.registryGeneration, state.registryGeneration!);
 		for (const [sessionId, epoch] of Object.entries(state.fences ?? {})) {
 			if (Number.isSafeInteger(epoch) && epoch >= 0) this.epochs.set(sessionId, epoch);
+		}
+		for (const [sessionId, claim] of Object.entries(state.createClaims ?? {})) {
+			if (
+				claim &&
+				claim.sessionId === sessionId &&
+				Number.isSafeInteger(claim.authorityEpoch) &&
+				claim.authorityEpoch >= 0 &&
+				Number.isFinite(claim.createdAt) &&
+				(claim.binding === undefined || hasValidBinding(claim.binding))
+			)
+				this.createClaims.set(sessionId, {
+					sessionId,
+					authorityEpoch: claim.authorityEpoch,
+					createdAt: claim.createdAt,
+					...(isValidBindingString(claim.hostId) ? { hostId: claim.hostId } : {}),
+					...(isValidBindingString(claim.leaseOwner) ? { leaseOwner: claim.leaseOwner } : {}),
+					...(claim.binding ? { binding: claim.binding } : {}),
+				});
 		}
 
 		for (const [sessionId, raw] of Object.entries(state.topics ?? {})) {
@@ -217,6 +497,7 @@ export class TopicRegistry {
 					(typeof raw.userNameUpdateId === "number" &&
 						Number.isSafeInteger(raw.userNameUpdateId) &&
 						raw.userNameUpdateId >= 0));
+			const legacyDeletePending = (raw as { authorityState?: unknown }).authorityState === "delete_pending";
 			const hasValidReplayCursor =
 				typeof raw.replayGeneration === "number" &&
 				Number.isSafeInteger(raw.replayGeneration) &&
@@ -239,6 +520,9 @@ export class TopicRegistry {
 			const fenceSupersedesRecord = fenceEpoch > rawAuthorityEpoch;
 			const record: TopicRecord = {
 				topicId: raw.topicId,
+				topicOrigin: raw.topicOrigin === "user_created" ? "user_created" : "daemon_created",
+				sessionUuid:
+					typeof raw.sessionUuid === "string" && raw.sessionUuid.length > 0 ? raw.sessionUuid : randomUUID(),
 				identitySent: raw.identitySent === true,
 				createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
 				...(typeof raw.name === "string" ? { name: raw.name } : {}),
@@ -258,16 +542,44 @@ export class TopicRegistry {
 					: {}),
 				...(hasValidReplayCursor ? { replayGeneration: raw.replayGeneration, replaySeq: raw.replaySeq } : {}),
 				authorityEpoch: Math.max(rawAuthorityEpoch, fenceEpoch),
-				...(raw.authorityState === "delete_pending" || fenceSupersedesRecord
-					? { authorityState: "delete_pending" as const }
-					: {}),
-				...(raw.topicOrigin === "user_created" ? { topicOrigin: "user_created" as const } : {}),
+				...(raw.authorityState === "disconnect_grace" ||
+				raw.authorityState === "archive_pending" ||
+				raw.authorityState === "archive_exhausted" ||
+				raw.authorityState === "inactive" ||
+				raw.authorityState === "legacy_quarantined" ||
+				legacyDeletePending ||
+				fenceSupersedesRecord
+					? {
+							authorityState:
+								raw.authorityState === "inactive"
+									? ("inactive" as const)
+									: raw.authorityState === "legacy_quarantined"
+										? ("legacy_quarantined" as const)
+										: raw.authorityState === "archive_exhausted"
+											? ("archive_exhausted" as const)
+											: raw.authorityState === "disconnect_grace" && !fenceSupersedesRecord
+												? ("disconnect_grace" as const)
+												: ("archive_pending" as const),
+						}
+					: { authorityState: "active" as const }),
 				...(isValidBindingString(raw.chatId) ? { chatId: raw.chatId } : {}),
 				...(isValidBindingString(raw.endpointKey) ? { endpointKey: raw.endpointKey } : {}),
 				...(isValidBindingString(raw.endpointDigest) ? { endpointDigest: raw.endpointDigest } : {}),
 				...(isValidBindingGeneration(raw.endpointGeneration) ? { endpointGeneration: raw.endpointGeneration } : {}),
 				...(isValidBindingGeneration(raw.endpointIncarnation)
 					? { endpointIncarnation: raw.endpointIncarnation }
+					: {}),
+				...(isValidBindingString(raw.leaseOwner) ? { leaseOwner: raw.leaseOwner } : {}),
+				...(typeof raw.leaseHeartbeatAt === "number" && Number.isFinite(raw.leaseHeartbeatAt)
+					? { leaseHeartbeatAt: raw.leaseHeartbeatAt }
+					: {}),
+				...(typeof raw.leaseExpiresAt === "number" && Number.isFinite(raw.leaseExpiresAt)
+					? { leaseExpiresAt: raw.leaseExpiresAt }
+					: {}),
+				...(isValidBindingString(raw.archiveHostId) ? { archiveHostId: raw.archiveHostId } : {}),
+				...(isValidBindingGeneration(raw.archiveLeaseEpoch) ? { archiveLeaseEpoch: raw.archiveLeaseEpoch } : {}),
+				...(typeof raw.disconnectGraceExpiresAt === "number" && Number.isFinite(raw.disconnectGraceExpiresAt)
+					? { disconnectGraceExpiresAt: raw.disconnectGraceExpiresAt }
 					: {}),
 				...(bindingMalformed ? { bindingMalformed: true as const } : {}),
 			};
@@ -284,14 +596,10 @@ export class TopicRegistry {
 	private rebuildInboundRoutes(): void {
 		this.byTopic.clear();
 		this.#ambiguousTopicIds.clear();
-		// A settled-but-not-yet-durable clear keeps its topic id quarantined: the
-		// clear is not authoritative until persisted, so no colliding survivor may
-		// become routable and no settled id may become adoptable during that write.
-		for (const settling of this.#settling.values()) this.#ambiguousTopicIds.add(settling.topicId);
 		const activeByTopic = new Map<string, string>();
 
 		for (const [sessionId, record] of this.topics) {
-			if (record.authorityState === "delete_pending" || record.bindingMalformed) {
+			if (record.authorityState !== "active" || record.bindingMalformed) {
 				this.#ambiguousTopicIds.add(record.topicId);
 				continue;
 			}
@@ -307,13 +615,6 @@ export class TopicRegistry {
 		}
 	}
 
-	/** Advance and publish the session authority epoch, saturating at the safe-integer bound. */
-	#advanceAuthorityEpoch(sessionId: string, base: number): number {
-		const epoch = nextAuthorityEpoch(base);
-		this.epochs.set(sessionId, epoch);
-		return epoch;
-	}
-
 	/** Resolve the owning session for a topic id (for fail-closed inbound routing). */
 	sessionForTopic(topicId: string): string | undefined {
 		return this.byTopic.get(topicId);
@@ -324,16 +625,49 @@ export class TopicRegistry {
 		return [...this.topics.keys()];
 	}
 
-	/** Persisted remote deletes that must be reconciled before recovery can proceed. */
-	deletePendingSessionIds(): string[] {
-		return [...this.topics].flatMap(([sessionId, record]) =>
-			record.authorityState === "delete_pending" ? [sessionId] : [],
-		);
-	}
-
 	/** The existing topic record for a session, if any. */
 	get(sessionId: string): TopicRecord | undefined {
 		return this.topics.get(sessionId);
+	}
+	/** Durable claims restored from disk require explicit authoritative reconciliation. */
+	pendingCreateClaims(): TopicCreateClaim[] {
+		return [...this.createClaims.values()].map(claim => ({
+			...claim,
+			...(claim.binding ? { binding: { ...claim.binding } } : {}),
+		}));
+	}
+
+	/**
+	 * Resolve a durable pre-create claim only with authoritative topic evidence.
+	 * An absent or malformed topic deliberately leaves the claim in place, fencing
+	 * subsequent creators after a crash.
+	 */
+	reconcileCreateClaim(sessionId: string, topic?: TopicRecord): boolean {
+		const claim = this.createClaims.get(sessionId);
+		if (!claim || !topic || !isValidTopicId(topic.topicId) || topic.authorityState !== "active") return false;
+		if (topic.authorityEpoch !== claim.authorityEpoch) return false;
+		if (
+			claim.binding &&
+			(!hasCompleteBinding(topic) ||
+				!hasValidBinding(claim.binding) ||
+				topic.chatId !== claim.binding.chatId ||
+				topic.endpointKey !== claim.binding.endpointKey ||
+				topic.endpointDigest !== claim.binding.endpointDigest ||
+				topic.endpointGeneration !== claim.binding.endpointGeneration)
+		)
+			return false;
+		this.topics.set(sessionId, { ...topic });
+		this.createClaims.delete(sessionId);
+		this.rebuildInboundRoutes();
+		return true;
+	}
+	/** Clear a claim only when the local create attempt proved no remote topic was accepted. */
+	abandonCreateClaim(sessionId: string, authorityEpoch: number): boolean {
+		const claim = this.createClaims.get(sessionId);
+		if (!claim || claim.authorityEpoch !== authorityEpoch) return false;
+		this.createClaims.delete(sessionId);
+		this.creatingBindings.delete(sessionId);
+		return true;
 	}
 
 	/** Current immutable authority epoch for a creation lease. */
@@ -344,7 +678,7 @@ export class TopicRegistry {
 	/** Whether this session has an active, unambiguous topic authority. */
 	isActiveUnambiguous(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
-		return record?.authorityState !== "delete_pending" && this.byTopic.get(record?.topicId ?? "") === sessionId;
+		return record?.authorityState === "active" && this.byTopic.get(record?.topicId ?? "") === sessionId;
 	}
 	/**
 	 * Pure read-only availability check for user-topic adoption. Rejects invalid
@@ -381,8 +715,13 @@ export class TopicRegistry {
 		const creating = [...this.creatingBindings].filter(
 			([sessionId, claim]) => canClaim(claim) && !excludesClaimant(sessionId),
 		);
-		if (committed.length === 0 && staged.length === 0 && creating.length === 0) return { state: "none" };
-		if (committed.length !== 1 || staged.length !== 0 || creating.length !== 0) return { state: "ambiguous" };
+		const durableClaims = [...this.createClaims].filter(
+			([sessionId, claim]) => claim.binding !== undefined && canClaim(claim.binding) && !excludesClaimant(sessionId),
+		);
+		if (committed.length === 0 && staged.length === 0 && creating.length === 0 && durableClaims.length === 0)
+			return { state: "none" };
+		if (committed.length !== 1 || staged.length !== 0 || creating.length !== 0 || durableClaims.length !== 0)
+			return { state: "ambiguous" };
 		const [sessionId, record] = committed[0]!;
 		return record.chatId === binding.chatId &&
 			record.endpointKey === binding.endpointKey &&
@@ -412,6 +751,30 @@ export class TopicRegistry {
 	}
 
 	/**
+	 * Retire a remotely settled inactive topic only when an authenticated
+	 * successor proves a different endpoint authority. The inactive predecessor
+	 * is serialized into retained history before the active slot is released.
+	 */
+	retireInactiveEndpointForSuccessor(sessionId: string, binding: TopicEndpointBinding): boolean {
+		const record = this.topics.get(sessionId);
+		if (
+			record?.authorityState !== "inactive" ||
+			record.bindingMalformed ||
+			!hasCompleteBinding(record) ||
+			!hasValidBinding(binding) ||
+			(record.endpointKey === binding.endpointKey && record.endpointDigest === binding.endpointDigest)
+		)
+			return false;
+		const history = this.retiredTopics.get(sessionId) ?? [];
+		history.push({ ...record });
+		this.retiredTopics.set(sessionId, history);
+		this.topics.delete(sessionId);
+		this.byTopic.delete(record.topicId);
+		this.archiveJobs.delete(sessionId);
+		this.createClaims.delete(sessionId);
+		return true;
+	}
+	/**
 	 * Rebind an existing topic to an authenticated successor endpoint. The exact
 	 * logical session id is proved by replay before this method is called. A
 	 * rotated credential may replace only an inactive incumbent; concurrent
@@ -426,11 +789,10 @@ export class TopicRegistry {
 	): "bound" | "unchanged" | "rejected" {
 		const record = this.topics.get(sessionId);
 		if (
-			!record ||
-			record.authorityState === "delete_pending" ||
+			(record?.authorityState !== "active" && record?.authorityState !== "disconnect_grace") ||
 			record.bindingMalformed ||
 			!hasValidBinding(binding) ||
-			!this.isActiveUnambiguous(sessionId)
+			(record.authorityState === "active" && !this.isActiveUnambiguous(sessionId))
 		)
 			return "rejected";
 		if (hasAnyBinding(record) && !hasCompleteBinding(record)) return "rejected";
@@ -460,12 +822,18 @@ export class TopicRegistry {
 			record.endpointKey !== binding.endpointKey ||
 			record.endpointDigest !== binding.endpointDigest ||
 			record.endpointGeneration !== binding.endpointGeneration;
-		if (!changed) return "unchanged";
+		if (!changed && record.authorityState === "active") return "unchanged";
 		record.chatId = binding.chatId;
 		record.endpointKey = binding.endpointKey;
 		record.endpointDigest = binding.endpointDigest;
 		record.endpointGeneration = binding.endpointGeneration;
 		if (!sameEndpoint) record.endpointIncarnation = (record.endpointIncarnation ?? 0) + 1;
+		if (record.authorityState === "disconnect_grace") {
+			record.authorityState = "active";
+			delete record.orphanedAt;
+			delete record.disconnectGraceExpiresAt;
+			this.rebuildInboundRoutes();
+		}
 		return "bound";
 	}
 
@@ -512,29 +880,44 @@ export class TopicRegistry {
 		topicOrigin?: TopicRecord["topicOrigin"],
 	): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
-		if (existing?.authorityState === "delete_pending") throw new Error("topic authority is deletion-fenced");
+		if (existing && existing.authorityState !== "active") throw new Error("topic authority is archive-fenced");
 		if (existing?.bindingMalformed) throw new Error("topic authority binding is quarantined");
 		if (existing) return existing;
 		const pending = this.inflight.get(sessionId);
 		if (pending) return pending;
+		// A claim loaded after a crash proves a create may have reached Telegram.
+		// It must not be replaced or retried until explicit authoritative recovery.
+		if (this.createClaims.has(sessionId)) throw new Error("topic create claim requires reconciliation");
 		const epoch = this.epochs.get(sessionId) ?? 0;
-		if (epoch >= Number.MAX_SAFE_INTEGER) throw new Error("topic authority epoch exhausted");
+		if (epoch >= Number.MAX_SAFE_INTEGER) throw new Error("topic authority epoch is exhausted");
 		// Publish the compatible endpoint claim before invoking `create`: the callback
 		// may immediately begin a remote create and identity-less recovery must never
 		// observe a false absence during that await.
 		if (binding) this.creatingBindings.set(sessionId, binding);
 		this.transientClaimants.set(sessionId, transientClaimant);
+		this.createClaims.set(sessionId, {
+			sessionId,
+			authorityEpoch: epoch,
+			createdAt: now(),
+			...(binding ? { binding } : {}),
+		});
 		const promise = (async () => {
+			// Persist this ambiguity before createForumTopic; a crash must fence,
+			// rather than silently permit, a duplicate remote topic.
+			await commit?.();
 			const topicId = await create();
 			if (!isValidTopicId(topicId)) throw new Error("createForumTopic: invalid message_thread_id");
 			const revoked = (this.epochs.get(sessionId) ?? 0) !== epoch;
 			const record: TopicRecord = {
 				topicId,
+				topicOrigin: topicOrigin ?? "daemon_created",
+				sessionUuid: randomUUID(),
 				name,
 				identitySent: false,
 				createdAt: now(),
 				authorityEpoch: revoked ? (this.epochs.get(sessionId) ?? 0) : epoch,
 				creationLeaseEpoch: epoch,
+				authorityState: revoked ? "archive_pending" : "active",
 				...(binding
 					? {
 							chatId: binding.chatId,
@@ -546,14 +929,13 @@ export class TopicRegistry {
 								: { endpointGeneration: binding.endpointGeneration }),
 						}
 					: {}),
-				...(revoked ? { authorityState: "delete_pending" as const } : {}),
-				...(topicOrigin === "user_created" ? { topicOrigin: "user_created" as const } : {}),
 			};
 			if (revoked) {
 				this.topics.set(sessionId, record);
 				throw new Error("topic authority was revoked during creation");
 			}
 			this.staged.set(sessionId, record);
+			this.createClaims.delete(sessionId);
 			try {
 				await commit?.();
 			} catch (error) {
@@ -563,7 +945,7 @@ export class TopicRegistry {
 			this.staged.delete(sessionId);
 			if ((this.epochs.get(sessionId) ?? 0) !== epoch) {
 				record.authorityEpoch = this.epochs.get(sessionId) ?? 0;
-				record.authorityState = "delete_pending";
+				record.authorityState = "archive_pending";
 				this.topics.set(sessionId, record);
 				throw new Error("topic authority was revoked during creation");
 			}
@@ -584,6 +966,7 @@ export class TopicRegistry {
 			this.inflight.delete(sessionId);
 			this.creatingBindings.delete(sessionId);
 			this.transientClaimants.delete(sessionId);
+			if (this.topics.has(sessionId)) this.createClaims.delete(sessionId);
 		}
 	}
 
@@ -591,6 +974,68 @@ export class TopicRegistry {
 	markIdentitySent(sessionId: string): void {
 		const record = this.topics.get(sessionId);
 		if (record) record.identitySent = true;
+	}
+	/** Generation used as the compare value for a shared CAS publication. */
+	registryVersion(): number {
+		return this.registryGeneration;
+	}
+
+	/** Advance only after a successful shared compare-and-set publication. */
+	markRegistryPublished(generation: number): void {
+		if (!Number.isSafeInteger(generation) || generation < this.registryGeneration)
+			throw new Error("invalid topic registry generation");
+		this.registryGeneration = generation;
+	}
+
+	/**
+	 * Acquire or renew a host lease. Another unexpired host is never displaced;
+	 * a disconnected owner may resume the exact topic during its grace window.
+	 */
+	acquireLease(sessionId: string, hostId: string, now: number, ttlMs: number, graceMs: number): boolean {
+		const record = this.topics.get(sessionId);
+		if (
+			!record ||
+			!isValidBindingString(hostId) ||
+			!Number.isFinite(now) ||
+			ttlMs <= 0 ||
+			graceMs < 0 ||
+			record.authorityState === "archive_pending" ||
+			record.authorityState === "archive_exhausted" ||
+			record.authorityState === "inactive" ||
+			record.authorityState === "legacy_quarantined"
+		)
+			return false;
+		if (record.leaseOwner !== undefined && record.leaseOwner !== hostId && (record.leaseExpiresAt ?? 0) > now)
+			return false;
+		if (
+			record.authorityState === "disconnect_grace" &&
+			record.disconnectGraceExpiresAt !== undefined &&
+			record.disconnectGraceExpiresAt < now
+		)
+			return false;
+		record.leaseOwner = hostId;
+		record.leaseHeartbeatAt = now;
+		record.leaseExpiresAt = now + ttlMs;
+		if (record.authorityState === "disconnect_grace") {
+			record.authorityState = "active";
+			delete record.orphanedAt;
+			delete record.disconnectGraceExpiresAt;
+			this.rebuildInboundRoutes();
+		}
+		return true;
+	}
+
+	/** Record a disconnect without losing the topic identity needed for a grace resume. */
+	releaseLeaseToGrace(sessionId: string, hostId: string, now: number, graceMs: number): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record || record.leaseOwner !== hostId || record.authorityState !== "active" || graceMs < 0) return false;
+		record.authorityState = "disconnect_grace";
+		record.orphanedAt = now;
+		record.leaseHeartbeatAt = now;
+		record.leaseExpiresAt = now;
+		record.disconnectGraceExpiresAt = now + graceMs;
+		this.rebuildInboundRoutes();
+		return true;
 	}
 
 	/** Whether the identity header still needs sending for this session. */
@@ -609,15 +1054,20 @@ export class TopicRegistry {
 	/** Start the orphan grace clock on the first positive liveness-loss observation. */
 	markOrphaned(sessionId: string, now: number): boolean {
 		const record = this.topics.get(sessionId);
-		if (!record || record.orphanedAt !== undefined) return false;
+		if (record?.authorityState !== "active" || record.orphanedAt !== undefined) return false;
 		record.orphanedAt = now;
+		record.authorityState = "disconnect_grace";
+		record.disconnectGraceExpiresAt = now + 30_000;
+		this.rebuildInboundRoutes();
 		return true;
 	}
 
 	/** Clear a prior orphan observation after the endpoint is positively live again. */
 	clearOrphaned(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
-		if (!record || record.orphanedAt === undefined) return false;
+		if (record?.authorityState !== "disconnect_grace" || record.orphanedAt === undefined) return false;
+		record.authorityState = "active";
+		delete record.disconnectGraceExpiresAt;
 		delete record.orphanedAt;
 		return true;
 	}
@@ -697,8 +1147,8 @@ export class TopicRegistry {
 		record.nameReconcilePending = false;
 	}
 
-	/** Capture only authority fields that a failed delete publication may restore. */
-	captureDeleteAuthority(sessionId: string): TopicDeleteAuthoritySnapshot {
+	/** Capture only authority fields that a failed archive-fence publication may restore. */
+	captureArchiveAuthority(sessionId: string): TopicArchiveAuthoritySnapshot {
 		const record = this.topics.get(sessionId);
 		return {
 			sessionId,
@@ -710,8 +1160,8 @@ export class TopicRegistry {
 		};
 	}
 
-	/** Restore a failed delete fence only while its exact authority mutation remains current. */
-	restoreDeleteAuthority(snapshot: TopicDeleteAuthoritySnapshot): boolean {
+	/** Restore a failed archive fence only while its exact authority mutation remains current. */
+	restoreArchiveAuthority(snapshot: TopicArchiveAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
 		const authorityBase = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0);
 		if (authorityBase >= Number.MAX_SAFE_INTEGER) return false;
@@ -722,7 +1172,7 @@ export class TopicRegistry {
 		} else if (
 			!record ||
 			record.topicId !== snapshot.topicId ||
-			record.authorityState !== "delete_pending" ||
+			record.authorityState !== "archive_pending" ||
 			record.authorityEpoch !== deleteEpoch
 		) {
 			return false;
@@ -736,17 +1186,13 @@ export class TopicRegistry {
 		return true;
 	}
 
-	/**
-	 * Restore the exact delete fence after a failed compensation publication.
-	 *
-	 * Settlement rebuilds derived routes, which can make a surviving colliding
-	 * record routable. Rebuild again on successful restoration so the reinstated
-	 * fence re-quarantines the topic id instead of leaving inbound routing open to
-	 * the collision partner despite the restored fence.
-	 */
-	restoreDeleteFence(snapshot: TopicDeleteAuthoritySnapshot): boolean {
+	/** Restore the exact archive fence after a failed compensation publication. */
+	restoreArchiveFence(snapshot: TopicArchiveAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
-		const deleteEpoch = nextAuthorityEpoch(Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0));
+		const authorityBase = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0);
+		if (authorityBase >= Number.MAX_SAFE_INTEGER) return false;
+		const deleteEpoch = nextAuthorityEpoch(authorityBase);
+		if (this.epochs.get(snapshot.sessionId) !== deleteEpoch) return false;
 		if (snapshot.topicId === undefined) {
 			if (record) return false;
 		} else if (!record) {
@@ -754,31 +1200,73 @@ export class TopicRegistry {
 			this.topics.set(snapshot.sessionId, {
 				...snapshot.record,
 				authorityEpoch: deleteEpoch,
-				authorityState: "delete_pending",
+				authorityState: "archive_pending",
 			});
 		} else if (record.topicId !== snapshot.topicId) {
 			return false;
 		} else {
 			record.authorityEpoch = deleteEpoch;
-			record.authorityState = "delete_pending";
+			record.authorityState = "archive_pending";
+			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
 		}
 		this.epochs.set(snapshot.sessionId, deleteEpoch);
-		this.rebuildInboundRoutes();
 		return true;
 	}
 
-	/** Fence new work before the remote delete starts, including an absent in-flight create. */
-	beginDelete(sessionId: string): TopicRecord | undefined {
+	/** Fence new work before the remote archive starts, including an absent in-flight create. */
+	beginArchive(sessionId: string, hostId?: string, now = Date.now()): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
-		const epoch = this.#advanceAuthorityEpoch(
-			sessionId,
-			Math.max(this.epochs.get(sessionId) ?? 0, record?.authorityEpoch ?? 0),
-		);
+		if (
+			record?.topicOrigin === "user_created" ||
+			((record?.archiveHostId !== undefined || record?.leaseOwner !== undefined) &&
+				record.archiveHostId !== hostId &&
+				record.leaseOwner !== hostId &&
+				(record.leaseExpiresAt ?? 0) > now)
+		)
+			return undefined;
+		const authorityBase = Math.max(this.epochs.get(sessionId) ?? 0, record?.authorityEpoch ?? 0);
+		if (authorityBase >= Number.MAX_SAFE_INTEGER) {
+			this.epochs.set(sessionId, Number.MAX_SAFE_INTEGER);
+			if (record) {
+				record.authorityEpoch = Number.MAX_SAFE_INTEGER;
+				record.authorityState = "archive_exhausted";
+				if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
+			}
+			return undefined;
+		}
+		const epoch = nextAuthorityEpoch(authorityBase);
+		this.epochs.set(sessionId, epoch);
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
-		record.authorityState = "delete_pending";
+		record.authorityState = "archive_pending";
+		if (hostId) record.archiveHostId = hostId;
+		record.archiveLeaseEpoch = epoch;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		return record;
+	}
+	/** Verify the durable archive initiator immediately before remote dispatch. */
+	archiveAuthorityAllows(sessionId: string, hostId: string, pairedChatId: string, now: number): boolean;
+	/** @deprecated Production dispatch must provide the current paired chat id. */
+	archiveAuthorityAllows(sessionId: string, hostId: string, now: number): boolean;
+	archiveAuthorityAllows(
+		sessionId: string,
+		hostId: string,
+		pairedChatIdOrNow: string | number,
+		suppliedNow?: number,
+	): boolean {
+		const record = this.topics.get(sessionId);
+		const pairedChatId = typeof pairedChatIdOrNow === "string" ? pairedChatIdOrNow : record?.chatId;
+		const now = typeof pairedChatIdOrNow === "number" ? pairedChatIdOrNow : suppliedNow;
+		return (
+			record?.topicOrigin === "daemon_created" &&
+			record.chatId === pairedChatId &&
+			typeof now === "number" &&
+			record.authorityState === "archive_pending" &&
+			record.archiveHostId === hostId &&
+			record.archiveLeaseEpoch === record.authorityEpoch &&
+			(record.authorityEpoch ?? Number.MAX_SAFE_INTEGER) < Number.MAX_SAFE_INTEGER &&
+			(record.leaseOwner === undefined || record.leaseOwner === hostId || (record.leaseExpiresAt ?? 0) <= now)
+		);
 	}
 
 	/** Retain an accepted create as deletion-fenced before remote compensation can begin. */
@@ -788,15 +1276,19 @@ export class TopicRegistry {
 		now: () => number = Date.now,
 		name?: string,
 		binding?: TopicEndpointBinding,
+		topicOrigin?: TopicRecord["topicOrigin"],
+		archiveChatId?: string,
 	): TopicRecord {
 		const epoch = Math.max(this.epochs.get(sessionId) ?? 0, this.topics.get(sessionId)?.authorityEpoch ?? 0);
 		const record: TopicRecord = {
 			topicId,
+			topicOrigin: topicOrigin ?? this.topics.get(sessionId)?.topicOrigin ?? "daemon_created",
+			sessionUuid: randomUUID(),
 			name,
 			identitySent: false,
 			createdAt: now(),
 			authorityEpoch: epoch,
-			authorityState: "delete_pending",
+			authorityState: "archive_pending",
 			...(binding
 				? {
 						chatId: binding.chatId,
@@ -807,7 +1299,9 @@ export class TopicRegistry {
 							? {}
 							: { endpointGeneration: binding.endpointGeneration }),
 					}
-				: {}),
+				: archiveChatId
+					? { chatId: archiveChatId }
+					: {}),
 		};
 		this.topics.set(sessionId, record);
 		if (this.byTopic.get(topicId) === sessionId) this.byTopic.delete(topicId);
@@ -820,9 +1314,12 @@ export class TopicRegistry {
 		sessionId: string,
 		topicId: string,
 		creationLeaseEpoch: number,
+		hostId: string,
 		now: () => number = Date.now,
 		name?: string,
 		binding?: TopicEndpointBinding,
+		topicOrigin?: TopicRecord["topicOrigin"],
+		archiveChatId?: string,
 	): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
 		const matchesBinding =
@@ -836,9 +1333,12 @@ export class TopicRegistry {
 				: (this.epochs.get(sessionId) ?? 0) !== creationLeaseEpoch
 		)
 			return undefined;
-		this.beginDelete(sessionId);
-		const fenced = this.fenceAcceptedCreate(sessionId, topicId, now, name, binding);
+		const archiveFence = this.beginArchive(sessionId, hostId, now());
+		if (record && !archiveFence) return undefined;
+		const fenced = this.fenceAcceptedCreate(sessionId, topicId, now, name, binding, topicOrigin, archiveChatId);
 		fenced.creationLeaseEpoch = creationLeaseEpoch;
+		fenced.archiveHostId = hostId;
+		fenced.archiveLeaseEpoch = fenced.authorityEpoch;
 		return fenced;
 	}
 
@@ -848,99 +1348,92 @@ export class TopicRegistry {
 	}
 
 	/**
-	 * Phase 1 of settling a definite remote delete: remove the record while
-	 * deliberately RETAINING its topic-id quarantine.
-	 *
-	 * `dispatchedAuthorityEpoch` is the authority epoch the caller held when it
-	 * dispatched the remote delete. Settlement requires that epoch to still equal
-	 * both the record's own authority epoch and the registry's current epoch for
-	 * the session, so a held earlier delete can never settle a newer fence: if a
-	 * scan or close-started delete re-fenced the same session/topic after this
-	 * delete was dispatched, the stale definite result is refused and the newer
-	 * `delete_pending` record plus its topic-id quarantine stay intact.
-	 *
-	 * An epoch outside the safe-integer range cannot identify a generation, and at
-	 * `Number.MAX_SAFE_INTEGER` epoch advancement has saturated so distinct
-	 * generations are no longer distinguishable. Both fail closed: settlement can
-	 * no longer be proven fresh, so the fence is kept.
-	 *
-	 * Derived routing tables are deliberately NOT rebuilt here. Until the cleared
-	 * snapshot is durably persisted the clear is not authoritative, so publishing
-	 * routes now would make a colliding survivor routable (and the settled id
-	 * adoptable) during the held write, and a failed persist would re-quarantine
-	 * too late. Publish with {@link commitSettledDelete} once the persist
-	 * succeeds, or undo with {@link rollbackSettledDelete} when it fails.
+	 * Retain a topic record after a definite remote archive only while the exact
+	 * dispatched authority epoch is still current.
 	 */
-	settleDelete(sessionId: string, topicId: string, dispatchedAuthorityEpoch: number): TopicSettledDelete | undefined {
-		if (!Number.isSafeInteger(dispatchedAuthorityEpoch) || dispatchedAuthorityEpoch < 0) return undefined;
-		if (this.#settling.has(sessionId)) return undefined;
-		const record = this.topics.get(sessionId);
-		if (!record || record.topicId !== topicId || record.authorityState !== "delete_pending") return undefined;
-		if ((record.authorityEpoch ?? 0) !== dispatchedAuthorityEpoch) return undefined;
-		const currentEpoch = this.authorityEpoch(sessionId);
-		if (currentEpoch !== dispatchedAuthorityEpoch) return undefined;
-		if (currentEpoch >= Number.MAX_SAFE_INTEGER) return undefined;
-		this.topics.delete(sessionId);
-		this.#settling.set(sessionId, { topicId, settledEpoch: dispatchedAuthorityEpoch, record: { ...record } });
-		this.#ambiguousTopicIds.add(topicId);
-		if (this.byTopic.get(topicId) === sessionId) this.byTopic.delete(topicId);
-		return { sessionId, topicId, settledEpoch: dispatchedAuthorityEpoch };
-	}
-
-	/**
-	 * Phase 2: publish derived routing tables once the cleared state is durable.
-	 *
-	 * Only here does the settled topic id lose its quarantine, so a surviving
-	 * colliding record becomes routable and a settled id becomes adoptable without
-	 * waiting for a daemon restart.
-	 */
-	commitSettledDelete(settled: TopicSettledDelete): boolean {
-		const pending = this.#settling.get(settled.sessionId);
-		if (!pending || pending.topicId !== settled.topicId || pending.settledEpoch !== settled.settledEpoch)
+	settleArchive(sessionId: string, topicId: string, dispatchedAuthorityEpoch: number): boolean {
+		if (
+			!Number.isSafeInteger(dispatchedAuthorityEpoch) ||
+			dispatchedAuthorityEpoch < 0 ||
+			dispatchedAuthorityEpoch >= Number.MAX_SAFE_INTEGER
+		)
 			return false;
-		this.#settling.delete(settled.sessionId);
-		this.rebuildInboundRoutes();
-		return true;
-	}
-
-	/**
-	 * Compare-and-swap undo for a settlement whose durable clear failed.
-	 *
-	 * Restoration applies only while the registry still holds exactly the state
-	 * that this settlement produced: the settlement is still awaiting commit, the
-	 * session still has no record, and the session epoch is still the settled
-	 * epoch. Any mismatch means a newer generation intervened, so the restore is
-	 * refused and the newer state is left untouched. A refused settlement produced
-	 * no token, so it can never reach this path.
-	 */
-	rollbackSettledDelete(settled: TopicSettledDelete): boolean {
-		const pending = this.#settling.get(settled.sessionId);
-		if (!pending || pending.topicId !== settled.topicId || pending.settledEpoch !== settled.settledEpoch)
-			return false;
-		if (this.topics.has(settled.sessionId)) return false;
-		if (this.authorityEpoch(settled.sessionId) !== settled.settledEpoch) return false;
-		this.#settling.delete(settled.sessionId);
-		this.topics.set(settled.sessionId, {
-			...pending.record,
-			authorityEpoch: settled.settledEpoch,
-			authorityState: "delete_pending",
-		});
-		this.epochs.set(settled.sessionId, settled.settledEpoch);
-		this.rebuildInboundRoutes();
-		return true;
-	}
-
-	/** Remove a topic record immediately for local/test cleanup compatibility. */
-	delete(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
-		if (!record) return false;
-		this.#advanceAuthorityEpoch(sessionId, Math.max(this.epochs.get(sessionId) ?? 0, record.authorityEpoch ?? 0));
+		if (
+			!record ||
+			record.topicId !== topicId ||
+			record.authorityState !== "archive_pending" ||
+			record.authorityEpoch !== dispatchedAuthorityEpoch ||
+			this.authorityEpoch(sessionId) !== dispatchedAuthorityEpoch
+		)
+			return false;
+		record.authorityState = "inactive";
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
-		return this.topics.delete(sessionId);
+		this.archiveJobs.delete(sessionId);
+		return true;
+	}
+
+	/** Durable archive jobs that are eligible for a retry at `now`. */
+	archivePendingSessionIds(now = Date.now()): string[] {
+		return [...this.topics].flatMap(([sessionId, record]) => {
+			if (record.authorityState === "archive_exhausted") {
+				const currentEpoch = Math.max(this.epochs.get(sessionId) ?? 0, record.authorityEpoch ?? 0);
+				if (currentEpoch < Number.MAX_SAFE_INTEGER) {
+					const epoch = Math.min(currentEpoch + 1, Number.MAX_SAFE_INTEGER - 1);
+					record.authorityEpoch = epoch;
+					record.archiveLeaseEpoch = epoch;
+					record.authorityState = "archive_pending";
+				}
+			}
+			return (record.authorityState === "archive_pending" || record.authorityState === "archive_exhausted") &&
+				(this.archiveJobs.get(sessionId)?.nextAttemptAt ?? 0) <= now
+				? [sessionId]
+				: [];
+		});
+	}
+	/** Durable/manual recovery candidates that exceeded the automatic archive retry budget. */
+	archiveExhaustedSessionIds(): string[] {
+		return [...this.topics].flatMap(([sessionId, record]) =>
+			record.authorityState === "archive_exhausted" ? [sessionId] : [],
+		);
+	}
+
+	/** Persist an indefinitely discoverable retry after an ambiguous archive result. */
+	scheduleArchiveRetry(sessionId: string, now: number, diagnostic?: string): ArchiveJob | undefined {
+		const record = this.topics.get(sessionId);
+		if (record?.authorityState !== "archive_pending" && record?.authorityState !== "archive_exhausted")
+			return undefined;
+		const previous = this.archiveJobs.get(sessionId);
+		const firstAttemptAt = previous?.firstAttemptAt ?? now;
+		const attempt = (previous?.attempt ?? 0) + 1;
+		const exhausted = attempt > 8 || now - firstAttemptAt > 24 * 60 * 60 * 1000;
+		const effectiveAttempt = Math.min(attempt, 8);
+		const backoffMs = exhausted ? 1_000 : Math.min(60_000, 250 * 2 ** effectiveAttempt);
+		const job = {
+			sessionId,
+			topicId: record.topicId,
+			attempt: effectiveAttempt,
+			firstAttemptAt,
+			backoffMs,
+			nextAttemptAt: now + backoffMs,
+			...(diagnostic ? { safeDiagnostic: diagnostic.slice(0, 256) } : {}),
+			...(exhausted ? { safeDiagnostic: "archive retry remains discoverable after retry budget" } : {}),
+		};
+		record.authorityState = "archive_pending";
+		this.archiveJobs.set(sessionId, job);
+		return job;
 	}
 
 	/** Serialise active records plus unpublished staged creates for atomic commit. */
 	serialize(): TopicRegistryState {
-		return { topics: Object.fromEntries([...this.topics, ...this.staged]), fences: Object.fromEntries(this.epochs) };
+		return {
+			version: 2,
+			registryGeneration: this.registryGeneration,
+			topics: Object.fromEntries([...this.topics, ...this.staged]),
+			fences: Object.fromEntries(this.epochs),
+			archiveJobs: Object.fromEntries(this.archiveJobs),
+			createClaims: Object.fromEntries(this.createClaims),
+			retiredTopics: Object.fromEntries(this.retiredTopics),
+		};
 	}
 }

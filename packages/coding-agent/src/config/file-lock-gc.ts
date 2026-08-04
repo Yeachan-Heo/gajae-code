@@ -61,6 +61,21 @@ function keptMalformedRecord(lockDir: string): GcRecord {
 async function collectLockRecord(lockDir: string, ctx: GcContext): Promise<GcRecord> {
 	const info = await readFileLockInfoForGc(lockDir);
 	if (!info) return keptMalformedRecord(lockDir);
+	if (info.owner_host_id !== undefined) {
+		return {
+			store: "file_locks",
+			id: lockDir,
+			path: lockDir,
+			pid: info.pid,
+			pid_status: "unknown",
+			status: "host_qualified",
+			stale: false,
+			removable: false,
+			action: "none",
+			reason: "host_qualified_lock_requires_owner_reclamation",
+			detail: `timestamp=${info.timestamp}`,
+		};
+	}
 
 	const probeResult = ctx.probe(info.pid);
 	const pidStatus = gcPidStatusLabel(probeResult);
@@ -166,6 +181,9 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 		const lockDir = record.path ?? record.id;
 		const info = await readFileLockInfoForGc(lockDir);
 		if (!info) return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
+		if (info.owner_host_id !== undefined) {
+			return { removed: false, skipped: "host_qualified_lock_requires_owner_reclamation" };
+		}
 
 		const probeResult = ctx.probe(info.pid);
 		if (probeResult.status !== "dead") {
