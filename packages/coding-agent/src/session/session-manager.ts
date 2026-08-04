@@ -4841,10 +4841,12 @@ export class SessionManager {
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
 	#adoptedArtifactManager: ArtifactManager | null = null;
-	// In-memory artifact fallback for non-persistent sessions (persist=false).
-	// Keyed by sequential numeric ID string; mirrors the file-based ArtifactManager ID scheme.
-	#inMemoryArtifacts: Map<string, string> | null = null;
-	#inMemoryArtifactCounter = 0;
+	// Filesystem-backed artifact fallback for non-persistent sessions (persist=false).
+	// The directory is created lazily on first save so artifact content is read back
+	// from disk on demand instead of being retained in memory for the session lifetime.
+	#ephemeralArtifactManager: ArtifactManager | null = null;
+	#ephemeralArtifactDir: string | null = null;
+	#ephemeralArtifactInit: Promise<ArtifactManager | null> | null = null;
 	readonly #blobStore: BlobStore;
 	#residentTextBlobStore: BlobStore = new MemoryBlobStore();
 	#residentImageBlobStore: BlobStore;
@@ -5438,8 +5440,7 @@ export class SessionManager {
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = false;
-		this.#inMemoryArtifacts = null;
-		this.#inMemoryArtifactCounter = 0;
+		this.#discardEphemeralArtifacts();
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
@@ -5668,8 +5669,6 @@ export class SessionManager {
 				flushed: this.#flushed,
 				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 				ensuredOnDisk: this.#ensuredOnDisk,
-				inMemoryArtifacts: this.#inMemoryArtifacts,
-				inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
 				artifactManager: this.#artifactManager,
 				artifactManagerSessionFile: this.#artifactManagerSessionFile,
 				adoptedArtifactManager: this.#adoptedArtifactManager,
@@ -5692,8 +5691,6 @@ export class SessionManager {
 				this.#flushed = previous.flushed;
 				this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
 				this.#ensuredOnDisk = previous.ensuredOnDisk;
-				this.#inMemoryArtifacts = previous.inMemoryArtifacts;
-				this.#inMemoryArtifactCounter = previous.inMemoryArtifactCounter;
 				this.#artifactManager = previous.artifactManager;
 				this.#artifactManagerSessionFile = previous.artifactManagerSessionFile;
 				this.#adoptedArtifactManager = previous.adoptedArtifactManager;
@@ -6139,8 +6136,7 @@ export class SessionManager {
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
-		this.#inMemoryArtifacts = null;
-		this.#inMemoryArtifactCounter = 0;
+		this.#discardEphemeralArtifacts();
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
@@ -8027,11 +8023,13 @@ export class SessionManager {
 	/**
 	 * Returns the ArtifactManager this session writes through. Lazily creates
 	 * one bound to the current session file unless an external manager was
-	 * adopted via `adoptArtifactManager`. Returns null only for non-persistent
-	 * sessions with no adopted manager.
+	 * adopted via `adoptArtifactManager`. Falls back to the lazily created
+	 * ephemeral filesystem store once a non-persistent session has saved an
+	 * artifact, so `artifact://` stays resolvable. Returns null only when no
+	 * store has been established yet.
 	 */
 	getArtifactManager(): ArtifactManager | null {
-		return this.#getOrCreateArtifactManager();
+		return this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
 	}
 
 	/**
@@ -8074,26 +8072,50 @@ export class SessionManager {
 
 	/**
 	 * Save artifact content under the current session and return artifact ID.
-	 * Returns an artifact ID for all sessions (file-backed for persistent, in-memory fallback otherwise).
+	 * Persistent sessions write into the session artifact directory; non-persistent
+	 * sessions write into a lazily created temporary directory so the content is
+	 * read back from the filesystem instead of being retained in memory.
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
-		const manager = this.#getOrCreateArtifactManager();
-		if (manager) return manager.save(content, toolType);
-		// Non-persistent session: store in memory so spill truncation can proceed.
-		if (!this.#inMemoryArtifacts) this.#inMemoryArtifacts = new Map();
-		const id = String(this.#inMemoryArtifactCounter++);
-		this.#inMemoryArtifacts.set(id, content);
-		return id;
+		const manager = this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
+		return manager ? manager.save(content, toolType) : undefined;
 	}
 
 	/**
 	 * Resolve an artifact ID to an on-disk path for the current session.
-	 * Returns null when missing or when the session is not persisted.
+	 * Returns null when the artifact is missing.
 	 */
 	async getArtifactPath(id: string): Promise<string | null> {
-		const manager = this.#getOrCreateArtifactManager();
+		const manager = this.getArtifactManager();
 		if (!manager) return null;
 		return manager.getPath(id);
+	}
+
+	/**
+	 * Create the non-persistent session's temporary artifact directory on first use.
+	 * Returns null when the directory cannot be created; callers then report no artifact.
+	 */
+	async #ensureEphemeralArtifactManager(): Promise<ArtifactManager | null> {
+		this.#ephemeralArtifactInit ??= fs.promises
+			.mkdtemp(path.join(os.tmpdir(), "gjc-session-artifacts-"))
+			.then(dir => {
+				this.#ephemeralArtifactDir = dir;
+				this.#ephemeralArtifactManager = new ArtifactManager(dir);
+				return this.#ephemeralArtifactManager;
+			})
+			.catch(() => null);
+		const manager = await this.#ephemeralArtifactInit;
+		if (!manager) this.#ephemeralArtifactInit = null;
+		return manager;
+	}
+
+	/** Unbind and remove the ephemeral store; the successor session owns its own artifacts. */
+	#discardEphemeralArtifacts(): void {
+		const dir = this.#ephemeralArtifactDir;
+		this.#ephemeralArtifactManager = null;
+		this.#ephemeralArtifactDir = null;
+		this.#ephemeralArtifactInit = null;
+		if (dir) void fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
 	}
 
 	/**

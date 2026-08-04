@@ -214,6 +214,42 @@ describe("task no-session output refs", () => {
 		expect(session.getArtifactsDir?.()).toBeNull();
 	});
 
+	it("keeps a nested subagent on the adopted parent artifact store", async () => {
+		const grandchildOutput = "grandchild output that must land in the shared parent root";
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession(grandchildOutput)),
+		);
+
+		const parentRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-parent-root-"));
+		const parentManager = new ArtifactManager(parentRoot);
+		// A subagent session file lives inside the parent artifact root, and its
+		// SessionManager adopts the parent manager instead of exposing its own dir.
+		const session = createSession(path.join(parentRoot, "0-Child.jsonl"), `nested-${Snowflake.next()}`);
+		session.getArtifactsDir = () => null;
+		session.getArtifactManager = () => parentManager;
+
+		try {
+			const resultText = await runDetachedTask(await TaskTool.create(session));
+			const outputId = matchAgentOutputId(resultText, "NoSession")?.[1];
+			expect(outputId).toBeTruthy();
+
+			const sharedOutput = path.join(parentRoot, `${outputId}.md`);
+			expect(await Bun.file(sharedOutput).text()).toContain(grandchildOutput);
+			expect(await Bun.file(path.join(parentRoot, "0-Child", `${outputId}.md`)).exists()).toBe(false);
+
+			const resolved = await InternalUrlRouter.instance().resolve(`agent://${outputId}`, {
+				cwd: session.cwd,
+				getArtifactsDir: () => parentRoot,
+				getAuthorizedArtifactsDirs: () => [parentRoot],
+			});
+			expect(resolved.content).toContain(grandchildOutput);
+		} finally {
+			await session.disposeSession();
+			await fs.rm(parentRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("shares one root and ID space with authorized descendants but denies foreign trees", async () => {
 		const firstOutput = "architect findings for sibling review";
 		const secondOutput = "architect second-pass output";

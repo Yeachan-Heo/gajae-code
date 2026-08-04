@@ -78,7 +78,7 @@ export class ArtifactManager {
 	readonly #dir: string;
 	readonly #store: ManagedSessionDescendantStore | undefined;
 	#dirCreated = false;
-	#initialized = false;
+	#initialized: Promise<void> | undefined;
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
@@ -118,10 +118,10 @@ export class ArtifactManager {
 			else ensureManagedDirectory(this.#dir);
 			this.#dirCreated = true;
 		}
-		if (!this.#initialized) {
-			await this.#scanExistingIds();
-			this.#initialized = true;
-		}
+		// Memoized: concurrent first writers must not each rescan and restart the
+		// ID counter at the same value, which would collide on publish.
+		this.#initialized ??= this.#scanExistingIds();
+		await this.#initialized;
 	}
 
 	#filename(id: string, toolType: string): string {

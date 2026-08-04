@@ -569,6 +569,28 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
+	 * The artifact store shared by this whole agent tree, when the session proves
+	 * one. A subagent adopts its parent's `ArtifactManager`, so the manager's dir
+	 * is the parent's artifact root rather than this session's own root; the
+	 * subagent session file living inside that root is the containment proof.
+	 * A manager unrelated to this session's roots is foreign and rejected.
+	 */
+	#sharedArtifactStore(): { dir: string; manager: ArtifactManager } | null {
+		const manager = this.session.getArtifactManager?.() ?? null;
+		if (!manager) return null;
+		const dir = path.resolve(manager.dir);
+		const sessionArtifactsDir = this.session.getArtifactsDir?.();
+		if (sessionArtifactsDir && path.resolve(sessionArtifactsDir) === dir) return { dir, manager };
+		// Lexical containment only: the subagent session file is usually allocated
+		// but not yet created, so a realpath-based check would fail spuriously.
+		const sessionFile = this.session.getSessionFile();
+		if (!sessionFile) return null;
+		const relative = path.relative(dir, path.resolve(sessionFile));
+		if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+		return { dir, manager };
+	}
+
+	/**
 	 * Ensure a session-lifetime artifact directory when the parent has no session file.
 	 * Returns null only when durable allocation fails (mkdir error) — callers must not
 	 * advertise agent:// URIs without a successful allocation.
@@ -579,9 +601,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const sessionArtifactsDir = this.session.getArtifactsDir?.() ?? null;
 		if (sessionArtifactsDir) {
-			const existingManager = this.session.getArtifactManager?.() ?? null;
-			if (existingManager && path.resolve(existingManager.dir) !== path.resolve(sessionArtifactsDir)) return null;
-			const manager = existingManager ?? new ArtifactManager(sessionArtifactsDir);
+			const manager = new ArtifactManager(sessionArtifactsDir);
 			state.dir = sessionArtifactsDir;
 			state.manager = manager;
 			if (!(await this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false))) return null;
@@ -701,8 +721,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	/**
 	 * Resolve the effective artifacts directory for this task batch.
-	 * File-backed sessions use the session artifacts path; in-memory parents use
-	 * the session-lifetime durable temp root when allocation succeeds.
+	 *
+	 * The session's ArtifactManager is authoritative when present: a subagent
+	 * adopts its parent's manager, so honouring it keeps the whole agent tree on
+	 * one artifact directory and one ID space instead of giving each nesting
+	 * level a private store. Sessions without a manager fall back to the session
+	 * artifacts path, then to the session-lifetime durable temp root.
 	 */
 	async #resolveEffectiveArtifactsDir(): Promise<{
 		sessionArtifactsDir: string | null;
@@ -710,19 +734,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		effectiveArtifactsDir: string | undefined;
 		parentArtifactManager: ArtifactManager | undefined;
 	}> {
+		const shared = this.#sharedArtifactStore();
+		if (shared) {
+			return {
+				sessionArtifactsDir: shared.dir,
+				durableArtifactsDir: null,
+				effectiveArtifactsDir: shared.dir,
+				parentArtifactManager: shared.manager,
+			};
+		}
 		const sessionFile = this.session.getSessionFile();
 		const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
 		if (sessionArtifactsDir) {
-			const candidateManager = this.session.getArtifactManager?.() ?? undefined;
-			const parentArtifactManager =
-				candidateManager && path.resolve(candidateManager.dir) === path.resolve(sessionArtifactsDir)
-					? candidateManager
-					: undefined;
 			return {
 				sessionArtifactsDir,
 				durableArtifactsDir: null,
 				effectiveArtifactsDir: sessionArtifactsDir,
-				parentArtifactManager,
+				parentArtifactManager: undefined,
 			};
 		}
 		const durable = await this.#ensureSessionLifetimeArtifacts();

@@ -84,6 +84,8 @@ If artifact directory is missing, scanning yields empty list and allocation star
 
 `AgentOutputManager` allocates IDs for subagent outputs as `<index>-<requestedId>` (optionally nested under parent prefix, e.g. `0-Parent.1-Child`). It scans existing `.md` files on initialization to continue from the next index on resume.
 
+A subagent adopts its parent's `ArtifactManager` (`SessionManager.adoptArtifactManager`), so the whole agent tree — including nested subagents whose own session file lives inside the shared root — writes `<outputId>.md` into one directory and one ID space. The task tool treats that adopted manager as authoritative when the session file is contained in the manager's directory; a manager unrelated to the session's roots is rejected as foreign.
+
 ## Persistence dataflow
 
 ## 1) Session entry persistence rewrite path
@@ -223,6 +225,7 @@ Blob implications after fork:
 | Artifact ID not found                                    | Throws with available IDs listing                                     |
 | OutputSink artifact writer init fails                    | Continues with tail-only truncation (no full-output artifact)         |
 | No session file (some task paths)                        | Task tool falls back to temp artifacts directory for subagent outputs |
+| Non-persistent session (`persist=false`)                 | `saveArtifact` lazily creates a temp artifact directory; content is read back from disk, never retained in memory |
 
 ## Binary blob externalization vs text-output artifacts
 
