@@ -1550,6 +1550,41 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	// Context
 	// ────────────────────────────────────────────────────────────────────────
+	// Context files
+	"context.userGlobalAgentsPrecedence": {
+		type: "enum",
+		values: ["fallback", "override"] as const,
+		default: "fallback",
+		ui: {
+			tab: "context",
+			label: "User Global AGENTS.md Precedence",
+			description:
+				"Controls whether user-global AGENTS.md files are fallback guidance or override project context files. System/developer instructions always remain higher authority.",
+			options: [
+				{
+					value: "fallback",
+					label: "Fallback",
+					description: "Render user-global AGENTS.md before project context so project files win conflicts",
+				},
+				{
+					value: "override",
+					label: "Override",
+					description: "Render user-global AGENTS.md after project context so user-global files win conflicts",
+				},
+			],
+		},
+	},
+
+	"context.homeRootAgents": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			label: "Home Root AGENTS.md",
+			description:
+				"Opt in to loading ~/AGENTS.md as a user-global context file. Foreign provider home files remain excluded.",
+		},
+	},
 
 	// Context promotion
 	"contextPromotion.enabled": {

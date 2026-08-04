@@ -5,7 +5,10 @@
 
 {{#if contextFiles.length}}
 <context>
-Follow the context files below for all tasks:
+Follow the context files below for all tasks. Later files have higher precedence when context files conflict.
+{{#if userGlobalAgentsOverride}}
+User-global AGENTS.md is configured as an override and has the highest context-file precedence.
+{{/if}}
 {{#each contextFiles}}
 <file path="{{path}}">
 {{content}}
@@ -16,7 +19,7 @@ Follow the context files below for all tasks:
 
 {{#if agentsMdSearch.files.length}}
 <dir-context>
-Some directories may have their own rules. Deeper rules override higher ones.
+Some directories may have their own rules. Deeper rules override higher ones{{#if userGlobalAgentsOverride}}, except user-global AGENTS.md remains the configured context-file override{{/if}}.
 MUST read before making changes within:
 {{#list agentsMdSearch.files join="\n"}}- {{this}}{{/list}}
 </dir-context>

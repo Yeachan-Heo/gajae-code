@@ -1176,6 +1176,26 @@
 			},
 			"additionalProperties": false
 		},
+		"context": {
+			"type": "object",
+			"properties": {
+				"userGlobalAgentsPrecedence": {
+					"type": "string",
+					"enum": [
+						"fallback",
+						"override"
+					],
+					"description": "Controls whether user-global AGENTS.md files are fallback guidance or override project context files. System/developer instructions always remain higher authority.",
+					"default": "fallback"
+				},
+				"homeRootAgents": {
+					"type": "boolean",
+					"description": "Opt in to loading ~/AGENTS.md as a user-global context file. Foreign provider home files remain excluded.",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"contextPromotion": {
 			"type": "object",
 			"properties": {

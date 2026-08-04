@@ -299,6 +299,17 @@ export {
 function hasAvailableIrcTool(session: ToolSession): boolean {
 	return session.settings.get("irc.enabled") === true && session.getToolByName?.("irc") !== undefined;
 }
+function isUserGlobalAgentsOverrideFile(session: ToolSession, filePath: string): boolean {
+	if (session.settings.get("context.userGlobalAgentsPrecedence") !== "override") return false;
+
+	const resolvedPath = path.resolve(filePath);
+	const candidates = [path.join(session.settings.getAgentDir(), "AGENTS.md")];
+	if (session.settings.get("context.homeRootAgents") === true) {
+		candidates.push(path.join(os.homedir(), "AGENTS.md"));
+	}
+
+	return candidates.some(candidate => path.resolve(candidate) === resolvedPath);
+}
 
 function renderDescription(
 	agents: AgentDefinition[],
@@ -1834,7 +1845,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							.filter((s): s is NonNullable<typeof s> => s !== undefined)
 					: [];
 			const contextFiles = this.session.contextFiles?.filter(
-				file => path.basename(file.path).toLowerCase() !== "agents.md",
+				file =>
+					path.basename(file.path).toLowerCase() !== "agents.md" ||
+					isUserGlobalAgentsOverrideFile(this.session, file.path),
 			);
 			const promptTemplates = this.session.promptTemplates;
 

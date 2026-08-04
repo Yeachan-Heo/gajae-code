@@ -640,14 +640,20 @@ export async function discoverSkills(
 
 /**
  * Discover context files (AGENTS.md) walking up from cwd.
- * Returns files sorted by depth (farther from cwd first, so closer files appear last/more prominent).
+ * Returns files sorted by prompt precedence, with later files winning context-file conflicts.
  */
 export async function discoverContextFiles(
 	cwd?: string,
 	_agentDir?: string,
+	options: {
+		userGlobalAgentsPrecedence?: "fallback" | "override";
+		includeHomeRootAgents?: boolean;
+	} = {},
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	return await loadContextFilesInternal({
 		cwd: cwd ?? getProjectDir(),
+		userGlobalAgentsPrecedence: options.userGlobalAgentsPrecedence,
+		includeHomeRootAgents: options.includeHomeRootAgents,
 	});
 }
 
@@ -686,6 +692,8 @@ export interface BuildSystemPromptOptions {
 	cwd?: string;
 	appendPrompt?: string;
 	repeatToolDescriptions?: boolean;
+	userGlobalAgentsPrecedence?: "fallback" | "override";
+	includeHomeRootAgents?: boolean;
 }
 
 /**
@@ -701,6 +709,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles: options.contextFiles,
 		appendSystemPrompt: options.appendPrompt,
 		repeatToolDescriptions: options.repeatToolDescriptions,
+		userGlobalAgentsPrecedence: options.userGlobalAgentsPrecedence,
+		includeHomeRootAgents: options.includeHomeRootAgents,
 	});
 }
 
@@ -1169,7 +1179,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session-context build, tool creation, MCP discovery, and extension discovery.
 		const contextFilesResultPromise = options.contextFiles
 			? Promise.resolve({ contextFiles: options.contextFiles, warnings: [] })
-			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd });
+			: logger.time("discoverContextFiles", loadContextFilesResultInternal, {
+					cwd,
+					userGlobalAgentsPrecedence: settings.get("context.userGlobalAgentsPrecedence"),
+					includeHomeRootAgents: settings.get("context.homeRootAgents"),
+				});
 		contextFilesResultPromise.catch(() => {});
 		const promptTemplatesPromise = options.promptTemplates
 			? Promise.resolve(options.promptTemplates)
@@ -2311,6 +2325,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				appendSystemPrompt: appendPrompt,
 				pluginAppendices: pluginSystemAppendices,
 				repeatToolDescriptions,
+				userGlobalAgentsPrecedence: settings.get("context.userGlobalAgentsPrecedence"),
+				includeHomeRootAgents: settings.get("context.homeRootAgents"),
 				intentField,
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
 				eagerTasks,

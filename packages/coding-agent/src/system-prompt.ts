@@ -3,6 +3,7 @@
  */
 
 import * as os from "node:os";
+import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { $env, getGpuCachePath, getProjectDir, hasFsCode, isEnoent, logger, prompt } from "@gajae-code/utils";
 import { $ } from "bun";
@@ -232,17 +233,24 @@ export async function resolvePromptInput(input: string | undefined, description:
 	}
 }
 
+export type UserGlobalAgentsPrecedence = "fallback" | "override";
+
 export interface LoadContextFilesOptions {
 	/** Working directory to start walking up from. Default: getProjectDir() */
 	cwd?: string;
+	/** Whether user-global AGENTS.md renders as fallback or as the strongest context file. */
+	userGlobalAgentsPrecedence?: UserGlobalAgentsPrecedence;
+	/** Include ~/AGENTS.md as an explicit opt-in user-global context file. */
+	includeHomeRootAgents?: boolean;
 }
 
-function dedupeExactContextFiles(
-	contextFiles: Array<{ path: string; content: string; depth?: number }>,
-): Array<{ path: string; content: string; depth?: number }> {
+type ContextFilePromptEntry = { path: string; content: string; depth?: number };
+
+function dedupeExactContextFiles(contextFiles: ContextFilePromptEntry[]): ContextFilePromptEntry[] {
 	const lastIndexByContent = new Map<string, number>();
 	for (const [index, file] of contextFiles.entries()) {
-		// Keep the closest matching context entry when content is byte-for-byte identical.
+		// Later entries have higher prompt precedence, so keep the strongest matching
+		// context entry when content is byte-for-byte identical.
 		lastIndexByContent.set(file.content, index);
 	}
 	return contextFiles.filter((file, index) => lastIndexByContent.get(file.content) === index);
@@ -253,28 +261,51 @@ export interface ProjectContextFilesResult {
 	warnings: string[];
 }
 
+async function loadHomeRootAgentsFile(home: string, include: boolean): Promise<ContextFilePromptEntry | null> {
+	if (!include) return null;
+
+	const homeRootAgentsPath = path.join(home, "AGENTS.md");
+	try {
+		const content = await Bun.file(homeRootAgentsPath).text();
+		if (!content.trim()) return null;
+		return { path: homeRootAgentsPath, content };
+	} catch (error) {
+		if (!isEnoent(error) && !hasFsCode(error, "ENOTDIR")) {
+			logger.warn("Could not read home-root AGENTS.md", { path: homeRootAgentsPath, error: String(error) });
+		}
+		return null;
+	}
+}
+
 /**
  * Load all context files using the capability API.
  * Returns {path, content, depth} entries for all discovered context files.
- * Native user-global files (`~/.gjc/agent/AGENTS.md`) come first, then project
- * files sorted by depth (descending) so files closer to cwd appear last/more
- * prominent. User-home files from foreign providers (`~/.claude/CLAUDE.md`,
- * `~/.codex/AGENTS.md`, …) stay excluded — only gjc's own user config applies.
+ * GJC-native user-global files (`~/.gjc/agent/AGENTS.md`) are included; the
+ * opt-in home-root file (`~/AGENTS.md`) is included only when requested. Foreign
+ * provider user-home files (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …)
+ * stay excluded. By default user-global files render first as fallback; with
+ * `userGlobalAgentsPrecedence: "override"` they render last and override project
+ * context while remaining below platform/system/developer instructions.
  */
 export async function loadProjectContextFilesResult(
 	options: LoadContextFilesOptions = {},
 ): Promise<ProjectContextFilesResult> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
-	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd });
+	const userGlobalAgentsPrecedence = options.userGlobalAgentsPrecedence ?? "fallback";
+
+	const [result, homeRootAgents] = await Promise.all([
+		loadCapability(contextFileCapability.id, { cwd: resolvedCwd }),
+		loadHomeRootAgentsFile(os.homedir(), options.includeHomeRootAgents === true),
+	]);
 	const items = result.items as ContextFile[];
 
-	// Native user-global context applies everywhere and is least specific, so it
-	// renders first — project files rendered later take precedence over it.
-	const userFiles = items
+	const nativeUserFiles = items
 		.filter(item => item.level === "user" && item._source.provider === "native")
 		.map(item => ({ path: item.path, content: item.content }));
+	const userFiles = [homeRootAgents, ...nativeUserFiles].filter(
+		(file): file is ContextFilePromptEntry => file !== null,
+	);
 
-	// Convert project-level ContextFile items and preserve depth info
 	const projectFiles = items
 		.filter(item => item.level === "project")
 		.map(item => ({
@@ -284,15 +315,18 @@ export async function loadProjectContextFilesResult(
 		}));
 
 	// Sort by depth (descending): higher depth (farther from cwd) comes first,
-	// so files closer to cwd appear later and are more prominent
+	// so files closer to cwd appear later and are more prominent.
 	projectFiles.sort((a, b) => {
 		const depthA = a.depth ?? -1;
 		const depthB = b.depth ?? -1;
 		return depthB - depthA;
 	});
 
+	const orderedFiles =
+		userGlobalAgentsPrecedence === "override" ? [...projectFiles, ...userFiles] : [...userFiles, ...projectFiles];
+
 	return {
-		contextFiles: dedupeExactContextFiles([...userFiles, ...projectFiles]),
+		contextFiles: dedupeExactContextFiles(orderedFiles),
 		warnings: result.warnings,
 	};
 }
@@ -374,6 +408,10 @@ export interface BuildSystemPromptOptions {
 	cwd?: string;
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
+	/** Whether user-global AGENTS.md renders before or after project context. */
+	userGlobalAgentsPrecedence?: UserGlobalAgentsPrecedence;
+	/** Include ~/AGENTS.md as an explicit opt-in user-global context file. */
+	includeHomeRootAgents?: boolean;
 	/** Skills provided directly to system prompt construction. */
 	skills?: Skill[];
 	/** Pre-loaded rulebook rules (descriptions, excluding TTSR and always-apply). */
@@ -448,6 +486,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd,
 		contextFiles: providedContextFiles,
 		rules,
+		userGlobalAgentsPrecedence = "fallback",
+		includeHomeRootAgents = false,
 		alwaysApplyRules,
 		intentField,
 		toolDiscoveryActive = false,
@@ -505,7 +545,11 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	});
 	const contextFilesPromise = providedContextFiles
 		? Promise.resolve({ contextFiles: providedContextFiles, warnings: [] })
-		: logger.time("loadProjectContextFiles", loadProjectContextFilesResult, { cwd: resolvedCwd });
+		: logger.time("loadProjectContextFiles", loadProjectContextFilesResult, {
+				cwd: resolvedCwd,
+				userGlobalAgentsPrecedence,
+				includeHomeRootAgents,
+			});
 	const workspaceTreePromise =
 		providedWorkspaceTree !== undefined
 			? Promise.resolve(providedWorkspaceTree)
@@ -614,6 +658,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolRefs,
 		environment,
 		contextFiles: sanitizedContextFiles,
+		userGlobalAgentsOverride: userGlobalAgentsPrecedence === "override",
 		agentsMdSearch: { files: agentsMdFiles.map(file => escapePromptMetadata(file)) },
 		workspaceTree,
 		rules: rules ?? [],

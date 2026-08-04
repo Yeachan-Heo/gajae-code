@@ -107,6 +107,67 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(paths).toContain(path.join(projectDir, "AGENTS.md"));
 	});
 
+	it("loads user-global AGENTS.md after project context when override precedence is configured", async () => {
+		const projectDir = path.join(tempDir, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.writeFileSync(path.join(projectDir, "AGENTS.md"), "Project instructions");
+		const userAgentsPath = path.join(tempHomeDir, ".gjc", "agent", "AGENTS.md");
+		fs.mkdirSync(path.dirname(userAgentsPath), { recursive: true });
+		fs.writeFileSync(userAgentsPath, "User-global instructions");
+
+		const files = await loadProjectContextFiles({
+			cwd: projectDir,
+			userGlobalAgentsPrecedence: "override",
+		});
+
+		expect(files.map(file => file.path)).toEqual([path.join(projectDir, "AGENTS.md"), userAgentsPath]);
+	});
+
+	it("loads home-root AGENTS.md only when explicitly enabled and lets it override project context", async () => {
+		const projectDir = path.join(tempDir, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.writeFileSync(path.join(projectDir, "AGENTS.md"), "Project instructions");
+		const homeRootAgentsPath = path.join(tempHomeDir, "AGENTS.md");
+		fs.writeFileSync(homeRootAgentsPath, "Home-root instructions");
+
+		await expect(loadProjectContextFiles({ cwd: projectDir })).resolves.toEqual([
+			{
+				path: path.join(projectDir, "AGENTS.md"),
+				content: "Project instructions",
+				depth: 0,
+			},
+		]);
+
+		const files = await loadProjectContextFiles({
+			cwd: projectDir,
+			includeHomeRootAgents: true,
+			userGlobalAgentsPrecedence: "override",
+		});
+
+		expect(files.map(file => file.path)).toEqual([path.join(projectDir, "AGENTS.md"), homeRootAgentsPath]);
+	});
+
+	it("renders an explicit override precedence notice in project context", async () => {
+		const projectDir = path.join(tempDir, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: projectDir,
+			contextFiles: [
+				{ path: path.join(projectDir, "AGENTS.md"), content: "Project instructions", depth: 0 },
+				{ path: path.join(tempHomeDir, "AGENTS.md"), content: "Home-root instructions" },
+			],
+			userGlobalAgentsPrecedence: "override",
+			skills: [],
+			rules: [],
+			toolNames: [],
+		});
+
+		const promptText = systemPrompt.join("\n\n");
+
+		expect(promptText).toContain("Later files have higher precedence");
+		expect(promptText).toContain("User-global AGENTS.md is configured as an override");
+	});
+
 	it("includes the native user-global file while still excluding foreign user-home files", async () => {
 		const projectDir = path.join(tempDir, "project");
 		fs.mkdirSync(projectDir, { recursive: true });
