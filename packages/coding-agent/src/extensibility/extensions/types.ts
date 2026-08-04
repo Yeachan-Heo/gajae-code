@@ -352,6 +352,8 @@ export interface ExtensionContext {
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Aborted when the runner stops waiting for this handler, including handler timeout. */
+	signal?: AbortSignal;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Session classification supplied by the SDK for extension policy decisions. */

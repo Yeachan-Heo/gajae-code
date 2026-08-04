@@ -890,7 +890,7 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
-	it("includes service_tier in SSE payloads when requested", async () => {
+	it("uses the explicit response service tier before the requested-tier fallback", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -899,17 +899,18 @@ describe("openai-codex streaming", () => {
 			"utf8",
 		).toBase64();
 		const token = `aaa.${payload}.bbb`;
-		let capturedBody: Record<string, unknown> | undefined;
+		const capturedBodies: Record<string, unknown>[] = [];
+		let responseServiceTier: "default" | undefined = "default";
 
-		const sse = `${[
-			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}`,
-			`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
-			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
-			`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
-			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", service_tier: "default", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
-		].join("\n\n")}\n\n`;
 		const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
-			capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			capturedBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+			const sse = `${[
+				`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}`,
+				`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
+				`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
+				`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
+				`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", ...(responseServiceTier ? { service_tier: responseServiceTier } : {}), usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+			].join("\n\n")}\n\n`;
 			return new Response(sse, {
 				status: 200,
 				headers: { "content-type": "text/event-stream" },
@@ -935,15 +936,27 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		};
 
-		const result = await streamOpenAICodexResponses(model, context, {
+		const explicitDefaultResult = await streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			serviceTier: "priority",
 		}).result();
-		expect(result.stopReason).toBe("stop");
-		expect(capturedBody?.service_tier).toBe("priority");
-		expect(result.usage.cost.input).toBeCloseTo(0.00001);
-		expect(result.usage.cost.output).toBeCloseTo(0.000012);
-		expect(result.usage.cost.total).toBeCloseTo(0.000022);
+		responseServiceTier = undefined;
+		const missingTierResult = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			serviceTier: "priority",
+		}).result();
+
+		expect(explicitDefaultResult.stopReason).toBe("stop");
+		expect(missingTierResult.stopReason).toBe("stop");
+		expect(capturedBodies).toHaveLength(2);
+		expect(capturedBodies[0]?.service_tier).toBe("priority");
+		expect(capturedBodies[1]?.service_tier).toBe("priority");
+		expect(explicitDefaultResult.usage.cost.input).toBeCloseTo(0.000005, 10);
+		expect(explicitDefaultResult.usage.cost.output).toBeCloseTo(0.000006, 10);
+		expect(explicitDefaultResult.usage.cost.total).toBeCloseTo(0.000011, 10);
+		expect(missingTierResult.usage.cost.input).toBeCloseTo(0.00001, 10);
+		expect(missingTierResult.usage.cost.output).toBeCloseTo(0.000012, 10);
+		expect(missingTierResult.usage.cost.total).toBeCloseTo(0.000022, 10);
 	});
 
 	it("fails truncated SSE streams that never emit a terminal response event", async () => {

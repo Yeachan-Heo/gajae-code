@@ -2,12 +2,20 @@
 
 ## [Unreleased]
 
+## [0.12.11] - 2026-08-03
+
+### Fixed
+
+- Native shared filesystem scans now enforce strict per-scan entry and successful-snapshot retained-capacity budgets, precharge logical ownership before allocation requests, reject allocator-granted excess with whole-scan errors instead of partial prefixes, share immutable snapshots without full-vector clones, and prevent stale in-flight scans from repopulating invalidated or TTL-expired cache entries. The byte budget does not claim a hard allocator or transient RSS ceiling. Cache retention remains compatible with #3774's 128 MiB default and zero-byte cache bypass, is bounded by both key count and aggregate bytes, and includes symlink-following behavior in cache identity (#3769, #3780).
+- Side-effecting macOS computer input now restores the global cursor after releasing held input on success, cancellation, action failure, and panic paths. Batches that include input run in one native capture-to-restore transaction; screenshot/wait-only batches stay cursor-neutral, and capture/restore failures are reported without masking the primary action error (#3642, #3781).
+
 ## [0.12.10] - 2026-08-03
 
 ### Fixed
 
 - Linux retained publish receipts now report the actual `linkat` or `mkdirat` fallback primitive, and a staging `unlinkat` failure after `linkat` publication is reported as committed-but-unproven with bounded errno evidence instead of as a retry-safe pre-mutation failure (#3746).
 - The native `fs_cache` scan cache is now bounded by an approximate byte budget in addition to its entry count. A single scan result larger than the budget is not cached at all, and storing a result evicts the oldest entries until the retained set fits; `FS_SCAN_CACHE_MAX_BYTES` (default `134217728`, 128 MiB) tunes it and `0` disables caching entirely. Previously 16 cached entries could each hold an arbitrarily large directory listing, so scanning a few huge trees pinned unbounded native memory for the process lifetime (#3774).
+- Managed *replacement* now works on filesystems that implement no `renameat2` rename flags. `replace_managed` reached `renameat2(RENAME_EXCHANGE)` directly and had no fallback, so on such a mount every managed replacement failed with `io_error` — and unlike the publish paths fixed in #3735, this one is reached during ordinary use: the session transcript rewrite (`#persistPatch` / `#rewriteFile` → `replaceSync`) goes through it, not just migration. A directory exchange has no window-free emulation, but this one does: `linkat(2)` gives the displaced object a second name, a plain `renameat(2)` then replaces the destination in a single atomic step that never unoccupies the name, and a final rename parks the displaced object under the candidate name where the exchange would have left it. Both objects end single-linked exactly as `RENAME_EXCHANGE` leaves them, so every identity proof the caller re-runs is unchanged. The rollback link is made durable in its own parent *before* anything is displaced, which is what makes the sequence crash-equivalent rather than only terminal-state-equivalent: the single-step primitive can never let the displaced object lose its last name, while a three-step emulation could if the replacing rename reached the disk and the rollback link did not. That sync is fail-closed — an unprovable rollback link is removed and nothing is published — and once the replacement commits, any later sync or proof failure is reported as committed-but-unproven rather than as a retryable pre-mutation failure. The destination descriptor is released between the rollback link and the replacing rename, because NFS silly-renames a still-open name that a rename displaces, which would otherwise leave the displaced object double-linked and fail its `st_nlink == 1` proof.
 
 ## [0.12.8] - 2026-08-02
 ### Fixed

@@ -3,9 +3,9 @@
 //! # Safety model
 //! Input is **runtime-gated**: [`InputController::guarded`] refuses to
 //! construct unless Accessibility is granted (see [`super::permissions`]), so
-//! no event can be posted while the TCC gate is closed. This module is also
-//! **not** wired to napi or the model surface yet — per the approved plan,
-//! input is exposed only after the kill-switch supervisor is proven live.
+//! no event can be posted while the TCC gate is closed. The N-API controller
+//! exposes input only through the executor after the kill-switch supervisor is
+//! proven live.
 //!
 //! # Testability
 //! All event *orchestration* (action → low-level event sequence, held
@@ -43,11 +43,11 @@ pub enum SinkOp {
 	Key { code: u16, down: bool },
 }
 
-/// Sink for low-level input events. The real implementation posts `CGEvent`s;
-/// the test implementation records them.
+/// Sink for ordinary low-level input events. These operations intentionally do
+/// not report cursor-transaction failures.
 pub trait EventSink {
 	/// Move the cursor.
-	fn move_cursor(&mut self, to: LogicalPoint);
+	fn move_cursor(&mut self, to: LogicalPoint) -> Result<(), InputError>;
 	/// Press or release a mouse button at a point.
 	fn mouse_button(&mut self, at: LogicalPoint, button: MouseButton, down: bool);
 	/// Scroll by logical deltas.
@@ -58,30 +58,58 @@ pub trait EventSink {
 	fn key(&mut self, code: u16, down: bool);
 }
 
+/// Fallible global cursor operations that bracket an input transaction.
+pub trait CursorHooks {
+	/// Capture the current global cursor position before input.
+	fn capture_cursor(&mut self) -> Result<LogicalPoint, CursorError>;
+	/// Restore the global cursor after input.
+	fn restore_cursor(&mut self, to: LogicalPoint) -> Result<(), CursorError>;
+}
+
+/// Failure to capture or restore the global cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorError {
+	/// Core Graphics could not create an event for cursor capture.
+	CaptureFailed,
+	/// Core Graphics rejected a cursor warp with this status.
+	RestoreFailed(i32),
+}
+
+impl std::fmt::Display for CursorError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::CaptureFailed => write!(f, "could not capture cursor position"),
+			Self::RestoreFailed(status) => write!(f, "cursor warp failed with status {status}"),
+		}
+	}
+}
+
+impl std::error::Error for CursorError {}
+
 /// Error from an input action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputError {
 	/// A coordinate could not be mapped to a logical point.
 	Coord(CoordError),
+	/// A Core Graphics cursor warp failed with this status.
+	CursorWarpFailed(i32),
 	/// A key name was not recognized.
 	UnknownKey(String),
 }
-
 impl From<CoordError> for InputError {
 	fn from(value: CoordError) -> Self {
 		Self::Coord(value)
 	}
 }
-
 impl std::fmt::Display for InputError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::Coord(err) => write!(f, "{err}"),
+			Self::CursorWarpFailed(status) => write!(f, "cursor warp failed with status {status}"),
 			Self::UnknownKey(key) => write!(f, "unknown key name: {key}"),
 		}
 	}
 }
-
 impl std::error::Error for InputError {}
 
 /// Resolve a named key (or single character) to a macOS virtual key code.
@@ -160,8 +188,8 @@ impl<S: EventSink> InputController<S> {
 		y: f64,
 	) -> Result<(), InputError> {
 		let point = display.to_logical_point(x, y)?;
+		self.sink.move_cursor(point)?;
 		self.cursor = point;
-		self.sink.move_cursor(point);
 		Ok(())
 	}
 
@@ -220,8 +248,11 @@ impl<S: EventSink> InputController<S> {
 		self.press(start, button);
 		match display.to_logical_point(to_x, to_y) {
 			Ok(end) => {
+				if let Err(err) = self.sink.move_cursor(end) {
+					self.release(start, button);
+					return Err(err);
+				}
 				self.cursor = end;
-				self.sink.move_cursor(end);
 				self.release(end, button);
 				Ok(())
 			},
@@ -255,18 +286,26 @@ impl<S: EventSink> InputController<S> {
 		self.sink.type_unicode(text);
 	}
 
-	/// Press and release each named key in order.
+	/// Press and release each named key in order, stopping between complete key
+	/// units when cancellation is requested.
 	///
 	/// # Errors
 	/// Returns [`InputError::UnknownKey`] when a name is unrecognized; keys
 	/// before the failure have already been sent.
-	pub fn keypress(&mut self, keys: &[String]) -> Result<(), InputError> {
+	pub fn keypress(
+		&mut self,
+		keys: &[String],
+		cancelled: &dyn Fn() -> bool,
+	) -> Result<bool, InputError> {
 		for name in keys {
+			if cancelled() {
+				return Ok(false);
+			}
 			let code = key_code_for(name).ok_or_else(|| InputError::UnknownKey(name.clone()))?;
 			self.sink.key(code, true);
 			self.sink.key(code, false);
 		}
-		Ok(())
+		Ok(true)
 	}
 
 	/// Release every held mouse button (idempotent). Run on abort/error paths
@@ -278,10 +317,15 @@ impl<S: EventSink> InputController<S> {
 			self.sink.mouse_button(at, button, false);
 		}
 	}
+
+	#[cfg(test)]
+	pub(crate) fn hold_button_for_test(&mut self, button: MouseButton) {
+		self.press(self.cursor, button);
+	}
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{MacEventSink, current_cursor_position, guarded_controller};
+pub use mac::{MacCursorHooks, MacEventSink, current_cursor_position, guarded_controller};
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -290,7 +334,7 @@ mod mac {
 
 	use std::ffi::c_void;
 
-	use super::{EventSink, InputController, MouseButton};
+	use super::{CursorError, CursorHooks, EventSink, InputController, MouseButton};
 	use crate::computer::{
 		coords::LogicalPoint,
 		permissions::{PermissionError, require_accessibility_for_input},
@@ -370,6 +414,9 @@ mod mac {
 		source: CgEventSourceRef,
 	}
 
+	/// Core Graphics cursor capture and restoration hooks.
+	pub struct MacCursorHooks;
+
 	impl MacEventSink {
 		fn new() -> Self {
 			// SAFETY: `CGEventSourceCreate` returns an owned source (or null,
@@ -401,15 +448,47 @@ mod mac {
 		}
 	}
 
+	impl CursorHooks for MacCursorHooks {
+		fn capture_cursor(&mut self) -> Result<LogicalPoint, CursorError> {
+			// SAFETY: `CGEventCreate(null)` returns an owned event or null.
+			unsafe {
+				let event = CGEventCreate(std::ptr::null_mut());
+				if event.is_null() {
+					return Err(CursorError::CaptureFailed);
+				}
+				let location = CGEventGetLocation(event);
+				CFRelease(event.cast_const());
+				Ok(LogicalPoint { x: location.x, y: location.y })
+			}
+		}
+
+		fn restore_cursor(&mut self, to: LogicalPoint) -> Result<(), CursorError> {
+			let position = CgPoint { x: to.x, y: to.y };
+			// SAFETY: pure Core Graphics cursor warp to a point; no ownership.
+			let status = unsafe { CGWarpMouseCursorPosition(position) };
+			if status == 0 {
+				Ok(())
+			} else {
+				Err(CursorError::RestoreFailed(status))
+			}
+		}
+	}
+
 	impl EventSink for MacEventSink {
-		fn move_cursor(&mut self, to: LogicalPoint) {
+		fn move_cursor(&mut self, to: LogicalPoint) -> Result<(), super::InputError> {
 			// `CGWarpMouseCursorPosition` reliably relocates the hardware cursor
 			// (a bare mouseMoved event does not); the moved event then notifies
 			// apps of the hover at the new point.
 			let position = CgPoint { x: to.x, y: to.y };
+			// The Core Graphics status is only produced by macOS; the injectable
+			// EventSink tests cover its InputError/ExecError propagation deterministically.
 			// SAFETY: pure Core Graphics cursor warp to a point; no ownership.
-			unsafe { CGWarpMouseCursorPosition(position) };
+			let status = unsafe { CGWarpMouseCursorPosition(position) };
+			if status != 0 {
+				return Err(super::InputError::CursorWarpFailed(status));
+			}
 			self.post_mouse(to, MOUSE_MOVED, BTN_LEFT);
+			Ok(())
 		}
 
 		fn mouse_button(&mut self, at: LogicalPoint, button: MouseButton, down: bool) {
@@ -475,19 +554,18 @@ mod mac {
 	}
 
 	/// Read the current global cursor position in logical points (top-left
-	/// origin). Used to verify mouse-move injection without clicking.
-	#[must_use]
-	pub fn current_cursor_position() -> LogicalPoint {
+	/// origin).
+	pub fn current_cursor_position() -> Result<LogicalPoint, CursorError> {
 		// SAFETY: `CGEventCreate(null)` returns an event whose location is the
 		// current cursor; it is released after the read.
 		unsafe {
 			let event = CGEventCreate(std::ptr::null_mut());
 			if event.is_null() {
-				return LogicalPoint { x: 0.0, y: 0.0 };
+				return Err(CursorError::CaptureFailed);
 			}
 			let location = CGEventGetLocation(event);
 			CFRelease(event.cast_const());
-			LogicalPoint { x: location.x, y: location.y }
+			Ok(LogicalPoint { x: location.x, y: location.y })
 		}
 	}
 }
@@ -503,8 +581,9 @@ mod tests {
 	}
 
 	impl EventSink for RecordingSink {
-		fn move_cursor(&mut self, to: LogicalPoint) {
+		fn move_cursor(&mut self, to: LogicalPoint) -> Result<(), InputError> {
 			self.ops.push(SinkOp::Move(to));
+			Ok(())
 		}
 
 		fn mouse_button(&mut self, at: LogicalPoint, button: MouseButton, down: bool) {
@@ -522,6 +601,21 @@ mod tests {
 		fn key(&mut self, code: u16, down: bool) {
 			self.ops.push(SinkOp::Key { code, down });
 		}
+	}
+	struct WarpFailingSink;
+
+	impl EventSink for WarpFailingSink {
+		fn move_cursor(&mut self, _to: LogicalPoint) -> Result<(), InputError> {
+			Err(InputError::CursorWarpFailed(7))
+		}
+
+		fn mouse_button(&mut self, _at: LogicalPoint, _button: MouseButton, _down: bool) {}
+
+		fn scroll(&mut self, _dx: f64, _dy: f64) {}
+
+		fn type_unicode(&mut self, _text: &str) {}
+
+		fn key(&mut self, _code: u16, _down: bool) {}
 	}
 
 	fn display() -> NormalizedDisplay {
@@ -613,6 +707,16 @@ mod tests {
 	}
 
 	#[test]
+	fn failed_cursor_warp_does_not_update_logical_cursor_or_post_click() {
+		let mut controller = InputController::new(WarpFailingSink);
+		assert_eq!(
+			controller.click(&display(), 10.0, 10.0, MouseButton::Left),
+			Err(InputError::CursorWarpFailed(7))
+		);
+		assert_eq!(controller.cursor(), LogicalPoint { x: 0.0, y: 0.0 });
+		assert!(!controller.has_held_buttons());
+	}
+	#[test]
 	fn move_out_of_bounds_errors_without_emitting_move() {
 		let mut c = InputController::new(RecordingSink::default());
 		let err = c.move_to(&display(), 200.0, 0.0).unwrap_err();
@@ -623,7 +727,7 @@ mod tests {
 	#[test]
 	fn keypress_maps_names_and_rejects_unknown() {
 		let mut c = InputController::new(RecordingSink::default());
-		c.keypress(&["enter".to_string(), "tab".to_string()])
+		c.keypress(&["enter".to_string(), "tab".to_string()], &|| false)
 			.unwrap();
 		assert_eq!(c.ops_ref(), &[
 			SinkOp::Key { code: 36, down: true },
@@ -632,9 +736,27 @@ mod tests {
 			SinkOp::Key { code: 48, down: false },
 		]);
 		let err = c
-			.keypress(&["definitely-not-a-key".to_string()])
+			.keypress(&["definitely-not-a-key".to_string()], &|| false)
 			.unwrap_err();
 		assert!(matches!(err, InputError::UnknownKey(_)));
+	}
+	#[test]
+	fn keypress_cancellation_stops_between_complete_keys() {
+		let polls = std::cell::Cell::new(0usize);
+		let mut controller = InputController::new(RecordingSink::default());
+		let completed = controller
+			.keypress(&["enter".to_string(), "tab".to_string()], &|| {
+				let current = polls.get();
+				polls.set(current + 1);
+				current > 0
+			})
+			.unwrap();
+
+		assert!(!completed);
+		assert_eq!(controller.into_ops(), vec![SinkOp::Key { code: 36, down: true }, SinkOp::Key {
+			code: 36,
+			down: false,
+		},]);
 	}
 
 	#[test]
@@ -696,7 +818,7 @@ mod live_tests {
 		let expected = display
 			.to_logical_point(target_px, target_py)
 			.expect("center is in bounds");
-		let pos = current_cursor_position();
+		let pos = current_cursor_position().expect("cursor position should be available");
 		let dx = (pos.x - expected.x).abs();
 		let dy = (pos.y - expected.y).abs();
 		assert!(

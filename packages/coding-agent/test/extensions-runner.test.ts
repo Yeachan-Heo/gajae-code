@@ -12,6 +12,8 @@ import {
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import type { ExtensionContext } from "@gajae-code/coding-agent/extensibility/extensions/types";
+
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@gajae-code/utils";
@@ -645,6 +647,77 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("handler timeouts", () => {
+		it("preserves live context accessors and writable signal semantics", async () => {
+			let currentModel = { id: "first-model" };
+			const observedModels: string[] = [];
+			const extension = {
+				path: "live-context-extension",
+				handlers: new Map([
+					[
+						"session_start",
+						[
+							async (_event: unknown, ctx: ExtensionContext) => {
+								expect(ctx.signal).toBeInstanceOf(AbortSignal);
+								const descriptor = Object.getOwnPropertyDescriptor(ctx, "signal");
+								expect(descriptor).toMatchObject({
+									configurable: true,
+									enumerable: true,
+									value: ctx.signal,
+									writable: true,
+								});
+								const replacementSignal = new AbortController().signal;
+								expect(() => {
+									ctx.signal = replacementSignal;
+								}).not.toThrow();
+								expect(ctx.signal).toBe(replacementSignal);
+								observedModels.push(ctx.model?.id ?? "missing");
+								currentModel = { id: "second-model" };
+								observedModels.push(ctx.model?.id ?? "missing");
+							},
+						],
+					],
+				]),
+			};
+			const runner = new ExtensionRunner(
+				[extension as never],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize({} as never, { getModel: () => currentModel } as never);
+
+			await expect(runner.emit({ type: "session_start" })).resolves.toBeUndefined();
+			expect(observedModels).toEqual(["first-model", "second-model"]);
+		});
+
+		it("does not evaluate unused context accessors before the handler error boundary", async () => {
+			const handler = vi.fn(async (_event: unknown, ctx: ExtensionContext) => {
+				expect(ctx.signal).toBeInstanceOf(AbortSignal);
+			});
+			const extension = {
+				path: "lazy-context-extension",
+				handlers: new Map([["session_start", [handler]]]),
+			};
+			const runner = new ExtensionRunner(
+				[extension as never],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{} as never,
+				{
+					getModel: () => {
+						throw new Error("model accessor must stay lazy");
+					},
+				} as never,
+			);
+
+			await expect(runner.emit({ type: "session_start" })).resolves.toBeUndefined();
+			expect(handler).toHaveBeenCalledTimes(1);
+		});
 		it("times out session_start handlers, emits an error, and continues to sibling extensions", async () => {
 			const hangExtensionPath = path.join(tempDir.path(), "hang-session-start.ts");
 			const fastExtensionPath = path.join(tempDir.path(), "fast-session-start.ts");

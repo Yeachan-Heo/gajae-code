@@ -1,0 +1,187 @@
+{
+  "schemaVersion": 2,
+  "kind": "native-algorithm-test-report",
+  "issue": 3769,
+  "baseSha": "971ff98fc5c33e34de0962c3e59c18f51a65c395",
+  "platform": "darwin-arm64",
+  "runtime": "bun 1.3.14",
+  "provenance": {
+    "hashAlgorithm": "sha256",
+    "implementationSourceHash": "sha256:16a5a677a8ca02f3c75e6fd71f803f929b9006b21f2d7011aad635bc4a752d51",
+    "implementationSourceHashDefinition": "SHA-256 over each ordered implementationSourceFile path, NUL, file bytes, NUL",
+    "implementationSourceFiles": [
+      "crates/pi-natives/src/fs_cache.rs",
+      "docs/fs-scan-cache-architecture.md",
+      "packages/coding-agent/src/internal-urls/docs-index.generated.ts",
+      "packages/natives/CHANGELOG.md"
+    ],
+    "fileHashes": {
+      "crates/pi-natives/src/fs_cache.rs": "sha256:f869946f5c490d2c668caeb456d491cc178fc0a0d2fd67003a50ba4702edc690",
+      "docs/fs-scan-cache-architecture.md": "sha256:3762d1b59e64b10815563b2213f9ca479a0eed451011557c8a6d5d5b6c69ea6d",
+      "packages/coding-agent/src/internal-urls/docs-index.generated.ts": "sha256:777bb5bac10cb163759cda7864b39d70a4d18a398808ef37b1a9d3b86907bb72",
+      "packages/natives/CHANGELOG.md": "sha256:b7a4537255ab72d70473bb2f9d1a39eefcffd337ab73c15e32469955680d02b8",
+      "artifacts/issue-3769-memory-probe.ts": "sha256:b524c03e11abd6a9980bab65819142a9a587beb503ea0482e628fc6978b3012c",
+      "artifacts/issue-3769-memory-observations.jsonl": "sha256:821074f38c55aa27fa623bd05f7075db5b08b04e88b24611d12a4567917df4cb",
+      "artifacts/issue-3769-performance-observations.jsonl": "sha256:70ddbff443f7b42d3b8e1319ca2e6039c130467feef411ca9b44d4e8ab44396e"
+    },
+    "nativeBinary": "packages/natives/native/pi_natives.darwin-arm64.node",
+    "nativeBinaryHash": "sha256:423deae4f6fca7efbc9e531c20a23978ba6ab068a89cbf1db52d4ebb981150ed",
+    "probe": "artifacts/issue-3769-memory-probe.ts",
+    "rawMemoryObservations": "artifacts/issue-3769-memory-observations.jsonl",
+    "rawPerformanceObservations": "artifacts/issue-3769-performance-observations.jsonl",
+    "rawRecordsIncludeEffectiveConfigurationAndNativeBinaryHash": true
+  },
+  "thresholds": {
+    "singlePeakDeltaBytesMax": 134217728,
+    "slopeBytesPerIterationMax": 524288,
+    "medianDeltaBytesMax": 8388608,
+    "concurrentPeakDeltaBytesMax": 536870912,
+    "consumerMatrixPeakDeltaBytesMax": 134217728,
+    "medianWallTimeRegressionPercentMax": 10
+  },
+  "results": {
+    "successInvalidate20": {
+      "scanBudgetBytes": 16777216,
+      "baselineRssBytes": 52183040,
+      "peakRssBytes": 66207744,
+      "peakDeltaBytes": 14024704,
+      "slopeBytesPerIteration": 67470.05112781955,
+      "lastFiveMinusFirstFiveMedianBytes": 1048576,
+      "errorCount": 0,
+      "verdict": "passed"
+    },
+    "overBudget20": {
+      "entryLimit": 100,
+      "baselineRssBytes": 52297728,
+      "peakRssBytes": 57868288,
+      "peakDeltaBytes": 5570560,
+      "slopeBytesPerIteration": 64464.26466165414,
+      "lastFiveMinusFirstFiveMedianBytes": 1114112,
+      "errorCount": 24,
+      "errorContract": "FS_SCAN_LIMIT operation=collect dimension=entries maximum=100 attempted=101",
+      "verdict": "passed"
+    },
+    "concurrentNearBoundFourScans": {
+      "scanBudgetBytesPerScan": 16777216,
+      "fileCountPerScan": 8000,
+      "pathPaddingBytes": 120,
+      "cacheDisabled": true,
+      "baselineRssBytes": 54067200,
+      "peakRssBytes": 79249408,
+      "peakDeltaBytes": 25182208,
+      "durationMs": 27.239666,
+      "errorCount": 0,
+      "verdict": "passed"
+    },
+    "invalidConfiguration": {
+      "input": "FS_SCAN_MAX_BYTES=invalid",
+      "errorCount": 5,
+      "errorContract": "FS_SCAN_CONFIG_INVALID name=FS_SCAN_MAX_BYTES reason=malformed value=invalid min=1048576 max=536870912",
+      "verdict": "passed"
+    },
+    "consumerNearBoundAllMatchesAndDrain": {
+      "scanBudgetBytes": 16777216,
+      "fileCount": 8000,
+      "pathPaddingBytes": 120,
+      "peakDeltaBytes": 45989888,
+      "errorCount": 0,
+      "consumers": [
+        {
+          "consumer": "glob",
+          "retainedResults": 8000,
+          "rssBefore": 56475648,
+          "rssWithResult": 64749568,
+          "rssAfterDrain": 64946176
+        },
+        {
+          "consumer": "fuzzyFind",
+          "retainedResults": 8000,
+          "rssBefore": 65060864,
+          "rssWithResult": 67584000,
+          "rssAfterDrain": 67665920
+        },
+        {
+          "consumer": "astGrep",
+          "retainedResults": 8000,
+          "rssBefore": 67764224,
+          "rssWithResult": 78348288,
+          "rssAfterDrain": 78381056
+        },
+        {
+          "consumer": "grep",
+          "retainedResults": 8000,
+          "rssBefore": 78594048,
+          "rssWithResult": 102252544,
+          "rssAfterDrain": 102318080
+        }
+      ],
+      "drainInterpretation": "Every consumer returned all 8000 matches under the exact 16 MiB per-scan budget. Results and cache references were dropped and Bun.gc(true) ran after every consumer; RSS may retain allocator arenas, so bounded peak delta and zero operation errors are the asserted evidence.",
+      "verdict": "passed"
+    },
+    "globCallbackNearBoundAndDrain": {
+      "scanBudgetBytes": 16777216,
+      "fileCount": 8000,
+      "pathPaddingBytes": 120,
+      "callbacks": 8000,
+      "expectedCallbacks": 8000,
+      "callbackErrors": 0,
+      "rssBefore": 56426496,
+      "rssWithResult": 67682304,
+      "rssAfterDrain": 67911680,
+      "peakDeltaBytes": 11534336,
+      "verdict": "passed"
+    },
+    "zeroCacheBudgetCompatibility": {
+      "input": "FS_SCAN_CACHE_MAX_BYTES=0",
+      "iterations": 5,
+      "peakDeltaBytes": 12894208,
+      "errorCount": 0,
+      "contract": "Caching is bypassed while per-scan bounds remain active",
+      "verdict": "passed"
+    },
+    "warmGlobPerformance": {
+      "upstreamBaseSha": "971ff98fc5c33e34de0962c3e59c18f51a65c395",
+      "upstreamRunMediansMs": [
+        0.5370830000000524,
+        0.5392919999999961,
+        0.5396255000000139,
+        0.5418340000000015,
+        0.5863119999999924
+      ],
+      "boundedRunMediansMs": [
+        0.5434584999999998,
+        0.5311040000000062,
+        0.5562915000000004,
+        0.5486244999999883,
+        0.5319369999999992
+      ],
+      "upstreamMedianMs": 0.5396255000000139,
+      "boundedMedianMs": 0.5434584999999998,
+      "regressionPercent": 0.7103074261660902,
+      "iterationsPerRun": 30,
+      "verdict": "passed",
+      "scanBudgetBytes": 16777216,
+      "pairedRuns": 5,
+      "followupBaseSha": "971ff98fc5c33e34de0962c3e59c18f51a65c395",
+      "upstreamNativeBinaryHash": "sha256:b391aa3f09d210dab75be21710c8b4c91dcea0ac1c545aa9c79cff0626a9b267",
+      "boundedNativeBinaryHash": "sha256:423deae4f6fca7efbc9e531c20a23978ba6ab068a89cbf1db52d4ebb981150ed"
+    }
+  },
+  "verification": [
+    "cargo test -p pi-natives --lib fs_cache::tests:: (22 passed)",
+    "cargo test -p pi-natives --lib (191 passed, 5 ignored)",
+    "cargo check -p pi-natives --lib",
+    "bun run build:native",
+    "bun --cwd=packages/natives run check",
+    "bun --cwd=packages/natives test (120 passed, 55 skipped)",
+    "bun --cwd=packages/coding-agent run check",
+    "bun run generate-docs-index",
+    "git diff --check"
+  ],
+  "limitations": [
+    "The synthetic corpus does not reproduce or attribute the reported 21.7 GiB production profile.",
+    "Deterministic collector/cache accounting tests are the primary bounded-ownership proof; RSS is corroborative and allocator arenas may remain resident after references are drained.",
+    "The evidence binds implementation files, the exact probe, raw observations, and the built native binary by content hash; it does not claim a self-referential Git diff hash for this evidence file.",
+    "On follow-up base 971ff98fc, `bun run check:rs` is blocked by six pre-existing `missing_const_for_fn` Clippy errors in crates/pi-natives/src/computer/controller.rs; the follow-up has no diff in that file. Targeted pi-natives cargo check and full native tests pass."
+  ]
+}

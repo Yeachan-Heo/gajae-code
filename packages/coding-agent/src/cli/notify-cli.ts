@@ -457,6 +457,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		process.stdout.write(`Using provided chat id ${result.chatId} (non-interactive).\n`);
 	}
 	let settingsCommitted = false;
+	let commitAttempted = false;
 	try {
 		const proposedIdentity = deps.setupPreflight
 			? proposedIdentityFromSetupPreflight(deps.setupPreflight, token.trim(), result.chatId)
@@ -480,6 +481,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 			{ path: "notifications.telegram.enabled", op: "set", value: true },
 		];
 		if (deps.setupRedact ?? cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
+		commitAttempted = true;
 		const receipt = await settings.commitAtomicBatch(patches);
 		settingsCommitted = true;
 		const activationMarker = createTelegramActivationMarker({
@@ -534,8 +536,24 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 		receipt.discard();
 	} catch (error) {
 		const detail = sanitizeDiagnostic(error instanceof Error ? error.message : "unknown persistence failure", token);
+		// The wording must describe what a follow-up `notify status` will show. A failure
+		// raised after the durable write landed — including one raised from inside the
+		// commit itself — must not claim the settings were not persisted, or the operator
+		// walks away believing Telegram is off while the daemon is armed for that token.
+		// Observed state wins; the code-path flag is only the fallback for an unreadable read.
+		const observed = telegramIntentIsPersisted(settings, token.trim(), result.chatId);
+		const persisted = observed ?? settingsCommitted;
+		// A commit that was entered and then failed, whose durable state is also unreadable,
+		// is genuinely undecided: `commitAtomicBatch` can persist and still throw. Claiming
+		// either outcome would be a guess, so say so and point at the authoritative check.
+		if (!persisted && observed === undefined && commitAttempted) {
+			throw new Error(
+				"Telegram notification settings may or may not have been saved, and the stored configuration could not be read; " +
+					`run \`gjc notify status\` before retrying: ${detail}`,
+			);
+		}
 		throw new Error(
-			settingsCommitted
+			persisted
 				? `Telegram notification settings were saved, but activation or recovery failed: ${detail}`
 				: `Unable to persist and activate Telegram notification settings: ${detail}`,
 		);
@@ -543,6 +561,26 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 	process.stdout.write(
 		`Notifications enabled. botToken=${maskToken(token)} chatId=${result.chatId} threaded=${result.threadedLabel}\n`,
 	);
+}
+
+/**
+ * Whether the durable settings already carry the Telegram intent this setup run attempted to
+ * write: the same identity *and* the enabled state it would have produced. Matching the token
+ * and chat id alone is not enough — a previously disabled configuration can already hold both,
+ * and a commit that fails before enabling Telegram has persisted nothing new.
+ *
+ * Returns `undefined` when the durable state cannot be observed, so the caller can fall back
+ * instead of reporting a state nobody read.
+ */
+function telegramIntentIsPersisted(settings: Settings, botToken: string, chatId: string): boolean | undefined {
+	try {
+		const cfg = getNotificationConfig(settings);
+		return (
+			cfg.enabled === true && cfg.telegram?.enabled === true && cfg.botToken === botToken && cfg.chatId === chatId
+		);
+	} catch {
+		return undefined;
+	}
 }
 
 function proposedIdentityFromSetupPreflight(

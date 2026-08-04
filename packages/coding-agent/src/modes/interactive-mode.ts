@@ -1036,9 +1036,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#goalModeController.beforeGetUserInput();
 		}
-		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
+		const { promise, resolve, reject } = Promise.withResolvers<SubmittedUserInput>();
+		let unsubscribeStop = () => {};
+		unsubscribeStop = this.onStop(() => {
+			this.onInputCallback = undefined;
+			reject(Object.assign(new Error("Interactive mode stopped"), { code: "cancelled" }));
+		});
 		this.onInputCallback = input => {
 			this.onInputCallback = undefined;
+			unsubscribeStop();
 			resolve(input);
 		};
 		this.#goalModeController.scheduleContinuation();

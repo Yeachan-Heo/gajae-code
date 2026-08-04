@@ -190,6 +190,175 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.dispose();
 		}
 	});
+	it("defers exact MCP connection and activates tools only after the startup handle runs", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-explicit-mcp.json");
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		const discoverAndConnect = vi
+			.spyOn(MCPManager.prototype, "discoverAndConnect")
+			.mockImplementation(async () => await discovery.promise);
+
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			expect(discoverAndConnect).not.toHaveBeenCalled();
+			expect(mcpManager).toBeUndefined();
+			expect(startDeferredMcpConfig).toBeDefined();
+			expect(session.getAllToolNames()).not.toContain("mcp__deferred_lookup");
+
+			const startup = startDeferredMcpConfig!();
+			expect(discoverAndConnect).toHaveBeenCalledTimes(1);
+			expect(discoverAndConnect).toHaveBeenCalledWith({ configPath });
+			expect(session.getAllToolNames()).not.toContain("mcp__deferred_lookup");
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			const prompt = session.prompt("wait for deferred MCP");
+			await Bun.sleep(0);
+			expect(agentPrompt).not.toHaveBeenCalled();
+
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__deferred_lookup", "exact", "lookup")]));
+			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			await prompt;
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+			expect(startDeferredMcpConfig!()).toBe(startup);
+			expect(session.getAllToolNames()).toContain("mcp__deferred_lookup");
+			expect(session.getActiveToolNames()).toContain("mcp__deferred_lookup");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("reports deferred MCP startup failures generically", async () => {
+		const configPath = path.join(tempDir, "private-deferred-mcp.json");
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementation(async () => await discovery.promise);
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			const startup = startDeferredMcpConfig!();
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("read", "private-server", "secret-tool")]));
+			await expect(startup).rejects.toThrow("MCP tools could not be loaded.");
+			expect(String(await startup.catch(error => error))).not.toContain(configPath);
+			expect(String(await startup.catch(error => error))).not.toContain("private-server");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("blocks idle yield delivery until deferred MCP startup completes", async () => {
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementation(async () => await discovery.promise);
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: path.join(tempDir, "deferred-idle.json"),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			session.yieldQueue.register<string>("deferred-mcp-test", {
+				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+			});
+			const startup = startDeferredMcpConfig!();
+			session.yieldQueue.enqueue("deferred-mcp-test", "background delivery");
+			await Bun.sleep(10);
+			expect(agentPrompt).not.toHaveBeenCalled();
+
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
+			await startup;
+			await Bun.sleep(10);
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("preserves persisted MCP selections while the deferred catalog is pending", async () => {
+		for (const selectedMcpToolNames of [["mcp__exact_keep"], []]) {
+			const sessionDir = fs.mkdtempSync(path.join(tempDir, "persisted-selection-"));
+			const firstManager = SessionManager.create(sessionDir, sessionDir);
+			const { session: firstSession } = await createAgentSession({
+				...createIsolatedSessionOptions(["read", "search_tool_bm25"]),
+				cwd: sessionDir,
+				agentDir: sessionDir,
+				sessionManager: firstManager,
+				settings: Settings.isolated({ "mcp.discoveryMode": true }),
+				customTools: [
+					createMcpCustomTool("mcp__exact_keep", "exact", "keep"),
+					createMcpCustomTool("mcp__exact_drop", "exact", "drop"),
+				],
+			});
+			await firstSession.activateDiscoveredTools(["mcp__exact_keep"]);
+			if (selectedMcpToolNames.length === 0) {
+				await firstSession.setActiveToolsByName(["read", "search_tool_bm25"]);
+			}
+			expect(firstSession.getSelectedMCPToolNames()).toEqual(selectedMcpToolNames);
+			expect(firstSession.sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(true);
+			const sessionFile = firstSession.sessionFile;
+			await firstSession.sessionManager.rewriteEntries();
+			await firstSession.dispose();
+
+			const discovery = Promise.withResolvers<MCPLoadResult>();
+			vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementationOnce(
+				async () => await discovery.promise,
+			);
+			const resumedManager = await SessionManager.open(sessionFile!, sessionDir);
+			const { session, startDeferredMcpConfig } = await createAgentSession({
+				...createIsolatedSessionOptions(["read", "search_tool_bm25"]),
+				cwd: sessionDir,
+				agentDir: sessionDir,
+				sessionManager: resumedManager,
+				settings: Settings.isolated({ "mcp.discoveryMode": true }),
+				mcpConfigPath: path.join(sessionDir, "exact-mcp.json"),
+				deferMcpConfigStartup: true,
+			});
+			try {
+				expect(session.sessionManager.buildSessionContext().selectedMCPToolNames).toEqual(selectedMcpToolNames);
+				const startup = startDeferredMcpConfig!();
+				discovery.resolve(
+					createMcpLoadResult([
+						createMcpCustomTool("mcp__exact_keep", "exact", "keep"),
+						createMcpCustomTool("mcp__exact_drop", "exact", "drop"),
+					]),
+				);
+				await startup;
+				expect(session.getSelectedMCPToolNames()).toEqual(selectedMcpToolNames);
+				expect(session.getActiveToolNames().includes("mcp__exact_keep")).toBe(selectedMcpToolNames.length === 1);
+				expect(session.getActiveToolNames()).not.toContain("mcp__exact_drop");
+			} finally {
+				await session.dispose();
+			}
+		}
+	});
+	it("does not start or publish deferred MCP tools after disposal begins", async () => {
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		const discoverAndConnect = vi
+			.spyOn(MCPManager.prototype, "discoverAndConnect")
+			.mockImplementationOnce(async () => await discovery.promise);
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: path.join(tempDir, "deferred-dispose.json"),
+			deferMcpConfigStartup: true,
+		});
+		const startup = startDeferredMcpConfig!();
+		const disposal = session.dispose();
+		discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__late_tool", "exact", "late")]));
+		await expect(startup).resolves.toEqual({ loadedToolCount: 0, hasErrors: false });
+		await disposal;
+		expect(session.getAllToolNames()).not.toContain("mcp__late_tool");
+
+		const { session: disposedSession, startDeferredMcpConfig: startAfterDispose } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: path.join(tempDir, "never-started.json"),
+			deferMcpConfigStartup: true,
+		});
+		await disposedSession.dispose();
+		await expect(startAfterDispose!()).rejects.toThrow("MCP tools could not be loaded.");
+		expect(discoverAndConnect).toHaveBeenCalledTimes(1);
+	});
 	it("preserves default built-in tools when explicit MCP config omits toolNames", async () => {
 		const configPath = path.join(tempDir, "explicit-mcp.json");
 		const defaultBuiltinToolNames = ["read", "bash", "skill", "skill_discovery", "search_tool_bm25"];

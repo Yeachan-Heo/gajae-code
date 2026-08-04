@@ -1,179 +1,117 @@
 # Filesystem Scan Cache Architecture Contract
 
-This document defines the current contract for the shared filesystem scan cache implemented in Rust (`crates/pi-natives/src/fs_cache.rs`) and consumed by native discovery/search APIs exposed to `packages/coding-agent`.
+This document defines the shared native filesystem scan collector and cache implemented in `crates/pi-natives/src/fs_cache.rs`. It is consumed by glob discovery, fuzzy find, AST candidate discovery, and cached grep.
 
-## What this cache is
+## Safety policy
 
-The cache stores full directory-scan entry lists (`GlobMatch[]`) keyed by scan scope and traversal policy, then lets higher-level operations (glob filtering, fuzzy scoring, grep file selection) run against those cached entries.
+The shared scan path has finite per-scan logical retained-capacity and process-cache ownership budgets. The safety controls are parsed strictly before a walker or cache is accessed:
 
-Primary goals:
+| Variable | Default | Accepted range |
+| --- | ---: | ---: |
+| `FS_SCAN_MAX_ENTRIES` | `250000` | `1..=1000000` |
+| `FS_SCAN_MAX_BYTES` | `67108864` (64 MiB) | `1048576..=536870912` |
+| `FS_SCAN_CACHE_MAX_ENTRIES` | `16` | `1..=64` |
+| `FS_SCAN_CACHE_MAX_BYTES` | `134217728` (128 MiB) | `0` (disable caching) or `1048576..=2147483648` |
 
-- avoid repeated filesystem walks for repeated discovery/search calls
-- keep consistency across `glob`, `fuzzyFind`, and `grep` when they share the same scan policy
-- allow explicit staleness recovery for empty results and explicit invalidation after file mutations
+Absent values use the defaults. An explicitly malformed, signed, overflowing, below-minimum, or above-maximum value fails with a bounded `FS_SCAN_CONFIG_INVALID` diagnostic. Zero is rejected for every finite safety limit except `FS_SCAN_CACHE_MAX_BYTES`, where it preserves the established cache-write bypass. There is no unlimited override.
 
-## Ownership and public surface
+`FS_SCAN_CACHE_TTL_MS` defaults to `1000`; setting it to `0` bypasses cache reads and writes but never disables the per-scan limits. `FS_SCAN_EMPTY_RECHECK_MS` defaults to `200` and controls caller-side stale-negative retries.
 
-- Cache implementation and policy: `crates/pi-natives/src/fs_cache.rs`
+## Ownership and consumers
+
+- Collector/cache implementation: `crates/pi-natives/src/fs_cache.rs`
 - Native consumers:
   - `crates/pi-natives/src/glob.rs`
   - `crates/pi-natives/src/fd.rs` (`fuzzyFind`)
-  - `crates/pi-natives/src/grep.rs`
-- JS binding/export:
-  - `packages/natives/native/index.js` (`invalidateFsScanCache`)
-  - `packages/natives/native/index.d.ts` (glob and grep option/result types)
-- Coding-agent mutation invalidation helpers:
-  - `packages/coding-agent/src/tools/fs-cache-invalidation.ts`
+  - `crates/pi-natives/src/ast.rs`
+  - `crates/pi-natives/src/grep.rs` when cached shared discovery is selected
+- The uncached directory-grep path remains streaming and does not materialize a shared scan snapshot.
+- Coding-agent mutation invalidation: `packages/coding-agent/src/tools/fs-cache-invalidation.ts`
 
-## Cache key partitioning (hard contract)
+A successful shared scan is one immutable `Arc<Vec<GlobMatch>>`. Cache hits and callers share that allocation; they do not clone the full vector or its path strings.
 
-Each entry is keyed by:
+## Cache key partitioning
 
-- canonicalized `root` directory path
-- `include_hidden` boolean
-- `use_gitignore` boolean
-- `skip_node_modules` boolean
+Each snapshot is keyed by all traversal and metadata dimensions:
 
-Implications:
+- canonicalized root directory
+- `include_hidden`
+- `use_gitignore`
+- `skip_node_modules`
+- `follow_links`
+- scan detail (`Minimal` or `Full`)
 
-- Hidden and non-hidden scans do **not** share entries.
-- Gitignore-respecting and ignore-disabled scans do **not** share entries.
-- Scans that prune `node_modules` do **not** share entries with scans that include it.
-- Consumers must pass stable semantics for hidden/gitignore/node_modules behavior; changing any flag creates a different cache partition.
+Consumers with different symlink-following or metadata requirements therefore cannot alias each other's snapshots.
 
-## Scan collection behavior
+Current native consumers deliberately use different symlink policies:
 
-Cache population uses a deterministic walker (`ignore::WalkBuilder`) configured by `include_hidden`, `use_gitignore`, and `skip_node_modules`:
+| Consumer | `follow_links` |
+| --- | --- |
+| glob discovery | `false` |
+| fuzzy find (`fd.rs`) | `true` |
+| AST candidate discovery | `false` |
+| cached grep discovery | `false` |
 
-- `follow_links(false)`
-- sorted by file path
-- `.git` is always skipped
-- `node_modules` is pruned at traversal time when `skip_node_modules=true`
-- entry file type + `mtime` are captured via `symlink_metadata`
+Fuzzy find therefore never shares a snapshot with those non-following consumers, even when root, hidden-file, ignore, `node_modules`, and detail settings otherwise match. Any new consumer must treat `follow_links` as a required cache-partition dimension rather than inheriting another consumer's snapshot.
 
-Search roots are resolved by `resolve_search_path`:
+## Bounded collection
 
-- relative paths are resolved against current cwd
-- target must be an existing directory
-- root is canonicalized when possible
+`ignore::WalkBuilder` visitors admit candidates through one per-scan mutex-owned collector. Visitor-local unbounded vectors and post-walk flattening are prohibited.
 
-## Freshness and eviction policy
+Admission is transactional:
 
-Global policy (environment-overridable):
+1. Compute a conservative path charge from the borrowed relative path before attempting to allocate its owned string.
+2. Reserve the logical entry and path bytes, then precharge the requested vector-capacity growth under the collector lock using checked arithmetic.
+3. Request geometric vector growth only when the requested target fits the configured logical entry and retained-capacity budgets. Live provisional slot claims prevent concurrent visitors from spending the same capacity.
+4. Allocate the normalized forward-slash path fallibly while retaining the collector lock. This serializes ownership transfer and avoids an extra lock round-trip on the small-directory hot path.
+5. Reconcile the actual vector and string capacities returned by the allocator. Commit only while the collector has no terminal error and those retained capacities fit the budget. A failed candidate rolls back its logical/path/slot claims; capacity still owned by the vector remains charged until the failed collector is discarded.
 
-- `FS_SCAN_CACHE_TTL_MS` (default `1000`)
-- `FS_SCAN_EMPTY_RECHECK_MS` (default `200`)
-- `FS_SCAN_CACHE_MAX_ENTRIES` (default `16`)
+The first configuration, cancellation, arithmetic, reservation, or budget error is write-once. Once present, later visitors cannot commit. The whole collector is discarded after walker join, so callers, callbacks, AST reads, and the cache never receive a prefix. Successful entries are sorted in place before the vector becomes immutable.
 
-Behavior:
+Retained snapshot accounting includes vector capacity and every path string's capacity, not only logical lengths. `try_reserve_exact` avoids deliberate speculative over-allocation, but Rust permits the allocator to return more capacity than requested. The collector can observe and reject that excess only after the allocation returns; vector reallocation can also transiently own both the old and new buffers. `FS_SCAN_MAX_BYTES` therefore strictly bounds the accounted retained capacity of a successful snapshot, not allocator metadata, transient heap allocation, or process RSS at the allocation instant. The scan budget covers collector-owned entries; consumer-derived allocations such as AST parse trees, grep result payloads, callback queues, and fuzzy-score buffers remain separate ownership domains.
 
-- `get_or_scan(...)`
-  - if TTL is `0`: bypass cache entirely, always fresh scan (`cache_age_ms = 0`)
-  - on cache hit within TTL: return cached entries + non-zero `cache_age_ms`
-  - on expired hit: evict key, rescan, store fresh entry
-- max entry enforcement is oldest-first eviction by `created_at`
+## Cache publication and eviction
 
-## Empty-result fast recheck (separate from normal hits)
+The cache is one short-held mutex state containing immutable snapshots, total retained bytes, entry count, and a global generation. Filesystem scans run outside this lock.
 
-Normal cache hit:
+- A normal miss captures the generation, scans, and publishes only if that generation is still current.
+- Competing normal misses adopt an already-published, non-expired snapshot instead of replacing it.
+- `force_rescan` advances the generation and removes its key before scanning. `store=false` never publishes; `store=true` publishes only if no later force or invalidation won.
+- An in-flight stale-generation scan still returns its complete snapshot to its own caller but cannot repopulate the cache.
+- Path and full invalidation advance the generation and remove/account snapshots atomically.
+- TTL expiry removes and subtracts a snapshot without advancing the generation. Normal scans timestamp candidates at completion and reject an expired same-generation winner before adoption, preventing an older long-running miss from resurrecting a stale snapshot.
+- Generation overflow clears the cache and permanently disables publication rather than wrapping.
+- Oldest whole snapshots are evicted until both key-count and retained-byte caps fit. A snapshot that cannot fit by itself is returned uncached. `FS_SCAN_CACHE_MAX_BYTES=0` bypasses cache reads and writes while retaining per-scan limits.
 
-- a cache hit inside TTL returns cached entries and does nothing else.
+These rules make invalidation and competing publication linearizable without holding the cache lock across filesystem I/O.
 
-Empty-result fast recheck:
+## Scan behavior
 
-- this is a **caller-side** policy using `ScanResult.cache_age_ms`
-- if filtered/query result is empty and cached scan age is at least `empty_recheck_ms()`, caller performs one `force_rescan(...)` and retries
-- intended to reduce stale-negative results when files were recently added but cache is still within TTL
+Roots are resolved relative to the current working directory, must be existing directories, and are canonicalized when possible. `.git` is always skipped. `node_modules` is pruned when requested. Traversal honors each consumer's hidden, ignore, symlink, and metadata-detail options, and completed snapshots are path-sorted.
 
-Current consumers:
-
-- `glob`: rechecks when filtered matches are empty and scan age exceeds threshold
-- `fuzzyFind` (`fd.rs`): rechecks only when query is non-empty and scored matches are empty
-- `grep`: rechecks when selected candidate file list is empty
-
-## Consumer defaults and cache usage
-
-Cache is opt-in on all exposed APIs (`cache?: boolean`, default `false`).
-
-Current defaults in native APIs:
-
-- `glob`: `hidden=false`, `gitignore=true`, `cache=false`, and `node_modules` included only when the pattern mentions `node_modules`
-- `fuzzyFind`: `hidden=false`, `gitignore=true`, `cache=false`, and `node_modules` is skipped
-- `grep`: `hidden=true`, `gitignore=true`, `cache=false`, and `node_modules` included only when the glob mentions `node_modules`
-
-Coding-agent callers today:
-
-- High-volume mention candidate discovery enables cache:
-  - `packages/coding-agent/src/utils/file-mentions.ts`
-  - profile: `hidden=true`, `gitignore=true`, `includeNodeModules=true`, `cache=true`
-- Tool-level `grep` integration currently disables scan cache (`cache: false`):
-  - `packages/coding-agent/src/tools/search.ts`
+Public cache usage remains opt-in. A normal cache hit within TTL returns its age. On an empty tool-specific result older than `FS_SCAN_EMPTY_RECHECK_MS`, glob, fuzzy find, or cached grep may perform one forced rescan to reduce stale negatives. This retry is separate from ordinary cache-hit behavior.
 
 ## Invalidation contract
 
-Native invalidation entrypoint:
+`invalidateFsScanCache(path?)` removes snapshots whose roots overlap the target path, or clears all snapshots when no path is supplied. Relative paths resolve against the current working directory. For deleted paths, invalidation canonicalizes the nearest existing parent and reattaches the missing suffix when possible.
 
-- `invalidateFsScanCache(path?: string)`
-  - with `path`: remove cache entries whose root is a prefix of target path
-  - without path: clear all scan cache entries
+Every successful coding-agent write, edit, delete, rename, or move must call the centralized invalidation helpers. Renames invalidate both old and new paths.
 
-Path handling details:
+## Adding a consumer
 
-- relative invalidation paths are resolved against cwd
-- invalidation attempts canonicalization
-- if target does not exist (e.g., delete), fallback canonicalizes parent and reattaches filename when possible
-- this preserves invalidation behavior for create/delete/rename where one side may not exist
+A new shared-scan consumer must:
 
-## Coding-agent mutation flow responsibilities
-
-Coding-agent code must invalidate after successful filesystem mutations.
-
-Central helpers:
-
-- `invalidateFsScanAfterWrite(path)`
-- `invalidateFsScanAfterDelete(path)`
-- `invalidateFsScanAfterRename(oldPath, newPath)` (invalidates both sides when paths differ)
-
-Current mutation tool callsites:
-
-- `packages/coding-agent/src/tools/write.ts`
-- `packages/coding-agent/src/edit/modes/patch.ts` (patch flow; uses all three helpers)
-- `packages/coding-agent/src/edit/modes/replace.ts` (replace flow)
-- `packages/coding-agent/src/hashline/execute.ts` (hashline flow)
-
-Rule: if a flow mutates filesystem content or location and bypasses these helpers, cache staleness bugs are expected.
-
-## Adding a new cache consumer safely
-
-When introducing cache use in a new scanner/search path:
-
-1. **Use stable scan policy inputs**
-   - decide hidden/gitignore/node_modules semantics first
-   - pass them consistently to `get_or_scan`/`force_rescan` so cache partitions are intentional
-
-2. **Treat cache data as pre-filtered only by traversal policy**
-   - apply tool-specific filtering (glob patterns, type filters, scoring) after retrieval
-   - never assume cached entries already reflect your higher-level filters
-
-3. **Implement empty-result fast recheck only for stale-negative risk**
-   - use `scan.cache_age_ms >= empty_recheck_ms()`
-   - retry once with `force_rescan(..., store=true, ...)`
-   - keep this path separate from normal cache-hit logic
-
-4. **Respect no-cache mode explicitly**
-   - when caller disables cache, call `force_rescan(..., store=false, ...)`
-   - do not populate shared cache in a no-cache request path
-
-5. **Wire mutation invalidation for any new write path**
-   - after successful write/edit/delete/rename, call the coding-agent invalidation helper
-   - for rename/move, invalidate both old and new paths
-
-6. **Do not add per-call TTL knobs**
-   - current contract is global policy only (env-configured), no per-request TTL override
+1. Define stable values for every cache-key dimension, including `follow_links` and detail level.
+2. Apply tool-specific filtering or scoring after snapshot retrieval.
+3. Treat collection failure as an operation error; it must not expose partial results or side effects.
+4. Use `force_rescan(..., store=false, ...)` when cache is disabled.
+5. Add mutation invalidation for any new write path.
+6. Keep per-call TTL controls out of the public contract.
 
 ## Known boundaries
 
-- Cache scope is process-local in-memory (`DashMap`), not persisted across process restarts.
-- Cache stores scan entries, not final tool results.
-- `glob`/`fuzzyFind`/`grep` share scan entries only when key dimensions (`root`, `hidden`, `gitignore`, `skip_node_modules`) match.
-- `.git` is always excluded at scan collection time regardless of caller options.
+- State is process-local and is not persisted across restarts.
+- The cache stores complete scan snapshots, not final tool results.
+- Per-scan limits bound each concurrent shared scan; they are not a process-wide admission controller.
+- `FS_SCAN_MAX_BYTES` is a logical successful-snapshot retained-capacity budget, not a hard allocator-footprint, transient-allocation, or RSS ceiling.
+- Uncached directory grep is intentionally streaming and does not use this collector/cache ownership model.

@@ -553,6 +553,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `GJC_TUI_DEBUG`            | If `1`, enables deep TUI debug dump path                                              |
 | `GJC_FORCE_IMAGE_PROTOCOL` | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) |
 | `GJC_TUI_KEYBOARD_PROTOCOL` | Enhanced keyboard input (Kitty keyboard protocol + xterm modifyOtherKeys). Enabled by default; set `0` / `false` to leave the keyboard in its default mode. Use this when a terminal (e.g. Android Termius) breaks IME/Hangul composition while these enhanced modes are active. |
+| `GJC_TUI_SYNCHRONIZED_OUTPUT` | Synchronized-output framing (`CSI ?2026h/l`) is enabled by default. Set `0` / `false` / `off` / `no` before starting or restarting GJC to remove that framing for terminal parsers that render it incorrectly. This is a process-wide compatibility and diagnostic switch, not tmux/Byobu client detection or per-client negotiation. Disabling it may expose visible tearing; return to the default after diagnosis unless the client requires the workaround. |
 
 ---
 

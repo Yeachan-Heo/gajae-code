@@ -86,7 +86,10 @@ export function createExactPrefixCommandBridge(options: ExactPrefixCommandBridge
 		process.env[recursionEnv] = nextRecursionDepth(recursionEnv);
 		try {
 			const result = await dispatch(options.command, [...args, event.text], ctx, { timeout });
-			if (result.code === 0) return { handled: true };
+			if (result.code === 0) {
+				const output = result.stdout.trim() || result.stderr.trim();
+				return output ? { handled: true, text: output } : { handled: true };
+			}
 			if (result.code === continueExitCode) return {};
 
 			const output =
@@ -117,12 +120,4 @@ export function createExactPrefixCommandBridge(options: ExactPrefixCommandBridge
 			}
 		}
 	};
-}
-
-export function createOuroborosOooBridge() {
-	return createExactPrefixCommandBridge({
-		prefix: "ooo",
-		command: "ouroboros",
-		args: ["dispatch"],
-	});
 }

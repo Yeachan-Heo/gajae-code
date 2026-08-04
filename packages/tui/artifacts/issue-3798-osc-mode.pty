@@ -1,0 +1,14 @@
+GJC issue #3798 controlled Byobu active-harness transcript
+session=gjc-3798-osc-31832 geometry=100x30 observationAfterFinalInputMs=7000
+queryCountDerivation=exact byte counts over PANE_OUTPUT: OSC11=ESC]11;?BEL; DA1=ESC[c
+--- PANE_OUTPUT BEGIN ---
+bun /tmp/gjc-3798-byobu-harness.ts osc 8000
+[1m[7m%[27m[1m[0m                                                                                                    k..es/issue-3798\[0m[27m[24m[J[01;32m➜  [36missue-3798[00m [K[?1h=[?2004hbbun /tmp/gjc-3798-byobu-harness.ts osc 8000[?1l>[?2004l
+kbun\[?2004h[?1000l[?1002l[?1006l[?1007l[?u]11;?[c[?2031h]11;?[c[>4;2m
+--- PANE_OUTPUT END ---
+--- INJECTED_INPUT_EVENTS BEGIN ---
+offsetMs=509.112 label=mode2031 byteLength=9 hex=1b5b3f3939373b316e raw=[?997;1n
+offsetMs=674.624 label=negative-da1-startup byteLength=7 hex=1b5b3f313b3263 raw=[?1;2c
+offsetMs=684.478 label=osc11-black byteLength=24 hex=1b5d31313b7267623a303030302f303030302f3030303007 raw=]11;rgb:0000/0000/0000
+offsetMs=845.059 label=negative-da1-followup byteLength=7 hex=1b5b3f313b3263 raw=[?1;2c
+--- INJECTED_INPUT_EVENTS END ---

@@ -127,6 +127,93 @@ describe("SettingsList", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	it("filters settings as printable text is entered", () => {
+		let changed = false;
+		const list = new SettingsList(
+			[
+				{ id: "memory", label: "Memory Backend", currentValue: "local", values: ["local", "off"] },
+				{ id: "theme", label: "Theme", currentValue: "dark" },
+			],
+			5,
+			testTheme,
+			() => {
+				changed = true;
+			},
+			() => {
+				throw new Error("cancel should not be called");
+			},
+		);
+
+		for (const character of "Memory") list.handleInput(character);
+		list.handleInput(" ");
+		const rendered = Bun.stripANSI(list.render(80).join("\n"));
+
+		expect(changed).toBe(false);
+		expect(rendered).toContain("Search: Memory ");
+		expect(rendered).toContain("Memory Backend");
+		expect(rendered).not.toContain("Theme");
+	});
+	it("activates the filtered item at its filtered index, not its original index", () => {
+		const changes: Array<[string, string]> = [];
+		const list = new SettingsList(
+			[
+				{ id: "memory", label: "Memory Backend", currentValue: "local", values: ["local", "off"] },
+				{ id: "theme", label: "Theme", currentValue: "dark", values: ["dark", "light"] },
+			],
+			5,
+			testTheme,
+			(id, newValue) => {
+				changes.push([id, newValue]);
+			},
+			() => {
+				throw new Error("cancel should not be called");
+			},
+		);
+
+		// "theme" is index 1 in the unfiltered list but index 0 once filtered.
+		for (const character of "theme") list.handleInput(character);
+		const filtered = Bun.stripANSI(list.render(80).join("\n"));
+		expect(filtered).toContain("Theme");
+		expect(filtered).not.toContain("Memory Backend");
+		expect(filtered).toContain("Enter to change");
+
+		list.handleInput("\n");
+
+		expect(changes).toEqual([["theme", "light"]]);
+	});
+
+	it("clears search before cancelling the settings list", () => {
+		let cancelCount = 0;
+		const list = new SettingsList(
+			[
+				{ id: "memory", label: "Memory Backend", currentValue: "local" },
+				{ id: "theme", label: "Theme", currentValue: "dark" },
+			],
+			5,
+			testTheme,
+			() => {},
+			() => {
+				cancelCount += 1;
+			},
+		);
+
+		list.handleInput("m");
+		list.handleInput("e");
+		list.handleInput("x");
+		list.handleInput("\x7f");
+		expect(Bun.stripANSI(list.render(80).join("\n"))).toContain("Search: me");
+
+		list.handleInput("\x1b");
+		const restored = Bun.stripANSI(list.render(80).join("\n"));
+		expect(cancelCount).toBe(0);
+		expect(restored).not.toContain("Search:");
+		expect(restored).toContain("Memory Backend");
+		expect(restored).toContain("Theme");
+
+		list.handleInput("\x1b");
+		expect(cancelCount).toBe(1);
+	});
+
 	it("clamps selection when a submenu closes after the list shrinks", () => {
 		const list = new SettingsList(
 			[

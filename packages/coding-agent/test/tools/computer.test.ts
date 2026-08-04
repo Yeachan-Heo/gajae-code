@@ -289,7 +289,7 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => {
 				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 20, heightPx: 10, png: new Uint8Array([1, 2, 3]), displayEpoch: 42, captureId: "cap-1" };
+				return { widthPx: 20, heightPx: 10, png: new Uint8Array([1, 2, 3]), displayEpoch: 42, captureId: 1 };
 			},
 			doubleClick: (...args) => {
 				calls.push({ method: "doubleClick", args });
@@ -314,7 +314,7 @@ describe("computer tool dispatch", () => {
 			heightPx: 10,
 			displayEpoch: 42,
 			pngBytes: 3,
-			captureId: "cap-1",
+			captureId: 1,
 		});
 		expect(shot.content.some(block => block.type === "image")).toBe(true);
 		const image = shot.content.find(block => block.type === "image");
@@ -368,7 +368,9 @@ describe("computer tool dispatch", () => {
 
 			expect(result.isError).toBe(true);
 			expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
-			expect(textOf(result)).toContain(`ComputerController.${testCase.method} is unavailable`);
+			expect(textOf(result)).toContain(
+				`ComputerController.${testCase.name === "screenshot" ? "screenshot" : "executeBatch"} is unavailable`,
+			);
 		}
 	});
 
@@ -396,30 +398,24 @@ describe("computer tool dispatch", () => {
 		expect(calls).toEqual(["click"]);
 	});
 
-	it("fails closed when batch auto-screenshot requires a missing screenshot method", async () => {
+	it("fails closed when a batch requires an unavailable executeBatch API", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
 		const calls: string[] = [];
-		setComputerControllerFactoryForTests(() => ({
-			click: () => {
-				calls.push("click");
-			},
-		}));
+		setComputerControllerFactoryForTests(() => ({}));
 		const tool = new ComputerTool(
 			createSession(Settings.isolated({ "computer.enabled": true, "computer.autoScreenshot": true })),
 		);
 
-		const result = await tool.execute("missing-batch-auto-shot", {
+		const result = await tool.execute("missing-batch-api", {
 			action: "batch",
 			actions: [{ action: "click", x: 1, y: 2 }],
 		});
 
 		expect(result.isError).toBe(true);
 		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
-		expect(result.details?.steps).toHaveLength(1);
-		expect(result.details?.steps?.[0]?.code).toBe("COMPUTER_UNAVAILABLE");
-		expect(textOf(result)).toContain("ComputerController.screenshot is unavailable");
-		expect(calls).toEqual(["click"]);
+		expect(textOf(result)).toContain("ComputerController.executeBatch is unavailable");
+		expect(calls).toEqual([]);
 	});
 
 	it("bounds oversized screenshot images sent inline while preserving the full-resolution artifact", async () => {
@@ -654,50 +650,83 @@ describe("computer tool dispatch", () => {
 		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "BwgJ" });
 	});
 
-	it("captures batch and per-step screenshots according to explicit options", async () => {
+	it("executes each model batch once and folds explicit, synthetic, and final screenshots", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
-		let capture = 0;
-		const calls: string[] = [];
+		const calls: Array<{ expectedEpoch: unknown; actions: unknown[]; timeoutMs: number | undefined }> = [];
 		setComputerControllerFactoryForTests(() => ({
-			click: () => {
-				calls.push("click");
+			executeBatch: (expectedEpoch, actions, timeoutMs) => {
+				calls.push({ expectedEpoch, actions, timeoutMs });
+				return {
+					results: [
+						{
+							index: 0,
+							action: "screenshot",
+							screenshot: { widthPx: 100, heightPx: 50, png: new Uint8Array([1]) },
+						},
+						{ index: 1, action: "click" },
+						{
+							index: 2,
+							action: "screenshot",
+							screenshot: { widthPx: 101, heightPx: 51, png: new Uint8Array([2]) },
+						},
+						{ index: 3, action: "type" },
+						{
+							index: 4,
+							action: "screenshot",
+							screenshot: { widthPx: 102, heightPx: 52, png: new Uint8Array([3]) },
+						},
+					],
+				};
 			},
-			type: () => {
-				calls.push("type");
-			},
-			screenshot: () => {
-				capture += 1;
-				calls.push(`screenshot-${capture}`);
-				return { widthPx: 100 + capture, heightPx: 50 + capture, png: new Uint8Array([capture]) };
-			},
+			screenshot: () => ({ widthPx: 99, heightPx: 49, png: new Uint8Array([9]), displayEpoch: 42 }),
 		}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		await tool.execute("prior-shot", { action: "screenshot" });
 
 		const result = await tool.execute("batch-shot", {
 			action: "batch",
 			include_screenshot: true,
 			actions: [
+				{ action: "screenshot" },
 				{ action: "click", x: 1, y: 2, include_screenshot: true },
 				{ action: "type", text: "done" },
 			],
 		});
 
 		expect(result.isError).not.toBe(true);
-		expect(calls).toEqual(["click", "screenshot-1", "type", "screenshot-2"]);
-		expect(result.details?.steps?.[0]?.screenshot).toMatchObject({ widthPx: 101, heightPx: 51 });
-		expect(result.details?.steps?.[1]?.screenshot).toBeUndefined();
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toMatchObject({
+			expectedEpoch: 42,
+			actions: [
+				{ action: "screenshot", timeoutGroup: 0 },
+				{ action: "click", x: 1, y: 2, timeoutGroup: 1 },
+				{ action: "screenshot", timeoutGroup: 1 },
+				{ action: "type", text: "done", timeoutGroup: 2 },
+				{ action: "screenshot" },
+			],
+		});
+		expect(calls[0]?.actions.at(-1)).toEqual({
+			action: "screenshot",
+			timeoutMs: calls[0]?.timeoutMs,
+		});
+		expect(calls[0]?.actions.at(-1)).not.toHaveProperty("timeoutGroup");
+		expect(calls[0]?.timeoutMs).toBeGreaterThan(0);
+		expect(result.details?.steps?.[0]?.screenshot).toMatchObject({ widthPx: 100, heightPx: 50 });
+		expect(result.details?.steps?.[1]?.screenshot).toMatchObject({ widthPx: 101, heightPx: 51 });
+		expect(result.details?.steps?.[2]?.screenshot).toBeUndefined();
 		expect(result.details?.screenshot).toMatchObject({ widthPx: 102, heightPx: 52 });
-		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "Ag==" });
+		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "Aw==" });
 	});
 
-	it("honors nested per-step timeout values inside batches", async () => {
+	it("caps waits before sending the single native batch", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
-		const waits: number[] = [];
+		const calls: Array<{ actions: unknown[]; timeoutMs: number | undefined }> = [];
 		setComputerControllerFactoryForTests(() => ({
-			wait: (_expectedEpoch, ms) => {
-				waits.push(ms);
+			executeBatch: (_expectedEpoch, actions, timeoutMs) => {
+				calls.push({ actions, timeoutMs });
+				return { results: actions.map((action, index) => ({ index, action: action.action })) };
 			},
 		}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
@@ -712,10 +741,289 @@ describe("computer tool dispatch", () => {
 		});
 
 		expect(result.isError).not.toBe(true);
-		expect(waits).toEqual([5_000, 1_000]);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.actions).toEqual([
+			{ action: "wait", ms: 5_000, timeoutMs: 5_000, timeoutGroup: 0 },
+			{ action: "wait", ms: 1_000, timeoutMs: 1_000, timeoutGroup: 1 },
+		]);
+		expect(calls[0]?.timeoutMs).toBeGreaterThan(0);
+		expect(calls[0]?.timeoutMs).toBeLessThanOrEqual(5_000);
 	});
 
-	it("times out slow native promises instead of reporting success", async () => {
+	it("checks abort before entering the native batch transaction", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let calls = 0;
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: (_expectedEpoch, actions) => {
+				calls += 1;
+				return { results: actions.map((action, index) => ({ index, action: action.action })) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			tool.execute(
+				"abort-batch",
+				{
+					action: "batch",
+					actions: [
+						{ action: "click", x: 1, y: 2 },
+						{ action: "type", text: "skipped" },
+					],
+				},
+				controller.signal,
+			),
+		).rejects.toThrow("Operation aborted");
+		expect(calls).toBe(0);
+	});
+
+	it("forwards in-flight aborts to the native transaction and waits for native cleanup", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const events: string[] = [];
+		let receivedSignal: AbortSignal | undefined;
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: async (_expectedEpoch, _actions, _timeoutMs, signal) => {
+				receivedSignal = signal;
+				events.push("native-start");
+				await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+				events.push("native-cleanup");
+				return {
+					results: [],
+					failureCode: "COMPUTER_CANCELLED",
+					failureIndex: 0,
+					failureMessage: "COMPUTER_CANCELLED: cancelled",
+				};
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const controller = new AbortController();
+		const execution = tool.execute(
+			"abort-in-flight",
+			{
+				action: "batch",
+				actions: [
+					{ action: "click", x: 1, y: 2 },
+					{ action: "type", text: "skipped" },
+				],
+			},
+			controller.signal,
+		);
+
+		await sleep(0);
+		controller.abort();
+
+		const result = await execution;
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CANCELLED");
+		expect(result.details?.steps).toHaveLength(1);
+		expect(receivedSignal).toBe(controller.signal);
+		expect(events).toEqual(["native-start", "native-cleanup"]);
+	});
+
+	it("preserves cursor restoration failure returned after in-flight abort cleanup", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: async (_expectedEpoch, _actions, _timeoutMs, signal) => {
+				await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+				return {
+					results: [],
+					failureCode: "COMPUTER_CURSOR_RESTORE_FAILED",
+					failureIndex: 0,
+					failureMessage: "COMPUTER_CURSOR_RESTORE_FAILED: restore failed",
+					primaryFailureCode: "COMPUTER_CANCELLED",
+					primaryFailureMessage: "COMPUTER_CANCELLED: cancelled",
+				};
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const controller = new AbortController();
+		const execution = tool.execute(
+			"abort-restore-failure",
+			{ action: "batch", actions: [{ action: "click", x: 1, y: 2 }] },
+			controller.signal,
+		);
+
+		await sleep(0);
+		controller.abort();
+		const result = await execution;
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CURSOR_RESTORE_FAILED");
+		expect(result.details?.primaryError?.code).toBe("COMPUTER_CANCELLED");
+		expect(textOf(result)).toContain("Primary failure: COMPUTER_CANCELLED");
+	});
+
+	it("preserves cursor restoration failure returned after the batch deadline", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: async () => {
+				await sleep(1_010);
+				return {
+					results: [],
+					failureCode: "COMPUTER_CURSOR_RESTORE_FAILED",
+					failureIndex: 0,
+					failureMessage: "COMPUTER_CURSOR_RESTORE_FAILED: restore failed",
+					primaryFailureCode: "COMPUTER_CANCELLED",
+					primaryFailureMessage: "COMPUTER_CANCELLED: timed out",
+				};
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("timeout-restore-failure", {
+			action: "batch",
+			timeout: 1,
+			actions: [{ action: "click", x: 1, y: 2 }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CURSOR_RESTORE_FAILED");
+		expect(result.details?.primaryError?.code).toBe("COMPUTER_CANCELLED");
+	});
+
+	it("forwards non-wait step timeouts and maps the native failure index", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let receivedActions: Array<{
+			action: string;
+			timeoutMs?: number;
+			timeoutGroup?: number;
+			x?: number;
+			y?: number;
+			text?: string;
+		}> = [];
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: (_expectedEpoch, actions) => {
+				receivedActions = actions;
+				return {
+					results: [{ index: 0, action: "screenshot" }],
+					failureCode: "COMPUTER_CANCELLED",
+					failureIndex: 1,
+					failureMessage: "COMPUTER_CANCELLED: action timed out",
+				};
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("step-timeout", {
+			action: "batch",
+			timeout: 5,
+			actions: [
+				{ action: "screenshot", timeout: 2 },
+				{ action: "click", x: 1, y: 2, timeout: 1 },
+				{ action: "type", text: "skipped", timeout: 3 },
+			],
+		});
+
+		expect(receivedActions).toEqual([
+			{ action: "screenshot", timeoutMs: 2_000, timeoutGroup: 0 },
+			{ action: "click", x: 1, y: 2, timeoutMs: 1_000, timeoutGroup: 1 },
+			{ action: "type", text: "skipped", timeoutMs: 3_000, timeoutGroup: 2 },
+		]);
+		expect(result.isError).toBe(true);
+		expect(result.details?.steps).toHaveLength(2);
+		expect(result.details?.steps?.[1]).toMatchObject({
+			action: "click",
+			code: "COMPUTER_CANCELLED",
+			status: "error",
+		});
+	});
+
+	it("maps native permission rejection as a structured action failure", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: () => ({
+				results: [],
+				failureCode: "COMPUTER_PERMISSION_REQUIRED",
+				failureIndex: 0,
+				failureMessage: "COMPUTER_PERMISSION_REQUIRED: accessibility permission is required",
+			}),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("permission", {
+			action: "batch",
+			actions: [{ action: "click", x: 1, y: 2 }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_PERMISSION_REQUIRED");
+		expect(result.details?.steps).toEqual([
+			expect.objectContaining({
+				action: "click",
+				code: "COMPUTER_PERMISSION_REQUIRED",
+				status: "error",
+			}),
+		]);
+	});
+	it("does not report unexecuted prefix steps when native preflight fails later", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: () => ({
+				results: [],
+				failureCode: "COMPUTER_PERMISSION_REQUIRED",
+				failureIndex: 2,
+				failureMessage: "COMPUTER_PERMISSION_REQUIRED: accessibility permission is required",
+			}),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("preflight-prefix", {
+			action: "batch",
+			actions: [{ action: "screenshot" }, { action: "wait", ms: 10 }, { action: "click", x: 1, y: 2 }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.steps).toEqual([
+			expect.objectContaining({
+				action: "click",
+				code: "COMPUTER_PERMISSION_REQUIRED",
+				status: "error",
+			}),
+		]);
+	});
+
+	it("routes a single input through native batch and retains restoration primary failure", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let legacyClickCalls = 0;
+		setComputerControllerFactoryForTests(() => ({
+			executeBatch: (_expectedEpoch, actions, timeoutMs, signal) => {
+				expect(actions).toEqual([expect.objectContaining({ action: "click", x: 1, y: 2, timeoutGroup: 0 })]);
+				expect(timeoutMs).toBeGreaterThan(0);
+				expect(signal).toBeInstanceOf(AbortSignal);
+				return {
+					results: [],
+					failureCode: "COMPUTER_CURSOR_RESTORE_FAILED",
+					failureIndex: 0,
+					failureMessage: "COMPUTER_CURSOR_RESTORE_FAILED: restore failed",
+					primaryFailureCode: "COMPUTER_COORD_INVALID",
+					primaryFailureMessage: "COMPUTER_COORD_INVALID: coordinates out of bounds",
+				};
+			},
+			click: () => {
+				legacyClickCalls += 1;
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const controller = new AbortController();
+
+		const result = await tool.execute("single-restore", { action: "click", x: 1, y: 2 }, controller.signal);
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CURSOR_RESTORE_FAILED");
+		expect(result.details?.primaryError?.code).toBe("COMPUTER_COORD_INVALID");
+		expect(legacyClickCalls).toBe(0);
+	});
+	it("times out slow single-action native promises instead of reporting success", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
 		const calls: string[] = [];
@@ -738,101 +1046,31 @@ describe("computer tool dispatch", () => {
 		expect(calls).toEqual(["screenshot-start"]);
 	});
 
-	it("honors abort signals between batch steps", async () => {
+	it("maps a native batch step failure to results.length without legacy fallback", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
-		const calls: string[] = [];
+		let executeBatchCalls = 0;
+		let legacyClickCalls = 0;
 		setComputerControllerFactoryForTests(() => ({
-			click: async () => {
-				calls.push("click-start");
-				await sleep(80);
-				calls.push("click-end");
-			},
-			type: () => {
-				calls.push("type");
-			},
-		}));
-		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
-		const controller = new AbortController();
-		setTimeout(() => controller.abort(), 20);
-
-		await expect(
-			tool.execute(
-				"abort-batch",
-				{
-					action: "batch",
-					actions: [
-						{ action: "click", x: 1, y: 2 },
-						{ action: "type", text: "skipped" },
+			executeBatch: () => {
+				executeBatchCalls += 1;
+				return {
+					results: [
+						{
+							index: 0,
+							action: "screenshot",
+							screenshot: { widthPx: 100, heightPx: 50, png: new Uint8Array([1]) },
+						},
 					],
-				},
-				controller.signal,
-			),
-		).rejects.toThrow("Operation aborted");
-		expect(calls).toEqual(["click-start"]);
-	});
-
-	it("executes batch actions sequentially and reports per-step results", async () => {
-		setComputerPlatformForTests("darwin");
-		setComputerArchForTests("arm64");
-		const calls: Array<{ method: string; args: unknown[] }> = [];
-		setComputerControllerFactoryForTests(() => ({
-			screenshot: () => {
-				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]), displayEpoch: 99 };
-			},
-			click: (...args) => {
-				calls.push({ method: "click", args });
-			},
-			type: (...args) => {
-				calls.push({ method: "type", args });
-			},
-		}));
-		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
-		const result = await tool.execute("batch", {
-			action: "batch",
-			actions: [{ action: "screenshot" }, { action: "click", x: 10, y: 20 }, { action: "type", text: "hello" }],
-		});
-
-		expect(result.isError).not.toBe(true);
-		expect(result.details?.action).toBe("batch");
-		expect(result.details?.steps).toHaveLength(3);
-		expect(result.details?.steps?.map(s => s.action)).toEqual(["screenshot", "click", "type"]);
-		expect(result.details?.steps?.every(s => s.status === "success")).toBe(true);
-		expect(result.details?.screenshot).toMatchObject({ widthPx: 100, heightPx: 50 });
-		expect(result.content.some(block => block.type === "image")).toBe(true);
-		const image = result.content.find(block => block.type === "image");
-		expect(image).toMatchObject({ type: "image", mimeType: "image/png", data: "AQID" });
-		expect(result.details?.screenshot?.path).toBeTruthy();
-		expect(await fs.stat(result.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
-		expect(calls.map(call => call.method)).toEqual(["screenshot", "click", "type"]);
-		expect(calls[1].args).toEqual([99, 10, 20, "left"]);
-		expect(calls[2].args).toEqual([undefined, "hello"]);
-	});
-
-	it("stops batch when native reports a stale display", async () => {
-		setComputerPlatformForTests("darwin");
-		setComputerArchForTests("arm64");
-		const calls: Array<{ method: string; args: unknown[] }> = [];
-		setComputerControllerFactoryForTests(() => ({
-			screenshot: () => {
-				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]), displayEpoch: 123 };
-			},
-			click: (...args) => {
-				calls.push({ method: "click", args });
-				const error = new Error("COMPUTER_DISPLAY_STALE: display epoch changed") as Error & {
-					code: string;
+					failureCode: "COMPUTER_DISPLAY_STALE",
+					failureMessage: "COMPUTER_DISPLAY_STALE: display epoch changed",
 				};
-				error.code = "GenericFailure";
-				throw error;
 			},
-			type: (...args) => {
-				calls.push({ method: "type", args });
+			click: () => {
+				legacyClickCalls += 1;
 			},
 		}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
-
 		const result = await tool.execute("batch", {
 			action: "batch",
 			actions: [{ action: "screenshot" }, { action: "click", x: 10, y: 20 }, { action: "type", text: "skipped" }],
@@ -843,66 +1081,44 @@ describe("computer tool dispatch", () => {
 		expect(result.details?.steps?.[0]?.status).toBe("success");
 		expect(result.details?.steps?.[1]?.code).toBe("COMPUTER_DISPLAY_STALE");
 		expect(result.details?.code).toBe("COMPUTER_DISPLAY_STALE");
-		expect(calls.map(call => call.method)).toEqual(["screenshot", "click"]);
-		expect(calls[1].args).toEqual([123, 10, 20, "left"]);
+		expect(executeBatchCalls).toBe(1);
+		expect(legacyClickCalls).toBe(0);
 	});
 
-	it("stops batch execution on first failure and reports the failing step", async () => {
+	it("retains the primary failure when cursor restoration fails", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
 		setComputerControllerFactoryForTests(() => ({
-			click: () => {
-				const error = new Error("COMPUTER_COORD_INVALID: coordinates out of bounds") as Error & { code: string };
-				error.code = "GenericFailure";
-				throw error;
-			},
+			executeBatch: () => ({
+				results: [],
+				failureCode: "COMPUTER_CURSOR_RESTORE_FAILED",
+				failureMessage: "COMPUTER_CURSOR_RESTORE_FAILED: restore failed",
+				primaryFailureCode: "COMPUTER_COORD_INVALID",
+				primaryFailureMessage: "COMPUTER_COORD_INVALID: coordinates out of bounds",
+			}),
 		}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
-		const result = await tool.execute("batch", {
-			action: "batch",
-			actions: [
-				{ action: "click", x: 10, y: 20 },
-				{ action: "type", text: "skipped" },
-			],
-		});
+		const result = await tool.execute("restore", { action: "batch", actions: [{ action: "click", x: 10, y: 20 }] });
 
 		expect(result.isError).toBe(true);
-		expect(result.details?.action).toBe("batch");
-		expect(result.details?.steps).toHaveLength(1);
-		expect(result.details?.steps?.[0]?.status).toBe("error");
-		expect(result.details?.steps?.[0]?.code).toBe("COMPUTER_COORD_INVALID");
-		expect(result.details?.code).toBe("COMPUTER_COORD_INVALID");
+		expect(result.details?.code).toBe("COMPUTER_CURSOR_RESTORE_FAILED");
+		expect(result.details?.primaryError?.code).toBe("COMPUTER_COORD_INVALID");
+		expect(textOf(result)).toContain("Primary failure: COMPUTER_COORD_INVALID");
 	});
 
-	it("validates batch coordinates against the latest screenshot bounds", async () => {
+	it("fails closed when executeBatch is unavailable", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
-		const calls: Array<{ method: string; args: unknown[] }> = [];
-		setComputerControllerFactoryForTests(() => ({
-			screenshot: () => {
-				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]) };
-			},
-			click: (...args) => {
-				calls.push({ method: "click", args });
-			},
-		}));
+		setComputerControllerFactoryForTests(() => ({}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
-		const result = await tool.execute("batch", {
+		const result = await tool.execute("missing-batch", {
 			action: "batch",
-			actions: [{ action: "screenshot" }, { action: "click", x: 150, y: 60 }],
+			actions: [{ action: "click", x: 1, y: 2 }],
 		});
 
 		expect(result.isError).toBe(true);
-		expect(result.details?.action).toBe("batch");
-		expect(result.details?.steps?.[0]?.status).toBe("success");
-		expect(result.details?.steps?.[1]?.status).toBe("error");
-		expect(result.details?.steps?.[1]?.code).toBe("COMPUTER_COORD_INVALID");
-		expect(result.details?.steps?.[1]?.message).toContain("outside the latest screenshot bounds");
-		expect(result.details?.code).toBe("COMPUTER_COORD_INVALID");
-		expect(result.details?.screenshot?.path).toBeTruthy();
-		expect(await fs.stat(result.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
-		expect(calls.map(call => call.method)).toEqual(["screenshot"]);
+		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(textOf(result)).toContain("ComputerController.executeBatch is unavailable");
 	});
 
 	it("writes an audit log record when computer.auditLog.enabled is true", async () => {
@@ -972,7 +1188,7 @@ describe("computer renderer", () => {
 			{
 				action: "screenshot",
 				status: "success",
-				screenshot: { widthPx: 640, heightPx: 480, pngBytes: 1234, captureId: "cap-1" },
+				screenshot: { widthPx: 640, heightPx: 480, pngBytes: 1234, captureId: 1 },
 			},
 			false,
 			fakeTheme,

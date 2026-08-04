@@ -5,6 +5,14 @@ import { Text } from "./text";
 
 const SPINNER_ADVANCE_MS = 80;
 
+/**
+ * Compatibility options for existing loader call sites.
+ *
+ * @deprecated `timeDependentColor` no longer selects a faster scheduler. Every
+ * colorizer is reevaluated on the shared 80 ms cadence, so both option values
+ * now have identical behavior. The field remains accepted to avoid a source
+ * break for downstream callers while they remove it.
+ */
 export interface LoaderOptions {
 	timeDependentColor?: boolean;
 }
@@ -13,9 +21,13 @@ export interface LoaderOptions {
 export const __loaderPerfCounters = {
 	liveIntervals: 0,
 	startedIntervals: 0,
+	callbackInvocations: 0,
+	renderRequests: 0,
 	reset(): void {
 		this.liveIntervals = 0;
 		this.startedIntervals = 0;
+		this.callbackInvocations = 0;
+		this.renderRequests = 0;
 	},
 };
 
@@ -26,7 +38,6 @@ export class Loader extends Text {
 	#ui: TUI | null = null;
 	#lastSpinnerTick = 0;
 	#lastDisplayed?: string;
-	#timeDependentColor: boolean;
 
 	constructor(
 		ui: TUI,
@@ -34,11 +45,10 @@ export class Loader extends Text {
 		private messageColorFn: (str: string) => string,
 		private message: string = "Loading...",
 		spinnerFrames?: string[],
-		options: LoaderOptions = {},
+		_options: LoaderOptions = {},
 	) {
 		super("", 1, 0);
 		this.#ui = ui;
-		this.#timeDependentColor = options.timeDependentColor ?? false;
 		if (spinnerFrames && spinnerFrames.length > 0) {
 			this.#frames = spinnerFrames;
 		}
@@ -62,16 +72,14 @@ export class Loader extends Text {
 		this.#updateDisplay();
 		__loaderPerfCounters.liveIntervals += 1;
 		__loaderPerfCounters.startedIntervals += 1;
-		this.#animation = registerAnimationCallback(
-			now => {
-				if (now - this.#lastSpinnerTick >= SPINNER_ADVANCE_MS) {
-					this.#currentFrame = (this.#currentFrame + 1) % this.#frames.length;
-					this.#lastSpinnerTick = now;
-				}
-				this.#updateDisplay();
-			},
-			this.#timeDependentColor ? 16 : 80,
-		);
+		this.#animation = registerAnimationCallback(now => {
+			__loaderPerfCounters.callbackInvocations += 1;
+			if (now - this.#lastSpinnerTick >= SPINNER_ADVANCE_MS) {
+				this.#currentFrame = (this.#currentFrame + 1) % this.#frames.length;
+				this.#lastSpinnerTick = now;
+			}
+			this.#updateDisplay();
+		}, SPINNER_ADVANCE_MS);
 	}
 
 	stop() {
@@ -97,6 +105,7 @@ export class Loader extends Text {
 		if (next === this.#lastDisplayed) return;
 		this.#lastDisplayed = next;
 		this.setText(next);
+		__loaderPerfCounters.renderRequests += 1;
 		this.#ui?.requestRender(false, "loader");
 	}
 }

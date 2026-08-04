@@ -263,6 +263,8 @@ function unsubscribeFromStdinErrors(subscriber: (err: Error) => void): void {
 	stdinErrorSubscribers.delete(subscriber);
 	if (stdinErrorSubscribers.size === 0) process.stdin.removeListener("error", dispatchStdinError);
 }
+type Osc11QuerySource = "startup" | "poll" | "mode2031";
+type Osc11QueuedSource = Exclude<Osc11QuerySource, "startup">;
 
 /**
  * Real terminal using process.stdin/stdout
@@ -287,7 +289,7 @@ export class ProcessTerminal implements Terminal {
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
-	#osc11QueryQueued = false;
+	#osc11QueuedSource?: Osc11QueuedSource;
 	#osc11ResponseBuffer = "";
 	#privateCsiResponseBuffer = "";
 	#pendingDa1Sentinels = 0;
@@ -409,7 +411,7 @@ export class ProcessTerminal implements Terminal {
 		// sequences in order, so if DA1 arrives before OSC 11 response,
 		// the terminal does not support OSC 11. This avoids indefinite hangs.
 		// Technique used by Neovim, bat, fish, and terminal-colorsaurus.
-		this.#queryBackgroundColor();
+		this.#queryBackgroundColor("startup");
 
 		// Subscribe to Mode 2031 appearance change notifications.
 		// When the terminal reports a change, we re-query OSC 11 to get the
@@ -571,16 +573,22 @@ export class ProcessTerminal implements Terminal {
 			// already succeeded. Other terminal probes should never see these replies.
 			if (da1ResponsePattern.test(sequence) && this.#pendingDa1Sentinels > 0) {
 				this.#pendingDa1Sentinels--;
-				if (this.#osc11Pending) {
-					// DA1 arrived before OSC 11 response: terminal does not support
-					// OSC 11. Clear the pending state without starting a queued query
-					// (queued query is started below, after sentinel is consumed).
+				const negativeEvidence = this.#osc11Pending;
+				const queuedSource = this.#osc11QueuedSource;
+				this.#osc11QueuedSource = undefined;
+				if (negativeEvidence) {
+					// DA1 arrived before OSC 11: this cycle proved OSC 11 unsupported.
+					// Stop futile polling, but retain one stronger Mode 2031 push request.
 					this.#osc11Pending = false;
 					this.#osc11ResponseBuffer = "";
-				}
-				// Now that this DA1 cycle is complete, start any queued query.
-				if (this.#osc11QueryQueued && !this.#dead) {
-					this.#osc11QueryQueued = false;
+					this.#clearOsc11QueryWatchdog();
+					this.#stopOsc11Poll();
+					if (queuedSource === "mode2031" && !this.#dead) {
+						this.#startOsc11Query();
+					}
+				} else if (queuedSource && !this.#dead) {
+					// A positive OSC reply arrived first. The delayed sentinel only
+					// closes that successful cycle, so preserve its single follow-up.
 					this.#startOsc11Query();
 				}
 				return;
@@ -600,8 +608,9 @@ export class ProcessTerminal implements Terminal {
 					const osc11Match = this.#osc11ResponseBuffer.match(osc11ResponsePattern);
 					if (osc11Match) {
 						const [, rHex, gHex, bHex] = osc11Match;
-						this.#osc11Pending = false;
 						this.#osc11ResponseBuffer = "";
+						if (!this.#osc11Pending) return;
+						this.#osc11Pending = false;
 						this.#clearOsc11QueryWatchdog();
 						this.#handleOsc11Response(rHex!, gHex!, bHex!);
 						return;
@@ -628,7 +637,7 @@ export class ProcessTerminal implements Terminal {
 				if (this.#mode2031DebounceTimer) clearTimeout(this.#mode2031DebounceTimer);
 				this.#mode2031DebounceTimer = setTimeout(() => {
 					this.#mode2031DebounceTimer = undefined;
-					this.#queryBackgroundColor();
+					this.#queryBackgroundColor("mode2031");
 				}, 100);
 				return;
 			}
@@ -662,14 +671,14 @@ export class ProcessTerminal implements Terminal {
 	 * DA1 avoids indefinite hangs: if DA1 response arrives before OSC 11,
 	 * the terminal does not support OSC 11.
 	 */
-	#queryBackgroundColor(): void {
+	#queryBackgroundColor(source: Osc11QuerySource): void {
 		if (this.#dead) return;
-		// Queue if an OSC 11 query is in flight or its DA1 sentinel hasn't been
-		// consumed yet. Starting a new query while a DA1 is outstanding would
-		// increment the sentinel counter, and the old DA1 arrival would then
-		// prematurely clear the new query's pending state.
+		// Queue if an OSC 11 query is in flight or its DA1 sentinel has not yet
+		// been consumed. Mode 2031 push evidence outranks a periodic poll.
 		if (this.#osc11Pending || this.#pendingDa1Sentinels > 0) {
-			this.#osc11QueryQueued = true;
+			if (source === "mode2031" || (source === "poll" && this.#osc11QueuedSource === undefined)) {
+				this.#osc11QueuedSource = source;
+			}
 			return;
 		}
 		this.#startOsc11Query();
@@ -698,11 +707,12 @@ export class ProcessTerminal implements Terminal {
 			this.#osc11QueryWatchdog = undefined;
 			if (this.#dead) return;
 			if (!this.#osc11Pending && this.#pendingDa1Sentinels === 0) return;
+			const queuedSource = this.#osc11QueuedSource;
+			this.#osc11QueuedSource = undefined;
 			this.#osc11Pending = false;
 			this.#osc11ResponseBuffer = "";
 			this.#pendingDa1Sentinels = 0;
-			if (this.#osc11QueryQueued && !this.#dead) {
-				this.#osc11QueryQueued = false;
+			if (queuedSource && !this.#dead) {
 				this.#startOsc11Query();
 			}
 		}, 1000);
@@ -750,7 +760,7 @@ export class ProcessTerminal implements Terminal {
 				this.#stopOsc11Poll();
 				return;
 			}
-			this.#queryBackgroundColor();
+			this.#queryBackgroundColor("poll");
 		}, 2_000);
 		this.#osc11PollTimer.unref();
 	}
@@ -878,7 +888,7 @@ export class ProcessTerminal implements Terminal {
 		}
 		this.#appearanceCallbacks = [];
 		this.#osc11Pending = false;
-		this.#osc11QueryQueued = false;
+		this.#osc11QueuedSource = undefined;
 		this.#osc11ResponseBuffer = "";
 		this.#privateCsiResponseBuffer = "";
 		this.#pendingDa1Sentinels = 0;

@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "issue": 3803,
+  "baseline": {
+    "gjcBase": "9477947f8b89b74bf3efcc4c1bf7c4591a0558ec",
+    "ouroborosRelease": "v0.50.7",
+    "ouroborosCommit": "cb658aa819bfabafecbbe91bc36327f10691171b",
+    "ouroborosWheelSha256": "df42f4ef10e032f2edc3249534bf91e8612dee789dfc3517895a9eb2df7f82c4",
+    "standaloneBridgeCommit": "4311fefd49e9c6781c4d1111b8dd3f758e7d8974",
+    "standaloneBridgeSha256": "2b0e1e25ac145331f112da629076875542db6f6e63c3c17adcd6770a4dcaf7bd"
+  },
+  "verification": [
+    {
+      "command": "bun test packages/coding-agent/test/ooo-bridge-extension-contract.test.ts packages/coding-agent/test/ooo-bridge-runner-redteam.test.ts packages/coding-agent/test/ooo-bridge-installed-flow.test.ts packages/coding-agent/test/extensions-discovery.test.ts packages/coding-agent/test/extensions-runner.test.ts",
+      "status": "passed",
+      "result": "100 pass, 0 fail, 295 expect() calls"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run check",
+      "status": "passed",
+      "result": "Biome checked 2514 files; TypeScript noEmit completed successfully"
+    },
+    {
+      "command": "bun run check:public-sync",
+      "status": "passed",
+      "result": "Public docs/site/version surfaces are in sync"
+    },
+    {
+      "command": "bun run generate-docs-index",
+      "status": "passed",
+      "result": "Embedded docs index regenerated with 120 documents"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "result": "No whitespace errors"
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "queued-explicit-generation-fence",
+      "status": "passed",
+      "evidence": "Deferred MCP operations hold queued explicit interview starts while actual AgentSession session_switch and InputController /clear resets advance the lifecycle generation; predecessor entries settle handled without issuing another MCP call."
+    },
+    {
+      "id": "session-switch-disposal",
+      "status": "passed",
+      "evidence": "The installed extension registers session_switch disposal. A real AgentSession new-session transition with the same ExtensionRunner clears the old Ouroboros session before InputController submits ordinary successor-session input."
+    },
+    {
+      "id": "clear-control-disposal",
+      "status": "passed",
+      "evidence": "InputController executes the real /clear path through AgentSession.clearContext after the bridge resets, and subsequent ordinary input is not sent to the prior Ouroboros session_id."
+    },
+    {
+      "id": "startup-overlap-serialization",
+      "status": "passed",
+      "evidence": "Two non-awaited InputController submissions during interview startup remain claimed; the second waits for the first session_id and cannot fall through to the model."
+    },
+    {
+      "id": "continuation-overlap-serialization",
+      "status": "passed",
+      "evidence": "Two concurrent continuation answers issue one MCP call at a time. The second starts only after the first settles and uses the latest correlated session state."
+    },
+    {
+      "id": "late-mcp-settlement-fence",
+      "status": "passed",
+      "evidence": "Runner timeout aborts the handler signal, disconnects the MCP transport, and a late question cannot recreate interview state or capture the next ordinary prompt."
+    },
+    {
+      "id": "dead-transport-release",
+      "status": "passed",
+      "evidence": "An MCP tool failure clears the interview session and cached connection; ordinary input passes through and a later explicit interview opens a fresh connection."
+    },
+    {
+      "id": "built-in-control-bypass",
+      "status": "passed",
+      "evidence": "Non-session slash controls plus bare dot and c bypass active capture; session-changing controls reset state before their built-in action."
+    },
+    {
+      "id": "compiled-one-file-install",
+      "status": "passed",
+      "evidence": "A real Bun compiled loader loads the isolated standalone extension without peer node_modules and registers both input and session_switch handlers."
+    },
+    {
+      "id": "visible-correlated-flow",
+      "status": "passed",
+      "evidence": "The installed example renders the first question, sends the next answer with the same session_id, renders completion, disconnects, and returns ordinary prompts to GJC."
+    },
+    {
+      "id": "compatible-cli-override",
+      "status": "passed",
+      "evidence": "OUROBOROS_CLI selects the executable for both MCP serving and non-interview dispatch."
+    },
+    {
+      "id": "unsupported-dispatch",
+      "status": "passed",
+      "evidence": "Exit code 78 remains pass-through for non-interview exact-prefix dispatch."
+    }
+  ]
+}

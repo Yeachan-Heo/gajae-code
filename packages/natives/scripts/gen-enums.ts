@@ -40,6 +40,11 @@ const FUNCTION_RE = /^export declare function (\w+)/gm;
 // platform implementation is built.
 const COMPATIBILITY_CLASSES = ["ComputerController"];
 
+const COMPUTER_COMPATIBILITY_DECLARATION_RE =
+	/\/\*\*\n \* macOS computer-use controller\.[\s\S]*?^export declare class ComputerController \{[\s\S]*?^\}\n*/m;
+const COMPUTER_BATCH_DTO_RE =
+	/^(?:\/\*\*\n \* One native batch step\.[\s\S]*?^\s\*\/\n)?export interface (?:ComputerInputAction|ComputerBatchStepResult|ComputerBatchResult) \{[\s\S]*?^\}\n*/gm;
+
 const COMPUTER_CONTROLLER_DECLARATION = `/**
  * macOS computer-use controller.
  *
@@ -47,8 +52,40 @@ const COMPUTER_CONTROLLER_DECLARATION = `/**
  * consumers can import them portably; the native controller itself is built
  * only on macOS.
  */
+export interface ComputerInputAction {
+  action: "screenshot" | "click" | "double_click" | "move" | "drag" | "scroll" | "type" | "keypress" | "wait"
+  x?: number
+  y?: number
+  toX?: number
+  toY?: number
+  scrollX?: number
+  scrollY?: number
+  button?: string
+  text?: string
+  keys?: Array<string>
+  ms?: number
+  timeoutMs?: number
+  timeoutGroup?: number
+}
+
+export interface ComputerBatchStepResult {
+  index: number
+  action: string
+  screenshot?: ComputerScreenshot
+}
+
+export interface ComputerBatchResult {
+  results: Array<ComputerBatchStepResult>
+  failureCode?: string
+  failureIndex?: number
+  failureMessage?: string
+  primaryFailureCode?: string
+  primaryFailureMessage?: string
+}
+
 export declare class ComputerController {
   constructor()
+  executeBatch(expectedEpoch: number | undefined | null, actions: Array<ComputerInputAction>, timeoutMs?: number | undefined | null, signal?: unknown): Promise<ComputerBatchResult>
   screenshot(): ComputerScreenshot
   click(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
   doubleClick(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
@@ -59,7 +96,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 `;
 interface EnumExport {
 	name: string;
@@ -266,19 +302,14 @@ function buildGeneratedBlock(dts: string): string {
 }
 
 function patchCompatibilityDeclarations(dts: string): string {
-	let patched = dts;
-	if (!patched.includes("macOS computer-use controller")) {
-		if (/^export declare class ComputerController \{[\s\S]*?\n\}/m.test(patched)) {
-			patched = patched.replace(
-				/^export declare class ComputerController \{[\s\S]*?\n\}/m,
-				COMPUTER_CONTROLLER_DECLARATION.trim(),
-			);
-		} else {
-			patched = patched.replace(
-				"/* eslint-disable */\n",
-				`/* eslint-disable */\n${COMPUTER_CONTROLLER_DECLARATION}`,
-			);
-		}
+	let patched = dts.replace(COMPUTER_COMPATIBILITY_DECLARATION_RE, "").replace(COMPUTER_BATCH_DTO_RE, "");
+	if (/^export declare class ComputerController \{[\s\S]*?\n\}/m.test(patched)) {
+		patched = patched.replace(
+			/^export declare class ComputerController \{[\s\S]*?\n\}/m,
+			COMPUTER_CONTROLLER_DECLARATION.trim(),
+		);
+	} else {
+		patched = patched.replace("/* eslint-disable */\n", `/* eslint-disable */\n${COMPUTER_CONTROLLER_DECLARATION}`);
 	}
 	return patched
 		.replace(
