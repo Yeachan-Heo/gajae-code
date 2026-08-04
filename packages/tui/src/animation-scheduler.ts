@@ -9,6 +9,35 @@ interface CadenceBucket {
 	startedTimers: number;
 }
 
+// Animation ticks are decorative: the spinner glyph advances on its own 80ms
+// clock, and the extra 16ms ticks exist only to move a colour gradient. When the
+// output sink cannot keep up — a remote terminal over SSH, a multiplexer, a slow
+// pipe — those frames are not merely wasted, they queue. Node buffers whatever
+// `write()` could not hand to the OS, so the renderer runs ahead of the wire and
+// the user watches a backlog drain instead of the current frame.
+//
+// Dropping a decorative tick loses nothing: the next one redraws from live state.
+// Skipping is therefore always safe here, and must never be extended to renders
+// that carry content, which the diff renderer must still emit in order.
+const DEFAULT_CONGESTION_THRESHOLD_BYTES = 64 * 1024;
+
+let congestionProbe: (() => boolean) | undefined;
+let skippedTicks = 0;
+
+function outputIsCongested(): boolean {
+	if (congestionProbe) return congestionProbe();
+	const stdout = globalThis.process?.stdout as { writableLength?: number } | undefined;
+	const buffered = stdout?.writableLength;
+	// A healthy TTY drains synchronously and reports 0 here, so this is a no-op
+	// locally and only engages once bytes are genuinely stuck.
+	return typeof buffered === "number" && buffered > DEFAULT_CONGESTION_THRESHOLD_BYTES;
+}
+
+/** Test seam: override how congestion is sampled. Pass undefined to restore. */
+export function __setAnimationCongestionProbe(probe: (() => boolean) | undefined): void {
+	congestionProbe = probe;
+}
+
 const buckets = new Map<AnimationCadence, CadenceBucket>();
 
 function getBucket(cadence: AnimationCadence): CadenceBucket {
@@ -23,6 +52,12 @@ function getBucket(cadence: AnimationCadence): CadenceBucket {
 function startBucket(cadence: AnimationCadence, bucket: CadenceBucket): void {
 	if (bucket.timer) return;
 	bucket.timer = setInterval(() => {
+		// Skip the whole tick, not each callback: the decision is about the shared
+		// output sink, so sampling it once keeps every registrant on the same frame.
+		if (outputIsCongested()) {
+			skippedTicks += 1;
+			return;
+		}
 		const now = performance.now();
 		// Snapshot so re-entrant register/unregister during a tick is safe, and
 		// isolate each callback so one throwing registrant cannot starve siblings
@@ -89,11 +124,16 @@ export const __animationSchedulerTestHooks = {
 		for (const bucket of buckets.values()) count += bucket.startedTimers;
 		return count;
 	},
+	getSkippedTickCount(): number {
+		return skippedTicks;
+	},
 	reset(): void {
 		for (const bucket of buckets.values()) {
 			stopBucket(bucket);
 			bucket.callbacks.clear();
 			bucket.startedTimers = 0;
 		}
+		skippedTicks = 0;
+		congestionProbe = undefined;
 	},
 };
