@@ -46,6 +46,13 @@ async function pathExists(target: string): Promise<boolean> {
 	);
 }
 
+async function waitForPathRemoval(target: string): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (!(await pathExists(target))) return;
+		await Bun.sleep(5);
+	}
+}
+
 function createAssistantMessage(text: string): Message {
 	return {
 		role: "assistant",
@@ -437,6 +444,77 @@ describe("task no-session output refs", () => {
 		expect(await pathExists(root)).toBe(false);
 	});
 
+	it("keeps SessionManager ephemeral artifacts readable when resume rolls back after adoption", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ephemeral-resume-rollback-"));
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		let runtime: AgentSession | undefined;
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model");
+			authStorage.setRuntimeApiKey("anthropic", "test-key");
+			const owner = SessionManager.inMemory(cwd, new FileSessionStorage());
+			runtime = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model, systemPrompt: ["Test"], tools: [] },
+				}),
+				sessionManager: owner,
+				settings: Settings.isolated(),
+				modelRegistry: new ModelRegistry(authStorage, path.join(cwd, "models.yml")),
+			});
+
+			expect(await owner.saveArtifact("ephemeral predecessor", "bash")).toBe("0");
+			const predecessorManager = owner.getArtifactManager()!;
+			const predecessorRoot = predecessorManager.dir;
+			const targetFile = path.join(cwd, "existing-populated.jsonl");
+			await Bun.write(
+				targetFile,
+				`${JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: "ephemeral-rollback-target",
+					timestamp: "2026-08-04T00:00:00.000Z",
+					cwd,
+				})}\n${JSON.stringify({
+					type: "message",
+					id: "target-message",
+					parentId: null,
+					timestamp: "2026-08-04T00:00:01.000Z",
+					message: { role: "user", content: "target", timestamp: 1 },
+				})}\n`,
+			);
+			const context = {
+				cwd,
+				getArtifactsDir: () => owner.getArtifactManager()?.dir ?? null,
+				getAuthorizedArtifactsDirs: () => {
+					const manager = owner.getArtifactManager();
+					return manager ? [manager.dir] : [];
+				},
+			};
+
+			const ensureOnDisk = vi
+				.spyOn(owner, "ensureOnDisk")
+				.mockRejectedValueOnce(new Error("injected post-adoption resume failure"));
+			await expect(runtime.switchSession(targetFile)).rejects.toThrow("injected post-adoption resume failure");
+			ensureOnDisk.mockRestore();
+			expect(owner.getArtifactManager()).toBe(predecessorManager);
+			expect(owner.isArtifactManagerAuthorized(predecessorManager)).toBe(true);
+			expect(await pathExists(predecessorRoot)).toBe(true);
+			expect((await InternalUrlRouter.instance().resolve("artifact://0", context)).content).toBe(
+				"ephemeral predecessor",
+			);
+
+			expect(await runtime.switchSession(targetFile)).toBe(true);
+			await waitForPathRemoval(predecessorRoot);
+			expect(await pathExists(predecessorRoot)).toBe(false);
+			expect(owner.isArtifactManagerAuthorized(predecessorManager)).toBe(false);
+			expect(owner.getArtifactManager()?.dir).toBe(targetFile.slice(0, -6));
+		} finally {
+			if (runtime) await runtime.dispose();
+			authStorage.close();
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 	it("retires a task-first fallback on resume and restores the persisted artifact root", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(

@@ -16427,7 +16427,9 @@ export class AgentSession {
 			let transitionCleanupCommitted = false;
 
 			try {
-				await this.sessionManager.setSessionFile(sessionPath);
+				await this.sessionManager.setSessionFile(sessionPath, {
+					deferEphemeralArtifactRetirement: switchingToDifferentSession,
+				});
 				// The successor identity is already rotated in the manager but not yet
 				// published; gate its local:// root before publication so the agent,
 				// workflow-gate emitter, and hooks cannot resolve against an ungated
@@ -16528,8 +16530,9 @@ export class AgentSession {
 				}
 
 				if (switchingToDifferentSession) {
-					await this.#runToolSessionTransitionCleanups();
 					transitionCleanupCommitted = true;
+					this.sessionManager.retireEphemeralArtifactsAfterTransition();
+					await this.#runToolSessionTransitionCleanups();
 				}
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime

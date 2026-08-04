@@ -5549,7 +5549,7 @@ export class SessionManager {
 	}
 
 	/** Switch to a different session file (used for resume and branching). */
-	async setSessionFile(sessionFile: string): Promise<void> {
+	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const strictAdoption = this.#pendingStrictAdoption;
@@ -5646,7 +5646,7 @@ export class SessionManager {
 					prepared.dispose();
 					throw error;
 				}
-				this.#retireEphemeralArtifacts();
+				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 				managedTransition?.settle();
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;
@@ -5683,7 +5683,7 @@ export class SessionManager {
 				managedTransition?.adopt();
 				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 				this.#commitResidentTextStoreTransition(prepared);
-				this.#retireEphemeralArtifacts();
+				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 			} catch (error) {
 				managedTransition?.rollback();
 				this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
@@ -8164,6 +8164,11 @@ export class SessionManager {
 		})();
 		void cleanup.catch(() => {});
 		this.#ephemeralArtifactCleanups.add(cleanup);
+	}
+
+	/** Retire predecessor ephemeral artifacts after an outer logical transition commits. */
+	retireEphemeralArtifactsAfterTransition(): void {
+		this.#retireEphemeralArtifacts();
 	}
 
 	async #drainEphemeralArtifactCleanups(): Promise<void> {
