@@ -84,6 +84,7 @@ function createHandlerContext(ctx: ExtensionContext, signal: AbortSignal): Exten
 	descriptors.signal = {
 		configurable: true,
 		enumerable: true,
+		writable: true,
 		value: signal,
 	};
 	return Object.defineProperties({}, descriptors) as ExtensionContext;

@@ -647,7 +647,7 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("handler timeouts", () => {
-		it("preserves live context accessors while attaching a handler abort signal", async () => {
+		it("preserves live context accessors and writable signal semantics", async () => {
 			let currentModel = { id: "first-model" };
 			const observedModels: string[] = [];
 			const extension = {
@@ -658,6 +658,18 @@ describe("ExtensionRunner", () => {
 						[
 							async (_event: unknown, ctx: ExtensionContext) => {
 								expect(ctx.signal).toBeInstanceOf(AbortSignal);
+								const descriptor = Object.getOwnPropertyDescriptor(ctx, "signal");
+								expect(descriptor).toMatchObject({
+									configurable: true,
+									enumerable: true,
+									value: ctx.signal,
+									writable: true,
+								});
+								const replacementSignal = new AbortController().signal;
+								expect(() => {
+									ctx.signal = replacementSignal;
+								}).not.toThrow();
+								expect(ctx.signal).toBe(replacementSignal);
 								observedModels.push(ctx.model?.id ?? "missing");
 								currentModel = { id: "second-model" };
 								observedModels.push(ctx.model?.id ?? "missing");
