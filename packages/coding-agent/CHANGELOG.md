@@ -8,7 +8,7 @@
 
 ### Added
 
-- Added a verified, copy-installable `ooo` bridge example: `ooo interview` renders Ouroboros MCP questions in GJC, correlates ordinary follow-up answers by session ID, cancellation-fences late timeout settlement, releases dead transports and built-in controls, honors `OUROBOROS_CLI`, and loads as a dependency-free one-file extension in compiled binaries (#3803).
+- Added a verified, copy-installable `ooo` bridge example: `ooo interview` renders Ouroboros MCP questions in GJC, serializes startup and follow-up answers by session ID, cancellation-fences late settlement, disposes state on GJC session changes and `/clear`, releases dead transports and controls, honors `OUROBOROS_CLI`, and loads dependency-free in compiled binaries (#3803).
 
 ### Fixed
 

@@ -48,6 +48,8 @@ Runner timeout aborts the handler context signal. The bridge passes that signal 
 
 Slash-prefixed UI commands bypass interview capture. The bare continue controls `.` and `c` also remain GJC controls; other ordinary text remains a valid interview answer.
 
+The installed example also registers `session_switch` disposal because GJC reuses one `ExtensionRunner` across `/new`, `/drop`, resume, and fork transitions. Session-changing input controls reset immediately, including `/clear`, and the lifecycle hook covers identity changes initiated outside the input path. Interview startup and continuation calls share one FIFO operation chain: a second submission during startup is claimed and waits for the session ID, while overlapping answers issue one MCP call at a time against the latest settled state.
+
 ## Recursion guard
 
 Before command dispatch, the exact-prefix helper increments the Ouroboros bridge recursion-depth environment variable and restores its previous value after dispatch finishes. A current numeric depth of `0` or `1` is dispatchable. A current numeric depth greater than `1`, or any non-empty non-numeric value, returns `{}` without dispatching. The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
@@ -67,10 +69,10 @@ ouroboros setup --runtime gjc
 
 ### Verified GJC bridge installation
 
-Ouroboros setup installs its own managed GJC bridge. Replace it with the standalone GJC bridge from immutable commit `c2c8e417d97f542c46881df9787baa967da684ed`, whose example file has SHA-256 `a270146136b6443a31aa5073923a9605246abe48a5921fffe1ce0b0aaea37a3f`:
+Ouroboros setup installs its own managed GJC bridge. Replace it with the standalone GJC bridge from immutable commit `4b07ee81675d16b81fd5eeb9645042d8fc307c3a`, whose example file has SHA-256 `2b0e1e25ac145331f112da629076875542db6f6e63c3c17adcd6770a4dcaf7bd`:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/c2c8e417d97f542c46881df9787baa967da684ed/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
+curl -fL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/4b07ee81675d16b81fd5eeb9645042d8fc307c3a/packages/coding-agent/examples/extensions/ooo-bridge.ts -o /tmp/gjc-ooo-bridge.ts
 shasum -a 256 /tmp/gjc-ooo-bridge.ts
 mkdir -p "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge" && cp /tmp/gjc-ooo-bridge.ts "${HOME}/${GJC_CONFIG_DIR:-.gjc}/agent/extensions/ouroboros-ooo-bridge/index.ts"
 ```
