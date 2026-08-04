@@ -2,17 +2,32 @@
  * Configure Telegram, Discord, or Slack notifications.
  */
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { type NotifyAction, type NotifyCommandArgs, runNotifyCliCommand } from "../cli/notify-cli";
+import {
+	assertStrictActivateThreadInvocation,
+	assertStrictBindThreadInvocation,
+	type NotifyAction,
+	type NotifyCommandArgs,
+	runNotifyCliCommand,
+} from "../cli/notify-cli";
 import { initTheme } from "../modes/theme/theme";
 
-const ACTIONS: NotifyAction[] = ["setup", "status", "health", "test", "recovery", "daemon-internal"];
+const ACTIONS: NotifyAction[] = [
+	"setup",
+	"status",
+	"health",
+	"test",
+	"recovery",
+	"bind-thread",
+	"activate-thread",
+	"daemon-internal",
+];
 
 export default class Notify extends Command {
 	static description = "Configure Telegram, Discord, or Slack notifications";
 
 	static args = {
 		action: Args.string({
-			description: "Notify action (setup|status|health|test|recovery|daemon-internal)",
+			description: "Notify action (setup|status|health|test|recovery|bind-thread|activate-thread|daemon-internal)",
 			required: false,
 		}),
 		extra: Args.string({
@@ -46,6 +61,8 @@ export default class Notify extends Command {
 		}),
 		probe: Flags.boolean({ description: "notify health: run the selected provider's REST diagnostic" }),
 		message: Flags.string({ description: "notify test: custom message body" }),
+		"session-id": Flags.string({ description: "Live GJC session to bind to an existing Slack thread" }),
+		"thread-ts": Flags.string({ description: "Existing Slack root thread timestamp" }),
 		"owner-id": Flags.string({ description: "Internal: daemon owner id" }),
 		"agent-dir": Flags.string({ description: "Internal: agent dir for the daemon" }),
 	};
@@ -105,8 +122,15 @@ export default class Notify extends Command {
 			redact: Boolean(flags.redact),
 			probe: Boolean(flags.probe),
 			message: flags.message as string | undefined,
+			sessionId: flagRec["session-id"] as string | undefined,
+			threadTs: flagRec["thread-ts"] as string | undefined,
 		};
 
+		// `bind-thread` and `activate-thread` have no positional or internal form:
+		// any extra argument or unrelated notify flag is rejected here rather than
+		// silently ignored.
+		if (action === "bind-thread") assertStrictBindThreadInvocation(cmd);
+		if (action === "activate-thread") assertStrictActivateThreadInvocation(cmd);
 		if (action !== "daemon-internal") await initTheme();
 		await runNotifyCliCommand(cmd);
 	}

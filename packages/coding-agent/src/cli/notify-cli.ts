@@ -7,6 +7,7 @@ import { createInterface } from "node:readline/promises";
 import { APP_NAME } from "@gajae-code/utils/dirs";
 import chalk from "chalk";
 import { Settings, type SettingsAtomicPatch } from "../config/settings";
+import { SessionIndex } from "../sdk/broker/session-index";
 import {
 	ChatDaemonController,
 	type EnsureChatDaemonResult,
@@ -14,6 +15,7 @@ import {
 	ensureSlackDaemon,
 } from "../sdk/bus/chat-daemon-control";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../sdk/bus/config";
+import { type ActivatedPreparedSession, activatePreparedSession } from "../sdk/bus/existing-thread-readiness";
 import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
@@ -37,6 +39,12 @@ import {
 	sendNotificationTest,
 } from "../sdk/bus/notification-service";
 import {
+	type BoundSlackThread,
+	bindConfiguredSlackThread,
+	isBoundedSlackRootTs,
+	SlackThreadBindingError,
+} from "../sdk/bus/slack-thread-binding";
+import {
 	type EnsureTelegramDaemonDetailedResult,
 	ensureTelegramDaemonRunningDetailed,
 	resolveTelegramSetupPreflight,
@@ -49,7 +57,15 @@ import {
 	type TelegramSetupTimers,
 } from "../sdk/bus/telegram-setup";
 
-export type NotifyAction = "setup" | "status" | "health" | "test" | "recovery" | "daemon-internal";
+export type NotifyAction =
+	| "setup"
+	| "status"
+	| "health"
+	| "test"
+	| "recovery"
+	| "bind-thread"
+	| "activate-thread"
+	| "daemon-internal";
 export type NotifySetupProvider = "telegram" | "discord" | "slack";
 
 export interface NotifyCommandArgs {
@@ -72,6 +88,8 @@ export interface NotifyCommandArgs {
 	forceDaemonLock?: boolean;
 	probe?: boolean;
 	message?: string;
+	sessionId?: string;
+	threadTs?: string;
 }
 
 export interface NotifyCommandDeps {
@@ -99,6 +117,8 @@ export interface NotifyCommandDeps {
 	setupPidIncarnation?: (pid: number) => string | undefined;
 	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<EnsureChatDaemonResult>;
 	ensureTelegramDaemon?: (settings: Settings) => Promise<EnsureTelegramDaemonDetailedResult>;
+	bindSlackThread?: (input: { settings: Settings; sessionId: string; threadTs: string }) => Promise<BoundSlackThread>;
+	activatePreparedSession?: (input: { settings: Settings; sessionId: string }) => Promise<ActivatedPreparedSession>;
 }
 
 export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
@@ -200,6 +220,23 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 			? { action, rawArgs: args.slice(2), forceDaemonLock: flags.get("--force-daemon-lock") === true }
 			: undefined;
 	}
+	if (action === "bind-thread") {
+		const rest = args.slice(2);
+		const flags = parseFlags(rest, new Set(["--session-id", "--thread-ts"]), new Set());
+		if (!flags) return undefined;
+		const sessionId = flags.get("--session-id");
+		const threadTs = flags.get("--thread-ts");
+		if (typeof sessionId !== "string" || typeof threadTs !== "string") return undefined;
+		return { action, rawArgs: rest, sessionId, threadTs };
+	}
+	if (action === "activate-thread") {
+		const rest = args.slice(2);
+		const flags = parseFlags(rest, new Set(["--session-id"]), new Set());
+		if (!flags) return undefined;
+		const sessionId = flags.get("--session-id");
+		if (typeof sessionId !== "string") return undefined;
+		return { action, rawArgs: rest, sessionId };
+	}
 	if (action === "daemon-internal") {
 		return {
 			action,
@@ -231,6 +268,12 @@ export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyComma
 			return;
 		case "recovery":
 			await runRecovery(deps, cmd.forceDaemonLock);
+			return;
+		case "bind-thread":
+			await runBindThread(cmd, deps);
+			return;
+		case "activate-thread":
+			await runActivateThread(cmd, deps);
 			return;
 		case "daemon-internal":
 			if (cmd.smoke) {
@@ -766,6 +809,143 @@ async function runRecovery(deps: NotifyCommandDeps, forceDaemonLock = false): Pr
 	process.stdout.write(`${formatNotificationRecoveryReport(report)}\n`);
 }
 
+/** Target and credential inputs stay owned by `notify setup`; binding never re-routes a session elsewhere. */
+const BIND_THREAD_REJECTED_INPUTS: readonly (keyof NotifyCommandArgs)[] = [
+	"provider",
+	"token",
+	"chatId",
+	"discordBotToken",
+	"discordApplicationId",
+	"discordGuildId",
+	"discordParentChannelId",
+	"slackBotToken",
+	"slackAppToken",
+	"slackWorkspaceId",
+	"slackChannelId",
+	"slackAuthorizedUserId",
+	"message",
+	"probe",
+	"redact",
+	"forceDaemonLock",
+	"smoke",
+];
+
+export interface BindThreadInvocation {
+	sessionId: string;
+	threadTs: string;
+}
+
+/**
+ * Enforce the exact `bind-thread` grammar at every entrypoint.
+ *
+ * The command accepts only a session and a root; a positional argument, an
+ * unrelated notify flag, or a target/credential input is a rejection rather than
+ * something silently ignored, so no other invocation shape can reach the
+ * binding authority.
+ */
+export function assertStrictBindThreadInvocation(cmd: NotifyCommandArgs): BindThreadInvocation {
+	const rejected = BIND_THREAD_REJECTED_INPUTS.filter(key => {
+		const value = cmd[key];
+		return value !== undefined && value !== false && value !== "";
+	});
+	if (rejected.length > 0)
+		throw new Error(
+			`notify bind-thread accepts only --session-id and --thread-ts (rejected: ${rejected.join(", ")}).`,
+		);
+	const { sessionId, threadTs } = cmd;
+	if (!sessionId || !threadTs) throw new Error("notify bind-thread requires --session-id and --thread-ts.");
+	const allowed = new Set(["--session-id", sessionId, "--thread-ts", threadTs]);
+	const stray = cmd.rawArgs.filter(token => !allowed.has(token));
+	if (stray.length > 0)
+		throw new Error(`notify bind-thread does not accept additional arguments (rejected: ${stray.join(", ")}).`);
+	if (!isBoundedSlackRootTs(threadTs))
+		throw new SlackThreadBindingError(
+			"invalid_root",
+			"Slack root timestamp must be a bounded <seconds>.<fraction> message timestamp.",
+		);
+	return { sessionId, threadTs };
+}
+
+/** Adopt an existing Slack thread for a live session; the operator supplies only session and root identity. */
+async function runBindThread(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
+	const { sessionId, threadTs } = assertStrictBindThreadInvocation(cmd);
+	const bind = deps.bindSlackThread ?? (input => bindConfiguredSlackThread(input));
+	const bound = await bind({ settings: await getSettings(deps), sessionId, threadTs });
+	process.stdout.write(`${formatBoundSlackThread(bound)}\n`);
+}
+
+/** Confirmation carries identifiers only: no tokens, message bodies, or control secrets. */
+export function formatBoundSlackThread(bound: BoundSlackThread): string {
+	return [
+		`${chalk.green("Bound")} Slack thread for session ${bound.sessionId}`,
+		`  session generation: ${bound.endpointGeneration}`,
+		`  workspace/channel:  ${bound.teamId}/${bound.channelId}`,
+		`  thread root:        ${bound.rootTs}`,
+		`  daemon owner:       ${bound.ownerId} (generation ${bound.daemonGeneration})`,
+	].join("\n");
+}
+
+/** Activation carries only a session; a root or target here is a rejection, not an override. */
+const ACTIVATE_THREAD_REJECTED_INPUTS: readonly (keyof NotifyCommandArgs)[] = [
+	...BIND_THREAD_REJECTED_INPUTS,
+	"threadTs",
+];
+
+export interface ActivateThreadInvocation {
+	sessionId: string;
+}
+
+/**
+ * Enforce the exact `activate-thread` grammar at every entrypoint.
+ *
+ * Activation names one prepared session and nothing else: the root it adopts is
+ * already the applied binding, so a supplied root, target, or credential is a
+ * rejection rather than something silently ignored.
+ */
+export function assertStrictActivateThreadInvocation(cmd: NotifyCommandArgs): ActivateThreadInvocation {
+	const rejected = ACTIVATE_THREAD_REJECTED_INPUTS.filter(key => {
+		const value = cmd[key];
+		return value !== undefined && value !== false && value !== "";
+	});
+	if (rejected.length > 0)
+		throw new Error(`notify activate-thread accepts only --session-id (rejected: ${rejected.join(", ")}).`);
+	const { sessionId } = cmd;
+	if (!sessionId) throw new Error("notify activate-thread requires --session-id.");
+	const allowed = new Set(["--session-id", sessionId]);
+	const stray = cmd.rawArgs.filter(token => !allowed.has(token));
+	if (stray.length > 0)
+		throw new Error(`notify activate-thread does not accept additional arguments (rejected: ${stray.join(", ")}).`);
+	return { sessionId };
+}
+
+/**
+ * Publish the readiness a prepared session withheld.
+ *
+ * The session's own host owns the decision: this command only proves discovery
+ * authority and asks it to activate, so activation before a binding exists is
+ * refused by the session rather than forced by the operator.
+ */
+async function runActivateThread(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
+	const { sessionId } = assertStrictActivateThreadInvocation(cmd);
+	const activate =
+		deps.activatePreparedSession ??
+		(async (input: { settings: Settings; sessionId: string }) =>
+			await activatePreparedSession({
+				sessionIndex: await new SessionIndex(input.settings.getAgentDir()).open(),
+				sessionId: input.sessionId,
+			}));
+	const activated = await activate({ settings: await getSettings(deps), sessionId });
+	process.stdout.write(`${formatActivatedSession(activated)}\n`);
+}
+
+/** Confirmation carries identifiers only: no endpoints, tokens, or thread content. */
+export function formatActivatedSession(activated: ActivatedPreparedSession): string {
+	return [
+		`${chalk.green("Activated")} session ${activated.sessionId} (${activated.status})`,
+		`  session generation: ${activated.endpointGeneration}`,
+	].join("\n");
+}
+
 export function printNotifyHelp(): void {
 	process.stdout.write(`${chalk.bold(`${APP_NAME} notify`)} - Configure Telegram, Discord, or Slack notifications
 
@@ -782,6 +962,8 @@ ${chalk.bold("Usage:")}
   ${APP_NAME} notify health [--provider telegram|discord|slack] [--probe]
   ${APP_NAME} notify test [--provider telegram|discord|slack] [--message <text>]
   ${APP_NAME} notify recovery [--force-daemon-lock]
+  ${APP_NAME} notify bind-thread --session-id <sessionId> --thread-ts <rootTs>
+  ${APP_NAME} notify activate-thread --session-id <sessionId>
 
 ${chalk.bold("Subcommands:")}
   setup     Pair Telegram or atomically save and activate complete Discord/Slack settings
@@ -789,6 +971,8 @@ ${chalk.bold("Subcommands:")}
   health    Report selected provider state; --probe uses REST only and never opens Gateway/Socket Mode
   test      Send a one-off test through one selected or uniquely effective provider
   recovery  Clear dead-owner daemon locks and stale per-session endpoint files (never touches a live owner); --force-daemon-lock retries only with the same fail-closed dead-owner proof
+  bind-thread      Adopt an existing Slack thread as a live session's root; target and credentials come from setup only
+  activate-thread  Publish the readiness a prepared session withheld once its thread binding is applied
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} notify setup
@@ -799,6 +983,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} notify health --provider discord --probe
   ${APP_NAME} notify test --provider slack --message "hello from gjc"
   ${APP_NAME} notify recovery
+  ${APP_NAME} notify bind-thread --session-id 01J... --thread-ts 1785573662.132329
+  ${APP_NAME} notify activate-thread --session-id 01J...
 
 ${chalk.bold("Threaded Mode:")}
   GJC uses Telegram private-chat topics for per-session threads. Setup verifies the bot

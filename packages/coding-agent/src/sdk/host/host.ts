@@ -4,6 +4,42 @@ import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types"
 
 export type SdkRequestObserver = (kind: "control" | "query", connectionId: string, frame: SdkFrame) => void;
 
+/**
+ * When a session publishes its replayable readiness signal.
+ *
+ * `immediate` is the stock contract: `start()` publishes `session_ready` at
+ * once, so a chat daemon that attaches (or replays late) surfaces the session
+ * and creates its stock root. `deferred` prepares the session instead: the
+ * session id, endpoint, and broker registration become discoverable authority,
+ * but no readiness exists for any consumer to act on until `activate()` runs.
+ * That ordering is what lets an operator adopt an existing chat root before the
+ * daemon would otherwise have published one of its own.
+ */
+export type SessionReadinessMode = "immediate" | "deferred";
+
+/**
+ * Replayable signal that a deferred session is fully initialized and holding
+ * endpoint authority while its readiness stays withheld.
+ *
+ * It is deliberately not `session_ready`: a broker lifecycle wait can
+ * authenticate it as the child's semantic completion receipt, while every
+ * readiness consumer — chat daemons above all — keeps ignoring it and publishes
+ * no root until the session is explicitly activated.
+ */
+export const SESSION_PREPARED_EVENT = "session_prepared";
+
+/** Every terminal answer an activation attempt can produce. */
+export type SessionActivationOutcome =
+	| "activated"
+	| "already"
+	| "not_prepared"
+	| "generation_changed"
+	| "not_authorized"
+	| "authority_unavailable";
+
+/** Proves that a prepared session may publish readiness at this exact generation. */
+export type SessionActivationGate = (input: { sessionId: string; generation: number }) => boolean | Promise<boolean>;
+
 export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	control?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
@@ -23,11 +59,31 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	onReverseCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
 	/** Best-effort capabilities mirrored from the native transport for out-of-band consumers. */
 	connectionCapabilities?: (connectionId: string) => ReadonlySet<string> | undefined;
+	/** Readiness publication mode; defaults to the stock immediate contract. */
+	readiness?: SessionReadinessMode;
+	/**
+	 * Authorization for a deferred activation. It is consulted on every attempt
+	 * that would publish readiness and never on an idempotent replay, and a gate
+	 * that fails is never read as authorization.
+	 */
+	activationGate?: SessionActivationGate;
 }
 
 const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 const CAP_GATED_FRAME_KINDS = new Set(["tool_activity", "reasoning_summary"]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
+
+/** Safe, identifier-free explanations for every refused activation status. */
+const ACTIVATION_MESSAGES: Record<
+	Exclude<SessionActivationOutcome, "activated" | "already"> | "session_mismatch",
+	string
+> = {
+	not_prepared: "The session is not prepared for activation.",
+	generation_changed: "The session endpoint generation changed before activation.",
+	not_authorized: "Session activation is not authorized at this endpoint generation.",
+	authority_unavailable: "Session activation authority could not be read.",
+	session_mismatch: "The activation request addresses a different session.",
+};
 
 /** SDK hosting is independent of notification configuration. Only root sessions host an endpoint. */
 export function shouldHostSdk(_settings: unknown, isTopLevel: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
@@ -120,6 +176,10 @@ export class SessionSdkHost {
 	#stopPromise?: Promise<"stopped">;
 	#unsubscribe?: () => void;
 	#registration?: { writer: BrokerIndexWriter; generation: number };
+	/** The generation whose readiness signal has already been published. */
+	#readyGeneration?: number;
+	/** Serializes activation attempts so a concurrent pair cannot both publish. */
+	#activation: Promise<SessionActivationOutcome> = Promise.resolve("not_prepared");
 
 	constructor(options: SessionSdkHostOptions) {
 		this.#options = options;
@@ -136,6 +196,14 @@ export class SessionSdkHost {
 	}
 	get generation(): number {
 		return this.events.generation;
+	}
+	/** True while the session holds endpoint authority but has published no readiness. */
+	get prepared(): boolean {
+		return this.#started && this.#readyGeneration !== this.events.generation;
+	}
+	/** True once readiness for the current generation has been published. */
+	get ready(): boolean {
+		return this.#started && this.#readyGeneration === this.events.generation;
 	}
 	/** Current installed definitions for a live provider capability. */
 	getProviderDefinitions(capability: string): unknown | undefined {
@@ -154,7 +222,13 @@ export class SessionSdkHost {
 	async start(): Promise<"started" | "already"> {
 		if (this.#started) return "already";
 		this.events.restart();
-		this.emitEvent({ name: "session_ready", sessionId: this.#options.sessionId, generation: this.events.generation });
+		if (this.#options.readiness !== "deferred") this.#publishReadiness();
+		else
+			this.emitEvent({
+				name: SESSION_PREPARED_EVENT,
+				sessionId: this.#options.sessionId,
+				generation: this.events.generation,
+			});
 		const disposer = this.#options.onFrame((connectionId, frame) => {
 			void this.#onFrame(connectionId, frame);
 		});
@@ -167,6 +241,58 @@ export class SessionSdkHost {
 				endpointGeneration: this.events.generation,
 			});
 		return "started";
+	}
+
+	#publishReadiness(): void {
+		this.emitEvent({ name: "session_ready", sessionId: this.#options.sessionId, generation: this.events.generation });
+		this.#readyGeneration = this.events.generation;
+	}
+
+	/**
+	 * Publish the readiness signal a prepared session withheld.
+	 *
+	 * The attempt is refused unless the session is still started at exactly
+	 * `expectedGeneration` (when supplied) and the activation gate authorizes it
+	 * at that same generation. Authority is re-proved after the gate resolves,
+	 * because a stop or an endpoint roll can land while it is in flight, and an
+	 * exact retry after a successful activation is answered `already` instead of
+	 * publishing a second readiness signal.
+	 */
+	activate(expectedGeneration?: number): Promise<SessionActivationOutcome> {
+		const attempt = this.#activation.then(
+			() => this.#activateOnce(expectedGeneration),
+			() => this.#activateOnce(expectedGeneration),
+		);
+		this.#activation = attempt.then(
+			outcome => outcome,
+			() => "authority_unavailable" as const,
+		);
+		return attempt;
+	}
+
+	async #activateOnce(expectedGeneration?: number): Promise<SessionActivationOutcome> {
+		if (!this.#started) return "not_prepared";
+		const generation = this.events.generation;
+		if (expectedGeneration !== undefined && expectedGeneration !== generation) return "generation_changed";
+		if (this.#readyGeneration === generation) return "already";
+		const gate = this.#options.activationGate;
+		if (gate) {
+			let authorized: boolean;
+			try {
+				authorized = await gate({ sessionId: this.#options.sessionId, generation });
+			} catch {
+				// An unreadable authority is never an authorization.
+				return "authority_unavailable";
+			}
+			if (!authorized) return "not_authorized";
+			// The gate is asynchronous, so the session may have stopped or rolled
+			// while it ran; nothing published below may rest on the earlier proof.
+			if (!this.#started) return "not_prepared";
+			if (this.events.generation !== generation) return "generation_changed";
+			if (this.#readyGeneration === generation) return "already";
+		}
+		this.#publishReadiness();
+		return "activated";
 	}
 
 	async stop(): Promise<"stopped" | "already"> {
@@ -239,6 +365,35 @@ export class SessionSdkHost {
 						await sendTerminal();
 						await this.#options.afterControlResponse?.(connectionId, frame, response);
 					}
+					break;
+				}
+				case "session_activate": {
+					const id = requiredString(frame, "id");
+					const requestedSession = optionalString(frame, "sessionId");
+					const requestedGeneration = frame.endpointGeneration;
+					if (
+						requestedGeneration !== undefined &&
+						(typeof requestedGeneration !== "number" ||
+							!Number.isSafeInteger(requestedGeneration) ||
+							requestedGeneration <= 0)
+					)
+						throw invalidFrame("endpointGeneration must be a positive integer.");
+					// A request addressed to another session is refused before any
+					// activation authority is consulted.
+					const status: SessionActivationOutcome | "session_mismatch" =
+						requestedSession !== undefined && requestedSession !== this.#options.sessionId
+							? "session_mismatch"
+							: await this.activate(requestedGeneration as number | undefined);
+					const ok = status === "activated" || status === "already";
+					await this.#send(connectionId, {
+						type: "session_activate_result",
+						id,
+						ok,
+						status,
+						sessionId: this.#options.sessionId,
+						generation: this.events.generation,
+						...(ok ? {} : { error: { code: status, message: ACTIVATION_MESSAGES[status] } }),
+					});
 					break;
 				}
 				case "event_replay": {

@@ -122,6 +122,7 @@ Read tools:
 Mutating tools:
 
 - `gjc_coordinator_start_session`
+- `gjc_coordinator_activate_session`
 - `gjc_coordinator_register_session`
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`
@@ -133,6 +134,8 @@ Mutating tools:
 The `gjc_delegate_*` tools are high-level, session-level delegation: each starts (or reuses) an SDK-discovered session and sends one workflow-tagged turn for `/skill:ralplan`, `/skill:ultragoal`, or `/skill:team`, returning a durable `turn_id`, status, and artifact references. They use the same `sessions` mutation class and fail-closed workdir gating as `gjc_coordinator_start_session`, and emit a `delegation.started` event. Pass `await_completion: true` to use the durable bounded await/report path; `timeout_ms` and `poll_interval_ms` apply to that completion payload. Without it, the tool returns immediately after SDK acknowledgement. Pass `cwd` and `task`; set `allow_mutation: true` and a caller-provided `idempotency_key` only with startup mutation opt-in plus per-call consent. Optionally pass `mpreset` (same semantics as `gjc --mpreset <profile>`) to `gjc_coordinator_start_session` or a delegate tool to authoritatively activate a GJC model profile when starting a fresh session — it is resolved through the merged built-in/custom profile registry, applied from the first turn, and surfaced in status; unknown names are rejected with the available-profile listing, and reusing a session with a conflicting `mpreset` fails with `mpreset_conflict`. This is distinct from the advisory `model` prompt hint. Prefer these over manual `start_session` + `send_prompt` when delegating a whole workflow.
 
 `gjc_coordinator_register_session` registers an existing SDK-discoverable GJC session for coordinator control. It validates the workdir allowlist and session id, then verifies the broker's exact canonical workspace and endpoint generation before writing a credential-free session record. Optional tmux identifiers are retained only as advisory process metadata and are never machine-read.
+
+`gjc_coordinator_activate_session` publishes the readiness a prepared session withheld. Start the session with `prepare_existing_thread: true` when an existing chat thread must be adopted: the session stays live and endpoint-addressable at state `prepared`, claims no root, refuses an initial prompt, and refuses `gjc_coordinator_send_prompt` with `session_not_activated`. Bind the thread with the daemon-owned `gjc notify bind-thread --session-id <id> --thread-ts <root>` command — the Coordinator never writes a chat mapping — then activate. Activation proves the exact endpoint generation, delegates the decision to the session's own activation gate (`not_bound` while no binding exists), is idempotent on replay, and moves durable state to `ready_for_input` only after the session proves `activated` or `already`.
 ## Turn orchestration flow
 
 External coordinators should treat turns, not terminal scrollback, as the unit of work:

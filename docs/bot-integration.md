@@ -103,6 +103,7 @@ Read-only tools:
 Mutating tools:
 
 - `gjc_coordinator_start_session`
+- `gjc_coordinator_activate_session`
 - `gjc_coordinator_register_session`
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`
@@ -133,6 +134,41 @@ Call `gjc_coordinator_start_session` with a canonical workdir inside `GJC_COORDI
 ```
 
 The returned payload includes `session.session_id`, `session_state`, and, when a prompt is provided, `turn_id`, `active_turn_id`, `status`, `delivery`, `queued`, and `delivered`. The top-level `status`, `queued`, and `delivered` exactly mirror the nested durable turn; `active_turn_id` is the current active turn.
+
+### Adopt an existing chat thread (prepare → bind → activate)
+
+A stock session publishes readiness immediately, so a running chat daemon surfaces it and creates its own root thread before an operator could name an existing one. To adopt an existing thread instead, start the session *prepared*:
+
+```json
+{
+  "cwd": "/path/to/repo",
+  "prepare_existing_thread": true,
+  "idempotency_key": "prepare-gjc-demo-1",
+  "allow_mutation": true
+}
+```
+
+A prepared session is live and endpoint-addressable but withholds its readiness signal, so no root is claimed. The response carries `session_id` and `state: "prepared"`, and `session_state.ready_for_input` is `false`. `prepare_existing_thread` refuses an initial `prompt`, and `gjc_coordinator_send_prompt` refuses the session with `session_not_activated` until it is activated.
+
+Preparation requires a configured, session-enabled Slack target in the selected workdir: that target plus the agent directory is what supplies the daemon-owned bind/activation authority. Without it the start fails closed with a lifecycle startup failure instead of returning a prepared session that could be activated before any thread is bound.
+
+Bind the existing thread through the daemon-owned command path, which is the only writer of chat mappings:
+
+```sh
+gjc notify bind-thread --session-id <session_id> --thread-ts <root_ts>
+```
+
+Then activate the session so it publishes the readiness it withheld:
+
+```json
+{
+  "session_id": "<session_id>",
+  "idempotency_key": "activate-gjc-demo-1",
+  "allow_mutation": true
+}
+```
+
+`gjc_coordinator_activate_session` proves the exact endpoint generation and asks the session itself to activate; the session's own gate refuses activation with `not_bound` while no binding exists at that generation. It is idempotent: an exact replay answers `already` without a second readiness signal, and durable state moves from `prepared` to `ready_for_input` only after the session proves `activated` or `already`.
 
 ### Register an SDK-discoverable session
 

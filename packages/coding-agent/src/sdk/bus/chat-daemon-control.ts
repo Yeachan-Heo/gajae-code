@@ -51,11 +51,15 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 24 / slack generation 23 apply provider-completeness and
  * effective-enable admission to chat daemon lifecycle controls. Discord
  * generation 25 / slack generation 24 apply identity-bound exact replacement
- * cleanup shared by managed-session and daemon filesystem authority.
+ * cleanup shared by managed-session and daemon filesystem authority. Discord
+ * generation 26 / slack generation 25 add the in-place operator command channel:
+ * an owner serves per-request commands inside its own serving loop and answers
+ * them against an exact owner tuple, so an owner at an earlier generation may
+ * not serve or answer a request captured against this contract.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 25,
-	slack: 24,
+	discord: 26,
+	slack: 25,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -277,6 +281,15 @@ export function chatDaemonPaths(
 		state: path.join(dir, "state.json"),
 		control: path.join(dir, "control.json"),
 	};
+}
+
+/**
+ * Configuration fingerprint that identifies which settings a daemon owner was
+ * started for. `undefined` means the current settings cannot configure that
+ * transport at all, so no owner can be authorized against them.
+ */
+export function chatDaemonIdentity(settings: Settings, kind: ChatDaemonKind): string | undefined {
+	return identityFor(settings, kind);
 }
 
 function identityFor(settings: Settings, kind: ChatDaemonKind): string | undefined {

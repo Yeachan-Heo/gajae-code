@@ -55,6 +55,12 @@ export interface SlackProviderClient {
 		clientMsgId: string;
 		threadTs?: string;
 	}): Promise<SlackMessageSearchResult | null>;
+	/**
+	 * Prove that an operator-supplied timestamp addresses a real message in the
+	 * requested channel. Adoption of an existing root is refused when a client
+	 * cannot answer this, so verification is never silently skipped.
+	 */
+	findMessageByTimestamp?(input: { channel: string; ts: string }): Promise<SlackMessageSearchResult | null>;
 	readonly transportHealthy?: boolean;
 }
 
@@ -96,5 +102,10 @@ export class SlackProvider {
 		threadTs?: string;
 	}): Promise<SlackMessageSearchResult | null> {
 		return (await this.client.findMessageByClientMsgId?.(input)) ?? null;
+	}
+
+	/** Fail-closed root verification: a client without this capability can never confirm a root. */
+	async findMessageByTimestamp(input: { channel: string; ts: string }): Promise<SlackMessageSearchResult | null> {
+		return (await this.client.findMessageByTimestamp?.(input)) ?? null;
 	}
 }

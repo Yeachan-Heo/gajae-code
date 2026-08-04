@@ -164,10 +164,38 @@ export class ConversationStore<T extends ConversationRecord> {
 
 	/** Apply a synchronous update under the mapping lock, retrying no stale state. */
 	async transact(key: string, update: (current: T | undefined) => T | undefined): Promise<T | undefined> {
+		return await this.transactWithSnapshot(key, current => update(current));
+	}
+
+	/**
+	 * Apply one key update while atomically observing every mapping in the same
+	 * store snapshot. The observation and the write share the cross-process file
+	 * lock, so a caller can enforce uniqueness constraints that span keys.
+	 *
+	 * The update may be asynchronous so a caller can re-prove local authority
+	 * (process, endpoint, or session state) inside the lock, immediately before
+	 * its commit; returning `current` unchanged aborts without any mutation. It
+	 * must never perform a remote/network call while holding the lock: the lock
+	 * is a short fence, not a place to wait on a provider.
+	 *
+	 * Authority proven by the update is the last proof before the atomic
+	 * replacement. Authority that rolls after it is an ordinary lifecycle event:
+	 * the mapping records the endpoint generation it was proven under, so a newer
+	 * generation fences it through the same monotonic compare-and-swap every
+	 * other writer uses.
+	 */
+	async transactWithSnapshot(
+		key: string,
+		update: (
+			current: T | undefined,
+			conversations: Readonly<Record<string, T>>,
+		) => T | undefined | Promise<T | undefined>,
+	): Promise<T | undefined> {
 		return this.#withLock(async () => {
 			const document = await this.#readDocument();
 			const current = document.conversations[key];
-			const next = update(current);
+			const snapshot: Readonly<Record<string, T>> = Object.freeze({ ...document.conversations });
+			const next = await update(current, snapshot);
 			if (!next || next === current) return current;
 			const expectedGeneration = current?.generation;
 			const expectedNext = (expectedGeneration ?? 0) + 1;

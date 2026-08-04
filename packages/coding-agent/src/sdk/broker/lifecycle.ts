@@ -31,6 +31,7 @@ import {
 } from "../../session/session-storage";
 import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
+import { SESSION_PREPARED_EVENT } from "../host/host";
 import {
 	type LogicalSessionCandidate,
 	listManagedSessionCandidates,
@@ -202,6 +203,16 @@ export interface SessionLifecycleTranscriptIdentity {
 	sha256: string;
 }
 
+/**
+ * When a lifecycle-managed session publishes its replayable readiness signal.
+ *
+ * `immediate` is the stock contract. `deferred` prepares the session instead:
+ * the child publishes a distinct prepared signal, keeps `session_ready`
+ * withheld, and stays unusable for input until it is explicitly activated. It
+ * is broker-issued and session-scoped precisely so a prepared session can never
+ * be produced by an inherited process-global flag.
+ */
+export type SessionLifecycleReadiness = "immediate" | "deferred";
 export interface SessionLifecycleLaunchRequest {
 	operation: "session.create" | "session.fork" | "session.resume";
 	sessionId: string;
@@ -218,6 +229,8 @@ export interface SessionLifecycleLaunchRequest {
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
 	worktree?: SessionLifecycleWorktreeTarget;
+	/** Absent means the stock immediate contract; `deferred` prepares the session. */
+	readiness?: SessionLifecycleReadiness;
 	receivedAt: number;
 	requestedReadinessTimeoutMs: number;
 	semanticReadyDeadlineAt: number;
@@ -363,6 +376,8 @@ export function readSessionLifecycleLaunchRequest(
 			now,
 		) ||
 		(request.worktree !== undefined && !isLifecycleWorktreeTarget(request.worktree)) ||
+		(request.readiness !== undefined && request.readiness !== "immediate" && request.readiness !== "deferred") ||
+		(request.readiness === "deferred" && request.operation !== "session.create") ||
 		(request.operation === "session.resume" &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
 		(request.operation === "session.fork" &&
@@ -386,6 +401,7 @@ type SessionLaunch = {
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
 	worktree?: SessionLifecycleWorktreeTarget;
+	readiness?: SessionLifecycleReadiness;
 	worktreePlan?: GjcLaunchWorktreePlan;
 };
 
@@ -2294,6 +2310,16 @@ function sameReadyAuthority(left: ReadyAuthority, right: ReadyAuthority): boolea
 	);
 }
 
+/**
+ * Wait for the child's semantic completion signal at exactly this endpoint.
+ *
+ * `session_ready` is the stock signal. A deferred launch waits on
+ * `session_prepared` instead: it is the same authenticated, replayable proof
+ * that the child finished initializing and owns its endpoint, minus the
+ * readiness no consumer may act on yet. Both are additionally bound to the
+ * owner-proved lifecycle receipt through `currentReadyAuthority`, so an
+ * endpoint file appearing on its own never satisfies either wait.
+ */
 async function waitForReady(
 	broker: Broker,
 	id: string,
@@ -2301,6 +2327,7 @@ async function waitForReady(
 	deadline: number,
 	expected: EffectMarker,
 	timing: LifecycleTiming,
+	signal: "session_ready" | typeof SESSION_PREPARED_EVENT = "session_ready",
 ): Promise<ReadinessResult> {
 	while (timing.now() < deadline) {
 		const startupFailure = await readSessionLifecycleFailure(root, id, expected);
@@ -2349,7 +2376,7 @@ async function waitForReady(
 						const frame = event as Record<string, unknown>;
 						return (
 							frame.type === "event" &&
-							frame.name === "session_ready" &&
+							frame.name === signal &&
 							frame.sessionId === id &&
 							frame.generation === authority.endpointGeneration
 						);
@@ -2446,8 +2473,28 @@ async function launchInput(
 		return fail("invalid_input", "mcpServers must contain unique valid stdio, HTTP, or SSE server definitions.");
 	const mcpServers = input.mcpServers as SessionLifecycleMcpServer[] | undefined;
 
+	/**
+	 * Prepared readiness is an explicit creation-only intent. Only the two exact
+	 * enum values are admissible, and a foreign value is refused rather than
+	 * collapsed into the stock immediate contract.
+	 */
+	if (input.readiness !== undefined && input.readiness !== "immediate" && input.readiness !== "deferred")
+		return fail("invalid_input", "readiness must be either immediate or deferred.");
+	const readiness = input.readiness as SessionLifecycleReadiness | undefined;
+	if (readiness === "deferred" && operation !== "session.create")
+		return fail("invalid_input", "readiness deferred is only supported for session.create.");
+
 	if (operation === "session.create")
-		return { id: randomUUID(), cwd, root: resolvedRoot, modelPreset, mcpServers, worktree, worktreePlan };
+		return {
+			id: randomUUID(),
+			cwd,
+			root: resolvedRoot,
+			modelPreset,
+			mcpServers,
+			worktree,
+			worktreePlan,
+			...(readiness ? { readiness } : {}),
+		};
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
 		const savedPath = text(input.sessionPath);
@@ -3107,6 +3154,7 @@ async function executeLifecycleResponse(
 			...(launch.modelPreset ? { modelPreset: launch.modelPreset } : {}),
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
+			...(launch.readiness ? { readiness: launch.readiness } : {}),
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
@@ -3161,7 +3209,15 @@ async function executeLifecycleResponse(
 		if (!child || !spawnedAuthority)
 			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
 		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
-		const readiness = await waitForReady(broker, launch.id, launch.root, readinessDeadline, spawnedAuthority, timing);
+		const readiness = await waitForReady(
+			broker,
+			launch.id,
+			launch.root,
+			readinessDeadline,
+			spawnedAuthority,
+			timing,
+			launch.readiness === "deferred" ? SESSION_PREPARED_EVENT : "session_ready",
+		);
 
 		if (readiness.kind !== "ready") {
 			const terminated = await terminateSpawnedChild(
@@ -3220,6 +3276,7 @@ async function executeLifecycleResponse(
 				sessionId: launch.id,
 				cwd: launch.cwd,
 				endpoint: verified.endpoint,
+				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
 			},
 		};

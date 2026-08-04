@@ -19,6 +19,11 @@ import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import {
+	type ActivatedPreparedSession,
+	requestPreparedSessionActivation,
+	SessionActivationError,
+} from "../sdk/session-activation";
+import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
 	resolveCoordinatorMpreset,
@@ -222,6 +227,8 @@ interface TurnRecord {
 
 type CoordinatorSessionStateValue =
 	| "booting"
+	/** Live and endpoint-addressable, but withholding readiness until activation. */
+	| "prepared"
 	| "ready_for_input"
 	| "running"
 	| "needs_user_input"
@@ -364,17 +371,39 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_start_session") {
 		return {
 			name,
-			description: "Start a broker-managed GJC session through canonical SDK lifecycle control.",
+			description:
+				"Start a broker-managed GJC session through canonical SDK lifecycle control. Set prepare_existing_thread to hold the session at prepared (endpoint-addressable, readiness withheld) so an existing chat thread can be bound before activation.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					cwd,
 					prompt: { type: "string" },
+					prepare_existing_thread: {
+						type: "boolean",
+						description:
+							"Create the session prepared instead of ready: no readiness is published and no initial prompt is accepted until gjc_coordinator_activate_session proves activation.",
+					},
 					mpreset,
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
 				},
 				required: ["cwd", "idempotency_key", "allow_mutation"],
+			},
+		};
+	}
+	if (name === "gjc_coordinator_activate_session") {
+		return {
+			name,
+			description:
+				"Activate a prepared session so it publishes the readiness it withheld. Requires the session's own proof at the exact endpoint generation, so it fails closed while no existing-thread binding has been applied.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					session_id: sessionId,
+					idempotency_key: idempotencyKey,
+					allow_mutation: allowMutation,
+				},
+				required: ["session_id", "idempotency_key", "allow_mutation"],
 			},
 		};
 	}
@@ -851,6 +880,38 @@ function boundedPublicValue(value: unknown, budget: { remaining: number }, depth
 function boundedPublicResponse(response: Record<string, unknown>): Record<string, unknown> {
 	const value = boundedPublicValue(response, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP });
 	return asRecord(value) ?? { ok: false, error: { code: "unavailable", message: "Invalid coordinator response." } };
+}
+
+/**
+ * `activation_outcome_unknown` states only that the activation's outcome could
+ * not be observed: the session may already have published the readiness the
+ * request asked for. It is the one activation answer that proves nothing, so it
+ * is returned to the caller without being sealed as a settled receipt.
+ */
+function isUnknownActivationOutcome(response: Record<string, unknown>): boolean {
+	if (response.ok !== false) return false;
+	return asRecord(response.error)?.code === "activation_outcome_unknown";
+}
+
+/**
+ * Which durable states may reach the activation proof, and which of them is
+ * already settled.
+ *
+ * Durable state is a record of what was proved, never a proof on its own. Only
+ * a `prepared` session (readiness still withheld) and a `ready_for_input` one
+ * (readiness already proved once) are activatable, and both are answered by the
+ * live session at the exact endpoint, generation, incarnation, and binding.
+ * Every other observed state — stale, booting, running, needs_user_input,
+ * completed, errored, unknown, or a missing state file — is not activatable and
+ * fails closed before any frame is sent.
+ */
+function classifyCoordinatorActivation(
+	state: CoordinatorSessionState | null,
+): { activatable: true; settled: boolean; observed: string } | { activatable: false; observed: string } {
+	const observed = state?.state ?? "unknown";
+	if (observed === "prepared") return { activatable: true, settled: false, observed };
+	if (observed === "ready_for_input") return { activatable: true, settled: true, observed };
+	return { activatable: false, observed };
 }
 
 interface RuntimePromptAcknowledgement {
@@ -2528,12 +2589,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 	}
 
+	/**
+	 * Run one mutation under its idempotency key, then seal its response as the
+	 * key's terminal replay.
+	 *
+	 * `isNonterminal` is the one exception. Sealing is correct for a decided
+	 * outcome, and wrong for a response that states only that the outcome could
+	 * not be observed: the key would answer that uncertainty forever, even once
+	 * the remote effect settled. A tool may declare such a response nonterminal,
+	 * which returns it to this caller while the receipt stays `in_progress`, so
+	 * an exact same-key retry re-runs the observation under the same request
+	 * digest. The default declares nothing nonterminal, so every other tool keeps
+	 * its existing caching, conflict, and replay behaviour unchanged.
+	 */
 	async function withToolIdempotency(
 		tool: string,
 		idempotencyKey: string,
 		canonicalArgs: Record<string, unknown>,
 		operation: () => Promise<Record<string, unknown>>,
 		recoverInProgress = false,
+		isNonterminal: (response: Record<string, unknown>) => boolean = () => false,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
@@ -2584,6 +2659,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					};
 				if (existing.state === "in_progress") {
 					const response = boundedPublicResponse(await operation().catch(error => sdkError(error)));
+					// The receipt keeps its original key and request digests, so a
+					// reused key still conflicts and a later settled answer still seals.
+					if (isNonterminal(response)) return response;
 					await writeCoordinatorIdempotencyFile(file, {
 						...existing,
 						state: "completed",
@@ -2610,6 +2688,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			};
 			await writeCoordinatorIdempotencyFile(file, started);
 			const response = boundedPublicResponse(await operation().catch(error => sdkError(error)));
+			if (isNonterminal(response)) return response;
 			await writeCoordinatorIdempotencyFile(file, {
 				...started,
 				state: "completed",
@@ -2801,6 +2880,75 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
 			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
 		return binding.endpoint;
+	}
+
+	/**
+	 * The same incarnation-bound authority `resolveSessionEndpoint` requires,
+	 * plus the exact endpoint generation the activation frame has to name. A
+	 * session whose endpoint rolled or whose workspace binding drifted is refused
+	 * here, before any activation is attempted.
+	 */
+	async function resolveSessionActivationTarget(
+		session: Record<string, unknown>,
+		idempotencyKey?: string,
+	): Promise<{ endpoint: { url: string; token: string }; endpointGeneration: number }> {
+		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
+		const cwd = optionalString(session.cwd);
+		const persistedWorkspace = optionalString(session.broker_workspace);
+		const persistedGeneration =
+			typeof session.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session.endpoint_incarnation);
+		if (!sessionId || !cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
+			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
+		const workspace = await canonicalBrokerWorkspace(cwd);
+		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
+			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
+		const binding = await exactBrokerSessionBinding(sessionId, workspace, idempotencyKey);
+		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
+		return { endpoint: binding.endpoint, endpointGeneration: binding.endpointGeneration };
+	}
+
+	/**
+	 * Ask a prepared session to publish its withheld readiness.
+	 *
+	 * The Coordinator never writes a chat mapping and never fakes a readiness
+	 * signal: it proves exact endpoint authority, then delegates to the same
+	 * activation exchange the `gjc notify activate-thread` CLI uses. The session's
+	 * own activation gate remains the authority on whether a binding exists.
+	 */
+	async function activatePreparedCoordinatorSession(
+		session: Record<string, unknown>,
+		sessionId: string,
+		idempotencyKey: string,
+	): Promise<ActivatedPreparedSession> {
+		const target = await resolveSessionActivationTarget(session, idempotencyKey);
+		let client: SdkClient;
+		try {
+			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+				target.endpoint.url,
+				target.endpoint.token,
+			);
+		} catch {
+			// Nothing was sent, so no activation can have been applied.
+			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
+		}
+		try {
+			return await requestPreparedSessionActivation(
+				{
+					request: async frame => (await client.request(frame)) as Record<string, unknown>,
+					close: async () => await client.close(),
+				},
+				sessionId,
+				target.endpointGeneration,
+			);
+		} finally {
+			await client.close().catch(() => undefined);
+		}
 	}
 
 	async function listSessions(cwd?: string): Promise<Array<Record<string, unknown>>> {
@@ -4026,10 +4174,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					};
 				}
 				const prompt = typeof args.prompt === "string" && args.prompt.length > 0 ? args.prompt : null;
+				/**
+				 * A prepared session is deliberately not ready for input: its readiness
+				 * is withheld until an operator-supplied thread is bound and activation
+				 * is proven. Accepting an initial prompt here would either be silently
+				 * dropped or delivered to a session no consumer has been told is live,
+				 * so it is refused before any broker mutation or idempotency record.
+				 */
+				const preparesExistingThread = args.prepare_existing_thread === true;
+				if (preparesExistingThread && prompt)
+					return {
+						ok: false,
+						error: {
+							code: "invalid_input",
+							message:
+								"prepare_existing_thread cannot carry an initial prompt; activate the session first, then send_prompt.",
+						},
+					};
 				const canonicalArgs = {
 					cwd,
 					mpreset: mpresetResolution.mpreset,
 					...(prompt ? { prompt } : {}),
+					...(preparesExistingThread ? { prepare_existing_thread: true } : {}),
 					allow_mutation: true,
 				};
 				return await withToolIdempotency(
@@ -4056,10 +4222,31 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										cwd,
 										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
 										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+										...(preparesExistingThread ? { readiness: "deferred" } : {}),
 									},
 									idempotencyKey,
 								),
 							);
+							/**
+							 * Preparation is only real when the broker proves it. A create that
+							 * silently published readiness would leave a live session whose root
+							 * is already claimed, so the session is closed rather than reported
+							 * as prepared.
+							 */
+							if (preparesExistingThread && created.readiness !== "prepared") {
+								const unpreparedId = optionalString(created.sessionId ?? created.session_id);
+								if (unpreparedId)
+									await brokerSession(
+										cwd,
+										"session.close",
+										{ sessionId: unpreparedId },
+										`${idempotencyKey}:unprepared-close`,
+									).catch(() => undefined);
+								throw new SdkClientError(
+									"broker_request_unavailable",
+									"SDK broker did not prepare the requested session.",
+								);
+							}
 							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
 							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
 							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd, idempotencyKey);
@@ -4076,7 +4263,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							kind: "start",
 							session: canonicalCreationSnapshot(session),
 							remote_create_key: creation.request.remote_create_key,
-							initial_state: prompt ? "running" : "ready_for_input",
+							initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
 							initial_prompt: prompt
 								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
 								: null,
@@ -4117,14 +4304,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 							return response;
 						}
-						const sessionState = await writeSessionState(namespaceDir, sessionId, "ready_for_input", {
-							live: null,
-							reason: null,
-						});
+						const sessionState = await writeSessionState(
+							namespaceDir,
+							sessionId,
+							preparesExistingThread ? "prepared" : "ready_for_input",
+							{ live: null, reason: null },
+						);
 						await appendCoordinatorEvent(namespaceDir, {
 							kind: "session.started",
 							sessionId,
-							summary: `Session ${sessionId} started through SDK lifecycle control`,
+							summary: preparesExistingThread
+								? `Session ${sessionId} prepared through SDK lifecycle control`
+								: `Session ${sessionId} started through SDK lifecycle control`,
 							payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
 						});
 						const response = {
@@ -4132,12 +4323,112 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							session: publicCoordinatorSession(session),
 							session_state: publicCoordinatorSessionState(sessionState),
 							lifecycle,
+							...(preparesExistingThread ? { session_id: sessionId, state: "prepared" as const } : {}),
 						};
 						await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
 						await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 						return response;
 					},
 					true,
+				);
+			}
+			if (name === "gjc_coordinator_activate_session") {
+				requireCoordinatorMutation(config, "sessions", args);
+				const idempotencyKey = requiredIdempotencyKey(args);
+				const sessionId = safeExternalId("session", args.session_id);
+				return await withToolIdempotency(
+					name,
+					idempotencyKey,
+					{ session_id: sessionId, allow_mutation: true },
+					async () =>
+						await withSessionTransition(sessionId, async () => {
+							const currentSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+							if (!currentSession)
+								return {
+									ok: false,
+									error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+								};
+							const before = await readSessionState(namespaceDir, sessionId);
+							/**
+							 * A settled activation is not reported from durable state alone: a
+							 * session that went stale, errored, completed, or never recorded a
+							 * state cannot be answered `already`, and even a recorded
+							 * `ready_for_input` has to be re-proved against the live session
+							 * below before it may be.
+							 */
+							const eligibility = classifyCoordinatorActivation(before);
+							if (!eligibility.activatable)
+								return {
+									ok: false,
+									session_id: sessionId,
+									state: eligibility.observed,
+									session_state: publicCoordinatorSessionState(before),
+									error: {
+										code: "session_not_activatable",
+										message: `Coordinator session is not activatable in state ${eligibility.observed}.`,
+									},
+								};
+							let activated: ActivatedPreparedSession;
+							try {
+								activated = await activatePreparedCoordinatorSession(currentSession, sessionId, idempotencyKey);
+							} catch (error) {
+								if (!(error instanceof SessionActivationError)) throw error;
+								return {
+									ok: false,
+									session_id: sessionId,
+									state: before?.state ?? "unknown",
+									session_state: publicCoordinatorSessionState(before),
+									error: { code: error.code, message: error.message },
+								};
+							}
+							/**
+							 * An already-ready session transitions nothing: the answer above is
+							 * the live session's own, proved at the exact endpoint generation
+							 * this call resolved, so durable state is neither rewritten nor
+							 * given a second readiness event.
+							 */
+							if (eligibility.settled)
+								return {
+									ok: true,
+									session_id: sessionId,
+									status: activated.status,
+									state: "ready_for_input" as const,
+									endpoint_generation: activated.endpointGeneration,
+									session_state: publicCoordinatorSessionState(before),
+								};
+							// Only a proven `activated`/`already` moves durable state to ready.
+							const sessionState = await writeSessionState(namespaceDir, sessionId, "ready_for_input", {
+								live: true,
+								reason: null,
+							});
+							await appendCoordinatorEvent(namespaceDir, {
+								kind: "session.started",
+								sessionId,
+								summary: `Session ${sessionId} activated its withheld readiness`,
+								payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
+								metadata: {
+									status: activated.status,
+									endpoint_generation: activated.endpointGeneration,
+								},
+							});
+							return {
+								ok: true,
+								session_id: sessionId,
+								status: activated.status,
+								state: "ready_for_input" as const,
+								endpoint_generation: activated.endpointGeneration,
+								session_state: publicCoordinatorSessionState(sessionState),
+							};
+						}),
+					/**
+					 * A crash between writing the receipt and settling it leaves an
+					 * in-progress activation. Recovering it is safe because every retry
+					 * re-proves the workspace, generation, and incarnation before it
+					 * sends anything, and the session answers a repeated activation
+					 * `already` rather than publishing readiness twice.
+					 */
+					true,
+					isUnknownActivationOutcome,
 				);
 			}
 			if (name === "gjc_coordinator_send_prompt") {
@@ -4164,6 +4455,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								return {
 									ok: false,
 									error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+								};
+							}
+							/**
+							 * A prepared session is not ready for input. Its readiness is still
+							 * withheld, so a prompt here would be delivered to a session no
+							 * consumer has been told is live, and (for an existing-thread
+							 * preparation) before its root binding could be applied.
+							 */
+							const preparedState = await readSessionState(namespaceDir, sessionId);
+							if (preparedState?.state === "prepared") {
+								return {
+									ok: false,
+									session_id: sessionId,
+									state: "prepared" as const,
+									error: {
+										code: "session_not_activated",
+										message: `Session ${sessionId} is prepared; activate it before sending a prompt.`,
+									},
+									session_state: publicCoordinatorSessionState(preparedState),
 								};
 							}
 							const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);

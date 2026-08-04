@@ -1834,6 +1834,7 @@ fn is_v3_frame(text: &str) -> bool {
 				| "provider_heartbeat"
 				| "lease_release"
 				| "reverse_response"
+				| "session_activate"
 		)
 	)
 }
@@ -2038,6 +2039,10 @@ mod tests {
 	#[test]
 	fn event_replay_is_a_v3_frame() {
 		assert!(is_v3_frame(r#"{"type":"event_replay","id":"replay-1"}"#));
+		// Prepared-session activation is a v3 session frame: the transport must
+		// forward it to the host instead of dropping it as an unknown message.
+		assert!(is_v3_frame(r#"{"type":"session_activate","id":"activate-1"}"#));
+		assert!(!is_v3_frame(r#"{"type":"user_message","id":"inbound-1"}"#));
 	}
 
 	#[tokio::test]

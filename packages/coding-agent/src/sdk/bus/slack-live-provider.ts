@@ -270,6 +270,22 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		return this.#findMessage(replies, input.clientMsgId, input.channel);
 	}
 
+	/**
+	 * Confirm that `ts` addresses a real message in `channel`. Slack answers
+	 * `conversations.replies` with the addressed message first; a timestamp that
+	 * is unknown, deleted, or lives in another channel produces a Web API error
+	 * instead, which surfaces as a `SlackProviderError` the caller treats as an
+	 * unverified root.
+	 */
+	async findMessageByTimestamp(input: { channel: string; ts: string }): Promise<SlackMessageSearchResult | null> {
+		const response = await this.#api("conversations.replies", { channel: input.channel, ts: input.ts, limit: "1" });
+		for (const candidate of messages(response.messages)) {
+			if (string(candidate.ts) !== input.ts) continue;
+			return { channel: string(candidate.channel) ?? input.channel, ts: input.ts, client_msg_id: undefined };
+		}
+		return null;
+	}
+
 	async #connect(generation = this.#lifecycleGeneration): Promise<void> {
 		const opened = await this.#openSocketUrl();
 		if (this.#stopped || generation !== this.#lifecycleGeneration) return;

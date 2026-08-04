@@ -172,7 +172,16 @@ export class SdkStartupCapability {
 		this.#cancelled = true;
 	}
 
-	constructor(readonly rollback?: SdkStartupRollbackTracker) {}
+	/**
+	 * The broker-issued, session-scoped readiness intent this child was launched
+	 * with. It is carried on the capability rather than read from the ambient
+	 * environment so bus wiring can never mistake an inherited process-global
+	 * flag for a broker-managed preparation.
+	 */
+	constructor(
+		readonly rollback?: SdkStartupRollbackTracker,
+		readonly readiness: "immediate" | "deferred" = "immediate",
+	) {}
 
 	normalizeFailure(phase: SdkStartupPhase, reason: SdkStartupReason, error?: unknown): SdkStartupFailure {
 		return normalizeSdkStartupFailure(phase, reason, error, lifecycleKnownSecrets());

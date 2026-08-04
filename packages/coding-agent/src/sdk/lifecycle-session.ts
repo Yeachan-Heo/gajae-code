@@ -24,6 +24,12 @@ export type CreateLifecycleAgentSessionOptions = CreateAgentSessionOptions & {
 	 * the manager's short default ceiling.
 	 */
 	mcpStartupTimeoutMs?: number;
+	/**
+	 * The broker-issued readiness intent from this session's launch request.
+	 * `deferred` prepares the session: it holds endpoint authority and publishes
+	 * a prepared signal instead of readiness until it is explicitly activated.
+	 */
+	readiness?: "immediate" | "deferred";
 };
 
 /** Internal lifecycle-only session construction with an owner-bound SDK startup result. */
@@ -31,9 +37,9 @@ export async function createLifecycleAgentSession(
 	options: CreateLifecycleAgentSessionOptions = {},
 ): Promise<CreateLifecycleAgentSessionResult> {
 	const rollback = new SdkStartupRollbackTracker();
-	const capability = new SdkStartupCapability(rollback);
+	const capability = new SdkStartupCapability(rollback, options.readiness ?? "immediate");
 	try {
-		const { mcpStartupTimeoutMs, ...sessionOptions } = options;
+		const { mcpStartupTimeoutMs, readiness: _readiness, ...sessionOptions } = options;
 		const internalOptions = {
 			...sessionOptions,
 			[lifecycleStartupCapabilityOption]: capability,

@@ -11,6 +11,11 @@ import {
 	slackConversationKey,
 } from "./slack-conversation";
 
+import { assertBoundedSlackRootTs, claimSlackThreadBinding, SlackThreadBindingError } from "./slack-thread-binding";
+
+export type { SlackThreadBindingErrorCode } from "./slack-thread-binding";
+export { SlackThreadBindingError } from "./slack-thread-binding";
+
 export class SlackEndpointBindingError extends Error {
 	constructor(message = "Slack session endpoint changed before dispatch.") {
 		super(message);
@@ -32,7 +37,12 @@ class SlackReconciledAbsentEffectError extends Error {
 
 import { type ChatEffect, ChatEffectJournal, type ChatEffectLease } from "./chat-effect-journal";
 import { SlackProviderError } from "./slack-live-provider";
-import type { SlackPostedMessage, SlackProvider, SlackSocketEnvelope } from "./slack-provider";
+import type {
+	SlackMessageSearchResult,
+	SlackPostedMessage,
+	SlackProvider,
+	SlackSocketEnvelope,
+} from "./slack-provider";
 
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
@@ -43,6 +53,12 @@ export interface SlackEndpoint extends SdkSessionEndpoint {
 
 export interface SlackSdkClient {
 	send(frame: Record<string, unknown>): void;
+}
+
+/** Proven right to bind one session at one endpoint generation. */
+export interface SlackBindingAuthority {
+	sessionId: string;
+	endpointGeneration: number;
 }
 
 export interface SlackNotificationDaemonOptions {
@@ -62,6 +78,12 @@ export interface SlackNotificationDaemonOptions {
 	publicationLeaseMs?: number;
 
 	resolveEndpoint?: (sessionId: string) => Promise<SlackEndpoint | null>;
+	/**
+	 * Exact discovery/attachment authority for adopting an existing root. The
+	 * runtime supplies index, endpoint, and attachment proof; without it only the
+	 * resolvable endpoint generation can be proven.
+	 */
+	resolveBindingAuthority?: (sessionId: string) => Promise<SlackBindingAuthority | undefined>;
 	createClient: (endpoint: SlackEndpoint) => SlackSdkClient;
 	onCommand?: (
 		sessionId: string,
@@ -348,6 +370,76 @@ export class SlackNotificationDaemon {
 		return (await this.#postRoot(sessionId, body, endpointGeneration)).conversation;
 	}
 
+	/**
+	 * Adopt an operator-supplied root in the configured workspace and channel
+	 * without publishing a replacement root.
+	 *
+	 * The root is verified against the provider before any lock is taken, and the
+	 * claim re-proves session authority inside the store lock. When the caller is
+	 * the daemon command channel it also supplies `commitAuthority`, which
+	 * re-proves the exact daemon owner tuple and takes terminal request
+	 * authority in the same fence, so an ownership change or a cancellation
+	 * between dispatch and commit leaves the store untouched. The claim targets
+	 * the same session key stock publication uses, so a concurrent first
+	 * notification observes the adopted root instead of posting a second one.
+	 */
+	async bindExistingRoot(
+		sessionId: string,
+		rootTs: string,
+		commitAuthority?: () => Promise<boolean>,
+	): Promise<SlackConversation> {
+		assertBoundedSlackRootTs(rootTs);
+		const authority = await this.#bindingAuthority(sessionId);
+		if (!authority)
+			throw new SlackThreadBindingError(
+				"session_not_live",
+				"Slack thread binding requires an exact live session endpoint.",
+			);
+		await this.#verifyExistingRoot(rootTs);
+		return await claimSlackThreadBinding({
+			store: this.store,
+			key: this.#intentKey(sessionId),
+			teamId: this.options.teamId,
+			channelId: this.options.channelId,
+			sessionId,
+			rootTs,
+			endpointGeneration: authority.endpointGeneration,
+			revalidate: async () => {
+				if ((await this.#bindingAuthority(sessionId))?.endpointGeneration !== authority.endpointGeneration)
+					return false;
+				return commitAuthority ? await commitAuthority() : true;
+			},
+			now: this.#now,
+		});
+	}
+
+	/**
+	 * Endpoint authority for a binding. The runtime injects exact discovery and
+	 * attachment authority; the fallback accepts only a resolvable endpoint with a
+	 * usable generation, which is all a directly constructed daemon can prove.
+	 */
+	async #bindingAuthority(sessionId: string): Promise<SlackBindingAuthority | undefined> {
+		if (this.options.resolveBindingAuthority) return await this.options.resolveBindingAuthority(sessionId);
+		const endpoint = await this.#resolveEndpoint(sessionId);
+		if (!endpoint || !Number.isSafeInteger(endpoint.generation) || endpoint.generation <= 0) return undefined;
+		return { sessionId, endpointGeneration: endpoint.generation };
+	}
+
+	/** Prove the operator-supplied root exists in the configured channel before persisting anything. */
+	async #verifyExistingRoot(rootTs: string): Promise<void> {
+		let found: SlackMessageSearchResult | null;
+		try {
+			found = await this.options.provider.findMessageByTimestamp({ channel: this.options.channelId, ts: rootTs });
+		} catch {
+			throw new SlackThreadBindingError(
+				"provider_unavailable",
+				"Slack could not be reached to verify the existing thread root.",
+			);
+		}
+		if (!found || found.ts !== rootTs || found.channel !== this.options.channelId)
+			throw new SlackThreadBindingError("root_not_found", "The Slack root was not found in the configured channel.");
+	}
+
 	async #postRoot(sessionId: string, body: string, endpointGeneration?: number): Promise<SlackRootPublication> {
 		const endpoint = await this.#resolveEndpoint(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
@@ -394,11 +486,14 @@ export class SlackNotificationDaemon {
 				inboundDispatches: current?.inboundDispatches ?? [],
 			};
 		});
-		if (!pending?.clientMsgId) throw new Error("Unable to persist Slack root post intent");
-		if (pending.state === "active") {
+		// An already-active session root is authoritative whether this daemon
+		// published it or adopted an operator-supplied one, so it is checked before
+		// the publication identity a claim of our own would have written.
+		if (pending?.state === "active" && pending.rootTs) {
 			if (pending.endpointGeneration !== generation) throw new SlackEndpointBindingError();
 			return { conversation: pending, created: false };
 		}
+		if (!pending?.clientMsgId) throw new Error("Unable to persist Slack root post intent");
 		if (!claimed)
 			return { conversation: await this.#waitForRoot(pendingKey, sessionId, body, generation), created: false };
 		if (pending.endpointGeneration !== generation) throw new SlackEndpointBindingError();
@@ -498,7 +593,7 @@ export class SlackNotificationDaemon {
 			bodyWasUsedAsRoot = publication.created;
 		}
 		if (!conversation.rootTs) return conversation;
-		const key = this.#intentKey(sessionId);
+		const key = usedExistingRoot && existing ? existing.key : this.#intentKey(sessionId);
 		const conversationGeneration = this.#requireEndpointGeneration(conversation);
 		if (conversationGeneration !== generation) throw new SlackEndpointBindingError();
 		if (bodyWasUsedAsRoot) {

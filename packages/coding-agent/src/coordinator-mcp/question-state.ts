@@ -6,6 +6,8 @@ import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec"
 
 export type CoordinatorSessionState =
 	| "booting"
+	/** Live and endpoint-addressable, but withholding readiness until activation. */
+	| "prepared"
 	| "ready_for_input"
 	| "running"
 	| "needs_user_input"

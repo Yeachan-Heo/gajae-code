@@ -79,6 +79,7 @@ import {
 	getCurrentTelegramActivationMarker,
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
+	isSlackComplete,
 	type NotificationConfig,
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
@@ -90,6 +91,12 @@ import {
 	runIdentityControlSuccessPath,
 	type TerminalSendOutcome,
 } from "./control-drain-lease";
+import { ConversationStore } from "./conversation-store";
+import {
+	createSlackBindingActivationGate,
+	EXISTING_THREAD_BIND_ENV,
+	isExistingThreadBindingRequested,
+} from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
@@ -97,6 +104,7 @@ import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
 import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
+import type { SlackConversation } from "./slack-conversation";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
@@ -3514,6 +3522,8 @@ export function createNotificationsExtension(
 		const sdkEnabledForSession =
 			(options.sdkHostModeSupported ?? true) && shouldHostSdk(settings, isNotificationEligibleContext(ctx));
 		const lifecycleRequired = lifecycleStartupCapability !== undefined;
+		/** The broker-issued readiness intent for this exact lifecycle-managed session. */
+		const lifecycleReadiness = lifecycleStartupCapability?.readiness ?? "immediate";
 		const failLifecycleStartup = (
 			reason: "disabled" | "ineligible" | "failed",
 			error?: unknown,
@@ -4277,10 +4287,70 @@ export function createNotificationsExtension(
 			}
 		};
 
+		/**
+		 * Existing-thread preparation.
+		 *
+		 * A prepared session withholds its readiness signal so
+		 * `gjc notify bind-thread` can adopt an operator-supplied Slack root before
+		 * any stock root is published; activation then publishes readiness once and
+		 * the daemon adopts that root.
+		 *
+		 * Preparation has exactly two authorities, and they never overlap. A
+		 * broker lifecycle-managed session is prepared only by the broker-issued,
+		 * session-scoped readiness intent on its launch request, which the
+		 * lifecycle wait completes on the prepared signal instead of readiness. A
+		 * manual/source session keeps the explicit `GJC_NOTIFY_BIND_EXISTING_THREAD`
+		 * opt-in, which is refused for lifecycle-managed sessions so an inherited
+		 * process-global flag can never silently defer a broker-created session.
+		 *
+		 * The activation gate is the existing-thread bind authority itself: it
+		 * proves a daemon-owned mapping exists at this exact endpoint generation,
+		 * so activation before a binding fails closed with no grace period. It can
+		 * only be built from a configured, enabled Slack target plus the agent
+		 * directory holding that mapping, so a preparation request that cannot
+		 * produce one has no bind authority at all and is refused here. Degrading
+		 * such a request to ordinary immediate readiness would answer "prepare" with
+		 * a session that publishes its own root anyway, and preparing without the
+		 * gate would hand back a prepared session that activates with no binding.
+		 */
+		const preparationAgentDir = settings?.getAgentDir?.();
+		const slackBindTarget =
+			notificationsEnabledForSession && isSlackComplete(cfg)
+				? { teamId: cfg.slack.workspaceId, channelId: cfg.slack.channelId }
+				: undefined;
+		const envRequestsPreparation = isExistingThreadBindingRequested(process.env);
+		if (envRequestsPreparation && lifecycleRequired)
+			return failLifecycleStartup(
+				"failed",
+				`${EXISTING_THREAD_BIND_ENV}=1 is not supported for broker lifecycle-managed sessions; use the broker readiness intent.`,
+			);
+		const preparesExistingThread = lifecycleRequired ? lifecycleReadiness === "deferred" : envRequestsPreparation;
+		const activationGate =
+			preparesExistingThread && preparationAgentDir && slackBindTarget
+				? createSlackBindingActivationGate({
+						store: new ConversationStore<SlackConversation>({ agentDir: preparationAgentDir, kind: "slack" }),
+						teamId: slackBindTarget.teamId,
+						channelId: slackBindTarget.channelId,
+					})
+				: undefined;
+		if (preparesExistingThread && !activationGate) {
+			const missing = slackBindTarget
+				? "an agent directory"
+				: "a configured Slack notification target for this session";
+			if (lifecycleRequired)
+				return failLifecycleStartup(
+					"failed",
+					`Existing-thread preparation requires ${missing} to prove the existing-thread binding.`,
+				);
+			throw new Error(`${EXISTING_THREAD_BIND_ENV}=1 requires ${missing} to prove the existing-thread binding.`);
+		}
+
 		host = new SessionSdkHost({
 			sessionId: id,
 			stateRoot,
 			token,
+			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
+			...(activationGate ? { activationGate } : {}),
 			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
