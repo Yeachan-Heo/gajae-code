@@ -100,6 +100,26 @@ describe("non-persistent session artifacts", () => {
 		}
 	});
 
+	it("rejects unsafe scanned numeric IDs without retrying forever", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-artifact-unsafe-id-"));
+		try {
+			await Bun.write(path.join(root, ".artifact-id-9007199254740992"), "");
+			const manager = new ArtifactManager(root);
+			const outcome = await Promise.race([
+				manager.save("must not publish", "bash").then(
+					() => new Error("unsafe artifact ID unexpectedly published"),
+					error => error,
+				),
+				Bun.sleep(250).then(() => new Error("unsafe artifact ID allocation timed out")),
+			]);
+			expect(outcome).toBeInstanceOf(Error);
+			expect((outcome as Error).message).toBe("artifact_id_out_of_range");
+			expect((await fs.readdir(root)).sort()).toEqual([".artifact-id-9007199254740992"]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("retires predecessor artifacts only after an existing-session transition commits", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-existing-session-artifacts-"));
 		const predecessor = SessionManager.inMemory(cwd, new FileSessionStorage());

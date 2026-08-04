@@ -4765,6 +4765,7 @@ interface SessionManagerStateSnapshot {
 	needsFullRewriteOnNextPersist: boolean;
 	fileEntries: FileEntry[];
 	materializedFileEntries: FileEntry[];
+	adoptedArtifactManager: ArtifactManager | null;
 }
 
 /** Benchmark-derived cap for strong materialized session snapshots. */
@@ -5363,6 +5364,7 @@ export class SessionManager {
 			// Rollback snapshots must own resident data before another session reset disposes
 			// the ephemeral store backing the resident sentinels above.
 			materializedFileEntries,
+			adoptedArtifactManager: this.#adoptedArtifactManager,
 		};
 	}
 
@@ -5400,7 +5402,7 @@ export class SessionManager {
 		this.#persistErrorReported = false;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
-		this.#adoptedArtifactManager = null;
+		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
 		this.#commitResidentTextStoreTransition(prepared);
 		if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 	}
@@ -8032,6 +8034,11 @@ export class SessionManager {
 	 */
 	adoptArtifactManager(manager: ArtifactManager): void {
 		this.#adoptedArtifactManager = manager;
+	}
+
+	/** Release only the matching externally adopted manager. */
+	releaseArtifactManager(manager: ArtifactManager): void {
+		if (this.#adoptedArtifactManager === manager) this.#adoptedArtifactManager = null;
 	}
 
 	/** Prove manager authority by exact object identity, never by pathname shape. */

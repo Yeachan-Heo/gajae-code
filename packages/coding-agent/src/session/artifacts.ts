@@ -135,9 +135,15 @@ export class ArtifactManager {
 		return `.artifact-id-${id}`;
 	}
 
+	#nextCandidateId(): number {
+		const id = this.#nextId++;
+		if (!Number.isSafeInteger(id) || id < 0) throw new Error("artifact_id_out_of_range");
+		return id;
+	}
+
 	async #claimNextId(): Promise<number> {
 		while (true) {
-			const id = this.#nextId++;
+			const id = this.#nextCandidateId();
 			try {
 				await this.#publish("", this.#claimFilename(id));
 				return id;
@@ -151,7 +157,7 @@ export class ArtifactManager {
 		if (!this.#initializedComplete)
 			throw new Error("ArtifactManager must be initialized before synchronous allocation");
 		while (true) {
-			const id = this.#nextId++;
+			const id = this.#nextCandidateId();
 			try {
 				const filename = this.#claimFilename(id);
 				if (this.#store) this.#store.publishNoReplaceSync(filename, new Uint8Array());
@@ -288,7 +294,8 @@ export class ArtifactManager {
 			// the numeric namespace across independent managers and processes.
 			const match = file.match(/^(\d+)\..*\.log$/) ?? file.match(/^\.artifact-id-(\d+)$/);
 			if (match) {
-				const id = Number.parseInt(match[1], 10);
+				const id = Number(match[1]);
+				if (!Number.isSafeInteger(id) || id < 0) throw new Error("artifact_id_out_of_range");
 				if (id > maxId) maxId = id;
 			}
 		}

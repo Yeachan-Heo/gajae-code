@@ -667,21 +667,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		let cleanupRan = false;
 		const cleanup = async () => {
 			cleanupRan = true;
-			try {
-				if (owned) await fs.rm(dir, { recursive: true, force: true });
-			} finally {
-				if (this.session.getArtifactsDir === state.installedGetArtifactsDir)
-					this.session.getArtifactsDir = state.originalGetArtifactsDir;
-				if (this.session.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
-					this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
-				if (this.session.getArtifactManager === state.installedGetArtifactManager)
-					this.session.getArtifactManager = state.originalGetArtifactManager;
-				if (this.session.isArtifactManagerAuthorized === state.installedIsArtifactManagerAuthorized)
-					this.session.isArtifactManagerAuthorized = state.originalIsArtifactManagerAuthorized;
-				if (this.session.agentOutputManager === state.installedAgentOutputManager)
-					this.session.agentOutputManager = state.originalAgentOutputManager;
-				sessionLifetimeArtifacts.delete(this.session);
-			}
+			this.session.releaseArtifactManager?.(manager);
+			if (this.session.getArtifactsDir === state.installedGetArtifactsDir)
+				this.session.getArtifactsDir = state.originalGetArtifactsDir;
+			if (this.session.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
+				this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
+			if (this.session.getArtifactManager === state.installedGetArtifactManager)
+				this.session.getArtifactManager = state.originalGetArtifactManager;
+			if (this.session.isArtifactManagerAuthorized === state.installedIsArtifactManagerAuthorized)
+				this.session.isArtifactManagerAuthorized = state.originalIsArtifactManagerAuthorized;
+			if (this.session.agentOutputManager === state.installedAgentOutputManager)
+				this.session.agentOutputManager = state.originalAgentOutputManager;
+			sessionLifetimeArtifacts.delete(this.session);
+			if (owned) await fs.rm(dir, { recursive: true, force: true });
 		};
 		if (owned) {
 			const registerCleanup = this.session.registerSessionCleanup;

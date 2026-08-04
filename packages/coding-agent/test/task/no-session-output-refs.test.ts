@@ -2,16 +2,21 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Message } from "@gajae-code/ai";
+import { Agent } from "@gajae-code/agent-core";
+import { getBundledModel, type Message } from "@gajae-code/ai";
 import { Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../src/async";
+import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
 import { InternalUrlRouter } from "../../src/internal-urls";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
-import type { AgentSession, AgentSessionEvent } from "../../src/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "../../src/session/agent-session";
 import { ArtifactManager } from "../../src/session/artifacts";
-import { SessionManager } from "../../src/session/session-manager";
+import { AuthStorage } from "../../src/session/auth-storage";
+import { CURRENT_SESSION_VERSION, SessionManager } from "../../src/session/session-manager";
+import { FileSessionStorage } from "../../src/session/session-storage";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
@@ -32,6 +37,13 @@ function matchAgentOutputId(text: string, taskId: string): RegExpMatchArray | nu
 
 function agentOutputIndex(id: string): number {
 	return Number.parseInt(id.split(".").at(-1)!.split("-")[0]!, 10);
+}
+
+async function pathExists(target: string): Promise<boolean> {
+	return fs.stat(target).then(
+		() => true,
+		() => false,
+	);
 }
 
 function createAssistantMessage(text: string): Message {
@@ -211,7 +223,7 @@ describe("task no-session output refs", () => {
 		expect(resolved.content).toContain(childOutput);
 
 		await session.disposeSession();
-		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
+		expect(await pathExists(artifactsDir!)).toBe(false);
 		expect(session.getArtifactsDir?.()).toBeNull();
 	});
 
@@ -317,7 +329,7 @@ describe("task no-session output refs", () => {
 			await session.disposeSession();
 			await fs.rm(priorAuthorizedRoot, { recursive: true, force: true });
 		}
-		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
+		expect(await pathExists(artifactsDir!)).toBe(false);
 	});
 
 	it("adopts its owned manager instead of a foreign manager without a primary root", async () => {
@@ -386,6 +398,7 @@ describe("task no-session output refs", () => {
 		session.getArtifactManager = () => owner.getArtifactManager();
 		session.isArtifactManagerAuthorized = candidate => owner.isArtifactManagerAuthorized(candidate);
 		session.adoptArtifactManager = manager => owner.adoptArtifactManager(manager);
+		session.releaseArtifactManager = manager => owner.releaseArtifactManager(manager);
 		session.getAuthorizedArtifactsDirs = () => {
 			const manager = owner.getArtifactManager();
 			return manager ? [manager.dir] : [];
@@ -421,7 +434,131 @@ describe("task no-session output refs", () => {
 		const root = adoptedManager!.dir;
 		await session.disposeSession();
 		await owner.close();
-		expect(await Bun.file(root).exists()).toBe(false);
+		expect(await pathExists(root)).toBe(false);
+	});
+
+	it("retires a task-first fallback on resume and restores the persisted artifact root", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("task-first resume output")),
+		);
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-first-resume-"));
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		let runtime: AgentSession | undefined;
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model");
+			authStorage.setRuntimeApiKey("anthropic", "test-key");
+			const modelRegistry = new ModelRegistry(authStorage, path.join(cwd, "models.yml"));
+			let rejectSwitch = true;
+			const extensionRunner = {
+				hasHandlers: vi.fn(() => false),
+				emit: vi.fn(async (event: { type: string }) => {
+					if (event.type === "session_switch" && rejectSwitch)
+						throw new Error("injected post-load switch failure");
+				}),
+			} as unknown as ExtensionRunner;
+			const owner = SessionManager.inMemory(cwd, new FileSessionStorage());
+			runtime = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model, systemPrompt: ["Test"], tools: [] },
+				}),
+				sessionManager: owner,
+				settings: Settings.isolated(),
+				modelRegistry,
+				extensionRunner,
+			});
+
+			let transitionCleanupCount = 0;
+			const session = createSession(null, `task-first-resume-${Snowflake.next()}`);
+			session.getArtifactManager = () => owner.getArtifactManager();
+			session.isArtifactManagerAuthorized = candidate => owner.isArtifactManagerAuthorized(candidate);
+			session.adoptArtifactManager = manager => owner.adoptArtifactManager(manager);
+			session.releaseArtifactManager = manager => owner.releaseArtifactManager(manager);
+			session.getAuthorizedArtifactsDirs = () => {
+				const manager = owner.getArtifactManager();
+				return manager ? [manager.dir] : [];
+			};
+			session.registerSessionCleanup = cleanup =>
+				runtime!.registerToolSessionCleanup(async () => {
+					transitionCleanupCount++;
+					await cleanup();
+				});
+
+			const targetFile = path.join(cwd, "existing-populated.jsonl");
+			await Bun.write(
+				targetFile,
+				`${JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: "persisted-target",
+					timestamp: "2026-08-04T00:00:00.000Z",
+					cwd,
+				})}\n${JSON.stringify({
+					type: "message",
+					id: "persisted-message",
+					parentId: null,
+					timestamp: "2026-08-04T00:00:01.000Z",
+					message: { role: "user", content: "persisted target", timestamp: 1 },
+				})}\n`,
+			);
+			const persistedManager = new ArtifactManager(targetFile.slice(0, -6));
+			expect(await persistedManager.save("persisted before restart", "read")).toBe("0");
+
+			await runDetachedTask(await TaskTool.create(session));
+			const fallbackManager = owner.getArtifactManager();
+			expect(fallbackManager).toBeTruthy();
+			expect(await fallbackManager!.save("task predecessor artifact", "task")).toBe("0");
+			expect(await owner.saveArtifact("parent predecessor artifact", "bash")).toBe("1");
+			const fallbackRoot = fallbackManager!.dir;
+
+			await expect(runtime.switchSession(targetFile)).rejects.toThrow("injected post-load switch failure");
+			expect(transitionCleanupCount).toBe(0);
+			expect(await pathExists(fallbackRoot)).toBe(true);
+			expect(owner.getArtifactManager()).toBe(fallbackManager);
+			expect(owner.isArtifactManagerAuthorized(fallbackManager!)).toBe(true);
+			expect(session.getArtifactManager?.()).toBe(fallbackManager);
+
+			rejectSwitch = false;
+			expect(await runtime.switchSession(targetFile)).toBe(true);
+			expect(await pathExists(fallbackRoot)).toBe(false);
+			const resumedManager = owner.getArtifactManager();
+			expect(resumedManager).toBeTruthy();
+			expect(resumedManager).not.toBe(fallbackManager);
+			expect(resumedManager!.dir).toBe(targetFile.slice(0, -6));
+			expect(owner.isArtifactManagerAuthorized(fallbackManager!)).toBe(false);
+			expect(owner.isArtifactManagerAuthorized(resumedManager!)).toBe(true);
+			expect(session.getArtifactManager?.()).toBe(resumedManager);
+
+			const context = {
+				cwd,
+				getArtifactsDir: () => session.getArtifactsDir?.() ?? null,
+				getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
+			};
+			expect((await InternalUrlRouter.instance().resolve("artifact://0", context)).content).toBe(
+				"persisted before restart",
+			);
+			expect(await owner.saveArtifact("persisted after resume", "bash")).toBe("1");
+			expect((await InternalUrlRouter.instance().resolve("artifact://1", context)).content).toBe(
+				"persisted after resume",
+			);
+
+			await runtime.dispose();
+			runtime = undefined;
+			const reopened = await SessionManager.open(targetFile, cwd);
+			try {
+				const artifactPath = await reopened.getArtifactPath("0");
+				expect(artifactPath).toBe(path.join(targetFile.slice(0, -6), "0.read.log"));
+				expect(await Bun.file(artifactPath!).text()).toBe("persisted before restart");
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			if (runtime) await runtime.dispose();
+			authStorage.close();
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects a lexically nested foreign manager without exact session proof", async () => {
@@ -550,6 +687,6 @@ describe("task no-session output refs", () => {
 		expect(artifactsDir).toBeTruthy();
 		await manager.dispose({ timeoutMs: 100 });
 		await session.disposeSession();
-		expect(await Bun.file(artifactsDir!).exists()).toBe(false);
+		expect(await pathExists(artifactsDir!)).toBe(false);
 	});
 });

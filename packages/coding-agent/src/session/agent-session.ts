@@ -10220,6 +10220,7 @@ export class AgentSession {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -10289,6 +10290,7 @@ export class AgentSession {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -10456,6 +10458,7 @@ export class AgentSession {
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -11572,6 +11575,7 @@ export class AgentSession {
 		const artifactManager = this.sessionManager.getArtifactManager();
 		const prunedArtifacts: Array<{ entryId: string; id: string; toolType: string; originalText: string }> = [];
 		let reservedArtifactId: string | undefined;
+		let artifactAllocationAvailable = artifactManager !== null;
 		if (artifactManager) {
 			try {
 				reservedArtifactId = (await artifactManager.allocatePath("tool-output")).id;
@@ -11579,14 +11583,24 @@ export class AgentSession {
 				logger.warn("Failed to reserve artifact ID for pruned tool output", {
 					error: error instanceof Error ? error.message : String(error),
 				});
+				artifactAllocationAvailable = false;
 			}
 		}
 		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: overThreshold ? 0 : undefined,
 			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			artifactRef: candidate => {
-				if (!artifactManager) return undefined;
-				const id = reservedArtifactId ?? String(artifactManager.allocateId());
+				if (!artifactManager || !artifactAllocationAvailable) return undefined;
+				let id: string;
+				try {
+					id = reservedArtifactId ?? String(artifactManager.allocateId());
+				} catch (error) {
+					artifactAllocationAvailable = false;
+					logger.warn("Failed to allocate artifact ID for pruned tool output", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return undefined;
+				}
 				reservedArtifactId = undefined;
 				const toolType = (candidate.toolName ?? "tool-output").replace(/[^a-zA-Z0-9_-]/g, "_") || "tool-output";
 				prunedArtifacts.push({ entryId: candidate.entryId, id, toolType, originalText: candidate.originalText });
@@ -12202,6 +12216,7 @@ export class AgentSession {
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
 				committed = true;
+				await this.#runToolSessionCleanups();
 				this.agent.reset();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -16509,6 +16524,7 @@ export class AgentSession {
 						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
+				if (switchingToDifferentSession) await this.#runToolSessionCleanups();
 				return true;
 			} catch (error) {
 				this.sessionManager.restoreState(previousSessionState);
@@ -16621,6 +16637,7 @@ export class AgentSession {
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}

@@ -183,6 +183,23 @@ describe("pruning cache-epoch invariant", () => {
 		expect(prunedEntryCount()).toBeGreaterThan(0);
 	});
 
+	it("keeps pruning best-effort when artifact reservation initialization fails", async () => {
+		await createSession();
+		seedPrunableHistory();
+		const artifactManager = sessionManager.getArtifactManager();
+		if (!artifactManager) throw new Error("expected an artifact manager for this session");
+		const allocatePath = vi.spyOn(artifactManager, "allocatePath").mockRejectedValue(new Error("mkdir failed"));
+		const allocateId = vi.spyOn(artifactManager, "allocateId");
+
+		await expect(driveTurnEnd(assistantMessage(190_000))).resolves.toBeUndefined();
+		expect(allocatePath).toHaveBeenCalledTimes(1);
+		expect(allocateId).not.toHaveBeenCalled();
+		expect(prunedEntryCount()).toBeGreaterThan(0);
+		expect(() =>
+			sessionManager.appendMessage({ role: "user", content: "session remains writable", timestamp: Date.now() }),
+		).not.toThrow();
+	});
+
 	it("uses sub-normal-minimum output savings to avert threshold compaction", async () => {
 		await createSession();
 		seedSubMinimumPrunableHistory();

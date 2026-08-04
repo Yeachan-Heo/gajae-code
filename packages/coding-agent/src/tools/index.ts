@@ -300,6 +300,8 @@ export interface ToolSession {
 	isArtifactManagerAuthorized?: (manager: ArtifactManager) => boolean;
 	/** Adopt a task-created fallback manager into the concrete session owner. */
 	adoptArtifactManager?: (manager: ArtifactManager) => void;
+	/** Release a task-created fallback manager when its logical session ends. */
+	releaseArtifactManager?: (manager: ArtifactManager) => void;
 	/** Register teardown work owned by the current logical session. */
 	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => () => void;
 	/** Allocate a new artifact path and ID for session-scoped truncated output. */
