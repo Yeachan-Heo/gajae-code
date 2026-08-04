@@ -4776,6 +4776,7 @@ export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
+	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -8067,6 +8068,11 @@ export class SessionManager {
 		return this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
 	}
 
+	/** Linearizably establish this session's persistent or ephemeral artifact manager. */
+	async ensureArtifactManager(): Promise<ArtifactManager | null> {
+		return this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
+	}
+
 	/**
 	 * Returns an artifact manager bound to the current session file.
 	 * Recreates the manager when the active session file changes.
@@ -8136,6 +8142,12 @@ export class SessionManager {
 			init = fs.promises
 				.mkdtemp(path.join(os.tmpdir(), "gjc-session-artifacts-"))
 				.then(async dir => {
+					try {
+						await SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall?.(dir);
+					} catch (error) {
+						await fs.promises.rm(dir, { recursive: true, force: true });
+						throw error;
+					}
 					const manager = new ArtifactManager(dir);
 					if (this.#ephemeralArtifactInit !== init) {
 						await fs.promises.rm(dir, { recursive: true, force: true });

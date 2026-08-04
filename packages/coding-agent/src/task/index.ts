@@ -589,13 +589,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #ensureSessionLifetimeArtifacts(): Promise<{ dir: string; manager: ArtifactManager } | null> {
 		const state = sessionLifetimeArtifactsState(this.session);
 		if (state.authorized && state.dir && state.manager) return { dir: state.dir, manager: state.manager };
+		if (this.session.ensureArtifactManager) {
+			const manager = await this.session.ensureArtifactManager();
+			if (manager && this.session.isArtifactManagerAuthorized?.(manager) === true) {
+				const dir = path.resolve(manager.dir);
+				state.dir = dir;
+				state.manager = manager;
+				if (!(await this.#authorizeSessionLifetimeArtifacts(state, dir, manager, false, false))) return null;
+				return { dir, manager };
+			}
+		}
 
 		const sessionArtifactsDir = this.session.getArtifactsDir?.() ?? null;
 		if (sessionArtifactsDir) {
 			const manager = new ArtifactManager(sessionArtifactsDir);
 			state.dir = sessionArtifactsDir;
 			state.manager = manager;
-			if (!(await this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false))) return null;
+			if (!(await this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false, true)))
+				return null;
 			return { dir: sessionArtifactsDir, manager };
 		}
 		if (!this.session.registerSessionCleanup) return null;
@@ -620,7 +631,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		state.dir = dir;
 		state.manager = new ArtifactManager(dir);
-		if (!(await this.#authorizeSessionLifetimeArtifacts(state, dir, state.manager, true))) return null;
+		if (!(await this.#authorizeSessionLifetimeArtifacts(state, dir, state.manager, true, true))) return null;
 		return dir;
 	}
 
@@ -634,6 +645,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		dir: string,
 		manager: ArtifactManager,
 		owned: boolean,
+		adoptIntoSessionOwner: boolean,
 	): Promise<boolean> {
 		if (state.authorized) return true;
 		state.originalGetArtifactsDir = this.session.getArtifactsDir;
@@ -681,30 +693,28 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			sessionLifetimeArtifacts.delete(this.session);
 			if (owned) await fs.rm(dir, { recursive: true, force: true });
 		};
-		if (owned) {
-			const registerCleanup = this.session.registerSessionCleanup;
-			if (!registerCleanup) {
-				state.dir = undefined;
-				state.manager = undefined;
-				state.ensurePromise = undefined;
-				sessionLifetimeArtifacts.delete(this.session);
-				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-				return false;
-			}
-			try {
-				registerCleanup(cleanup);
-			} catch {
-				state.dir = undefined;
-				state.manager = undefined;
-				state.ensurePromise = undefined;
-				sessionLifetimeArtifacts.delete(this.session);
-				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-				return false;
-			}
-			if (cleanupRan) return false;
-			state.cleanupRegistered = true;
+		const registerCleanup = this.session.registerSessionCleanup;
+		if (!registerCleanup) {
+			state.dir = undefined;
+			state.manager = undefined;
+			state.ensurePromise = undefined;
+			sessionLifetimeArtifacts.delete(this.session);
+			if (owned) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+			return false;
 		}
-		if (this.session.adoptArtifactManager) {
+		try {
+			registerCleanup(cleanup);
+		} catch {
+			state.dir = undefined;
+			state.manager = undefined;
+			state.ensurePromise = undefined;
+			sessionLifetimeArtifacts.delete(this.session);
+			if (owned) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+			return false;
+		}
+		if (cleanupRan) return false;
+		state.cleanupRegistered = true;
+		if (adoptIntoSessionOwner && this.session.adoptArtifactManager) {
 			try {
 				this.session.adoptArtifactManager(manager);
 			} catch {

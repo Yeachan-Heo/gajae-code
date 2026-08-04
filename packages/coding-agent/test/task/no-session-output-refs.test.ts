@@ -15,7 +15,7 @@ import * as sdkModule from "../../src/sdk";
 import { AgentSession, type AgentSessionEvent } from "../../src/session/agent-session";
 import { ArtifactManager } from "../../src/session/artifacts";
 import { AuthStorage } from "../../src/session/auth-storage";
-import { CURRENT_SESSION_VERSION, SessionManager } from "../../src/session/session-manager";
+import { CURRENT_SESSION_VERSION, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 import { TaskTool } from "../../src/task";
 import * as discoveryModule from "../../src/task/discovery";
@@ -444,6 +444,122 @@ describe("task no-session output refs", () => {
 		await session.disposeSession();
 		await owner.close();
 		expect(await pathExists(root)).toBe(false);
+	});
+
+	it("linearizes parent first-save with first task artifact initialization", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("concurrent task output")),
+		);
+		const owner = SessionManager.inMemory("/tmp");
+		const session = createSession(null, `concurrent-artifacts-${Snowflake.next()}`);
+		session.getArtifactManager = () => owner.getArtifactManager();
+		session.isArtifactManagerAuthorized = candidate => owner.isArtifactManagerAuthorized(candidate);
+		session.adoptArtifactManager = manager => owner.adoptArtifactManager(manager);
+		session.releaseArtifactManager = manager => owner.releaseArtifactManager(manager);
+		session.getAuthorizedArtifactsDirs = () => {
+			const manager = owner.getArtifactManager();
+			return manager ? [manager.dir] : [];
+		};
+		const initializationEntered = Promise.withResolvers<void>();
+		const releaseInitialization = Promise.withResolvers<void>();
+		const taskEnsureEntered = Promise.withResolvers<void>();
+		SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = async () => {
+			initializationEntered.resolve();
+			await releaseInitialization.promise;
+		};
+		session.ensureArtifactManager = async () => {
+			taskEnsureEntered.resolve();
+			return owner.ensureArtifactManager();
+		};
+
+		let root: string | undefined;
+		try {
+			const tool = await TaskTool.create(session);
+			const parentSave = owner.saveArtifact("concurrent parent artifact", "bash");
+			await initializationEntered.promise;
+			const taskRun = runDetachedTask(tool);
+			await taskEnsureEntered.promise;
+			expect(owner.getArtifactManager()).toBeNull();
+			releaseInitialization.resolve();
+
+			const [parentArtifactId, resultText] = await Promise.all([parentSave, taskRun]);
+			expect(parentArtifactId).toBe("0");
+			expect(matchAgentOutputId(resultText, "NoSession")).toBeTruthy();
+			const canonicalManager = owner.getArtifactManager();
+			expect(canonicalManager).toBeTruthy();
+			expect(session.getArtifactManager?.()).toBe(canonicalManager);
+			expect(owner.isArtifactManagerAuthorized(canonicalManager!)).toBe(true);
+			root = canonicalManager!.dir;
+
+			const childArtifactId = await canonicalManager!.save("concurrent child artifact", "task");
+			expect(childArtifactId).toBe("1");
+			expect(session.getAuthorizedArtifactsDirs?.().map(dir => path.resolve(dir))).toEqual([path.resolve(root)]);
+			const context = {
+				cwd: session.cwd,
+				getArtifactsDir: () => session.getArtifactsDir?.() ?? null,
+				getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
+			};
+			expect((await InternalUrlRouter.instance().resolve("artifact://0", context)).content).toBe(
+				"concurrent parent artifact",
+			);
+			expect((await InternalUrlRouter.instance().resolve("artifact://1", context)).content).toBe(
+				"concurrent child artifact",
+			);
+			expect((await fs.readdir(root)).filter(name => /^\.artifact-id-|^\d+\..*\.log$/.test(name)).sort()).toEqual([
+				".artifact-id-0",
+				".artifact-id-1",
+				"0.bash.log",
+				"1.task.log",
+			]);
+		} finally {
+			SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = undefined;
+			releaseInitialization.resolve();
+			await session.disposeSession();
+			await owner.close();
+		}
+		if (!root) throw new Error("Expected canonical artifact root");
+		expect(await pathExists(root)).toBe(false);
+		expect(owner.getArtifactManager()).toBeNull();
+	});
+
+	it("keeps the canonical manager owned when task authorization registration fails", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("canonical rollback output")),
+		);
+		const owner = SessionManager.inMemory("/tmp");
+		const session = createSession(null, `canonical-rollback-${Snowflake.next()}`);
+		session.getArtifactManager = () => owner.getArtifactManager();
+		session.isArtifactManagerAuthorized = candidate => owner.isArtifactManagerAuthorized(candidate);
+		session.ensureArtifactManager = () => owner.ensureArtifactManager();
+		session.getAuthorizedArtifactsDirs = () => {
+			const manager = owner.getArtifactManager();
+			return manager ? [manager.dir] : [];
+		};
+		session.registerSessionCleanup = () => {
+			throw new Error("cleanup registry unavailable");
+		};
+
+		const resultText = await runDetachedTask(await TaskTool.create(session));
+		expect(resultText).toContain("Task completed; output artifact unavailable.");
+		expect(matchAgentOutputId(resultText, "NoSession")).toBeNull();
+		const manager = owner.getArtifactManager();
+		expect(manager).toBeTruthy();
+		expect(owner.isArtifactManagerAuthorized(manager!)).toBe(true);
+		expect(session.getArtifactsDir?.()).toBeNull();
+		expect(await owner.saveArtifact("parent survives task rollback", "bash")).toBe("0");
+		const resolved = await InternalUrlRouter.instance().resolve("artifact://0", {
+			cwd: session.cwd,
+			getArtifactsDir: () => null,
+			getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
+		});
+		expect(resolved.content).toBe("parent survives task rollback");
+
+		const root = manager!.dir;
+		await owner.close();
+		expect(await pathExists(root)).toBe(false);
+		expect(owner.isArtifactManagerAuthorized(manager!)).toBe(false);
 	});
 
 	it("keeps SessionManager ephemeral artifacts readable when resume rolls back after adoption", async () => {
