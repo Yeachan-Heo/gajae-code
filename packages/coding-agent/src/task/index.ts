@@ -706,6 +706,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (cleanupRan) return false;
 			state.cleanupRegistered = true;
 		}
+		if (this.session.adoptArtifactManager) {
+			try {
+				this.session.adoptArtifactManager(manager);
+			} catch {
+				await cleanup();
+				return false;
+			}
+			if (
+				this.session.getArtifactManager?.() !== manager ||
+				this.session.isArtifactManagerAuthorized?.(manager) !== true
+			) {
+				await cleanup();
+				return false;
+			}
+		}
 
 		state.authorized = true;
 		this.session.getArtifactsDir = state.installedGetArtifactsDir;

@@ -298,6 +298,8 @@ export interface ToolSession {
 	getArtifactManager?: () => ArtifactManager | null;
 	/** Prove that an ArtifactManager belongs to this concrete session or its explicitly adopted parent tree. */
 	isArtifactManagerAuthorized?: (manager: ArtifactManager) => boolean;
+	/** Adopt a task-created fallback manager into the concrete session owner. */
+	adoptArtifactManager?: (manager: ArtifactManager) => void;
 	/** Register teardown work owned by the current logical session. */
 	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => () => void;
 	/** Allocate a new artifact path and ID for session-scoped truncated output. */

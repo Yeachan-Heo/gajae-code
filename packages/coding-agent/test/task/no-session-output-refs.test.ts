@@ -376,6 +376,54 @@ describe("task no-session output refs", () => {
 		).toBe(false);
 	});
 
+	it("adopts a task-first fallback manager before later parent artifact saves", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
+			createSessionResult(createYieldingSession("task-first child output")),
+		);
+		const owner = SessionManager.inMemory("/tmp");
+		const session = createSession(null, `task-first-${Snowflake.next()}`);
+		session.getArtifactManager = () => owner.getArtifactManager();
+		session.isArtifactManagerAuthorized = candidate => owner.isArtifactManagerAuthorized(candidate);
+		session.adoptArtifactManager = manager => owner.adoptArtifactManager(manager);
+		session.getAuthorizedArtifactsDirs = () => {
+			const manager = owner.getArtifactManager();
+			return manager ? [manager.dir] : [];
+		};
+
+		const resultText = await runDetachedTask(await TaskTool.create(session));
+		const outputId = matchAgentOutputId(resultText, "NoSession")?.[1];
+		expect(outputId).toBeTruthy();
+		const adoptedManager = owner.getArtifactManager();
+		expect(adoptedManager).toBeTruthy();
+		expect(session.getArtifactManager?.()).toBe(adoptedManager);
+		expect(owner.isArtifactManagerAuthorized(adoptedManager!)).toBe(true);
+
+		const childArtifactId = await adoptedManager!.save("child task artifact", "task");
+		const parentArtifactId = await owner.saveArtifact("later parent artifact", "bash");
+		expect(childArtifactId).toBe("0");
+		expect(parentArtifactId).toBe("1");
+		expect(session.getAuthorizedArtifactsDirs?.().map(dir => path.resolve(dir))).toEqual([
+			path.resolve(adoptedManager!.dir),
+		]);
+
+		const context = {
+			cwd: session.cwd,
+			getArtifactsDir: () => session.getArtifactsDir?.() ?? null,
+			getAuthorizedArtifactsDirs: () => session.getAuthorizedArtifactsDirs?.() ?? [],
+		};
+		const childResolved = await InternalUrlRouter.instance().resolve(`artifact://${childArtifactId}`, context);
+		const parentResolved = await InternalUrlRouter.instance().resolve(`artifact://${parentArtifactId}`, context);
+		expect(childResolved.content).toBe("child task artifact");
+		expect(parentResolved.content).toBe("later parent artifact");
+		expect(await Bun.file(path.join(adoptedManager!.dir, `${outputId}.md`)).exists()).toBe(true);
+
+		const root = adoptedManager!.dir;
+		await session.disposeSession();
+		await owner.close();
+		expect(await Bun.file(root).exists()).toBe(false);
+	});
+
 	it("rejects a lexically nested foreign manager without exact session proof", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [TEST_AGENT], projectAgentsDir: null });
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
