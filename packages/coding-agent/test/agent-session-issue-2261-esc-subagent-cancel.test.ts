@@ -263,6 +263,56 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		expect(manager.getDeliveryState({ ownerId: "owner" }).queued).toBe(0);
 	});
 
+	it("commits copied-transcript switches with the same session id and suppresses predecessor state", async () => {
+		const completions: string[] = [];
+		manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				completions.push(jobId);
+			},
+		});
+		AsyncJobManager.setInstance(manager);
+		const previousFile = session.sessionFile;
+		if (!previousFile) throw new Error("Expected a persisted predecessor session");
+		await sessionManager.ensureOnDisk();
+		const previousSessionId = session.sessionId;
+		const copiedFile = path.join(tempDir.path(), "copied-transcript.jsonl");
+		await Bun.write(copiedFile, Bun.file(previousFile));
+		const predecessorJobId = manager.register(
+			"task",
+			"copied transcript predecessor",
+			async ({ signal }) => {
+				if (!signal.aborted)
+					await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				return "predecessor completion";
+			},
+			{
+				id: "copied-transcript-predecessor-job",
+				ownerId: "owner",
+				metadata: { subagent: { id: "copied-transcript-child", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord({
+			subagentId: "copied-transcript-child",
+			ownerId: "owner",
+			currentJobId: predecessorJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/copied-transcript-child.jsonl",
+			resumable: true,
+		});
+		const finishShutdown = vi.spyOn(manager, "finishOwnerSubagentShutdown");
+
+		await expect(session.switchSession(copiedFile)).resolves.toBe(true);
+		await Bun.sleep(10);
+		expect(session.sessionFile).toBe(copiedFile);
+		expect(session.sessionId).toBe(previousSessionId);
+		expect(finishShutdown).toHaveBeenCalledWith(expect.any(Object), "commit");
+		expect(manager.getJob(predecessorJobId)?.status).toBe("cancelled");
+		expect(manager.getDeliveryState({ ownerId: "owner" }).queued).toBe(0);
+		expect(manager.getSubagentRecord("copied-transcript-child")).toBeUndefined();
+		expect(completions).toEqual([]);
+	});
+
 	it("fences late same-owner generic admission while leaving foreign jobs isolated", async () => {
 		const ownerManager = installOwnerManager();
 		const foreignGate = Promise.withResolvers<void>();

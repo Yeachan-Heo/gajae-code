@@ -16373,7 +16373,7 @@ export class AgentSession {
 	): Promise<boolean> {
 		let ownerShutdownManager: AsyncJobManager | undefined;
 		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
-		let ownerShutdownInitialSessionId: string | undefined;
+		let ownerShutdownTransitionCommitted = false;
 		let ownerShutdownFinished = false;
 		this.#beginSessionTransition("switch-session");
 		try {
@@ -16412,7 +16412,6 @@ export class AgentSession {
 			if (lease && asyncManager && ownerId) {
 				ownerShutdownManager = asyncManager;
 				ownerShutdownLease = lease;
-				ownerShutdownInitialSessionId = this.sessionManager.getSessionId();
 				try {
 					asyncManager.runOwnerProducerCleanupsStrict({ ownerId });
 					await this.abort();
@@ -16588,6 +16587,8 @@ export class AgentSession {
 
 				if (switchingToDifferentSession) {
 					transitionCleanupCommitted = true;
+					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
+					ownerShutdownTransitionCommitted = true;
 					this.sessionManager.retireEphemeralArtifactsAfterTransition();
 					await this.#runToolSessionTransitionCleanups();
 				}
@@ -16673,7 +16674,7 @@ export class AgentSession {
 			if (ownerShutdownManager && ownerShutdownLease && !ownerShutdownFinished) {
 				ownerShutdownManager.finishOwnerSubagentShutdown(
 					ownerShutdownLease,
-					this.sessionManager.getSessionId() !== ownerShutdownInitialSessionId ? "commit" : "release",
+					ownerShutdownTransitionCommitted ? "commit" : "release",
 				);
 			}
 			this.#endSessionTransition();
