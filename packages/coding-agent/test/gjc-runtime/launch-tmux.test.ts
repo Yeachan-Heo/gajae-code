@@ -52,6 +52,7 @@ type SpawnSyncResult = Bun.SyncSubprocess<"pipe", "pipe">;
 const launchTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-launch-tests-"));
 let launchStateSequence = 0;
 const NATIVE_SESSION_ID = "$0";
+const nativeTmux = process.platform === "win32" ? null : Bun.which("tmux");
 
 function safeAbsentOwnerIsolationProbe(
 	platform: NodeJS.Platform = "linux",
@@ -465,28 +466,36 @@ describe("default GJC tmux launch", () => {
 		expect(writeSpy).not.toHaveBeenCalled();
 	});
 
-	it("passes prefixed tmux window titles after the tmux option separator", () => {
+	it("quotes identity-guarded tmux window titles as one command argument", () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"] }),
 			rawArgs: ["hello world"],
 			cwd: "/tmp/-repo",
-			env: { TMUX: "/tmp/tmux" },
+			env: { TMUX: "/tmp/tmux", TMUX_PANE: "%9" },
 			argv: ["/usr/local/bin/gjc"],
 			execPath: "/bin/bun",
 			platform: "darwin",
 			tty: interactiveTty,
 			tmuxAvailable: true,
 			existingBranchSessionName: null,
-			currentBranch: "feature/demo",
+			currentBranch: "feature/demo';kill-window",
 			spawnSync: (command, spawnArgs, options) => {
 				calls.push({ command, args: spawnArgs, options });
-				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				if (spawnArgs[0] === "display-message") return { exitCode: 0, stdout: "%9\t@4\t1" };
+				return { exitCode: 0 };
 			},
 		});
 
 		expect(handled).toBe(false);
-		expect(calls[0]?.args).toEqual(["rename-window", "--", "GJC--repo-feature/demo"]);
+		expect(calls[1]?.args).toEqual([
+			"if-shell",
+			"-t",
+			"%9",
+			"-F",
+			"#{&&:#{==:#{pane_id},%9},#{&&:#{==:#{window_id},@4},#{==:#{window_index},1}}}",
+			"rename-window -t @4 -- 'GJC--repo-feature/demo'\\'';kill-window'",
+		]);
 	});
 
 	it("does not plan tmux for interactive root launch without --tmux", () => {
@@ -1614,7 +1623,7 @@ describe("default GJC tmux launch", () => {
 		).toBeUndefined();
 	});
 
-	it("renames the current window for direct interactive launches inside tmux", () => {
+	it("renames the originating tmux window through an identity and index guard", () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"] }),
@@ -1622,6 +1631,7 @@ describe("default GJC tmux launch", () => {
 			cwd: "/repo",
 			env: {
 				TMUX: "/tmp/tmux",
+				TMUX_PANE: "%7",
 			},
 			argv: ["/usr/local/bin/gjc"],
 			execPath: "/bin/bun",
@@ -1632,16 +1642,152 @@ describe("default GJC tmux launch", () => {
 			currentBranch: "feature/demo",
 			spawnSync: (command, spawnArgs, options) => {
 				calls.push({ command, args: spawnArgs, options });
-				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				if (spawnArgs[0] === "display-message") return { exitCode: 0, stdout: "%7\t@3\t2" };
+				return { exitCode: 0 };
 			},
 		});
 
 		expect(handled).toBe(false);
-		expect(calls).toHaveLength(1);
+		expect(calls).toHaveLength(2);
 		expect(calls[0]).toMatchObject({
 			command: "tmux",
-			args: ["rename-window", "--", "GJC-repo-feature/demo"],
+			args: ["display-message", "-p", "-t", "%7", "#{pane_id}\t#{window_id}\t#{window_index}"],
 		});
+		expect(calls[1]).toMatchObject({
+			command: "tmux",
+			args: [
+				"if-shell",
+				"-t",
+				"%7",
+				"-F",
+				"#{&&:#{==:#{pane_id},%7},#{&&:#{==:#{window_id},@3},#{==:#{window_index},2}}}",
+				"rename-window -t @3 -- 'GJC-repo-feature/demo'",
+			],
+		});
+	});
+
+	it("preserves tmux window names when the originating pane identity cannot be proven", () => {
+		const cases = [
+			{ name: "missing pane", env: { TMUX: "/tmp/tmux" }, stdout: "%7\t@3\t2" },
+			{ name: "pane mismatch", env: { TMUX: "/tmp/tmux", TMUX_PANE: "%7" }, stdout: "%8\t@3\t2" },
+			{ name: "invalid window id", env: { TMUX: "/tmp/tmux", TMUX_PANE: "%7" }, stdout: "%7\t3\t2" },
+			{ name: "invalid window index", env: { TMUX: "/tmp/tmux", TMUX_PANE: "%7" }, stdout: "%7\t@3\told" },
+		];
+
+		for (const testCase of cases) {
+			const calls: string[][] = [];
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello world"] }),
+				rawArgs: ["hello world"],
+				cwd: "/repo",
+				env: testCase.env,
+				argv: ["/usr/local/bin/gjc"],
+				execPath: "/bin/bun",
+				platform: "darwin",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				currentBranch: "feature/demo",
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return { exitCode: 0, stdout: testCase.stdout };
+				},
+			});
+
+			expect(handled, testCase.name).toBe(false);
+			expect(
+				calls.some(call => call[0] === "rename-window"),
+				testCase.name,
+			).toBe(false);
+			expect(
+				calls.some(call => call[0] === "if-shell"),
+				testCase.name,
+			).toBe(false);
+		}
+	});
+
+	it.skipIf(!nativeTmux)("keeps real tmux renames on the originating window and refuses index drift", () => {
+		const tmuxCommand = nativeTmux;
+		if (!tmuxCommand) throw new Error("tmux unavailable");
+		const socket = `gjc-rename-${process.pid}-${Date.now()}`;
+		const runTmux = (spawnArgs: string[]) =>
+			Bun.spawnSync([tmuxCommand, "-L", socket, ...spawnArgs], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+		const requireSuccess = (spawnArgs: string[]): SpawnSyncResult => {
+			const result = runTmux(spawnArgs);
+			expect(result.exitCode, `${spawnArgs.join(" ")}: ${result.stderr.toString()}`).toBe(0);
+			return result;
+		};
+
+		try {
+			requireSuccess(["new-session", "-d", "-s", "probe", "-n", "origin"]);
+			requireSuccess(["new-window", "-t", "probe:1", "-n", "active"]);
+			const paneId = requireSuccess(["display-message", "-p", "-t", "probe:0", "#{pane_id}"])
+				.stdout.toString()
+				.trim();
+			const windowId = requireSuccess(["display-message", "-p", "-t", paneId, "#{window_id}"])
+				.stdout.toString()
+				.trim();
+			const tmuxEnv = requireSuccess(["display-message", "-p", "-t", paneId, "#{socket_path},#{pid},0"])
+				.stdout.toString()
+				.trim();
+			let moveAfterProbe = false;
+
+			const invokeDirectLaunch = (branch: string): void => {
+				const handled = launchDefaultTmuxIfNeeded({
+					parsed: args({ messages: ["hello world"] }),
+					rawArgs: ["hello world"],
+					cwd: "/repo",
+					env: { TMUX: tmuxEnv, TMUX_PANE: paneId, GJC_TMUX_COMMAND: tmuxCommand },
+					argv: ["/usr/local/bin/gjc"],
+					execPath: "/bin/bun",
+					platform: "darwin",
+					tty: interactiveTty,
+					tmuxAvailable: true,
+					existingBranchSessionName: null,
+					currentBranch: branch,
+					spawnSync: (_command, spawnArgs) => {
+						const result = runTmux(spawnArgs);
+						if (moveAfterProbe && spawnArgs[0] === "display-message" && result.exitCode === 0) {
+							moveAfterProbe = false;
+							requireSuccess(["move-window", "-s", windowId, "-t", "probe:2"]);
+						}
+						return {
+							exitCode: result.exitCode,
+							signalCode: result.signalCode,
+							stdout: result.stdout.toString(),
+							stderr: result.stderr.toString(),
+						};
+					},
+				});
+				expect(handled).toBe(false);
+			};
+
+			invokeDirectLaunch("feature/demo';kill-window");
+			expect(
+				requireSuccess(["display-message", "-p", "-t", windowId, "#{window_name}"]).stdout.toString().trim(),
+			).toBe("GJC-repo-feature/demo';kill-window");
+			expect(
+				requireSuccess(["display-message", "-p", "-t", "probe:1", "#{window_name}"]).stdout.toString().trim(),
+			).toBe("active");
+
+			requireSuccess(["rename-window", "-t", windowId, "--", "origin"]);
+			moveAfterProbe = true;
+			invokeDirectLaunch("feature/drift");
+
+			expect(
+				requireSuccess(["display-message", "-p", "-t", windowId, "#{window_index}\t#{window_name}"])
+					.stdout.toString()
+					.trim(),
+			).toBe("2\torigin");
+			expect(
+				requireSuccess(["display-message", "-p", "-t", "probe:1", "#{window_name}"]).stdout.toString().trim(),
+			).toBe("active");
+		} finally {
+			runTmux(["kill-server"]);
+		}
 	});
 
 	it("does not rename direct launches already inside a GJC-launched tmux wrapper", () => {

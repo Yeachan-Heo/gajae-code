@@ -652,6 +652,56 @@ function renameTmuxWindow(
 	spawnSync(tmuxCommand, buildTmuxRenameWindowArgs(title, target), options);
 }
 
+interface TmuxWindowIdentity {
+	paneId: string;
+	windowId: string;
+	windowIndex: string;
+}
+
+function parseTmuxWindowIdentity(value: string): TmuxWindowIdentity | null {
+	const [paneId, windowId, windowIndex, extra] = value.trim().split("\t");
+	if (
+		extra !== undefined ||
+		paneId === undefined ||
+		windowId === undefined ||
+		windowIndex === undefined ||
+		!/^%\d+$/.test(paneId) ||
+		!/^@\d+$/.test(windowId) ||
+		!/^\d+$/.test(windowIndex)
+	)
+		return null;
+	return { paneId, windowId, windowIndex };
+}
+
+function quoteTmuxCommandArgument(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function renameExistingTmuxWindow(
+	tmuxCommand: string,
+	paneId: string,
+	title: string,
+	spawnSync: TmuxSpawnSync,
+	options: TmuxSpawnOptions,
+): void {
+	if (!/^%\d+$/.test(paneId)) return;
+	const observed = spawnSync(
+		tmuxCommand,
+		["display-message", "-p", "-t", paneId, "#{pane_id}\t#{window_id}\t#{window_index}"],
+		options,
+	);
+	if (observed.exitCode !== 0) return;
+	const identity = parseTmuxWindowIdentity(observed.stdout ?? "");
+	if (!identity || identity.paneId !== paneId) return;
+
+	// `if-shell -F` evaluates the pane binding and inserts the rename into the
+	// same tmux command queue. The nested command targets the immutable window
+	// id, so an active-window switch or index reuse cannot redirect the rename.
+	const predicate = `#{&&:#{==:#{pane_id},${identity.paneId}},#{&&:#{==:#{window_id},${identity.windowId}},#{==:#{window_index},${identity.windowIndex}}}}`;
+	const command = `rename-window -t ${identity.windowId} -- ${quoteTmuxCommandArgument(title)}`;
+	spawnSync(tmuxCommand, ["if-shell", "-t", identity.paneId, "-F", predicate, command], options);
+}
+
 function renameExistingTmuxWindowIfNeeded(context: TmuxLaunchContext): void {
 	const env = context.env ?? process.env;
 	if (!env.TMUX || env[GJC_TMUX_LAUNCHED_ENV] === "1") return;
@@ -669,11 +719,13 @@ function renameExistingTmuxWindowIfNeeded(context: TmuxLaunchContext): void {
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
 	if (!tmuxAvailable) return;
 
+	const paneId = env.TMUX_PANE?.trim();
+	if (!paneId) return;
 	const cwd = context.cwd ?? process.cwd();
 	const branch = context.worktreeBranch ?? context.currentBranch ?? readCurrentBranch(cwd);
 	const title = buildGjcTmuxWindowTitle(context.project ?? cwd, branch);
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
-	renameTmuxWindow(tmuxCommand, title, spawnSync, {
+	renameExistingTmuxWindow(tmuxCommand, paneId, title, spawnSync, {
 		cwd,
 		env,
 		stdin: "pipe",

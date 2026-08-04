@@ -4,6 +4,7 @@
 ### Fixed
 
 - Telegram daemon restart now revokes every persisted callback alias before polling. Reconnecting sessions must replay a pending ask to receive fresh, owner-bound aliases; old controls remain stale, and their keyboards are best-effort terminalized when the original Telegram message id is available. Shutdown now fences new session messages and drains every admitted handler before final callback persistence and ownership release, preventing a successful send racing shutdown from publishing alias state after a successor takes ownership (#3727).
+- Direct interactive launches inside tmux now bind automatic window renames to the originating pane's immutable pane/window identities and observed window index. If that binding changes before mutation, GJC preserves every window name instead of renaming whichever window became active (#3808).
 
 ### Fixed
 
