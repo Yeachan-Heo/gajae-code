@@ -30,7 +30,7 @@ describe("host status markers", () => {
 	});
 
 	it("emits a self-terminating OSC that carries no cursor movement", () => {
-		const output = { write: vi.fn(() => true) };
+		const output = { write: vi.fn((_value: string) => true) };
 
 		emitHostStatus("working", output);
 
