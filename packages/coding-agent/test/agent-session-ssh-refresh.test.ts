@@ -10,7 +10,8 @@ import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { addSSHHost, removeSSHHost, updateSSHHost } from "../src/ssh/config-writer";
 import * as connectionManager from "../src/ssh/connection-manager";
-import { loadSshTool, type ToolSession } from "../src/tools";
+import { loadSshTool } from "../src/tools/implementations";
+import type { ToolSession } from "../src/tools";
 
 function createModel(): Model<"openai-responses"> {
 	return {

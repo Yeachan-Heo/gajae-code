@@ -8,6 +8,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner, loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions";
 import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
@@ -62,6 +63,7 @@ describe("AgentSession handoff", () => {
 				tools: [],
 				messages: [],
 			},
+			appendOnlyContext: createAppendOnlyContextManager(model.provider),
 		});
 
 		session = new AgentSession({
@@ -133,6 +135,18 @@ describe("AgentSession handoff", () => {
 		const created = await session.newSession();
 		expect(created).toBe(true);
 		expect(sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-sonnet-4-5");
+	});
+
+	it("releases append-only provider-normalized history at the handoff rewrite boundary", async () => {
+		const appendOnly = session.agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		appendOnly?.syncMessages([{ role: "user", content: "handoff-provider-marker" }]);
+		expect(appendOnly?.log.length).toBe(1);
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue from here");
+
+		const result = await session.handoff();
+		expect(result?.document).toContain("Continue from here");
+		expect(appendOnly?.log.length).toBe(0);
 	});
 
 	it("does not run auto-compaction after handoff turn completes", async () => {

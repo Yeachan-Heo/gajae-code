@@ -64,6 +64,24 @@ export interface ArtifactSaveOptions {
 	maxBytes?: number;
 }
 
+export type ArtifactPublishOutcome =
+	| { outcome: "saved"; handle: import("../tools/output-meta").EvictedToolOutputHandle }
+	| { outcome: "incomplete"; bytes: number; maxBytes: number }
+	| { outcome: "unavailable"; diagnostic: string }
+	| { outcome: "failed"; diagnostic: string };
+
+export interface ArtifactPublishOptions {
+	/** Disable persistence explicitly; this fails closed without writing. */
+	persist?: boolean;
+	maxBytes?: number;
+	toolType?: string;
+}
+
+export interface ArtifactByteRange {
+	start?: number;
+	endExclusive?: number;
+}
+
 /**
  * Manages artifact storage for a session.
  *
@@ -364,6 +382,62 @@ export class ArtifactManager {
 		} catch {
 			return [];
 		}
+	}
+
+	/** Persist exact UTF-8 text for heap-eviction rehydration. */
+	async publishExactText(text: string, options: ArtifactPublishOptions = {}): Promise<ArtifactPublishOutcome> {
+		const bytes = Buffer.from(text, "utf8");
+		const maxBytes = Math.max(0, options.maxBytes ?? DEFAULT_ARTIFACT_MAX_BYTES);
+		if (options.persist === false) return { outcome: "unavailable", diagnostic: "artifact persistence disabled" };
+		if (bytes.byteLength > maxBytes) return { outcome: "incomplete", bytes: bytes.byteLength, maxBytes };
+		let filename: string | undefined;
+		try {
+			const toolType = options.toolType ?? "evicted";
+			const id = String((await this.allocatePath(toolType)).id);
+			filename = this.#filename(id, toolType);
+			await this.#publish(bytes.toString("utf8"), filename);
+			const written = this.#store
+				? this.#store.readExpected(filename)?.bytes
+				: await fs.readFile(path.join(this.#dir, filename));
+			if (!written || written.byteLength !== bytes.byteLength || sha256(written) !== sha256(bytes)) {
+				throw new Error("artifact publication verification failed");
+			}
+			return {
+				outcome: "saved",
+				handle: {
+					v: 1,
+					artifactId: id,
+					uri: `artifact://${id}`,
+					encoding: "utf-8",
+					bytes: bytes.byteLength,
+					sha256: sha256(bytes),
+					complete: true,
+				},
+			};
+		} catch (error) {
+			if (filename) await this.removeNamedBestEffort(filename);
+			return { outcome: "failed", diagnostic: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	async readRange(id: string, range: ArtifactByteRange = {}): Promise<string> {
+		const artifactPath = await this.getPath(id);
+		if (!artifactPath) throw new Error(`artifact://${id} not found`);
+		const file = Bun.file(artifactPath);
+		const size = file.size;
+		const start = Math.max(0, Math.min(size, range.start ?? 0));
+		const end = Math.max(start, Math.min(size, range.endExclusive ?? size));
+		return await file.slice(start, end).text();
+	}
+
+	async openReadStream(id: string, range: ArtifactByteRange = {}): Promise<ReadableStream<Uint8Array>> {
+		const artifactPath = await this.getPath(id);
+		if (!artifactPath) throw new Error(`artifact://${id} not found`);
+		const file = Bun.file(artifactPath);
+		const size = file.size;
+		const start = Math.max(0, Math.min(size, range.start ?? 0));
+		const end = Math.max(start, Math.min(size, range.endExclusive ?? size));
+		return file.slice(start, end).stream();
 	}
 
 	/**

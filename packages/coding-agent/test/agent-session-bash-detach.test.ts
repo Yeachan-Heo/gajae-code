@@ -50,7 +50,8 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { BashTool, type ToolSession } from "@gajae-code/coding-agent/tools";
+import { BashTool } from "@gajae-code/coding-agent/tools/implementations";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { Snowflake } from "@gajae-code/utils";
 
 /** Scripted assistant turn that issues a single `bash` tool call. */

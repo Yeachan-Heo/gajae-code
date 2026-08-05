@@ -6,11 +6,12 @@ import type { AssistantMessage, Model, ProviderSessionState, Usage } from "@gaja
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { getLatestCompactionEntry, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { getLatestCompactionEntry, loadEntriesFromFile, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
 
 /**
@@ -101,14 +102,19 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 	async function buildSession(options: {
 		contextWindow?: number;
 		shortCircuit?: boolean;
+		persisted?: boolean;
+		appendOnly?: boolean;
 		settings?: Record<string, unknown>;
 	}): Promise<AgentSession> {
 		const model = codexModel(options.contextWindow ?? 200_000);
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = options.persisted
+			? SessionManager.create(process.cwd(), tempDir.path())
+			: SessionManager.inMemory();
 		const extensionRunner = options.shortCircuit ? await shortCircuitExtensionRunner(sessionManager) : undefined;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			appendOnlyContext: options.appendOnly ? createAppendOnlyContextManager(model.provider) : undefined,
 		});
 		const settings = Settings.isolated({
 			"compaction.enabled": true,
@@ -144,6 +150,36 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			{ role: "user", content: "third request: keep going with the plan", timestamp: Date.now() },
 			assistant(m, usage(finalUsageTotal), "final response near the window"),
 		]);
+	}
+
+	async function seedPrunableToolConversation(s: AgentSession, output: string, finalUsageTotal: number): Promise<string> {
+		const toolCallId = "evict-call";
+		await seed(s, [
+			{ role: "user", content: "first request", timestamp: Date.now() },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: toolCallId, name: "bash", arguments: { command: "cat" } }],
+				api: s.model!.api,
+				provider: s.model!.provider,
+				model: s.model!.id,
+				usage: usage(1_000),
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			},
+			{ role: "user", content: "second request", timestamp: Date.now() },
+			assistant(s.model!, usage(1_000), "second response"),
+			{ role: "user", content: "third request", timestamp: Date.now() },
+			assistant(s.model!, usage(finalUsageTotal), "final response"),
+		]);
+		await seed(s, [
+			{ role: "toolResult", toolCallId, toolName: "bash", content: [{ type: "text", text: output }], isError: false, timestamp: Date.now() },
+			{ role: "toolResult", toolCallId: "recent-call", toolName: "bash", content: [{ type: "text", text: "recent-protected-".repeat(10_000) }], isError: false, timestamp: Date.now() },
+		]);
+		await seed(s, [
+			{ role: "user", content: "fence request one", timestamp: Date.now() },
+			{ role: "user", content: "fence request two", timestamp: Date.now() },
+		]);
+		return toolCallId;
 	}
 
 	function contextOf(s: AgentSession): AgentContext {
@@ -442,6 +478,162 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			persisted.filter(message => message.role === "user" && message.content === "second distinct steering"),
 		).toHaveLength(1);
 		expect(closed).toBeGreaterThanOrEqual(1);
+	});
+
+	it("fails closed when tool-output artifact persistence is unavailable", async () => {
+		session = await buildSession({ settings: { "compaction.keepRecentTokens": 10 } });
+		const output = "unavailable-output-".repeat(35_000);
+		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
+		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+		expect(outcome).toBe("failed");
+		const entry = session.sessionManager.getBranch().find(
+			(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+				candidate.type === "message" && candidate.message.role === "toolResult" && candidate.message.toolCallId === toolCallId,
+		);
+		expect(entry?.type).toBe("message");
+		if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") return;
+		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
+	}, 15_000);
+
+	it("keeps canonical output when exact publication is incomplete", async () => {
+		session = await buildSession({ persisted: true, settings: { "compaction.keepRecentTokens": 10 } });
+		const output = "incomplete-output-".repeat(700_000);
+		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
+		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+		expect(outcome).toBe("failed");
+		const entry = session.sessionManager.getBranch().find(
+			(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+				candidate.type === "message" && candidate.message.role === "toolResult" && candidate.message.toolCallId === toolCallId,
+		);
+		expect(entry?.type).toBe("message");
+		if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") return;
+		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
+		expect((await session.sessionManager.getArtifactManager()?.listFiles()) ?? []).toEqual([]);
+	}, 30_000);
+
+	it("keeps canonical output when exact publication fails after planning", async () => {
+		session = await buildSession({ persisted: true, settings: { "compaction.keepRecentTokens": 10 } });
+		const output = "publication-failure-output-".repeat(35_000);
+		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
+		const artifactManager = session.sessionManager.getArtifactManager();
+		expect(artifactManager).not.toBeNull();
+		if (!artifactManager) return;
+		const originalPublishExactText = artifactManager.publishExactText.bind(artifactManager);
+		artifactManager.publishExactText = async () => ({ outcome: "failed", diagnostic: "injected publication failure" });
+		try {
+			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+			expect(outcome).toBe("failed");
+		} finally {
+			artifactManager.publishExactText = originalPublishExactText;
+		}
+		const entry = session.sessionManager.getBranch().find(
+			(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+				candidate.type === "message" && candidate.message.role === "toolResult" && candidate.message.toolCallId === toolCallId,
+		);
+		expect(entry?.type).toBe("message");
+		if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") return;
+		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
+		expect(await artifactManager.listFiles()).toEqual([]);
+	}, 30_000);
+
+	it("commits persisted tool-output eviction through production maintenance and releases append-only retainers", async () => {
+		session = await buildSession({
+			persisted: true,
+			appendOnly: true,
+			settings: { "provider.appendOnlyContext": "on", "compaction.keepRecentTokens": 10 },
+		});
+		const output = "evictable-output-".repeat(35_000);
+		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
+		const appendOnly = session.agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		appendOnly?.syncMessages([{ role: "user", content: "provider-retained-marker" }]);
+		expect(appendOnly?.log.length).toBe(1);
+		let closed = 0;
+		session.providerSessionState.set("openai-codex-responses", { close: () => closed++ } satisfies ProviderSessionState);
+
+		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+		expect(outcome).toBe("pruned");
+		expect(closed).toBe(1);
+		expect(appendOnly?.log.length).toBe(0);
+		expect(session.messages.some(message => JSON.stringify(message).includes(output))).toBe(false);
+
+		const persisted = session.sessionManager.getBranch().find(
+			(entry): entry is Extract<typeof entry, { type: "message" }> =>
+				entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === toolCallId,
+		);
+		expect(persisted).toBeDefined();
+		if (!persisted || persisted.type !== "message" || persisted.message.role !== "toolResult") return;
+		const details = persisted.message.details as { meta?: { eviction?: unknown } } | undefined;
+		expect(details?.meta?.eviction).toBeDefined();
+		if (!details?.meta?.eviction) return;
+		expect(await session.sessionManager.rehydrateToolResultMessage(details.meta.eviction)).toBe(output);
+	});
+
+	it("restores the durable transcript when downstream agent replacement fails after rewrite", async () => {
+		session = await buildSession({ persisted: true, contextWindow: 200_000 });
+		const model = session.model!;
+		const oldOutput = `rollback-candidate-${"x".repeat(180_000)}`;
+		const messages = [
+			{ role: "user", content: "first request", timestamp: Date.now() },
+			{
+				role: "toolResult",
+				toolCallId: "rollback-old",
+				toolName: "bash",
+				content: [{ type: "text", text: oldOutput }],
+				timestamp: Date.now(),
+			},
+			assistant(model, usage(1_000), "first response"),
+			{ role: "user", content: "second request", timestamp: Date.now() },
+			{
+				role: "toolResult",
+				toolCallId: "rollback-new",
+				toolName: "bash",
+				content: [{ type: "text", text: "newer output".repeat(30_000) }],
+				timestamp: Date.now(),
+			},
+			assistant(model, usage(1_000), "second response"),
+			{ role: "user", content: "third request", timestamp: Date.now() },
+			assistant(model, usage(THRESHOLD + 20_000), "final response"),
+		];
+		for (const message of messages) {
+			session.agent.appendMessage(message as never);
+			session.sessionManager.appendMessage(message as never);
+		}
+		await session.sessionManager.flush();
+		const sessionFile = session.sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		if (!sessionFile) return;
+
+		const originalReplaceMessages = session.agent.replaceMessages.bind(session.agent);
+		let failNextReplace = true;
+		session.agent.replaceMessages = (...args) => {
+			if (failNextReplace) {
+				failNextReplace = false;
+				throw new Error("downstream agent replacement failed");
+			}
+			return originalReplaceMessages(...args);
+		};
+		try {
+			await expect(session.runMidRunMaintenanceForTests(contextOf(session))).rejects.toThrow(
+				/downstream agent replacement failed/,
+			);
+		} finally {
+			session.agent.replaceMessages = originalReplaceMessages;
+		}
+
+		const restoredEntries = await loadEntriesFromFile(sessionFile);
+		const restored = restoredEntries.find(
+			(entry): entry is Extract<typeof entry, { type: "message" }> =>
+				entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === "rollback-old",
+		);
+		expect(restored).toBeDefined();
+		if (!restored || restored.type !== "message") return;
+		const restoredMessage = restored.message as { role: "toolResult"; content: unknown; prunedAt?: unknown };
+		expect(restoredMessage.content).toEqual([{ type: "text", text: oldOutput }]);
+		expect(restoredMessage.prunedAt).toBeUndefined();
+		const artifacts = session.sessionManager.getArtifactManager();
+		expect(artifacts).not.toBeNull();
+		if (artifacts) expect((await artifacts.listFiles()).filter(file => file.endsWith(".evicted.log"))).toEqual([]);
 	});
 
 	it("cleans a held EventStream consumer barrier before it can flush or rewrite", async () => {

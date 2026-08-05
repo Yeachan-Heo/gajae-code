@@ -12,7 +12,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { TodoWriteTool } from "@gajae-code/coding-agent/tools";
+import { TodoWriteTool } from "@gajae-code/coding-agent/tools/implementations";
 import { Snowflake } from "@gajae-code/utils";
 
 /**
