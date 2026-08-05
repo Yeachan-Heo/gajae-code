@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- DeepSeek-family reasoning-content replay 400s are now retryable via a bounded, strip-only circuit breaker. When a proxy strips the encrypted reasoning blob to an empty `encrypted_content`, DeepSeek rejects every follow-up turn with "The `reasoning_content` in the thinking mode must be passed back to the API." Resending the identical history re-triggers this deterministic 400, so the agent loop now strips the unusable `reasoning` items from the Responses history payload in place and resends exactly once (mirroring the `invalid_prompt` poisoned-history breaker). Non-reasoning items are preserved; fail-fast when nothing can be stripped. Budget = one repaired resend.
+
 ## [0.12.11] - 2026-08-03
 
 ## [0.12.10] - 2026-08-03

@@ -24,7 +24,12 @@ import {
 	COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
 	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
-import { isInvalidPromptError, neutralizeReservedControlTokens } from "@gajae-code/ai/utils";
+import {
+	isInvalidPromptError,
+	isReasoningContentReplayError,
+	neutralizeReservedControlTokens,
+	stripUnusableReasoningItems,
+} from "@gajae-code/ai/utils";
 import { sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
@@ -201,6 +206,31 @@ function repairInvalidPromptHistory(messages: AgentMessage[]): boolean {
 		}
 	}
 	return changed;
+}
+/**
+ * Strip Responses-API `reasoning` items whose `encrypted_content` a proxy
+ * emptied, in-place across the outgoing history's `providerPayload`. DeepSeek in
+ * thinking mode rejects replay of reasoning whose encrypted blob was stripped,
+ * so dropping those items lets the model re-reason instead of re-triggering a
+ * deterministic 400 ("reasoning_content ... must be passed back to the API").
+ * Only the opaque Responses history payload is mutated; durable message content
+ * and ordering are preserved. Returns whether any item was actually removed —
+ * the circuit breaker uses this to decide between a single repaired resend
+ * (removed) and immediate fail-fast (unchanged).
+ */
+function repairReasoningContentReplayHistory(messages: AgentMessage[]): boolean {
+	let removed = 0;
+	for (const message of messages) {
+		const payload = (message as { providerPayload?: { type?: string; items?: Array<Record<string, unknown>> } })
+			.providerPayload;
+		if (payload?.type !== "openaiResponsesHistory" || !Array.isArray(payload.items)) continue;
+		const { result, removed: count } = stripUnusableReasoningItems(payload.items);
+		if (count > 0) {
+			payload.items = result;
+			removed += count;
+		}
+	}
+	return removed > 0;
 }
 
 function managedFailureOutcome(message: AssistantMessage, scope?: AttemptScope): ManagedAttemptOutcome {
@@ -1418,6 +1448,9 @@ async function runLoopBody(
 	// Fires at most one repaired resend per run for the poisoned-history
 	// `invalid_prompt` circuit breaker below.
 	let invalidPromptRepairAttempted = false;
+	// Fires at most one repaired resend per run for the reasoning-content replay
+	// breaker below (DeepSeek "reasoning_content ... must be passed back").
+	let reasoningContentRepairAttempted = false;
 	let previousMalformedToolSignatures = new Set<string>();
 	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider";
 	let pendingRecovery:
@@ -1676,6 +1709,40 @@ async function runLoopBody(
 					? currentContext.messages.slice(0, rejectedIndex)
 					: currentContext.messages;
 				if (repairInvalidPromptHistory(retained)) {
+					if (rejectedCommitted) currentContext.messages.splice(rejectedIndex, 1);
+					continue;
+				}
+			}
+			// Session-level reasoning-content replay circuit breaker (bounded,
+			// strip-only). DeepSeek V4 (and reasoning-capable siblings on any
+			// OpenAI-compatible proxy) reject every follow-up turn with
+			// "reasoning_content ... must be passed back to the API" once a prior
+			// assistant turn carried reasoning the proxy stripped to an empty
+			// `encrypted_content`. Resending the identical history re-triggers the
+			// deterministic 400, so naive auto-retry would loop. On the first such
+			// rejection of this run, strip the unusable `reasoning` items from the
+			// Responses history payload IN PLACE (never dropping text, tool-call, or
+			// tool-output items). If that removed anything, resend exactly once so
+			// the model re-reasons; if nothing could be stripped, fall through to
+			// terminal handling and fail fast. Budget = one repaired resend.
+			if (
+				!config.fallbackManaged &&
+				message.stopReason === "error" &&
+				!reasoningContentRepairAttempted &&
+				isReasoningContentReplayError(message)
+			) {
+				reasoningContentRepairAttempted = true;
+				// The rejected turn was already committed to the context by the
+				// streaming path. Repair (and resend) only the history that
+				// preceded it: replaying an errored assistant turn re-triggers the
+				// rejection and leaves a second assistant tail behind.
+				const rejectedIndex = currentContext.messages.length - 1;
+				const rejectedCommitted =
+					rejectedIndex >= 0 && currentContext.messages[rejectedIndex]?.role === "assistant";
+				const retained = rejectedCommitted
+					? currentContext.messages.slice(0, rejectedIndex)
+					: currentContext.messages;
+				if (repairReasoningContentReplayHistory(retained)) {
 					if (rejectedCommitted) currentContext.messages.splice(rejectedIndex, 1);
 					continue;
 				}

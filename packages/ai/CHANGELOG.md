@@ -5,6 +5,7 @@
 ### Fixed
 
 - OpenAI Codex cost estimates now treat an explicit response `service_tier` as authoritative, so a request for priority processing that the provider serves at the default tier is no longer charged the priority multiplier; the requested tier remains the fallback when the terminal response omits the field.
+- Added shared `isReasoningContentReplayError` classifier and `stripUnusableReasoningItems` repair for the DeepSeek-family reasoning-content replay rejection ("The `reasoning_content` in the thinking mode must be passed back to the API"). The classifier detects the error across message carrier shapes; the repair removes only `reasoning` items whose `encrypted_content` a proxy stripped to empty, preserving all non-reasoning history (text, tool calls, tool outputs). The agent loop consumes both for a bounded repair-and-resend circuit breaker.
 
 ## [0.12.11] - 2026-08-03
 

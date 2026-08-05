@@ -200,6 +200,62 @@ function asLowerString(value: unknown): string | undefined {
 }
 
 /**
+ * Shape-tolerant classifier for the DeepSeek-family reasoning-content replay
+ * rejection: "The `reasoning_content` in the thinking mode must be passed back
+ * to the API." DeepSeek V4 (and reasoning-capable siblings reached through any
+ * OpenAI-compatible proxy) 400 every follow-up turn once a prior assistant turn
+ * carried reasoning the proxy stripped to an empty `encrypted_content` /
+ * `reasoning_content`. Resending the identical history re-triggers it, so naive
+ * session auto-retry just burns the budget — it needs the same bounded
+ * repair-and-resend contract as the `invalid_prompt` poisoned-history breaker.
+ *
+ * Accepts a raw provider error, an assistant message, or any object carrying an
+ * `errorMessage` field (the agent-loop circuit breaker keys on this).
+ */
+export function isReasoningContentReplayError(input: unknown): boolean {
+	if (!input) return false;
+	const message =
+		typeof input === "string"
+			? input
+			: input && typeof input === "object"
+				? ((input as { errorMessage?: unknown; message?: unknown }).errorMessage ??
+					(input as { message?: unknown }).message)
+				: undefined;
+	return typeof message === "string" && REASONING_CONTENT_REPLAY_MESSAGE_RE.test(message);
+}
+
+const REASONING_CONTENT_REPLAY_MESSAGE_RE =
+	/reasoning_content[\s\S]*must be passed back to the API|reasoning content[\s\S]*must be passed back to the API/i;
+
+/**
+ * Remove Responses-API `reasoning` items whose `encrypted_content` is missing or
+ * empty from an outgoing history payload. DeepSeek rejects replay of reasoning
+ * whose encrypted blob a proxy stripped to `""`; dropping those items lets the
+ * model re-reason on the next turn instead of re-triggering a deterministic 400.
+ * Non-reasoning items (text, function_call, function_call_output, ...) are kept
+ * verbatim so tool-use pairing and message order are preserved. Returns whether
+ * any item was actually removed — the circuit breaker uses this to decide
+ * between a single repaired resend (removed) and immediate fail-fast (unchanged).
+ */
+export function stripUnusableReasoningItems(items: Array<Record<string, unknown>>): {
+	result: Array<Record<string, unknown>>;
+	removed: number;
+} {
+	let removed = 0;
+	const result: Array<Record<string, unknown>> = [];
+	for (const item of items) {
+		if (item?.type === "reasoning") {
+			const encrypted = item.encrypted_content;
+			if (encrypted === undefined || encrypted === null || encrypted === "") {
+				removed++;
+				continue;
+			}
+		}
+		result.push(item);
+	}
+	return { result, removed };
+}
+/**
  * Neutralize leaked reserved control tokens across every string in an outgoing
  * Responses `input` array. This is the request-boundary complement to the
  * replay-history sanitizer: leaked Harmony markers (`<|channel|>analysis`, ...)
