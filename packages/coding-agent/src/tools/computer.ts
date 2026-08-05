@@ -2,12 +2,21 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { markScreenshotFallbackDirCreatedForGc } from "./computer-gc";
+import { isComputerCallable } from "./computer-policy";
+export {
+	isComputerCallable,
+	isComputerEnabled,
+	isComputerLoadablePlatform,
+	isComputerSupportedPlatform,
+	setComputerArchForTests,
+	setComputerPlatformForTests,
+} from "./computer-policy";
 import type { ToolSession } from "./index";
 import type { OutputMeta } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -210,8 +219,6 @@ function createNativeComputerController(): NativeController {
 }
 
 let controllerFactory: ComputerControllerFactory = createNativeComputerController;
-let platformOverrideForTests: NodeJS.Platform | undefined;
-let archOverrideForTests: NodeJS.Architecture | undefined;
 const screenshotFallbackDirs = new WeakMap<ToolSession, Promise<string>>();
 const latestScreenshotContexts = new WeakMap<ToolSession, ScreenshotContext>();
 
@@ -224,51 +231,6 @@ export function setComputerControllerFactoryForTests(factory: ComputerController
 	controllerFactory = factory ? () => withLegacyBatchAdapterForTests(factory()) : createNativeComputerController;
 }
 
-export function setComputerPlatformForTests(platform: NodeJS.Platform | undefined): void {
-	platformOverrideForTests = platform;
-}
-
-export function setComputerArchForTests(arch: NodeJS.Architecture | undefined): void {
-	archOverrideForTests = arch;
-}
-
-function currentComputerPlatform(): NodeJS.Platform {
-	return platformOverrideForTests ?? process.platform;
-}
-
-function currentComputerArch(): NodeJS.Architecture {
-	return archOverrideForTests ?? process.arch;
-}
-
-export function isComputerSupportedPlatform(
-	platform: NodeJS.Platform = currentComputerPlatform(),
-	arch: NodeJS.Architecture = currentComputerArch(),
-): boolean {
-	return platform === "darwin" && arch === "arm64";
-}
-
-/**
- * Whether the computer capability is loaded/advertised at all on this platform.
- * macOS is callable; Linux is listable (support planned); Windows is fully absent.
- */
-export function isComputerLoadablePlatform(platform: NodeJS.Platform = process.platform): boolean {
-	return platform !== "win32";
-}
-
-export function isComputerEnabled(session: Pick<ToolSession, "settings">): boolean {
-	if (session.settings.get("computer.enabled")) return true;
-	if (session.settings.has("computer.enabled")) return false;
-	if (session.settings.has("computer.alwaysOn")) return Boolean(session.settings.get("computer.alwaysOn"));
-	return true;
-}
-
-export function isComputerCallable(
-	session: Pick<ToolSession, "settings">,
-	platform: NodeJS.Platform = currentComputerPlatform(),
-	arch: NodeJS.Architecture = currentComputerArch(),
-): boolean {
-	return isComputerSupportedPlatform(platform, arch) && isComputerEnabled(session);
-}
 
 export class ComputerTool implements AgentTool<typeof computerSchema, ComputerToolDetails> {
 	readonly name = "computer";
@@ -477,6 +439,29 @@ function validatePointerCoordinates(action: string, x: number, y: number, bounds
 	}
 }
 
+function validateBatchPointerCoordinates(params: SingleComputerParams, bounds: CoordinateBounds | undefined): void {
+	switch (params.action) {
+		case "click":
+			validatePointerCoordinates("click", params.x, params.y, bounds);
+			return;
+		case "double_click":
+			validatePointerCoordinates("double_click", params.x, params.y, bounds);
+			return;
+		case "move":
+			validatePointerCoordinates("move", params.x, params.y, bounds);
+			return;
+		case "drag":
+			validatePointerCoordinates("drag start", params.x, params.y, bounds);
+			validatePointerCoordinates("drag end", params.to_x, params.to_y, bounds);
+			return;
+		case "scroll":
+			validatePointerCoordinates("scroll", params.x, params.y, bounds);
+			return;
+		default:
+			return;
+	}
+}
+
 function expectedEpochFromContext(context: ScreenshotContext | undefined): number | undefined {
 	return typeof context?.displayEpoch === "number" &&
 		Number.isFinite(context.displayEpoch) &&
@@ -618,67 +603,109 @@ function withLegacyBatchAdapterForTests(controller: NativeController): NativeCon
 	}
 	return {
 		...controller,
-		executeBatch: async (expectedEpoch, actions, _timeoutMs, signal) => {
+		executeBatch: async (expectedEpoch, actions, timeoutMs, signal) => {
 			const results: NativeBatchStepResult[] = [];
+			// The adapter must honor the same timeout/cancellation contract the native
+			// batch implements from `timeoutMs`; otherwise a legacy action that never
+			// resolves would run the batch unbounded instead of being cancelled.
+			const deadline = createComputerDeadline(timeoutMs ?? undefined);
 			for (const [index, action] of actions.entries()) {
 				throwIfAborted(signal);
-				switch (action.action) {
-					case "screenshot":
-						if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
-						results.push({ index, action: "screenshot", screenshot: await controller.screenshot() });
-						break;
-					case "click":
-						if (!controller.click) missingNativeMethod("click", "click");
-						controller.click(expectedEpoch, action.x!, action.y!, action.button ?? "left");
-						results.push({ index, action: "click" });
-						break;
-					case "double_click":
-						if (!controller.doubleClick) missingNativeMethod("double_click", "doubleClick");
-						controller.doubleClick(expectedEpoch, action.x!, action.y!, action.button ?? "left");
-						results.push({ index, action: "double_click" });
-						break;
-					case "move":
-						if (!controller.move) missingNativeMethod("move", "move");
-						controller.move(expectedEpoch, action.x!, action.y!);
-						results.push({ index, action: "move" });
-						break;
-					case "drag":
-						if (!controller.drag) missingNativeMethod("drag", "drag");
-						controller.drag(
-							expectedEpoch,
-							action.x!,
-							action.y!,
-							action.toX!,
-							action.toY!,
-							action.button ?? "left",
-						);
-						results.push({ index, action: "drag" });
-						break;
-					case "scroll":
-						if (!controller.scroll) missingNativeMethod("scroll", "scroll");
-						controller.scroll(expectedEpoch, action.x!, action.y!, action.scrollX!, action.scrollY!);
-						results.push({ index, action: "scroll" });
-						break;
-					case "type":
-						if (!controller.type) missingNativeMethod("type", "type");
-						controller.type(undefined, action.text!);
-						results.push({ index, action: "type" });
-						break;
-					case "keypress":
-						if (!controller.keypress) missingNativeMethod("keypress", "keypress");
-						controller.keypress(undefined, action.keys!);
-						results.push({ index, action: "keypress" });
-						break;
-					case "wait":
-						if (!controller.wait) missingNativeMethod("wait", "wait");
-						controller.wait(undefined, action.ms!);
-						results.push({ index, action: "wait" });
-						break;
+				// The native batch reports a refused/failed step through the result
+				// (failureCode/failureIndex), never by throwing. Legacy per-action
+				// mocks throw, so translate that into the native failure shape or
+				// step-level reporting would be lost on the failure path.
+				try {
+					await runComputerOperation(
+						() => dispatchLegacyBatchStep(controller, expectedEpoch, action, index, results),
+						deadline,
+						signal,
+					);
+				} catch (error) {
+					// mapComputerError resolves typed refusals, timeouts (COMPUTER_CANCELLED),
+					// and aborts into the stable code the native batch would have reported.
+					const mapped = mapComputerError(error);
+					return {
+						results,
+						failureCode: mapped.code,
+						failureMessage: mapped.message,
+						failureIndex: index,
+					};
 				}
 			}
 			return { results };
 		},
 	};
+}
+
+async function dispatchLegacyBatchStep(
+	controller: NativeController,
+	expectedEpoch: number | undefined,
+	action: NativeBatchAction,
+	index: number,
+	results: NativeBatchStepResult[],
+): Promise<void> {
+	switch (action.action) {
+		case "screenshot":
+			if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
+			results.push({ index, action: "screenshot", screenshot: await controller.screenshot() });
+			break;
+		case "click":
+			if (!controller.click) missingNativeMethod("click", "click");
+			await settleLegacyStep(controller.click(expectedEpoch, action.x!, action.y!, action.button ?? "left"));
+			results.push({ index, action: "click" });
+			break;
+		case "double_click":
+			if (!controller.doubleClick) missingNativeMethod("double_click", "doubleClick");
+			await settleLegacyStep(
+				controller.doubleClick(expectedEpoch, action.x!, action.y!, action.button ?? "left"),
+			);
+			results.push({ index, action: "double_click" });
+			break;
+		case "move":
+			if (!controller.move) missingNativeMethod("move", "move");
+			await settleLegacyStep(controller.move(expectedEpoch, action.x!, action.y!));
+			results.push({ index, action: "move" });
+			break;
+		case "drag":
+			if (!controller.drag) missingNativeMethod("drag", "drag");
+			await settleLegacyStep(
+				controller.drag(expectedEpoch, action.x!, action.y!, action.toX!, action.toY!, action.button ?? "left"),
+			);
+			results.push({ index, action: "drag" });
+			break;
+		case "scroll":
+			if (!controller.scroll) missingNativeMethod("scroll", "scroll");
+			await settleLegacyStep(
+				controller.scroll(expectedEpoch, action.x!, action.y!, action.scrollX!, action.scrollY!),
+			);
+			results.push({ index, action: "scroll" });
+			break;
+		case "type":
+			if (!controller.type) missingNativeMethod("type", "type");
+			await settleLegacyStep(controller.type(undefined, action.text!));
+			results.push({ index, action: "type" });
+			break;
+		case "keypress":
+			if (!controller.keypress) missingNativeMethod("keypress", "keypress");
+			await settleLegacyStep(controller.keypress(undefined, action.keys!));
+			results.push({ index, action: "keypress" });
+			break;
+		case "wait":
+			if (!controller.wait) missingNativeMethod("wait", "wait");
+			await settleLegacyStep(controller.wait(undefined, action.ms!));
+			results.push({ index, action: "wait" });
+			break;
+	}
+}
+
+/**
+ * Legacy per-action controllers are typed `=> void` but may return a promise.
+ * Awaiting it keeps the adapter's timeout/cancellation semantics identical to
+ * the native batch, which never returns before its steps settle.
+ */
+async function settleLegacyStep(value: unknown): Promise<void> {
+	await value;
 }
 
 function dispatchComputerAction(
@@ -820,6 +847,10 @@ async function dispatchBatchComputerActions(
 	const steps = actions.map(detailsFromParams);
 	const wireSteps: BatchWireStep[] = [];
 	for (const [userIndex, action] of actions.entries()) {
+		// Coordinate bounds are a pre-dispatch safety contract: every pointer
+		// action must be refused with COMPUTER_COORD_INVALID before any native
+		// input is emitted, on the batch path exactly as on the single path.
+		validateBatchPointerCoordinates(action, initialContext);
 		const nativeAction = { ...nativeBatchAction(action, timeoutMs), timeoutGroup: userIndex };
 		wireSteps.push({ action: nativeAction, userIndex });
 		if (action.action !== "screenshot" && (action.include_screenshot === true || autoScreenshot)) {

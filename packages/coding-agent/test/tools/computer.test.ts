@@ -5,16 +5,18 @@ import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	BUILTIN_CAPABILITY_CATALOG,
+	createTools,
+	type ToolSession,
+} from "@gajae-code/coding-agent/tools";
+import {
 	ComputerTool,
 	computerSchema,
-	createTools,
 	isComputerCallable,
 	isComputerLoadablePlatform,
 	setComputerArchForTests,
 	setComputerControllerFactoryForTests,
 	setComputerPlatformForTests,
-	type ToolSession,
-} from "@gajae-code/coding-agent/tools";
+} from "@gajae-code/coding-agent/tools/implementations";
 import { summarizeComputerDetails } from "@gajae-code/coding-agent/tools/computer/render";
 import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
 import { zlibSync } from "fflate";
