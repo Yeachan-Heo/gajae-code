@@ -76,7 +76,12 @@ import {
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
 import { wrapOpenAIFetchForBoundedRateLimits } from "./openai-bounded-rate-limits";
-import { detectOpenAICompat, type ResolvedOpenAICompat, resolveOpenAICompat } from "./openai-completions-compat";
+import {
+	detectAlibabaTokenPlanQwen38,
+	detectOpenAICompat,
+	type ResolvedOpenAICompat,
+	resolveOpenAICompat,
+} from "./openai-completions-compat";
 import {
 	applyOpenAIRequestTransformBody,
 	applyOpenAIRequestTransformHeaders,
@@ -1416,8 +1421,7 @@ function buildParams(
 			reasoningEnabled &&
 			reasoningEffort !== undefined &&
 			compat.supportsReasoningEffort &&
-			model.provider === "alibaba-token-plan" &&
-			(model.id === "qwen3.8-max" || model.id === "qwen3.8-max-preview")
+			detectAlibabaTokenPlanQwen38(model, resolvedBaseUrl) !== undefined
 		) {
 			params.reasoning_effort = mapReasoningEffort(reasoningEffort, compat.reasoningEffortMap) as Effort;
 		}

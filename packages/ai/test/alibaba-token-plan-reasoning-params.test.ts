@@ -105,6 +105,19 @@ const qwenGa = getBundledModel("alibaba-token-plan", "qwen3.8-max") as Model<"op
 const glm = getBundledModel("alibaba-token-plan", "glm-5.2") as Model<"openai-completions">;
 const deepseek = getBundledModel("alibaba-token-plan", "deepseek-v4-flash-0731") as Model<"openai-completions">;
 
+/**
+ * A user-defined `providers:` entry that points at the Token Plan endpoint, as documented
+ * in `docs/models.md`. Its provider id is arbitrary, so provider-id-only matching misses it.
+ */
+function customTokenPlanModel(overrides: Partial<Model<"openai-completions">> = {}): Model<"openai-completions"> {
+	return {
+		...qwenGa,
+		provider: "ali" as Model["provider"],
+		compat: undefined,
+		...overrides,
+	};
+}
+
 describe("Alibaba Token Plan reasoning request parameters", () => {
 	it("resolves only the documented Alibaba Token Plan credential environment variable", () => {
 		Bun.env.ALIBABA_TOKEN_PLAN_API_KEY = "alibaba-token-plan-test-key";
@@ -256,5 +269,78 @@ describe("Alibaba Token Plan Qwen3.8 Max GA thinking history", () => {
 describe("Alibaba Token Plan Qwen3.8 Max Preview capabilities", () => {
 	it("keeps the documented visual-understanding input modality", () => {
 		expect(qwenPreview.input).toEqual(["text", "image"]);
+	});
+});
+
+describe("Qwen3.8 Max reached through a custom Token Plan provider", () => {
+	it("applies the Qwen3.8 Max contract by endpoint rather than built-in provider id", () => {
+		const compat = detectCompat(customTokenPlanModel());
+
+		expect(compat.thinkingFormat).toBe("qwen");
+		expect(compat.reasoningEffortMap).toMatchObject({ minimal: "low", high: "xhigh", max: "xhigh" });
+		expect(compat.requiresReasoningContentForToolCalls).toBe(true);
+		expect(compat.allowsSyntheticReasoningContentForToolCalls).toBe(false);
+		expect(compat.disableReasoningOnForcedToolChoice).toBe(true);
+	});
+
+	it("resolves the contract through wireModelId when the local id is renamed", () => {
+		const compat = detectCompat(customTokenPlanModel({ id: "ali-max", wireModelId: "qwen3.8-max" }));
+
+		expect(compat.thinkingFormat).toBe("qwen");
+		expect(compat.reasoningEffortMap).toMatchObject({ minimal: "low", high: "xhigh", max: "xhigh" });
+		expect(compat.requiresReasoningContentForToolCalls).toBe(true);
+		expect(compat.allowsSyntheticReasoningContentForToolCalls).toBe(false);
+		expect(compat.disableReasoningOnForcedToolChoice).toBe(true);
+	});
+
+	it("leaves unrelated models on the same endpoint untouched", () => {
+		const compat = detectCompat(customTokenPlanModel({ id: "qwen3.7-max" }));
+
+		expect(compat.requiresReasoningContentForToolCalls).toBe(false);
+		expect(compat.allowsSyntheticReasoningContentForToolCalls).toBe(true);
+		expect(compat.disableReasoningOnForcedToolChoice).toBe(false);
+	});
+
+	it("sends the mapped Chat reasoning effort instead of the raw OpenAI alias", async () => {
+		const payload = await captureCompletionsPayload(customTokenPlanModel(), "minimal");
+
+		expect(payload.enable_thinking).toBe(true);
+		expect(payload.reasoning_effort).toBe("low");
+	});
+
+	it("suppresses thinking on forced tool choice", async () => {
+		const payload = await captureCompletionsToolPayload(customTokenPlanModel(), { type: "tool", name: "echo" });
+
+		expect(payload.tool_choice).toEqual({ type: "function", function: { name: "echo" } });
+		expect(payload.enable_thinking).toBe(false);
+		expect(payload.reasoning_effort).toBeUndefined();
+	});
+
+	it("replays prior reasoning_content on a tool-call continuation turn", () => {
+		const model = customTokenPlanModel();
+		const messages = convertMessages(
+			model,
+			{
+				messages: [
+					{ role: "user", content: "list files", timestamp: 0 },
+					assistantTurn(model, [
+						{ type: "thinking", thinking: "Custom provider thinking.", thinkingSignature: "reasoning_content" },
+						{ type: "toolCall", id: "call_3", name: "echo", arguments: { text: "." } },
+					]),
+					{
+						role: "toolResult",
+						toolCallId: "call_3",
+						toolName: "echo",
+						content: [{ type: "text", text: "ok" }],
+						isError: false,
+						timestamp: 0,
+					},
+				],
+			},
+			detectCompat(model),
+		);
+
+		const assistant = messages.find(m => m.role === "assistant") as object;
+		expect(Reflect.get(assistant, "reasoning_content")).toBe("Custom provider thinking.");
 	});
 });

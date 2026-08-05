@@ -17,6 +17,32 @@ export type ResolvedOpenAICompat = Required<
 	toolChoiceSupport?: OpenAICompat["toolChoiceSupport"];
 };
 
+/** Host suffix shared by every regional Alibaba Token Plan OpenAI-compatible endpoint. */
+const ALIBABA_TOKEN_PLAN_HOST = "maas.aliyuncs.com";
+
+/**
+ * Identify an Alibaba Token Plan Qwen3.8 model.
+ *
+ * These models carry provider-specific reasoning contracts — a non-OpenAI effort
+ * vocabulary, mandatory `reasoning_content` replay, and a forced-tool/thinking
+ * exclusion — that the generic Qwen path gets wrong. A user-defined `providers:`
+ * entry can point at the Token Plan endpoint under any local provider id, so match
+ * the endpoint and the wire model id instead of only the built-in provider id.
+ */
+export function detectAlibabaTokenPlanQwen38(
+	model: Pick<Model<"openai-completions">, "provider" | "id" | "baseUrl"> & { wireModelId?: string },
+	resolvedBaseUrl?: string,
+): "ga" | "preview" | undefined {
+	const baseUrl = resolvedBaseUrl ?? model.baseUrl;
+	if (model.provider !== "alibaba-token-plan" && !baseUrl.includes(ALIBABA_TOKEN_PLAN_HOST)) {
+		return undefined;
+	}
+	const wireModelId = model.wireModelId ?? model.id;
+	if (wireModelId === "qwen3.8-max") return "ga";
+	if (wireModelId === "qwen3.8-max-preview") return "preview";
+	return undefined;
+}
+
 function detectStrictModeSupport(provider: string, baseUrl: string): boolean {
 	if (
 		provider === "openai" ||
@@ -71,7 +97,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		/(^|\/)anthropic\//i.test(model.id);
 	const isAlibaba = baseUrl.includes("dashscope");
 	const isQwen = model.id.toLowerCase().includes("qwen");
-	const isAlibabaTokenPlanQwen38Max = provider === "alibaba-token-plan" && model.id === "qwen3.8-max";
+	const isAlibabaTokenPlanQwen38Max = detectAlibabaTokenPlanQwen38(model, resolvedBaseUrl) === "ga";
 	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
 	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
 	// upstream model is reachable through many OpenAI-compat hosts (api.deepseek.com, Deepinfra,
@@ -230,7 +256,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 				? "zai"
 				: provider === "openrouter" || baseUrl.includes("openrouter.ai")
 					? "openrouter"
-					: isAlibaba || isQwen
+					: isAlibaba || isQwen || isAlibabaTokenPlanQwen38Max
 						? "qwen"
 						: "openai",
 		reasoningContentField: "reasoning_content",
