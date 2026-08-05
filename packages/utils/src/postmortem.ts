@@ -190,46 +190,53 @@ function installProcessStdoutWriteClassifier(): void {
 	process.stdout.write = markedWrite as typeof process.stdout.write;
 }
 
-function errorForDiagnostic(reason: unknown): Error {
-	if (reason instanceof Error) return reason;
-	// A thrown plain object (e.g. a structured startup-failure shape such as
-	// `{ phase, reason, message }`) would otherwise stringify to
-	// "[object Object]", hiding the actual failure in the crash log and on
-	// stderr. Surface `.message`/`.name` when present, otherwise fall back to a
-	// best-effort JSON snapshot. This runs on the uncaughtException path, where
-	// it must never throw, so every property read and serialization below is
-	// guarded: a throwing getter (or a Proxy get-trap), a circular structure, or
-	// a non-serializable value cannot re-enter the crash path. Arrays keep the
-	// existing `String(reason)` format ("1,2,3") rather than switching to JSON.
-	if (reason !== null && typeof reason === "object" && !Array.isArray(reason)) {
-		const value = reason as Record<string, unknown>;
-		let message: string;
-		try {
-			const msg = value.message;
-			message =
-				typeof msg === "string" && msg.length > 0
-					? msg
-					: (JSON.stringify(reason) ?? "[unserializable thrown object]");
-		} catch {
-			// A throwing getter on `.message` or an unserializable value (a circular
-			// structure) must not escape on the crash path.
-			message = "[unserializable thrown object]";
-		}
-		const error = new Error(message);
-		try {
-			const name = value.name;
-			if (typeof name === "string" && name.length > 0) error.name = name;
-		} catch {
-			// A throwing `.name` getter must not clobber the message above; leave
-			// the default name in place.
-		}
-		return error;
-	}
+function readSafeStringProperty(value: object, key: string): string | undefined {
+	// Reads one property without letting a throwing getter (or a Proxy get-trap)
+	// escape on the crash path. Returns the value only when it is a non-empty
+	// string; any throw, non-string, or empty result yields undefined so the
+	// caller can fall back to a safe default.
 	try {
+		const v = (value as Record<string, unknown>)[key];
+		return typeof v === "string" && v.length > 0 ? v : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function errorForDiagnostic(reason: unknown): Error {
+	// This runs on the uncaughtException/unhandledRejection path, where it must
+	// never throw: a throw here masks the original fatal with a secondary
+	// exception. `instanceof`, `Object.getPrototypeOf`, and every property read
+	// below can trigger a hostile or revoked Proxy trap, so the entire
+	// normalization is wrapped in a single outer guard.
+	try {
+		if (reason instanceof Error) return reason;
+		if (reason === null || typeof reason !== "object") {
+			return new Error(String(reason));
+		}
+		// Only a plain object can carry a structured `.message` worth surfacing.
+		// Arrays and non-plain objects (Date/RegExp/Map/Set/Promise/...) keep the
+		// pre-change `String()` rendering ("1,2,3", "/re/", "[object Map]"); a JSON
+		// snapshot would regress that fidelity.
+		const proto = Object.getPrototypeOf(reason);
+		if (proto === null || proto === Object.prototype) {
+			const message = readSafeStringProperty(reason, "message");
+			if (message !== undefined) {
+				// Sanitize at the source so the value is clean in the message
+				// property, the record header, and the Error.stack first line alike.
+				const error = new Error(sanitizeCrashHeader(message));
+				const name = readSafeStringProperty(reason, "name");
+				if (name) error.name = sanitizeCrashHeader(name);
+				return error;
+			}
+		}
+		// Plain objects without a usable string `.message`, plus arrays and
+		// non-plain objects, fall back to the existing `String()` rendering. We
+		// deliberately do NOT JSON-snapshot the object: arbitrary opaque fields
+		// (e.g. a bare `token`) would bypass the regex redactor in recordFatalCrash
+		// and persist verbatim in the indefinitely-retained crash log.
 		return new Error(String(reason));
 	} catch {
-		// `String()` can still throw here — e.g. an array whose element has a
-		// throwing `toString` reaches this branch — so guard it like the rest.
 		return new Error("[unserializable thrown value]");
 	}
 }
@@ -240,8 +247,8 @@ function errorForDiagnostic(reason: unknown): Error {
 let inspectorOpened = false;
 
 function formatFatalError(label: string, err: Error): string {
-	const name = err.name || "Error";
-	const message = err.message || "(no message)";
+	const name = redactCrashSecrets(sanitizeCrashHeader(err.name || "Error"));
+	const message = redactCrashSecrets(sanitizeCrashHeader(err.message || "(no message)"));
 	const stack = err.stack || "";
 	const stackLines = stack.split("\n").slice(1);
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
@@ -288,6 +295,23 @@ function redactCrashSecrets(text: string): string {
 	);
 	return redacted;
 }
+/**
+ * Collapse line breaks, other C0 control characters, DEL, and terminal escape
+ * sequences in the single-line crash-record header / stderr banner so a hostile
+ * thrown `.name`/`.message` cannot forge record boundaries, fake a timestamp
+ * line, or inject terminal control sequences. The multi-line stack (generated
+ * by the Error constructor, not attacker-controlled) is left intact.
+ */
+function sanitizeCrashHeader(text: string): string {
+	return text
+		// Terminal escape sequences (OSC `ESC ] … BEL/ST`, CSI `ESC [ … letter`,
+		// and any other ESC-prefixed byte) carry control bytes themselves, so strip
+		// them before the control sweep turns their internals into stray spaces.
+		.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, " ")
+		.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, " ")
+		.replace(/\x1b./g, " ")
+		.replace(/[\x00-\x1f\x7f]/g, " ");
+}
 
 /**
  * Bound one record to CRASH_RECORD_MAX_BYTES without splitting a UTF-8
@@ -328,9 +352,11 @@ export function recordFatalCrash(
 		const err = errorForDiagnostic(reason);
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
+		const name = redactCrashSecrets(sanitizeCrashHeader(err.name || "Error"));
+		const message = redactCrashSecrets(sanitizeCrashHeader(err.message || "(no message)"));
 		const report = boundCrashRecord(
 			`${now.toISOString()} pid=${process.pid} [${label}] ` +
-				`${err.name || "Error"}: ${redactCrashSecrets(err.message || "(no message)")}\n` +
+				`${name}: ${message}\n` +
 				`${redactCrashSecrets(err.stack ?? "")}\n\n`,
 		);
 		fs.mkdirSync(path.dirname(target), { recursive: true });

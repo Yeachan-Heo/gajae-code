@@ -64,18 +64,29 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("Cannot append to corrupt session index log");
 		expect(contents).not.toContain("[object Object]");
 	});
-	it("snapshots plain objects that have no string message", () => {
+	it("does not snapshot opaque fields of a thrown object into the crash log", () => {
+		// A plain object without a usable string `.message` must fall back to the
+		// safe `String()` rendering rather than a JSON snapshot: the regex redactor
+		// cannot recognize an arbitrary opaque credential field, so snapshotting
+		// would persist it verbatim in the indefinitely-retained crash log.
 		const target = tempCrashLog();
-		recordFatalCrash(
-			"Uncaught Exception",
-			{ code: "ECorrupt", nested: { host: "127.0.0.1", port: 8765 } },
-			{ path: target },
-		);
+		const secret = "opaque_session_credential_0123456789";
+		recordFatalCrash("Uncaught Exception", { code: "E_AUTH", token: secret }, { path: target });
 		const contents = fs.readFileSync(target, "utf8");
-		expect(contents).toContain("ECorrupt");
-		expect(contents).toContain("127.0.0.1");
-		expect(contents).toContain("8765");
-		expect(contents).not.toContain("[object Object]");
+		expect(contents).toContain("Uncaught Exception");
+		expect(contents).not.toContain(secret);
+		expect(contents).not.toContain("E_AUTH");
+	});
+	it("redacts a credential-shaped name copied from a thrown object", () => {
+		// `err.name` is interpolated into the record header; a PAT-shaped name
+		// must be routed through the redactor instead of persisting verbatim.
+		const target = tempCrashLog();
+		const pat = "ghp_abcdef0123456789abcdef0123";
+		recordFatalCrash("Uncaught Exception", { name: pat, message: "auth misconfigured" }, { path: target });
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).not.toContain(pat);
+		expect(contents).toContain("«redacted-github-token»");
+		expect(contents).toContain("auth misconfigured");
 	});
 	it("never throws and still records a circular thrown object", () => {
 		const target = tempCrashLog();
@@ -85,7 +96,10 @@ describe("recordFatalCrash", () => {
 		expect(written).toBe(target);
 		const contents = fs.readFileSync(target, "utf8");
 		expect(contents).toContain("Uncaught Exception");
-		expect(contents).not.toContain("[object Object]");
+		// No string `.message` and no opaque-field snapshot: the safe `String()`
+		// fallback renders without leaking the object's fields.
+		expect(contents).toContain("[object Object]");
+		expect(contents).not.toContain("ECircular");
 	});
 	it("preserves the name of a thrown object alongside its message", () => {
 		const target = tempCrashLog();
@@ -119,7 +133,7 @@ describe("recordFatalCrash", () => {
 		expect(written).toBe(target);
 		const contents = fs.readFileSync(target, "utf8");
 		expect(contents).toContain("Uncaught Exception");
-		expect(contents).toContain("[unserializable thrown object]");
+		expect(contents).toContain("[object Object]");
 	});
 	it("keeps arrays on the existing String path instead of JSON", () => {
 		const target = tempCrashLog();
@@ -157,6 +171,27 @@ describe("recordFatalCrash", () => {
 		expect(written).toBe(target);
 		const contents = fs.readFileSync(target, "utf8");
 		expect(contents).toContain("real failure");
+	});
+	it("strips line breaks and terminal escapes from a hostile name/message", () => {
+		// A hostile thrown `.name`/`.message` must not forge record boundaries or
+		// inject terminal control sequences into the crash-log header.
+		const target = tempCrashLog();
+		const reason = {
+			name: "Bad\x1b[31mName",
+			message: "line-one\nforged-timestamp 1970-01-01T00:00:00.000Z pid=1 [Uncaught Exception] fake",
+		};
+		recordFatalCrash("Uncaught Exception", reason, { path: target });
+		const contents = fs.readFileSync(target, "utf8");
+		// No terminal escape sequence survives anywhere in the record.
+		expect(contents).not.toContain("\x1b");
+		// The newline in the message is collapsed, so the forged payload rides on
+		// the real header line instead of starting a believable forged record.
+		const lines = contents.split("\n");
+		const standaloneForged = lines.some(
+			(line) => line.includes("forged-timestamp") && !line.includes("line-one"),
+		);
+		expect(standaloneForged).toBe(false);
+		expect(lines[0]).toContain("line-one");
 	});
 
 	it("appends successive crashes rather than overwriting", () => {
@@ -383,5 +418,26 @@ describe("fatal handler process fixtures", () => {
 		const contents = fs.readFileSync(crashLog, "utf8");
 		expect(contents).toContain("[Unhandled Rejection]");
 		expect(contents).toContain("spawned rejection boom");
+	});
+	it("never masks the original fatal for a Proxy whose getPrototypeOf trap throws", () => {
+		// `instanceof`/`getPrototypeOf` invoke the trap, which would otherwise
+		// throw inside errorForDiagnostic on the uncaughtException path and turn
+		// the original crash into a secondary unhandled rejection.
+		const { exitCode, crashLog } = runFatalFixture(
+			`const p = new Proxy({}, { getPrototypeOf() { throw new Error("getPrototypeOf boom"); } });\nthrow p;`,
+		);
+		expect(exitCode).toBe(1);
+		const contents = fs.readFileSync(crashLog, "utf8");
+		expect(contents).toContain("[Uncaught Exception]");
+		expect(contents).not.toContain("getPrototypeOf boom");
+	});
+
+	it("never masks the original fatal for a revoked Proxy", () => {
+		const { exitCode, crashLog } = runFatalFixture(
+			`const { proxy, revoke } = Proxy.revocable({}, {});\nrevoke();\nthrow proxy;`,
+		);
+		expect(exitCode).toBe(1);
+		const contents = fs.readFileSync(crashLog, "utf8");
+		expect(contents).toContain("[Uncaught Exception]");
 	});
 });
