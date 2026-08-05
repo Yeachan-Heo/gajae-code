@@ -58,6 +58,7 @@ packages/ai/test/.temp-images/
 .gjc/rlm/
 .gjc/state/
 .gjc/_session-*/
+.gjc/rss-checkpoints/
 .gjc/metrics.json
 .pi_config/
 .opencode/
