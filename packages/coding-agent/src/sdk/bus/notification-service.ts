@@ -182,12 +182,34 @@ export async function readNotificationEndpointFile(file: string): Promise<Notifi
 /** Bump when the native exact-deletion identity contract changes. */
 export const NATIVE_PATH_IDENTITY_CONTRACT_VERSION = 1;
 
+/**
+ * Remove exactly the inspected regular file.
+ *
+ * Intermediate directory symlinks (e.g. multi-account layouts that share
+ * `notifications/` via a directory symlink) are resolved before the native
+ * no-follow unlink. The final path component must still be a regular file:
+ * a file symlink is rejected as `reparse_point` so callers cannot delete
+ * through an alias.
+ */
 export function exactUnlinkNotificationFile(
 	file: string,
 	identity: NotificationEndpointFileIdentity,
 	quarantineName: string,
 ): NotificationExactUnlinkResult {
-	const result = native.exactUnlink(file, { ...identity, quarantineName });
+	let target = file;
+	try {
+		const st = fsSync.lstatSync(file);
+		if (st.isSymbolicLink()) {
+			return { ok: false, code: "reparse_point" };
+		}
+		// Native exact_unlink walks every path component with O_NOFOLLOW and
+		// rejects intermediate directory reparse points. Resolve those first so
+		// a legitimate shared notifications directory still unlinks by inode.
+		target = fsSync.realpathSync(file);
+	} catch {
+		// Missing/unreadable paths fall through; the native call reports the failure.
+	}
+	const result = native.exactUnlink(target, { ...identity, quarantineName });
 	return {
 		ok: result.ok,
 		code: result.code,
