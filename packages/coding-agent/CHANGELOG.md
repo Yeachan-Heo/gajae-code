@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `/model` reasoning menu header now shows the highlighted reasoning level (not the model id), seeds the cursor from the role badge when re-editing the same model, and uses a provider-neutral label for `max` instead of "Opus maximum reasoning" (#3847).
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 
 ## [0.12.12] - 2026-08-05

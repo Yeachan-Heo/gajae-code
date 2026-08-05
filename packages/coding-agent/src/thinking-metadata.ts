@@ -39,7 +39,8 @@ const THINKING_LEVEL_METADATA: Record<ThinkingLevelValue, ThinkingLevelMetadata>
 	max: {
 		value: "max",
 		label: "max",
-		description: "Opus maximum reasoning",
+		// Provider-neutral: max is not Anthropic/Opus-specific (OpenAI, Luna, etc.).
+		description: "Absolute maximum reasoning",
 	},
 };
 
