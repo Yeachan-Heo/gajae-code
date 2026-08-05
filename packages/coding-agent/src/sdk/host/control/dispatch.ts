@@ -128,6 +128,42 @@ function text(input: ControlInput, key = "text"): string {
 	return input[key] as string;
 }
 
+const TERMINAL_ABORT_FIELDS = new Set(["mode", "scope"]);
+
+function invalidInput(message: string): never {
+	throw new TypedControlError("invalid_input", message);
+}
+
+/**
+ * C04 `turn.abort` dispatch.
+ *
+ * Legacy behavior (omitted mode or `mode:"turn"`) is preserved verbatim: the
+ * input is dropped and the ordinary argument-less `surface.abort()` runs.
+ *
+ * Terminal mode (`mode:"terminal"`) is validated strictly and side-effect-free
+ * before any surface call: only `mode`/`scope` fields are accepted, `scope`
+ * must be `"turn"` or `"owned"` (default `"turn"`), and a nonempty idempotency
+ * key of at most 128 UTF-8 bytes is required on the request envelope. Terminal
+ * semantics (see the approved plan): stop the root worker's current turn and
+ * block only its own continuation routes; left-running owned work keeps
+ * running and its completions are delivered normally so the root worker can
+ * resume with a fresh attempt — owned delivery is NOT suppressed.
+ */
+function invokeAbort(surface: ControlSurface, input: ControlInput, idempotencyKey: string | undefined): ControlValue {
+	const mode = input.mode === undefined ? "turn" : input.mode;
+	if (mode === "turn") return surface.abort();
+	if (mode !== "terminal") invalidInput('turn.abort mode must be "turn" or "terminal".');
+	for (const key of Object.keys(input))
+		if (!TERMINAL_ABORT_FIELDS.has(key)) invalidInput(`Unknown turn.abort terminal field: ${key}`);
+	const scope = input.scope === undefined ? "turn" : input.scope;
+	if (scope !== "turn" && scope !== "owned") invalidInput('turn.abort terminal scope must be "turn" or "owned".');
+	if (typeof idempotencyKey !== "string" || idempotencyKey.length === 0)
+		invalidInput("terminal abort requires a nonempty idempotency key.");
+	if (new TextEncoder().encode(idempotencyKey).length > 128)
+		invalidInput("terminal abort idempotency key must be at most 128 UTF-8 bytes.");
+	if (!surface.abortTerminal) invalidInput("terminal abort is not supported by this surface.");
+	return surface.abortTerminal({ mode: "terminal", scope });
+}
 function invoke(
 	surface: ControlSurface,
 	operation: string,
@@ -143,7 +179,7 @@ function invoke(
 		case "turn.follow_up":
 			return surface.followUp(text(input));
 		case "turn.abort":
-			return surface.abort();
+			return invokeAbort(surface, input, idempotencyKey);
 		case "turn.abort_and_prompt":
 			return surface.abortAndPrompt(text(input));
 		case "ask.answer":

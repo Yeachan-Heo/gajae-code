@@ -1,4 +1,17 @@
 export type ControlValue = unknown;
+export type AbortMode = "turn" | "terminal";
+export type AbortScope = "turn" | "owned";
+
+/**
+ * Terminal-mode C04 `turn.abort` input. `scope` selects whether exact causal
+ * owned work (background Bash/task jobs, detached subagents) is also stopped
+ * (`"owned"`) or left running so its completion can resume the root worker
+ * (`"turn"`, the default).
+ */
+export interface TerminalAbortInput {
+	mode: "terminal";
+	scope?: AbortScope;
+}
 export type ControlInput = Record<string, unknown>;
 
 /**
@@ -10,6 +23,8 @@ export interface ControlSurface {
 	steer(text: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
+	/** Terminal abort: stop the current root turn (and optionally exact owned work). */
+	abortTerminal?(input: TerminalAbortInput): Promise<ControlValue> | ControlValue;
 	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
 	answerAsk(id: string, answer: ControlValue): Promise<ControlValue> | ControlValue;
 	answerGate(
