@@ -2572,6 +2572,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:registerToolSessionTransitionCleanup",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal tool transition cleanup registration for shared artifact-manager ownership, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:getAsyncJobSnapshot",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
