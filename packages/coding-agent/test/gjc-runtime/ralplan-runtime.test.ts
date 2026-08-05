@@ -54,6 +54,16 @@ async function tempDir(): Promise<string> {
 	tempRoots.push(dir);
 	return dir;
 }
+async function seedProjectRalplanMaxIterations(root: string, maxIterations = 5): Promise<void> {
+	// Project settings beat any user-layer configuration, making the cap
+	// scenarios hermetic regardless of the developer's ~/.gjc config.
+	await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+	await fs.writeFile(
+		path.join(root, ".gjc", "settings.json"),
+		JSON.stringify({ gjc: { ralplan: { maxIterations } } }),
+		"utf-8",
+	);
+}
 
 afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
@@ -2035,6 +2045,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("rejects a 6th revision opener with PLANNING-STUCK and still allows final", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "cap-run";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2116,6 +2127,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 	});
 	it("fails closed when index.jsonl is emptied after max openers (ledger wipe)", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "wipe-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2142,6 +2154,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("fails closed when index.jsonl is truncated under on-disk openers", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "trunc-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2166,6 +2179,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("fails closed when index.jsonl is only malformed lines while openers exist on disk", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "malformed-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2191,6 +2205,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("fails closed when index is deleted but opener stage files remain", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "delete-index-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2212,6 +2227,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("clean new run_id still allows openers after another run is ledger-stuck", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const write = async (runId: string, stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
 				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
@@ -2775,6 +2791,7 @@ describe("ralplan review lane budget settings", () => {
 describe("ralplan review lane budget replays", () => {
 	it("refuses only the pathological same-iteration lane retries and preserves final escalation", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "pathological-replay";
 		const sequence = [
 			["planner", "planner"],
@@ -2852,6 +2869,7 @@ describe("ralplan review lane budget replays", () => {
 describe("ralplan review lane budget rigor and receipts", () => {
 	it("does not parse or demote a justified critic blocker, while exhausted openers remain visibly stuck", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "rigor-preserved";
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# initial plan")).status).toBe(0);
 		const critic = await writeRalplanArtifact(

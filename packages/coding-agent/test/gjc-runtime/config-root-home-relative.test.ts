@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { standardizeMacOSPath } from "@gajae-code/utils";
 
 /**
  * `GJC_CONFIG_DIR` is documented as "Config root dirname under home", and
@@ -48,7 +49,7 @@ describe("config root is resolved under home", () => {
 		const result = (await resolveIn(home, repo, ".myconfig")).ralplan as { maxIterations: number; source: string };
 
 		expect(result.maxIterations).toBe(9);
-		expect(result.source).toBe(path.join(home, ".myconfig", "settings.json"));
+		expect(result.source).toBe(standardizeMacOSPath(path.join(home, ".myconfig", "settings.json")));
 	});
 
 	it("reads ultragoal settings from <home>/<GJC_CONFIG_DIR>", async () => {
@@ -56,7 +57,7 @@ describe("config root is resolved under home", () => {
 		const result = (await resolveIn(home, repo, ".myconfig")).ultragoal as { budget: number; source: string };
 
 		expect(result.budget).toBe(7);
-		expect(result.source).toBe(path.join(home, ".myconfig", "settings.json"));
+		expect(result.source).toBe(standardizeMacOSPath(path.join(home, ".myconfig", "settings.json")));
 	});
 
 	it("keeps using the default config dir name when unset", async () => {
@@ -64,6 +65,6 @@ describe("config root is resolved under home", () => {
 		const result = (await resolveIn(home, repo, undefined)).ralplan as { maxIterations: number; source: string };
 
 		expect(result.maxIterations).toBe(4);
-		expect(result.source).toBe(path.join(home, ".gjc", "settings.json"));
+		expect(result.source).toBe(standardizeMacOSPath(path.join(home, ".gjc", "settings.json")));
 	});
 });

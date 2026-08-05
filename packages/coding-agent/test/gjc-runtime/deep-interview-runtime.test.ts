@@ -602,7 +602,7 @@ describe("native gjc deep-interview runtime", () => {
 		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "settings.json"));
 	});
 
-	it("prefers modern config.yml threshold over legacy project settings.json", async () => {
+	it("prefers project settings over user config.yml (project beats user)", async () => {
 		const root = await tempDir();
 		const agentDir = await tempDir();
 		setAgentDir(agentDir);
@@ -619,8 +619,8 @@ describe("native gjc deep-interview runtime", () => {
 
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
-		expect(payload.threshold).toBeCloseTo(0.2);
-		expect(payload.threshold_source).toBe(path.join(agentDir, "config.yml"));
+		expect(payload.threshold).toBeCloseTo(0.08);
+		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "settings.json"));
 	});
 
 	it("--threshold beats project settings.json", async () => {

@@ -1,7 +1,6 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getConfigRootDir } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -62,6 +61,8 @@ import {
 	writeArtifact,
 	writeGuardedJsonAtomic,
 } from "./state-writer";
+
+import { resolveWorkflowSetting } from "./workflow-settings";
 
 export {
 	captureUltragoalRecoverySnapshot,
@@ -387,39 +388,22 @@ function parseNudgeBudgetValue(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-async function readSettingsNudgeBudget(settingsPath: string): Promise<number | null> {
-	try {
-		const raw = await Bun.file(settingsPath).text();
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		// Support both the flat dotted key and a nested gjc.ultragoal.nudgeBudget shape.
-		const flat = parseNudgeBudgetValue(parsed["gjc.ultragoal.nudgeBudget"]);
-		if (flat !== null) return flat;
-		const gjc = parsed.gjc;
-		if (gjc && typeof gjc === "object") {
-			const ultragoal = (gjc as Record<string, unknown>).ultragoal;
-			if (ultragoal && typeof ultragoal === "object") {
-				return parseNudgeBudgetValue((ultragoal as Record<string, unknown>).nudgeBudget);
-			}
-		}
-		return null;
-	} catch {
-		return null;
-	}
-}
-
 /**
- * Resolve the per-story nudge budget. Project `./.gjc/settings.json` overrides the
- * user settings (`$GJC_CONFIG_DIR/settings.json` or `~/.gjc/settings.json`), else the
- * default. Mirrors the `gjc.deepInterview.ambiguityThreshold` user+project precedence.
+ * Resolve the per-story nudge budget through the shared five-layer resolver.
+ * Ultragoal stays tolerant: an invalid optional settings file continues to the
+ * next layer and finally to the built-in default (10).
  */
 export async function resolveUltragoalNudgeBudget(cwd: string): Promise<{ budget: number; source: string }> {
-	const projectPath = path.join(gjcRoot(cwd), "settings.json");
-	const project = await readSettingsNudgeBudget(projectPath);
-	if (project !== null) return { budget: project, source: projectPath };
-	const userPath = path.join(getConfigRootDir(), "settings.json");
-	const user = await readSettingsNudgeBudget(userPath);
-	if (user !== null) return { budget: user, source: userPath };
-	return { budget: DEFAULT_ULTRAGOAL_NUDGE_BUDGET, source: "default" };
+	const resolution = await resolveWorkflowSetting(cwd, "gjc.ultragoal.nudgeBudget", {
+		defaultValue: DEFAULT_ULTRAGOAL_NUDGE_BUDGET,
+		parse: value => {
+			const parsed = parseNudgeBudgetValue(value);
+			return parsed === null
+				? { kind: "invalid", reason: "expected gjc.ultragoal.nudgeBudget to be a non-negative integer" }
+				: { kind: "valid", value: parsed };
+		},
+	});
+	return { budget: resolution.value, source: resolution.source };
 }
 
 /**
