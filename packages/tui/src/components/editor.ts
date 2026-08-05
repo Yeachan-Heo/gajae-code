@@ -1,6 +1,7 @@
 import { getProjectDir, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
 import {
 	type AutocompleteProvider,
+	type AutocompleteSuggestionKind,
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	isInsideInlineCodeSpan,
@@ -2894,10 +2895,7 @@ export class Editor implements Component, Focusable {
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(
-				suggestions.items,
-				this.#isSlashCommandNameAutocompleteContext() ? "slash-command" : "default",
-			);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
 			this.#autocompleteState = "regular";
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
@@ -2909,7 +2907,7 @@ export class Editor implements Component, Focusable {
 	}
 	#createAutocompleteList(
 		items: Array<{ value: string; label: string; description?: string }>,
-		kind: "slash-command" | "default",
+		kind: AutocompleteSuggestionKind,
 	): SelectList {
 		const layout = kind === "slash-command" ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
 		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
@@ -3039,10 +3037,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
-			this.#autocompleteList = this.#createAutocompleteList(
-				suggestions.items,
-				this.#isSlashCommandNameAutocompleteContext() ? "slash-command" : "default",
-			);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {

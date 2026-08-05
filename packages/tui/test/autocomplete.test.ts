@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	type AutocompleteItem,
 	type AutocompleteProvider,
+	type AutocompleteSuggestionKind,
 	CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 } from "@gajae-code/tui/autocomplete";
@@ -244,6 +245,16 @@ describe("inline backtick slash classification", () => {
 });
 
 describe("inline slash command suggestions", () => {
+	it("marks start-of-input command-name suggestions as slash commands", async () => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "model", description: "Switch AI model", value: "model" }],
+			"/tmp",
+		);
+		const result = await provider.getSuggestions(["/mo"], 0, 3);
+
+		expect(result?.kind).toBe("slash-command");
+	});
+
 	it("suggests command names for slash tokens after existing prompt text", async () => {
 		const provider = new CombinedAutocompleteProvider(
 			[{ name: "model", description: "Switch AI model", value: "model" }],
@@ -254,6 +265,7 @@ describe("inline slash command suggestions", () => {
 
 		expect(result).not.toBeNull();
 		expect(result!.prefix).toBe("/mo");
+		expect(result!.kind).toBe("slash-command");
 		expect(result!.items.map(item => item.value)).toEqual(["model"]);
 	});
 
@@ -281,6 +293,7 @@ describe("inline slash command suggestions", () => {
 		const result = await provider.getSuggestions([line], 0, line.length);
 
 		expect(result).toEqual(pathOnlyResult);
+		expect(result?.kind).toBe("default");
 		expect(result?.items.map(item => item.value) ?? []).not.toContain("template");
 	});
 
@@ -294,6 +307,7 @@ describe("inline slash command suggestions", () => {
 
 		expect(result).not.toBeNull();
 		expect(result!.prefix).toBe("/");
+		expect(result!.kind).toBe("default");
 		expect(result!.items.some(item => item.value.startsWith("/"))).toBe(true);
 		expect(result!.items.map(item => item.value)).not.toContain("model");
 	});
@@ -482,13 +496,13 @@ describe("trySyncSlashCompletion", () => {
 });
 
 class StaticAutocompleteProvider implements AutocompleteProvider {
-	#result: { items: AutocompleteItem[]; prefix: string };
+	#result: { items: AutocompleteItem[]; prefix: string; kind?: AutocompleteSuggestionKind };
 
-	constructor(result: { items: AutocompleteItem[]; prefix: string }) {
+	constructor(result: { items: AutocompleteItem[]; prefix: string; kind?: AutocompleteSuggestionKind }) {
 		this.#result = result;
 	}
 
-	async getSuggestions(): Promise<{ items: AutocompleteItem[]; prefix: string }> {
+	async getSuggestions(): Promise<{ items: AutocompleteItem[]; prefix: string; kind?: AutocompleteSuggestionKind }> {
 		return this.#result;
 	}
 
@@ -501,10 +515,17 @@ class StaticAutocompleteProvider implements AutocompleteProvider {
 	}
 }
 
-async function renderEditorAutocomplete(prefix: string, items: AutocompleteItem[], width: number): Promise<string[]> {
+async function renderEditorAutocomplete(
+	prefix: string,
+	items: AutocompleteItem[],
+	width: number,
+	kind: AutocompleteSuggestionKind = "default",
+	leadingText: string = "",
+): Promise<string[]> {
 	const editor = new Editor(defaultEditorTheme);
 	editor.setBorderVisible(false);
-	editor.setAutocompleteProvider(new StaticAutocompleteProvider({ prefix, items }));
+	editor.setAutocompleteProvider(new StaticAutocompleteProvider({ prefix, items, kind }));
+	editor.setText(leadingText);
 	for (const character of prefix) editor.handleInput(character);
 	await Bun.sleep(0);
 	return editor
@@ -520,7 +541,7 @@ async function renderEditorAbsolutePathAutocomplete(
 ): Promise<string[]> {
 	const editor = new Editor(defaultEditorTheme);
 	editor.setBorderVisible(false);
-	editor.setAutocompleteProvider(new StaticAutocompleteProvider({ prefix, items }));
+	editor.setAutocompleteProvider(new StaticAutocompleteProvider({ prefix, items, kind: "default" }));
 	editor.setText(`read ${prefix}`);
 	editor.handleInput("\t");
 	await Bun.sleep(0);
@@ -539,7 +560,7 @@ describe("Editor autocomplete layout", () => {
 	it("keeps slash-command rows width-safe at narrow, medium, and wide terminal widths", async () => {
 		const snapshots = await Promise.all(
 			[20, 40, 120].map(async width => {
-				const lines = await renderEditorAutocomplete("/g", slashItems, width);
+				const lines = await renderEditorAutocomplete("/g", slashItems, width, "slash-command");
 				expect(lines.every(line => visibleWidth(line) <= width)).toBeTrue();
 				return lines;
 			}),
@@ -553,7 +574,7 @@ describe("Editor autocomplete layout", () => {
 	});
 
 	it("clamps slash primary columns between 12 and 32 cells with Unicode labels", async () => {
-		const shortLines = await renderEditorAutocomplete("/g", slashItems, 120);
+		const shortLines = await renderEditorAutocomplete("/g", slashItems, 120, "slash-command");
 		const longLines = await renderEditorAutocomplete(
 			"/g",
 			[
@@ -564,6 +585,7 @@ describe("Editor autocomplete layout", () => {
 				},
 			],
 			120,
+			"slash-command",
 		);
 		const shortDescriptionColumn = visibleWidth(shortLines[0]!.slice(0, shortLines[0]!.indexOf("Run immediately")));
 		const longDescriptionColumn = visibleWidth(longLines[0]!.slice(0, longLines[0]!.indexOf("Long description")));
@@ -579,6 +601,11 @@ describe("Editor autocomplete layout", () => {
 			"> go                              Run immediately",
 			"  한글명령                        Unicode workflow description",
 		]);
+	});
+	it("uses the compact slash-command layout for inline command-name suggestions", async () => {
+		const lines = await renderEditorAutocomplete("/g", slashItems, 120, "slash-command", "explain this ");
+
+		expect(lines).toEqual(["> go          Run immediately", "  한글명령    Unicode workflow description"]);
 	});
 
 	it("keeps absolute-path file autocomplete byte-identical to the default layout", async () => {
