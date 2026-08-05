@@ -541,7 +541,9 @@ describe("ModelRegistry", () => {
 			const variants = registry.getCanonicalVariants("deepseek-v4-pro");
 
 			expect(model?.cost.cacheRead).toBeGreaterThan(0);
-			expect(model?.thinking?.maxLevel).toBe(Effort.XHigh);
+			// DeepSeek V4 family keeps first-class `max` (not clamped to `xhigh`) so
+			// selectors like `:max` remain valid on aliases and custom proxies (#3858).
+			expect(model?.thinking?.maxLevel).toBe(Effort.Max);
 			expect(variants.some(variant => variant.selector === "ollama/deepseek-v4-pro:cloud")).toBe(true);
 		});
 
