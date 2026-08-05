@@ -15066,6 +15066,17 @@ export class AgentSession {
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
 		// content-free check is the replay-safety guarantee for credential rotation.
 		const canReplayRotatedCredential = credentialRotated;
+		// Universal automatic replay-safety gate (#3791): once the failed attempt
+		// carries observable assistant text, thinking, or tool-call content,
+		// automatic session retry must not re-issue the request. This covers
+		// configured legacy retry (which previously only gated first-event
+		// timeouts) as well as bare defaults. Managed fallback keeps its
+		// provisional discard path (events never published to the session).
+		// Content-free credential rotation remains eligible above; first-event
+		// timeout keeps its additional typed/scope checks earlier in this method.
+		if (!managedFallback && assistantMessageHasVisibleOrToolContent(message)) {
+			return false;
+		}
 		// Bare defaults retain their narrow watchdog and Codex admissions. A
 		// first-event timeout adds the typed, content-free, current-clean-scope
 		// requirement above; other transient watchdogs preserve legacy behavior.

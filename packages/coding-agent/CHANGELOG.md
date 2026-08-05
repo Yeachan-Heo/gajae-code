@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Automatic session retry now refuses to re-issue a request once the failed attempt carries observable assistant text, thinking, or tool-call content — including under explicit legacy `retry.*` settings. Content-free clean failures keep their existing bounded/unbounded policy; managed provisional discard, credential rotation, first-event timeout scope checks, and manual `/retry` are unchanged (#3791).
+
 - Parent sessions and their subagent trees now share one identity-authorized artifact manager across persistent and ephemeral operation. Non-persistent roots are retired on committed session transitions and terminal close, failed transitions retain predecessor ownership, and atomic numeric-ID claims prevent same-root managers from creating ambiguous artifact references (#3813).
 
 - Telegram daemon restart now revokes every persisted callback alias before polling. Reconnecting sessions must replay a pending ask to receive fresh, owner-bound aliases; old controls remain stale, and their keyboards are best-effort terminalized when the original Telegram message id is available. Shutdown now fences new session messages and drains every admitted handler before final callback persistence and ownership release, preventing a successful send racing shutdown from publishing alias state after a successor takes ownership (#3727).

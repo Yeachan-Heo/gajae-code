@@ -375,6 +375,97 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
 
+	it("does not auto-retry configured legacy unknown errors after partial stream progress (#3791)", async () => {
+		// Proxy-style terminal stream failure after partial output crossed the public
+		// stream boundary. Under explicit retry.* settings the unclassified failure
+		// is bounded-unknown-retry eligible, but replaying after observable content
+		// is unsafe for non-idempotent tool side effects.
+		const cases: Array<{
+			partialContent: string;
+			errorMessage: string;
+			transportFailure?: AssistantMessage["transportFailure"];
+		}> = [
+			{
+				partialContent: "already streamed",
+				errorMessage: "upstream request failed: stream interrupted before terminal response event",
+				transportFailure: { kind: "transport", providerCode: "upstream_stream_error" },
+			},
+			{
+				partialContent: "partial thinking leaked as text",
+				errorMessage: "weird unclassified glitch after progress",
+			},
+		];
+		for (const testCase of cases) {
+			const requestedModels: string[] = [];
+			session = buildStatusErrorSession({
+				errorMessage: testCase.errorMessage,
+				transportFailure: testCase.transportFailure,
+				partialContent: testCase.partialContent,
+				recoveredContent: "should-not-retry",
+				requestedModels,
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("partial progress then terminal stream failure");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requestedModels).toHaveLength(1);
+			const last = lastAssistant(session);
+			expect(last.stopReason).toBe("error");
+			expect(last.errorMessage).toBe(testCase.errorMessage);
+			expect(last.content).toEqual([{ type: "text", text: testCase.partialContent }]);
+			await session.dispose();
+			session = undefined;
+		}
+	});
+
+	it("does not auto-retry configured legacy transient errors after partial stream progress (#3791)", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "stream stall: connection terminated mid-response",
+			partialContent: "hello from the partial stream",
+			recoveredContent: "should-not-retry",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("partial progress then transient-class stream failure");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.content).toEqual([{ type: "text", text: "hello from the partial stream" }]);
+	});
+
+	it("still retries content-free configured legacy unknown errors after the replay-safety gate (#3791)", async () => {
+		// Content-free clean failures keep the existing bounded unknown retry policy.
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "upstream request failed: stream interrupted before terminal response event",
+			transportFailure: { kind: "transport", providerCode: "upstream_stream_error" },
+			recoveredContent: "recovered",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("content-free upstream_stream_error");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "recovered" }],
+		});
+	});
+
 	it("surfaces terminal coded errors without retrying", async () => {
 		session = buildSession({
 			responses: [{ throw: "401 unauthorized: invalid api key" }],
