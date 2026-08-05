@@ -30,6 +30,7 @@ import {
 	truncateHeadBytes,
 	truncateTailBytes,
 } from "../session/streaming-output";
+import { registerOwnedIfLineaged } from "../session/terminal-abort";
 
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
@@ -750,6 +751,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
+		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
+		toolCallId?: string;
 	}): ManagedBashJobHandle {
 		const manager = AsyncJobManager.instance();
 		if (!manager) {
@@ -839,6 +842,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				},
 			},
 		);
+		registerOwnedIfLineaged(manager, options.toolCallId, jobId);
 
 		return {
 			jobId,
@@ -1183,7 +1187,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		{
 			command: rawCommand,
 			env: rawEnv,
@@ -1233,6 +1237,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				resolvedEnv,
 				onUpdate,
 				startBackgrounded: true,
+				toolCallId,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1268,6 +1273,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				resolvedEnv,
 				onUpdate,
 				startBackgrounded,
+				toolCallId,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {

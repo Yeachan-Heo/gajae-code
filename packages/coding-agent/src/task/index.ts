@@ -55,6 +55,7 @@ import {
 } from "../gjc-runtime/repository-binding";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { ArtifactManager } from "../session/artifacts";
+import { registerOwnedIfLineaged } from "../session/terminal-abort";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
@@ -65,7 +66,6 @@ import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary, type TaskResultReceipt } from "./receipt";
-
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
@@ -1065,7 +1065,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					repositoryBinding: descriptor.repositoryBinding,
 					duplicate_policy: descriptor.duplicatePolicy,
 				};
-				return manager.register(
+				const resumeJobId = manager.register(
 					"task",
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
@@ -1127,6 +1127,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
+				registerOwnedIfLineaged(manager, descriptor.toolCallId, resumeJobId);
+				return resumeJobId;
 			};
 			manager.setResumeRunner(resumeRunner);
 		}
@@ -1356,6 +1358,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
+				registerOwnedIfLineaged(manager, _toolCallId, jobId);
 				startedJobs.push({ jobId, taskId: taskItem.id });
 				if (typeof manager.registerResumeDescriptor === "function") {
 					manager.registerResumeDescriptor(

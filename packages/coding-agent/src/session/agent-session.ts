@@ -438,6 +438,7 @@ import {
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
+import { bindToolLineage, mintTurnLineageIdHash } from "./terminal-abort";
 
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
@@ -2243,6 +2244,15 @@ export class AgentSession {
 
 	#pendingRewindReport: string | undefined = undefined;
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
+	// Private terminal-abort machinery (C04 mode:"terminal"). The lineage id is
+	// minted per prompt turn before the model runs; tool-call bindings attach
+	// the attempt epoch so background registrations can later be classified as
+	// exact owned work (turn-continuation vs owned-completion) by source, never
+	// by timing. Endpoint generation is 0 for local/non-SDK sessions and is
+	// bound by the SDK host layer when a terminal endpoint is known.
+	#terminalEndpointGeneration = 0;
+	#turnLineageIdHash: string | undefined;
+	#terminalLineageSecret = crypto.randomUUID();
 	#promptGeneration = 0;
 	#promptPreflightAbortController = new AbortController();
 
@@ -2866,6 +2876,24 @@ export class AgentSession {
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => this.#ttsrAfterToolCall(ctx);
+		// Bind immutable lineage/attempt metadata to each tool call id before the
+		// tool executes. Background registrations made inside the tool (task, Bash)
+		// read this binding synchronously so their completion can later be
+		// classified as exact owned work instead of a turn continuation. Bindings
+		// intentionally survive the tool call: resumed registrations re-use the
+		// original tool call id and must retain the same owned-completion origin.
+		// They are superseded by a rebind on the same id or by bounded eviction.
+		this.agent.beforeToolCall = ctx => {
+			const lineageIdHash = this.#turnLineageIdHash;
+			if (lineageIdHash) {
+				bindToolLineage(ctx.toolCall.id, {
+					lineageIdHash,
+					promptAttemptEpoch: this.#promptGeneration,
+					endpointGeneration: this.#terminalEndpointGeneration,
+				});
+			}
+			return undefined;
+		};
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#removeEphemeralCustomMessages();
@@ -8763,6 +8791,15 @@ export class AgentSession {
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
 		const generation = this.#promptGeneration;
+		// Mint the immutable lineage identity for this prompt turn before the
+		// model runs; beforeToolCall attaches this lineage + attempt epoch to
+		// each tool call id so background registrations can be classified by
+		// source later (terminal-abort owned-completion vs turn-continuation).
+		this.#turnLineageIdHash = mintTurnLineageIdHash(
+			this.sessionManager.getSessionId?.() ?? "local",
+			generation,
+			this.#terminalLineageSecret,
+		);
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;

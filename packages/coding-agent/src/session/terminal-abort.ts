@@ -14,7 +14,7 @@
  * The earlier stage-04 no-successor delivery fence was a misunderstanding and
  * must not be reinstated under any name.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 /** Origin class assigned to every causal callback/queue entry before escape. */
 export type DeliveryOrigin =
@@ -120,6 +120,132 @@ export interface TerminalScopeDispositions {
 	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
 	automaticDeliveryDisposition: "enabled" | "none";
 	resumeOnOwnedCompletion: boolean;
+}
+export interface ActiveTerminalScope {
+	scopeId: string;
+	lineageIdHash: string;
+	abortedAttemptEpoch: number;
+	gate: TurnContinuationGate;
+	fence: TurnContinuationFence;
+}
+
+const MAX_ACTIVE_TERMINAL_SCOPES = 1024;
+const MAX_OWNED_REGISTRATIONS = 8192;
+const activeScopes = new Map<string, ActiveTerminalScope>();
+const activeScopeByAttempt = new Map<string, string>();
+const ownedRegistrations = new Map<string, TurnRegistrationKey>();
+
+/** Register one active terminal scope (scopeId -> seam). Bounded; evicts oldest. */
+export function registerTerminalScope(scope: ActiveTerminalScope): void {
+	if (activeScopes.size >= MAX_ACTIVE_TERMINAL_SCOPES) {
+		const oldest = activeScopes.keys().next().value;
+		if (oldest !== undefined) unregisterTerminalScope(oldest);
+	}
+	activeScopes.set(scope.scopeId, scope);
+	activeScopeByAttempt.set(`${scope.lineageIdHash}\u0000${scope.abortedAttemptEpoch}`, scope.scopeId);
+}
+
+/** Look up the active terminal scope for an aborted attempt (exact lineage+epoch). */
+export function lookupTerminalScope(lineageIdHash: string, attemptEpoch: number): ActiveTerminalScope | undefined {
+	const scopeId = activeScopeByAttempt.get(`${lineageIdHash}\u0000${attemptEpoch}`);
+	return scopeId === undefined ? undefined : activeScopes.get(scopeId);
+}
+
+export function unregisterTerminalScope(scopeId: string): void {
+	const scope = activeScopes.get(scopeId);
+	if (!scope) return;
+	activeScopes.delete(scopeId);
+	activeScopeByAttempt.delete(`${scope.lineageIdHash}\u0000${scope.abortedAttemptEpoch}`);
+}
+
+/** Record an exact owned registration before its handle escapes (bounded). */
+export function registerOwnedRegistration(key: TurnRegistrationKey): void {
+	const mapKey = `${key.jobId}\u0000${key.jobGeneration}`;
+	if (ownedRegistrations.has(mapKey)) return;
+	if (ownedRegistrations.size >= MAX_OWNED_REGISTRATIONS) {
+		const oldest = ownedRegistrations.keys().next().value;
+		if (oldest !== undefined) ownedRegistrations.delete(oldest);
+	}
+	ownedRegistrations.set(mapKey, key);
+}
+
+/** Exact (jobId, jobGeneration) lookup for completion-origin classification. */
+export function lookupOwnedRegistration(jobId: string, jobGeneration: string): TurnRegistrationKey | undefined {
+	return ownedRegistrations.get(`${jobId}\u0000${jobGeneration}`);
+}
+
+export function unregisterOwnedRegistration(key: TurnRegistrationKey): void {
+	ownedRegistrations.delete(`${key.jobId}\u0000${key.jobGeneration}`);
+}
+export interface LineageBinding {
+	lineageIdHash: string;
+	promptAttemptEpoch: number;
+	endpointGeneration: number;
+}
+
+const MAX_LINEAGE_BINDINGS = 8192;
+const lineageByToolCall = new Map<string, LineageBinding>();
+
+/**
+ * Bind immutable lineage/attempt metadata to an attempt-scoped tool call
+ * identity (toolCallId). The binding is set once at prompt admission and must
+ * never be mutated from a session-current fallback; missing/mismatched
+ * context fails closed (resolve returns undefined).
+ */
+export function bindToolLineage(toolCallId: string, binding: LineageBinding): void {
+	if (lineageByToolCall.size >= MAX_LINEAGE_BINDINGS) {
+		const oldest = lineageByToolCall.keys().next().value;
+		if (oldest !== undefined) lineageByToolCall.delete(oldest);
+	}
+	lineageByToolCall.set(toolCallId, binding);
+}
+
+export function resolveToolLineage(toolCallId: string | undefined): LineageBinding | undefined {
+	return toolCallId === undefined ? undefined : lineageByToolCall.get(toolCallId);
+}
+
+export function unbindToolLineage(toolCallId: string): void {
+	lineageByToolCall.delete(toolCallId);
+}
+
+/**
+ * Mint an unforgeable opaque lineage id for one prompt turn. The hash binds
+ * session id, attempt epoch, and a per-session secret; it never contains
+ * prompt body and cannot be re-derived from public session data. It is
+ * created before model/tool execution and must never be mutated from a
+ * session-current fallback.
+ */
+export function mintTurnLineageIdHash(sessionId: string, promptAttemptEpoch: number, sessionSecret: string): string {
+	return createHash("sha256")
+		.update(`turn-lineage-v1:${sessionId}\u0000${promptAttemptEpoch}\u0000${sessionSecret}`)
+		.digest("hex");
+}
+/**
+ * Register an exact owned registration when the tool call carries immutable
+ * lineage metadata. The generation is read synchronously from the manager's
+ * job record; a missing generation fails closed (no ownership claim). A
+ * registry failure never breaks ordinary registration.
+ */
+export function registerOwnedIfLineaged(
+	manager: { getJob?(id: string): { generation?: string } | undefined },
+	toolCallId: string | undefined,
+	jobId: string,
+): void {
+	try {
+		const lineage = resolveToolLineage(toolCallId);
+		if (!lineage) return;
+		const jobGeneration = manager.getJob?.(jobId)?.generation;
+		if (!jobGeneration) return;
+		registerOwnedRegistration({
+			endpointGeneration: lineage.endpointGeneration,
+			lineageIdHash: lineage.lineageIdHash,
+			promptAttemptEpoch: lineage.promptAttemptEpoch,
+			jobId,
+			jobGeneration,
+		});
+	} catch {
+		// ignore: never break ordinary registration
+	}
 }
 
 let attemptEpochCounter = 0;
