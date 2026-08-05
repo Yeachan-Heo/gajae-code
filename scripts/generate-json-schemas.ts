@@ -110,6 +110,20 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.minimum = 60_000;
 		schema.maximum = 86_400_000;
 	}
+	if (settingPath === "gjc.ultragoal.nudgeBudget") {
+		schema.type = "integer";
+		schema.minimum = 0;
+	}
+	if (settingPath === "gjc.ralplan.maxIterations") {
+		schema.type = "integer";
+		schema.minimum = 1;
+		schema.maximum = 20;
+	}
+	if (settingPath === "gjc.ralplan.maxReviewPassesPerLane") {
+		schema.type = "integer";
+		schema.minimum = 1;
+		schema.maximum = 10;
+	}
 	return schema;
 }
 
