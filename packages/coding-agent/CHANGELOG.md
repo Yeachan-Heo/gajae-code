@@ -62,6 +62,7 @@
 
 - Managed replacement cleanup now migrates version-one receipts from earlier releases and recovers canonical exchange placeholders left by interrupted cleanup, so a stale receipt cannot permanently block the next managed session mutation with `managed_replace_cleanup_receipt_invalid`.
 - SDK reverse-provider failures now include the response the provider actually returned. Both `permission provider returned an invalid response` and `fs provider returned an invalid read response` surface a bounded description of the unexpected payload (shape mismatch, `null`, a non-object) instead of an opaque message with no detail, so a host that answers a reverse-request with the wrong shape is immediately diagnosable. The shared helper never throws on circular/non-serializable values.
+- SDK reverse-provider failures now describe the unexpected payload without disclosing it. Both `permission provider returned an invalid response` and `fs provider returned an invalid read response` append a content-free structural descriptor (JSON kind, object key names, array lengths) rather than the raw response, so a host that answers a reverse-request with the wrong shape is immediately diagnosable without copying secrets or file bodies across the error boundary into session transcripts. The shared helper never throws on circular, non-serializable, or hostile (Proxy) values.
 
 ## [0.12.11] - 2026-08-03
 

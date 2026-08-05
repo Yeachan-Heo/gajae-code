@@ -2819,6 +2819,138 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
 });
 
+test("SDK host surfaces a content-free descriptor when a permission provider returns an invalid response", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-invalid-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-permission-invalid-${Date.now()}`;
+	let permissionProvider:
+		| ((
+				toolCall: ClientBridgePermissionToolCall,
+				options: ClientBridgePermissionOption[],
+				signal?: AbortSignal,
+		  ) => Promise<ClientBridgePermissionOutcome>)
+		| undefined;
+	const ctx = {
+		...context(cwd, sessionId),
+		setSdkPermissionProvider: (provider: typeof permissionProvider) => {
+			permissionProvider = provider;
+		},
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(ctx);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	const frames: Record<string, unknown>[] = [];
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "permission",
+			connectionId,
+			capability: "permission",
+			definitions: [],
+		}),
+	);
+	await waitFor(() => permissionProvider !== undefined, "permission provider installation");
+	const secret = "ghp_abcdef0123456789abcdef0123";
+	const requested = permissionProvider!(
+		{ toolCallId: "call-1", toolName: "bash", title: "printf guarded", status: "pending" },
+		[{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+	).catch(error => error);
+	await waitFor(() => frames.some(frame => frame.type === "reverse_request"), "reverse permission request");
+	const request = frames.find(frame => frame.type === "reverse_request")!;
+	// Wrong outcome plus a credential-shaped field: the error must describe the
+	// shape (key name) without copying the secret value across the boundary.
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: request.id,
+			connectionId,
+			leaseId: request.leaseId,
+			ok: true,
+			result: { outcome: "bogus", token: secret },
+		}),
+	);
+	const error = await requested;
+	expect(error).toBeInstanceOf(Error);
+	expect(String(error.message)).toContain("permission provider returned an invalid response");
+	expect(String(error.message)).toContain("token");
+	expect(String(error.message)).not.toContain(secret);
+	socket.close();
+	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
+});
+
+test("SDK host surfaces a content-free descriptor when an fs provider returns an invalid read response", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fs-invalid-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-fs-invalid-${Date.now()}`;
+	let clientBridge:
+		| { readTextFile?: (params: { path: string; line?: number; limit?: number }) => Promise<string> }
+		| undefined;
+	const ctx = {
+		...context(cwd, sessionId),
+		setSdkClientBridge: (bridge: typeof clientBridge) => {
+			clientBridge = bridge;
+		},
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(ctx);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	const frames: Record<string, unknown>[] = [];
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "fs",
+			connectionId,
+			capability: "fs",
+			definitions: [{ name: "fs.readTextFile" }],
+		}),
+	);
+	await waitFor(() => clientBridge?.readTextFile !== undefined, "fs readTextFile bridge installation");
+	const fileBody = "super-secret-file-body-0123456789";
+	const requested = clientBridge!.readTextFile!({ path: "/repo/secret.txt" }).catch(error => error);
+	await waitFor(() => frames.some(frame => frame.type === "reverse_request"), "reverse fs read request");
+	const request = frames.find(frame => frame.type === "reverse_request")!;
+	// Non-string `content` wrapping the file body: the error must describe the
+	// shape without copying the body across the boundary.
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: request.id,
+			connectionId,
+			leaseId: request.leaseId,
+			ok: true,
+			result: { content: { data: fileBody } },
+		}),
+	);
+	const error = await requested;
+	expect(error).toBeInstanceOf(Error);
+	expect(String(error.message)).toContain("fs provider returned an invalid read response");
+	expect(String(error.message)).toContain("content");
+	expect(String(error.message)).not.toContain(fileBody);
+	socket.close();
+});
+
 test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-"));
 	dirs.push(cwd);

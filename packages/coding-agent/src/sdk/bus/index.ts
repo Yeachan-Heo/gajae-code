@@ -3235,24 +3235,36 @@ export function shouldAwaitNotificationStartup(event: {
 }
 
 /**
- * Best-effort, bounded description of a reverse-provider response for error
- * messages. Strings pass through; other values are JSON-serialized and capped
- * at 500 chars; non-serializable values (circular structures, throwing getters)
- * fall back to a safe, never-throwing tag so the diagnostic itself never throws.
+ * Content-free structural descriptor of a reverse-provider response, for error
+ * messages. Reports only the JSON kind and — for objects/arrays — the field
+ * names or element counts, never the values, so an invalid response that
+ * carries secrets or file bodies cannot cross the error boundary into session
+ * transcripts. The descriptor itself never throws: any failure returns a fixed
+ * literal without inspecting the value again, so a hostile/revoked Proxy or a
+ * throwing getter/`Symbol.toStringTag` cannot escape.
  */
 export function describeProviderResponse(value: unknown): string {
-	let text: string;
-	if (typeof value === "string") {
-		text = value;
-	} else {
-		try {
-			const stringified = JSON.stringify(value);
-			text = typeof stringified === "string" ? stringified : Object.prototype.toString.call(value);
-		} catch {
-			text = Object.prototype.toString.call(value);
+	try {
+		if (value === null) return "null";
+		if (value === undefined) return "undefined";
+		if (typeof value === "string") return `string (length ${value.length})`;
+		const kind = typeof value;
+		if (kind === "number" || kind === "boolean" || kind === "bigint" || kind === "symbol" || kind === "function") {
+			return kind;
 		}
+		if (Array.isArray(value)) return `array (length ${value.length})`;
+		if (kind === "object") {
+			// Report only the enumerable own key NAMES (structural), never the
+			// values. Cap the count so a huge object does bounded work here.
+			const keys = Object.keys(value);
+			const shown = keys.slice(0, 20).join(", ");
+			const more = keys.length > 20 ? `, +${keys.length - 20} more` : "";
+			return `object (keys: ${shown}${more})`;
+		}
+		return "unknown";
+	} catch {
+		return "[unserializable provider response]";
 	}
-	return text.length > 500 ? `${text.slice(0, 500)}…` : text;
 }
 export function createNotificationsExtension(
 	api: ExtensionAPI,
