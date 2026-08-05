@@ -150,6 +150,15 @@ export class YieldQueue {
 	}
 
 	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[]): AgentMessage | null {
+		// Corrected turn semantics (terminal abort): turn-scope abort blocks only
+		// deliveries whose origin is a continuation of the aborted turn.
+		// Owned-completion deliveries from work deliberately left running are
+		// intentionally allowed to resume the agent through the normal
+		// followUp/prompt path and receive a fresh turn attempt. A closed
+		// terminal record must never make an allowed owned-completion entry
+		// stale merely because it is closed; stale filtering below applies only
+		// to ordinary manager state (e.g. isDeliverySuppressed) or explicit
+		// blocked-continuation/owned-cleanup entries.
 		const survivors: unknown[] = [];
 		for (const entry of entries) {
 			if (dispatcher.isStale) {

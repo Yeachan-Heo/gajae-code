@@ -46,6 +46,11 @@ export type TurnDeliveryKey = TurnRegistrationKey & {
 	entryId: string;
 	progressSeq?: number;
 };
+/** Private origin envelope carried through the plain AgentMessage boundary. */
+export interface OwnedCompletionEnvelope {
+	lineageIdHash: string;
+	promptAttemptEpoch: number;
+}
 
 export type TurnContinuationFenceState = "open" | "closing" | "closed" | "retained" | "released";
 
@@ -176,6 +181,38 @@ export function lookupOwnedRegistration(jobId: string, jobGeneration: string): T
 
 export function unregisterOwnedRegistration(key: TurnRegistrationKey): void {
 	ownedRegistrations.delete(`${key.jobId}\u0000${key.jobGeneration}`);
+}
+export interface OwnedCompletionClassification {
+	lineageIdHash: string;
+	promptAttemptEpoch: number;
+	registration: TurnRegistrationKey;
+	terminalScopeId: string;
+}
+
+/**
+ * Classify a manager completion/progress delivery against the terminal-abort
+ * registries. Returns an exact owned-completion classification ONLY when the
+ * job carries an exact registered five-tuple AND a terminal scope exists for
+ * that turn. Missing or mismatched metadata fails closed (undefined) and the
+ * delivery is then ordinary. Classification is source/lineage-based, never
+ * timing-based; a closed terminal record does NOT suppress an exact
+ * left-running owned completion (corrected turn semantics).
+ */
+export function classifyOwnedCompletion(
+	jobId: string,
+	jobGeneration: string | undefined,
+): OwnedCompletionClassification | undefined {
+	if (!jobGeneration) return undefined;
+	const registration = lookupOwnedRegistration(jobId, jobGeneration);
+	if (!registration) return undefined;
+	const scope = lookupTerminalScope(registration.lineageIdHash, registration.promptAttemptEpoch);
+	if (!scope) return undefined;
+	return {
+		lineageIdHash: registration.lineageIdHash,
+		promptAttemptEpoch: registration.promptAttemptEpoch,
+		registration,
+		terminalScopeId: scope.scopeId,
+	};
 }
 export interface LineageBinding {
 	lineageIdHash: string;

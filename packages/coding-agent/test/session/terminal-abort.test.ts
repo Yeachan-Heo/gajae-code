@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
 	bindToolLineage,
+	classifyOwnedCompletion,
 	createTurnContinuationSeam,
 	type DeliveryOrigin,
 	lookupOwnedRegistration,
@@ -258,4 +259,46 @@ test("terminal scope registry evicts oldest beyond its bound", () => {
 	expect(lookupTerminalScope("lineage-evict-0", 0)).toBeUndefined();
 	expect(lookupTerminalScope("lineage-evict-1024", 1024)).toBeDefined();
 	unregisterTerminalScope("scope-evict-1024");
+});
+test("classifyOwnedCompletion resolves only for exact registration plus terminal scope", () => {
+	// No registration -> ordinary.
+	expect(classifyOwnedCompletion("job-x", "gen-x")).toBeUndefined();
+	// Registered but no terminal scope for its turn -> ordinary (fail closed).
+	registerOwnedRegistration(registration);
+	expect(classifyOwnedCompletion("job-1", "gen-1")).toBeUndefined();
+	// Missing generation -> ordinary.
+	expect(classifyOwnedCompletion("job-1", undefined)).toBeUndefined();
+	// Terminal scope for the exact lineage+epoch -> owned-completion.
+	const { fence, gate } = createTurnContinuationSeam({
+		lineageIdHash: "lineage-a",
+		abortedAttemptEpoch: 7,
+		terminalScopeId: "scope-1",
+	});
+	registerTerminalScope({ scopeId: "scope-1", lineageIdHash: "lineage-a", abortedAttemptEpoch: 7, gate, fence });
+	const classified = classifyOwnedCompletion("job-1", "gen-1");
+	expect(classified).toEqual({
+		lineageIdHash: "lineage-a",
+		promptAttemptEpoch: 7,
+		registration,
+		terminalScopeId: "scope-1",
+	});
+	// A different generation of the same job id is NOT owned (exact tuple).
+	expect(classifyOwnedCompletion("job-1", "gen-other")).toBeUndefined();
+	unregisterTerminalScope("scope-1");
+	unregisterOwnedRegistration(registration);
+});
+
+test("classifyOwnedCompletion fails closed when the scope is removed or epoch mismatches", () => {
+	registerOwnedRegistration(registration);
+	const { fence, gate } = createTurnContinuationSeam({
+		lineageIdHash: "lineage-a",
+		abortedAttemptEpoch: 7,
+		terminalScopeId: "scope-1",
+	});
+	registerTerminalScope({ scopeId: "scope-1", lineageIdHash: "lineage-a", abortedAttemptEpoch: 7, gate, fence });
+	expect(classifyOwnedCompletion("job-1", "gen-1")).toBeDefined();
+	unregisterTerminalScope("scope-1");
+	// After the scope is gone, the same delivery is ordinary again.
+	expect(classifyOwnedCompletion("job-1", "gen-1")).toBeUndefined();
+	unregisterOwnedRegistration(registration);
 });

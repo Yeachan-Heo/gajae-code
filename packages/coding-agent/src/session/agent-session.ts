@@ -438,7 +438,12 @@ import {
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
-import { bindToolLineage, mintTurnLineageIdHash } from "./terminal-abort";
+import {
+	bindToolLineage,
+	mintTurnLineageIdHash,
+	nextPromptAttemptEpoch,
+	type OwnedCompletionEnvelope,
+} from "./terminal-abort";
 
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
@@ -466,6 +471,15 @@ function sanitizeCompactionStateText(value: string, maxLength: number): string {
 function appendCompactionStateContext(summary: string, stateContext: string[]): string {
 	if (stateContext.length === 0) return summary;
 	return `${summary}\n\n<compaction-state>\n${stateContext.join("\n")}\n</compaction-state>`;
+}
+/**
+ * Detect the private owned-completion origin envelope on an async-result
+ * delivery message. The envelope is carried in the message details by the SDK
+ * session callback and is never part of the public message surface.
+ */
+function hasOwnedCompletionEnvelope(message: AgentMessage): boolean {
+	const details = (message as { details?: { ownedCompletions?: OwnedCompletionEnvelope[] } }).details;
+	return (details?.ownedCompletions?.length ?? 0) > 0;
 }
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
@@ -2465,6 +2479,22 @@ export class AgentSession {
 			// in #refreshTeamWorkerHeartbeat(), including internally dispatched turns.
 		}
 	}
+	/**
+	 * Allocate a FRESH prompt attempt/lineage for an allowed owned-completion
+	 * delivery (corrected turn semantics). The new turn gets a new attempt epoch
+	 * and an opaque lineage id; it never reuses the aborted attempt's epoch and
+	 * is not a retry/TTSR/steering/successor of the aborted turn. The caller
+	 * then invokes the existing followUp/prompt path.
+	 */
+	#resumeFromOwnedCompletion(): void {
+		const freshEpoch = nextPromptAttemptEpoch();
+		if (freshEpoch > this.#promptGeneration) this.#promptGeneration = freshEpoch;
+		this.#turnLineageIdHash = mintTurnLineageIdHash(
+			this.sessionManager.getSessionId?.() ?? "local",
+			freshEpoch,
+			this.#terminalLineageSecret,
+		);
+	}
 
 	#isPromptPreflightCancelled(generation: number, signal: AbortSignal): boolean {
 		return signal.aborted || this.#promptGeneration !== generation;
@@ -2772,12 +2802,25 @@ export class AgentSession {
 		this.#bindWorkflowGateEmitter();
 		this.yieldQueue = new YieldQueue({
 			isStreaming: () => this.isStreaming || this.#handoffTransitionActive,
-			injectStreaming: message => this.agent.followUp(message),
+			injectStreaming: message => {
+				// Mandated boundary comment (corrected turn semantics): turn-scope
+				// abort blocks only deliveries whose origin is a continuation of the
+				// aborted turn. Owned-completion deliveries from work deliberately
+				// left running are intentionally allowed to resume the agent through
+				// the normal followUp/prompt path and receive a fresh turn attempt.
+				if (hasOwnedCompletionEnvelope(message)) this.#resumeFromOwnedCompletion();
+				this.agent.followUp(message);
+			},
 			injectIdle: async messages => {
+				// Mandated boundary comment (corrected turn semantics): same origin
+				// split as the streaming injector — an allowed owned-completion
+				// delivery starts a fresh turn attempt/lineage and is not a
+				// continuation of the aborted turn.
 				const first = messages[0];
 				if (!first) return;
 				await this.#awaitStartupTurnBarrier();
 				if (this.#isDisposed) return;
+				if (messages.some(hasOwnedCompletionEnvelope)) this.#resumeFromOwnedCompletion();
 				if (messages.length === 1) {
 					await this.agent.prompt(first, this.#managedFallbackPromptOptions());
 				} else {

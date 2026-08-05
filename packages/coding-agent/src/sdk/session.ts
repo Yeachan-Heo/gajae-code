@@ -121,6 +121,7 @@ import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
+import { classifyOwnedCompletion, type OwnedCompletionEnvelope } from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
 import {
 	type BuildSystemPromptResult,
@@ -161,6 +162,8 @@ type AsyncResultEntry = {
 	result: string;
 	job: AsyncJob | undefined;
 	durationMs: number | undefined;
+	/** Exact owned-completion origin when the job is registered left-running work of a terminal turn. */
+	ownedCompletion?: OwnedCompletionEnvelope;
 };
 
 type AsyncResultJobDetails = {
@@ -172,6 +175,8 @@ type AsyncResultJobDetails = {
 
 type AsyncResultDetails = {
 	jobs: AsyncResultJobDetails[];
+	/** Private origin envelope(s); absent = ordinary delivery. Never a public field. */
+	ownedCompletions?: OwnedCompletionEnvelope[];
 };
 
 type McpNotificationEntry = {
@@ -188,6 +193,12 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 		label: entry.job?.label,
 		durationMs: entry.durationMs,
 	}));
+	const ownedCompletions = entries
+		.filter(
+			(entry): entry is AsyncResultEntry & { ownedCompletion: OwnedCompletionEnvelope } =>
+				entry.ownedCompletion !== undefined,
+		)
+		.map(entry => entry.ownedCompletion);
 	const details: AsyncResultDetails = {
 		jobs: jobs.map(job => ({
 			jobId: job.jobId,
@@ -195,6 +206,9 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 			label: job.label,
 			durationMs: job.durationMs,
 		})),
+		// Private origin envelope for the AgentSession injector; absent for
+		// ordinary deliveries. This is internal metadata, never a public field.
+		...(ownedCompletions.length > 0 ? { ownedCompletions } : {}),
 	};
 	return {
 		role: "custom",
@@ -1607,6 +1621,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						maxRunningJobs: asyncMaxJobs,
 						onJobComplete: async (jobId, result, job) => {
 							if (!session) return;
+							// Mandated boundary comment (corrected turn semantics):
+							// turn-scope abort blocks only deliveries whose origin is a
+							// continuation of the aborted turn. Owned-completion deliveries
+							// from work deliberately left running are intentionally allowed
+							// to resume the agent through the normal followUp/prompt path
+							// and receive a fresh turn attempt. Recover the immutable origin
+							// BEFORE formatting or artifact allocation; missing metadata
+							// fails closed to an ordinary delivery.
+							const ownedCompletion = job ? classifyOwnedCompletion(jobId, job.generation) : undefined;
 							const formattedResult = await formatAsyncResultForFollowUp(result);
 							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
 
@@ -1617,6 +1640,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								result: formattedResult,
 								job,
 								durationMs,
+								...(ownedCompletion
+									? {
+											ownedCompletion: {
+												lineageIdHash: ownedCompletion.lineageIdHash,
+												promptAttemptEpoch: ownedCompletion.promptAttemptEpoch,
+											},
+										}
+									: {}),
 							});
 						},
 					})
