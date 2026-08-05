@@ -1,10 +1,12 @@
 import { expect, test } from "bun:test";
+import { ownedCompletionResumeAction } from "../../src/session/agent-session";
 import {
 	bindToolLineage,
 	classifyOwnedCompletion,
 	createTurnContinuationSeam,
 	type DeliveryOrigin,
 	findOwnedRegistrationsForTurn,
+	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
@@ -501,4 +503,134 @@ test("settleOwnedWork fails closed when a captured job is still running or missi
 		acknowledgeDeliveries: () => 0,
 	};
 	expect(await settleOwnedWork(paused, [registration], 2)).toBe("unsettled");
+});
+
+test("settleOwnedWork fails closed when the job id is reused with a new generation during grace", async () => {
+	const cancelled: string[] = [];
+	const purged: string[][] = [];
+	let generation = "gen-1";
+	const manager = {
+		cancel: (jobId: string) => {
+			cancelled.push(jobId);
+			return true;
+		},
+		getJob: () => ({ generation, status: "cancelled" }),
+		acknowledgeDeliveries: (jobIds: string[]) => {
+			purged.push(jobIds);
+			return jobIds.length;
+		},
+	};
+	// The job id is reused with a NEW generation between the cancel and the
+	// second proof: the foreign job must not be claimed or purged.
+	const settling = settleOwnedWork(manager, [registration], 20);
+	generation = "gen-2";
+	const outcome = await settling;
+	expect(outcome).toBe("unsettled");
+	expect(purged).toEqual([]);
+	// Only the exact captured generation was cancelled; the foreign job record
+	// was left untouched (no post-grace claim of it).
+	expect(cancelled).toEqual(["job-1"]);
+});
+
+test("ownedCompletionResumeAction drops denied owned deliveries at the injector boundary", async () => {
+	// An ordinary async-result message (no envelope) delivers as before.
+	expect(ownedCompletionResumeAction({ role: "custom", customType: "async-result" } as never)).toBe("ordinary");
+	// A scope:"turn" envelope with the exact registered tuple resumes fresh.
+	const turnScope = registerTerminalTurnScope({ lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 });
+	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 });
+	const freshMessage = {
+		details: {
+			ownedCompletions: [
+				{
+					lineageIdHash: "lineage-drop",
+					promptAttemptEpoch: 21,
+					registration: { ...registration, lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 },
+				},
+			],
+		},
+	} as never;
+	expect(ownedCompletionResumeAction(freshMessage)).toBe("fresh");
+	// A scope:"owned" envelope (policy disabled) is DROPPED — stopped work must
+	// never call followUp/prompt even if a delivery races the purge.
+	const ownedScope = registerTerminalTurnScope({
+		lineageIdHash: "lineage-owned",
+		promptAttemptEpoch: 22,
+		ownedCompletionPolicy: "disabled",
+	});
+	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-owned", promptAttemptEpoch: 22 });
+	const ownedMessage = {
+		details: {
+			ownedCompletions: [
+				{
+					lineageIdHash: "lineage-owned",
+					promptAttemptEpoch: 22,
+					registration: { ...registration, lineageIdHash: "lineage-owned", promptAttemptEpoch: 22 },
+				},
+			],
+		},
+	} as never;
+	expect(ownedCompletionResumeAction(ownedMessage)).toBe("drop");
+	// A forged/unregistered tuple is dropped.
+	expect(ownedCompletionResumeAction(freshMessage)).toBe("fresh");
+	expect(
+		ownedCompletionResumeAction({
+			details: {
+				ownedCompletions: [
+					{
+						lineageIdHash: "lineage-drop",
+						promptAttemptEpoch: 21,
+						registration: {
+							...registration,
+							lineageIdHash: "lineage-drop",
+							promptAttemptEpoch: 21,
+							jobGeneration: "forged",
+						},
+					},
+				],
+			},
+		} as never),
+	).toBe("drop");
+	// An envelope whose scope no longer exists is dropped (fail closed).
+	unregisterTerminalScope(turnScope.scopeId);
+	expect(ownedCompletionResumeAction(freshMessage)).toBe("drop");
+	unregisterTerminalScope(ownedScope.scopeId);
+	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 });
+	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-owned", promptAttemptEpoch: 22 });
+});
+
+test("mixed owned-completion batches drop when ANY envelope is denied", async () => {
+	// Allowed turn-scope envelope.
+	const turnScope = registerTerminalTurnScope({ lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 });
+	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 });
+	const allowed = {
+		lineageIdHash: "lineage-mix-a",
+		promptAttemptEpoch: 31,
+		registration: { ...registration, lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 },
+	};
+	// Denied owned-scope envelope (policy disabled).
+	const ownedScope = registerTerminalTurnScope({
+		lineageIdHash: "lineage-mix-b",
+		promptAttemptEpoch: 32,
+		ownedCompletionPolicy: "disabled",
+	});
+	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-b", promptAttemptEpoch: 32 });
+	const denied = {
+		lineageIdHash: "lineage-mix-b",
+		promptAttemptEpoch: 32,
+		registration: { ...registration, lineageIdHash: "lineage-mix-b", promptAttemptEpoch: 32 },
+	};
+	const message = (ownedCompletions: unknown[]) => ({ details: { ownedCompletions } }) as never;
+	// Allowed-then-denied and denied-then-allowed orderings both drop.
+	expect(ownedCompletionResumeAction(message([allowed, denied]))).toBe("drop");
+	expect(ownedCompletionResumeAction(message([denied, allowed]))).toBe("drop");
+	// All-allowed stays fresh; no envelope is ordinary.
+	expect(ownedCompletionResumeAction(message([allowed, allowed]))).toBe("fresh");
+	expect(ownedCompletionResumeAction(message([]))).toBe("ordinary");
+	// Build-time partitioning predicate: a denied envelope is never allowed.
+	expect(isOwnedCompletionEnvelopeAllowed(denied)).toBe(false);
+	expect(isOwnedCompletionEnvelopeAllowed(allowed)).toBe(true);
+	unregisterTerminalScope(turnScope.scopeId);
+	unregisterTerminalScope(ownedScope.scopeId);
+	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 });
+	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-b", promptAttemptEpoch: 32 });
 });

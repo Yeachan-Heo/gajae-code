@@ -440,6 +440,7 @@ import {
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
 import {
 	bindToolLineage,
+	isOwnedCompletionEnvelopeAllowed,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
 	nextPromptAttemptEpoch,
@@ -475,30 +476,24 @@ function appendCompactionStateContext(summary: string, stateContext: string[]): 
 	return `${summary}\n\n<compaction-state>\n${stateContext.join("\n")}\n</compaction-state>`;
 }
 /**
- * Whether an async-result delivery carries an owned-completion origin that the
- * owning terminal scope's gate authorizes as a fresh-turn resume. The envelope
- * is carried in the message details by the SDK session callback and is never
- * part of the public message surface. The gate validates the EXACT registered
- * five-tuple and the owned-completion policy: scope:"turn" keeps it enabled
- * (left-running delivery intentionally resumes as a fresh turn), while
- * scope:"owned" disables it so stopped work can never call followUp/prompt
- * even if a delivery races the settlement purge. A forged or unregistered
- * origin fails closed.
+ * Classify an async-result delivery against terminal-abort ownership:
+ * - "ordinary": no owned-completion envelope — deliver as before.
+ * - "fresh": an exact registered owned-completion the owning scope's gate
+ *   authorizes as a fresh-turn resume (scope:"turn", policy enabled).
+ * - "drop": a recognized owned-completion the gate denies — scope:"owned"
+ *   (policy disabled, stopped work must never call followUp/prompt), a
+ *   forged/unregistered tuple, or an envelope whose terminal scope no longer
+ *   exists. Dropped entries never reach the agent (AC 36 zero final calls
+ *   from stopped work), even if a delivery races the settlement purge.
  */
-function isOwnedCompletionResumeAllowed(message: AgentMessage): boolean {
+export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" | "fresh" | "drop" {
 	const details = (message as { details?: { ownedCompletions?: OwnedCompletionEnvelope[] } }).details;
-	const envelope = details?.ownedCompletions?.[0];
-	if (!envelope) return false;
-	const scope = lookupTerminalScope(envelope.lineageIdHash, envelope.promptAttemptEpoch);
-	if (!scope) return false;
-	return (
-		scope.gate.authorizeOwnedCompletion({
-			kind: "owned-completion",
-			lineageIdHash: envelope.lineageIdHash,
-			attemptEpoch: envelope.promptAttemptEpoch,
-			registration: envelope.registration,
-		}) === "allow-new-turn"
-	);
+	const envelopes = details?.ownedCompletions;
+	if (!envelopes || envelopes.length === 0) return "ordinary";
+	// Build-time partitioning (sdk/session.ts) already excludes denied entries,
+	// but fail closed here too: ANY denied envelope drops the whole delivery
+	// (defense in depth against a mixed/forged batch).
+	return envelopes.every(isOwnedCompletionEnvelopeAllowed) ? "fresh" : "drop";
 }
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
@@ -2850,23 +2845,30 @@ export class AgentSession {
 				// aborted turn. Owned-completion deliveries from work deliberately
 				// left running are intentionally allowed to resume the agent through
 				// the normal followUp/prompt path and receive a fresh turn attempt.
-				if (isOwnedCompletionResumeAllowed(message)) this.#resumeFromOwnedCompletion();
+				// A denied owned-completion entry (owned scope, forged tuple, or
+				// missing scope) is DROPPED here — it must never call followUp/prompt.
+				const action = ownedCompletionResumeAction(message);
+				if (action === "drop") return;
+				if (action === "fresh") this.#resumeFromOwnedCompletion();
 				this.agent.followUp(message);
 			},
 			injectIdle: async messages => {
 				// Mandated boundary comment (corrected turn semantics): same origin
 				// split as the streaming injector — an allowed owned-completion
 				// delivery starts a fresh turn attempt/lineage and is not a
-				// continuation of the aborted turn.
-				const first = messages[0];
+				// continuation of the aborted turn. Denied owned-completion entries
+				// are dropped (mixed batches split before injection).
+				const survivors = messages.filter(message => ownedCompletionResumeAction(message) !== "drop");
+				const first = survivors[0];
 				if (!first) return;
 				await this.#awaitStartupTurnBarrier();
 				if (this.#isDisposed) return;
-				if (messages.some(isOwnedCompletionResumeAllowed)) this.#resumeFromOwnedCompletion();
-				if (messages.length === 1) {
+				if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
+					this.#resumeFromOwnedCompletion();
+				if (survivors.length === 1) {
 					await this.agent.prompt(first, this.#managedFallbackPromptOptions());
 				} else {
-					await this.agent.prompt(messages, this.#managedFallbackPromptOptions());
+					await this.agent.prompt(survivors, this.#managedFallbackPromptOptions());
 				}
 			},
 			scheduleIdleFlush: run => {

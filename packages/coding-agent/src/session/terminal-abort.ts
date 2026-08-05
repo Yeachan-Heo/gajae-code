@@ -231,6 +231,25 @@ export function classifyOwnedCompletion(
 		terminalScopeId: scope.scopeId,
 	};
 }
+/**
+ * Whether an owned-completion envelope is authorized by its owning terminal
+ * scope as a fresh-turn resume. Used at batch build (sdk/session.ts) and the
+ * final injection boundary (agent-session.ts): a denied envelope — owned scope
+ * (policy disabled), forged/unregistered tuple, or vanished scope — must be
+ * dropped/partitioned out so stopped work can never call followUp/prompt.
+ */
+export function isOwnedCompletionEnvelopeAllowed(envelope: OwnedCompletionEnvelope): boolean {
+	const scope = lookupTerminalScope(envelope.lineageIdHash, envelope.promptAttemptEpoch);
+	if (!scope) return false;
+	return (
+		scope.gate.authorizeOwnedCompletion({
+			kind: "owned-completion",
+			lineageIdHash: envelope.lineageIdHash,
+			attemptEpoch: envelope.promptAttemptEpoch,
+			registration: envelope.registration,
+		}) === "allow-new-turn"
+	);
+}
 /** Structural subset of AsyncJobManager used by owned-stop settlement (avoids an import cycle). */
 export interface OwnedStopManager {
 	cancel(jobId: string): boolean;
@@ -259,9 +278,19 @@ export async function settleOwnedWork(
 	});
 	if (!generationExact) return "unsettled";
 	await Bun.sleep(graceMs);
+	// Second proof: every captured job must still be the EXACT captured
+	// generation and terminal (cancelled/completed/failed). A reused job id
+	// with a NEW generation during the grace, a missing/evicted record, or a
+	// still-running/paused job fails closed — foreign work is never swept and
+	// unprovable quiescence never claims stopped.
 	const quiescent = exactJobs.every(reg => {
 		const job = manager.getJob(reg.jobId);
-		return job !== undefined && job.status !== "running" && job.status !== "paused";
+		return (
+			job !== undefined &&
+			job.generation === reg.jobGeneration &&
+			job.status !== "running" &&
+			job.status !== "paused"
+		);
 	});
 	if (!quiescent) return "unsettled";
 	manager.acknowledgeDeliveries(exactJobs.map(reg => reg.jobId));

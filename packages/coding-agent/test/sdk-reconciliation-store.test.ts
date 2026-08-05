@@ -260,6 +260,7 @@ describe("reconciliation-store", () => {
 		const scope: DurableTerminalScopeRecord = {
 			selection: "turn",
 			idempotencyKeyHash: "k-hash-1",
+			idempotencyInputHash: "input-hash-1",
 			turnDisposition: "stopped",
 			ownedWorkDisposition: "left_running",
 			automaticDeliveryDisposition: "enabled",
@@ -340,4 +341,47 @@ describe("reconciliation-store", () => {
 		const stopped: DurableTerminalScopeRecord = { ...pending, turnDisposition: "stopped", terminalAt: 2 };
 		expect(settleTerminalScopeRestart([stopped], now)[0]).toBe(stopped);
 	});
+});
+
+test("terminal scope response state advances pending -> sent through the shared owner", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-resp-"));
+	const sessionFile = path.join(root, "s.jsonl");
+	await fs.writeFile(sessionFile, "");
+	const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	const scope: DurableTerminalScopeRecord = {
+		selection: "turn",
+		idempotencyKeyHash: "k-hash-1",
+		idempotencyInputHash: "input-hash-1",
+		turnDisposition: "stopped",
+		ownedWorkDisposition: "left_running",
+		automaticDeliveryDisposition: "enabled",
+		resumeOnOwnedCompletion: true,
+		turnContinuationFence: {
+			state: "retained",
+			abortedAttemptEpoch: 3,
+			blockedContinuationIds: [],
+			predecessorTombstones: [],
+			ownedCompletionPolicy: "enabled",
+		},
+		responseState: "pending",
+		responsePayloadHash: "hash-1",
+		acceptedAt: 10,
+		terminalAt: 20,
+	};
+	await store.transactTerminalScopes(() => [scope]);
+	expect(store.snapshotTerminalScopes()[0]!.responseState).toBe("pending");
+	// The afterControlResponse hook advances only the matching key from
+	// pending to sent (AC 18 monotonic) and persists through reload.
+	await store.transactTerminalScopes(scopes =>
+		scopes.map(s =>
+			s.idempotencyKeyHash === "k-hash-1" && s.responseState === "pending"
+				? { ...s, responseState: "sent" as const }
+				: s,
+		),
+	);
+	expect(store.snapshotTerminalScopes()[0]!.responseState).toBe("sent");
+	const reloaded = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	await reloaded.load();
+	expect(reloaded.snapshotTerminalScopes()[0]!.responseState).toBe("sent");
+	await fs.rm(root, { recursive: true, force: true });
 });

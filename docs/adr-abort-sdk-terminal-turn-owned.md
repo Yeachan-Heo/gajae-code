@@ -54,7 +54,7 @@ attempt/lineage/worker epoch.
 
 ## Implementation state
 
-Committed on `feat/abort-sdk-terminal` (lore `c04-terminal-*`):
+Committed on `feat/abort-sdk-terminal` (lore `c04-terminal-*`), base `e92a04e3`:
 
 - `c04-terminal-lineage`: lineage/attempt origin authority — per-turn lineage minted before
   model execution, `beforeToolCall` binding, task/Bash `registerOwnedIfLineaged` five-tuple
@@ -66,11 +66,27 @@ Committed on `feat/abort-sdk-terminal` (lore `c04-terminal-*`):
 - `c04-terminal-surface`: `turn.abort` terminal surface wired to the durable prompt
   terminalization; landed-terminal verification before claiming `stopped`; no-active-turn =
   `terminal_no_effect`; unfencible = `terminal_uncertain`; turn dispositions as above.
+- `c04-terminal-scope-registration`: terminal scope registered + synchronously closed at abort
+  (session `abortPromptAndWait` terminal option), epoch advanced so the fence never leaks onto
+  later turns; `classifyOwnedCompletion` live end to end.
+- `c04-terminal-continuation-gate`: same-turn continuations denied at the final synchronous
+  boundary (skip reason `terminal_turn`); fail-open without a scope.
+- `c04-terminal-durable-record`: bounded `DurableTerminalScopeRecord` (selection, fence, policy,
+  dispositions, response state, payload hash, key hash) through the v2 store; AC 5 no-store
+  gate; same-key replay via dispatch + durable key-hash lookup.
+- `c04-terminal-owned-stop`: `scope:"owned"` generation-verified exact cancel, fixed grace,
+  second quiescence proof (generation-revalidated), delivery purge, `ownedWork:"stopped"` only
+  after proof; `settleOwnedWork` unit-tested; event metadata on the correlated `agent_end`.
+- `c04-terminal-gate-authority`: gate requires the exact registered five-tuple (forged/
+  unregistered denied); injectors drop denied owned-completion deliveries entirely (AC 36
+  zero final calls) and allocate a fresh attempt only on `allow-new-turn`.
 
-Still pending (explicit, not silently omitted): owned-scope exact cleanup + six-path
-settlement observer, terminal scope registration bound to the aborted turn's lineage
-(feeding `classifyOwnedCompletion`), durable terminal-scope record consumption, publication
-/replay/retention, and the full race matrix.
+Documented remaining work (not silently omitted): the durable record is written at the terminal
+transition but is not yet re-hydrated into a runtime continuation fence on restart, and the
+six-row response replay table across restart/eviction is covered by the dispatch LRU plus the
+durable key-hash replay but not by a full persisted publication-bit state machine. These are
+tracked as follow-ups; the corrected design note, naming rules, boundary comments, and reviewer
+checklist below are the implementation contract.
 
 ## Reviewer / implementer checklist (mandatory)
 

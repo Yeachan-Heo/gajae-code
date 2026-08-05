@@ -44,6 +44,8 @@ export interface DurableTerminalScopeRecord {
 	selection: "turn" | "owned";
 	/** SHA-256 of the bounded idempotency key; the raw key is never persisted. */
 	idempotencyKeyHash?: string;
+	/** SHA-256 of the canonicalized normalized input; raw input is never persisted. */
+	idempotencyInputHash?: string;
 	turnDisposition: "pending" | "stopped" | "uncertain";
 	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
 	automaticDeliveryDisposition: "enabled" | "none";

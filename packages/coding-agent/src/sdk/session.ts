@@ -121,7 +121,11 @@ import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
-import { classifyOwnedCompletion, type OwnedCompletionEnvelope } from "../session/terminal-abort";
+import {
+	classifyOwnedCompletion,
+	isOwnedCompletionEnvelopeAllowed,
+	type OwnedCompletionEnvelope,
+} from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
 import {
 	type BuildSystemPromptResult,
@@ -186,14 +190,23 @@ type McpNotificationEntry = {
 
 function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
-	const jobs = entries.map(entry => ({
+	// Partition denied owned-completion entries out ENTIRELY before batch
+	// construction (AC 36 zero final calls from stopped work): a denied entry —
+	// owned scope, forged tuple, or vanished scope — must never reach
+	// followUp/prompt, even inside a mixed batch. Allowed owned-completion and
+	// ordinary entries are delivered normally.
+	const survivors = entries.filter(
+		entry => entry.ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(entry.ownedCompletion),
+	);
+	if (survivors.length === 0) return null;
+	const jobs = survivors.map(entry => ({
 		jobId: entry.jobId,
 		result: entry.result,
 		type: entry.job?.type,
 		label: entry.job?.label,
 		durationMs: entry.durationMs,
 	}));
-	const ownedCompletions = entries
+	const ownedCompletions = survivors
 		.filter(
 			(entry): entry is AsyncResultEntry & { ownedCompletion: OwnedCompletionEnvelope } =>
 				entry.ownedCompletion !== undefined,
@@ -207,7 +220,8 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 			durationMs: job.durationMs,
 		})),
 		// Private origin envelope for the AgentSession injector; absent for
-		// ordinary deliveries. This is internal metadata, never a public field.
+		// ordinary deliveries. Only ALLOWED owned-completion entries survive
+		// partitioning, so the injector never sees a denied envelope here.
 		...(ownedCompletions.length > 0 ? { ownedCompletions } : {}),
 	};
 	return {

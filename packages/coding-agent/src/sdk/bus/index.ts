@@ -2313,7 +2313,7 @@ function sdkControlSurface(
 		idempotencyKey?: string,
 	) => Promise<
 		| { ok: true; outcome: "stopped" | "stopped_owned" | "no_active_turn" | "already_terminal" | "no_store" }
-		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" }
+		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" | "conflict" }
 	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
 		admit: (clientRef?: string) => void;
@@ -2585,6 +2585,9 @@ function sdkControlSurface(
 			const requesterConnectionId = controlRequesterContext.getStore();
 			const scope: AbortScope = input.scope === "owned" ? "owned" : "turn";
 			const outcome = await abortTerminalPrompt(requesterConnectionId, scope, idempotencyKey);
+			if (!outcome.ok && outcome.reason === "conflict") {
+				return { ok: false, error: { code: "idempotency_conflict" } };
+			}
 			if (!outcome.ok) {
 				return {
 					ok: true,
@@ -4513,23 +4516,32 @@ export function createNotificationsExtension(
 					// gated off (plan AC 5) before any fence, stop, or cleanup.
 					return { ok: true as const, outcome: "no_store" as const };
 				}
-				// Same-key replay: a durable terminal-scope record already exists
-				// for this bounded idempotency key + selection -> return the stored
-				// dispositions exactly, never re-run cleanup, never a second event.
+				// Same-key replay/conflict: a durable terminal-scope record already
+				// exists for this bounded idempotency key. Same key + same
+				// normalized input -> return the stored dispositions exactly, never
+				// re-run cleanup, never a second event. Same key + different input
+				// (scope change) -> deterministic conflict (AC 3).
 				const keyHash = idempotencyKey
 					? crypto.createHash("sha256").update(idempotencyKey).digest("hex")
 					: undefined;
+				const inputHash = crypto
+					.createHash("sha256")
+					.update(JSON.stringify({ mode: "terminal", scope }))
+					.digest("hex");
 				if (keyHash) {
-					const existing = durableStore
-						.snapshotTerminalScopes()
-						.find(s => s.idempotencyKeyHash === keyHash && s.selection === scope);
-					if (existing?.turnDisposition === "stopped") {
-						return {
-							ok: true as const,
-							outcome: (existing.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
-								| "stopped"
-								| "stopped_owned",
-						};
+					const existing = durableStore.snapshotTerminalScopes().find(s => s.idempotencyKeyHash === keyHash);
+					if (existing) {
+						if (existing.selection !== scope || existing.idempotencyInputHash !== inputHash) {
+							return { ok: false as const, reason: "conflict" as const };
+						}
+						if (existing.turnDisposition === "stopped") {
+							return {
+								ok: true as const,
+								outcome: (existing.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
+									| "stopped"
+									| "stopped_owned",
+							};
+						}
 					}
 				}
 				const active = [...promptSubmissions.entries()].find(
@@ -4602,7 +4614,7 @@ export function createNotificationsExtension(
 								...retained,
 								{
 									selection: scope,
-									...(keyHash ? { idempotencyKeyHash: keyHash } : {}),
+									...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
 									turnDisposition: "stopped",
 									ownedWorkDisposition,
 									automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
@@ -4861,6 +4873,32 @@ export function createNotificationsExtension(
 						acknowledgePrompt(connectionId, { commandId: result.commandId, turnId: result.turnId });
 				}
 
+				// Terminal abort: the control response was actually written to the
+				// client — advance the durable terminal-scope record's response
+				// state pending -> sent (AC 18 monotonic; a same-key replay then
+				// returns the same stored payload with responseState:"sent"). A
+				// failed transition never breaks the already-delivered response.
+				if (
+					request.operation === "turn.abort" &&
+					typeof request.input === "object" &&
+					request.input !== null &&
+					(request.input as { mode?: unknown }).mode === "terminal" &&
+					typeof request.idempotencyKey === "string" &&
+					durableStore
+				) {
+					const keyHash = crypto.createHash("sha256").update(request.idempotencyKey).digest("hex");
+					try {
+						await durableStore.transactTerminalScopes(scopes =>
+							scopes.map(scope =>
+								scope.idempotencyKeyHash === keyHash && scope.responseState === "pending"
+									? { ...scope, responseState: "sent" as const }
+									: scope,
+							),
+						);
+					} catch (error) {
+						logger.warn(`sdk: terminal response-state persistence failed: ${String(error)}`);
+					}
+				}
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
 			control: async (connectionId, frame) => {
