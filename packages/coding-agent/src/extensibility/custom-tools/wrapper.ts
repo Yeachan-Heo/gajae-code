@@ -2,7 +2,7 @@
  * CustomToolAdapter wraps CustomTool instances into AgentTool for use with the agent.
  */
 import type { AgentTool, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { Static, TSchema } from "@gajae-code/ai";
+import type { Static, TSchema } from "@gajae-code/ai/core";
 import type { Theme } from "../../modes/theme/theme";
 import { applyToolProxy } from "../tool-proxy";
 import type { CustomTool, CustomToolContext } from "./types";

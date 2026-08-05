@@ -1,6 +1,6 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
-import { completeSimple } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
+import { completeSimple } from "@gajae-code/ai/core";
 import { prompt } from "@gajae-code/utils";
 import analysisSystemPrompt from "../../commit/prompts/analysis-system.md" with { type: "text" };
 import analysisUserPrompt from "../../commit/prompts/analysis-user.md" with { type: "text" };

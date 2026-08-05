@@ -4,7 +4,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { THINKING_EFFORTS } from "@gajae-code/ai";
+import { THINKING_EFFORTS } from "@gajae-code/ai/core";
 import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { parseArgs } from "../cli/args";

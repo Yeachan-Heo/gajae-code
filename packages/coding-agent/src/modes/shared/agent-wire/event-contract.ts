@@ -14,7 +14,7 @@
  * conformance tests can assert fixture coverage equals the registry exactly.
  */
 
-import type { AssistantMessageEvent } from "@gajae-code/ai";
+import type { AssistantMessageEvent } from "@gajae-code/ai/core";
 import type { AgentSessionEvent } from "../../../session/agent-session";
 
 /** Wire protocol version. Bump on breaking envelope/semantic changes. */

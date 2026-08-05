@@ -4,7 +4,7 @@
  * Uses xAI's Responses API with the built-in web_search and x_search tools.
  * Endpoint: POST https://api.x.ai/v1/responses
  */
-import type { AuthStorage } from "@gajae-code/ai";
+import type { AuthStorage } from "@gajae-code/ai/core";
 import { $credentialEnv, $env } from "@gajae-code/utils";
 import type { SearchCitation, SearchResponse, SearchSource, SearchUsage } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";

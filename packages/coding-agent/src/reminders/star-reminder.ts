@@ -14,7 +14,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ImageContent, MessageAttribution } from "@gajae-code/ai";
+import type { ImageContent, MessageAttribution } from "@gajae-code/ai/core";
 import { getConfigRootDir, isEnoent } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import type { CustomMessage } from "../session/messages";

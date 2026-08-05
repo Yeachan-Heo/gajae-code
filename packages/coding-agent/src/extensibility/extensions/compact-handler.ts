@@ -5,7 +5,7 @@
  * takes two positional arguments `(instructions, options)`. This helper splits the
  * union so the same adapter can be reused by print, SDK, ACP, and executor callers.
  */
-import type { Model } from "@gajae-code/ai";
+import type { Model } from "@gajae-code/ai/core";
 import type { CompactOptions } from "./types";
 
 interface CompactableSession {

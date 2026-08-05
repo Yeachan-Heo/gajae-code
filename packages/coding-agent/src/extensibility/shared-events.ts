@@ -14,7 +14,7 @@
  */
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionPreparation, CompactionResult } from "@gajae-code/agent-core/compaction";
-import type { ImageContent, TextContent, ToolResultMessage } from "@gajae-code/ai";
+import type { ImageContent, TextContent, ToolResultMessage } from "@gajae-code/ai/core";
 import type { Rule } from "../capability/rule";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-manager";

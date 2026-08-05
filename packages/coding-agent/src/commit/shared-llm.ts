@@ -1,5 +1,5 @@
-import type { AssistantMessage } from "@gajae-code/ai";
-import { validateToolCall } from "@gajae-code/ai";
+import type { AssistantMessage } from "@gajae-code/ai/core";
+import { validateToolCall } from "@gajae-code/ai/core";
 import * as z from "zod/v4";
 import type { ChangelogCategory, ConventionalAnalysis } from "./types";
 import { extractTextContent, extractToolCall, normalizeAnalysis, parseJsonPayload } from "./utils";

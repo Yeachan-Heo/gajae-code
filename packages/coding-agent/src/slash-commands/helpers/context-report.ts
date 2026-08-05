@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { type CompactionSettings, calculatePromptTokens } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, Usage } from "@gajae-code/ai";
+import type { AssistantMessage, Usage } from "@gajae-code/ai/core";
 import { computeContextBreakdown } from "../../modes/utils/context-usage";
 import type { CompactionEntry, SessionEntry } from "../../session/session-manager";
 import type { SlashCommandRuntime } from "../types";

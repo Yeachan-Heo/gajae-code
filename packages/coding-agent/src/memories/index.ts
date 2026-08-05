@@ -3,7 +3,7 @@ import type * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { completeSimple, Effort, type Model } from "@gajae-code/ai";
+import { completeSimple, Effort, type Model } from "@gajae-code/ai/core";
 import { getAgentDbPath, getMemoriesDir, logger, parseJsonlLenient, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";

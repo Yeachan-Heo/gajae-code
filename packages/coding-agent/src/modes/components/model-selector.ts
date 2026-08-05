@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai";
+import { getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import {
 	Container,
 	fuzzyFilter,

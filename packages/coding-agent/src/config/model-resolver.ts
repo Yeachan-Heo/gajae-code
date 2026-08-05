@@ -3,7 +3,7 @@
  */
 
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { type Api, DEFAULT_MODEL_PER_PROVIDER, type KnownProvider, type Model, modelsAreEqual } from "@gajae-code/ai";
+import { type Api, DEFAULT_MODEL_PER_PROVIDER, type KnownProvider, type Model, modelsAreEqual } from "@gajae-code/ai/core";
 
 import { logger } from "@gajae-code/utils";
 import chalk from "chalk";

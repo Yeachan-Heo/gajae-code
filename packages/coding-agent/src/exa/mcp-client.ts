@@ -1,4 +1,4 @@
-import type { TSchema } from "@gajae-code/ai";
+import type { TSchema } from "@gajae-code/ai/core";
 import { $credentialEnv, logger } from "@gajae-code/utils";
 import type { CustomTool, CustomToolResult } from "../extensibility/custom-tools/types";
 import { callMCP } from "../runtime-mcp/json-rpc";

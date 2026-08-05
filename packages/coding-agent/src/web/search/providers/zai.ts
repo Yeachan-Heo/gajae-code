@@ -4,7 +4,7 @@
  * Calls Z.AI's remote MCP server (`webSearchPrime`) and adapts results into
  * the unified SearchResponse shape used by the web search tool.
  */
-import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai";
+import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai/core";
 import { asRecord, asString } from "../../../web/scrapers/utils";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";

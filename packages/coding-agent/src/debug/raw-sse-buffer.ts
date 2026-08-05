@@ -1,4 +1,4 @@
-import type { Model, ProviderResponseMetadata, RawSseEvent } from "@gajae-code/ai";
+import type { Model, ProviderResponseMetadata, RawSseEvent } from "@gajae-code/ai/core";
 
 const MAX_RAW_SSE_EVENTS = 1_000;
 const MAX_RAW_SSE_CHARS = 512_000;

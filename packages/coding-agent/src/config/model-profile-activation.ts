@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
 import type { AgentSession } from "../session/agent-session";
 import { formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";

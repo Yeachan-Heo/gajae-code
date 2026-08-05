@@ -5,7 +5,7 @@
  * Endpoint: POST https://api.synthetic.new/v2/search
  */
 
-import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai";
+import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai/core";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { SearchParams } from "./base";

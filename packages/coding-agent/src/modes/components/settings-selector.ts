@@ -1,5 +1,5 @@
 import { ThinkingLevel, type ThinkingLevel as ThinkingLevelValue } from "@gajae-code/agent-core";
-import type { Effort } from "@gajae-code/ai";
+import type { Effort } from "@gajae-code/ai/core";
 import {
 	type Component,
 	Container,

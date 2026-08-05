@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { ToolChoice } from "@gajae-code/ai";
+import type { ToolChoice } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";

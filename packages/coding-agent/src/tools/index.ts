@@ -1,16 +1,11 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
-import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai";
+import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { $env, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
-import { EditTool } from "../edit";
-import { isTruthyPythonFlag } from "../eval/py/env";
-import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
-import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
-import { LspTool } from "../lsp";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
@@ -24,87 +19,33 @@ import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import type { SkillActiveEntry } from "../skill-state/active-state";
-import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
 import type { EventBus } from "../utils/event-bus";
-import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
-import { AskTool } from "./ask";
-import { AstEditTool } from "./ast-edit";
-import { AstGrepTool } from "./ast-grep";
-import { BashTool } from "./bash";
 import type { BashRestrictionProfile } from "./bash-allowed-prefixes";
-import { BisectTool } from "./bisect";
-import { BrowserTool } from "./browser";
-import { CalculatorTool } from "./calculator";
-import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
-import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
-import { CronTool } from "./cron";
-import { DebugTool } from "./debug";
-import { EvalTool } from "./eval";
-import { FindTool } from "./find";
-import { GithubTool } from "./gh";
-import { IrcTool } from "./irc";
-import { JobTool } from "./job";
-import { MonitorTool } from "./monitor";
+import type { CheckpointState } from "./checkpoint";
+import { isComputerLoadablePlatform } from "./computer-policy";
 import { wrapToolWithMetaNotice } from "./output-meta";
-import { ReadTool } from "./read";
-import { RecipeTool } from "./recipe";
-import { RenderMermaidTool } from "./render-mermaid";
-import { ResolveTool } from "./resolve";
-import { reportFindingTool } from "./review";
-import { SearchTool } from "./search";
-import { SearchToolBm25Tool } from "./search-tool-bm25";
-import { SkillTool } from "./skill";
-import { SkillDiscoveryTool } from "./skill-discovery";
-import { loadSshTool } from "./ssh";
-import { SubagentTool } from "./subagent";
-import { TelegramSendTool } from "./telegram-send";
-import { type TodoPhase, TodoWriteTool } from "./todo-write";
-import { WriteTool } from "./write";
-import { YieldTool } from "./yield";
-
-export * from "../edit";
-export * from "../goals";
-export * from "../lsp";
-export * from "../session/streaming-output";
-export * from "../task";
-export * from "../web/search";
-export * from "./ask";
-export * from "./ast-edit";
-export * from "./ast-grep";
-export * from "./bash";
-export * from "./bisect";
-export * from "./browser";
-export * from "./calculator";
-export * from "./checkpoint";
-export * from "./computer";
-export * from "./cron";
-export * from "./debug";
-export * from "./eval";
-export * from "./find";
-export * from "./gh";
-export * from "./image-gen";
-export * from "./irc";
-export * from "./job";
-export * from "./monitor";
-export * from "./read";
-export * from "./recipe";
-export * from "./render-mermaid";
-export * from "./resolve";
-export * from "./review";
-export * from "./search";
-export * from "./search-tool-bm25";
-export * from "./skill";
-export * from "./skill-discovery";
-export * from "./ssh";
-export * from "./subagent";
-export * from "./telegram-send";
-export * from "./todo-write";
-export * from "./vim";
-export * from "./write";
-export * from "./yield";
+import type { TodoPhase } from "./todo-write";
+import {
+	BUILTIN_TOOLS,
+	BUILTIN_TOOL_DESCRIPTORS,
+	HIDDEN_TOOLS,
+	HIDDEN_TOOL_DESCRIPTORS,
+	LazyAgentTool,
+	resolveEffectiveDiscoveryMode,
+	type ToolAvailabilityContext,
+	type ToolDescriptorLoadResult,
+} from "./descriptors";
+export * from "./descriptors";
+export { TOOL_CATALOG } from "./tool-catalog.generated";
+export type { BashToolDetails, BashToolInput } from "./bash";
+export type { FindToolDetails, FindToolInput } from "./find";
+export type { ReadToolDetails, ReadToolInput } from "./read";
+export type { SearchToolDetails, SearchToolInput } from "./search";
+export type { WriteToolDetails, WriteToolInput } from "./write";
+export type { LspStartupServerInfo } from "../lsp";
 
 /** Tool type (AgentTool from pi-ai) */
 export type Tool = AgentTool<any, any, any>;
@@ -275,6 +216,8 @@ export interface ToolSession {
 	requestForegroundBashBackground?: () => boolean;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Scope-held MCP facade for mcp:// resolution. */
+	getMcpManager?: () => import("../runtime-mcp/manager").MCPManager | undefined;
 	/** Whether local:// must use external managed scratch instead of artifacts/local. */
 	isManagedSessionDestination?: () => boolean;
 	/** Get Hindsight runtime state for this agent session. */
@@ -360,6 +303,8 @@ export interface ToolSession {
 	/** Replace cached todo phases for this session. */
 	setTodoPhases?: (phases: TodoPhase[]) => void;
 	// ── Generic tool discovery (unified — covers built-in + MCP + extension) ──
+	/** Explicit top-level MCP config path; affects effective discovery mode before manager setup. */
+	mcpConfigPath?: string;
 	/** Whether any form of tool discovery is active (tools.discoveryMode !== "off" or mcp.discoveryMode). */
 	isToolDiscoveryEnabled?: () => boolean;
 	/** Get all hidden-but-discoverable tools for search_tool_bm25 prompts. */
@@ -478,51 +423,7 @@ export const BUILTIN_CAPABILITY_CATALOG: readonly BuiltinCapabilityCatalogEntry[
 		]
 	: [];
 
-export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
-	read: s => new ReadTool(s),
-	bash: s => new BashTool(s),
-	edit: s => new EditTool(s),
-	ast_grep: s => new AstGrepTool(s),
-	ast_edit: s => new AstEditTool(s),
-	render_mermaid: s => new RenderMermaidTool(s),
-	ask: AskTool.createIf,
-	debug: DebugTool.createIf,
-	bisect: s => new BisectTool(s),
-	eval: s => new EvalTool(s),
-	calc: s => new CalculatorTool(s),
-	ssh: loadSshTool,
-	github: GithubTool.createIf,
-	find: s => new FindTool(s),
-	search: s => new SearchTool(s),
-	lsp: LspTool.createIf,
-	browser: s => new BrowserTool(s),
-	...(isComputerLoadablePlatform() ? { computer: ComputerTool.createIf } : {}),
-	checkpoint: CheckpointTool.createIf,
-	rewind: RewindTool.createIf,
-	task: s => TaskTool.create(s),
-	subagent: s => new SubagentTool(s),
-	job: JobTool.createIf,
-	monitor: MonitorTool.createIf,
-	cron: CronTool.createIf,
-	recipe: RecipeTool.createIf,
-	irc: IrcTool.createIf,
-	todo_write: s => new TodoWriteTool(s),
-	web_search: s => new WebSearchTool(s),
-	search_tool_bm25: SearchToolBm25Tool.createIf,
-	skill_discovery: SkillDiscoveryTool.createIf,
-	telegram_send: TelegramSendTool.createIf,
-	write: s => new WriteTool(s),
-	skill: SkillTool.createIf,
-	goal: s => new GoalTool(s),
-};
-
 const GOAL_MODE_TOOL_NAMES = [] as const;
-
-export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
-	yield: s => new YieldTool(s),
-	report_finding: () => reportFindingTool,
-	resolve: s => new ResolveTool(s),
-};
 
 export type ToolName = keyof typeof BUILTIN_TOOLS;
 
@@ -565,6 +466,10 @@ export function parseGjcPy(env: Record<string, string | undefined>): { py: boole
 		default:
 			return null;
 	}
+}
+
+function isTruthyPythonFlag(value: string | undefined): boolean {
+	return value !== undefined && ["1", "true", "yes", "on", "y"].includes(value.trim().toLowerCase());
 }
 
 /**
@@ -610,14 +515,9 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
 	return resolveEvalBackendsFromEnv($env) ?? readEvalBackendsAllowance(session);
 }
 
-export {
-	resolvePythonIntegrationGate,
-	resolvePythonIpcTrace,
-	resolvePythonSkipCheck,
-} from "../eval/py/env";
 
 /**
- * Create tools from BUILTIN_TOOLS registry.
+ * Create tools from the descriptor registry.
  */
 export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
 	const includeYield = session.requireYieldTool === true;
@@ -649,6 +549,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		!allowJs &&
 		(requestedTools === undefined || requestedTools.includes("eval"))
 	) {
+		const { checkPythonKernelAvailability } = await import("../eval/py/kernel");
 		const availability = await logger.time("createTools:pythonCheck", checkPythonKernelAvailability, session.cwd);
 		pythonAvailable = availability.ok;
 		if (!availability.ok) {
@@ -687,60 +588,29 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			requestedTools.push("recipe");
 		}
 	}
-	// Resolve effective tool discovery mode.
-	// tools.discoveryMode takes precedence; mcp.discoveryMode is a back-compat alias for "mcp-only".
-	const toolsDiscoveryMode = session.settings.get("tools.discoveryMode");
-	const effectiveDiscoveryMode: "off" | "mcp-only" | "all" =
-		toolsDiscoveryMode !== "off"
-			? (toolsDiscoveryMode as "off" | "mcp-only" | "all")
-			: session.settings.get("mcp.discoveryMode")
-				? "mcp-only"
-				: "off";
+	// Resolve effective tool discovery mode through the shared policy used by SDK session construction.
+	const effectiveDiscoveryMode = resolveEffectiveDiscoveryMode(session.settings, session.mcpConfigPath);
 	const discoveryActive = effectiveDiscoveryMode !== "off";
 
-	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
-	const allToolFactoryEntries = Object.entries(allTools) as Array<[string, ToolFactory]>;
-	const allToolsByRequestName = new Map<string, [string, ToolFactory]>();
-	for (const [name, factory] of allToolFactoryEntries) {
-		allToolsByRequestName.set(name.toLowerCase(), [name, factory]);
-	}
-	const isToolAllowed = (name: string) => {
-		if (name === "goal") return goalEnabled;
-		if (goalStateToolNames.includes(name as (typeof GOAL_MODE_TOOL_NAMES)[number])) return goalEnabled;
-		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
-		if (name === "bash") return true;
-		if (name === "eval") return allowEval;
-		if (name === "debug") return session.settings.get("debug.enabled");
-		if (name === "todo_write") return !includeYield && session.settings.get("todo.enabled");
-		if (name === "find") return session.settings.get("find.enabled");
-		if (name === "search") return session.settings.get("search.enabled");
-		if (name === "github") return session.settings.get("github.enabled");
-		if (name === "ast_grep") return session.settings.get("astGrep.enabled");
-		if (name === "ast_edit") return session.settings.get("astEdit.enabled");
-		if (name === "render_mermaid") return session.settings.get("renderMermaid.enabled");
-		if (name === "web_search") return session.settings.get("web_search.enabled");
-		// search_tool_bm25 is allowed when either legacy mcp.discoveryMode or new tools.discoveryMode is active.
-		if (name === "search_tool_bm25") return discoveryActive;
-		if (name === "calc") return session.settings.get("calc.enabled");
-		if (name === "skill") return session.settings.get("skill.enabled");
-		if (name === "skill_discovery") return session.settings.get("skill.enabled");
-		if (name === "browser") return session.settings.get("browser.enabled");
-		if (name === "computer") return isComputerCallable(session);
-		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
-		if (name === "irc") {
-			if (!session.settings.get("irc.enabled")) return false;
-			// Task subagents now detach regardless of async.enabled, so the main agent
-			// may need IRC coordination whenever IRC itself is enabled.
-			return true;
-		}
-		if (name === "recipe") return session.settings.get("recipe.enabled");
-		if (name === "task") {
-			const maxDepth = session.settings.get("task.maxRecursionDepth") ?? 2;
-			const currentDepth = session.taskDepth ?? 0;
-			return maxDepth < 0 || currentDepth < maxDepth;
-		}
-		return true;
+	const availabilityContext: ToolAvailabilityContext = {
+		includeYield,
+		enableLsp,
+		goalEnabled,
+		goalStateToolNames,
+		allowEval,
+		discoveryActive,
 	};
+	const allToolDescriptors: Record<string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]> = {
+		...BUILTIN_TOOL_DESCRIPTORS,
+		...HIDDEN_TOOL_DESCRIPTORS,
+	};
+	const allToolDescriptorEntries = Object.entries(allToolDescriptors) as Array<
+		[string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]]
+	>;
+	const allToolsByRequestName = new Map<string, [string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]]>();
+	for (const [name, descriptor] of allToolDescriptorEntries) {
+		allToolsByRequestName.set(name.toLowerCase(), [name, descriptor]);
+	}
 	if (includeYield && requestedTools && !requestedTools.includes("yield")) {
 		requestedTools.push("yield");
 	}
@@ -755,29 +625,45 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	const filteredRequestedTools = requestedTools
 		?.map(name => allToolsByRequestName.get(name))
-		.filter((entry): entry is [string, ToolFactory] => entry !== undefined)
-		.filter(([name]) => isToolAllowed(name));
+		.filter((entry): entry is [string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]] => entry !== undefined)
+		.filter(([, descriptor]) => descriptor.isAvailable(session, availabilityContext));
 	const baseEntries =
 		filteredRequestedTools !== undefined
 			? filteredRequestedTools.filter(([name]) => name !== "resolve")
 			: [
-					...Object.entries(BUILTIN_TOOLS)
-						.filter(([name]) => isToolAllowed(name))
-						.map(([name, factory]) => [name, factory] as const),
-					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
+					...Object.entries(BUILTIN_TOOL_DESCRIPTORS)
+						.filter(([, descriptor]) => descriptor.isAvailable(session, availabilityContext))
+						.map(([name, descriptor]) => [name, descriptor] as const),
+					...(includeYield ? ([['yield', HIDDEN_TOOL_DESCRIPTORS.yield]] as const) : []),
 				];
 
-	const baseResults = await Promise.all(
-		baseEntries.map(async ([name, factory]) => {
-			const tool = await logger.time(`createTools:${name}`, factory as ToolFactory, session);
-			return tool ? wrapToolWithMetaNotice(tool) : null;
-		}),
-	);
-	const tools = baseResults.filter((r): r is Tool => r !== null);
+	const selectedDiscoveredNames = new Set([
+		...(requestedTools ?? []),
+		...(session.getSelectedDiscoveredToolNames?.() ?? []),
+	].map(name => name.toLowerCase()));
+	const materialize = async ([name, descriptor]: readonly [string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]]) => {
+		const defer =
+			effectiveDiscoveryMode !== "off" &&
+			descriptor.metadata.loadMode === "discoverable" &&
+			!selectedDiscoveredNames.has(name.toLowerCase());
+		if (defer) {
+			return wrapToolWithMetaNotice(
+				new LazyAgentTool(descriptor, undefined, () => descriptor.load(session), session),
+			);
+		}
+		const materialized = await logger.time(`createTools:${name}`, descriptor.load, session);
+		return materialized ? wrapToolWithMetaNotice(new LazyAgentTool(descriptor, materialized, undefined, session)) : null;
+	};
+	const tools: LazyAgentTool[] = [];
+	for (const entry of baseEntries) {
+		const materialized = await materialize(entry);
+		if (materialized) tools.push(materialized);
+	}
 	if (!tools.some(tool => tool.name === "resolve")) {
-		const resolveTool = await logger.time("createTools:resolve", HIDDEN_TOOLS.resolve, session);
+		const resolveDescriptor = HIDDEN_TOOL_DESCRIPTORS.resolve;
+		const resolveTool = await logger.time("createTools:resolve", resolveDescriptor.load, session);
 		if (resolveTool) {
-			tools.push(wrapToolWithMetaNotice(resolveTool));
+			tools.push(wrapToolWithMetaNotice(new LazyAgentTool(resolveDescriptor, resolveTool, undefined, session)));
 		}
 	}
 

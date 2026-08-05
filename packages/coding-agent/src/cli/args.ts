@@ -2,7 +2,7 @@
  * CLI argument parsing
  */
 import * as path from "node:path";
-import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai";
+import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseEffort } from "../thinking";

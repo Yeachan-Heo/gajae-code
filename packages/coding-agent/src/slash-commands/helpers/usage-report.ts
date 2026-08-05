@@ -1,4 +1,4 @@
-import type { UsageLimit, UsageReport } from "@gajae-code/ai";
+import type { UsageLimit, UsageReport } from "@gajae-code/ai/core";
 import type { SlashCommandRuntime } from "../types";
 import { formatDuration, renderAsciiBar } from "./format";
 

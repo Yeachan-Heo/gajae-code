@@ -9,7 +9,7 @@ import type {
 	ImageContent,
 	Model,
 	ProviderResponseMetadata,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 import type { KeyId } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";

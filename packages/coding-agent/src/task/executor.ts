@@ -15,7 +15,7 @@ import type {
 } from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
 import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, Message, Model, ServiceTier } from "@gajae-code/ai";
+import type { AssistantMessage, Message, Model, ServiceTier } from "@gajae-code/ai/core";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -267,6 +267,11 @@ export interface ExecutorOptions {
 	/** Skills to autoload via sendCustomMessage before the first prompt */
 	autoloadSkills?: Skill[];
 	forkContextSeed?: ForkContextSeed;
+	/**
+	 * W6b: the parent's scope-held MCP facade, forwarded so the subagent inherits
+	 * always-on MCP tools without the removed process-global singleton.
+	 */
+	parentMcpManager?: import("../runtime-mcp/manager").MCPManager;
 }
 
 export class ManagedTaskPersistence {
@@ -1698,6 +1703,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentTaskPrefix: id,
+					inheritedMcpManager: options.parentMcpManager,
 					agentId: id,
 					agentDisplayName: agent.name,
 					agentRosterLabel: options.description,

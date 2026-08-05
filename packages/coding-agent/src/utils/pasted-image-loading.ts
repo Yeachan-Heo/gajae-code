@@ -2,7 +2,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import { formatBytes, parseImageMetadata } from "@gajae-code/utils";
 import {
 	ImageInputTooLargeError,

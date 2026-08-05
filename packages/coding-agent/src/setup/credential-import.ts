@@ -16,7 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AuthCredential, OAuthCredential } from "@gajae-code/ai";
+import type { AuthCredential, OAuthCredential } from "@gajae-code/ai/core";
 import { $credentialEnv, isEnoent } from "@gajae-code/utils";
 import { redactSecret } from "./provider-onboarding";
 

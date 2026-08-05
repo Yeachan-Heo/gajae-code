@@ -11,7 +11,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent } from "@gajae-code/ai";
+import type { ImageContent, TextContent } from "@gajae-code/ai/core";
 import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
@@ -92,11 +92,27 @@ export interface LimitsMeta {
 /**
  * Structured metadata for tool outputs.
  */
+/**
+ * Versioned handle for an exact persisted tool-output artifact. `complete` is
+ * intentionally literal: incomplete/capped artifacts MUST NOT be represented
+ * by this handle, so callers cannot accidentally claim rehydration support.
+ */
+export interface EvictedToolOutputHandle {
+	v: 1;
+	artifactId: string;
+	uri: `artifact://${string}`;
+	encoding: "utf-8";
+	bytes: number;
+	sha256: string;
+	complete: true;
+}
+
 export interface OutputMeta {
 	truncation?: TruncationMeta;
 	source?: SourceMeta;
 	diagnostics?: DiagnosticMeta;
 	limits?: LimitsMeta;
+	eviction?: EvictedToolOutputHandle;
 }
 
 // =============================================================================

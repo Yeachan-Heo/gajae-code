@@ -7,7 +7,7 @@
  * surviving message's `TextContent` parts are joined with newlines.
  */
 
-import type { AssistantMessage } from "@gajae-code/ai";
+import type { AssistantMessage } from "@gajae-code/ai/core";
 import type { SessionEntry } from "../session/session-manager";
 import type { HindsightMessage } from "./content";
 

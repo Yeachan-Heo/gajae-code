@@ -11,7 +11,7 @@
  * throw instead of pretending a shallow fetch succeeded.
  */
 
-import type { AuthStorage } from "@gajae-code/ai";
+import type { AuthStorage } from "@gajae-code/ai/core";
 
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";

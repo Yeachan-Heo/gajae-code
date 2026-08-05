@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
+import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai/core";
 import type { Component, Container, EditorTheme, Loader, SlashCommand, Spacer, Text, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
@@ -389,6 +389,7 @@ export interface InteractiveModeContext {
 	/** Resolved source of truth for slash autocomplete and command palette entries. */
 	getSlashCommands?(): readonly SlashCommand[];
 	refreshSlashCommandState(cwd?: string): Promise<void>;
+	ensureHistoryStorage(): Promise<HistoryStorage | undefined>;
 
 	// Selector handling
 	showCommandPalette(
@@ -399,7 +400,7 @@ export interface InteractiveModeContext {
 	showSettingsSelector(): void;
 	showThemeSelector(): void;
 	showPetSelector(): void;
-	showHistorySearch(): void;
+	showHistorySearch(): Promise<void>;
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;
 	showModelSelector(options?: { temporaryOnly?: boolean }): void;

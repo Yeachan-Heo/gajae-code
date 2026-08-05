@@ -30,7 +30,7 @@ import type {
 	Tool,
 	TSchema,
 	UsageReport,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
 import type * as piCodingAgent from "@gajae-code/coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@gajae-code/tui";

@@ -1,4 +1,4 @@
-import type { Api, Model } from '@gajae-code/ai';
+import type { Api, Model } from '@gajae-code/ai/core';
 import type { ExtensionAPI } from '@gajae-code/coding-agent';
 import { XaiOAuthError } from '../shared/errors.js';
 import { fetchBillingUsage, formatQuota } from './billing.js';

@@ -26,7 +26,7 @@ import {
 	UNK_CONTEXT_WINDOW,
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 
 // Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
 // any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.

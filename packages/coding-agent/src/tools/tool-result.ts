@@ -1,5 +1,5 @@
 import type { AgentToolResult } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent } from "@gajae-code/ai";
+import type { ImageContent, TextContent } from "@gajae-code/ai/core";
 import type { OutputSummary, ReadWindow, TruncationResult } from "../session/streaming-output";
 import type { OutputMeta, TruncationOptions, TruncationSummaryOptions, TruncationTextOptions } from "./output-meta";
 import { outputMeta } from "./output-meta";

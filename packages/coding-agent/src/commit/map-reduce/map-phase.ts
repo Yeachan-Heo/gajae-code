@@ -1,6 +1,6 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, AssistantMessage, Message, Model } from "@gajae-code/ai";
-import { completeSimple } from "@gajae-code/ai";
+import type { Api, AssistantMessage, Message, Model } from "@gajae-code/ai/core";
+import { completeSimple } from "@gajae-code/ai/core";
 import { prompt } from "@gajae-code/utils";
 import fileObserverSystemPrompt from "../../commit/prompts/file-observer-system.md" with { type: "text" };
 import fileObserverUserPrompt from "../../commit/prompts/file-observer-user.md" with { type: "text" };

@@ -1,7 +1,7 @@
 /** Runtime backend that an eval cell dispatches to. */
 export type EvalLanguage = "python" | "js";
 
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import type { OutputMeta } from "../tools/output-meta";
 
 /** Status event emitted by prelude helpers (python or js) for TUI rendering. */

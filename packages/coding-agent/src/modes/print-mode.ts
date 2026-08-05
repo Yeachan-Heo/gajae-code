@@ -5,7 +5,7 @@
  * - `gjc -p "prompt"` - text output
  * - `gjc --mode json "prompt"` - JSON event stream
  */
-import { type AssistantMessage, type ImageContent, isContextOverflow } from "@gajae-code/ai";
+import { type AssistantMessage, type ImageContent, isContextOverflow } from "@gajae-code/ai/core";
 import { isKnownSinkPeerClosedError, logger, sanitizeText } from "@gajae-code/utils";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { AgentSession } from "../session/agent-session";

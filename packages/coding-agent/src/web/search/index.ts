@@ -5,7 +5,7 @@
  * providers with provider-specific parameters exposed conditionally.
  */
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { AuthStorage } from "@gajae-code/ai";
+import type { AuthStorage } from "@gajae-code/ai/core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";

@@ -7,7 +7,7 @@
  * SQLite store, never POSTs the broker sentinel to an OpenAI token endpoint.
  */
 import * as os from "node:os";
-import { type AuthStorage, getBundledModels } from "@gajae-code/ai";
+import { type AuthStorage, getBundledModels } from "@gajae-code/ai/core";
 import { decodeJwt } from "@gajae-code/ai/utils/oauth/openai-codex";
 import { $env, readSseJson } from "@gajae-code/utils";
 import packageJson from "../../../../package.json" with { type: "json" };

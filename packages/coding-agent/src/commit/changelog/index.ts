@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { CHANGELOG_CATEGORIES } from "../../commit/types";
 import * as git from "../../utils/git";

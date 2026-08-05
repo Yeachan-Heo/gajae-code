@@ -1,4 +1,4 @@
-import type { Model } from "@gajae-code/ai";
+import type { Model } from "@gajae-code/ai/core";
 
 /**
  * A single line in the `/fast status` report: a labelled model and whether fast

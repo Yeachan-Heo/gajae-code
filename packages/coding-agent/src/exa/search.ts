@@ -3,7 +3,7 @@
  *
  * Basic neural/keyword search, deep research, code search, and URL crawling.
  */
-import type { TSchema } from "@gajae-code/ai";
+import type { TSchema } from "@gajae-code/ai/core";
 import * as z from "zod/v4";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { createExaTool } from "./factory";

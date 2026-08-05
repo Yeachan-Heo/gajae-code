@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { $pickenv } from "@gajae-code/utils";
 import { parseFileDiffs } from "../../commit/git/diff";
 import type { ConventionalAnalysis } from "../../commit/types";
