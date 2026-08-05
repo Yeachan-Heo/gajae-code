@@ -30,24 +30,44 @@ const MAX_ERROR_NAME_CODE_POINTS = 64;
 const MAX_ERROR_MESSAGE_CODE_POINTS = 256;
 
 function boundedDiagnosticText(value: string, limit: number, fallback: string): string {
-	const sanitized = sanitizeText(value).replace(/\s+/g, " ").trim();
-	return Array.from(sanitized || fallback)
-		.slice(0, limit)
-		.join("");
+	try {
+		let bounded = "";
+		let codePoints = 0;
+		for (const codePoint of value) {
+			if (codePoints >= limit) break;
+			bounded += codePoint;
+			codePoints += 1;
+		}
+		const sanitized = sanitizeText(bounded).replace(/\s+/g, " ").trim();
+		return sanitized || fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+function isErrorValue(value: unknown): value is Error {
+	try {
+		return value instanceof Error;
+	} catch {
+		return false;
+	}
+}
+
+function readErrorString(error: Error, property: "name" | "message"): string | undefined {
+	try {
+		const value = Reflect.get(error, property);
+		return typeof value === "string" ? value : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function errorDiagnostic(error: unknown): { errorName: string; message: string } {
-	if (!(error instanceof Error)) {
+	if (!isErrorValue(error)) {
 		return { errorName: "UnknownError", message: "Animation callback threw a non-Error value" };
 	}
-	let name = "Error";
-	let message = "Animation callback threw";
-	try {
-		if (typeof error.name === "string") name = error.name;
-		if (typeof error.message === "string") message = error.message;
-	} catch {
-		// Hostile accessors must not turn diagnostic extraction into another tick failure.
-	}
+	const name = readErrorString(error, "name") ?? "Error";
+	const message = readErrorString(error, "message") ?? "Animation callback threw";
 	return {
 		errorName: boundedDiagnosticText(name, MAX_ERROR_NAME_CODE_POINTS, "Error"),
 		message: boundedDiagnosticText(message, MAX_ERROR_MESSAGE_CODE_POINTS, "Animation callback threw"),

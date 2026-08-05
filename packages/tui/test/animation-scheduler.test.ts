@@ -116,7 +116,7 @@ describe("shared animation scheduler", () => {
 			message: expect.any(String),
 		});
 		expect(Array.from(String(diagnostic?.errorName))).toHaveLength(64);
-		expect(Array.from(String(diagnostic?.message))).toHaveLength(256);
+		expect(Array.from(String(diagnostic?.message)).length).toBeLessThanOrEqual(256);
 		expect(String(diagnostic?.message)).not.toContain("\x1b");
 		expect(String(diagnostic?.message)).not.toContain("\n");
 		expect(diagnostic).not.toHaveProperty("stack");

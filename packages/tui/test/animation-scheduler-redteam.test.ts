@@ -220,17 +220,36 @@ describe("G010 shared animation scheduler red-team", () => {
 		expect(__animationSchedulerTestHooks.getActiveTimerCount()).toBe(0);
 	});
 
-	it("keeps scheduler failures out of terminal bytes", () => {
+	it("quarantines hostile thrown Proxies without blocking siblings or emitting terminal bytes", () => {
 		const result = Bun.spawnSync({
 			cmd: [
 				process.execPath,
 				"--eval",
 				`
 					import { __animationSchedulerTestHooks, registerAnimationCallback } from "./packages/tui/src/animation-scheduler.ts";
-					registerAnimationCallback(() => { throw new Error("terminal-byte-sentinel"); }, 16);
-					await Bun.sleep(40);
+					const hostilePrototype = new Proxy(new Error("hidden"), {
+						getPrototypeOf() {
+							throw new Error("\\x1b[31mterminal-byte-sentinel");
+						},
+					});
+					const hostileProperties = new Proxy(new Error("hidden"), {
+						get() {
+							throw new Error("\\x1b[31mterminal-byte-sentinel");
+						},
+					});
+					let healthyCalls = 0;
+					registerAnimationCallback(() => { throw hostilePrototype; }, 16);
+					registerAnimationCallback(() => { throw hostileProperties; }, 16);
+					const healthy = registerAnimationCallback(() => { healthyCalls += 1; }, 16);
+					await Bun.sleep(55);
+					const quarantined =
+						__animationSchedulerTestHooks.getFailedCallbackCount() === 2 &&
+						__animationSchedulerTestHooks.getRegistrantCount(16) === 1 &&
+						__animationSchedulerTestHooks.getActiveTimerCount(16) === 1;
+					healthy.unregister();
 					process.exitCode =
-						__animationSchedulerTestHooks.getFailedCallbackCount() === 1 &&
+						quarantined &&
+						healthyCalls >= 2 &&
 						__animationSchedulerTestHooks.getActiveTimerCount() === 0
 							? 0
 							: 1;
