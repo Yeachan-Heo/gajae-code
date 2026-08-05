@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { parseArgs } from "../src/sdk/bus/telegram-cli";
 import {
 	buildActionMarkdown,
@@ -395,24 +396,16 @@ describe("telegram reference client negotiation", () => {
 		}
 	});
 
-	test("treats action_unavailable as a diagnostic without Telegram sends or WebSocket replies", async () => {
+	test("logs action_unavailable without Telegram sends, WebSocket replies, or a callback", async () => {
 		const originalWebSocket = globalThis.WebSocket;
-		const originalWarn = console.warn;
 		const fixture = createReferenceClientFixture();
-		const diagnostics: string[] = [];
-		let resolveDiagnostic: (() => void) | undefined;
-		const diagnostic = new Promise<void>(resolve => {
-			resolveDiagnostic = resolve;
-		});
+		const warning = Promise.withResolvers<void>();
+		const warnSpy = spyOn(logger, "warn").mockImplementation(() => warning.resolve());
 		let client: Promise<void> | undefined;
 
 		try {
 			FakeReferenceWebSocket.instances = [];
 			globalThis.WebSocket = FakeReferenceWebSocket as unknown as typeof WebSocket;
-			console.warn = (...args: unknown[]) => {
-				diagnostics.push(args.map(String).join(" "));
-				resolveDiagnostic?.();
-			};
 			client = runTelegramReferenceClient({
 				botToken: "bot-token",
 				chatId: "chat-id",
@@ -427,21 +420,144 @@ describe("telegram reference client negotiation", () => {
 
 			socket.emitMessage({
 				type: "action_unavailable",
-				id: "a1",
-				sessionId: "s1",
+				id: "must-not-be-logged",
+				sessionId: "must-not-be-logged",
 				reason: "missing_capability",
 				requiredCapabilities: ["ask_controls_v1"],
 			});
-			await diagnostic;
+			await warning.promise;
 
-			expect(diagnostics).toHaveLength(1);
-			expect(diagnostics[0]).toContain("ask_controls_v1");
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			expect(warnSpy).toHaveBeenCalledWith("Telegram reference client action unavailable", {
+				code: "action_unavailable",
+				requiredCapabilities: ["ask_controls_v1"],
+			});
+			expect(JSON.stringify(warnSpy.mock.calls)).not.toContain("must-not-be-logged");
 			expect(fixture.calls.map(call => call.url)).toEqual(["https://telegram.test/botbot-token/getUpdates"]);
 			expect(fixture.calls.filter(call => /\/(?:sendMessage|sendPhoto)$/.test(call.url))).toEqual([]);
 			expect(socket.sent).toHaveLength(1);
 		} finally {
 			await stopReferenceClient(client, fixture);
-			console.warn = originalWarn;
+			warnSpy.mockRestore();
+			globalThis.WebSocket = originalWebSocket;
+			fixture.cleanup();
+		}
+	});
+
+	test("mirrors a bounded immutable action_unavailable diagnostic", async () => {
+		const originalWebSocket = globalThis.WebSocket;
+		const fixture = createReferenceClientFixture();
+		const warning = Promise.withResolvers<void>();
+		const mirrored = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const warnSpy = spyOn(logger, "warn").mockImplementation(() => {
+			events.push("logger");
+			warning.resolve();
+		});
+		const diagnostics: unknown[] = [];
+		let client: Promise<void> | undefined;
+
+		try {
+			FakeReferenceWebSocket.instances = [];
+			globalThis.WebSocket = FakeReferenceWebSocket as unknown as typeof WebSocket;
+			client = runTelegramReferenceClient({
+				botToken: "bot-token",
+				chatId: "chat-id",
+				endpointFile: fixture.endpointFile,
+				apiBase: "https://telegram.test",
+				fetchImpl: fixture.fetchImpl,
+				onDiagnostic: diagnostic => {
+					diagnostics.push(diagnostic);
+					events.push("callback");
+					mirrored.resolve();
+				},
+			});
+
+			const socket = FakeReferenceWebSocket.instances[0]!;
+			socket.emitOpen();
+			socket.emitMessage({
+				type: "action_unavailable",
+				requiredCapabilities: [`\u0000ask\ncontrols_v1`, "😀".repeat(80), "third", "fourth", "ignored-fifth"],
+			});
+			await Promise.all([warning.promise, mirrored.promise]);
+
+			expect(diagnostics).toHaveLength(1);
+			const diagnostic = diagnostics[0] as {
+				code: string;
+				requiredCapabilities: readonly string[];
+			};
+			expect(diagnostic).toEqual({
+				code: "action_unavailable",
+				requiredCapabilities: ["askcontrols_v1", "😀".repeat(64), "third", "fourth"],
+			});
+			expect(Object.isFrozen(diagnostic)).toBe(true);
+			expect(Object.isFrozen(diagnostic.requiredCapabilities)).toBe(true);
+			expect(() => (diagnostic.requiredCapabilities as string[]).push("mutation")).toThrow();
+			expect([...diagnostic.requiredCapabilities[1]!]).toHaveLength(64);
+			expect(events).toEqual(["logger", "callback"]);
+		} finally {
+			await stopReferenceClient(client, fixture);
+			warnSpy.mockRestore();
+			globalThis.WebSocket = originalWebSocket;
+			fixture.cleanup();
+		}
+	});
+
+	test("contains a throwing diagnostic callback and keeps handling messages", async () => {
+		const originalWebSocket = globalThis.WebSocket;
+		const fixture = createReferenceClientFixture();
+		const warnings = Promise.withResolvers<void>();
+		const warningCalls: Array<[string, unknown]> = [];
+		const warnSpy = spyOn(logger, "warn").mockImplementation((message, metadata) => {
+			warningCalls.push([message, metadata]);
+			if (warningCalls.length === 4) warnings.resolve();
+		});
+		let callbackCalls = 0;
+		let client: Promise<void> | undefined;
+
+		try {
+			FakeReferenceWebSocket.instances = [];
+			globalThis.WebSocket = FakeReferenceWebSocket as unknown as typeof WebSocket;
+			client = runTelegramReferenceClient({
+				botToken: "bot-token",
+				chatId: "chat-id",
+				endpointFile: fixture.endpointFile,
+				apiBase: "https://telegram.test",
+				fetchImpl: fixture.fetchImpl,
+				onDiagnostic: () => {
+					callbackCalls++;
+					throw new Error(`Bad\u0000Name:${"m".repeat(160)}`);
+				},
+			});
+
+			const socket = FakeReferenceWebSocket.instances[0]!;
+			socket.emitOpen();
+			socket.emitMessage({ type: "action_unavailable", requiredCapabilities: ["first"] });
+			socket.emitMessage({ type: "action_unavailable", requiredCapabilities: ["second"] });
+			await warnings.promise;
+
+			expect(callbackCalls).toBe(2);
+			expect(warningCalls.map(([message]) => message)).toEqual([
+				"Telegram reference client action unavailable",
+				"Telegram reference client diagnostic callback failed",
+				"Telegram reference client action unavailable",
+				"Telegram reference client diagnostic callback failed",
+			]);
+			const failures = warningCalls
+				.filter(([message]) => message.endsWith("callback failed"))
+				.map(([, metadata]) => metadata as { code: string; errorName: string; errorMessage: string });
+			expect(failures).toHaveLength(2);
+			for (const failure of failures) {
+				expect(failure.code).toBe("diagnostic_callback_failed");
+				expect([...failure.errorName]).toHaveLength(5);
+				expect([...failure.errorMessage]).toHaveLength(128);
+				expect(failure.errorMessage).not.toContain("\u0000");
+			}
+			expect(fixture.calls.filter(call => /\/(?:sendMessage|sendPhoto)$/.test(call.url))).toEqual([]);
+			expect(socket.sent).toHaveLength(1);
+		} finally {
+			await stopReferenceClient(client, fixture);
+			warnSpy.mockRestore();
 			globalThis.WebSocket = originalWebSocket;
 			fixture.cleanup();
 		}

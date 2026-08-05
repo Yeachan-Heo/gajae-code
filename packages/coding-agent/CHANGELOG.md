@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Made Telegram reference-client capability diagnostics safe for TUI embedding.
+
 ## [0.12.12] - 2026-08-05
 
 ### Added

@@ -16,6 +16,7 @@
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import { logger } from "@gajae-code/utils";
 import {
 	bold,
 	buildCompactChoiceGrid,
@@ -33,6 +34,44 @@ const REFERENCE_CLIENT_HELLO = {
 	protocolVersion: 3,
 	capabilities: ["ask_controls_v1"],
 } as const;
+
+const MAX_DIAGNOSTIC_CAPABILITIES = 4;
+const MAX_DIAGNOSTIC_CAPABILITY_CODE_POINTS = 64;
+const MAX_DIAGNOSTIC_ERROR_NAME_CODE_POINTS = 64;
+const MAX_DIAGNOSTIC_ERROR_MESSAGE_CODE_POINTS = 128;
+
+function boundedDiagnosticText(value: string, maxCodePoints: number): string {
+	let result = "";
+	let codePoints = 0;
+	for (const character of value) {
+		const codePoint = character.codePointAt(0)!;
+		if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) continue;
+		result += character;
+		codePoints++;
+		if (codePoints === maxCodePoints) break;
+	}
+	return result;
+}
+
+function boundedDiagnosticCallbackError(error: unknown): Readonly<{ errorName: string; errorMessage: string }> {
+	let errorName = "UnknownError";
+	let errorMessage = "Diagnostic callback threw";
+	try {
+		if (error instanceof Error) {
+			errorName = boundedDiagnosticText(error.name, MAX_DIAGNOSTIC_ERROR_NAME_CODE_POINTS) || "Error";
+			errorMessage =
+				boundedDiagnosticText(error.message, MAX_DIAGNOSTIC_ERROR_MESSAGE_CODE_POINTS) ||
+				"Diagnostic callback threw";
+		} else {
+			errorMessage =
+				boundedDiagnosticText(String(error), MAX_DIAGNOSTIC_ERROR_MESSAGE_CODE_POINTS) ||
+				"Diagnostic callback threw";
+		}
+	} catch {
+		// Hostile thrown values must not escape the diagnostic failure boundary.
+	}
+	return Object.freeze({ errorName, errorMessage });
+}
 
 /** One inline-keyboard button. */
 export interface InlineButton {
@@ -406,6 +445,12 @@ export function readEndpoint(path: string): { url: string; token: string; pid?: 
 	};
 }
 
+/** A bounded, diagnostic-only notification mirrored to reference-client embedders. */
+export type TelegramReferenceDiagnostic = Readonly<{
+	code: "action_unavailable";
+	requiredCapabilities: readonly string[];
+}>;
+
 /** Options for {@link runTelegramReferenceClient}. */
 export interface TelegramReferenceOptions {
 	botToken: string;
@@ -414,6 +459,11 @@ export interface TelegramReferenceOptions {
 	apiBase?: string;
 	fetchImpl?: typeof fetch;
 	sound?: TelegramNotificationSound;
+	/**
+	 * Additive mirror of bounded logger diagnostics. It never receives tokens,
+	 * identifiers, raw frames, Telegram content, or WebSocket replies.
+	 */
+	onDiagnostic?: (diagnostic: TelegramReferenceDiagnostic) => void;
 }
 
 /**
@@ -470,15 +520,27 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 				msg.kind ?? "ask",
 			);
 		} else if (msg.type === "action_unavailable") {
-			const requiredCapabilities = Array.isArray(msg.requiredCapabilities)
-				? msg.requiredCapabilities
-						.filter((capability): capability is string => typeof capability === "string")
-						.slice(0, 4)
-						.map(capability => capability.slice(0, 64))
-				: [];
-			console.warn(
-				`Telegram reference client: server withheld a controlled ask because this client lacks requiredCapabilities=[${requiredCapabilities.join(", ") || "unspecified"}].`,
+			const requiredCapabilities = Object.freeze(
+				Array.isArray(msg.requiredCapabilities)
+					? msg.requiredCapabilities
+							.filter((capability): capability is string => typeof capability === "string")
+							.slice(0, MAX_DIAGNOSTIC_CAPABILITIES)
+							.map(capability => boundedDiagnosticText(capability, MAX_DIAGNOSTIC_CAPABILITY_CODE_POINTS))
+					: [],
 			);
+			const diagnostic: TelegramReferenceDiagnostic = Object.freeze({
+				code: "action_unavailable",
+				requiredCapabilities,
+			});
+			logger.warn("Telegram reference client action unavailable", diagnostic);
+			try {
+				opts.onDiagnostic?.(diagnostic);
+			} catch (error) {
+				logger.warn("Telegram reference client diagnostic callback failed", {
+					code: "diagnostic_callback_failed",
+					...boundedDiagnosticCallbackError(error),
+				});
+			}
 			// Diagnostic only: never turn it into a Telegram prompt or option buttons.
 			return;
 		} else if (msg.type === "action_resolved" && msg.id === latestPendingAskId) {

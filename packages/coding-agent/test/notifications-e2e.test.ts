@@ -38,6 +38,7 @@ test("e2e: ask -> Telegram -> button tap -> reply -> resolved", async () => {
 	const sent: Array<Record<string, unknown>> = [];
 	const pendingUpdates: Array<Record<string, unknown>> = [];
 	let askDelivered = false;
+	const diagnostics: string[] = [];
 	let updateId = 1000;
 
 	const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -88,6 +89,7 @@ test("e2e: ask -> Telegram -> button tap -> reply -> resolved", async () => {
 		chatId: "1",
 		endpointFile,
 		fetchImpl: fakeFetch,
+		onDiagnostic: diagnostic => diagnostics.push(diagnostic.code),
 	}).catch(error => {
 		clientError = error;
 	});
@@ -143,6 +145,7 @@ test("e2e: ask -> Telegram -> button tap -> reply -> resolved", async () => {
 	observer.close();
 	await clientDone;
 	expect(clientError).toBeUndefined();
+	expect(diagnostics).toEqual([]);
 }, 30000);
 
 test("interactive ask answered remotely via SDK answer source", async () => {
