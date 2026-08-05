@@ -13,6 +13,8 @@ import {
 	setDefaultTabWidth,
 } from "@gajae-code/utils";
 import { YAML } from "bun";
+import * as z from "zod/v4";
+import { ConfigFile } from "../src/config/config-file";
 import { withFileLock } from "../src/config/file-lock";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 
@@ -90,6 +92,22 @@ describe("Settings", () => {
 		} finally {
 			warning.mockRestore();
 		}
+	});
+	it("loads a legacy JSON config through the retained atomic YAML migration", async () => {
+		const legacyPath = path.join(agentDir, "config.json");
+		const legacy = { theme: { dark: "custom-dark", light: "custom-light" } };
+		fs.writeFileSync(legacyPath, JSON.stringify(legacy), { mode: 0o640 });
+		fs.chmodSync(legacyPath, 0o640);
+
+		const config = new ConfigFile(
+			"config",
+			z.object({ theme: z.object({ dark: z.string(), light: z.string() }) }),
+			getConfigPath(),
+		);
+		expect(config.load()).toEqual(legacy);
+		expect(await readSettings()).toMatchObject(legacy);
+		expect(JSON.parse(fs.readFileSync(legacyPath, "utf8"))).toEqual(legacy);
+		expect(fs.statSync(getConfigPath()).mode & 0o777).toBe(fs.statSync(legacyPath).mode & 0o777);
 	});
 	it("distinguishes an absent first-event retry timeout from an explicit zero", () => {
 		const absent = Settings.isolated();

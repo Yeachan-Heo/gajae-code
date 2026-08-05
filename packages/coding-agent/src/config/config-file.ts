@@ -1,5 +1,8 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { NativeNoReplaceResult } from "@gajae-code/natives";
+import * as native from "@gajae-code/natives";
 import { getAgentDir, isEnoent, logger } from "@gajae-code/utils";
 import { JSONC, YAML } from "bun";
 import type { ZodType } from "zod/v4";
@@ -10,20 +13,210 @@ interface ConfigSchemaError {
 	message: string | undefined;
 }
 
-function migrateJsonToYml(jsonPath: string, ymlPath: string) {
-	try {
-		if (fs.existsSync(ymlPath)) return;
-		if (!fs.existsSync(jsonPath)) return;
+interface FileIdentity {
+	dev: number | bigint;
+	ino: number | bigint;
+}
 
-		const content = fs.readFileSync(jsonPath, "utf-8");
-		const parsed = JSON.parse(content);
-		if (!parsed) {
-			logger.warn("migrateJsonToYml: invalid json structure", { path: jsonPath });
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function warningDetails(outcomeCode: string, error?: unknown): Record<string, string> {
+	const rawName = error instanceof Error ? error.name : "";
+	const errorName = /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(rawName) ? rawName : "Error";
+	return {
+		outcomeCode,
+		errorName,
+		errorMessage: "Legacy config migration was not proven durable.",
+	};
+}
+
+function warnMigration(outcomeCode: string, error?: unknown): void {
+	logger.warn("migrateJsonToYml: migration not completed", warningDetails(outcomeCode, error));
+}
+
+function isStructuredPublishOutcome(value: NativeNoReplaceResult): boolean {
+	return (
+		typeof value.ok === "boolean" &&
+		typeof value.mutationState === "string" &&
+		typeof value.durabilityState === "string" &&
+		typeof value.reason === "string" &&
+		typeof value.primitive === "string" &&
+		value.primitive.length > 0 &&
+		typeof value.phase === "string" &&
+		typeof value.diagnostic === "object" &&
+		value.diagnostic !== null
+	);
+}
+
+function isCommittedPublishOutcome(value: NativeNoReplaceResult): boolean {
+	return (
+		isStructuredPublishOutcome(value) &&
+		value.mutationState === "committed" &&
+		value.durabilityState === "not_attempted" &&
+		value.reason === "none" &&
+		value.phase === "complete"
+	);
+}
+
+const CERTIFIED_NON_COMMIT_REASONS = new Set([
+	"destination_exists",
+	"atomic_unavailable",
+	"invalid_request",
+	"cross_device",
+	"permission_denied",
+	"io_failure",
+	"interrupted",
+	"identity_violation",
+]);
+
+function isCertifiedNonCommit(value: NativeNoReplaceResult): boolean {
+	return (
+		isStructuredPublishOutcome(value) &&
+		value.ok === false &&
+		value.mutationState === "not_committed" &&
+		value.durabilityState === "not_attempted" &&
+		CERTIFIED_NON_COMMIT_REASONS.has(value.reason)
+	);
+}
+
+function writeFully(fd: number, bytes: Uint8Array): void {
+	let offset = 0;
+	while (offset < bytes.byteLength) {
+		const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+		if (written <= 0) throw new Error("Config migration temp write made no progress");
+		offset += written;
+	}
+}
+
+function syncParentDirectory(ymlPath: string): void {
+	const noFollow = fs.constants.O_NOFOLLOW;
+	const directory = fs.constants.O_DIRECTORY;
+	if (typeof noFollow !== "number" || noFollow === 0 || typeof directory !== "number" || directory === 0) {
+		throw new Error("Secure directory sync is unsupported");
+	}
+	const fd = fs.openSync(path.dirname(ymlPath), fs.constants.O_RDONLY | directory | noFollow);
+	try {
+		fs.fsyncSync(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+function removeCertifiedTemp(tempPath: string, identity: FileIdentity | undefined): void {
+	if (!identity) return;
+	try {
+		const current = fs.lstatSync(tempPath);
+		if (!current.isFile() || current.isSymbolicLink() || !sameIdentity(current, identity)) return;
+		fs.unlinkSync(tempPath);
+	} catch {
+		// Cleanup is best effort and never grants authority to touch another path.
+	}
+}
+
+export function migrateJsonToYml(jsonPath: string, ymlPath: string): void {
+	let tempPath: string | undefined;
+	let tempIdentity: FileIdentity | undefined;
+	let tempFd: number | undefined;
+	let publicationCommitted = false;
+
+	try {
+		try {
+			fs.lstatSync(ymlPath);
+			return;
+		} catch (error) {
+			if (!isEnoent(error)) {
+				warnMigration("destination_identity_failed", error);
+				return;
+			}
+		}
+
+		let source: fs.Stats;
+		try {
+			source = fs.lstatSync(jsonPath);
+		} catch (error) {
+			if (!isEnoent(error)) warnMigration("source_identity_failed", error);
 			return;
 		}
-		fs.writeFileSync(ymlPath, YAML.stringify(parsed, null, 2));
+		if (!source.isFile() || source.isSymbolicLink()) {
+			warnMigration("source_not_regular");
+			return;
+		}
+
+		const noFollow = fs.constants.O_NOFOLLOW;
+		if (typeof noFollow !== "number" || noFollow === 0) {
+			warnMigration("no_follow_unsupported");
+			return;
+		}
+
+		const sourceFd = fs.openSync(jsonPath, fs.constants.O_RDONLY | noFollow);
+		let content: string | undefined;
+		try {
+			const openedSource = fs.fstatSync(sourceFd);
+			if (openedSource.isFile() && sameIdentity(source, openedSource)) {
+				content = fs.readFileSync(sourceFd, "utf8");
+			}
+		} finally {
+			fs.closeSync(sourceFd);
+		}
+		if (content === undefined) {
+			warnMigration("source_identity_changed");
+			return;
+		}
+
+		const parsed = JSON.parse(content);
+		if (!parsed) {
+			warnMigration("invalid_json_structure");
+			return;
+		}
+		const bytes = Buffer.from(YAML.stringify(parsed, null, 2), "utf8");
+
+		tempPath = path.join(path.dirname(ymlPath), `.${path.basename(ymlPath)}.${randomUUID()}.tmp`);
+		tempFd = fs.openSync(
+			tempPath,
+			fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
+			source.mode & 0o777,
+		);
+		const openedTemp = fs.fstatSync(tempFd);
+		if (!openedTemp.isFile()) throw new Error("Config migration temp is not a regular file");
+		tempIdentity = openedTemp;
+		writeFully(tempFd, bytes);
+		fs.fchmodSync(tempFd, source.mode & 0o777);
+		fs.fsyncSync(tempFd);
+		fs.closeSync(tempFd);
+		tempFd = undefined;
+
+		const publication = native.renameNoReplacePath(tempPath, ymlPath);
+		if (isCommittedPublishOutcome(publication)) {
+			publicationCommitted = true;
+			try {
+				syncParentDirectory(ymlPath);
+			} catch (error) {
+				warnMigration("published_parent_sync_failed", error);
+				return;
+			}
+			if (!publication.ok) warnMigration("published_outcome_not_proven");
+			return;
+		}
+		if (isCertifiedNonCommit(publication)) {
+			if (publication.reason !== "destination_exists") {
+				warnMigration(`not_committed_${publication.reason}`);
+			}
+			return;
+		}
+		warnMigration("publication_outcome_indeterminate");
 	} catch (error) {
-		logger.warn("migrateJsonToYml: migration failed", { error: String(error) });
+		warnMigration("migration_failed", error);
+	} finally {
+		if (tempFd !== undefined) {
+			try {
+				fs.closeSync(tempFd);
+			} catch {
+				// The identity check below remains authoritative for cleanup.
+			}
+		}
+		if (!publicationCommitted && tempPath) removeCertifiedTemp(tempPath, tempIdentity);
 	}
 }
 
