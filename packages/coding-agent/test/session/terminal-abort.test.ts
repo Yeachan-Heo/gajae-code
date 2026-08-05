@@ -12,6 +12,7 @@ import {
 	registerOwnedIfLineaged,
 	registerOwnedRegistration,
 	registerTerminalScope,
+	registerTerminalTurnScope,
 	resolveToolLineage,
 	type TurnRegistrationKey,
 	unbindToolLineage,
@@ -301,4 +302,53 @@ test("classifyOwnedCompletion fails closed when the scope is removed or epoch mi
 	// After the scope is gone, the same delivery is ordinary again.
 	expect(classifyOwnedCompletion("job-1", "gen-1")).toBeUndefined();
 	unregisterOwnedRegistration(registration);
+});
+test("registerTerminalTurnScope registers a synchronously closed scope for the turn", () => {
+	const { scopeId, lineageIdHash, promptAttemptEpoch, seam } = registerTerminalTurnScope({
+		lineageIdHash: "lineage-turn-1",
+		promptAttemptEpoch: 9,
+	});
+	expect(seam.fence.state).toBe("closed");
+	expect(seam.fence.ownedCompletionPolicy).toBe("enabled");
+	expect(seam.fence.abortedAttemptEpoch).toBe(9);
+	// The scope is lookup-able by the exact lineage+epoch.
+	const found = lookupTerminalScope("lineage-turn-1", 9);
+	expect(found?.scopeId).toBe(scopeId);
+	expect(found?.lineageIdHash).toBe(lineageIdHash);
+	expect(found?.abortedAttemptEpoch).toBe(promptAttemptEpoch);
+	// Post-close same-turn continuations are denied; owned completions allowed.
+	expect(seam.gate.authorizeContinuation(continuation("retry-x"))).toBe("deny");
+	unregisterTerminalScope(scopeId);
+	expect(lookupTerminalScope("lineage-turn-1", 9)).toBeUndefined();
+});
+
+test("registerTerminalTurnScope with owned policy disables owned-completion delivery", () => {
+	const { seam } = registerTerminalTurnScope({
+		lineageIdHash: "lineage-turn-2",
+		promptAttemptEpoch: 11,
+		ownedCompletionPolicy: "disabled",
+	});
+	expect(seam.fence.ownedCompletionPolicy).toBe("disabled");
+	expect(
+		seam.gate.authorizeOwnedCompletion(
+			owned(
+				{ lineageIdHash: "lineage-turn-2", attemptEpoch: 11 },
+				{ ...registration, lineageIdHash: "lineage-turn-2", promptAttemptEpoch: 11 },
+			),
+		),
+	).toBe("deny");
+	unregisterTerminalScope(seam.fence.terminalScopeId);
+});
+
+test("a registered terminal turn scope makes a matching owned job classify as owned-completion", () => {
+	registerTerminalTurnScope({ lineageIdHash: "lineage-chain", promptAttemptEpoch: 13 });
+	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-chain", promptAttemptEpoch: 13 });
+	const classified = classifyOwnedCompletion("job-1", "gen-1");
+	expect(classified).toEqual({
+		lineageIdHash: "lineage-chain",
+		promptAttemptEpoch: 13,
+		registration: { ...registration, lineageIdHash: "lineage-chain", promptAttemptEpoch: 13 },
+		terminalScopeId: expect.any(String),
+	});
+	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-chain", promptAttemptEpoch: 13 });
 });

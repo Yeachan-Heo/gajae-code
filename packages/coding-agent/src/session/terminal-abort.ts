@@ -374,3 +374,49 @@ export function createTurnContinuationSeam(options: {
 
 	return { fence, gate };
 }
+export interface RegisteredTerminalScope {
+	scopeId: string;
+	lineageIdHash: string;
+	promptAttemptEpoch: number;
+	seam: TurnContinuationSeam;
+}
+
+/**
+ * Create, register, and synchronously close a terminal scope for one aborted
+ * turn. The fence closes before the first await that interrupts the root turn;
+ * owned-completion policy is enabled for `scope:"turn"` (left-running owned
+ * delivery intentionally resumes the agent as a fresh turn) and disabled for
+ * `scope:"owned"`. Registered scopes are process-local and bounded; the exact
+ * (lineageIdHash, attemptEpoch) key makes later owned-completion classification
+ * source-exact and fail-closed.
+ */
+export function registerTerminalTurnScope(options: {
+	lineageIdHash: string;
+	promptAttemptEpoch: number;
+	terminalScopeId?: string;
+	ownedCompletionPolicy?: OwnedCompletionPolicy;
+	blockedContinuationIds?: readonly string[];
+}): RegisteredTerminalScope {
+	const terminalScopeId = options.terminalScopeId ?? newTerminalScopeId();
+	const seam = createTurnContinuationSeam({
+		lineageIdHash: options.lineageIdHash,
+		abortedAttemptEpoch: options.promptAttemptEpoch,
+		terminalScopeId,
+		ownedCompletionPolicy: options.ownedCompletionPolicy,
+		blockedContinuationIds: options.blockedContinuationIds,
+	});
+	seam.gate.close("terminal-turn");
+	registerTerminalScope({
+		scopeId: terminalScopeId,
+		lineageIdHash: options.lineageIdHash,
+		abortedAttemptEpoch: options.promptAttemptEpoch,
+		gate: seam.gate,
+		fence: seam.fence,
+	});
+	return {
+		scopeId: terminalScopeId,
+		lineageIdHash: options.lineageIdHash,
+		promptAttemptEpoch: options.promptAttemptEpoch,
+		seam,
+	};
+}

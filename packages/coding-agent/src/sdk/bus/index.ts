@@ -82,7 +82,7 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
-import { type ControlSurface, dispatchControl } from "../host/control";
+import { type AbortScope, type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
@@ -2303,6 +2303,13 @@ function sdkControlSurface(
 		aborted: true,
 		disposition: "idle",
 	}),
+	abortTerminalPrompt: (
+		connectionId: string | undefined,
+		_scope: AbortScope,
+	) => Promise<
+		| { ok: true; outcome: "stopped" | "no_active_turn" | "already_terminal" }
+		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" }
+	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
 		admit: (clientRef?: string) => void;
 		release: (clientRef?: string) => void;
@@ -2562,6 +2569,61 @@ function sdkControlSurface(
 				return { aborted: true, disposition: "preflight_cancelled" };
 			}
 			return await abortOwnedPrompt(requesterConnectionId);
+		},
+		abortTerminal: async input => {
+			// Terminal abort (C04 mode:"terminal", approved plan): stop the root
+			// worker's current turn and block only its own continuation routes.
+			// Left-running owned work (background Bash/task jobs, detached
+			// subagents) keeps running and its completions are delivered normally
+			// through the existing followUp/prompt path as a fresh turn — owned
+			// delivery is intentionally NOT suppressed.
+			const requesterConnectionId = controlRequesterContext.getStore();
+			const scope: AbortScope = input.scope === "owned" ? "owned" : "turn";
+			const outcome = await abortTerminalPrompt(requesterConnectionId, scope);
+			if (!outcome.ok) {
+				return {
+					ok: true,
+					selection: scope,
+					turn: "uncertain",
+					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					automaticDelivery: scope === "turn" ? "enabled" : "none",
+					resumeOnOwnedCompletion: scope === "turn",
+					reason: outcome.reason,
+				};
+			}
+			if (outcome.outcome === "no_active_turn" || outcome.outcome === "already_terminal") {
+				// No active root turn to stop: process-local no-effect, no fence.
+				return {
+					ok: true,
+					selection: scope,
+					turn: "no_active_turn",
+					terminal: "terminal_no_effect",
+				};
+			}
+			if (scope === "owned") {
+				// Exact owned cleanup (captured-job stop, quiescence proof, delivery
+				// settlement) is implemented in a later increment. Until the exact
+				// proof exists the plan mandates safe uncertainty — never a claimed
+				// quiescence — so owned returns terminal_uncertain with reason
+				// owned_unsettled instead of a fabricated stopped disposition.
+				return {
+					ok: true,
+					selection: "owned",
+					turn: "stopped",
+					ownedWork: "uncertain",
+					automaticDelivery: "none",
+					resumeOnOwnedCompletion: false,
+					reason: "owned_unsettled",
+				};
+			}
+			return {
+				ok: true,
+				selection: "turn",
+				turn: "stopped",
+				ownedWork: "left_running",
+				automaticDelivery: "enabled",
+				resumeOnOwnedCompletion: true,
+			};
 		},
 		abortAndPrompt: async text => {
 			await awaitAbortReady();
@@ -4208,7 +4270,7 @@ export function createNotificationsExtension(
 			// Cleanup-initiated claims (cancel, deadline, owner disconnect) must abort the
 			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
 			// so aborting there would cancel the next turn instead of fencing this one.
-			options: { fence?: boolean } = {},
+			options: { fence?: boolean; terminal?: { scope: AbortScope } } = {},
 			extra?: { finalText?: string; error?: { code: string; message: string } },
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
@@ -4229,7 +4291,10 @@ export function createNotificationsExtension(
 			submission.phase = "terminalizing";
 			if (options.fence) {
 				const seam = ctx as typeof ctx & {
-					abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+					abortPromptAndWait?: (
+						handle: string,
+						options: { graceMs: number; terminal?: { scope: AbortScope } },
+					) => Promise<RunSettlementProof>;
 				};
 				// Only the handle captured for this correlation may be fenced; a later run
 				// must never be aborted by an older prompt's cleanup.
@@ -4246,6 +4311,11 @@ export function createNotificationsExtension(
 				try {
 					proof = await seam.abortPromptAndWait(submission.executionHandle, {
 						graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
+						// Terminal abort registers the continuation fence for the
+						// aborted turn before the run is interrupted (see
+						// AgentSession.abortPromptAndWait). Ordinary cancels pass no
+						// terminal option and register nothing.
+						...(options.terminal ? { terminal: options.terminal } : {}),
 					});
 				} catch (error) {
 					logger.warn(`sdk: prompt resource fencing failed: ${String(error)}`);
@@ -4392,6 +4462,31 @@ export function createNotificationsExtension(
 						{ fence: true },
 					);
 				return { aborted: true, disposition: "cancelled" as const };
+			},
+			async (connectionId, scope) => {
+				// Terminal abort stops the root turn through the same durable
+				// terminalization as ordinary client cancel, then verifies the
+				// terminal actually landed before claiming "stopped". The fence
+				// for the aborted turn is registered by the session (via the
+				// terminal option on abortPromptAndWait) so a later left-running
+				// owned completion classifies by exact source. A fatal
+				// fail-closed path (no exact run handle or unsettled resources)
+				// reports safe uncertainty, never a fabricated stop.
+				const active = [...promptSubmissions.entries()].find(
+					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
+				);
+				if (!active) return { ok: true as const, outcome: "no_active_turn" as const };
+				const [commandId, turnId] = active[0].split(":", 2);
+				if (!commandId || !turnId) return { ok: true as const, outcome: "already_terminal" as const };
+				await terminalizePrompt(
+					{ commandId, turnId },
+					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+					{ fence: true, terminal: { scope } },
+				);
+				const submission = promptSubmissions.get(promptSubmissionKey({ commandId, turnId }));
+				if (!submission?.terminal || submission.fatal === true)
+					return { ok: false as const, reason: "worker_unsettled" as const };
+				return { ok: true as const, outcome: "stopped" as const };
 			},
 			{
 				admit: (clientRef?: string) => kindReconciliation.admit("skill", clientRef),

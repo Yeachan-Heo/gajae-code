@@ -440,9 +440,11 @@ import {
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
 import {
 	bindToolLineage,
+	lookupTerminalScope,
 	mintTurnLineageIdHash,
 	nextPromptAttemptEpoch,
 	type OwnedCompletionEnvelope,
+	registerTerminalTurnScope,
 } from "./terminal-abort";
 
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -2493,6 +2495,29 @@ export class AgentSession {
 			this.sessionManager.getSessionId?.() ?? "local",
 			freshEpoch,
 			this.#terminalLineageSecret,
+		);
+	}
+	/**
+	 * Whether a same-turn continuation of the current turn is blocked by a
+	 * terminal-abort fence. Fails open (false) when no terminal scope exists for
+	 * the current lineage+epoch, so ordinary sessions never consult a gate.
+	 * Post-close continuations (retry/TTSR/steering/hidden-next-turn/
+	 * maintenance/worker successor) are denied at the final synchronous boundary
+	 * before method entry; a continuation already linearized as a predecessor
+	 * before close stays allowed to finish.
+	 */
+	#isTurnContinuationBlocked(): boolean {
+		const lineageIdHash = this.#turnLineageIdHash;
+		if (!lineageIdHash) return false;
+		const scope = lookupTerminalScope(lineageIdHash, this.#promptGeneration);
+		if (!scope) return false;
+		return (
+			scope.gate.authorizeContinuation({
+				kind: "turn-continuation",
+				lineageIdHash,
+				attemptEpoch: this.#promptGeneration,
+				continuationId: crypto.randomUUID(),
+			}) === "deny"
 		);
 	}
 
@@ -4848,7 +4873,9 @@ export class AgentSession {
 		skipCompactionCheck?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
-		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
+		onSkip?: (
+			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
+		) => void;
 		allowDuringCancelAndSubmit?: boolean;
 		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
@@ -4859,7 +4886,9 @@ export class AgentSession {
 			? this.#reserveDeferredAgentEndForContinuation()
 			: undefined;
 		let terminalized = false;
-		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => {
+		const skip = (
+			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
+		) => {
 			if (terminalized) return;
 			terminalized = true;
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -4924,6 +4953,14 @@ export class AgentSession {
 						}
 						if (options?.shouldContinue && !options.shouldContinue()) {
 							skip("queue_drained");
+							return;
+						}
+						// A scheduled same-turn continuation of a terminally aborted turn is
+						// denied at the final synchronous boundary before agent.continue
+						// entry; no await intervenes between this check and method entry.
+						// Owned-completion deliveries are NOT affected (they use followUp).
+						if (this.#isTurnContinuationBlocked()) {
+							skip("terminal_turn");
 							return;
 						}
 						// A continuation scheduled before a handoff engaged must not start a
@@ -5106,6 +5143,13 @@ export class AgentSession {
 					"auto_continue_prompt",
 					this.#isDisposed ? "session_disposed" : "generation_changed",
 				);
+				return false;
+			}
+			// A same-turn auto-continue of a terminally aborted turn is denied
+			// (corrected turn semantics); owned-completion deliveries are not
+			// affected — they flow through followUp as fresh turns.
+			if (this.#isTurnContinuationBlocked()) {
+				this.#logCompactionContinuationSkipped("auto_continue_prompt", "terminal_turn");
 				return false;
 			}
 			const authorized = requireUnfinishedWork
@@ -10246,7 +10290,28 @@ export class AgentSession {
 	/**
 	 * Abort a specific active prompt and prove whether its tracked resources settled.
 	 */
-	async abortPromptAndWait(handle: string, options: { graceMs: number }): Promise<RunSettlementProof> {
+	async abortPromptAndWait(
+		handle: string,
+		options: { graceMs: number; terminal?: { scope: "turn" | "owned" } },
+	): Promise<RunSettlementProof> {
+		if (options.terminal) {
+			// Terminal abort (C04 mode:"terminal"): register and synchronously
+			// close the continuation fence for the current turn BEFORE the run is
+			// interrupted, so a later left-running owned completion classifies as
+			// owned-completion by exact source (lineage + attempt epoch). The
+			// owned-completion policy stays enabled for scope:"turn" — delivery
+			// intentionally resumes the agent — and disabled for scope:"owned".
+			// A missing lineage (no active turn) fails closed: no scope is
+			// registered, so nothing is attributed.
+			const lineageIdHash = this.#turnLineageIdHash;
+			if (lineageIdHash) {
+				registerTerminalTurnScope({
+					lineageIdHash,
+					promptAttemptEpoch: this.#promptGeneration,
+					ownedCompletionPolicy: options.terminal.scope === "owned" ? "disabled" : "enabled",
+				});
+			}
+		}
 		const aborted = this.#runCancellationDomains.abort(handle);
 		if (!aborted.ok) {
 			if (aborted.reason === "quarantined") {

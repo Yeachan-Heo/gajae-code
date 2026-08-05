@@ -2470,6 +2470,115 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+test("SDK host turn.abort terminal mode returns no-effect with no active turn", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-noop-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-terminal-noop-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext, undefined, () => {}, true);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "terminal-noop",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "terminal-noop-key",
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-noop"),
+		"terminal abort no-effect response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "terminal-noop")).toMatchObject({
+		ok: true,
+		result: {
+			selection: "turn",
+			turn: "no_active_turn",
+			terminal: "terminal_no_effect",
+		},
+	});
+	// No agent turn ever started.
+	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("SDK host turn.abort terminal mode fails closed when the turn cannot be fenced", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-fence-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-terminal-fence-${Date.now()}`;
+	const live = { idle: true };
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const sessionContext = context(cwd, sessionId, "main", live);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "terminal-prompt",
+			operation: "turn.prompt",
+			input: { text: "terminalize me" },
+		}),
+	);
+	await waitFor(() => deliveries.length === 1, "terminal prompt accepted");
+	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	// The fixture harness has no exact run handle or abortPromptAndWait seam, so
+	// the fence cannot settle: terminal abort must fail closed with safe
+	// uncertainty instead of fabricating a stopped disposition.
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "terminal-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "terminal-abort-key",
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-abort"),
+		"terminal abort uncertainty response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "terminal-abort")).toMatchObject({
+		ok: true,
+		result: {
+			selection: "turn",
+			turn: "uncertain",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+			reason: "worker_unsettled",
+		},
+	});
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
 
 test("SDK session switches rotate endpoint authority before publishing the replacement host", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-switch-"));

@@ -1454,7 +1454,10 @@ export interface ExtensionContextActions {
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle?: () => string | undefined;
 	abort: () => void;
-	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+	abortPromptAndWait?: (
+		handle: string,
+		options: { graceMs: number; terminal?: { scope: "turn" | "owned" } },
+	) => Promise<RunSettlementProof>;
 	hasPendingMessages: () => boolean;
 	/** Typed pending-message counts per queue; optional for embedders without a counted queue. */
 	getPendingMessageCounts?: () => { steering: number; followUp: number; nextTurn: number };

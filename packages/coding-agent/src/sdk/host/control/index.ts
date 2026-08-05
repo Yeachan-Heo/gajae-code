@@ -7,4 +7,4 @@ export {
 	dispatchControl,
 	TypedControlError,
 } from "./dispatch";
-export type { ControlInput, ControlSurface, ControlValue } from "./operations";
+export type { AbortScope, ControlInput, ControlSurface, ControlValue } from "./operations";
