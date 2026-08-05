@@ -61,7 +61,9 @@ import { SessionMigrationBusyError } from "./session/internal/session-open-error
 import {
 	type ResumeSessionIdentity,
 	resolveResumableSession,
+	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionArtifactCapacityError,
+	SessionTranscriptOversizedError,
 	type SessionDestination,
 	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
@@ -620,10 +622,13 @@ function operatorFacingSessionOpenMessage(value: unknown): string | undefined {
 			? value.code
 			: value instanceof SessionMigrationBusyError
 				? value.code
-				: typeof value === "string"
-					? value
-					: undefined;
+				: value instanceof SessionTranscriptOversizedError
+					? value.code
+					: typeof value === "string"
+						? value
+						: undefined;
 	if (code === "artifact_capacity_exceeded") return SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE;
+	if (code === "oversized") return SESSION_OVERSIZED_RECOVERY_MESSAGE;
 	if (code === "migration_busy") return new SessionMigrationBusyError().message;
 	return undefined;
 }

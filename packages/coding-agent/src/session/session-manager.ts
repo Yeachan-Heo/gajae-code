@@ -80,6 +80,7 @@ import {
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
@@ -915,11 +916,24 @@ export interface ResumeTailTerminal {
 
 export interface ResumeTailError {
 	kind: "error";
-	reason: "missing" | "malformed" | "unstable" | "read-failed" | "legacy_migration_disabled";
+	reason: "missing" | "malformed" | "unstable" | "read-failed" | "legacy_migration_disabled" | "oversized";
+	size?: number;
 }
 
 export type SessionDirectoryMigrationPolicy = ManagedMigrationPolicy;
 export type SessionAppendPersistenceFailurePhase = "current_append" | "prior_failure";
+
+/**
+ * Safety bound for resuming a single transcript file. Matches the managed-storage
+ * per-file artifact limit (`MANAGED_ARTIFACT_MAX_FILE_BYTES`): transcripts at or above
+ * this size are not loaded into memory wholesale because the decode + per-line JSON
+ * parse + identity hash would OOM or stall the process (#3851). The bound is a
+ * load-time guard only; it does not raise the on-disk managed-storage limit.
+ */
+export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
+
+export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
+	"The selected session transcript is too large to resume safely. Use `gjc export <session-file>` to export its content into a new session, or remove/archive it after confirming its content is no longer needed.";
 
 export class SessionAppendPersistenceError extends Error {
 	readonly phase: SessionAppendPersistenceFailurePhase;
@@ -964,6 +978,17 @@ export class SessionArtifactCapacityError extends Error {
 	}
 }
 
+export class SessionTranscriptOversizedError extends Error {
+	readonly code = "oversized";
+	readonly size: number;
+
+	constructor(size: number) {
+		super(SESSION_OVERSIZED_RECOVERY_MESSAGE);
+		this.name = "SessionTranscriptOversizedError";
+		this.size = size;
+	}
+}
+
 export type ResumeTailInspection = ResumeTailResumable | ResumeTailTerminal | ResumeTailError;
 export interface StrictSessionOpenSuccess {
 	kind: "opened";
@@ -979,6 +1004,7 @@ export interface StrictSessionOpenFailure {
 		| "artifact_capacity_exceeded"
 		| "migration_busy";
 	message?: string;
+	size?: number;
 }
 
 /** Exact transcript bytes and authority captured from one descriptor-bound read. */
@@ -2345,6 +2371,12 @@ function inspectResumeSessionFile(
 	}
 	if (!before.isFile || !storage.readSnapshotSync) {
 		return { kind: "error", reason: "read-failed" };
+	}
+	// Fail closed on oversized transcripts before the full read/decode/parse
+	// path that would otherwise OOM or stall the process (#3851). The stat is
+	// already in hand; this bound matches the managed-storage per-file limit.
+	if (before.size > RESUME_TRANSCRIPT_MAX_BYTES) {
+		return { kind: "error", reason: "oversized", size: before.size };
 	}
 
 	let bytes: Uint8Array;
@@ -9938,6 +9970,16 @@ export class SessionManager {
 		// owner-only and reparse guards accept.
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (destination.kind === "explicit" || !(storage instanceof FileSessionStorage)) {
+		// Fail closed on oversized transcripts before the full read in the explicit path too (#3851).
+		// A missing file falls through to loadEntriesFromFile, which returns [] and creates
+		// a fresh session — matching the pre-existing behavior.
+		try {
+			const preStat = storage.statSync(filePath);
+			if (preStat.size > RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(preStat.size);
+		} catch (error) {
+			if (error instanceof SessionTranscriptOversizedError) throw error;
+			if (!isEnoent(error)) throw error;
+		}
 			const entries = await loadEntriesFromFile(filePath, storage);
 			const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 			const manager = new SessionManager(
@@ -9953,13 +9995,14 @@ export class SessionManager {
 
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
-			if (inspected.reason === "missing") {
-				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
-				await manager.#initSessionFile(filePath);
-				return manager;
-			}
-			throw new Error(`Could not open session: ${inspected.reason}`);
+		if (inspected.reason === "missing") {
+			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+			await manager.#initSessionFile(filePath);
+			return manager;
 		}
+		if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
+		throw new Error(`Could not open session: ${inspected.reason}`);
+	}
 		const opened = await SessionManager.openExistingStrict(inspected.identity, destination, storage, migrationPolicy);
 		if (opened.kind === "error") {
 			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
@@ -9967,6 +10010,7 @@ export class SessionManager {
 				throw new SessionArtifactCapacityError(
 					opened.message ?? "Session artifacts exceed the migration capacity.",
 				);
+			if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
 			if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
 			throw new Error(`Could not open session: ${opened.reason}`);
 		}
@@ -10705,7 +10749,10 @@ export class SessionManager {
 		const dir = destination.directory;
 		const openSelectedStrictly = async (selectedPath: string): Promise<SessionManager | undefined> => {
 			const inspected = await SessionManager.inspectSessionTailReadOnly(selectedPath, storage);
-			if (inspected.kind === "error") return undefined;
+			if (inspected.kind === "error") {
+				if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
+				return undefined;
+			}
 			const opened = await SessionManager.openExistingStrict(
 				inspected.identity,
 				destination,
@@ -10718,6 +10765,7 @@ export class SessionManager {
 					throw new SessionArtifactCapacityError(
 						opened.message ?? "Session artifacts exceed the migration capacity.",
 					);
+				if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
 				if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
 				return undefined;
 			}

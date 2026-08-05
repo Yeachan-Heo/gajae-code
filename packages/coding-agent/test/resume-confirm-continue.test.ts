@@ -21,7 +21,9 @@ import { AuthStorage } from "../src/session/auth-storage";
 import { SessionMigrationBusyError } from "../src/session/internal/session-open-errors";
 import {
 	type ResumeSessionIdentity,
+	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionArtifactCapacityError,
+	SessionTranscriptOversizedError,
 	type SessionDestination,
 	type SessionInfo,
 	SessionManager,
@@ -447,6 +449,10 @@ it("renders fixed redacted operator guidance for bare-resume managed failures", 
 			reason: "artifact_capacity_exceeded" as const,
 			message: SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE,
 		},
+		{
+			reason: "oversized" as const,
+			message: SESSION_OVERSIZED_RECOVERY_MESSAGE,
+		},
 		{ reason: "migration_busy" as const, message: SESSION_MIGRATION_BUSY_MESSAGE },
 	]) {
 		const stderr = await captureStderr(async () => {
@@ -479,6 +485,10 @@ it("renders the same fixed guidance for normal startup typed failures", async ()
 		{
 			error: new SessionArtifactCapacityError("PRIVATE_PATH PRIVATE_CONTENT"),
 			message: SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE,
+		},
+		{
+			error: new SessionTranscriptOversizedError(99_999_999),
+			message: SESSION_OVERSIZED_RECOVERY_MESSAGE,
 		},
 		{ error: new SessionMigrationBusyError(), message: SESSION_MIGRATION_BUSY_MESSAGE },
 	]) {
