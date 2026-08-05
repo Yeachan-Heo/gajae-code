@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `gjc models` is no longer treated as a free-form agent prompt. The mistaken subcommand spelling now routes to the existing `--list-models` listing path so a nested bash-tool invocation cannot recursively spawn unbounded GJC agents (#3857).
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 
 ## [0.12.12] - 2026-08-05

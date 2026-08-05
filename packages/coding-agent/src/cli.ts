@@ -389,11 +389,34 @@ function routeLegacyRootArgv(argv: readonly string[]): string[] | undefined {
 	return ["team", size, ...remaining];
 }
 
+/**
+ * Map the common mistaken `models` subcommand spelling to non-agent listing.
+ *
+ * Agents frequently run `gjc models` from the bash tool expecting a catalog.
+ * Without this route, `models` was a positional launch prompt and nested agents
+ * re-invoked `gjc models`, spawning an unbounded process chain (#3857).
+ * Always rewrite to `launch --list-models` so the invocation exits after a
+ * bounded listing and never starts an interactive agent session.
+ */
+export function routeModelsAlias(argv: readonly string[]): string[] | undefined {
+	if (argv[0] !== "models") return undefined;
+	const rest = argv.slice(1);
+	if (rest.length === 0) return ["launch", "--list-models"];
+	// Pure search tokens become a single fuzzy pattern (matches --list-models).
+	if (rest.every(token => !token.startsWith("-") && !token.startsWith("@"))) {
+		return ["launch", "--list-models", rest.join(" ")];
+	}
+	// Mixed flags still go through list-models first so "models" is never a prompt.
+	return ["launch", "--list-models", ...rest];
+}
+
 /** Apply the same default-launch routing used by runCli after root fast paths. */
 export function routeRootArgv(argv: readonly string[]): string[] {
 	const normalizedArgv = normalizeResumeAlias(argv);
 	const legacyArgv = routeLegacyRootArgv(normalizedArgv);
 	if (legacyArgv) return legacyArgv;
+	const modelsArgv = routeModelsAlias(normalizedArgv);
+	if (modelsArgv) return modelsArgv;
 	const first = normalizedArgv[0];
 	return first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
 		? normalizedArgv
