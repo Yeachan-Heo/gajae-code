@@ -22418,3 +22418,93 @@ test("CAS winner advance after accepted create publishes the exact archive fence
 		[2],
 	);
 });
+
+test("a failed root scan is retried on the next tick instead of exiting the daemon owner", async () => {
+	// A dead session's topic is archived by the scan pass, and that pass persists
+	// through the shared topic authority. When the authority is momentarily
+	// unavailable the rejection used to escape the scan timer and the run loop,
+	// reach the process-level fatal handler, and exit the owner: every topic was
+	// then left behind as an unarchived shell that answers nothing.
+	const warn = spyOn(logger, "warn").mockImplementation(() => {});
+	const escaped: unknown[] = [];
+	const onEscape = (reason: any): void => void escaped.push(reason?.stack ?? String(reason));
+	process.on("unhandledRejection", onEscape);
+	const ticks: Array<() => void> = [];
+	let compareAndSetCalls = 0;
+	let armed = false;
+	let state = {
+		version: 2 as const,
+		registryGeneration: 1,
+		topics: {
+			S: {
+				topicId: "700",
+				topicOrigin: "daemon_created" as const,
+				sessionUuid: "dead-session",
+				identitySent: true,
+				createdAt: 1,
+				authorityEpoch: 0,
+				authorityState: "active" as const,
+				chatId: "42",
+				endpointKey: "ws://dead-endpoint|dead-token",
+				endpointDigest: "dead-digest",
+				endpointGeneration: 1,
+			},
+		},
+	};
+	const authority = {
+		read: async () => state,
+		compareAndSet: async (_expectedGeneration: number, next: any) => {
+			if (!armed) {
+				state = next;
+				return true;
+			}
+			compareAndSetCalls++;
+			throw new Error("shared topic authority unavailable");
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "token",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		installationHostId: "local-host",
+		topicRegistryAuthority: authority as never,
+		setIntervalImpl: ((tick: () => void) => {
+			ticks.push(tick);
+			return 0;
+		}) as never,
+		clearIntervalImpl: (() => {}) as never,
+	});
+	try {
+		await daemon.loadTopics();
+		expect((daemon as any).topics.get("S")?.topicId).toBe("700");
+		armed = true;
+		(daemon as any).running = true;
+		(daemon as any).startScanTimer();
+		expect(ticks).toHaveLength(1);
+
+		const settle = async (): Promise<void> => {
+			for (let i = 0; i < 50; i++) await new Promise(resolve => setTimeout(resolve, 1));
+		};
+
+		const scan = spyOn(daemon, "scanRoots");
+		ticks[0]!();
+		await settle();
+		// The pass reached the shared authority, failed, and reported the failure
+		// instead of letting the rejection reach the process-level fatal handler.
+		expect(compareAndSetCalls).toBeGreaterThanOrEqual(1);
+		expect(warn.mock.calls.some(call => String(call[0]).includes("session scan failed"))).toBe(true);
+		expect(escaped).toEqual([]);
+		// The owner is still running, so the next interval retries the same pass.
+		expect((daemon as any).running).toBe(true);
+		ticks[0]!();
+		await settle();
+		expect(scan.mock.calls).toHaveLength(2);
+		expect(escaped).toEqual([]);
+		scan.mockRestore();
+	} finally {
+		process.off("unhandledRejection", onEscape);
+		warn.mockRestore();
+	}
+});

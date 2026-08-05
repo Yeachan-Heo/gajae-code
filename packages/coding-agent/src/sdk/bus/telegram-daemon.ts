@@ -9556,7 +9556,11 @@ export class TelegramNotificationDaemon {
 	private startFlushTimer(): void {
 		this.runtime.startInterval("telegram-flush", RATE_LIMIT_FLUSH_INTERVAL_MS, () => {
 			if (!this.running || this.pool.pending === 0) return;
-			void this.flushPool();
+			// `flushPool` only swallows failures for the shared chain; the promise it
+			// returns still rejects, and an unhandled rejection here exits the daemon.
+			void this.flushPool().catch(error => {
+				logger.warn(`notifications: queue flush failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`);
+			});
 		});
 	}
 
@@ -9596,11 +9600,27 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-owner-heartbeat");
 	}
 
-	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
+	/**
+	 * Run a root scan, guarding against overlapping scans from the timer + loop.
+	 *
+	 * A reconciliation pass is retried every scan interval, so a failed one must
+	 * never tear the owner down. Both callers are fatal boundaries: the timer
+	 * fires and forgets, and the run loop awaits without a handler. A rejection
+	 * escaping either one (a shared topic authority whose lock or compare-and-set
+	 * is momentarily unavailable is the observed case) reaches the process-level
+	 * handler, which exits the daemon: every session topic is then left as an
+	 * unarchived shell that answers nothing, and the sessions that were still
+	 * live lose notifications too. Report the failure and let the next scan
+	 * retry instead.
+	 */
 	private async runScan(): Promise<void> {
-		await this.runtime.runExclusive("telegram-scan", async () => {
-			await this.scanRoots();
-		});
+		try {
+			await this.runtime.runExclusive("telegram-scan", async () => {
+				await this.scanRoots();
+			});
+		} catch (error) {
+			logger.warn(`notifications: session scan failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`);
+		}
 	}
 
 	private startScanTimer(): void {

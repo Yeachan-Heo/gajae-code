@@ -5,6 +5,7 @@
 ### Fixed
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
+- A Telegram notification daemon whose reconciliation pass fails no longer exits. The pass persists through the shared topic authority, and a momentarily unavailable authority (lock contention or a rejected compare-and-set) rejected out of both the scan timer and the run loop into the process-level fatal handler, killing the owner. Every session topic was then left behind as an unarchived shell that answers nothing — including for sessions that were still live and lost their notifications. The pass now reports the failure and the next scan interval retries it; the queue-flush timer is guarded the same way.
 - MiniMax M3 preset and profile ids canonicalized to `MiniMax-M3` (issue #3896): the `minimax` / `minimax-cn` onboarding presets and the `minimax-eco` / `minimax-medium` / `minimax-pro` builtin model profiles no longer reference the removed lowercase `minimax-m3` / `minimax-v3` first-class catalog ids.
 
 ## [0.12.12] - 2026-08-05
