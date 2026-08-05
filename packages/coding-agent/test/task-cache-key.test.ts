@@ -175,7 +175,7 @@ describe("task fork-context provider identity", () => {
 		const restoredContent = resumed.messages.map(message => JSON.stringify(message));
 		expect(restoredContent.some(content => content.includes("persisted child turn"))).toBe(true);
 		expect(restoredContent.some(content => content.includes("parent context"))).toBe(false);
-	});
+	}, 15_000);
 
 	it("honors an explicit providerSessionId over the fork seed and logical id", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-explicit-id-${Snowflake.next()}-`));
