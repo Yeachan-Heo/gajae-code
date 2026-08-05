@@ -13,8 +13,15 @@ describe("ask answer source priority", () => {
 		await initTheme(false);
 	});
 	const tempDirs: string[] = [];
+	const answerSourceDisposers: Array<() => void> = [];
+
+	function trackAnswerSource(dispose: () => void): () => void {
+		answerSourceDisposers.push(dispose);
+		return dispose;
+	}
 
 	afterEach(() => {
+		for (const dispose of answerSourceDisposers.splice(0).reverse()) dispose();
 		for (const dir of tempDirs.splice(0)) {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
@@ -34,8 +41,8 @@ describe("ask answer source priority", () => {
 		try {
 			const interactive = { awaitAnswer: async () => undefined };
 			const protocol = { awaitAnswer: async () => undefined };
-			registerAskAnswerSource(session.sessionId, interactive, "interactive");
-			registerAskAnswerSource(session.sessionId, protocol, "protocol");
+			trackAnswerSource(registerAskAnswerSource(session.sessionId, interactive, "interactive"));
+			trackAnswerSource(registerAskAnswerSource(session.sessionId, protocol, "protocol"));
 
 			expect(getAskAnswerSource(session.sessionId)).toBe(protocol);
 		} finally {
@@ -57,8 +64,8 @@ describe("ask answer source priority", () => {
 		try {
 			const protocol = { awaitAnswer: async () => undefined };
 			const interactive = { awaitAnswer: async () => undefined };
-			registerAskAnswerSource(session.sessionId, protocol, "protocol");
-			registerAskAnswerSource(session.sessionId, interactive, "interactive");
+			trackAnswerSource(registerAskAnswerSource(session.sessionId, protocol, "protocol"));
+			trackAnswerSource(registerAskAnswerSource(session.sessionId, interactive, "interactive"));
 
 			expect(getAskAnswerSource(session.sessionId)).toBe(protocol);
 		} finally {
@@ -80,8 +87,8 @@ describe("ask answer source priority", () => {
 		try {
 			const protocol = { awaitAnswer: async () => undefined };
 			const interactive = { awaitAnswer: async () => undefined };
-			const disposeProtocol = registerAskAnswerSource(session.sessionId, protocol, "protocol");
-			registerAskAnswerSource(session.sessionId, interactive, "interactive");
+			const disposeProtocol = trackAnswerSource(registerAskAnswerSource(session.sessionId, protocol, "protocol"));
+			trackAnswerSource(registerAskAnswerSource(session.sessionId, interactive, "interactive"));
 			disposeProtocol();
 
 			expect(getAskAnswerSource(session.sessionId)).toBe(interactive);
@@ -104,8 +111,10 @@ describe("ask answer source priority", () => {
 		try {
 			const protocol = { awaitAnswer: async () => undefined };
 			const legacyInteractive = { awaitAnswer: async () => undefined };
-			const disposeProtocol = registerAskAnswerSource(session.sessionId, protocol, "protocol");
-			const disposeLegacyInteractive = registerAskAnswerSource(session.sessionId, legacyInteractive);
+			const disposeProtocol = trackAnswerSource(registerAskAnswerSource(session.sessionId, protocol, "protocol"));
+			const disposeLegacyInteractive = trackAnswerSource(
+				registerAskAnswerSource(session.sessionId, legacyInteractive),
+			);
 
 			expect(getAskAnswerSource(session.sessionId)).toBe(protocol);
 			disposeProtocol();
@@ -130,8 +139,8 @@ describe("ask answer source priority", () => {
 		try {
 			const firstProtocol = { awaitAnswer: async () => undefined };
 			const secondProtocol = { awaitAnswer: async () => undefined };
-			registerAskAnswerSource(session.sessionId, firstProtocol, "protocol");
-			registerAskAnswerSource(session.sessionId, secondProtocol, "protocol");
+			trackAnswerSource(registerAskAnswerSource(session.sessionId, firstProtocol, "protocol"));
+			trackAnswerSource(registerAskAnswerSource(session.sessionId, secondProtocol, "protocol"));
 
 			expect(getAskAnswerSource(session.sessionId)).toBe(secondProtocol);
 		} finally {
