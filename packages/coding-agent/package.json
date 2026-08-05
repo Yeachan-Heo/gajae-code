@@ -42,7 +42,8 @@
 		"fmt": "biome format --write . && bun run format-prompts",
 		"format-prompts": "bun scripts/format-prompts.ts",
 		"generate-docs-index": "bun scripts/generate-docs-index.ts",
-		"prepack": "bun scripts/generate-docs-index.ts",
+		"generate-tool-catalog": "bun scripts/generate-tool-catalog.ts",
+		"prepack": "bun scripts/generate-tool-catalog.ts && bun scripts/generate-docs-index.ts",
 		"generate-template": "bun scripts/generate-template.ts",
 		"install:defaults": "bun src/cli.ts setup defaults",
 		"verify:insane-vendor": "bun scripts/verify-insane-vendor.ts",
@@ -330,6 +331,8 @@
 		},
 		"./extensibility/gjc-plugins/installer": null,
 		"./extensibility/gjc-plugins/registry": null,
+		"./extensibility/gjc-plugins/loader": null,
+		"./extensibility/gjc-plugins/loader.js": null,
 		"./extensibility/*": {
 			"types": "./src/extensibility/*.ts",
 			"import": "./src/extensibility/*.ts"

@@ -32,6 +32,25 @@
 			}
 		}
 	},
+	"overrides": [
+		{
+			"includes": ["packages/coding-agent/src/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"paths": {
+									"@gajae-code/ai": "Import from @gajae-code/ai/core instead."
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	],
 	"formatter": {
 		"enabled": true,
 		"indentStyle": "tab",
