@@ -6,6 +6,7 @@
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 - MiniMax M3 preset and profile ids canonicalized to `MiniMax-M3` (issue #3896): the `minimax` / `minimax-cn` onboarding presets and the `minimax-eco` / `minimax-medium` / `minimax-pro` builtin model profiles no longer reference the removed lowercase `minimax-m3` / `minimax-v3` first-class catalog ids.
+- Telegram notifications no longer disappear in a paired private chat whose bot has no Threaded Mode. Telegram answers `createForumTopic` there with `Bad Request: the chat is not a forum`, which was not recognized as a capability refusal, and the refusal verdict lived in caller-local flags — so every frame that joined the shared in-flight topic creation rethrew and its message (identity headers after `/resume`, asks, context updates) was dropped instead of being delivered flat. The rejection is now carried by typed errors that every awaiter of the same creation classifies identically, `the chat is not a forum` counts as a capability refusal, and a confirmed refusal is latched so later frames stop re-issuing a rejected `createForumTopic` per message.
 
 ## [0.12.12] - 2026-08-05
 
