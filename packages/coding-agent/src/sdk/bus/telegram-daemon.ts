@@ -519,7 +519,7 @@ function topicArchiveSettled(response: unknown): boolean {
 	if (!response || typeof response !== "object") return false;
 	const result = response as { ok?: unknown; result?: unknown; error_code?: unknown; description?: unknown };
 	if (result.ok === true && result.result === true) return true;
-	if (result.ok !== false || typeof result.description !== "string") return false;
+	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
 	const description = result.description.trim();
 	return /^(?:Bad Request: )?(?:TOPIC_NOT_FOUND|THREAD_NOT_FOUND|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
 		description,
