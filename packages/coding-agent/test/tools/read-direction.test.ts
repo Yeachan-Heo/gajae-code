@@ -493,10 +493,21 @@ describe("read truncation direction resolution", () => {
 		const databasePath = path.join(tempDir, "tables.sqlite");
 		const db = new Database(databasePath);
 		try {
-			for (let index = 0; index < 600; index++) {
-				const name = `table_${String(index).padStart(4, "0")}_${"x".repeat(90)}`;
-				db.run(`CREATE TABLE "${name}" (id INTEGER)`);
+			// Batch the 600 schema writes into one commit: per-statement
+			// autocommit fsyncs blow the bun test timeout under CI disk load,
+			// which then lets afterEach delete the fixture while the read is
+			// still in flight and surfaces a spurious `Path not found`.
+			db.run("BEGIN");
+			try {
+				for (let index = 0; index < 600; index++) {
+					const name = `table_${String(index).padStart(4, "0")}_${"x".repeat(90)}`;
+					db.run(`CREATE TABLE "${name}" (id INTEGER)`);
+				}
+			} catch (error) {
+				db.run("ROLLBACK");
+				throw error;
 			}
+			db.run("COMMIT");
 		} finally {
 			db.close();
 		}
