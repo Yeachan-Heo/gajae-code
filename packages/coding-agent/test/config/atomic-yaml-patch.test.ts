@@ -9,6 +9,7 @@ import {
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
 	atomicYamlPathHash,
+	withAtomicYamlConfigTransaction,
 } from "../../src/config/atomic-yaml-patch";
 
 const temporaryDirectories: string[] = [];
@@ -153,5 +154,55 @@ describe("atomic YAML patches", () => {
 		expect(await readYaml(configPath)).toEqual({ durable: { value: "old" } });
 		const directoryEntries = await fs.readdir(path.dirname(configPath));
 		expect(directoryEntries.filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+	});
+	test("transaction exposes root/current and applies patches under the lock", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, YAML.stringify({ external: { keep: true } }, null, 2));
+
+		let observedRoot: unknown;
+		let observedCurrent: Record<string, unknown> | undefined;
+		const result = await withAtomicYamlConfigTransaction(configPath, async tx => {
+			observedRoot = structuredClone(tx.root);
+			observedCurrent = structuredClone(tx.current);
+			await tx.applyPatches([{ path: "settings.first", op: "set", value: "A" }]);
+			await tx.applyPatches([{ path: "settings.second", op: "set", value: "B" }]);
+			return "done";
+		});
+
+		expect(result).toBe("done");
+		expect(observedRoot).toEqual({ external: { keep: true } });
+		expect(observedCurrent).toEqual({ external: { keep: true } });
+		expect(await readYaml(configPath)).toEqual({
+			external: { keep: true },
+			settings: { first: "A", second: "B" },
+		});
+	});
+
+	test("transaction surfaces a parse failure before the callback runs", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, "broken: [unclosed", "utf8");
+
+		let callbackRan = false;
+		await expect(
+			withAtomicYamlConfigTransaction(configPath, async () => {
+				callbackRan = true;
+				return "unreachable";
+			}),
+		).rejects.toThrow();
+		expect(callbackRan).toBe(false);
+	});
+
+	test("transaction exposes a scalar/array root without writing", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, YAML.stringify(["a", "b"], null, 2));
+
+		let observedRoot: unknown = "unset";
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			observedRoot = tx.root;
+			return "noop";
+		});
+
+		expect(observedRoot).toEqual(["a", "b"]);
+		expect(YAML.parse(await fs.readFile(configPath, "utf8"))).toEqual(["a", "b"]);
 	});
 });

@@ -396,6 +396,41 @@ export function applyAtomicYamlPatchesWithCurrent(
 		});
 	});
 }
+export interface AtomicYamlConfigTransaction {
+	configPath: string;
+	root: unknown;
+	current: Readonly<Record<string, unknown>>;
+	applyPatches(patches: readonly AtomicYamlPatch[], options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
+}
+
+/**
+ * Run a caller-owned multi-step mutation under the config file's per-file queue
+ * and cross-process lock. The current YAML is read once and exposed as
+ * `root`/`current`; the callback may inspect it, decide patches, and apply them
+ * (or perform adjacent durable actions such as marker/source transitions)
+ * without re-acquiring the lock. A YAML parse failure surfaces before the
+ * callback runs, so no migration action can execute against a malformed target.
+ */
+export function withAtomicYamlConfigTransaction<T>(
+	configPath: string,
+	operation: (transaction: AtomicYamlConfigTransaction) => Promise<T>,
+): Promise<T> {
+	return enqueueAtomicYamlOperation(configPath, async canonicalPath => {
+		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
+		return await withFileLock(canonicalPath, async () => {
+			const { current, root } = await readYaml(canonicalPath);
+			return await operation({
+				configPath: canonicalPath,
+				root,
+				current,
+				applyPatches: (patches, options = {}) => {
+					for (const patch of patches) assertPatch(patch);
+					return applyPatchesUnderLock(canonicalPath, current, patches, options);
+				},
+			});
+		});
+	});
+}
 
 /**
  * Reserve a FIFO operation for a config file immediately. The patch supplier runs
