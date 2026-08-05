@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
 import { YAML } from "bun";
 import { withFileLock } from "./file-lock";
 
@@ -67,9 +68,33 @@ export interface AtomicYamlUpdate<T> {
 	committed?(current: Record<string, unknown>, result: T): void | Promise<void>;
 }
 
+type NativeAtomicYamlBindings = {
+	exactReplacePath: (
+		sourcePath: string,
+		destinationPath: string,
+		expectedSource: NativeExactFileIdentity,
+		expectedDestination: NativeExactFileIdentity,
+	) => NativeExactUnlinkResult;
+	renameNoReplacePath: (sourcePath: string, destinationPath: string) => NativeNoReplaceResult;
+};
+
+let nativeAtomicYamlBindings: NativeAtomicYamlBindings | undefined;
+
+function nativeAtomicYaml(): NativeAtomicYamlBindings {
+	nativeAtomicYamlBindings ??= require("@gajae-code/natives") as NativeAtomicYamlBindings;
+	return nativeAtomicYamlBindings;
+}
+
 export interface AtomicYamlPatchOptions {
 	/** Test seam for deterministic pre-rename and Windows sharing-violation failures. */
 	rename?: (from: string, to: string) => Promise<void>;
+	/** Test seam for an identity-checked atomic replacement. */
+	exactReplace?: (
+		sourcePath: string,
+		destinationPath: string,
+		expectedSource: NativeExactFileIdentity,
+		expectedDestination: NativeExactFileIdentity,
+	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
 	/** Test seam for bounded retry timing. */
 	sleep?: (ms: number) => Promise<void>;
 	/** Test seam for Windows rename retry behavior. */
@@ -240,12 +265,104 @@ async function syncParentDirectory(directory: string): Promise<void> {
 	}
 }
 
-async function replaceWithRetry(tempPath: string, configPath: string, options: AtomicYamlPatchOptions): Promise<void> {
+async function captureExactFileIdentity(file: string): Promise<NativeExactFileIdentity | null> {
+	try {
+		const [bytes, stat, parent] = await Promise.all([
+			Bun.file(file).arrayBuffer(),
+			fs.stat(file, { bigint: true }),
+			fs.stat(path.dirname(file), { bigint: true }),
+		]);
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: createHash("sha256").update(Buffer.from(bytes)).digest("hex"),
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+async function currentRawOrEmpty(configPath: string): Promise<string> {
+	return await Bun.file(configPath)
+		.text()
+		.catch((error: unknown) => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+			throw error;
+		});
+}
+
+async function replaceWithExpectedIdentity(
+	tempPath: string,
+	configPath: string,
+	expectedRaw: string,
+	options: AtomicYamlPatchOptions,
+): Promise<void> {
+	const expectedHash = createHash("sha256").update(expectedRaw).digest("hex");
+	const [source, destination] = await Promise.all([
+		captureExactFileIdentity(tempPath),
+		captureExactFileIdentity(configPath),
+	]);
+	if (!source)
+		throw new AtomicYamlReplaceError(configPath, 1, new Error("staged YAML disappeared before replacement"));
+	if (!destination) {
+		if (expectedRaw !== "")
+			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
+		const published = nativeAtomicYaml().renameNoReplacePath(tempPath, configPath);
+		if (published.ok) return;
+		if (published.reason === "destination_exists") {
+			const actual = await currentRawOrEmpty(configPath);
+			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update(actual).digest("hex"));
+		}
+		throw new AtomicYamlReplaceError(
+			configPath,
+			1,
+			new Error(`native no-replace publish failed: ${published.code ?? "unknown"}`),
+		);
+	}
+	if (destination.sha256 !== expectedHash) {
+		throw new AtomicYamlConflictError(configPath, expectedHash, destination.sha256 ?? expectedHash);
+	}
+	// `exactReplacePath` validates both identities inside one native atomic
+	// namespace exchange. A save after the snapshots therefore rejects the
+	// exchange without replacing the editor's newer destination.
+	const replaced = await (options.exactReplace ?? nativeAtomicYaml().exactReplacePath)(
+		tempPath,
+		configPath,
+		source,
+		destination,
+	);
+	if (replaced.ok) return;
+	if (replaced.code === "identity_mismatch") {
+		const actual = await currentRawOrEmpty(configPath);
+		throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update(actual).digest("hex"));
+	}
+	throw new AtomicYamlReplaceError(
+		configPath,
+		1,
+		new Error(`native exact replacement failed: ${replaced.code ?? "unknown"}`),
+	);
+}
+
+async function replaceWithRetry(
+	tempPath: string,
+	configPath: string,
+	options: AtomicYamlPatchOptions,
+	expectedRaw?: string,
+): Promise<void> {
+	if (expectedRaw !== undefined) {
+		await replaceWithExpectedIdentity(tempPath, configPath, expectedRaw, options);
+		return;
+	}
 	const rename = options.rename ?? fs.rename;
 	const sleep = options.sleep ?? (async (delay: number): Promise<void> => await Bun.sleep(delay));
 	const isWindows = (options.platform ?? process.platform) === "win32";
 	let attempts = 0;
-
 	for (;;) {
 		attempts++;
 		try {
@@ -393,6 +510,41 @@ export function applyAtomicYamlPatchesWithCurrent(
 			for (const patch of patches) assertPatch(patch);
 			await options.validateRoot?.(root, patches);
 			return await applyPatchesUnderLock(canonicalPath, current, patches, options);
+		});
+	});
+}
+export interface AtomicYamlConfigTransaction {
+	configPath: string;
+	root: unknown;
+	current: Readonly<Record<string, unknown>>;
+	applyPatches(patches: readonly AtomicYamlPatch[], options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
+}
+
+/**
+ * Run a caller-owned multi-step mutation under the config file's per-file queue
+ * and cross-process lock. The current YAML is read once and exposed as
+ * `root`/`current`; the callback may inspect it, decide patches, and apply them
+ * (or perform adjacent durable actions such as marker/source transitions)
+ * without re-acquiring the lock. A YAML parse failure surfaces before the
+ * callback runs, so no migration action can execute against a malformed target.
+ */
+export function withAtomicYamlConfigTransaction<T>(
+	configPath: string,
+	operation: (transaction: AtomicYamlConfigTransaction) => Promise<T>,
+): Promise<T> {
+	return enqueueAtomicYamlOperation(configPath, async canonicalPath => {
+		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
+		return await withFileLock(canonicalPath, async () => {
+			const { current, root } = await readYaml(canonicalPath);
+			return await operation({
+				configPath: canonicalPath,
+				root,
+				current,
+				applyPatches: (patches, options = {}) => {
+					for (const patch of patches) assertPatch(patch);
+					return applyPatchesUnderLock(canonicalPath, current, patches, options);
+				},
+			});
 		});
 	});
 }
