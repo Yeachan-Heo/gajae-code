@@ -2479,7 +2479,7 @@ test("SDK host turn.abort terminal mode returns no-effect with no active turn", 
 		// Provide a file-backed session so the terminal abort has a reconciliation
 		// owner (the no-store gate only fires for genuinely store-less sessions).
 		sessionManager: {
-			...context(cwd, sessionId).sessionManager,
+			...(context(cwd, sessionId).sessionManager as Record<string, unknown>),
 			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
 		},
 	};
@@ -2532,7 +2532,7 @@ test("SDK host turn.abort terminal mode fails closed when the turn cannot be fen
 		// File-backed reconciliation owner so the terminal abort reaches the
 		// fence path (and fails closed there) instead of the no-store gate.
 		sessionManager: {
-			...context(cwd, sessionId, "main", live).sessionManager,
+			...(context(cwd, sessionId, "main", live).sessionManager as Record<string, unknown>),
 			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
 		},
 	};

@@ -4,6 +4,7 @@ import {
 	classifyOwnedCompletion,
 	createTurnContinuationSeam,
 	type DeliveryOrigin,
+	findOwnedRegistrationsForTurn,
 	lookupOwnedRegistration,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
@@ -351,4 +352,50 @@ test("a registered terminal turn scope makes a matching owned job classify as ow
 		terminalScopeId: expect.any(String),
 	});
 	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-chain", promptAttemptEpoch: 13 });
+});
+test("findOwnedRegistrationsForTurn returns only exact lineage+epoch registrations", () => {
+	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-a", promptAttemptEpoch: 7 });
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-2",
+		lineageIdHash: "lineage-a",
+		promptAttemptEpoch: 7,
+	});
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-foreign",
+		lineageIdHash: "lineage-other",
+		promptAttemptEpoch: 7,
+	});
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-later",
+		lineageIdHash: "lineage-a",
+		promptAttemptEpoch: 8,
+	});
+	const exact = findOwnedRegistrationsForTurn("lineage-a", 7);
+	expect(exact.map(key => key.jobId).sort()).toEqual(["job-1", "job-2"]);
+	// Foreign lineage and a different epoch are never captured.
+	expect(findOwnedRegistrationsForTurn("lineage-other", 7).map(key => key.jobId)).toEqual(["job-foreign"]);
+	expect(findOwnedRegistrationsForTurn("lineage-a", 8).map(key => key.jobId)).toEqual(["job-later"]);
+	expect(findOwnedRegistrationsForTurn("lineage-none", 7)).toEqual([]);
+	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-a", promptAttemptEpoch: 7 });
+	unregisterOwnedRegistration({
+		...registration,
+		jobId: "job-2",
+		lineageIdHash: "lineage-a",
+		promptAttemptEpoch: 7,
+	});
+	unregisterOwnedRegistration({
+		...registration,
+		jobId: "job-foreign",
+		lineageIdHash: "lineage-other",
+		promptAttemptEpoch: 7,
+	});
+	unregisterOwnedRegistration({
+		...registration,
+		jobId: "job-later",
+		lineageIdHash: "lineage-a",
+		promptAttemptEpoch: 8,
+	});
 });

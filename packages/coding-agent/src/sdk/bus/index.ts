@@ -48,6 +48,9 @@ function sdkBusNatives(): NativeSdkBusBindings {
 type NotificationServer = NativeNotificationServer;
 
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
+import { AsyncJobManager } from "../../async";
+import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
+import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
@@ -60,6 +63,7 @@ import {
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
+import { findOwnedRegistrationsForTurn } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -2307,7 +2311,7 @@ function sdkControlSurface(
 		connectionId: string | undefined,
 		_scope: AbortScope,
 	) => Promise<
-		| { ok: true; outcome: "stopped" | "no_active_turn" | "already_terminal" | "no_store" }
+		| { ok: true; outcome: "stopped" | "stopped_owned" | "no_active_turn" | "already_terminal" | "no_store" }
 		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" }
 	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
@@ -2610,20 +2614,17 @@ function sdkControlSurface(
 					terminal: "terminal_no_effect",
 				};
 			}
-			if (scope === "owned") {
-				// Exact owned cleanup (captured-job stop, quiescence proof, delivery
-				// settlement) is implemented in a later increment. Until the exact
-				// proof exists the plan mandates safe uncertainty — never a claimed
-				// quiescence — so owned returns terminal_uncertain with reason
-				// owned_unsettled instead of a fabricated stopped disposition.
+			if (outcome.outcome === "stopped_owned") {
+				// scope:"owned" stopped the exact captured owned work and proved
+				// quiescence (every captured generation/entry terminal); stopped
+				// work can never resume the agent.
 				return {
 					ok: true,
 					selection: "owned",
 					turn: "stopped",
-					ownedWork: "uncertain",
+					ownedWork: "stopped",
 					automaticDelivery: "none",
 					resumeOnOwnedCompletion: false,
-					reason: "owned_unsettled",
 				};
 			}
 			return {
@@ -4382,6 +4383,22 @@ export function createNotificationsExtension(
 					...correlation,
 					...(extra?.finalText ? { finalText: extra.finalText } : {}),
 					outcome: winner,
+					// Terminal abort: one correlated existing agent_end carries bounded
+					// scope/turn/ownedWork/automatic metadata before the first terminal
+					// success. ownedWork is pre-proof here (owned cleanup settles it in
+					// the terminal response); later owned-completion feedback uses the
+					// ordinary fresh-turn event path, never a second terminal event.
+					...(options.terminal
+						? {
+								terminal: {
+									scope: options.terminal.scope,
+									turn: "stopped",
+									ownedWork: options.terminal.scope === "turn" ? "left_running" : "uncertain",
+									automaticDelivery: options.terminal.scope === "turn" ? "enabled" : "none",
+									resumeOnOwnedCompletion: options.terminal.scope === "turn",
+								},
+							}
+						: {}),
 				});
 			}
 		};
@@ -4514,9 +4531,38 @@ export function createNotificationsExtension(
 				const submission = promptSubmissions.get(promptSubmissionKey({ commandId, turnId }));
 				if (!submission?.terminal || submission.fatal === true)
 					return { ok: false as const, reason: "worker_unsettled" as const };
+				// For scope:"owned", stop the exact captured owned work and prove
+				// quiescence before claiming stopped. Exactness comes from the
+				// registered five-tuples of this turn's lineage+epoch; foreign or
+				// unclassified work is never swept and yields uncertainty.
+				const terminalScope = captured.proof?.terminalScope;
+				let ownedStopped = true;
+				if (scope === "owned") {
+					const exactJobs = terminalScope
+						? findOwnedRegistrationsForTurn(terminalScope.lineageIdHash, terminalScope.abortedAttemptEpoch)
+						: [];
+					if (exactJobs.length > 0) {
+						const manager = AsyncJobManager.instance();
+						if (!manager) {
+							return { ok: false as const, reason: "owned_unsettled" as const };
+						}
+						ownedStopped = exactJobs.every(reg => {
+							manager.cancel(reg.jobId);
+							const job = manager.getJob(reg.jobId);
+							// Quiescent = terminal (cancelled/completed/failed); running or
+							// paused work proves the capture could not be stopped exactly.
+							return job !== undefined && job.status !== "running" && job.status !== "paused";
+						});
+						if (!ownedStopped) return { ok: false as const, reason: "owned_unsettled" as const };
+						// Purge queued deliveries of the exact captured jobs through the
+						// existing exact-key acknowledgement path so no delivery from
+						// stopped work can resume the agent; foreign deliveries are
+						// untouched.
+						manager.acknowledgeDeliveries(exactJobs.map(reg => reg.jobId));
+					}
+				}
 				// Persist the bounded durable terminal-scope record through the
 				// same full-document owner (idempotent per selection+epoch).
-				const terminalScope = captured.proof?.terminalScope;
 				if (terminalScope) {
 					try {
 						await durableStore.transactTerminalScopes(scopes => {
@@ -4527,13 +4573,15 @@ export function createNotificationsExtension(
 										s.turnContinuationFence.abortedAttemptEpoch === terminalScope.abortedAttemptEpoch
 									),
 							);
+							const ownedWorkDisposition =
+								scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain";
 							const payloadHash = crypto
 								.createHash("sha256")
 								.update(
 									JSON.stringify({
 										selection: scope,
 										turn: "stopped",
-										ownedWork: scope === "turn" ? "left_running" : "uncertain",
+										ownedWork: ownedWorkDisposition,
 										automaticDelivery: scope === "turn" ? "enabled" : "none",
 										resumeOnOwnedCompletion: scope === "turn",
 									}),
@@ -4544,7 +4592,7 @@ export function createNotificationsExtension(
 								{
 									selection: scope,
 									turnDisposition: "stopped",
-									ownedWorkDisposition: scope === "turn" ? "left_running" : "uncertain",
+									ownedWorkDisposition,
 									automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
 									resumeOnOwnedCompletion: scope === "turn",
 									turnContinuationFence: {
@@ -4568,6 +4616,9 @@ export function createNotificationsExtension(
 						logger.warn(`sdk: terminal scope persistence failed: ${String(error)}`);
 						return { ok: false as const, reason: "worker_unsettled" as const };
 					}
+				}
+				if (scope === "owned") {
+					return { ok: true as const, outcome: "stopped_owned" as const };
 				}
 				return { ok: true as const, outcome: "stopped" as const };
 			},

@@ -182,6 +182,21 @@ export function lookupOwnedRegistration(jobId: string, jobGeneration: string): T
 export function unregisterOwnedRegistration(key: TurnRegistrationKey): void {
 	ownedRegistrations.delete(`${key.jobId}\u0000${key.jobGeneration}`);
 }
+/**
+ * Enumerate every exact owned registration belonging to one aborted turn
+ * (matching lineage + attempt epoch). Used by `scope:"owned"` cleanup to
+ * capture the exact causal job set; foreign/unclassified work is never
+ * returned and is never swept.
+ */
+export function findOwnedRegistrationsForTurn(lineageIdHash: string, attemptEpoch: number): TurnRegistrationKey[] {
+	const matches: TurnRegistrationKey[] = [];
+	for (const key of ownedRegistrations.values()) {
+		if (key.lineageIdHash === lineageIdHash && key.promptAttemptEpoch === attemptEpoch) {
+			matches.push(key);
+		}
+	}
+	return matches;
+}
 export interface OwnedCompletionClassification {
 	lineageIdHash: string;
 	promptAttemptEpoch: number;
