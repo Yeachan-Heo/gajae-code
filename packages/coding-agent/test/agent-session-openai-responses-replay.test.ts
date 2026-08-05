@@ -550,7 +550,6 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		} satisfies ProviderSessionState);
 
 		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
-		expect(seed.cacheIdentity).toBe(parent.sessionId);
 		expect(seed.messages).toHaveLength(3);
 		expect(seed.metadata.skippedReasons["developer-role"]).toBe(1);
 		const inheritedToolDigest = seed.messages.at(-1);
@@ -604,7 +603,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		authStorages.push(childAuthStorage);
 
 		expect(child.sessionId).not.toBe(parent.sessionId);
-		expect(child.agent.providerSessionId).toBe(parent.sessionId);
+		expect(child.agent.providerSessionId).toBe(child.sessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
 		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
@@ -832,10 +831,10 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 
 		for (const child of [execChild!, archChild!]) {
 			expect(child.forkContextSeed).toBeDefined();
-			// cacheIdentity is the seed-borne identity; it must reuse the parent's sessionId so
-			// the child session's provider-side prefix cache hits when configured via sdk/session.ts:870
-			// (which uses options.forkContextSeed?.cacheIdentity as the providerSessionId fallback).
-			expect(child.forkContextSeed!.cacheIdentity).toBe(parent.sessionId);
+			// Seeds carry conversation content only. TaskTool must not inject a
+			// provider identity: each child derives its own from its logical session
+			// so concurrent workers never share an upstream session owner.
+			expect(child.providerSessionId).toBeUndefined();
 		}
 	});
 

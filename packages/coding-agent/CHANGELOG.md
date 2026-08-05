@@ -78,6 +78,7 @@
 - Windows automatic tmux resolution now selects `psmux` then `pmux` by canonical command order without rejecting distinct lower-priority aliases; it probes `tmux` only when neither named provider is available (#3725).
 - CI failure extraction now aggregates Bun failure and suite-error summaries across every test invocation in a job log instead of silently using only the first summary.
 - The GitHub status-line lookup now binds terminal links to positive PR numbers and canonical matching HTTP(S) pull-request URLs, rejecting ambiguous or control-bearing targets.
+- Fork-context subagents no longer inherit the parent's provider continuity identity. Each child session now presents its own `session_id`/`prompt_cache_key`, so concurrent subagent fleets stop colliding on session-owning upstream transports (`owner_busy` websocket-to-HTTP fallbacks) and keep per-worker cache affinity. Explicit `providerSessionId` overrides and serial same-session continuity are unchanged.
 - Ordinary `ask` selectors now bound long question premises and page through every premise row without skipping rows hidden by overflow indicators (#3675).
 - First-event timeout retries now require a typed, content-free failure from the current clean attempt scope, preventing prior or stale extension activity from suppressing or admitting a later request (#3553).
 - The issue-1979 Korean prose wrap test now cleans up inherited multiplexer env vars (`TMUX`, `TMUX_PANE`, etc.) so it deterministically exercises the plain-terminal render path regardless of the CI runner's terminal session (#1979).
