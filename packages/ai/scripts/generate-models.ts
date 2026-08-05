@@ -136,6 +136,9 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 				thinkingFormat: "qwen",
 				reasoningEffortMap: { minimal: "low", high: "xhigh", max: "xhigh" },
 				reasoningContentField: "reasoning_content",
+				requiresReasoningContentForToolCalls: true,
+				allowsSyntheticReasoningContentForToolCalls: false,
+				disableReasoningOnForcedToolChoice: true,
 			},
 		},
 		{
@@ -145,7 +148,7 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 			provider: "alibaba-token-plan",
 			baseUrl,
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 1_000_000,
 			maxTokens: 65_536,

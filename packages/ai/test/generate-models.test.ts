@@ -39,7 +39,7 @@ describe("injectAlibabaTokenPlanModels", () => {
 			if (model.id === "qwen3.8-max") model.api = "openai-responses";
 			if (model.id === "qwen3.8-max-preview") {
 				model.api = "openai-completions";
-				model.input = ["text", "image"];
+				model.input = ["text"];
 				model.maxTokens = 131_072;
 			}
 		}
@@ -61,6 +61,9 @@ describe("injectAlibabaTokenPlanModels", () => {
 						supportsReasoningEffort: true,
 						thinkingFormat: "qwen",
 						reasoningEffortMap: { minimal: "low", high: "xhigh", max: "xhigh" },
+						requiresReasoningContentForToolCalls: true,
+						allowsSyntheticReasoningContentForToolCalls: false,
+						disableReasoningOnForcedToolChoice: true,
 					}),
 				}),
 				expect.objectContaining({
@@ -69,7 +72,7 @@ describe("injectAlibabaTokenPlanModels", () => {
 					api: "openai-responses",
 					provider: "alibaba-token-plan",
 					reasoning: true,
-					input: ["text"],
+					input: ["text", "image"],
 					contextWindow: 1_000_000,
 					maxTokens: 65_536,
 				}),

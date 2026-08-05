@@ -449,6 +449,12 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	if (model.provider === "zai" && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
 	}
+	if (model.provider === "alibaba-token-plan" && model.id === "qwen3.8-max-preview") {
+		// Token Plan lists Qwen3.8 Max Preview with visual understanding. The Responses
+		// adapter drops image parts whenever model.input omits "image", so pin the
+		// documented modality instead of inheriting a text-only catalog entry.
+		model.input = ["text", "image"];
+	}
 	if (model.api === "openai-completions" && model.provider === "alibaba-token-plan" && model.id === "qwen3.8-max") {
 		const compat = model.compat as OpenAICompat | undefined;
 		model.input = ["text", "image"];
@@ -466,6 +472,14 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 				max: "xhigh",
 			},
 			reasoningContentField: "reasoning_content",
+			// Qwen3.8 Max runs with `preserve_thinking` on by default: every historical
+			// `reasoning_content` must round-trip on later turns, and the service validates
+			// the replayed value, so synthetic "." placeholders are not acceptable.
+			requiresReasoningContentForToolCalls: true,
+			allowsSyntheticReasoningContentForToolCalls: false,
+			// Qwen thinking mode cannot be combined with forcing a specific tool.
+			// Keep the tool-selection contract and suppress thinking for that turn.
+			disableReasoningOnForcedToolChoice: true,
 		};
 	}
 	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {

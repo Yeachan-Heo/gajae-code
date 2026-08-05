@@ -246,6 +246,9 @@ describe("generated model policies", () => {
 				thinkingFormat: "qwen",
 				reasoningEffortMap: { minimal: "low", high: "xhigh", max: "xhigh" },
 				reasoningContentField: "reasoning_content",
+				requiresReasoningContentForToolCalls: true,
+				allowsSyntheticReasoningContentForToolCalls: false,
+				disableReasoningOnForcedToolChoice: true,
 			},
 			thinking: {
 				mode: "effort",
@@ -253,6 +256,21 @@ describe("generated model policies", () => {
 				maxLevel: Effort.XHigh,
 			},
 		});
+	});
+
+	it("restores Alibaba Qwen3.8 Max Preview visual understanding stripped by discovery", () => {
+		const models: Model<Api>[] = [
+			createModel({
+				id: "qwen3.8-max-preview",
+				api: "openai-responses",
+				provider: "alibaba-token-plan",
+			}),
+		];
+		models[0]!.input = ["text"];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.input).toEqual(["text", "image"]);
 	});
 
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {

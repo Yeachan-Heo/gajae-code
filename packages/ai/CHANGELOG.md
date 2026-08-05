@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Alibaba Token Plan now bundles the GA `qwen3.8-max` model through OpenAI Chat Completions with its official 1M context window, 131,072-token output limit, text/image input, and normalized reasoning efforts through `xhigh`. Qwen3.8 Chat requests send both `enable_thinking` and the provider's mapped `reasoning_effort`; the preview model remains available separately through Responses and keeps its documented visual-understanding input.
+- Qwen3.8 Max GA replays historical `reasoning_content` on later turns instead of dropping it, matching the provider's `preserve_thinking` contract, and never substitutes a synthetic `.` placeholder the service would reject. Forcing a specific tool (or requiring any tool) now also clears `enable_thinking`, because Qwen rejects thinking mode combined with a forced tool choice.
+
 ### Fixed
 
 - OpenAI Codex cost estimates now treat an explicit response `service_tier` as authoritative, so a request for priority processing that the provider serves at the default tier is no longer charged the priority multiplier; the requested tier remains the fallback when the terminal response omits the field.
@@ -12,7 +17,6 @@
 ### Added
 
 - Anthropic OAuth can now pair by pasting the authorization code Anthropic displays (`https://platform.claude.com/oauth/code/callback`) instead of waiting on `http://localhost:54545/callback`, so a browser with no network route back to the machine running gjc can complete the login. Opt in per login with `OAuthLoginOptions.manualCode`; the loopback flow stays the default and is unchanged. Callback flows can now opt out of binding a local listener entirely (`OAuthCallbackFlowOptions.skipCallbackServer`), which fails fast when no manual code handler is supplied instead of idling until the five-minute timeout. The hosted redirect is a hard-coded constant with no env or config override, so it cannot be repointed at an attacker-controlled collector.
-- Alibaba Token Plan now bundles the GA `qwen3.8-max` model through OpenAI Chat Completions with its official 1M context window, 131,072-token output limit, text/image input, and normalized reasoning efforts through `xhigh`. Qwen3.8 Chat requests send both `enable_thinking` and the provider's mapped `reasoning_effort`; the preview model remains available separately through Responses.
 
 ### Fixed
 

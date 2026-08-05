@@ -215,7 +215,8 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		supportsReasoningEffort: !isGrok && !isZai,
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
-		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel || isOpenCodeGoReasoning,
+		disableReasoningOnForcedToolChoice:
+			isKimiModel || isAnthropicModel || isOpenCodeGoReasoning || isAlibabaTokenPlanQwen38Max,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(model.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
 		supportsForcedToolChoice: !isOpenCodeGoKimiReasoning,
@@ -241,13 +242,18 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		//     rely on a placeholder — see `convertMessages` for the placeholder injection.
 		//   - OpenCode-Go and OpenCode-Zen handle reasoning content internally and reject
 		//     `reasoning_content` in client-sent messages — exclude them even for Kimi models.
+		//   - Alibaba Token Plan Qwen3.8 Max: runs with `preserve_thinking` enabled, so every
+		//     historical `reasoning_content` has to round-trip on later turns.
 		requiresReasoningContentForToolCalls:
 			(isKimiModel && !isOpenCodeProvider) ||
 			(isDeepseekFamily && Boolean(model.reasoning)) ||
+			isAlibabaTokenPlanQwen38Max ||
 			((provider === "openrouter" || baseUrl.includes("openrouter.ai")) && Boolean(model.reasoning)),
 		// DeepSeek V4 rejects synthetic reasoning_content placeholders (".") on tool-call turns.
 		// Kimi and OpenRouter accept them when actual reasoning is unavailable.
-		allowsSyntheticReasoningContentForToolCalls: !isDeepseekFamily || !model.reasoning,
+		// Qwen3.8 Max validates the replayed thinking, so it rejects placeholders too.
+		allowsSyntheticReasoningContentForToolCalls:
+			(!isDeepseekFamily || !model.reasoning) && !isAlibabaTokenPlanQwen38Max,
 		requiresAssistantContentForToolCalls: isKimiModel || isDirectDeepseekReasoning,
 		openRouterRouting: undefined,
 		vercelGatewayRouting: undefined,

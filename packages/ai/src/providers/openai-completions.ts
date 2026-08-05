@@ -1483,6 +1483,14 @@ function buildParams(
 		if (compat.thinkingFormat === "zai") {
 			params.thinking = { type: "disabled" };
 		}
+		if (compat.thinkingFormat === "qwen") {
+			// Qwen carries thinking in a top-level boolean, so deleting the effort
+			// field alone still leaves `enable_thinking: true` on the wire.
+			params.enable_thinking = false;
+		}
+		if (compat.thinkingFormat === "qwen-chat-template") {
+			params.chat_template_kwargs = { enable_thinking: false };
+		}
 	}
 
 	// OpenRouter provider routing preferences

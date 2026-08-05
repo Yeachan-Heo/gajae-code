@@ -117,7 +117,10 @@
 					"high": "xhigh",
 					"max": "xhigh"
 				},
-				"reasoningContentField": "reasoning_content"
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"allowsSyntheticReasoningContentForToolCalls": false,
+				"disableReasoningOnForcedToolChoice": true
 			},
 			"thinking": {
 				"mode": "effort",
@@ -133,7 +136,8 @@
 			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0,

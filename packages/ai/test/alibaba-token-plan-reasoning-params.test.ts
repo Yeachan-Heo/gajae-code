@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
-import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
+import { convertMessages, detectCompat, streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
 import { getEnvApiKey } from "@gajae-code/ai/stream";
-import type { Context, Model } from "@gajae-code/ai/types";
+import type { AssistantMessage, Context, Model, Tool, ToolChoice } from "@gajae-code/ai/types";
+import * as z from "zod/v4";
 
 const originalAlibabaTokenPlanApiKey = Bun.env.ALIBABA_TOKEN_PLAN_API_KEY;
 
@@ -52,6 +53,51 @@ function captureCompletionsPayload(
 		onPayload: payload => resolve(payload as Record<string, unknown>),
 	});
 	return promise;
+}
+
+const echoTool: Tool = {
+	name: "echo",
+	description: "Echo input",
+	parameters: z.object({ text: z.string() }),
+};
+
+function captureCompletionsToolPayload(
+	model: Model<"openai-completions">,
+	toolChoice: ToolChoice,
+): Promise<Record<string, unknown>> {
+	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+	streamOpenAICompletions(
+		model,
+		{ messages: [{ role: "user", content: "call echo", timestamp: 0 }], tools: [echoTool] },
+		{
+			apiKey: "test-key",
+			signal: abortedSignal(),
+			reasoning: "high",
+			toolChoice,
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		},
+	);
+	return promise;
+}
+
+function assistantTurn(model: Model<"openai-completions">, content: AssistantMessage["content"]): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: 0,
+	};
 }
 
 const qwenPreview = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
@@ -103,5 +149,112 @@ describe("Alibaba Token Plan reasoning request parameters", () => {
 
 		expect(payload.reasoning_effort).toBe("max");
 		expect(payload.thinking).toBeUndefined();
+	});
+
+	it("keeps Qwen3.8 Max GA thinking on for open tool choice", async () => {
+		const payload = await captureCompletionsToolPayload(qwenGa, "auto");
+
+		expect(payload.tool_choice).toBe("auto");
+		expect(payload.enable_thinking).toBe(true);
+		expect(payload.reasoning_effort).toBe("xhigh");
+	});
+
+	it("suppresses Qwen3.8 Max GA thinking when a specific tool is forced", async () => {
+		const payload = await captureCompletionsToolPayload(qwenGa, { type: "tool", name: "echo" });
+
+		expect(payload.tool_choice).toEqual({ type: "function", function: { name: "echo" } });
+		expect(payload.enable_thinking).toBe(false);
+		expect(payload.reasoning_effort).toBeUndefined();
+	});
+
+	it("suppresses Qwen3.8 Max GA thinking when any tool call is required", async () => {
+		const payload = await captureCompletionsToolPayload(qwenGa, "any");
+
+		expect(payload.tool_choice).toBe("required");
+		expect(payload.enable_thinking).toBe(false);
+		expect(payload.reasoning_effort).toBeUndefined();
+	});
+});
+
+describe("Alibaba Token Plan Qwen3.8 Max GA thinking history", () => {
+	it("requires exact reasoning_content replay and rejects synthetic placeholders", () => {
+		const compat = detectCompat(qwenGa);
+
+		expect(compat.thinkingFormat).toBe("qwen");
+		expect(compat.requiresReasoningContentForToolCalls).toBe(true);
+		expect(compat.allowsSyntheticReasoningContentForToolCalls).toBe(false);
+		expect(compat.disableReasoningOnForcedToolChoice).toBe(true);
+	});
+
+	it("replays prior reasoning_content on a tool-call continuation turn", () => {
+		const compat = detectCompat(qwenGa);
+		const messages = convertMessages(
+			qwenGa,
+			{
+				messages: [
+					{ role: "user", content: "list files", timestamp: 0 },
+					assistantTurn(qwenGa, [
+						{ type: "thinking", thinking: "I should list files.", thinkingSignature: "reasoning_content" },
+						{ type: "text", text: "Calling a tool." },
+						{ type: "toolCall", id: "call_1", name: "echo", arguments: { text: "." } },
+					]),
+					{
+						role: "toolResult",
+						toolCallId: "call_1",
+						toolName: "echo",
+						content: [{ type: "text", text: "ok" }],
+						isError: false,
+						timestamp: 0,
+					},
+				],
+			},
+			compat,
+		);
+
+		const assistant = messages.find(m => m.role === "assistant") as object;
+		expect(Reflect.get(assistant, "reasoning_content")).toBe("I should list files.");
+	});
+
+	it("replays reasoning_content on plain assistant turns, not just tool-call turns", () => {
+		const compat = detectCompat(qwenGa);
+		const messages = convertMessages(
+			qwenGa,
+			{
+				messages: [
+					{ role: "user", content: "hi", timestamp: 0 },
+					assistantTurn(qwenGa, [
+						{ type: "thinking", thinking: "Greeting.", thinkingSignature: "reasoning_content" },
+						{ type: "text", text: "hello" },
+					]),
+					{ role: "user", content: "again", timestamp: 0 },
+				],
+			},
+			compat,
+		);
+
+		const assistant = messages.find(m => m.role === "assistant") as object;
+		expect(Reflect.get(assistant, "reasoning_content")).toBe("Greeting.");
+	});
+
+	it("emits an empty reasoning_content rather than a '.' placeholder when no thinking was captured", () => {
+		const compat = detectCompat(qwenGa);
+		const messages = convertMessages(
+			qwenGa,
+			{
+				messages: [
+					assistantTurn(qwenGa, [{ type: "toolCall", id: "call_2", name: "echo", arguments: { text: "." } }]),
+				],
+			},
+			compat,
+		);
+
+		const assistant = messages.find(m => m.role === "assistant") as object;
+		expect(Reflect.get(assistant, "reasoning_content")).toBe("");
+	});
+});
+
+describe("Alibaba Token Plan Qwen3.8 Max Preview capabilities", () => {
+	it("keeps the documented visual-understanding input modality", () => {
+		expect(qwenPreview.input).toEqual(["text", "image"]);
 	});
 });
