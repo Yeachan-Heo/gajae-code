@@ -48,6 +48,8 @@ import {
 	buildCompactChoiceGrid,
 	code,
 	markdownToTelegramHtml,
+	SELECTION_MARK_CHECKED,
+	SELECTION_MARK_UNCHECKED,
 	splitTelegramHtml,
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
@@ -10376,7 +10378,9 @@ export class TelegramNotificationDaemon {
 					: [],
 			);
 			const displayOptions = options.map((option, index) =>
-				multiSelect ? `${selectedOptionIndices.has(index) ? "☑" : "☐"} ${option}` : option,
+				multiSelect
+					? `${selectedOptionIndices.has(index) ? SELECTION_MARK_CHECKED : SELECTION_MARK_UNCHECKED} ${option}`
+					: option,
 			);
 			const rendered = buildActionMessage({
 				kind: msg.kind ?? "ask",

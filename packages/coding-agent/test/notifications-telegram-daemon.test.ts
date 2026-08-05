@@ -6176,6 +6176,35 @@ describe("telegram daemon", () => {
 		});
 	});
 
+	test("multi-select state renumbers pre-numbered options exactly once", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as never,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		// Deep-interview options arrive pre-numbered by the ask tool.
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Pick all",
+			options: ["1. Alpha", "2. Beta"],
+			selectedOptionIndices: [0],
+		});
+		const sent = bot.calls.find(call => call.method === "sendMessage")!.body;
+		expect(sent.text).toContain("1. ☑ Alpha");
+		expect(sent.text).toContain("2. ☐ Beta");
+		expect(sent.text).not.toContain("1. Alpha");
+	});
+
 	test("callback alias reply is delivered when Telegram callback ack fails", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();

@@ -6,6 +6,7 @@
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 - MiniMax M3 preset and profile ids canonicalized to `MiniMax-M3` (issue #3896): the `minimax` / `minimax-cn` onboarding presets and the `minimax-eco` / `minimax-medium` / `minimax-pro` builtin model profiles no longer reference the removed lowercase `minimax-m3` / `minimax-v3` first-class catalog ids.
+- A remote multi-select ask now shows what is already selected. The ask tool re-issues one remote request per toggle, but the request carried no selection state, so Telegram kept posting an identical prompt with no sign that option 1 had been picked — the checkbox rendering existed only for durable workflow gates. `AskAnswerRequest` now carries `multi` and the selected option labels, the notification bus publishes them as `selectedOptionIndices` with the `(N selected)` question prefix while keeping the ask tool's own Next/Done control, and pre-numbered options (deep interview) are renumbered once instead of rendering as `1. ☑ 1. …`.
 
 ## [0.12.12] - 2026-08-05
 
