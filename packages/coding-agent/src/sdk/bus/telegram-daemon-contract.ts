@@ -66,9 +66,12 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and polling dependency chain. Generation 48 uses crash-durable callback
  * receipts, a legacy-disjoint random alias namespace, and exact topic leases.
  * Generation 49 drains every admitted session-message handler before final
- * durable persistence and ownership release.
+ * durable persistence and ownership release. Generation 50 resolves intermediate
+ * notifications-directory symlinks before native exact unlink while keeping
+ * final-component file symlinks fail-closed under AT_SYMLINK_NOFOLLOW (bounded
+ * #3761 multi-account activation repair).
  */
-export const DAEMON_GENERATION = 49;
+export const DAEMON_GENERATION = 50;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
