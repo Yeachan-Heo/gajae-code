@@ -83,6 +83,7 @@ describe("UX change-set adversarial probes", () => {
 		KeybindingsManager.create(root);
 		expect(await fs.readFile(file, "utf8")).toBe("{ broken");
 		expect(await Bun.file(`${file}.bak`).exists()).toBe(false);
+		expect(await Bun.file(`${file}.migration-v1`).exists()).toBe(false);
 
 		const legacy = '{"interrupt":"escape"}\n';
 		await fs.writeFile(file, legacy);
@@ -90,6 +91,9 @@ describe("UX change-set adversarial probes", () => {
 		await fs.rm(`${file}.migration-v1`);
 		KeybindingsManager.create(root);
 		expect(await fs.readFile(`${file}.bak`, "utf8")).toBe(legacy);
+		expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ "app.interrupt": "escape" });
+		expect(await fs.readFile(`${file}.migration-v1`, "utf8")).toBe("v1\n");
+		expect((await fs.readdir(root)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
 	});
 
 	it("stores a literal key in canonical AuthStorage with a custom models path", async () => {

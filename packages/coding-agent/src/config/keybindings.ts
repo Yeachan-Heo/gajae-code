@@ -1,4 +1,5 @@
-import { copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	type Keybinding,
@@ -432,42 +433,119 @@ function orderKeybindingsConfig(config: KeybindingsConfig): KeybindingsConfig {
  */
 function loadRawConfig(filePath: string): unknown {
 	try {
-		if (!existsSync(filePath)) {
+		if (!fs.existsSync(filePath)) {
 			return null;
 		}
-		const content = readFileSync(filePath, "utf-8");
+		const content = fs.readFileSync(filePath, "utf-8");
 		return JSON.parse(content);
 	} catch (error) {
 		if (isEnoent(error)) {
 			return null;
 		}
+
 		logger.warn("Failed to parse keybindings config", { path: filePath, error: String(error) });
 		return null;
 	}
 }
 
+export type KeybindingMigrationStage =
+	| "backup"
+	| "primary-open"
+	| "primary-write"
+	| "primary-fsync"
+	| "primary-close"
+	| "primary-rename"
+	| "marker-open"
+	| "marker-write"
+	| "marker-fsync"
+	| "marker-close"
+	| "marker-rename";
+
+type KeybindingMigrationStageHook = (stage: KeybindingMigrationStage) => void;
+
+function publishKeybindingMigrationFile(
+	destination: string,
+	content: string,
+	stagePrefix: "primary" | "marker",
+	beforeStage: KeybindingMigrationStageHook,
+): void {
+	const temporary = `${destination}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	let descriptor: number | undefined;
+	try {
+		beforeStage(`${stagePrefix}-open`);
+		descriptor = fs.openSync(temporary, "wx");
+		beforeStage(`${stagePrefix}-write`);
+		fs.writeFileSync(descriptor, content, "utf-8");
+		beforeStage(`${stagePrefix}-fsync`);
+		fs.fsyncSync(descriptor);
+		beforeStage(`${stagePrefix}-close`);
+		fs.closeSync(descriptor);
+		descriptor = undefined;
+		beforeStage(`${stagePrefix}-rename`);
+		fs.renameSync(temporary, destination);
+	} finally {
+		if (descriptor !== undefined) {
+			try {
+				fs.closeSync(descriptor);
+			} catch {
+				// The publication error is authoritative; cleanup continues below.
+			}
+		}
+		try {
+			fs.unlinkSync(temporary);
+		} catch (error) {
+			if (!isEnoent(error)) {
+				logger.warn("Failed to clean keybindings migration temporary file", {
+					path: temporary,
+					error: String(error),
+				});
+			}
+		}
+	}
+}
+
+function preserveFirstKeybindingsBackup(filePath: string, beforeStage: KeybindingMigrationStageHook): void {
+	beforeStage("backup");
+	try {
+		fs.copyFileSync(filePath, `${filePath}.bak`, fs.constants.COPYFILE_EXCL);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+}
+
 /** Migrate legacy keybindings once, preserving the original file as .bak. */
-function loadKeybindingsConfig(filePath: string, writeBack: boolean): KeybindingsConfig {
+function loadKeybindingsConfig(
+	filePath: string,
+	writeBack: boolean,
+	beforeStage: KeybindingMigrationStageHook = () => undefined,
+): KeybindingsConfig {
 	const rawConfig = loadRawConfig(filePath);
 	if (rawConfig === null) return {};
 	const markerPath = `${filePath}.migration-v1`;
-	const { config: migratedConfig, migrated } = existsSync(markerPath)
-		? { config: toKeybindingsConfig(rawConfig), migrated: false }
-		: migrateKeybindingNames(rawConfig);
-	if (writeBack && migrated) {
-		const ordered = orderKeybindingsConfig(migratedConfig);
-		const tempPath = `${filePath}.${process.pid}.tmp`;
+	if (fs.existsSync(markerPath)) return toKeybindingsConfig(rawConfig);
+
+	const { config: migratedConfig, migrated } = migrateKeybindingNames(rawConfig);
+	if (writeBack) {
 		try {
-			copyFileSync(filePath, `${filePath}.bak`);
-			writeFileSync(tempPath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
-			renameSync(tempPath, filePath);
-			writeFileSync(markerPath, "v1\n", "utf-8");
-			logger.debug("Migrated keybindings config", { path: filePath });
+			if (migrated) {
+				preserveFirstKeybindingsBackup(filePath, beforeStage);
+				const ordered = orderKeybindingsConfig(migratedConfig);
+				publishKeybindingMigrationFile(filePath, `${JSON.stringify(ordered, null, 2)}\n`, "primary", beforeStage);
+			}
+			publishKeybindingMigrationFile(markerPath, "v1\n", "marker", beforeStage);
+			logger.debug("Completed keybindings migration", { path: filePath, migrated });
 		} catch (error) {
 			logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });
 		}
 	}
 	return migratedConfig;
+}
+
+export function loadKeybindingsConfigForTest(
+	filePath: string,
+	beforeStage: KeybindingMigrationStageHook,
+): KeybindingsConfig {
+	return loadKeybindingsConfig(filePath, true, beforeStage);
 }
 
 function migrateKeybindingsConfigFile(agentDir: string): void {
