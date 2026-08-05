@@ -49,7 +49,8 @@ export interface AtomicYamlPatchRevision {
 export type CasRestoreResult =
 	| { status: "restored"; receipt: CasReceipt }
 	| { status: "conflict"; paths: readonly string[] }
-	| { status: "discarded" };
+	| { status: "discarded" }
+	| { status: "not-restorable" };
 
 /**
  * A receipt intentionally exposes only path-level hashes and opaque revisions.
@@ -214,14 +215,17 @@ export function atomicYamlPathHash(value: Record<string, unknown>, path: string)
 type YamlReadResult = {
 	current: Record<string, unknown>;
 	root: unknown;
+	/** Raw file content ("" when the file is absent); the CAS basis for writes. */
+	raw: string;
 };
 
 async function readYaml(configPath: string): Promise<YamlReadResult> {
 	try {
-		const root = YAML.parse(await fs.readFile(configPath, "utf8"));
-		return { current: record(root) ?? {}, root };
+		const raw = await Bun.file(configPath).text();
+		const root = YAML.parse(raw);
+		return { current: record(root) ?? {}, root, raw };
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { current: {}, root: undefined };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { current: {}, root: undefined, raw: "" };
 		throw error;
 	}
 }
@@ -240,7 +244,15 @@ async function syncParentDirectory(directory: string): Promise<void> {
 	}
 }
 
-async function replaceWithRetry(tempPath: string, configPath: string, options: AtomicYamlPatchOptions): Promise<void> {
+async function replaceWithRetry(
+	tempPath: string,
+	configPath: string,
+	options: AtomicYamlPatchOptions,
+	/** Re-verify the target content before EVERY rename attempt (an external
+	 * save between retries on a Windows sharing-violation backoff must not be
+	 * overwritten by a later retry). */
+	expectedRaw?: string,
+): Promise<void> {
 	const rename = options.rename ?? fs.rename;
 	const sleep = options.sleep ?? (async (delay: number): Promise<void> => await Bun.sleep(delay));
 	const isWindows = (options.platform ?? process.platform) === "win32";
@@ -248,6 +260,21 @@ async function replaceWithRetry(tempPath: string, configPath: string, options: A
 
 	for (;;) {
 		attempts++;
+		if (expectedRaw !== undefined) {
+			const currentRaw = await Bun.file(configPath)
+				.text()
+				.catch((error: unknown) => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+					throw error;
+				});
+			if (currentRaw !== expectedRaw) {
+				throw new AtomicYamlConflictError(
+					configPath,
+					createHash("sha256").update(expectedRaw).digest("hex"),
+					createHash("sha256").update(currentRaw).digest("hex"),
+				);
+			}
+		}
 		try {
 			await rename(tempPath, configPath);
 			return;
@@ -269,7 +296,9 @@ async function writeAtomicYaml(
 	configPath: string,
 	value: Record<string, unknown>,
 	options: AtomicYamlPatchOptions,
-): Promise<void> {
+	/** Expected current content; re-verified immediately before the rename. */
+	expectedRaw?: string,
+): Promise<string> {
 	const directory = path.dirname(configPath);
 	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${randomUUID()}.tmp`);
 	try {
@@ -280,11 +309,30 @@ async function writeAtomicYaml(
 		} finally {
 			await tempHandle.close();
 		}
-		await replaceWithRetry(tempPath, configPath, options);
+		if (expectedRaw !== undefined) {
+			// The transaction's CAS guard ran before this write; re-verify right
+			// before the rename so an external save during the temp write cannot
+			// be silently overwritten by the replacement.
+			const currentRaw = await Bun.file(configPath)
+				.text()
+				.catch((error: unknown) => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+					throw error;
+				});
+			if (currentRaw !== expectedRaw) {
+				throw new AtomicYamlConflictError(
+					configPath,
+					createHash("sha256").update(expectedRaw).digest("hex"),
+					createHash("sha256").update(currentRaw).digest("hex"),
+				);
+			}
+		}
+		await replaceWithRetry(tempPath, configPath, options, expectedRaw);
 		await syncParentDirectory(directory);
 	} finally {
 		await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
+	return YAML.stringify(value, null, 2);
 }
 
 function createReceipt(
@@ -334,6 +382,8 @@ async function applyPatchesUnderLock(
 	current: Record<string, unknown>,
 	patches: readonly AtomicYamlPatch[],
 	options: AtomicYamlPatchOptions,
+	skipWrite = false,
+	expectedRaw?: string,
 ): Promise<CasReceipt> {
 	if (patches.length === 0) return createReceipt(configPath, [], options);
 
@@ -373,7 +423,7 @@ async function applyPatchesUnderLock(
 	}
 	const changes = [...changesByPath.values()];
 
-	await writeAtomicYaml(configPath, current, options);
+	if (!skipWrite) await writeAtomicYaml(configPath, current, options, expectedRaw);
 	return createReceipt(configPath, changes, options);
 }
 
@@ -400,7 +450,33 @@ export interface AtomicYamlConfigTransaction {
 	configPath: string;
 	root: unknown;
 	current: Readonly<Record<string, unknown>>;
+	/** True once any write op has durably committed (a later CAS rejection then
+	 * leaves the target with partial writes, so recovery artifacts must stay). */
+	written: boolean;
 	applyPatches(patches: readonly AtomicYamlPatch[], options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
+	/**
+	 * Delete top-level keys verbatim, including dotted key names (e.g. a flat
+	 * `"gjc.ralplan.maxIterations"` key that the patch grammar would otherwise
+	 * interpret as a nested path). Writes atomically under the same lock.
+	 */
+	removeTopLevelKeys(keys: readonly string[], options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
+	/**
+	 * Apply patches AND delete top-level keys verbatim in a SINGLE atomic
+	 * write, so an external editor's change cannot land between the two
+	 * operations (external editors do not participate in the file lock). The
+	 * returned receipt is not restorable (the deletions are not journaled).
+	 */
+	applyPatchesAndRemoveTopLevelKeys(
+		patches: readonly AtomicYamlPatch[],
+		topLevelKeys: readonly string[],
+		options?: AtomicYamlPatchOptions,
+	): Promise<CasReceipt>;
+	/**
+	 * Replace the whole document (used to revert the target when a later
+	 * verification fails). Writes atomically under the same lock; the returned
+	 * receipt is not restorable.
+	 */
+	replaceCurrent(next: Readonly<Record<string, unknown>>, options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
 }
 
 /**
@@ -418,14 +494,116 @@ export function withAtomicYamlConfigTransaction<T>(
 	return enqueueAtomicYamlOperation(configPath, async canonicalPath => {
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
-			const { current, root } = await readYaml(canonicalPath);
+			const { current, root, raw } = await readYaml(canonicalPath);
+			// External editors do not participate in the file lock, so a save
+			// between the initial read and a write would be silently overwritten.
+			// Guard every write with a compare-and-swap against the last content
+			// this transaction read/wrote; on mismatch, fail closed.
+			let lastKnownRaw: string | null = null;
+			const casGuard = async (): Promise<void> => {
+				const expected = lastKnownRaw ?? raw;
+				const currentRaw = await Bun.file(canonicalPath)
+					.text()
+					.catch((error: unknown) => {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+						// An unreadable (EACCES) or transient I/O failure is NOT an
+						// empty file: fail closed so the write never clobbers a file
+						// it cannot read.
+						throw error;
+					});
+				if (currentRaw !== expected) {
+					throw new AtomicYamlConflictError(
+						canonicalPath,
+						createHash("sha256").update(expected).digest("hex"),
+						createHash("sha256")
+							.update(currentRaw ?? "")
+							.digest("hex"),
+					);
+				}
+			};
+			let written = false;
+			const markWritten = (): void => {
+				written = true;
+			};
 			return await operation({
 				configPath: canonicalPath,
 				root,
 				current,
-				applyPatches: (patches, options = {}) => {
+				get written(): boolean {
+					return written;
+				},
+				applyPatches: async (patches, options = {}) => {
 					for (const patch of patches) assertPatch(patch);
-					return applyPatchesUnderLock(canonicalPath, current, patches, options);
+					await options.validateRoot?.(root, patches);
+					await casGuard();
+					const receipt = await applyPatchesUnderLock(
+						canonicalPath,
+						current,
+						patches,
+						options,
+						false,
+						lastKnownRaw ?? raw,
+					);
+					if (patches.length > 0) {
+						lastKnownRaw = YAML.stringify(current, null, 2);
+						markWritten();
+					}
+					return receipt;
+				},
+				removeTopLevelKeys: async (keys, options = {}) => {
+					for (const key of keys) delete current[key];
+					await casGuard();
+					lastKnownRaw = await writeAtomicYaml(canonicalPath, current, options, lastKnownRaw ?? raw);
+					markWritten();
+					// The deleted top-level key values are not journaled, so a
+					// restore() would vacuously claim success; report honestly that
+					// the receipt is not restorable.
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+				applyPatchesAndRemoveTopLevelKeys: async (patches, topLevelKeys, options = {}) => {
+					for (const patch of patches) assertPatch(patch);
+					await options.validateRoot?.(root, patches);
+					await casGuard();
+					await applyPatchesUnderLock(canonicalPath, current, patches, options, true);
+					for (const key of topLevelKeys) delete current[key];
+					lastKnownRaw = await writeAtomicYaml(canonicalPath, current, options, lastKnownRaw ?? raw);
+					markWritten();
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+				replaceCurrent: async (next, options = {}) => {
+					for (const key of Object.keys(current)) delete current[key];
+					Object.assign(current, next);
+					await casGuard();
+					lastKnownRaw = await writeAtomicYaml(canonicalPath, current, options, lastKnownRaw ?? raw);
+					markWritten();
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
 				},
 			});
 		});

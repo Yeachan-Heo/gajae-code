@@ -205,4 +205,48 @@ describe("atomic YAML patches", () => {
 		expect(observedRoot).toEqual(["a", "b"]);
 		expect(YAML.parse(await fs.readFile(configPath, "utf8"))).toEqual(["a", "b"]);
 	});
+	test("transaction removes dotted top-level keys verbatim", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(
+			configPath,
+			YAML.stringify({ "gjc.ralplan.maxIterations": "bad", gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			const receipt = await tx.removeTopLevelKeys(["gjc.ralplan.maxIterations"]);
+			expect((await receipt.restore()).status).toBe("not-restorable");
+			return "done";
+		});
+
+		expect(YAML.parse(await fs.readFile(configPath, "utf8"))).toEqual({ gjc: { ralplan: { maxIterations: 7 } } });
+	});
+	test("transaction replaces the whole document atomically", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, YAML.stringify({ old: { keep: false }, theme: { dark: "red" } }, null, 2));
+
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			await tx.replaceCurrent({ theme: { dark: "blue" } });
+			return "done";
+		});
+
+		expect(YAML.parse(await fs.readFile(configPath, "utf8"))).toEqual({ theme: { dark: "blue" } });
+	});
+	test("an external edit between the transaction read and write is not overwritten", async () => {
+		const target = await configPathForTest();
+		await fs.writeFile(target, YAML.stringify({ a: 1 }, null, 2));
+
+		await expect(
+			withAtomicYamlConfigTransaction(target, async tx => {
+				// Simulate an external editor saving config.yml after the
+				// transaction read it (external editors do not take the lock).
+				await fs.writeFile(target, YAML.stringify({ a: 99 }, null, 2));
+				await tx.applyPatches([{ path: "b", op: "set", value: 2 }]);
+			}),
+		).rejects.toThrow(/precondition failed/i);
+
+		// The external edit is preserved, not overwritten by the stale snapshot.
+		const after = YAML.parse(await fs.readFile(target, "utf8")) as Record<string, unknown>;
+		expect(after.a).toBe(99);
+		expect(after.b).toBeUndefined();
+	});
 });
