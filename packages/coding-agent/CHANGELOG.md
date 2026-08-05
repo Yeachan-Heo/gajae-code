@@ -14,11 +14,17 @@
 - Added lease-backed MCP connection pooling with typed recovery, shared HTTP/SSE sessions, per-lease callback demultiplexing, and authorization binding scopes that keep credential secrets out of pool keys.
 - Added plugin registry v2 as the single execution authority for plugin tools, subskills, and prompt appendices, with digest verification at final use.
 - Added module-trace and process-tree RSS verification harnesses for startup-memory regressions.
+- Workflow settings (ralplan `maxIterations`/`autoHandoff`/`maxReviewPassesPerLane`, deep-interview `ambiguityThreshold`, ultragoal `nudgeBudget`) now resolve through one shared five-layer precedence: project `.gjc/config.yml` → project `.gjc/settings.json` → user `<agentDir>/config.yml` → legacy `<configRoot>/settings.json` → built-in default. `config.yml` values previously ignored by the workflow runtimes now take effect (`gjc config set gjc.ralplan.maxIterations 7` is honored by ralplan); project configuration beats user configuration, fixing deep-interview's former user-YAML-first inversion.
 
 ### Changed
 
 - Workflow skills are no longer implicitly auto-routed. The UserPromptSubmit keyword autoroute now matches only explicit `$`-prefixed tokens (`$deep-interview`, `$ralplan`, `$ultragoal`, `$team`); natural-language phrases ("don't assume", "consensus plan", "interview me", "coordinated team") and bare skill names no longer activate workflows. The system prompt now ranks explicit user intent above every routing heuristic, forbids workflow self-invocation and plan stacking, bans task-difficulty overestimation, directs the agent to offer heuristic workflow escalation (especially deep-interview for vague requirements) through the `ask` tool with an opt-out, and adds an `<engineering>` principles section.
+- Registered `gjc.ultragoal.nudgeBudget` in the public settings schema (default 10, non-negative integer).
+- The legacy config-root `~/.gjc/settings.json` workflow keys are migrated once into `~/.gjc/agent/config.yml` on the next default-global-scope load (absent-only, atomic marker, no-clobber `.bak`). Invalid strict ralplan legacy values keep the source active so `gjc ralplan` still fails loudly (exit 2); future-schema `config.yml` targets are never touched.
+- ralplan settings are strict for all three keys: malformed or invalid explicit settings in any layer/format exit 2 (the former silent `maxIterations` fallback is removed). An invalid strict ralplan value in the target `config.yml` is repaired with a valid legacy value during migration.
+- `config.yml` settings use the nested schema form; flat dotted keys are honored only in legacy `settings.json` files so every effective override stays manageable via `Settings`/`gjc config`.
 - Deferred notification adapters, native bindings, provider construction, tools, skills, eval, session artifacts, and history storage until their feature paths are used, reducing the CLI startup module graph without changing default behavior.
+
 - Split SDK session hosting into a transport-neutral runtime and lazy notification adapters.
 
 ### Fixed
