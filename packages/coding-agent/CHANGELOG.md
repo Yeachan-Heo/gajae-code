@@ -6,6 +6,7 @@
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 - MiniMax M3 preset and profile ids canonicalized to `MiniMax-M3` (issue #3896): the `minimax` / `minimax-cn` onboarding presets and the `minimax-eco` / `minimax-medium` / `minimax-pro` builtin model profiles no longer reference the removed lowercase `minimax-m3` / `minimax-v3` first-class catalog ids.
+- Slash commands now expand in non-interactive runs. `gjc -p "/init"` previously reached the model as the literal text `/init`, so no command body was injected, no file was written, and the model still answered as if the command had run. Print mode now loads the same bundled and file-based command list interactive mode uses before it prompts.
 
 ## [0.12.12] - 2026-08-05
 
