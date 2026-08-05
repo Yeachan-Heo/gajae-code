@@ -10,6 +10,8 @@
  * For tests, `Settings.isolated()` seeds explicit user/global settings:
  *   const isolated = Settings.isolated({ "compaction.enabled": false });
  */
+
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,6 +19,7 @@ import * as util from "node:util";
 import {
 	getAgentDbPath,
 	getAgentDir,
+	getConfigRootDir,
 	getCustomThemesDir,
 	getProjectDir,
 	isEnoent,
@@ -30,6 +33,7 @@ import { YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-registry";
 import { loadCapability } from "../discovery";
+import { extractWorkflowSetting, type WorkflowSettingKey } from "../gjc-runtime/workflow-settings";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import {
 	type NotificationSettingsReader,
@@ -39,6 +43,8 @@ import {
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import {
+	type AtomicYamlConfigTransaction,
+	AtomicYamlConflictError,
 	type AtomicYamlPatch,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
@@ -48,6 +54,7 @@ import {
 	enqueueAtomicYamlOperation,
 	reserveAtomicYamlUpdateSlot,
 	setByPath,
+	withAtomicYamlConfigTransaction,
 } from "./atomic-yaml-patch";
 import { isModelSelectorValue, type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 
@@ -76,6 +83,52 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
+
+const CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS: readonly WorkflowSettingKey[] = [
+	"gjc.deepInterview.ambiguityThreshold",
+	"gjc.ralplan.autoHandoff",
+	"gjc.ralplan.maxIterations",
+	"gjc.ralplan.maxReviewPassesPerLane",
+	"gjc.ultragoal.nudgeBudget",
+];
+
+const WORKFLOW_MIGRATION_MARKER_VERSION = 1;
+
+type WorkflowMigrationMarker = {
+	version: 1;
+	status: "pending" | "complete";
+	sourcePath: string;
+	backupPath: string;
+	targetPath: string;
+	/** Canonical (realpath) agent dir at migration time; a symlink repointed
+	 * afterwards must not be treated as the same migration target. */
+	canonicalTargetDir?: string;
+	/** `dev:ino` of the target config.yml at migration time; detects a
+	 * same-pathname profile REPLACEMENT (deleted + recreated), which realpath
+	 * alone cannot. */
+	canonicalTargetIdentity?: string;
+	sourceSha256: string;
+	migratedKeys: WorkflowSettingKey[];
+	startedAt: string;
+	/** The prior source hash (the migration-write ownership basis) when the
+	 * reconcile rewrites the marker as pending; the resume accepts a backup
+	 * matching either the new hash (after refresh) or this prior hash. */
+	priorSourceSha256?: string;
+	/** Per-key sha256 of the values written by an interrupted reconcile; the
+	 * resume recognizes a target matching a recorded repair value as the
+	 * reconcile's own write even after a further source edit. */
+	repairValueHashes?: Record<string, string>;
+	/** True once the reconcile's target repairs were actually applied (the
+	 * pending marker is rewritten after the CAS-protected apply succeeds);
+	 * only then are repairValueHashes treated as committed-write evidence. */
+	repairsApplied?: boolean;
+	/** Per-key sha256 of the target values BEFORE the interrupted reconcile's
+	 * repairs; the resume recognizes a repair value as committed when the
+	 * target CHANGED from this recorded state (even if the post-apply marker
+	 * rewrite was not reached). */
+	preRepairTargetHashes?: Record<string, string>;
+	completedAt?: string;
+};
 
 type SettingsPatch = {
 	readonly path: string;
@@ -1127,7 +1180,8 @@ export class Settings implements NotificationSettingsReader {
 		try {
 			if (this.#persist) {
 				this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
-				await this.#migrateFromLegacy();
+				await this.#migrateAgentDirAndDatabaseLegacy();
+				await this.#migrateConfigRootWorkflowSettings();
 				this.#global = await this.#loadYaml(this.#configPath!);
 			}
 			if (this.#schemaMigrationPending)
@@ -1405,7 +1459,7 @@ export class Settings implements NotificationSettingsReader {
 		logger.warn(`Settings: ${message}`);
 	}
 
-	async #migrateFromLegacy(): Promise<void> {
+	async #migrateAgentDirAndDatabaseLegacy(): Promise<void> {
 		if (!this.#configPath) return;
 
 		// Check if config.yml already exists
@@ -1455,6 +1509,1579 @@ export class Settings implements NotificationSettingsReader {
 				logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 			} catch {}
 		}
+	}
+
+	/**
+	 * One-time migration of the machine-global config-root `settings.json`
+	 * (`<configRoot>/settings.json`, normally `~/.gjc/settings.json`) workflow
+	 * keys into the default global agent `config.yml`. Runs only for the default
+	 * global agent scope, inside one critical section on the target config lock,
+	 * and migrates only the five workflow keys that the workflow runtimes read.
+	 *
+	 * The legacy config-root file is an orphan path: only the workflow runtimes
+	 * ever read it, and the earlier Settings migrations never covered it. Keeping
+	 * it read-only forever would leave two settings surfaces in conflict, so a
+	 * valid source is consumed exactly once (absent-only patches, no-clobber
+	 * `.bak`, durable sidecar marker) after which the runtimes' legacy fallback
+	 * still works for a user-recreated file.
+	 */
+	async #migrateConfigRootWorkflowSettings(): Promise<void> {
+		if (!this.#configPath) return;
+		// Strengthened pairing gate: only the default global agent scope may
+		// consume the machine-global source. A custom/temporary agentDir
+		// (`Settings.loadForScope` for SDK or tests) must never touch it.
+		if (!this.#isDefaultGlobalAgentScope()) return;
+
+		const source = path.resolve(getConfigRootDir(), "settings.json");
+		const backup = `${source}.bak`;
+		const markerPath = `${source}.migrated`;
+		const target = path.resolve(this.#configPath);
+		// If the config root is literally the agent dir, the agent-dir migration
+		// already owns this physical source; never double-rename it.
+		if (source === path.resolve(path.join(this.#agentDir, "settings.json"))) return;
+
+		// Short-circuit before touching the target config.yml: with no source,
+		// backup, or marker there is nothing to migrate, and entering the
+		// transaction would parse the target (aborting settings load on a
+		// malformed config.yml even when no migration is needed).
+		const preSourceExists = await this.#pathExists(source);
+		const preBackupExists = await this.#pathExists(backup);
+		const preMarkerExists = await this.#pathExists(markerPath);
+		if (!preSourceExists && !preBackupExists && !preMarkerExists) return;
+		try {
+			await withAtomicYamlConfigTransaction(target, async tx => {
+				// A config.yml written by a NEWER schema version is intentionally
+				// read-only across Settings; the migration runs before #loadYaml
+				// sets #futureSchemaVersion, so it must check the target schema
+				// itself and never patch it or consume the legacy source.
+				const targetSchemaVersion = (tx.root as Record<string, unknown> | null | undefined)?.configSchemaVersion;
+				if (typeof targetSchemaVersion === "number" && targetSchemaVersion > CONFIG_SCHEMA_VERSION) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration skipped: ${target} is a future config schema (configSchemaVersion ${targetSchemaVersion} > ${CONFIG_SCHEMA_VERSION})`,
+					);
+					return;
+				}
+				const markerFileExists = await this.#pathExists(markerPath);
+				let marker = await this.#readWorkflowMigrationMarker(markerPath);
+				// A structurally valid marker that points at different source/backup/
+				// target paths (e.g. the config root moved) must never suppress or
+				// shortcut the migration; treat it as invalid.
+				if (marker && !this.#workflowMigrationMarkerPathsMatch(marker, source, backup, target)) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration marker at ${markerPath} does not match the current source/backup/target paths; treating it as invalid`,
+					);
+					marker = null;
+				}
+				if (marker?.status === "complete") {
+					// The migration is complete only while the source still matches
+					// the marker hash. If the user edited/recreated the legacy
+					// source, the stale migration-owned target values must be
+					// reconciled with the current source (the resolver already
+					// reactivates the legacy layer on the hash mismatch, but the
+					// higher-precedence agent-config value would keep shadowing it).
+					let currentCompleteSourceHash: string | null = null;
+					try {
+						currentCompleteSourceHash = await this.#sha256File(source);
+					} catch (error) {
+						if (!isEnoent(error)) {
+							// A transient read failure (permissions/I-O) is NOT a
+							// deletion: leave everything unchanged so no
+							// configuration or recovery data is lost.
+							this.#warnLegacyFallbackMigration(
+								`Settings: could not re-read ${source} after migration; leaving source/backup/marker untouched`,
+							);
+							return;
+						}
+						// ENOENT = deleted after completion: honor the deletion by
+						// reverting ONLY the marker-owned target values that still
+						// match the migration's write (the backup copy); a newer
+						// `gjc config set` override is never reverted.
+						let deletionBackupDoc: Record<string, unknown> | null = null;
+						try {
+							// Read the backup ONCE: verify its hash and parse the
+							// SAME bytes (a second read could observe a different
+							// revision). A complete marker has no priorSourceSha256,
+							// so the two-hash check below equals the old
+							// sourceSha256-only basis.
+							const deletionBackupRead = await this.#readBackupBytes(backup);
+							const deletionBackupHash = createHash("sha256")
+								.update(Buffer.from(deletionBackupRead.bytes))
+								.digest("hex");
+							if (
+								deletionBackupHash !== marker.sourceSha256 &&
+								deletionBackupHash !== marker.priorSourceSha256
+							) {
+								this.#warnLegacyFallbackMigration(
+									`Settings: the migration backup ${backup} no longer matches the marker hash; leaving source/backup/marker untouched`,
+								);
+								return;
+							}
+							deletionBackupDoc = JSON.parse(deletionBackupRead.text) as Record<string, unknown>;
+						} catch {
+							this.#warnLegacyFallbackMigration(
+								`Settings: could not read the migration backup ${backup} for deletion recovery; leaving source/backup/marker untouched`,
+							);
+							return;
+						}
+						const unsets: AtomicYamlPatch[] = [];
+						const flatKeys: string[] = [];
+						for (const key of marker.migratedKeys) {
+							const targetValue = extractWorkflowSetting(tx.root, key, { flat: false });
+							const migratedValue = extractWorkflowSetting(deletionBackupDoc, key);
+							if (
+								targetValue.present &&
+								migratedValue.present &&
+								this.#coerceWorkflowScalar(key, migratedValue.value) === targetValue.value
+							) {
+								unsets.push({ path: key, op: "unset" });
+								if (Object.hasOwn(tx.root as Record<string, unknown>, key)) flatKeys.push(key);
+							}
+						}
+						await tx.applyPatchesAndRemoveTopLevelKeys(unsets, flatKeys);
+						await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+						await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow settings deleted after migration (${source}); stale marker-owned target values reverted, user overrides kept, backup removed, marker cleared`,
+						);
+						return;
+					}
+					if (currentCompleteSourceHash === marker.sourceSha256) return;
+					await this.#reconcileMigratedSource({
+						tx,
+						marker,
+						source,
+						backup,
+						markerPath,
+						target,
+						currentSourceHash: currentCompleteSourceHash,
+					});
+					return;
+				}
+
+				const sourceExists = await this.#pathExists(source);
+				const backupExists = await this.#pathExists(backup);
+
+				// Valid pending marker: crash-recovery proof only.
+				if (marker?.status === "pending") {
+					if (backupExists && !sourceExists) {
+						// The copy path NEVER removes the source, so its absence
+						// here is an external DELETION: honor it by reverting the
+						// marker-owned target values, removing the backup, and
+						// clearing the marker - instead of finalizing and silently
+						// restoring the deleted overrides.
+						const backupHash = await this.#sha256File(backup);
+						if (backupHash !== marker.sourceSha256 && backupHash !== marker.priorSourceSha256) {
+							this.#warnLegacyFallbackMigration(
+								`Settings: config-root workflow migration pending marker cannot be verified (${backup}); leaving for diagnosis/retry`,
+							);
+							return;
+						}
+						// A deletion during a reconcile transition (the backup still
+						// matches priorSourceSha256) must revert EVERY marker-owned
+						// target - the marker claims them as its repairs. In the
+						// fresh case (backup matches the marker hash) revert only
+						// the values still matching the migration write, preserving
+						// a newer `gjc config set` override.
+						// A deletion during a reconcile transition accepts the
+						// prior-hash backup, but only targets matching a verifiable
+						// migration write (the backup) are reverted: a target the
+						// user replaced after the transition cannot be verified
+						// (the repaired values' source is gone) and is preserved.
+						let deletionBackupDoc: Record<string, unknown> | null = null;
+						try {
+							const deletionBackupRead = await this.#readBackupBytes(backup);
+							const deletionBackupHash = createHash("sha256")
+								.update(Buffer.from(deletionBackupRead.bytes))
+								.digest("hex");
+							if (
+								deletionBackupHash !== marker.sourceSha256 &&
+								deletionBackupHash !== marker.priorSourceSha256
+							) {
+								this.#warnLegacyFallbackMigration(
+									`Settings: the migration backup ${backup} no longer matches the marker hash; leaving source/backup/marker untouched`,
+								);
+								return;
+							}
+							deletionBackupDoc = JSON.parse(deletionBackupRead.text) as Record<string, unknown>;
+						} catch {
+							this.#warnLegacyFallbackMigration(
+								`Settings: could not read the migration backup ${backup} for deletion recovery; leaving source/backup/marker untouched`,
+							);
+							return;
+						}
+						const markerOwnedUnsets: AtomicYamlPatch[] = [];
+						const markerFlatKeys: string[] = [];
+						for (const key of marker.migratedKeys) {
+							const targetValue = extractWorkflowSetting(tx.root, key, { flat: false });
+							if (!targetValue.present) continue;
+							const migratedValue = extractWorkflowSetting(deletionBackupDoc, key);
+							if (
+								(migratedValue.present &&
+									this.#coerceWorkflowScalar(key, migratedValue.value) === targetValue.value) ||
+								// A reconcile that COMMITTED its repairs left the recorded
+								// repair values in the target: the deletion must revert
+								// them too (they are migration writes, not user
+								// overrides). The repair is committed only when the
+								// post-apply flag is set (a mere change from the
+								// pre-repair state could be a coincidental user
+								// value).
+								(marker.repairValueHashes?.[key] !== undefined &&
+									createHash("sha256").update(JSON.stringify(targetValue.value)).digest("hex") ===
+										marker.repairValueHashes[key] &&
+									marker.repairsApplied === true)
+							) {
+								markerOwnedUnsets.push({ path: key, op: "unset" });
+								if (Object.hasOwn(tx.root as Record<string, unknown>, key)) markerFlatKeys.push(key);
+							}
+						}
+						await tx.applyPatchesAndRemoveTopLevelKeys(markerOwnedUnsets, markerFlatKeys);
+						await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+						await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration cleared: ${source} was deleted during pending recovery; marker-owned target values reverted, backup removed`,
+						);
+						return;
+					}
+					if (sourceExists && backupExists) {
+						const sourceStat = await fs.promises.stat(source).catch((error: unknown) => {
+							// Only ENOENT means absence; a transient permission/I-O
+							// failure must not be misread as a source edit (which
+							// would revert marker-owned values and remove recovery
+							// artifacts).
+							if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+							throw error;
+						});
+						const sourceHash = sourceStat ? await this.#sha256File(source) : "";
+						// Read the backup ONCE: the hash below and the edited-source
+						// parse use the SAME bytes (a second read could observe a
+						// different revision).
+						const pendingBackupRead = await this.#readBackupBytes(backup);
+						const backupHash = createHash("sha256").update(Buffer.from(pendingBackupRead.bytes)).digest("hex");
+						if (
+							(sourceHash === marker.sourceSha256 && backupHash !== marker.sourceSha256) ||
+							// The source was edited AGAIN during the transition: the
+							// backup still matches priorSourceSha256, which is
+							// evidence the reconcile is in progress - resume it
+							// against the CURRENT source.
+							(marker.priorSourceSha256 !== undefined && backupHash === marker.priorSourceSha256)
+						) {
+							// The reconcile recorded the CURRENT source hash in a
+							// PENDING marker: it was interrupted between the pending
+							// write and the COMPLETE marker (a crash or a backup
+							// failure). Resume it to completion.
+							await this.#reconcileMigratedSource({
+								tx,
+								marker,
+								source,
+								backup,
+								markerPath,
+								target,
+								currentSourceHash: sourceHash,
+							});
+							return;
+						}
+						if (sourceHash === marker.sourceSha256 && backupHash === marker.sourceSha256) {
+							// Interrupted no-replace move with the target already patched:
+							// the duplicate source is kept ACTIVE - a path-based unlink
+							// after the identity check could delete a rename-replaced
+							// file - and the resolver deactivates the migrated legacy
+							// layer while the source still matches the marker hash
+							// (reactivating it on later edits/recreates). Complete only
+							// when the target actually contains the migrated keys.
+							if (this.#workflowMigrationTargetSatisfies(tx.root, marker)) {
+								const targetIdentity = await this.#workflowMigrationTargetIdentity(target);
+								if (targetIdentity === null) {
+									this.#warnLegacyFallbackMigration(
+										`Settings: config-root workflow migration cannot publish completion because the target directory identity is unavailable; leaving source, backup, and marker pending`,
+									);
+								} else {
+									await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
+										...marker,
+										status: "complete",
+										priorSourceSha256: undefined,
+										repairValueHashes: undefined,
+										repairsApplied: undefined,
+										preRepairTargetHashes: undefined,
+										...targetIdentity,
+										completedAt: new Date().toISOString(),
+									});
+								}
+							} else {
+								this.#warnLegacyFallbackMigration(
+									`Settings: config-root workflow migration pending marker has matching source/backup but the target lacks the migrated keys; leaving source and backup untouched`,
+								);
+							}
+						} else {
+							if (backupHash === marker.sourceSha256 && sourceHash !== marker.sourceSha256) {
+								// The user EDITED the still-active source after the
+								// crash: revert ONLY the marker-owned target values
+								// that still match the migration's write (the backup
+								// copy); a newer `gjc config set` override is
+								// preserved. Remove the backup and the pending marker
+								// so the next load re-runs fresh against the edited
+								// source.
+								let editBackupDoc: Record<string, unknown> | null = null;
+								try {
+									// Parse the bytes already read and verified above
+									// (the branch requires backupHash ===
+									// marker.sourceSha256, a subset of the check here).
+									editBackupDoc = JSON.parse(pendingBackupRead.text) as Record<string, unknown>;
+								} catch {
+									this.#warnLegacyFallbackMigration(
+										`Settings: could not read the migration backup ${backup} for edited-source recovery; leaving source/backup/marker untouched`,
+									);
+									return;
+								}
+								const markerOwnedUnsets: AtomicYamlPatch[] = [];
+								const markerFlatKeys: string[] = [];
+								for (const key of marker.migratedKeys) {
+									const targetValue = extractWorkflowSetting(tx.root, key, { flat: false });
+									const migratedValue = extractWorkflowSetting(editBackupDoc, key);
+									if (
+										targetValue.present &&
+										migratedValue.present &&
+										this.#coerceWorkflowScalar(key, migratedValue.value) === targetValue.value
+									) {
+										markerOwnedUnsets.push({ path: key, op: "unset" });
+										if (Object.hasOwn(tx.root as Record<string, unknown>, key)) markerFlatKeys.push(key);
+									}
+								}
+								await tx.applyPatchesAndRemoveTopLevelKeys(markerOwnedUnsets, markerFlatKeys);
+								await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+								await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+								this.#warnLegacyFallbackMigration(
+									`Settings: config-root workflow migration pending marker source edited after a crash; stale marker-owned target values reverted, user overrides kept, backup removed, marker cleared`,
+								);
+							} else {
+								this.#warnLegacyFallbackMigration(
+									`Settings: config-root workflow migration pending marker has both source and backup with mismatched hashes; leaving untouched`,
+								);
+							}
+						}
+						return;
+					}
+					if (!sourceExists && !backupExists) {
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration pending marker without source or backup; leaving for diagnosis`,
+						);
+						return;
+					}
+					// pending | yes | no — fall through and re-run the idempotent fresh
+					// transaction (absent-only patches make re-application harmless).
+				} else if (sourceExists && backupExists) {
+					// Absent/invalid marker with a pre-existing backup is ambiguous;
+					// never consume or overwrite either file.
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration found pre-existing ${backup} without a valid marker; leaving source and backup untouched`,
+					);
+					return;
+				} else if (!sourceExists && backupExists) {
+					// Orphan backup: values may already be in the target; keep both
+					// recoverable and never infer completion from the backup alone.
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration found orphan backup ${backup} without a marker; leaving it untouched`,
+					);
+					return;
+				} else if (!sourceExists && !backupExists) {
+					return;
+				}
+
+				// Fresh transaction (or pending | yes | no re-run): source exists,
+				// backup absent. All steps run under the target config lock.
+				let sourceRaw: string;
+				try {
+					sourceRaw = await Bun.file(source).text();
+				} catch {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration could not read ${source}; leaving untouched`,
+					);
+					return;
+				}
+				const sourceSha256 = createHash("sha256").update(sourceRaw).digest("hex");
+				let sourceDoc: unknown;
+				try {
+					sourceDoc = JSON.parse(sourceRaw);
+				} catch {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration found malformed JSON in ${source}; leaving source/backup/marker unchanged`,
+					);
+					return;
+				}
+				// A `null` document root is malformed per the strict resolver (exit
+				// 2); the migration must not consume it (empty keys + .bak +
+				// complete marker would silently default). Leave the source active
+				// so the strict failure stays loud.
+				if (
+					sourceDoc === null ||
+					sourceDoc === undefined ||
+					typeof sourceDoc !== "object" ||
+					Array.isArray(sourceDoc)
+				) {
+					// A `null`/non-object root is malformed per the strict resolver
+					// (exit 2); the migration must not consume it (empty keys +
+					// .bak + complete marker would silently default). Under a
+					// changed-pending recovery (crash after the patch, before the
+					// backup), clear the stale marker-owned target patches so the
+					// malformed source is visible to strict ralplan instead of
+					// being shadowed by the old agent value.
+					// Only clear patches when a backup verifies they are still the
+					// migration write; without one the target values may be newer
+					// overrides and must be preserved.
+					if (marker?.status === "pending" && backupExists) {
+						// A malformed source cannot establish ownership of the target
+						// values. Verify and parse the backup bytes that the marker records
+						// before clearing anything; a post-crash user override must survive.
+						let staleBackupDoc: Record<string, unknown>;
+						try {
+							const staleBackupRead = await this.#readBackupBytes(backup);
+							const staleBackupHash = createHash("sha256")
+								.update(Buffer.from(staleBackupRead.bytes))
+								.digest("hex");
+							if (staleBackupHash !== marker.sourceSha256 && staleBackupHash !== marker.priorSourceSha256) {
+								this.#warnLegacyFallbackMigration(
+									`Settings: the migration backup ${backup} no longer matches the marker hash; leaving source/backup/marker untouched`,
+								);
+								return;
+							}
+							const parsedBackup = JSON.parse(staleBackupRead.text) as unknown;
+							if (!parsedBackup || typeof parsedBackup !== "object" || Array.isArray(parsedBackup)) {
+								this.#warnLegacyFallbackMigration(
+									`Settings: the migration backup ${backup} has a non-mapping root; leaving source/backup/marker untouched`,
+								);
+								return;
+							}
+							staleBackupDoc = parsedBackup as Record<string, unknown>;
+						} catch {
+							this.#warnLegacyFallbackMigration(
+								`Settings: could not read the migration backup ${backup} for malformed-source recovery; leaving source/backup/marker untouched`,
+							);
+							return;
+						}
+						const staleUnsets: AtomicYamlPatch[] = [];
+						const staleFlatKeys: string[] = [];
+						for (const key of marker.migratedKeys) {
+							const targetValue = extractWorkflowSetting(tx.current, key, { flat: false });
+							if (!targetValue.present) continue;
+							const backupValue = extractWorkflowSetting(staleBackupDoc, key);
+							const targetHash = createHash("sha256").update(JSON.stringify(targetValue.value)).digest("hex");
+							const migrationOwned =
+								(backupValue.present &&
+									this.#coerceWorkflowScalar(key, backupValue.value) === targetValue.value) ||
+								(marker.repairsApplied === true &&
+									marker.repairValueHashes?.[key] !== undefined &&
+									targetHash === marker.repairValueHashes[key]);
+							if (!migrationOwned) continue;
+							staleUnsets.push({ path: key, op: "unset" });
+							if (Object.hasOwn(tx.current as Record<string, unknown>, key)) staleFlatKeys.push(key);
+						}
+						await tx.applyPatchesAndRemoveTopLevelKeys(staleUnsets, staleFlatKeys);
+					}
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration found a malformed root in ${source}; leaving source/backup/marker unchanged`,
+					);
+					return;
+				}
+				// A `null`/`~` YAML root is treated by #loadYaml as a malformed
+				// config (settings stay read-only until repaired), so the migration
+				// must treat it like the other non-object roots: abort without
+				// writing or consuming the legacy source.
+				if (tx.root !== undefined && (tx.root === null || typeof tx.root !== "object" || Array.isArray(tx.root))) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration target ${target} has a non-object or null YAML root; not migrating`,
+					);
+					return;
+				}
+				const targetDoc = tx.root === undefined ? {} : (tx.root as Record<string, unknown>);
+				const migratedKeys: WorkflowSettingKey[] = [];
+				const patches: AtomicYamlPatch[] = [];
+				const flatKeysToRemove: string[] = [];
+				// A pending marker means a crashed run may have left a STALE patch
+				// in the target; if the source changed since that marker, the stale
+				// target value must not suppress the key (it would shadow the edit
+				// and move it to .bak). Reapply the current source value over it.
+				const stalePendingOverride = marker?.status === "pending" && sourceSha256 !== marker.sourceSha256;
+				for (const key of CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS) {
+					// Only keys the crashed run actually recorded are migration-owned
+					// in the changed-pending window: they may be reapplied, unset, or
+					// overridden by the current source, but a key the marker did NOT
+					// record was skipped because config.yml already held a valid
+					// higher-precedence user value, which must never be clobbered.
+					const staleMarkerKey = stalePendingOverride && marker?.migratedKeys.includes(key);
+					const extracted = extractWorkflowSetting(sourceDoc, key);
+					if (extracted.malformedParent) {
+						// A non-mapping workflow parent in the source (e.g.
+						// `{"gjc":{"ralplan":"broken"}}`) is malformed legacy JSON
+						// that strict ralplan must fail on (exit 2); completing the
+						// migration would deactivate the source and silently use
+						// defaults. Under a changed-pending recovery (crash after
+						// the patch), first clear the stale marker-owned target
+						// patches so the malformed source is visible to strict
+						// ralplan instead of being shadowed by the old agent value.
+						// Clear ONLY targets that match a verifiable migration write:
+						// the backup (the migration's copy) or a committed repair
+						// hash (repairsApplied). A target the user replaced after
+						// the crash is a genuine override and must not be cleared
+						// merely because the source is now malformed.
+						if (marker?.status === "pending") {
+							const staleBackupDoc = backupExists
+								? (JSON.parse(await Bun.file(backup).text()) as unknown as Record<string, unknown>)
+								: null;
+							const staleUnsets: AtomicYamlPatch[] = [];
+							const staleFlatKeys: string[] = [];
+							for (const ownedKey of marker.migratedKeys) {
+								const ownedValue = extractWorkflowSetting(tx.current, ownedKey, { flat: false });
+								if (!ownedValue.present) continue;
+								const ownedBackupValue = staleBackupDoc
+									? extractWorkflowSetting(staleBackupDoc, ownedKey)
+									: { present: false, value: undefined };
+								const ownedHash = createHash("sha256").update(JSON.stringify(ownedValue.value)).digest("hex");
+								const verifiable =
+									(ownedBackupValue.present &&
+										this.#coerceWorkflowScalar(ownedKey, ownedBackupValue.value) === ownedValue.value) ||
+									(marker.repairsApplied === true &&
+										marker.repairValueHashes?.[ownedKey] !== undefined &&
+										ownedHash === marker.repairValueHashes[ownedKey]);
+								if (verifiable) {
+									staleUnsets.push({ path: ownedKey, op: "unset" });
+									if (Object.hasOwn(tx.current as Record<string, unknown>, ownedKey)) {
+										staleFlatKeys.push(ownedKey);
+									}
+								}
+							}
+							await tx.applyPatchesAndRemoveTopLevelKeys(staleUnsets, staleFlatKeys);
+						}
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration aborted: ${source} has a non-mapping parent for ${key}; leaving source/backup/marker unchanged`,
+						);
+						return;
+					}
+					if (!extracted.present) {
+						// A key the user REMOVED from the source (after a crash that
+						// had already patched config.yml) should drop its stale
+						// target value, so the deletion is honored. But ownership is
+						// verifiable only against the migration's backup copy: in
+						// the pending no-backup recovery the target value may be a
+						// NEWER `gjc config set` override, so never unset it
+						// blindly - leave it and warn.
+						if (staleMarkerKey && extractWorkflowSetting(targetDoc, key, { flat: false }).present) {
+							if (backupExists) {
+								patches.push({ path: key, op: "unset" });
+								if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
+							} else {
+								// Ownership is unverifiable: abort the recovery (the
+								// source stays active) instead of completing with the
+								// key omitted from migratedKeys, which would
+								// deactivate the edited source and leave the stale
+								// target effective permanently.
+								this.#warnLegacyFallbackMigration(
+									`Settings: config-root workflow migration aborted: ${key} removed from ${source} but its target value cannot be verified as the migration write (no backup); keeping the source active`,
+								);
+								return;
+							}
+						}
+						continue;
+					}
+					// A *valid* present target value for this key wins: the legacy
+					// config-root value (valid or not) is never observed by the
+					// resolver, so skip this key entirely instead of aborting the
+					// whole migration over a stale overridden value (unless the
+					// target itself holds a stale patch for a marker-recorded key -
+					// see above).
+					const targetValue = extractWorkflowSetting(targetDoc, key, { flat: false });
+					if (targetValue.malformedParent) {
+						// A non-object intermediate in config.yml (e.g.
+						// `gjc: { ralplan: "repair-me" }`) is malformed user data
+						// that #loadYaml would report for repair; writing the
+						// migrated value would silently replace it. Abort and leave
+						// everything untouched.
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration aborted: ${target} has a non-mapping parent for ${key}; leaving source/backup/marker untouched`,
+						);
+						return;
+					}
+					if (targetValue.present && this.#workflowKeyValueIsValid(key, targetValue.value)) {
+						// A *valid* present target value wins unless the key is a
+						// stale marker-owned key under a changed-pending recovery
+						// (staleMarkerKey), where the current source value must be
+						// reapplied over the stale patch below.
+						if (!staleMarkerKey) {
+							// Retry (unchanged source) or a genuine user value:
+							// still schedule the flat-form cleanup for marker-owned
+							// keys so a dotted top-level key left by a crash between
+							// applyPatches and removeTopLevelKeys does not keep
+							// config.yml rejected by the generated schema - and keep
+							// the key in the rebuilt migratedKeys so ownership
+							// survives the marker rewrite.
+							if (marker?.migratedKeys.includes(key)) {
+								if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
+								if (!migratedKeys.includes(key)) migratedKeys.push(key);
+							}
+							continue;
+						}
+					}
+					// Validate the legacy value BEFORE migrating it. An invalid
+					// tolerant value (e.g. `"gjc.ultragoal.nudgeBudget": "bad"`)
+					// must not be copied into the durable config.yml, where
+					// Settings.load()/config doctor would report it on every
+					// startup (previously the tolerant runtime simply ignored it
+					// in settings.json and fell back to the default).
+					if (!this.#workflowKeyValueIsValid(key, extracted.value)) {
+						if (
+							staleMarkerKey &&
+							backupExists &&
+							extractWorkflowSetting(targetDoc, key, { flat: false }).present
+						) {
+							// Changed-pending recovery: unset the stale crashed patch
+							// for a marker-recorded key so the current source value
+							// (valid or invalid, tolerant or strict) is honored -
+							// never leave a stale target value shadowing it.
+							patches.push({ path: key, op: "unset" });
+							if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
+						}
+						// Strict ralplan keys must keep the legacy source active only
+						// when the invalid value would actually be the winning layer:
+						// consuming it would silently fall back to defaults instead of
+						// failing loudly (the strict resolver throws exit 2 on the
+						// invalid value). Tolerant keys are simply skipped.
+						if (key.startsWith("gjc.ralplan.")) {
+							// If the unset above was queued, apply it so the invalid
+							// legacy source is visible (exit 2) instead of being
+							// shadowed by the stale valid target value.
+							if (
+								staleMarkerKey &&
+								backupExists &&
+								extractWorkflowSetting(targetDoc, key, { flat: false }).present
+							) {
+								patches.push({ path: key, op: "unset" });
+								if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
+							}
+							// Apply ALL queued repairs (earlier keys' unsets and this
+							// key's unset) before aborting, so no stale target value
+							// for any marker-recorded key survives in config.yml.
+							// Only under a changed-pending recovery: in a FRESH
+							// migration the queued patches are plain SETs for valid
+							// keys, and applying them on an abort would write
+							// un-marker'd partial artifacts that the target-wins
+							// rule would freeze.
+							if (stalePendingOverride) {
+								// Apply only MARKER-OWNED repairs: fresh SETs for
+								// unrecorded keys must not be committed on an abort
+								// (the marker does not own them; committing would
+								// shadow later source edits forever via the
+								// valid-target guard).
+								const repairPatches = patches.filter(patch =>
+									marker?.migratedKeys.includes(patch.path as WorkflowSettingKey),
+								);
+								const repairFlatKeys = flatKeysToRemove.filter(key =>
+									marker?.migratedKeys.includes(key as WorkflowSettingKey),
+								);
+								// One atomic write for the repairs + flat cleanup.
+								if (repairPatches.length > 0 || repairFlatKeys.length > 0) {
+									await tx.applyPatchesAndRemoveTopLevelKeys(repairPatches, repairFlatKeys);
+								}
+							}
+							this.#warnLegacyFallbackMigration(
+								`Settings: config-root workflow migration aborted: invalid strict ralplan value for ${key} in ${source}; keeping the legacy source active so gjc ralplan still fails loudly`,
+							);
+							return;
+						}
+						continue;
+					}
+					// The changed-pending REAPPLY overwrites a present target value;
+					// without a backup the migration write is unverifiable and the
+					// target may be an editor's newer value. Abort the recovery
+					// (keeping the source active) instead of completing with the
+					// key omitted from migratedKeys, which would deactivate the
+					// edited source and leave the stale target effective forever.
+					if (stalePendingOverride && marker?.migratedKeys.includes(key) && targetValue.present && !backupExists) {
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration aborted: ${key} reapplied by the source but its target value cannot be verified as the migration write (no backup); keeping the source active`,
+						);
+						return;
+					}
+					migratedKeys.push(key);
+					// Persist the COERCED value (quoted numeric string -> number), not
+					// the raw string: a schema-backed config.yml must hold values the
+					// generated JSON schema accepts and Settings does not need to
+					// re-coerce on every load.
+					patches.push({ path: key, op: "set", value: this.#coerceWorkflowScalar(key, extracted.value) });
+					// Flat keys are checked before nested ones by
+					// extractWorkflowSetting, so an invalid flat key (e.g.
+					// `"gjc.ralplan.maxIterations": bad`) would keep masking the
+					// migrated nested value after the legacy source is moved to .bak.
+					// Remove the flat form verbatim (the patch grammar cannot address
+					// dotted top-level key names).
+					if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
+				}
+
+				// An invalid/untrusted marker must never suppress migration. Preserve
+				// its bytes by a no-clobber quarantine; abort if quarantine is
+				// impossible. (A malformed marker parses to null, so the file's
+				// existence is the signal, not a non-null marker object.)
+				if (markerFileExists && marker === null) {
+					const corruptPath = `${markerPath}.corrupt`;
+					if (!(await this.#moveLegacySourceNoReplace(markerPath, corruptPath))) {
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration could not quarantine invalid marker ${markerPath}; leaving unchanged`,
+						);
+						return;
+					}
+				}
+
+				const startedAt =
+					marker?.status === "pending" && typeof marker.startedAt === "string"
+						? marker.startedAt
+						: new Date().toISOString();
+				await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
+					version: WORKFLOW_MIGRATION_MARKER_VERSION,
+					status: "pending",
+					sourcePath: source,
+					backupPath: backup,
+					targetPath: target,
+					sourceSha256,
+					migratedKeys,
+					startedAt,
+				});
+
+				// The legacy source may have been edited since `sourceSha256` was
+				// computed and the patches built. Re-hash BEFORE writing anything so
+				// a stale patch never lands in the higher-precedence config.yml,
+				// and snapshot the target so a late mismatch can revert it.
+				if ((await this.#sha256File(source)) !== sourceSha256) {
+					// Nothing was patched by THIS run: the pending marker's
+					// migratedKeys would falsely claim ownership of these patches
+					// on the next changed-pending recovery (staleMarkerKey),
+					// letting it overwrite a valid user target override. Remove it
+					// so the next load starts fresh - but ONLY when no marker
+					// existed before this run: a PRIOR run that already patched
+					// config.yml left that marker as the only evidence its target
+					// values are migration-written, so it must be retained.
+					if (!marker) {
+						await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+					}
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: ${source} changed during migration; marker ${marker ? "retained" : "cleared"}, source left active for the next load`,
+					);
+					return;
+				}
+				const prePatchTargetSnapshot = structuredClone(tx.current);
+				// Apply the nested patches AND the flat-form cleanup in a single
+				// atomic write: two separate writes would let an external editor's
+				// config.yml change (which does not participate in the file lock)
+				// land between them and be overwritten.
+				await tx.applyPatchesAndRemoveTopLevelKeys(patches, flatKeysToRemove);
+
+				// Re-hash immediately before the no-replace move; on mismatch, revert
+				// the target to its pre-patch state so the next load re-runs against
+				// the current file instead of resolving a stale agent-config value.
+				let preMoveSourceHash: string | null = null;
+				try {
+					preMoveSourceHash = await this.#sha256File(source);
+				} catch {
+					// The source was deleted after the patch: revert the target and
+					// clear the now-obsolete marker so the deletion is honored (the
+					// later post-copy deletion path does the same).
+					await tx.replaceCurrent(prePatchTargetSnapshot);
+					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: ${source} was deleted during migration; target reverted, backup removed, marker cleared`,
+					);
+					return;
+				}
+				if (preMoveSourceHash !== sourceSha256) {
+					await tx.replaceCurrent(prePatchTargetSnapshot);
+					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: ${source} changed during migration; target reverted, backup removed, marker cleared`,
+					);
+					return;
+				}
+				if (!(await this.#moveLegacySourceNoReplace(source, backup, sourceSha256))) {
+					// The target was already patched; revert it so the higher
+					// precedence config.yml does not shadow the still-active source
+					// (a `.bak` that appeared in the window would otherwise leave
+					// the pending yes/yes recovery row warning on mismatch forever).
+					await tx.replaceCurrent(prePatchTargetSnapshot);
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration could not move ${source} to ${backup} without overwrite; target reverted, pending marker retained for retry`,
+					);
+					return;
+				}
+
+				// The source may have been edited in the narrow window after the
+				// pre-move check but before/during the move; verify the bytes we
+				// actually moved. The source is kept ACTIVE on every path, so on
+				// mismatch the edit is already live: revert the target and remove
+				// the now-superseded backup so the next load sees pending + source
+				// + no backup and re-runs the fresh transaction against the edited
+				// file (never completing behind a stale hash).
+				if ((await this.#sha256File(backup)) !== sourceSha256) {
+					await tx.replaceCurrent(prePatchTargetSnapshot);
+					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: ${source} changed during migration; target reverted, backup removed, source left active for the next load`,
+					);
+					return;
+				}
+				// On the copy fallback (filesystems without hard links) the source
+				// is deliberately kept ACTIVE, so a same-key edit after the copy is
+				// shadowed by the higher-precedence patched config.yml; verify the
+				// source (absent = externally deleted) and revert on
+				// mismatch, removing the now-superseded backup so the next load
+				// sees pending + source + no backup and re-runs the fresh
+				// transaction against the edited file.
+				let sourceHashAfterMove: string | null = null;
+				try {
+					sourceHashAfterMove = await this.#sha256File(source);
+				} catch (error) {
+					// The source is kept ACTIVE on every path, so ENOENT can only be
+					// a concurrent DELETION of the legacy file: honor it by undoing
+					// the patch and backup and clearing the pending marker (there is
+					// nothing left to migrate), instead of completing behind the old
+					// values and silently undoing the deletion.
+					if (isEnoent(error)) {
+						await tx.replaceCurrent(prePatchTargetSnapshot);
+						await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+						await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration aborted: ${source} was deleted during migration; target reverted, backup removed, marker cleared`,
+						);
+						return;
+					}
+					// Non-ENOENT read failure: fail closed (revert + retain
+					// pending) rather than completing behind a possibly-edited
+					// source.
+					await tx.replaceCurrent(prePatchTargetSnapshot);
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: could not re-read ${source} after the move; target reverted, pending marker retained`,
+					);
+					return;
+				}
+				if (sourceHashAfterMove !== null && sourceHashAfterMove !== sourceSha256) {
+					await tx.replaceCurrent(prePatchTargetSnapshot);
+					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: ${source} edited after the copy; target reverted, backup removed, source left active for the next load`,
+					);
+					return;
+				}
+
+				const targetIdentity = await this.#workflowMigrationTargetIdentity(target);
+				if (targetIdentity === null) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration cannot publish completion because the target directory identity is unavailable; leaving source, backup, and marker pending`,
+					);
+					return;
+				}
+				await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
+					version: WORKFLOW_MIGRATION_MARKER_VERSION,
+					status: "complete",
+					sourcePath: source,
+					backupPath: backup,
+					targetPath: target,
+					...targetIdentity,
+					sourceSha256,
+					migratedKeys,
+					startedAt,
+					completedAt: new Date().toISOString(),
+				});
+				logger.debug("Settings: migrated config-root workflow settings to config.yml", {
+					source,
+					target,
+					migratedKeys,
+				});
+			});
+		} catch (error) {
+			// A CAS rejection means an external editor changed config.yml before
+			// any patch of this run applied: a pending marker's migratedKeys
+			// would falsely claim ownership of never-applied patches, so clear it
+			// A CAS rejection means an external editor changed config.yml before a
+			// write of THIS run applied. The pending marker is RETAINED: in a
+			// changed-pending recovery the prior run already patched config.yml
+			// and the marker is the only evidence that the existing target value
+			// is migration-written - clearing it would let the stale value pass
+			// the valid-target guard and complete with the key omitted. (A
+			// retained marker whose claims were never applied is handled safely
+			// by the unverifiable-ownership abort, which keeps the source active.)
+			if (error instanceof AtomicYamlConflictError) {
+				this.#warnLegacyFallbackMigration(
+					`Settings: config-root workflow migration aborted: ${target} changed externally during migration; pending marker retained`,
+				);
+				return;
+			}
+			// A malformed target config.yml must not abort settings load: warn and
+			// leave source/backup/marker untouched so #loadYaml's recoverable
+			// malformed-config diagnostics still run after the migration returns.
+			this.#warnLegacyFallbackMigration(
+				`Settings: config-root workflow migration could not run against ${target}: ${error instanceof Error ? error.message : String(error)}; leaving source/backup/marker untouched`,
+			);
+		}
+	}
+
+	async #reconcileMigratedSource(params: {
+		tx: AtomicYamlConfigTransaction;
+		marker: WorkflowMigrationMarker;
+		source: string;
+		backup: string;
+		markerPath: string;
+		target: string;
+		currentSourceHash: string;
+	}): Promise<void> {
+		let { tx, marker, source, backup, markerPath, target, currentSourceHash } = params;
+		// The source changed after completion: validate its root before
+		// reconciling - a malformed root (null/array) must not be
+		// accepted as a settings mapping (strict ralplan fails on it).
+		let currentSourceText: string;
+		try {
+			currentSourceText = await Bun.file(source).text();
+			// Bind the marker hash to the bytes ACTUALLY read (the editor
+			// may have saved between the earlier #sha256File and this
+			// read): the backup and marker must describe the same text.
+			currentSourceHash = createHash("sha256").update(currentSourceText).digest("hex");
+		} catch (error) {
+			// Only a DELETED source (ENOENT) is left untouched; a transient
+			// EACCES/EIO read failure propagates so the recovery never
+			// misreads the source state.
+			if (!isEnoent(error)) throw error;
+			this.#warnLegacyFallbackMigration(
+				`Settings: could not read ${source} for re-migration; leaving source/backup/marker untouched`,
+			);
+			return;
+		}
+		let currentSourceDoc: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(currentSourceText) as unknown;
+			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+				this.#warnLegacyFallbackMigration(
+					`Settings: ${source} changed after migration to a non-mapping root; leaving source/backup/marker untouched (strict ralplan fails on it)`,
+				);
+				return;
+			}
+			currentSourceDoc = parsed as Record<string, unknown>;
+		} catch {
+			this.#warnLegacyFallbackMigration(
+				`Settings: could not parse ${source} for re-migration; leaving source/backup/marker untouched`,
+			);
+			return;
+		}
+		let backupDoc: Record<string, unknown> | null = null;
+		try {
+			// The backup must hash to the marker's sourceSha256 (the OLD
+			// ownership basis after refresh) OR to the marker's priorSourceSha256
+			// (the migration-write basis when the reconcile is resumed before its
+			// backup refresh). Accepting an arbitrary refreshed backup would let
+			// an interrupted refresh reclassify a user's target override as
+			// migration-owned; only these two recorded hashes are accepted.
+			const reconcileBackupRaw = await Bun.file(backup).arrayBuffer();
+			const reconcileBackupHash = createHash("sha256").update(Buffer.from(reconcileBackupRaw)).digest("hex");
+			if (reconcileBackupHash !== marker.sourceSha256 && reconcileBackupHash !== marker.priorSourceSha256) {
+				this.#warnLegacyFallbackMigration(
+					`Settings: the migration backup ${backup} no longer matches the marker hash; leaving source/backup/marker untouched`,
+				);
+				return;
+			}
+			// Parse the SAME bytes that were verified (a second read could observe
+			// a different revision).
+			backupDoc = JSON.parse(Buffer.from(reconcileBackupRaw).toString("utf8")) as Record<string, unknown>;
+		} catch {
+			// No usable backup: cannot verify what the migration wrote;
+			// leave everything unchanged.
+			this.#warnLegacyFallbackMigration(
+				`Settings: could not read the migration backup ${backup}; leaving source/backup/marker untouched`,
+			);
+			return;
+		}
+		// Reconcile EVERY supported workflow key: marker-recorded keys
+		// (only when the target still matches the migration's write) and
+		// keys newly added to the source after completion (copied when
+		// the target has no value for them).
+		const repairPatches: AtomicYamlPatch[] = [];
+		const newlyPropagatedKeys: WorkflowSettingKey[] = [];
+		// Marker-owned keys whose target STILL matches the old migration
+		// write (the backup): a target the user changed after migration
+		// loses migration ownership.
+		const retainedOwnedKeys: WorkflowSettingKey[] = [];
+		const repairFlatKeys: string[] = [];
+		for (const key of CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS) {
+			const sourceValue = extractWorkflowSetting(currentSourceDoc, key);
+			if (sourceValue.malformedParent) {
+				// A non-mapping workflow parent (e.g. `gjc.ralplan:
+				// "broken"`) hides EVERY sibling under it, so strict
+				// ralplan must fail on the malformed explicit source.
+				// Clear ALL marker-owned targets under the malformed
+				// parent prefix that still match the migration's write,
+				// and DROP the accumulated repairs (they were never
+				// committed, so committing them here would leave
+				// ownership evidence inconsistent).
+				const malformedPrefix = key.split(".").slice(0, -1).join(".");
+				const malformedUnsets: AtomicYamlPatch[] = [];
+				const malformedFlatKeys: string[] = [];
+				for (const ownedKey of marker.migratedKeys) {
+					if (!ownedKey.startsWith(`${malformedPrefix}.`) && ownedKey !== malformedPrefix) continue;
+					const staleTarget = extractWorkflowSetting(tx.root, ownedKey, { flat: false });
+					const backupVal = extractWorkflowSetting(backupDoc, ownedKey);
+					if (
+						staleTarget.present &&
+						backupVal.present &&
+						this.#coerceWorkflowScalar(ownedKey, backupVal.value) === staleTarget.value
+					) {
+						malformedUnsets.push({ path: ownedKey, op: "unset" });
+						if (Object.hasOwn(tx.root as Record<string, unknown>, ownedKey)) {
+							malformedFlatKeys.push(ownedKey);
+						}
+					}
+				}
+				if (malformedUnsets.length > 0 || malformedFlatKeys.length > 0) {
+					await tx.applyPatchesAndRemoveTopLevelKeys(malformedUnsets, malformedFlatKeys);
+				}
+				this.#warnLegacyFallbackMigration(
+					`Settings: ${source} has a non-mapping parent for ${key} after migration; stale marker-owned values cleared, source/backup/marker left active (strict ralplan fails on it)`,
+				);
+				return;
+			}
+			const markerRecorded = marker.migratedKeys.includes(key);
+			const targetValue = extractWorkflowSetting(tx.root, key, { flat: false });
+			const migratedValue = markerRecorded
+				? extractWorkflowSetting(backupDoc, key)
+				: { present: false, value: undefined };
+			const targetIsMigrationWrite =
+				markerRecorded &&
+				targetValue.present &&
+				// The reconcile's own write is proven by the recorded repair value
+				// (repairValueHashes) or the migration-write backup - NOT by
+				// equality with the CURRENT source, which a later source edit or a
+				// coincidental user value could match.
+				((migratedValue.present && this.#coerceWorkflowScalar(key, migratedValue.value) === targetValue.value) ||
+					// A target matching a value an interrupted reconcile recorded
+					// (repairValueHashes) is its own write ONLY when the post-apply
+					// flag is set: a target that merely CHANGED from the pre-repair
+					// state could be a coincidental user value (an external
+					// `gjc config set` before the repair's CAS), so the change
+					// alone does not prove the reconcile wrote it.
+					(marker.repairValueHashes?.[key] !== undefined &&
+						createHash("sha256").update(JSON.stringify(targetValue.value)).digest("hex") ===
+							marker.repairValueHashes[key] &&
+						marker.repairsApplied === true));
+			if (targetIsMigrationWrite) retainedOwnedKeys.push(key);
+			if (sourceValue.present) {
+				// Never copy an invalid edited value into config.yml. For
+				// a STRICT ralplan key, also clear the stale
+				// migration-write target so the invalid source is visible
+				// to strict ralplan (exit 2) instead of being shadowed;
+				// tolerant keys keep the migration-write (the tolerant
+				// runtime ignores the invalid value and falls back).
+				if (!this.#workflowKeyValueIsValid(key, sourceValue.value)) {
+					if (key.startsWith("gjc.ralplan.") && targetIsMigrationWrite) {
+						const clearKeys = Object.hasOwn(tx.root as Record<string, unknown>, key) ? [key] : [];
+						await tx.applyPatchesAndRemoveTopLevelKeys([{ path: key, op: "unset" }], clearKeys);
+					}
+					this.#warnLegacyFallbackMigration(
+						`Settings: ${source} has an invalid value for ${key} after migration; leaving source/backup/marker untouched (strict ralplan fails on it)`,
+					);
+					return;
+				}
+				// Copy when the target still holds the migration write, or
+				// when the key was never migrated / is absent from the
+				// target. A target value that merely EQUALS the source is
+				// not reclaimed as migration-owned (it may be a user
+				// override that happens to match).
+				if (targetIsMigrationWrite || !targetValue.present) {
+					// A stale migration-write (reapply the current source
+					// value), a NEWLY ADDED key with no target value, or a
+					// deleted-and-readded key (target absent again) all
+					// copy the current source value. A marker-recorded key
+					// copied back into an absent target REMAINS owned.
+					if (markerRecorded) retainedOwnedKeys.push(key);
+					repairPatches.push({
+						path: key,
+						op: "set",
+						value: this.#coerceWorkflowScalar(key, sourceValue.value),
+					});
+					if (Object.hasOwn(tx.root as Record<string, unknown>, key)) repairFlatKeys.push(key);
+					if (!markerRecorded) newlyPropagatedKeys.push(key);
+				}
+				// else: the user edited the target; keep it.
+			} else if (targetIsMigrationWrite && targetValue.present) {
+				// The user removed the key from the source AND the
+				// target still holds the migration's value: honor the
+				// deletion.
+				repairPatches.push({ path: key, op: "unset" });
+				if (Object.hasOwn(tx.root as Record<string, unknown>, key)) repairFlatKeys.push(key);
+			}
+		}
+		// Record the reconcile in a PENDING marker FIRST (new hash + keys +
+		// the written repair values): a crash or backup failure between here
+		// and the COMPLETE marker leaves a pending state that the next load
+		// resumes, so ownership of the reconcile-copied keys survives partial
+		// writes - and the resume can recognize a target matching a recorded
+		// repair value even after a further source edit.
+		const repairValueHashes: Record<string, string> = {};
+		for (const patch of repairPatches) {
+			if (patch.op === "set") {
+				repairValueHashes[patch.path] = createHash("sha256").update(JSON.stringify(patch.value)).digest("hex");
+			}
+		}
+		// The prior basis must be the DURABLE backup hash (a resumed pass's
+		// marker.sourceSha256 may describe a source the backup never saw).
+		// The target BEFORE the repairs is the durable basis for recognizing a
+		// committed repair when the post-apply marker rewrite is not reached.
+		// Record pre-repair evidence for EVERY repair patch: newly propagated
+		// and re-added keys are absent before the apply, so they get an explicit
+		// absent sentinel - any present target then proves the repair committed.
+		const preRepairTargetHashes: Record<string, string> = {};
+		for (const patch of repairPatches) {
+			if (patch.op !== "set") continue;
+			const preRepairValue = extractWorkflowSetting(tx.current, patch.path as WorkflowSettingKey, { flat: false });
+			preRepairTargetHashes[patch.path] = preRepairValue.present
+				? createHash("sha256").update(JSON.stringify(preRepairValue.value)).digest("hex")
+				: "absent";
+		}
+		const durableBackupHash = await this.#sha256File(backup);
+		// Pre-apply state: repair hashes describe the PROPOSED write but are not
+		// ownership evidence yet. A crash here must leave a matching external
+		// user value as a genuine override, not claim that this reconcile wrote it.
+		// The marker is rewritten with repairsApplied only after the target CAS
+		// write succeeds.
+		const pendingRepairMarker: WorkflowMigrationMarker = {
+			...marker,
+			status: "pending",
+			priorSourceSha256: durableBackupHash,
+			preRepairTargetHashes,
+			repairValueHashes,
+			repairsApplied: false,
+			sourceSha256: currentSourceHash,
+			migratedKeys: [...new Set([...retainedOwnedKeys, ...newlyPropagatedKeys])],
+		};
+		await this.#writeWorkflowMigrationMarkerAtomic(markerPath, pendingRepairMarker);
+		// Snapshot the target before the repairs so they can be rolled
+		// back if the source changes again before publication.
+		const preRepairTargetSnapshot = structuredClone(tx.current);
+		if (repairPatches.length > 0 || repairFlatKeys.length > 0) {
+			try {
+				await tx.applyPatchesAndRemoveTopLevelKeys(repairPatches, repairFlatKeys);
+			} catch (error) {
+				// The apply was rejected (CAS): proposed repair hashes remain
+				// non-owning, so a coincidental user value is never reclaimed.
+				throw error;
+			}
+			// Publish ownership only after the durable target apply. A crash
+			// before this rewrite leaves repairsApplied false, deliberately
+			// favoring a genuine user override over unproven migration ownership.
+			await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
+				...pendingRepairMarker,
+				repairsApplied: true,
+			});
+		}
+		// The editor may have saved again during the reconcile: only
+		// publish when the source still holds the exact bytes we
+		// reconciled and hashed.
+		let finalSourceText: string;
+		try {
+			finalSourceText = await Bun.file(source).text();
+		} catch {
+			// Roll back the just-applied repairs so the target does not
+			// hold an intermediate value classified as a user override.
+			await tx.replaceCurrent(preRepairTargetSnapshot);
+			// The repairs were rolled back: clear the recorded repair evidence so
+			// a later load does not treat the (now reverted) target values as
+			// committed writes.
+			await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
+				...marker,
+				status: "pending",
+				priorSourceSha256: durableBackupHash,
+				repairValueHashes: undefined,
+				repairsApplied: undefined,
+				preRepairTargetHashes: undefined,
+				sourceSha256: currentSourceHash,
+				migratedKeys: [...new Set([...retainedOwnedKeys, ...newlyPropagatedKeys])],
+			});
+			this.#warnLegacyFallbackMigration(
+				`Settings: could not re-read ${source} before publishing the reconciliation; target repairs rolled back, leaving source/backup/marker untouched`,
+			);
+			return;
+		}
+		if (finalSourceText !== currentSourceText) {
+			// Roll back the just-applied repairs: the next load must
+			// re-reconcile against the NEW source without the target
+			// holding an intermediate value classified as a user
+			// override.
+			await tx.replaceCurrent(preRepairTargetSnapshot);
+			// Clear the recorded repair evidence (the repairs were rolled back).
+			await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
+				...marker,
+				status: "pending",
+				priorSourceSha256: durableBackupHash,
+				repairValueHashes: undefined,
+				repairsApplied: undefined,
+				preRepairTargetHashes: undefined,
+				sourceSha256: currentSourceHash,
+				migratedKeys: [...new Set([...retainedOwnedKeys, ...newlyPropagatedKeys])],
+			});
+			this.#warnLegacyFallbackMigration(
+				`Settings: ${source} changed again during reconciliation; target repairs rolled back (the next load re-reconciles)`,
+			);
+			return;
+		}
+		// REFRESH the backup to the current source (the new
+		// migration-write basis), then publish the COMPLETE marker only
+		// after both durable writes succeed - a crash or CAS rejection
+		// before that leaves the OLD complete marker, so the next load
+		// re-enters the reconcile (source hash mismatch) instead of
+		// deactivating the legacy layer over an un-reconciled target.
+		// Replace the backup atomically (write a temp, then rename): an
+		// in-place Bun.write could truncate it on a crash, leaving the
+		// old marker with an unverifiable backup.
+		const backupDir = path.dirname(backup);
+		const backupTemp = path.join(backupDir, `.${path.basename(backup)}.${process.pid}.${randomUUID()}.tmp`);
+		try {
+			await Bun.write(backupTemp, currentSourceText);
+			// Durable before the rename: a host crash or power loss after the
+			// complete marker must not leave a marker pointing at a missing or
+			// stale backup.
+			const backupTempHandle = await fs.promises.open(backupTemp, "r");
+			try {
+				await backupTempHandle.sync();
+			} finally {
+				await backupTempHandle.close();
+			}
+			await fs.promises.rename(backupTemp, backup);
+		} finally {
+			await fs.promises.rm(backupTemp, { force: true }).catch(() => undefined);
+		}
+		const targetIdentity = await this.#workflowMigrationTargetIdentity(target);
+		if (targetIdentity === null) {
+			this.#warnLegacyFallbackMigration(
+				`Settings: config-root workflow migration cannot publish completion because the target directory identity is unavailable; leaving source, backup, and marker pending`,
+			);
+			return;
+		}
+		await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
+			...marker,
+			// The resume enters with a pending marker; the repairs and backup
+			// refresh succeeded, so publish COMPLETE.
+			status: "complete",
+			priorSourceSha256: undefined,
+			repairValueHashes: undefined,
+			repairsApplied: undefined,
+			preRepairTargetHashes: undefined,
+			...targetIdentity,
+			sourceSha256: currentSourceHash,
+			migratedKeys: [...new Set([...retainedOwnedKeys, ...newlyPropagatedKeys])],
+			completedAt: new Date().toISOString(),
+		});
+		this.#warnLegacyFallbackMigration(
+			`Settings: config-root workflow settings changed after migration (${source}); reconciled the current values`,
+		);
+		return;
+	}
+
+	/** Read a backup once and return both its bytes and text so the caller can
+	 * verify the hash and parse the SAME bytes (a second read could observe a
+	 * different revision). */
+	async #readBackupBytes(backup: string): Promise<{ bytes: ArrayBuffer; text: string }> {
+		const bytes = await Bun.file(backup).arrayBuffer();
+		return { bytes, text: Buffer.from(bytes).toString("utf8") };
+	}
+
+	async #statIdentity(filePath: string): Promise<string | undefined> {
+		const st = await fs.promises.stat(filePath).catch(() => null);
+		return st ? `${st.dev}:${st.ino}` : undefined;
+	}
+
+	async #workflowMigrationTargetIdentity(
+		target: string,
+	): Promise<{ canonicalTargetDir: string; canonicalTargetIdentity: string } | null> {
+		const targetDir = path.dirname(target);
+		const canonicalTargetDir = await fs.promises.realpath(targetDir).catch(() => null);
+		if (canonicalTargetDir === null) return null;
+		const canonicalTargetIdentity = await this.#statIdentity(targetDir);
+		if (canonicalTargetIdentity === undefined) return null;
+		return { canonicalTargetDir, canonicalTargetIdentity };
+	}
+
+	#isDefaultGlobalAgentScope(): boolean {
+		return (
+			path.resolve(this.#agentDir) === path.resolve(getAgentDir()) &&
+			path.resolve(getAgentDir()) === path.resolve(path.join(getConfigRootDir(), "agent"))
+		);
+	}
+
+	#workflowMigrationTargetSatisfies(root: unknown, marker: WorkflowMigrationMarker): boolean {
+		if (root === undefined || root === null) return marker.migratedKeys.length === 0;
+		if (typeof root !== "object" || Array.isArray(root)) return false;
+		const doc = root as Record<string, unknown>;
+		return marker.migratedKeys.every(key => extractWorkflowSetting(doc, key, { flat: false }).present);
+	}
+	#workflowKeyValueIsValid(key: WorkflowSettingKey, value: unknown): boolean {
+		const def = SETTINGS_SCHEMA[key] as
+			| { type?: string; validate?: (value: number) => boolean; values?: readonly unknown[] }
+			| undefined;
+		if (!def) return true;
+		let candidate: unknown = value;
+		candidate = this.#coerceWorkflowScalar(key, candidate);
+		switch (def.type) {
+			case "enum":
+				return def.values !== undefined && def.values.includes(candidate);
+			case "number":
+				return def.validate !== undefined
+					? def.validate(candidate as number)
+					: typeof candidate === "number" && Number.isFinite(candidate);
+			case "boolean":
+				return typeof candidate === "boolean";
+			case "string":
+				return typeof candidate === "string";
+			default:
+				return true;
+		}
+	}
+	#workflowMigrationMarkerPathsMatch(
+		marker: WorkflowMigrationMarker,
+		source: string,
+		backup: string,
+		target: string,
+	): boolean {
+		return (
+			path.resolve(marker.sourcePath) === path.resolve(source) &&
+			path.resolve(marker.backupPath) === path.resolve(backup) &&
+			path.resolve(marker.targetPath) === path.resolve(target)
+		);
+	}
+	/**
+	 * Mirror the resolver/Settings scalar coercion for a workflow key: a quoted
+	 * numeric string for a number setting (e.g. `maxIterations: "9"`) becomes
+	 * the number 9. Used both for validity checks and for what the migration
+	 * persists into config.yml.
+	 */
+	#coerceWorkflowScalar(key: WorkflowSettingKey, value: unknown): unknown {
+		const def = SETTINGS_SCHEMA[key] as { type?: string } | undefined;
+		if (
+			def?.type === "number" &&
+			typeof value === "string" &&
+			value.trim() !== "" &&
+			Number.isFinite(Number(value))
+		) {
+			return Number(value);
+		}
+		return value;
+	}
+
+	async #readWorkflowMigrationMarker(markerPath: string): Promise<WorkflowMigrationMarker | null> {
+		let raw: string;
+		try {
+			raw = await Bun.file(markerPath).text();
+		} catch (error) {
+			// Only ENOENT means no marker; a transient EACCES/EIO read failure
+			// must propagate so a valid pending marker is never quarantined as
+			// corrupt and its ownership evidence lost.
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw error;
+		}
+		try {
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			if (parsed.version !== WORKFLOW_MIGRATION_MARKER_VERSION) return null;
+			if (parsed.status !== "pending" && parsed.status !== "complete") return null;
+			if (
+				typeof parsed.sourcePath !== "string" ||
+				typeof parsed.backupPath !== "string" ||
+				typeof parsed.targetPath !== "string" ||
+				typeof parsed.sourceSha256 !== "string" ||
+				!/^[0-9a-f]{64}$/.test(parsed.sourceSha256) ||
+				typeof parsed.startedAt !== "string" ||
+				Number.isNaN(Date.parse(parsed.startedAt)) ||
+				!Array.isArray(parsed.migratedKeys) ||
+				!parsed.migratedKeys.every(
+					key =>
+						typeof key === "string" && (CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS as readonly string[]).includes(key),
+				)
+			) {
+				return null;
+			}
+			if (
+				parsed.status === "complete" &&
+				(typeof parsed.completedAt !== "string" || Number.isNaN(Date.parse(parsed.completedAt)))
+			) {
+				return null;
+			}
+			return parsed as WorkflowMigrationMarker;
+		} catch {
+			return null;
+		}
+	}
+
+	async #writeWorkflowMigrationMarkerAtomic(markerPath: string, marker: WorkflowMigrationMarker): Promise<void> {
+		if (marker.status === "complete") {
+			if (typeof marker.canonicalTargetIdentity !== "string" || marker.canonicalTargetIdentity.length === 0) {
+				throw new Error("Cannot publish a complete workflow migration marker without target directory identity.");
+			}
+			const currentTargetIdentity = await this.#statIdentity(path.dirname(marker.targetPath));
+			if (currentTargetIdentity !== marker.canonicalTargetIdentity) {
+				throw new Error("Cannot publish a complete workflow migration marker without a matching target directory.");
+			}
+		}
+		const serialized = JSON.stringify(marker, null, 2);
+		const directory = path.dirname(markerPath);
+		const tempPath = path.join(directory, `.${path.basename(markerPath)}.${process.pid}.${randomUUID()}.tmp`);
+		try {
+			await Bun.write(tempPath, serialized);
+			// Durable before publication: fsync the marker file so a crash
+			// cannot leave a rename that survives while the marker content is
+			// lost.
+			const tempHandle = await fs.promises.open(tempPath, "r");
+			try {
+				await tempHandle.sync();
+			} finally {
+				await tempHandle.close();
+			}
+			await fs.promises.rename(tempPath, markerPath);
+			// Durable publication: sync the parent directory so the rename (the
+			// marker's directory entry) survives a host crash even when the
+			// temp file content was already durable.
+			// Best-effort (like the atomic-YAML writer): some platforms (Windows,
+			// filesystems that reject opening/syncing directories) throw here -
+			// the marker rename is already durable; a directory-sync failure
+			// must not abort the migration.
+			try {
+				const dirHandle = await fs.promises.open(directory, "r");
+				try {
+					await dirHandle.sync();
+				} finally {
+					await dirHandle.close();
+				}
+			} catch {
+				// Unsupported directory sync: ignore.
+			}
+		} finally {
+			await fs.promises.rm(tempPath, { force: true }).catch(() => undefined);
+		}
+	}
+
+	async #moveLegacySourceNoReplace(
+		source: string,
+		destination: string,
+		expectedSourceSha256?: string,
+	): Promise<boolean> {
+		try {
+			await fs.promises.lstat(destination);
+			return false; // Never overwrite an existing destination.
+		} catch (error) {
+			if (!isEnoent(error)) return false;
+		}
+		if (expectedSourceSha256 !== undefined) {
+			// USER-DATA move: use an INDEPENDENT copy (never a hard link - a kept
+			// source and a hard-linked backup share an inode, so a later in-place
+			// edit or truncation of the still-active legacy file would mutate the
+			// backup and the marker hash would no longer preserve the migrated
+			// bytes) and keep the source ACTIVE (never unlink; a path-based unlink
+			// after a non-atomic identity check could delete a rename-replaced
+			// file). The caller re-verifies the source before the complete marker.
+			try {
+				await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+			} catch {
+				return false;
+			}
+			// Durable before the complete marker: sync the copied backup (a power
+			// loss must not leave a surviving marker + target with a missing or
+			// empty backup).
+			const userCopyHandle = await fs.promises.open(destination, "r");
+			try {
+				await userCopyHandle.sync();
+			} finally {
+				await userCopyHandle.close();
+			}
+			let copiedSourceHash: string | null = null;
+			try {
+				copiedSourceHash = await this.#sha256File(source);
+			} catch {
+				// The source was deleted right after the copy: remove the copy and
+				// report failure so the caller reverts the target (the caller's
+				// later guarded recheck would otherwise be bypassed by the throw).
+				await fs.promises.rm(destination, { force: true });
+				return false;
+			}
+			if (copiedSourceHash !== expectedSourceSha256) {
+				await fs.promises.rm(destination, { force: true });
+				return false;
+			}
+			return true;
+		}
+		// Internal artifacts (marker quarantine): capture the inode, hard-link
+		// (copy fallback), and remove the source name only while it is still the
+		// inode we verified.
+		let sourceIno: number | undefined;
+		try {
+			sourceIno = (await fs.promises.stat(source)).ino;
+		} catch {
+			return false;
+		}
+		try {
+			// Atomic same-directory no-clobber move via hard link + unlink.
+			await fs.promises.link(source, destination);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+			// Filesystems without hard links: a no-clobber copy. COPYFILE_EXCL
+			// fails with EEXIST if the destination appears, so it can never
+			// replace an existing `.bak`/quarantine - unlike a raw rename, which
+			// would overwrite a destination created after the lstat above.
+			try {
+				await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+			} catch {
+				return false;
+			}
+			// Durable before the complete marker: sync the copied backup file (a
+			// power loss must not leave a surviving marker + target with a
+			// missing or empty backup).
+			const copyHandle = await fs.promises.open(destination, "r");
+			try {
+				await copyHandle.sync();
+			} finally {
+				await copyHandle.close();
+			}
+		}
+		if (!(await this.#legacySourceStillVerified(source, sourceIno))) {
+			await fs.promises.rm(destination, { force: true });
+			return false;
+		}
+		try {
+			await fs.promises.rm(source, { force: true });
+		} catch {
+			return false;
+		}
+		return true;
+	}
+	/**
+	 * True only if `path` still refers to the same inode that was verified
+	 * earlier and (when an expected hash is given) still holds the verified
+	 * bytes. Used immediately before any unlink of a legacy source so a
+	 * concurrent rename-style save or in-place edit is never consumed.
+	 */
+	async #legacySourceStillVerified(
+		path: string,
+		expectedIno: number,
+		expectedSourceSha256?: string,
+	): Promise<boolean> {
+		const stat = await fs.promises.stat(path).catch(() => null);
+		if (!stat || stat.ino !== expectedIno) return false;
+		if (expectedSourceSha256 !== undefined && (await this.#sha256File(path)) !== expectedSourceSha256) return false;
+		return true;
+	}
+
+	async #pathExists(target: string): Promise<boolean> {
+		try {
+			await fs.promises.lstat(target);
+			return true;
+		} catch (error) {
+			// Only ENOENT means absence; a transient EACCES/EIO failure must
+			// propagate so recovery never mistakes it for a deletion/removal.
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+	}
+
+	async #sha256File(target: string): Promise<string> {
+		const raw = await Bun.file(target).arrayBuffer();
+		return createHash("sha256").update(Buffer.from(raw)).digest("hex");
 	}
 
 	#hasCustomThemeFile(name: string): boolean {
