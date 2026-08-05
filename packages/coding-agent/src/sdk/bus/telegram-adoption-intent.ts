@@ -30,7 +30,7 @@ import type { SessionCreateTarget } from "./index";
 
 /** Persisted document version. */
 export const TELEGRAM_ADOPTION_INTENT_VERSION = 1;
-export type TelegramAdoptionTarget = Extract<SessionCreateTarget, { kind: "existing_path" }>;
+export type TelegramAdoptionTarget = Extract<SessionCreateTarget, { kind: "existing_path" | "plain_dir" }>;
 /** Default intent TTL (configurable at write time). Plan starts at 10 minutes. */
 export const DEFAULT_ADOPTION_INTENT_TTL_MS = 10 * 60 * 1000;
 /** Per-intent filename prefix/suffix under the notifications dir. */
@@ -104,7 +104,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isSessionCreateTarget(value: unknown): value is TelegramAdoptionTarget {
-	return isRecord(value) && value.kind === "existing_path" && typeof value.path === "string";
+	return (
+		isRecord(value) &&
+		typeof value.path === "string" &&
+		(value.kind === "existing_path" || value.kind === "plain_dir")
+	);
 }
 
 function isPersistedIntent(value: unknown): value is PersistedIntent {

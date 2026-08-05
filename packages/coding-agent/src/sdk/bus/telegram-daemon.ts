@@ -5413,21 +5413,6 @@ export class TelegramNotificationDaemon {
 					.catch(() => undefined);
 			}
 		};
-		const replyHtml = async (body: string): Promise<void> => {
-			for (const text of splitTelegramHtml(body)) {
-				await this.botApi
-					.call("sendMessage", {
-						chat_id: this.opts.chatId,
-						...(threadId !== undefined ? { message_thread_id: threadId } : {}),
-						text,
-						parse_mode: TELEGRAM_PARSE_MODE,
-						...(telegramDisableNotification(this.opts.sound, "finalized") === true
-							? { disable_notification: true }
-							: {}),
-					})
-					.catch(() => undefined);
-			}
-		};
 
 		const parsed = parseLifecycleCommand(text, commandCtx);
 		if (parsed.kind === "none") return false;
@@ -5473,10 +5458,9 @@ export class TelegramNotificationDaemon {
 			}
 			const lines = rows.map(r => r.line);
 			const inline_keyboard = rows.map(r => [r.btn]);
-			const header =
-				recent.warnings.length ?
-					`<b>Recent GJC sessions</b>\n${recent.warnings.map(w => `⚠️ ${w}`).join("\n")}\n`
-				:	"<b>Recent GJC sessions</b>\n";
+			const header = recent.warnings.length
+				? `<b>Recent GJC sessions</b>\n${recent.warnings.map(w => `⚠️ ${w}`).join("\n")}\n`
+				: "<b>Recent GJC sessions</b>\n";
 			const body = header + lines.join("\n");
 
 			const chunks = splitTelegramHtml(body);
