@@ -75,13 +75,16 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * final-component file symlinks fail-closed under AT_SYMLINK_NOFOLLOW (bounded
  * #3761 multi-account activation repair). Generation 51 adds shared durable
  * topic authority, archive recovery, and requires Telegram's documented error
- * code for idempotent archive settlement. Generation 52 is claimed by the
- * pre-readiness daemon-child exit diagnostics slice (#3761). Generation 53
- * renders multi-select state for ask-tool asks, not only durable workflow
- * gates, and renumbers pre-numbered options exactly once around the selection
- * marker.
+ * code for idempotent archive settlement. Generation 52 was reserved for the
+ * exit-diagnostics slice below and left unpublished when that slice landed
+ * after #3899, so no daemon ever served it. Generation 53 renders multi-select
+ * state for ask-tool asks, not only durable workflow gates, and renumbers
+ * pre-numbered options exactly once around the selection marker. Generation 54
+ * makes every pre-readiness daemon-child exit report a durable, credential-free
+ * reason on the child's stderr (captured into `notifications/daemon.log`) and
+ * publishes a readiness notice (#3761).
  */
-export const DAEMON_GENERATION = 53;
+export const DAEMON_GENERATION = 54;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

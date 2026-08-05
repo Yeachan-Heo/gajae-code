@@ -1840,6 +1840,7 @@ describe("notify daemon-internal lightweight startup", () => {
 		try {
 			await runDaemonInternal(["--owner-id", `12345-${token}`, "--agent-dir", tempAgentDir()], {
 				pidAlive: () => false,
+				diagnostic: () => {},
 				SettingsImpl: {
 					async init() {
 						settingsLoaded = true;
@@ -1854,7 +1855,9 @@ describe("notify daemon-internal lightweight startup", () => {
 					async run(): Promise<void> {}
 				} as never,
 			});
-			expect(warning).toHaveBeenCalledWith("GJC notify daemon exiting because its owner is not alive");
+			expect(warning).toHaveBeenCalledWith(
+				"gjc notify daemon: exiting before startup: owner process 12345 is not alive",
+			);
 			expect(warning.mock.calls.flat().join("\n")).not.toContain(token);
 			expect(settingsLoaded).toBe(false);
 			expect(daemonConstructed).toBe(false);

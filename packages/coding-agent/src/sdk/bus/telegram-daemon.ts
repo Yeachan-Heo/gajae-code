@@ -19,6 +19,11 @@ import {
 	parseTelegramControlCommand,
 	parseToolActivityToggleCommand,
 } from "./config-commands";
+import {
+	type DaemonDiagnosticSink,
+	recordDaemonStartupDiagnostic,
+	recordDaemonStartupNotice,
+} from "./daemon-diagnostics";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
 	acquireDaemonTransitionLock,
@@ -2937,6 +2942,48 @@ export async function acquireDaemonOwnership(input: {
 	}
 }
 
+/**
+ * Names the first ownership condition that refuses a heartbeat renewal. The
+ * guard in {@link renewDaemonHeartbeat} stays authoritative; this only turns its
+ * refusal into an operator-readable reason, because a daemon child that returns
+ * a bare `false` here is indistinguishable from one that never started (#3761).
+ */
+function describeDaemonHeartbeatRefusal(input: {
+	state: DaemonState | undefined;
+	ownerId: string;
+	acquisitionId: string;
+	tokenFingerprint?: string;
+	chatId?: string;
+	pid: number | undefined;
+	generation: number | undefined;
+	incarnation: string | undefined;
+	canBindProvisionalPid: boolean;
+}): string | undefined {
+	const { state, pid, generation, incarnation, canBindProvisionalPid } = input;
+	if (!state) return "no persisted ownership state exists";
+	if (!hasSafeDaemonStateShape(state)) return "persisted ownership state has an unsafe shape";
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)
+		return `daemon pid ${String(pid)} is unusable`;
+	if (!isProcessIncarnation(incarnation)) return `process incarnation for pid ${pid} is unavailable`;
+	if (generation !== DAEMON_GENERATION)
+		return `generation ${String(generation)} does not match this binary's generation ${DAEMON_GENERATION}`;
+	if (state.ownerId !== input.ownerId) return "persisted ownership belongs to a different owner id";
+	if (state.acquisitionId !== input.acquisitionId) return "persisted acquisition id does not match this owner";
+	if (input.tokenFingerprint !== undefined && state.tokenFingerprint !== input.tokenFingerprint)
+		return "persisted bot token fingerprint does not match the configured token";
+	if (input.chatId !== undefined && state.chatId !== input.chatId)
+		return "persisted paired chat id does not match the configured chat id";
+	if (!canBindProvisionalPid && state.incarnation !== incarnation)
+		return `persisted incarnation does not match pid ${pid} and provisional pid binding is not admitted`;
+	if (!canBindProvisionalPid && state.pid !== pid)
+		return `persisted pid ${String(state.pid)} does not match daemon pid ${pid} and provisional pid binding is not admitted`;
+	if (state.generation !== generation)
+		return `persisted generation ${String(state.generation)} does not match requested generation ${String(generation)}`;
+	if (state.stoppedAt !== undefined) return "persisted ownership is already stopped";
+	if (state.ownershipPhase === "retired") return "persisted ownership is already retired";
+	return undefined;
+}
+
 export async function renewDaemonHeartbeat(input: {
 	settings: Settings;
 	ownerId: string;
@@ -2951,10 +2998,16 @@ export async function renewDaemonHeartbeat(input: {
 	sleep?: (ms: number) => Promise<void>;
 	stealRetries?: number;
 	stealRetryDelayMs?: number;
+	/** Receives the exact reason for a refused renewal; the return value stays `false`. */
+	onRefusal?: (reason: string) => void;
 }): Promise<boolean> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	const acquisitionId = input.acquisitionId ?? input.ownerId;
+	const refuse = (reason: string): false => {
+		input.onRefusal?.(reason);
+		return false;
+	};
 	// The steal lock is held only briefly by concurrent lifecycle operations.
 	// A contended lock never proves readiness: only the holder may validate and
 	// publish the exact ready PID/generation state.
@@ -2966,7 +3019,10 @@ export async function renewDaemonHeartbeat(input: {
 		retries: input.stealRetries,
 		retryDelayMs: input.stealRetryDelayMs,
 	});
-	if (!transition) return false;
+	if (!transition)
+		return refuse(
+			"the notifications transition lock (telegram-daemon.steal) could not be acquired: another lifecycle operation holds it, or the notifications directory is unusable",
+		);
 	try {
 		const state = await readJson<DaemonState>(fsImpl, paths.state);
 		const pid = input.pid ?? state?.pid;
@@ -2997,8 +3053,23 @@ export async function renewDaemonHeartbeat(input: {
 			state.stoppedAt !== undefined ||
 			state.ownershipPhase === "retired"
 		)
-			return false;
-		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
+			return refuse(
+				`persisted ownership does not admit this daemon: ${
+					describeDaemonHeartbeatRefusal({
+						state,
+						ownerId: input.ownerId,
+						acquisitionId,
+						tokenFingerprint: input.tokenFingerprint,
+						chatId: input.chatId,
+						pid,
+						generation,
+						incarnation,
+						canBindProvisionalPid,
+					}) ?? "unspecified mismatch"
+				}`,
+			);
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })))
+			return refuse("the transition lock was taken over by another lifecycle operation during admission");
 		const previousLock = canBindProvisionalPid ? await readOwnershipLock(fsImpl, paths.lock) : undefined;
 		const expectedLock =
 			previousLock?.kind === "valid" &&
@@ -3023,7 +3094,7 @@ export async function renewDaemonHeartbeat(input: {
 					rebound: reboundLock,
 				})))
 		)
-			return false;
+			return refuse("the provisional ownership lock could not be rebound to this daemon pid");
 		const heartbeatAt = (input.now ?? Date.now)();
 		const boundState: DaemonState = {
 			...state,
@@ -3038,7 +3109,7 @@ export async function renewDaemonHeartbeat(input: {
 		};
 		try {
 			await writeJsonAtomic(fsImpl, paths.state, boundState);
-		} catch {
+		} catch (error) {
 			if (expectedLock && reboundLock)
 				await rollbackOwnershipLockRebind({
 					fs: fsImpl,
@@ -3049,7 +3120,7 @@ export async function renewDaemonHeartbeat(input: {
 					previous: expectedLock,
 					rebound: reboundLock,
 				});
-			return false;
+			return refuse(`the bound ownership state could not be written: ${sanitizeDiagnostic(String(error))}`);
 		}
 		const retireBoundOwnership = async (): Promise<void> => {
 			const lock = await readOwnershipLock(fsImpl, paths.lock);
@@ -3080,19 +3151,17 @@ export async function renewDaemonHeartbeat(input: {
 			sidecarRenewed = false;
 		}
 		if (!sidecarRenewed) {
-			logger.warn(
-				"notifications: Telegram daemon initial heartbeat sidecar proof failed; retiring provisional ownership",
-			);
 			await retireBoundOwnership();
-			return false;
+			return refuse("the initial heartbeat sidecar proof failed; provisional ownership was retired");
 		}
 		try {
 			await writeJsonAtomic(fsImpl, paths.state, { ...boundState, ownershipPhase: "ready" });
 			return true;
-		} catch {
-			logger.warn("notifications: Telegram daemon ready publication failed after sidecar proof; retiring ownership");
+		} catch (error) {
 			await retireBoundOwnership();
-			return false;
+			return refuse(
+				`ready publication failed after the sidecar proof; ownership was retired: ${sanitizeDiagnostic(String(error))}`,
+			);
 		}
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
@@ -4629,6 +4698,13 @@ export interface TelegramDaemonOptions {
 	topicRegistryAuthority?: TopicRegistryCasAuthority;
 	/** Stable host-local identity. Required whenever a shared authority is configured. */
 	installationHostId?: string;
+	/**
+	 * Durable one-line diagnostic sink for startup refusals and readiness. The
+	 * daemon-internal entrypoint passes the child's stderr, which the launcher
+	 * redirected into `notifications/daemon.log`; an embedded host passes its own
+	 * sink, and without one only the logger records the reason (#3761).
+	 */
+	diagnostic?: DaemonDiagnosticSink;
 }
 
 interface StagedCallbackActivation {
@@ -12171,7 +12247,13 @@ export class TelegramNotificationDaemon {
 	async run(): Promise<void> {
 		// Runtime callers can bypass TypeScript's option type. Without a valid bot
 		// token, there is no authenticated daemon identity or lifecycle authority.
-		if (!validBotToken(this.opts.botToken)) return;
+		if (!validBotToken(this.opts.botToken)) {
+			recordDaemonStartupDiagnostic(
+				"exiting before startup: the configured Telegram bot token is missing or blank",
+				this.opts.diagnostic,
+			);
+			return;
+		}
 		if (this.validationMode()) {
 			if (!/^-100\d+$/.test(this.opts.validationTestSupergroupChatId!))
 				throw new Error("validation forum destination must be a negative -100... chat ID");
@@ -12180,6 +12262,7 @@ export class TelegramNotificationDaemon {
 		}
 		let ownershipProved = false;
 		try {
+			let refusal: string | undefined;
 			const renewed = await renewDaemonHeartbeat({
 				settings: this.opts.settings,
 				ownerId: this.opts.ownerId,
@@ -12190,8 +12273,24 @@ export class TelegramNotificationDaemon {
 				now: this.opts.now,
 				pid: this.opts.pid ?? process.pid,
 				pidIncarnation: this.opts.pidIncarnation,
+				onRefusal: reason => {
+					refusal = reason;
+				},
 			});
-			if (!renewed) return;
+			if (!renewed) {
+				// A detached child that returns here has no terminal and no flushed
+				// logger sink, so the refusal must reach daemon.log directly (#3761).
+				recordDaemonStartupDiagnostic(
+					`exiting before readiness: ownership was refused because ${refusal ?? "the reason was not reported"}`,
+					this.opts.diagnostic,
+				);
+				return;
+			}
+			recordDaemonStartupNotice(
+				// The owner id carries the acquisition secret: report only its pid.
+				`ownership is ready: daemon pid ${this.opts.pid ?? process.pid}`,
+				this.opts.diagnostic,
+			);
 			ownershipProved = true;
 			this.running = !this.stopRequested;
 			if (!this.running) return;

@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
@@ -11,6 +10,11 @@ import {
 	type NotificationSettingsReader,
 	parseNotificationSettingsSnapshot,
 } from "./config";
+import {
+	type DaemonDiagnosticSink,
+	recordDaemonStartupDiagnostic,
+	stderrDaemonDiagnosticSink,
+} from "./daemon-diagnostics";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
 	type DaemonState,
@@ -49,6 +53,8 @@ export interface RunDaemonInternalDeps {
 	readDaemonState?: (settings: Settings) => Promise<DaemonState | undefined>;
 	/** Loads the verified machine-local identity; injectable so daemon tests do not touch the host. */
 	loadInstallationHostId?: () => Promise<string>;
+	/** Durable one-line diagnostic sink; defaults to the child's stderr. */
+	diagnostic?: DaemonDiagnosticSink;
 }
 
 /** Ownership-watchdog cadence while the daemon process is running. */
@@ -58,13 +64,6 @@ const OWNER_STALL_MS = 3 * HEARTBEAT_TTL_MS;
 function argValue(argv: string[], name: string): string | undefined {
 	const i = argv.indexOf(name);
 	return i >= 0 ? argv[i + 1] : undefined;
-}
-const DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT = 1;
-let daemonCompatibilityDiagnosticCount = 0;
-function recordDaemonCompatibilityDiagnostic(message: string): void {
-	if (daemonCompatibilityDiagnosticCount >= DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT) return;
-	daemonCompatibilityDiagnosticCount++;
-	logger.warn(message);
 }
 
 export function createLightweightDaemonSettings(input: {
@@ -227,14 +226,40 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	if (smoke) return runDaemonSmoke({ agentDir });
 	const ownerId = argValue(argv, "--owner-id");
 	if (!ownerId) throw new Error("missing --owner-id");
+	// This is the daemon child's process boundary: its stderr is the fd the
+	// launcher redirected into notifications/daemon.log (#3761).
+	const diagnostic = deps.diagnostic ?? stderrDaemonDiagnosticSink;
 	if (!ownerProcessIsAlive(ownerId, deps)) {
-		recordDaemonCompatibilityDiagnostic("GJC notify daemon exiting because its owner is not alive");
+		recordDaemonStartupDiagnostic(
+			// The owner id carries the acquisition secret: report only its pid.
+			`exiting before startup: owner process ${ownerPidFromOwnerId(ownerId) ?? "(no pid in owner id)"} is not alive`,
+			diagnostic,
+		);
 		return;
 	}
 	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
-	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
+	let settings: LightweightDaemonSettings;
+	try {
+		settings = await resolveDaemonSettings(resolvedAgentDir, deps);
+	} catch (error) {
+		// The child owns no terminal: an unreported load failure is invisible.
+		recordDaemonStartupDiagnostic(
+			`exiting before startup: cannot load notification settings from ${resolvedAgentDir}: ${String(error)}`,
+			diagnostic,
+		);
+		throw error;
+	}
 	const cfg = getNotificationConfig(settings);
-	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
+	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) {
+		// The child reads config.yml directly, so a parent that considers Telegram
+		// configured through the full Settings stack can still spawn a child which
+		// sees an unconfigured provider. Name which half refused (#3761).
+		recordDaemonStartupDiagnostic(
+			`exiting before startup: ${path.join(resolvedAgentDir, "config.yml")} does not enable a complete Telegram provider (effectively enabled: ${isProviderEffectivelyEnabled(cfg, "telegram")}, credentials complete: ${isTelegramComplete(cfg)})`,
+			diagnostic,
+		);
+		return;
+	}
 	const installationHostId = await (deps.loadInstallationHostId ?? loadInstallationHostId)();
 	const topicRegistryAuthority = new FilesystemTopicRegistryCasAuthority(
 		path.join(daemonPaths(resolvedAgentDir).dir, "telegram-topics.json"),
@@ -258,6 +283,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		control: createDaemonControlHooks(settings as Settings),
 		topicRegistryAuthority,
 		installationHostId,
+		diagnostic,
 	});
 	// Signals are a process concern: install them at the daemon-internal boundary,
 	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.
