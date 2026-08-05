@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CombinedAutocompleteProvider, extractSlashCommandTokenPrefix } from "@gajae-code/tui/autocomplete";
+import {
+	type AutocompleteItem,
+	type AutocompleteProvider,
+	CombinedAutocompleteProvider,
+	extractSlashCommandTokenPrefix,
+} from "@gajae-code/tui/autocomplete";
+import { Editor } from "@gajae-code/tui/components/editor";
+import { visibleWidth } from "@gajae-code/tui/utils";
+import { defaultEditorTheme } from "./test-themes";
 
 describe("CombinedAutocompleteProvider", () => {
 	describe("extractPathPrefix", () => {
@@ -470,5 +478,89 @@ describe("trySyncSlashCompletion", () => {
 		const colon = provider.trySyncSlashCompletion("/skill:te");
 		expect(dashed?.items[0]?.value).toBe("skill:team");
 		expect(colon?.items[0]?.value).toBe("skill:team");
+	});
+});
+
+class StaticAutocompleteProvider implements AutocompleteProvider {
+	#result: { items: AutocompleteItem[]; prefix: string };
+
+	constructor(result: { items: AutocompleteItem[]; prefix: string }) {
+		this.#result = result;
+	}
+
+	async getSuggestions(): Promise<{ items: AutocompleteItem[]; prefix: string }> {
+		return this.#result;
+	}
+
+	applyCompletion(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+	): { lines: string[]; cursorLine: number; cursorCol: number } {
+		return { lines, cursorLine, cursorCol };
+	}
+}
+
+async function renderEditorAutocomplete(prefix: string, items: AutocompleteItem[], width: number): Promise<string[]> {
+	const editor = new Editor(defaultEditorTheme);
+	editor.setBorderVisible(false);
+	editor.setAutocompleteProvider(new StaticAutocompleteProvider({ prefix, items }));
+	for (const character of prefix) editor.handleInput(character);
+	await Bun.sleep(0);
+	return editor
+		.render(width)
+		.slice(1)
+		.map(line => Bun.stripANSI(line));
+}
+
+describe("Editor autocomplete layout", () => {
+	const slashItems: AutocompleteItem[] = [
+		{ value: "go", label: "go", description: "Run immediately" },
+		{ value: "한글명령", label: "한글명령", description: "Unicode workflow description" },
+	];
+
+	it("keeps slash-command rows width-safe at narrow, medium, and wide terminal widths", async () => {
+		const snapshots = await Promise.all(
+			[20, 40, 120].map(async width => {
+				const lines = await renderEditorAutocomplete("/g", slashItems, width);
+				expect(lines.every(line => visibleWidth(line) <= width)).toBeTrue();
+				return lines;
+			}),
+		);
+
+		expect(snapshots).toEqual([
+			["> go", "  한글명령"],
+			["> go", "  한글명령"],
+			["> go          Run immediately", "  한글명령    Unicode workflow description"],
+		]);
+	});
+
+	it("clamps slash primary columns between 12 and 32 cells with Unicode labels", async () => {
+		const shortLines = await renderEditorAutocomplete("/g", slashItems, 120);
+		const longLines = await renderEditorAutocomplete(
+			"/g",
+			[
+				{
+					value: "skill:한글-워크플로-이름이-아주-긴-명령",
+					label: "skill:한글-워크플로-이름이-아주-긴-명령",
+					description: "Long description",
+				},
+			],
+			120,
+		);
+		const shortDescriptionColumn = visibleWidth(shortLines[0]!.slice(0, shortLines[0]!.indexOf("Run immediately")));
+		const longDescriptionColumn = visibleWidth(longLines[0]!.slice(0, longLines[0]!.indexOf("Long description")));
+
+		expect(shortDescriptionColumn).toBe(14);
+		expect(longDescriptionColumn).toBe(34);
+	});
+
+	it("keeps non-slash autocomplete on the default 32-column layout", async () => {
+		const lines = await renderEditorAutocomplete("@f", slashItems, 120);
+
+		expect(lines).toEqual([
+			"> go                              Run immediately",
+			"  한글명령                        Unicode workflow description",
+		]);
 	});
 });
