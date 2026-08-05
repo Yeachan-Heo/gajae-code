@@ -41,6 +41,7 @@ import {
 	isCurrentCompatibleOwner,
 	isFreshLiveOwner,
 	LEGACY_TOOL_ACTIVITY_CAPABILITY,
+	POLL_CONFLICT_YIELD_AFTER,
 	readAttestedLegacyDaemonOwner,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
@@ -2986,7 +2987,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 53 ask-tool multi-select rendering", () => {
+	test("keeps wire protocol 3 through generation 54 sustained-409 self-defense", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3010,8 +3011,10 @@ describe("telegram daemon", () => {
 		// binds idempotent archive settlement to Telegram error code 400; generation
 		// 52 is claimed by the pre-readiness daemon-child exit diagnostics slice;
 		// generation 53 renders multi-select state for ask-tool asks and renumbers
-		// pre-numbered options exactly once around the selection marker.
-		expect(DAEMON_GENERATION).toBe(53);
+		// pre-numbered options exactly once around the selection marker; generation 54
+		// adds bounded sustained getUpdates 409 self-defense (poller yield + normal
+		// shutdown; no peer signal) as a secondary fence for orphan dual-pollers.
+		expect(DAEMON_GENERATION).toBe(54);
 	});
 	test.each([
 		"1",
@@ -13598,18 +13601,147 @@ test("pollOnce backs off on a Telegram 409 conflict instead of processing update
 			return 0;
 		}) as unknown as typeof setTimeout,
 	});
-	expect(await daemon.pollOnce()).toBe(0);
-	expect(await daemon.pollOnce()).toBe(0);
-	expect(await daemon.pollOnce()).toBe(0);
-	expect(await daemon.pollOnce()).toBe(0);
-	expect(await daemon.pollOnce()).toBe(0);
-	expect(await daemon.pollOnce()).toBe(0);
-	expect(sleeps).toHaveLength(6);
+	// Stay strictly below the sustained-yield threshold so this test only
+	// covers jittered backoff (self-defense is covered separately).
+	const samples = Math.min(6, POLL_CONFLICT_YIELD_AFTER - 1);
+	for (let i = 0; i < samples; i++) expect(await daemon.pollOnce()).toBe(0);
+	expect(sleeps).toHaveLength(samples);
 	expect(sleeps[0]).toBe(1_000);
 	for (let index = 1; index < sleeps.length; index++) {
 		if (sleeps[index] < 10_000) expect(sleeps[index]).toBeGreaterThanOrEqual(sleeps[index - 1] * 1.5);
 		expect(sleeps[index]).toBeLessThanOrEqual(Math.min(sleeps[index - 1] * 2, 10_000));
 	}
+});
+
+test("TelegramUpdatePoller yields after sustained getUpdates 409 conflicts", async () => {
+	const sleeps: number[] = [];
+	const bot = {
+		call: async () => ({
+			ok: false,
+			error_code: 409,
+			description:
+				"Conflict: terminated by other getUpdates request; make sure that only one bot instance is running",
+		}),
+	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const poller = new TelegramUpdatePoller({
+			botApi: bot,
+			runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+			backoff: {
+				next: () => 250,
+				reset() {},
+			},
+			processUpdate: async () => "consumed",
+			conflictYieldAfter: 3,
+		});
+
+		expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict", backoffMs: 250 });
+		expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict", backoffMs: 250 });
+		const yieldResult = await poller.pollOnceDetailed();
+		expect(yieldResult).toEqual({
+			kind: "conflict_yield",
+			description:
+				"Conflict: terminated by other getUpdates request; make sure that only one bot instance is running",
+			consecutiveConflicts: 3,
+			backoffMs: 250,
+		});
+		expect(sleeps).toEqual([250, 250, 250]);
+		const yieldLogs = errorSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates yielding after sustained 409 conflicts",
+		);
+		expect(yieldLogs).toHaveLength(1);
+		expect(yieldLogs[0]?.[1]).toMatchObject({ consecutiveConflicts: 3, backoffMs: 250 });
+	} finally {
+		errorSpy.mockRestore();
+	}
+});
+
+test("TelegramUpdatePoller resets the 409 streak after a successful getUpdates", async () => {
+	const sleeps: number[] = [];
+	let calls = 0;
+	const bot = {
+		async call() {
+			calls += 1;
+			// Two conflicts, one success, two conflicts — never reaches yield at threshold 3.
+			if (calls === 3) return { ok: true, result: [] };
+			return {
+				ok: false,
+				error_code: 409,
+				description: "Conflict: terminated by other getUpdates request",
+			};
+		},
+	};
+	const poller = new TelegramUpdatePoller({
+		botApi: bot,
+		runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+		backoff: {
+			next: () => 100,
+			reset() {},
+		},
+		processUpdate: async () => "consumed",
+		conflictYieldAfter: 3,
+	});
+
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict" });
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict" });
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "success", updateCount: 0 });
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict" });
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict" });
+	// Streak was reset by success; still below yield threshold.
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict_yield", consecutiveConflicts: 3 });
+	expect(sleeps).toEqual([100, 100, 100, 100, 100]);
+});
+
+test("TelegramUpdatePoller does not yield on non-409 API failures", async () => {
+	const sleeps: number[] = [];
+	const bot = {
+		call: async () => ({
+			ok: false,
+			error_code: 401,
+			description: "Unauthorized",
+		}),
+	};
+	const poller = new TelegramUpdatePoller({
+		botApi: bot,
+		runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+		backoff: { next: () => 50, reset() {} },
+		processUpdate: async () => "consumed",
+		conflictYieldAfter: 2,
+	});
+
+	for (let i = 0; i < 4; i++) {
+		expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "api_failure", errorCode: 401 });
+	}
+	expect(sleeps).toEqual([1_000, 1_000, 1_000, 1_000]);
+});
+
+test("TelegramUpdatePoller resetConflictStreak allows a still-owning daemon to resume after yield", async () => {
+	const bot = {
+		call: async () => ({
+			ok: false,
+			error_code: 409,
+			description: "Conflict: terminated by other getUpdates request",
+		}),
+	};
+	const poller = new TelegramUpdatePoller({
+		botApi: bot,
+		runtime: { sleep: async () => undefined } as any,
+		backoff: { next: () => 10, reset() {} },
+		processUpdate: async () => "consumed",
+		conflictYieldAfter: 2,
+	});
+
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict" });
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict_yield", consecutiveConflicts: 2 });
+	poller.resetConflictStreak();
+	// After reset the next 409 is conflict again (streak 1), not an immediate re-yield.
+	expect(await poller.pollOnceDetailed()).toEqual({
+		kind: "conflict",
+		description: "Conflict: terminated by other getUpdates request",
+		backoffMs: 10,
+	});
+	expect(await poller.pollOnceDetailed()).toMatchObject({ kind: "conflict_yield", consecutiveConflicts: 2 });
 });
 
 test("TelegramUpdatePoller logs getUpdates failures only on transition and reports suppressed recovery", async () => {

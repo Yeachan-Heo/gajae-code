@@ -310,6 +310,19 @@ const BOT_API_RETRY_ATTEMPTS = 3;
 // Backoff after a failed getUpdates long-poll so a persistent outage does not
 // busy-loop the daemon.
 const POLL_BACKOFF_MS = 1_000;
+/**
+ * Consecutive getUpdates 409 conflicts before the poller emits `conflict_yield`.
+ * Telegram admits only one long-poller per bot token; sustained 409s mean another
+ * live poller owns the slot (orphaned predecessor after session exit / ownership
+ * reclaim race). The run loop treats yield as self-defense only when this process
+ * is no longer the durable owner — it exits through normal shutdown and never
+ * signals or kills another PID. A still-owning daemon keeps serving so a thrashing
+ * orphan cannot push the legitimate owner out. Brief dual-poller races below the
+ * threshold keep the existing jittered backoff.
+ *
+ * Exported for tests; not a user-facing knobs surface.
+ */
+export const POLL_CONFLICT_YIELD_AFTER = 8;
 const AUTOMATIC_RELOAD_COOLDOWN_MS = 10 * 60 * 1_000;
 // Default freshness-poll window a cooldown contender waits for a sibling's
 // replacement daemon to publish a fresh ready owner before reloading itself.
@@ -4358,7 +4371,9 @@ export type TelegramPollResult =
 	| { kind: "aborted" }
 	| { kind: "getUpdates_failed"; error: string }
 	| { kind: "api_failure"; errorCode?: number; description: string }
-	| { kind: "conflict"; description: string; backoffMs: number };
+	| { kind: "conflict"; description: string; backoffMs: number }
+	/** Sustained 409 streak: this poller must stop so a single owner remains. */
+	| { kind: "conflict_yield"; description: string; consecutiveConflicts: number; backoffMs: number };
 
 export interface TelegramUpdatePollerOptions {
 	botApi: BotApi;
@@ -4366,9 +4381,11 @@ export interface TelegramUpdatePollerOptions {
 	backoff: { next(): number; reset(): void };
 	processUpdate: (update: unknown) => Promise<TelegramUpdateOutcome>;
 	health?: TelegramPollHealth;
+	/** Test override for the sustained-409 yield threshold. */
+	conflictYieldAfter?: number;
 }
 
-type TelegramPollHealthStatus = "healthy" | "getUpdates_failed" | "api_failure" | "conflict";
+type TelegramPollHealthStatus = "healthy" | "getUpdates_failed" | "api_failure" | "conflict" | "conflict_yield";
 
 export class TelegramPollHealth {
 	#status: TelegramPollHealthStatus = "healthy";
@@ -4385,6 +4402,21 @@ export class TelegramPollHealth {
 				});
 			}
 			this.#status = "healthy";
+			this.#suppressedCount = 0;
+			return;
+		}
+
+		// A yield is always terminal for this process: log once at full severity
+		// even when the preceding streak was already logged as conflict.
+		if (result.kind === "conflict_yield") {
+			logger.error("notifications daemon: Telegram getUpdates yielding after sustained 409 conflicts", {
+				description: result.description,
+				consecutiveConflicts: result.consecutiveConflicts,
+				backoffMs: result.backoffMs,
+				previousStatus: this.#status,
+				suppressedCount: this.#suppressedCount,
+			});
+			this.#status = "conflict_yield";
 			this.#suppressedCount = 0;
 			return;
 		}
@@ -4444,16 +4476,42 @@ export class TelegramUpdatePoller {
 	#offset = 0;
 	#opts: TelegramUpdatePollerOptions;
 	#health: TelegramPollHealth;
+	/** Consecutive 409 conflict responses since the last non-conflict outcome. */
+	#consecutiveConflicts = 0;
+	/** Optional override for tests; defaults to {@link POLL_CONFLICT_YIELD_AFTER}. */
+	#conflictYieldAfter: number;
 
 	constructor(opts: TelegramUpdatePollerOptions) {
 		this.#opts = opts;
 		this.#health = opts.health ?? new TelegramPollHealth();
+		this.#conflictYieldAfter =
+			typeof opts.conflictYieldAfter === "number" &&
+			Number.isSafeInteger(opts.conflictYieldAfter) &&
+			opts.conflictYieldAfter > 0
+				? opts.conflictYieldAfter
+				: POLL_CONFLICT_YIELD_AFTER;
 	}
 
 	async pollOnce(signal?: AbortSignal): Promise<number> {
+		const result = await this.pollOnceDetailed(signal);
+		return result.kind === "success" ? result.updateCount : 0;
+	}
+
+	/**
+	 * One getUpdates cycle with health recording. The daemon run loop uses this
+	 * so a sustained-409 {@link TelegramPollResult} `conflict_yield` can stop the
+	 * process cleanly (normal shutdown + ownership release) without signaling
+	 * another PID.
+	 */
+	async pollOnceDetailed(signal?: AbortSignal): Promise<TelegramPollResult> {
 		const result = await this.pollOnceResult(signal);
 		this.#health.record(result);
-		return result.kind === "success" ? result.updateCount : 0;
+		return result;
+	}
+
+	/** Clear the sustained-409 streak after a still-owning daemon elects to keep serving. */
+	resetConflictStreak(): void {
+		this.#consecutiveConflicts = 0;
 	}
 
 	async pollOnceResult(signal?: AbortSignal): Promise<TelegramPollResult> {
@@ -4473,17 +4531,31 @@ export class TelegramUpdatePoller {
 			// A cooperative stop aborts the in-flight long poll; treat as a clean wake.
 			if (isAbortError(err)) return { kind: "aborted" };
 			// A transient Telegram API failure must never crash the daemon.
+			this.#consecutiveConflicts = 0;
 			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
 			return { kind: "getUpdates_failed", error: sanitizeDiagnostic(String(err)) };
 		}
 		// Telegram allows only one active getUpdates poller per bot. A 409 means
-		// another poller is live; back off boundedly instead of hot-looping.
+		// another poller is live; back off boundedly instead of hot-looping. After
+		// a sustained streak, yield so an orphaned dual-poller state converges to
+		// at most one survivor (this process exits; it never kills the peer).
 		if (body && body.ok === false && (body.error_code === 409 || /409|conflict/i.test(body.description ?? ""))) {
+			this.#consecutiveConflicts += 1;
 			const backoffMs = this.#opts.backoff.next();
 			await this.#opts.runtime.sleep(backoffMs, signal);
-			return { kind: "conflict", description: sanitizeDiagnostic(body.description ?? "no description"), backoffMs };
+			const description = sanitizeDiagnostic(body.description ?? "no description");
+			if (this.#consecutiveConflicts >= this.#conflictYieldAfter) {
+				return {
+					kind: "conflict_yield",
+					description,
+					consecutiveConflicts: this.#consecutiveConflicts,
+					backoffMs,
+				};
+			}
+			return { kind: "conflict", description, backoffMs };
 		}
 		if (body?.ok !== true || !Array.isArray(body.result)) {
+			this.#consecutiveConflicts = 0;
 			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
 			return {
 				kind: "api_failure",
@@ -4491,6 +4563,7 @@ export class TelegramUpdatePoller {
 				description: sanitizeDiagnostic(body?.description ?? "Malformed getUpdates response"),
 			};
 		}
+		this.#consecutiveConflicts = 0;
 		this.#opts.backoff.reset();
 		let malformedSeen = false;
 		for (const update of body.result) {
@@ -12135,6 +12208,11 @@ export class TelegramNotificationDaemon {
 		return this.poller.pollOnce(signal);
 	}
 
+	/** One getUpdates cycle with health recording (exposes conflict_yield to callers). */
+	async pollOnceDetailed(signal?: AbortSignal): Promise<TelegramPollResult> {
+		return this.poller.pollOnceDetailed(signal);
+	}
+
 	/** Sync the bot's Telegram command menu to what the daemon actually handles. */
 	async registerBotCommands(): Promise<void> {
 		try {
@@ -12265,7 +12343,19 @@ export class TelegramNotificationDaemon {
 				// /session_*) are always received until idle-exit.
 				const activePoll = this.runtime.createAbortController();
 				try {
-					await this.pollOnce(activePoll.signal);
+					const pollResult = await this.poller.pollOnceDetailed(activePoll.signal);
+					// Sustained 409: another live poller is racing this token. Self-defense
+					// only — never signal the peer. Exit solely when we no longer hold
+					// durable ownership (orphaned predecessor). A still-owning daemon
+					// keeps serving so the legitimate owner is not pushed out by thrash.
+					if (pollResult.kind === "conflict_yield") {
+						if (await this.renewOwnershipHeartbeat()) {
+							this.poller.resetConflictStreak();
+							this.loopBackoff.reset();
+							continue;
+						}
+						break;
+					}
 					this.loopBackoff.reset();
 				} catch (e) {
 					// A transient getUpdates/network failure must not kill the daemon.

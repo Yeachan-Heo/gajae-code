@@ -79,9 +79,13 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * pre-readiness daemon-child exit diagnostics slice (#3761). Generation 53
  * renders multi-select state for ask-tool asks, not only durable workflow
  * gates, and renumbers pre-numbered options exactly once around the selection
- * marker.
+ * marker. Generation 54 adds bounded sustained getUpdates 409 self-defense:
+ * after a consecutive conflict streak the poller yields, and a non-owner exits
+ * through normal shutdown without signaling another PID while a still-owning
+ * daemon keeps serving (#3587 secondary fence; ownership reclaim provenance is
+ * unchanged).
  */
-export const DAEMON_GENERATION = 53;
+export const DAEMON_GENERATION = 54;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
