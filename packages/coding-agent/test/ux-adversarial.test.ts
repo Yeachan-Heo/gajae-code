@@ -77,7 +77,7 @@ describe("UX change-set adversarial probes", () => {
 		).toBeUndefined();
 	});
 
-	it("does not write malformed keybindings and preserves backup through a resumed migration", async () => {
+	it("does not write malformed or canonical-only keybindings and preserves the first migration backup", async () => {
 		const file = path.join(root, "keybindings.json");
 		await fs.writeFile(file, "{ broken");
 		KeybindingsManager.create(root);
@@ -90,8 +90,13 @@ describe("UX change-set adversarial probes", () => {
 		KeybindingsManager.create(root);
 		await fs.rm(`${file}.migration-v1`);
 		KeybindingsManager.create(root);
+		expect(await Bun.file(`${file}.migration-v1`).exists()).toBe(false);
+
+		await fs.writeFile(file, '{"clear":"ctrl+x"}\n');
+		const resumed = KeybindingsManager.create(root);
+		expect(resumed.getKeys("app.clear")).toEqual(["ctrl+x"]);
 		expect(await fs.readFile(`${file}.bak`, "utf8")).toBe(legacy);
-		expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ "app.interrupt": "escape" });
+		expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ "app.clear": "ctrl+x" });
 		expect(await fs.readFile(`${file}.migration-v1`, "utf8")).toBe("v1\n");
 		expect((await fs.readdir(root)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
 	});

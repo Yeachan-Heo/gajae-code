@@ -525,15 +525,13 @@ function loadKeybindingsConfig(
 	if (fs.existsSync(markerPath)) return toKeybindingsConfig(rawConfig);
 
 	const { config: migratedConfig, migrated } = migrateKeybindingNames(rawConfig);
-	if (writeBack) {
+	if (writeBack && migrated) {
 		try {
-			if (migrated) {
-				preserveFirstKeybindingsBackup(filePath, beforeStage);
-				const ordered = orderKeybindingsConfig(migratedConfig);
-				publishKeybindingMigrationFile(filePath, `${JSON.stringify(ordered, null, 2)}\n`, "primary", beforeStage);
-			}
+			preserveFirstKeybindingsBackup(filePath, beforeStage);
+			const ordered = orderKeybindingsConfig(migratedConfig);
+			publishKeybindingMigrationFile(filePath, `${JSON.stringify(ordered, null, 2)}\n`, "primary", beforeStage);
 			publishKeybindingMigrationFile(markerPath, "v1\n", "marker", beforeStage);
-			logger.debug("Completed keybindings migration", { path: filePath, migrated });
+			logger.debug("Completed keybindings migration", { path: filePath });
 		} catch (error) {
 			logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });
 		}

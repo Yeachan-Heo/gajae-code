@@ -29,6 +29,22 @@ describe("keybindings config", () => {
 		expect(await Bun.file(`${file}.migration-v1`).exists()).toBe(false);
 		expect(await migrationTemps(tempDir)).toEqual([]);
 	});
+	it("migrates legacy keys added after an initial canonical-only load", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-keybindings-"));
+		const file = path.join(tempDir, "keybindings.json");
+		await fs.writeFile(file, '{"app.clear":"ctrl+c"}\n');
+
+		expect(KeybindingsManager.create(tempDir).getKeys("app.clear")).toEqual(["ctrl+c"]);
+		expect(await Bun.file(`${file}.migration-v1`).exists()).toBe(false);
+		expect(await Bun.file(`${file}.bak`).exists()).toBe(false);
+
+		const legacy = '{"interrupt":"escape"}\n';
+		await fs.writeFile(file, legacy);
+		expect(KeybindingsManager.create(tempDir).getKeys("app.interrupt")).toEqual(["escape"]);
+		expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ "app.interrupt": "escape" });
+		expect(await fs.readFile(`${file}.bak`, "utf8")).toBe(legacy);
+		expect(await fs.readFile(`${file}.migration-v1`, "utf8")).toBe("v1\n");
+	});
 	it("publishes migration files atomically and preserves the first backup", async () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-keybindings-"));
 		const file = path.join(tempDir, "keybindings.json");
@@ -99,7 +115,7 @@ describe("keybindings config", () => {
 			expect(resumed.getKeys("app.interrupt")).toEqual(["escape"]);
 			expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ "app.interrupt": "escape" });
 			expect(await fs.readFile(`${file}.bak`, "utf8")).toBe(legacy);
-			expect(await fs.readFile(`${file}.migration-v1`, "utf8")).toBe("v1\n");
+			expect(await Bun.file(`${file}.migration-v1`).exists()).toBe(!failedAfterPrimary);
 			expect(await migrationTemps(directory)).toEqual([]);
 		}
 	});
