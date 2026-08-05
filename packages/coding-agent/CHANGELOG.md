@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Resume listing now reverse-scans for buried but canonically valid `header_patch` titles, so a persisted manual title remains visible in the picker after later transcript growth instead of falling back to an empty/line-1 projection (#3633).
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 
 ## [0.12.12] - 2026-08-05
