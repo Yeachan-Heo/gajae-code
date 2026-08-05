@@ -3868,18 +3868,34 @@ export class AgentSession {
 		const fullTextBytes = utf8ByteLength(fullText);
 		const thresholdBytes = this.settings.get("tools.artifactSpillThreshold") * 1024;
 		if (fullTextBytes <= thresholdBytes) return;
-		if (fullTextBytes > DEFAULT_ARTIFACT_MAX_BYTES) {
-			logPreAdmissionSpillFailure(
-				"artifact_too_large",
-				message.toolName,
-				undefined,
-				"Tool result exceeds the exact artifact storage limit",
-			);
-			return;
-		}
 
 		try {
-			const artifactId = await this.sessionManager.saveArtifact(fullText, "tool-result");
+			let artifactId: string | undefined;
+			if (fullTextBytes > DEFAULT_ARTIFACT_MAX_BYTES) {
+				const artifactManager = await this.sessionManager.ensureArtifactManager();
+				if (!artifactManager || !this.sessionManager.isArtifactManagerAuthorized(artifactManager)) {
+					logPreAdmissionSpillFailure(
+						"artifact_store_unavailable",
+						message.toolName,
+						undefined,
+						"Session-owned artifact storage is unavailable",
+					);
+					return;
+				}
+				artifactManager.assertManagedBinding();
+				artifactId = await artifactManager.save(fullText, "tool-result", { maxBytes: fullTextBytes });
+				if (!this.sessionManager.isArtifactManagerAuthorized(artifactManager)) {
+					logPreAdmissionSpillFailure(
+						"artifact_store_changed",
+						message.toolName,
+						undefined,
+						"Session artifact storage changed during save",
+					);
+					return;
+				}
+			} else {
+				artifactId = await this.sessionManager.saveArtifact(fullText, "tool-result");
+			}
 			if (!artifactId?.trim()) {
 				logPreAdmissionSpillFailure(
 					"artifact_id_missing",
@@ -3889,7 +3905,8 @@ export class AgentSession {
 				);
 				return;
 			}
-			if (!(await this.sessionManager.getArtifactPath(artifactId))) {
+			const artifactPath = await this.sessionManager.getArtifactPath(artifactId);
+			if (!artifactPath) {
 				logPreAdmissionSpillFailure(
 					"artifact_unreachable",
 					message.toolName,
@@ -3899,8 +3916,20 @@ export class AgentSession {
 				return;
 			}
 
-			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
-			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifactId, digest);
+			const expectedDigest = crypto.createHash("sha256").update(fullText).digest("hex");
+			const savedBytes = new Uint8Array(await Bun.file(artifactPath).arrayBuffer());
+			const savedDigest = crypto.createHash("sha256").update(savedBytes).digest("hex");
+			if (savedBytes.byteLength !== fullTextBytes || savedDigest !== expectedDigest) {
+				logPreAdmissionSpillFailure(
+					"artifact_content_mismatch",
+					message.toolName,
+					undefined,
+					"Saved artifact does not match the complete tool result",
+				);
+				return;
+			}
+
+			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifactId, expectedDigest);
 			const spillMeta = outputMeta()
 				.truncationFromText(preview, {
 					direction: "middle",
@@ -3912,7 +3941,8 @@ export class AgentSession {
 			const projectedDetails = detailRecord ?? {};
 			const projectedMeta = existingMeta ?? {};
 			// Admission invariant: the session-owned artifact is canonical; only after
-			// it is reachable may persistence and the provider share this receipt projection.
+			// its exact bytes, digest, and reachability are verified may persistence and
+			// the provider share this receipt projection.
 			message.details = { ...projectedDetails, meta: { ...projectedMeta, ...spillMeta } };
 			textBlock.text = preview;
 		} catch (error) {

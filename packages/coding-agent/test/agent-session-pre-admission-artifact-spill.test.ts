@@ -382,14 +382,18 @@ describe("AgentSession pre-admission artifact spill", () => {
 		}
 	});
 
-	it("retains the only full copy when the artifact store cannot save it exactly", async () => {
+	it("keeps the full result inline when saved artifact bytes fail digest verification", async () => {
+		tempDir = TempDir.createSync("@gjc-pre-admission-spill-mismatch-");
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic model");
 		const agent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 		});
-		const sessionManager = SessionManager.inMemory();
-		const save = vi.spyOn(sessionManager, "saveArtifact");
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const mismatchedPath = path.join(tempDir.path(), "same-size-mismatch.log");
+		await Bun.write(mismatchedPath, "b".repeat(2 * 1024));
+		vi.spyOn(sessionManager, "saveArtifact").mockResolvedValue("mismatch");
+		vi.spyOn(sessionManager, "getArtifactPath").mockResolvedValue(mismatchedPath);
 		session = new AgentSession({
 			agent,
 			sessionManager,
@@ -401,15 +405,9 @@ describe("AgentSession pre-admission artifact spill", () => {
 		});
 		const result: ToolResultMessage = {
 			role: "toolResult",
-			toolCallId: "over-artifact-cap",
+			toolCallId: "digest-mismatch",
 			toolName: "read",
-			content: [
-				{
-					type: "text",
-					text: "界".repeat(Math.floor(DEFAULT_ARTIFACT_MAX_BYTES / 3) + 1),
-				},
-			],
-			details: { stable: true },
+			content: [{ type: "text", text: "a".repeat(2 * 1024) }],
 			isError: false,
 			timestamp: Date.now(),
 		};
@@ -420,18 +418,87 @@ describe("AgentSession pre-admission artifact spill", () => {
 			await session.awaitPendingContextTransformations();
 			await Bun.sleep(0);
 
-			expect(save).not.toHaveBeenCalled();
 			expect(Buffer.from(JSON.stringify(result))).toEqual(expected);
 			expect(
-				warn.mock.calls.filter(
+				warn.mock.calls.some(
 					([message, metadata]) =>
 						message === "Pre-admission artifact spill preserved inline tool result" &&
-						metadata?.outcome === "artifact_too_large",
+						metadata?.outcome === "artifact_content_mismatch",
 				),
-			).toHaveLength(1);
+			).toBe(true);
 		} finally {
 			warn.mockRestore();
 		}
+	});
+
+	it("recovers, resumes, and deletes a byte-exact artifact above the generic 10 MiB cap", async () => {
+		tempDir = TempDir.createSync("@gjc-pre-admission-spill-over-cap-");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const agent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+		const genericSave = vi.spyOn(sessionManager, "saveArtifact");
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"tools.preAdmissionArtifactSpill": true,
+				"tools.artifactSpillThreshold": 1,
+			}),
+			modelRegistry: {} as never,
+		});
+		const fullText = `head\n${"界".repeat(Math.floor(DEFAULT_ARTIFACT_MAX_BYTES / 3) + 1)}\ntail`;
+		expect(Buffer.byteLength(fullText, "utf8")).toBeGreaterThan(DEFAULT_ARTIFACT_MAX_BYTES);
+		const expectedBytes = Buffer.from(fullText, "utf8");
+		const expectedDigest = crypto.createHash("sha256").update(expectedBytes).digest("hex");
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "over-artifact-cap",
+			toolName: "read",
+			content: [{ type: "text", text: fullText }],
+			details: { stable: true },
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		agent.emitExternalEvent({ type: "message_end", message: result });
+		await session.awaitPendingContextTransformations();
+		await Bun.sleep(0);
+
+		expect(genericSave).not.toHaveBeenCalled();
+		const preview = result.content[0];
+		expect(preview?.type).toBe("text");
+		if (preview?.type !== "text") throw new Error("Expected text preview");
+		expect(preview.text).toContain(expectedDigest);
+		const artifactId = preview.text.match(SPILL_URI)?.[1];
+		expect(artifactId).toBeDefined();
+		if (!artifactId) throw new Error("Expected artifact URI");
+		expect(result.details?.meta?.truncation?.artifactId).toBe(artifactId);
+
+		const artifactPath = await sessionManager.getArtifactPath(artifactId);
+		expect(artifactPath).not.toBeNull();
+		if (!artifactPath) throw new Error("Expected artifact path");
+		expect(await fs.readFile(artifactPath)).toEqual(expectedBytes);
+
+		const sessionFile = sessionManager.getSessionFile();
+		expect(sessionFile).not.toBeNull();
+		if (!sessionFile) throw new Error("Expected session file");
+		const resumed = await SessionManager.open(sessionFile);
+		expect(await resumed.getArtifactPath(artifactId)).toBe(artifactPath);
+		expect(await fs.readFile((await resumed.getArtifactPath(artifactId))!)).toEqual(expectedBytes);
+
+		await session.dispose();
+		session = undefined;
+		await sessionManager.dropSession(sessionFile);
+		expect(
+			await fs.stat(path.dirname(artifactPath)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
 	});
 	it("preserves existing artifact metadata without resaving, whether reachable or stale", async () => {
 		tempDir = TempDir.createSync("@gjc-pre-admission-spill-existing-");
