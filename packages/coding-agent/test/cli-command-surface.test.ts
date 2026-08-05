@@ -37,11 +37,7 @@ describe("GJC public CLI command surface", () => {
 	it("routes bare models to --list-models instead of a launch prompt (#3857)", () => {
 		expect(routeModelsAlias(["models"])).toEqual(["launch", "--list-models"]);
 		expect(routeModelsAlias(["models", "deepseek"])).toEqual(["launch", "--list-models", "deepseek"]);
-		expect(routeModelsAlias(["models", "claude", "sonnet"])).toEqual([
-			"launch",
-			"--list-models",
-			"claude sonnet",
-		]);
+		expect(routeModelsAlias(["models", "claude", "sonnet"])).toEqual(["launch", "--list-models", "claude sonnet"]);
 		expect(routeModelsAlias(["models", "--json"])).toEqual(["launch", "--list-models", "--json"]);
 		expect(routeModelsAlias(["stats"])).toBeUndefined();
 		expect(routeRootArgv(["models"])).toEqual(["launch", "--list-models"]);
