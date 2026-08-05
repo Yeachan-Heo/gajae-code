@@ -1,3 +1,5 @@
+import { logger, sanitizeText } from "@gajae-code/utils";
+
 export type AnimationCadence = 16 | 80;
 
 type TimerHandle = ReturnType<typeof setInterval>;
@@ -22,6 +24,35 @@ const DEFAULT_CONGESTION_THRESHOLD_BYTES = 64 * 1024;
 
 let bufferedOutputBytesProbe: (() => number | undefined) | undefined;
 let skippedTicks = 0;
+let failedCallbackCount = 0;
+
+const MAX_ERROR_NAME_CODE_POINTS = 64;
+const MAX_ERROR_MESSAGE_CODE_POINTS = 256;
+
+function boundedDiagnosticText(value: string, limit: number, fallback: string): string {
+	const sanitized = sanitizeText(value).replace(/\s+/g, " ").trim();
+	return Array.from(sanitized || fallback)
+		.slice(0, limit)
+		.join("");
+}
+
+function errorDiagnostic(error: unknown): { errorName: string; message: string } {
+	if (!(error instanceof Error)) {
+		return { errorName: "UnknownError", message: "Animation callback threw a non-Error value" };
+	}
+	let name = "Error";
+	let message = "Animation callback threw";
+	try {
+		if (typeof error.name === "string") name = error.name;
+		if (typeof error.message === "string") message = error.message;
+	} catch {
+		// Hostile accessors must not turn diagnostic extraction into another tick failure.
+	}
+	return {
+		errorName: boundedDiagnosticText(name, MAX_ERROR_NAME_CODE_POINTS, "Error"),
+		message: boundedDiagnosticText(message, MAX_ERROR_MESSAGE_CODE_POINTS, "Animation callback threw"),
+	};
+}
 
 function outputIsCongested(): boolean {
 	const stdout = globalThis.process?.stdout as { writableLength?: number } | undefined;
@@ -52,14 +83,22 @@ function startBucket(cadence: AnimationCadence, bucket: CadenceBucket): void {
 			return;
 		}
 		const now = performance.now();
-		// Snapshot so re-entrant register/unregister during a tick is safe, and
-		// isolate each callback so one throwing registrant cannot starve siblings
-		// or surface as an uncaught exception that kills the shared timer.
+		// Snapshot so re-entrant register/unregister during a tick is safe.
 		for (const callback of [...bucket.callbacks]) {
 			try {
 				callback(now);
-			} catch (err) {
-				console.error("[animation-scheduler] callback threw:", err);
+			} catch (error) {
+				// A failed decorative registration is disposable: quarantine it before
+				// reporting so neither logger latency nor failure can make it run again.
+				bucket.callbacks.delete(callback);
+				failedCallbackCount += 1;
+				if (bucket.callbacks.size === 0) stopBucket(bucket);
+				const diagnostic = errorDiagnostic(error);
+				logger.warn("Animation callback quarantined after throwing", {
+					cadence,
+					errorName: diagnostic.errorName,
+					message: diagnostic.message,
+				});
 			}
 		}
 	}, cadence);
@@ -120,6 +159,9 @@ export const __animationSchedulerTestHooks = {
 	getSkippedTickCount(): number {
 		return skippedTicks;
 	},
+	getFailedCallbackCount(): number {
+		return failedCallbackCount;
+	},
 	getCongestionThresholdBytes(): number {
 		return DEFAULT_CONGESTION_THRESHOLD_BYTES;
 	},
@@ -133,6 +175,7 @@ export const __animationSchedulerTestHooks = {
 			bucket.startedTimers = 0;
 		}
 		skippedTicks = 0;
+		failedCallbackCount = 0;
 		bufferedOutputBytesProbe = undefined;
 	},
 };

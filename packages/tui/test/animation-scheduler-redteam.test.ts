@@ -3,6 +3,7 @@ import { __animationSchedulerTestHooks } from "@gajae-code/tui";
 import { registerAnimationCallback } from "@gajae-code/tui/animation-scheduler";
 import { Loader } from "@gajae-code/tui/components/loader";
 import type { TUI } from "@gajae-code/tui/tui";
+import { logger } from "@gajae-code/utils";
 
 function makeUi() {
 	return { requestRender: vi.fn() } as unknown as TUI & { requestRender: ReturnType<typeof vi.fn> };
@@ -193,6 +194,7 @@ describe("G010 shared animation scheduler red-team", () => {
 
 	it("THROW-ISOLATION: one throwing callback does not stop the bucket or block other registrants", () => {
 		vi.useFakeTimers();
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		let healthyCalls = 0;
 		const throwing = registerAnimationCallback(() => {
 			throw new Error("red-team scheduler throw");
@@ -204,14 +206,45 @@ describe("G010 shared animation scheduler red-team", () => {
 		expect(() => vi.advanceTimersByTime(80)).not.toThrow();
 		expect(healthyCalls).toBe(1);
 		expect(__animationSchedulerTestHooks.getActiveTimerCount(80)).toBe(1);
+		expect(__animationSchedulerTestHooks.getRegistrantCount(80)).toBe(1);
+		expect(__animationSchedulerTestHooks.getFailedCallbackCount()).toBe(1);
+		expect(warning).toHaveBeenCalledTimes(1);
 
 		throwing.unregister();
 		vi.advanceTimersByTime(80);
 		expect(healthyCalls).toBe(2);
 		expect(__animationSchedulerTestHooks.getActiveTimerCount(80)).toBe(1);
+		expect(warning).toHaveBeenCalledTimes(1);
 
 		healthy.unregister();
 		expect(__animationSchedulerTestHooks.getActiveTimerCount()).toBe(0);
+	});
+
+	it("keeps scheduler failures out of terminal bytes", () => {
+		const result = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"--eval",
+				`
+					import { __animationSchedulerTestHooks, registerAnimationCallback } from "./packages/tui/src/animation-scheduler.ts";
+					registerAnimationCallback(() => { throw new Error("terminal-byte-sentinel"); }, 16);
+					await Bun.sleep(40);
+					process.exitCode =
+						__animationSchedulerTestHooks.getFailedCallbackCount() === 1 &&
+						__animationSchedulerTestHooks.getActiveTimerCount() === 0
+							? 0
+							: 1;
+				`,
+			],
+			cwd: process.cwd(),
+			env: process.env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.byteLength).toBe(0);
+		expect(result.stderr.byteLength).toBe(0);
 	});
 
 	it("REENTRANT: callback registration and unregistration during a tick do not corrupt invocation counts", () => {

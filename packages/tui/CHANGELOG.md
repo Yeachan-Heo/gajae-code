@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Throwing animation callbacks are now removed before one bounded centralized diagnostic is recorded, so a failed decorative registrant runs only once, healthy siblings continue, the final shared timer stops, and scheduler failures never write directly to terminal stdout or stderr.
+
 ## [0.12.12] - 2026-08-05
 ### Fixed
 
