@@ -367,6 +367,8 @@ export interface CreateAgentSessionOptions {
 	providerSessionId?: string;
 	/** Runtime credential selector for multi-account auth pools. */
 	credentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
+	/** Soft runtime credential preference; quota/rate-limit failures may rotate away. */
+	preferredCredentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -1164,20 +1166,34 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		});
 		let runtimeCredentialSelectorInstalled = false;
+		let runtimePreferredCredentialSelectorInstalled = false;
 		const installRuntimeCredentialSelector = (provider: string): void => {
 			if (!options.credentialSelector || runtimeCredentialSelectorInstalled) return;
 			authStorage.setRuntimeCredentialSelector(provider, options.credentialSelector.selector);
 			runtimeCredentialSelectorInstalled = true;
 		};
+		const installRuntimePreferredCredentialSelector = (provider: string): void => {
+			if (!options.preferredCredentialSelector || runtimePreferredCredentialSelectorInstalled) return;
+			authStorage.setRuntimePreferredCredentialSelector(provider, options.preferredCredentialSelector.selector);
+			runtimePreferredCredentialSelectorInstalled = true;
+		};
 		const earlyCredentialSelectorProvider = options.credentialSelector?.provider ?? options.model?.provider;
 		if (earlyCredentialSelectorProvider) {
 			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
+		}
+		const earlyPreferredCredentialSelectorProvider =
+			options.preferredCredentialSelector?.provider ?? options.model?.provider;
+		if (earlyPreferredCredentialSelectorProvider) {
+			installRuntimePreferredCredentialSelector(earlyPreferredCredentialSelectorProvider);
 		}
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		const canRefreshModelsBeforeCredentialSelector =
-			!options.credentialSelector || runtimeCredentialSelectorInstalled || options.modelRegistry !== undefined;
+			(!options.credentialSelector || runtimeCredentialSelectorInstalled || options.modelRegistry !== undefined) &&
+			(!options.preferredCredentialSelector ||
+				runtimePreferredCredentialSelectorInstalled ||
+				options.modelRegistry !== undefined);
 		if (!options.modelRegistry && canRefreshModelsBeforeCredentialSelector) {
 			modelRegistry.refreshInBackground();
 		}
@@ -1265,6 +1281,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: undefined
 					: undefined;
 			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
+				modelApiKeyAvailability.set(availabilityKey, false);
+				return false;
+			}
+			if (
+				options.preferredCredentialSelector?.provider &&
+				options.preferredCredentialSelector.provider !== candidate.provider
+			) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
 			}
@@ -2111,6 +2134,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				);
 			}
 			installRuntimeCredentialSelector(credentialProvider);
+			if (!options.modelRegistry && !canRefreshModelsBeforeCredentialSelector) {
+				modelRegistry.refreshInBackground();
+			}
+		}
+		if (options.preferredCredentialSelector && !runtimePreferredCredentialSelectorInstalled) {
+			const credentialProvider = options.preferredCredentialSelector.provider ?? model?.provider;
+			if (!credentialProvider) {
+				throw new Error(
+					`--prefer-credential ${options.preferredCredentialSelector.raw} requires a resolved model or an explicit provider prefix`,
+				);
+			}
+			installRuntimePreferredCredentialSelector(credentialProvider);
 			if (!options.modelRegistry && !canRefreshModelsBeforeCredentialSelector) {
 				modelRegistry.refreshInBackground();
 			}

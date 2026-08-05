@@ -22,6 +22,7 @@ export interface Args {
 	default?: boolean;
 	apiKey?: string;
 	credential?: string;
+	preferCredential?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	mcpConfig?: string;
@@ -159,6 +160,12 @@ export function parseArgs(args: string[]): Args {
 				throw new CliParseError("--credential requires <selector>");
 			}
 			result.credential = args[++i];
+		} else if (arg === "--prefer-credential") {
+			const next = args[i + 1];
+			if (!next || next.startsWith("-")) {
+				throw new CliParseError("--prefer-credential requires <selector>");
+			}
+			result.preferCredential = args[++i];
 		} else if (arg === "--system-prompt" && i + 1 < args.length) {
 			result.systemPrompt = args[++i];
 		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
@@ -246,6 +253,12 @@ export function parseArgs(args: string[]): Args {
 
 	if (result.default && !result.mpreset) {
 		throw new Error("--default requires --mpreset <name>");
+	}
+	if (result.credential && result.preferCredential) {
+		throw new CliParseError("--credential and --prefer-credential cannot be used together");
+	}
+	if (result.apiKey && result.preferCredential) {
+		throw new CliParseError("--api-key and --prefer-credential cannot be used together");
 	}
 	if (
 		result.mcpConfig !== undefined &&

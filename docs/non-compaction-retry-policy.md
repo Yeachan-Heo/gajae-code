@@ -78,6 +78,23 @@ Flow (`#handleRetryableError`):
 
 `#retryPromise` resolves/clears when retry chain ends (success, cancellation, or max-exceeded), via `#resolveRetry()`.
 
+## Preferred credential quota fallback
+
+`--prefer-credential <selector>` gives one active stored OAuth credential first priority without pinning it:
+
+```bash
+gjc --prefer-credential id:15
+gjc --prefer-credential email:name@example.com
+gjc --prefer-credential anthropic/id:15
+gjc --resume --prefer-credential id:15
+```
+
+The selector works for any provider backed by a multi-account OAuth credential pool; it is not Anthropic-specific. API-key credentials and runtime `--api-key` overrides are intentionally outside this soft-selection path.
+
+A usable preferred credential is placed before candidates ordered by the provider's existing balanced policy. A content-free quota or rate-limit failure marks that row blocked, switches immediately to another active candidate, and replays the request with zero delay. The fallback row remains sticky for the session. Partial assistant output or tool execution prevents replay, and exhaustion surfaces the final error without a retry loop. `403 forbidden` remains an authorization failure and does not mutate quota state.
+
+`--credential` remains a hard pin. `--prefer-credential` is mutually exclusive with both `--credential` and `--api-key`, and an invalid or inactive selector fails startup.
+
 ## Backoff and max-attempt semantics
 
 Settings:

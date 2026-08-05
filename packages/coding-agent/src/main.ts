@@ -192,6 +192,7 @@ export function resolveAcpStartupOptions(
 		| "apiKey"
 		| "appendSystemPrompt"
 		| "credential"
+		| "preferCredential"
 		| "continue"
 		| "default"
 		| "cwd"
@@ -235,6 +236,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.apiKey ? ["--api-key"] : []),
 		...(parsed.appendSystemPrompt ? ["--append-system-prompt"] : []),
 		...(parsed.credential ? ["--credential"] : []),
+		...(parsed.preferCredential ? ["--prefer-credential"] : []),
 		...(parsed.continue ? ["--continue"] : []),
 		...(parsed.cwd ? ["--cwd"] : []),
 		...(parsed.fileArgs.length > 0 ? ["@file"] : []),
@@ -1613,7 +1615,15 @@ export async function runRootCommand(
 	deps.rlmPreset?.applyOptions(sessionOptions, settingsInstance);
 	const acpStartupOptions = mode === "acp" ? resolveAcpStartupOptions(parsedArgs, sessionOptions) : undefined;
 
-	// Handle CLI --api-key as runtime override (not persisted)
+	// Handle CLI credential selection and --api-key as runtime overrides (not persisted).
+	if (parsedArgs.credential && parsedArgs.preferCredential) {
+		process.stderr.write(`${chalk.red("--credential and --prefer-credential cannot be used together")}\n`);
+		process.exit(1);
+	}
+	if (parsedArgs.apiKey && parsedArgs.preferCredential) {
+		process.stderr.write(`${chalk.red("--api-key and --prefer-credential cannot be used together")}\n`);
+		process.exit(1);
+	}
 	if (parsedArgs.apiKey && parsedArgs.credential) {
 		process.stderr.write(`${chalk.red("--api-key and --credential cannot be used together")}\n`);
 		process.exit(1);
@@ -1622,6 +1632,15 @@ export async function runRootCommand(
 	if (parsedArgs.credential) {
 		try {
 			sessionOptions.credentialSelector = parseCliCredentialSelector(parsedArgs.credential);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			process.stderr.write(`${chalk.red(message)}\n`);
+			process.exit(1);
+		}
+	}
+	if (parsedArgs.preferCredential) {
+		try {
+			sessionOptions.preferredCredentialSelector = parseCliCredentialSelector(parsedArgs.preferCredential);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			process.stderr.write(`${chalk.red(message)}\n`);

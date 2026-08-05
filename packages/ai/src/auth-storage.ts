@@ -835,6 +835,7 @@ export class AuthStorage {
 	#runtimeOverrides: Map<string, string> = new Map();
 	#configOverrides: Map<string, string> = new Map();
 	#runtimeCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
+	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
 	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
@@ -1068,6 +1069,9 @@ export class AuthStorage {
 	 */
 	setRuntimeCredentialSelector(provider: string, selector: AuthCredentialSelector): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimePreferredCredentialSelectors.has(storageProvider)) {
+			throw new Error(`Credential selector cannot be combined with a preferred credential selector for ${provider}`);
+		}
 		this.#assertCredentialSelectorUsable(storageProvider, selector);
 		this.#runtimeCredentialSelectors.set(storageProvider, selector);
 		this.#bumpGeneration("set-runtime-credential-selector", provider);
@@ -1080,6 +1084,28 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (this.#runtimeCredentialSelectors.delete(storageProvider)) {
 			this.#bumpGeneration("remove-runtime-credential-selector", provider);
+		}
+	}
+
+	/**
+	 * Prefer one OAuth credential for a provider while retaining quota fallback.
+	 * Used for CLI --prefer-credential.
+	 */
+	setRuntimePreferredCredentialSelector(provider: string, selector: AuthCredentialSelector): void {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeCredentialSelectors.has(storageProvider)) {
+			throw new Error(`Preferred credential selector cannot be combined with a credential selector for ${provider}`);
+		}
+		this.#assertPreferredCredentialSelectorUsable(storageProvider, selector);
+		this.#runtimePreferredCredentialSelectors.set(storageProvider, selector);
+		this.#bumpGeneration("set-runtime-preferred-credential-selector", provider);
+	}
+
+	/** Remove a runtime preferred credential selector. */
+	removeRuntimePreferredCredentialSelector(provider: string): void {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimePreferredCredentialSelectors.delete(storageProvider)) {
+			this.#bumpGeneration("remove-runtime-preferred-credential-selector", provider);
 		}
 	}
 
@@ -1106,6 +1132,11 @@ export class AuthStorage {
 	 */
 	hasRuntimeCredentialSelector(provider: string): boolean {
 		return this.#runtimeCredentialSelectors.has(resolveOAuthStorageProvider(provider));
+	}
+
+	/** Whether a provider has a soft runtime credential preference. */
+	hasRuntimePreferredCredentialSelector(provider: string): boolean {
+		return this.#runtimePreferredCredentialSelectors.has(resolveOAuthStorageProvider(provider));
 	}
 
 	/**
@@ -1451,6 +1482,20 @@ export class AuthStorage {
 		}
 		if (!this.#findCredentialBySelector(provider, selector)) {
 			throw new Error(`No credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`);
+		}
+	}
+
+	#assertPreferredCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector): void {
+		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
+			throw new Error(
+				`Preferred credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while an API key override is active`,
+			);
+		}
+		const selected = this.#findCredentialBySelector(provider, selector);
+		if (selected?.credential.type !== "oauth") {
+			throw new Error(
+				`No active credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`,
+			);
 		}
 	}
 
@@ -2656,6 +2701,15 @@ export class AuthStorage {
 		return identifiers.map(identifier => `${report.provider}:${identifier.toLowerCase()}`);
 	}
 
+	#getUsageReportCredentialRowId(report: UsageReport): number | undefined {
+		const identifiers = new Set(this.#getUsageReportIdentifiers(report));
+		if (identifiers.size === 0) return undefined;
+		return this.#getStoredCredentials(report.provider).find(entry => {
+			const identityKey = resolveCredentialIdentityKey(report.provider, entry.credential);
+			return identityKey !== null && identifiers.has(identityKey.toLowerCase());
+		})?.id;
+	}
+
 	#mergeUsageReportGroup(reports: UsageReport[]): UsageReport {
 		if (reports.length === 1) return reports[0];
 		const sorted = [...reports].sort((a, b) => {
@@ -2837,8 +2891,7 @@ export class AuthStorage {
 						provider: request.provider,
 						credentialType: request.credential.type,
 						baseUrl: request.baseUrl,
-						accountId: request.credential.accountId,
-						email: request.credential.email,
+						credentialId: this.#findStoredCredentialIdForUsageCredential(request.provider, request.credential),
 					});
 				}
 			}
@@ -2854,20 +2907,11 @@ export class AuthStorage {
 			const resolved = deduped;
 			if (options?.logDetails !== false) {
 				this.#usageLogger?.debug("Usage fetch resolved", {
-					reports: resolved.map(report => {
-						const accountLabel =
-							this.#getUsageReportMetadataValue(report, "email") ??
-							this.#getUsageReportMetadataValue(report, "accountId") ??
-							this.#getUsageReportMetadataValue(report, "account") ??
-							this.#getUsageReportMetadataValue(report, "user") ??
-							this.#getUsageReportMetadataValue(report, "username") ??
-							this.#getUsageReportScopeAccountId(report);
-						return {
-							provider: report.provider,
-							limits: report.limits.length,
-							account: accountLabel,
-						};
-					}),
+					reports: resolved.map(report => ({
+						provider: report.provider,
+						limits: report.limits.length,
+						credentialId: this.#getUsageReportCredentialRowId(report),
+					})),
 				});
 			}
 			return resolved;
@@ -3286,6 +3330,25 @@ export class AuthStorage {
 					.map(idx => credentials[idx])
 					.filter((selection): selection is { credential: OAuthCredential; index: number } => Boolean(selection))
 					.map(selection => ({ selection, usage: null, usageChecked: false }));
+
+		if (!selectedCredential) {
+			const preferredSelector = this.#runtimePreferredCredentialSelectors.get(resolveOAuthStorageProvider(provider));
+			const preferredSelection = preferredSelector
+				? this.#findCredentialBySelector(provider, preferredSelector)
+				: undefined;
+			if (
+				preferredSelection?.credential.type === "oauth" &&
+				!this.#isCredentialBlocked(providerKey, preferredSelection.index)
+			) {
+				const preferredCandidate = candidates.findIndex(
+					candidate => candidate.selection.index === preferredSelection.index,
+				);
+				if (preferredCandidate > 0) {
+					const [preferred] = candidates.splice(preferredCandidate, 1);
+					candidates.unshift(preferred);
+				}
+			}
+		}
 
 		if (!selectedCredential && sessionPreferredIndex !== undefined && !requiresProModel) {
 			const sessionPreferredCandidate = candidates.findIndex(
