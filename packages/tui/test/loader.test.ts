@@ -14,6 +14,9 @@ const TERMINAL_TRANSPORT_ENV_KEYS = [
 	"STY",
 	"ZELLIJ",
 	"GJC_TMUX_LAUNCHED",
+	// TERM feeds the multiplexer predicate: tmux-*/screen-* values count as
+	// multiplexed and would route animated loaders back to the 80ms bucket.
+	"TERM",
 ] as const;
 
 function clearTerminalTransportEnv(): () => void {
@@ -151,6 +154,7 @@ describe("Loader component", () => {
 	it("restores the 60fps color cadence for direct local terminals", () => {
 		vi.useFakeTimers();
 		const restoreEnv = clearTerminalTransportEnv();
+		process.env.TERM = "xterm-256color";
 		const term = new VirtualTerminal(40, 4);
 		const tui = new TUI(term);
 		let colorTick = 0;
