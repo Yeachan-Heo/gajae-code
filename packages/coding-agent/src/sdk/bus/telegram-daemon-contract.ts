@@ -72,9 +72,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 49 drains every admitted session-message handler before final
  * durable persistence and ownership release. Generation 50 resolves intermediate
  * notifications-directory symlinks before native exact unlink while keeping
- * final-component file symlinks fail-closed under AT_SYMLINK_NOFOLLOW, and adds
- * shared durable topic authority with archive recovery. Generation 51 requires
- * Telegram's documented error code for idempotent archive settlement.
+ * final-component file symlinks fail-closed under AT_SYMLINK_NOFOLLOW (bounded
+ * #3761 multi-account activation repair). Generation 51 adds shared durable
+ * topic authority, archive recovery, and requires Telegram's documented error
+ * code for idempotent archive settlement.
  */
 export const DAEMON_GENERATION = 51;
 
