@@ -94,6 +94,16 @@ export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 		chainLength: 2,
 		attemptsUsed: 3,
 	}),
+	credential_switched: ev({
+		type: "credential_switched",
+		eventId: "credential-1",
+		provider: "anthropic",
+		from: 11,
+		to: 12,
+		reason: "rate_limit",
+		retryAfterMs: 1_000,
+		timestamp: 1_700_000_000_000,
+	}),
 	thinking_level_changed: ev({ type: "thinking_level_changed", thinkingLevel: "high" }),
 	goal_updated: ev({ type: "goal_updated", goal: { objective: RAW_SECRET } }),
 };

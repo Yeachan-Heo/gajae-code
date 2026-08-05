@@ -498,6 +498,22 @@ export type AgentSessionEvent =
 			chainLength: number;
 			attemptsUsed: number;
 	  }
+	| {
+			/**
+			 * Mid-session credential rotation on the same model. `from`/`to` are
+			 * opaque stored row ids only — never email, account, project, or key
+			 * material — so the event is safe across RPC, ACP, and subagent
+			 * forwarding. No TUI status line is required.
+			 */
+			type: "credential_switched";
+			eventId: string;
+			provider: string;
+			from: number;
+			to: number;
+			reason: string;
+			retryAfterMs?: number;
+			timestamp: number;
+	  }
 	| { type: "ttsr_triggered"; rules: Rule[] }
 	| { type: "todo_reminder"; todos: TodoItem[]; attempt: number; maxAttempts: number }
 	| { type: "todo_auto_clear" }
@@ -1799,6 +1815,21 @@ export class AgentSession {
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
+	/**
+	 * Facts for the most recent distinct-row credential rotation produced by
+	 * `#markFailedCredential`. Consumed only when the rotation is converted into
+	 * a same-model retry (or an in-budget managed retry), so a rotation whose
+	 * restore is refused never announces a switch.
+	 */
+	#pendingCredentialSwitch:
+		| {
+				provider: string;
+				from: number;
+				to: number;
+				reason: string;
+				retryAfterMs?: number;
+		  }
+		| undefined;
 
 	#rebuildEventListenerSnapshot(): void {
 		this.#eventListenerSnapshot = Object.freeze([...this.#eventListeners]);
@@ -14434,22 +14465,33 @@ export class AgentSession {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
+		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
+		// A plain `forbidden` is terminal on every path. Without this, a 403 would
+		// re-enter retry policy: credential mutation is vetoed downstream, but the
+		// session would still retry and (on managed fallback) advance models on a
+		// request the caller is simply not authorized to make.
+		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return false;
 		if (!managedFallback) {
 			const classification = this.#classifyErrorForRetry(message);
-			return (
+			if (
 				classification === "usage_limit" ||
 				classification === "transient" ||
 				classification === "unknown" ||
 				classification === "first_event_timeout"
+			) {
+				return true;
+			}
+			// Content-free credential faults (HTTP 401 / typed invalid_api_key) are
+			// as replay-safe as a content-free 429: admit them so mid-session
+			// rotation can convert them into a same-model retry. If no alternate
+			// credential exists, `#handleRetryableError` surfaces immediately and
+			// does not fall through to generic same-key retry.
+			return (
+				trigger.class === "auth" &&
+				trigger.authDisposition !== "forbidden" &&
+				!assistantMessageHasVisibleOrToolContent(message)
 			);
 		}
-		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
-		// A plain `forbidden` is terminal. Without this, the blanket
-		// `transportFailure` admission below re-admits a committed forbidden
-		// failure into retry policy: credential mutation is vetoed downstream, but
-		// the chain would still retry and advance models on a request the caller is
-		// simply not authorized to make.
-		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return false;
 		if (transportFailure) return true;
 		if (
 			trigger.class === "rate_limit" ||
@@ -14973,6 +15015,7 @@ export class AgentSession {
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
 	}): Promise<boolean> {
+		this.#pendingCredentialSwitch = undefined;
 		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
 			return false;
 		}
@@ -14985,7 +15028,9 @@ export class AgentSession {
 		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) return false;
 
 		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
+		// Resolve first so the sticky row id reflects the credential that just failed.
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
+		const fromRowId = authStorage.getSessionCredentialRowId(provider, providerAffinitySessionId);
 
 		let mutated: boolean;
 		if (trigger.class === "auth") {
@@ -15001,7 +15046,45 @@ export class AgentSession {
 		if (!mutated) return false;
 
 		// (3) Distinct-row proof.
-		return (await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) !== activeApiKey;
+		if ((await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) === activeApiKey) {
+			return false;
+		}
+		const toRowId = authStorage.getSessionCredentialRowId(provider, providerAffinitySessionId);
+		// Stash opaque row ids for the caller to announce only when the rotation
+		// is accepted as a same-model retry. from/to must both be stored row ids;
+		// env-key / resolver paths have nothing safe to put on the wire.
+		if (typeof fromRowId === "number" && typeof toRowId === "number" && fromRowId !== toRowId) {
+			this.#pendingCredentialSwitch = {
+				provider,
+				from: fromRowId,
+				to: toRowId,
+				reason: trigger.class,
+				retryAfterMs: trigger.retryAfterMs,
+			};
+		}
+		return true;
+	}
+
+	/** Emit a buffered credential switch once the rotation is accepted as a same-model retry. */
+	#emitPendingCredentialSwitch(): void {
+		const pending = this.#pendingCredentialSwitch;
+		this.#pendingCredentialSwitch = undefined;
+		if (!pending) return;
+		this.#emit({
+			type: "credential_switched",
+			eventId: crypto.randomUUID(),
+			provider: pending.provider,
+			from: pending.from,
+			to: pending.to,
+			reason: pending.reason,
+			retryAfterMs: pending.retryAfterMs,
+			timestamp: Date.now(),
+		});
+	}
+
+	/** Drop a buffered switch without announcing it (restore refused / abandoned rotation). */
+	#discardPendingCredentialSwitch(): void {
+		this.#pendingCredentialSwitch = undefined;
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -15048,14 +15131,19 @@ export class AgentSession {
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
 				: false;
 		}
-		// Credential rotation: a content-free quota/rate-limit failure has no
+		// Credential rotation: a content-free quota/rate-limit/auth failure has no
 		// observable state to corrupt, so it is replay-safe regardless of
 		// extension lifecycle participation. Mark the failed credential and
-		// retry with the next stored credential of the same provider.
+		// retry with the next stored credential of the same provider. Auth (HTTP
+		// 401 / typed credential faults) is admitted under the same content-free
+		// condition as 429 — a plain `forbidden` is already vetoed inside
+		// `#markFailedCredential` via `authDisposition`.
+		const isCredentialRotationTrigger =
+			trigger.class === "quota" || trigger.class === "rate_limit" || trigger.class === "auth";
 		let credentialRotated =
 			!managedFallback &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
+			isCredentialRotationTrigger &&
 			(await this.#markFailedCredential(trigger));
 		// A content-free credential rotation is inherently replay-safe: no partial
 		// output, no tool calls, no extension-observable streaming state was produced
@@ -15071,6 +15159,7 @@ export class AgentSession {
 		// Content-free credential rotation remains eligible above; first-event
 		// timeout keeps its additional typed/scope checks earlier in this method.
 		if (!managedFallback && assistantMessageHasVisibleOrToolContent(message)) {
+			this.#discardPendingCredentialSwitch();
 			return false;
 		}
 		// Bare defaults retain their narrow watchdog and Codex admissions. A
@@ -15089,8 +15178,19 @@ export class AgentSession {
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
 				(!canReplayCodexOverload && !firstEventTimeout && !this.#hasCleanRetryReplaySafety)
 			) {
+				// Auth without a successful rotation must not fall through to any
+				// same-key bare-default retry path: classification would treat 401
+				// as terminal, and replaying the failed credential is not useful.
+				this.#discardPendingCredentialSwitch();
 				return false;
 			}
+		}
+		// Non-managed auth only exists on the retry path for mid-session rotation.
+		// If the pool did not produce a distinct credential, surface the error —
+		// do not convert a terminal credential fault into a same-key delay-retry.
+		if (!managedFallback && trigger.class === "auth" && !credentialRotated) {
+			this.#discardPendingCredentialSwitch();
+			return false;
 		}
 		const legacyUnbounded = !managedFallback && classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
@@ -15102,8 +15202,10 @@ export class AgentSession {
 				: "exhausted";
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
-		// exhaustion and forces an immediate same-model retry.
-		if (managedFallback && outcome === "advance" && (trigger.class === "quota" || trigger.class === "rate_limit")) {
+		// exhaustion and forces an immediate same-model retry. Auth joins quota
+		// and rate_limit here so a content-free 401 rotates-and-retries the same
+		// model instead of advancing the chain while the failed key is still sticky.
+		if (managedFallback && outcome === "advance" && isCredentialRotationTrigger) {
 			credentialRotated = await this.#markFailedCredential(trigger);
 		}
 		if (credentialRotated) {
@@ -15115,6 +15217,12 @@ export class AgentSession {
 			// attempt attribution, exhaustion, and sticky selection across two models.
 			if (!managedFallback || controller.restorePreviousEntryForRetry()) {
 				outcome = "retry";
+				this.#emitPendingCredentialSwitch();
+			} else {
+				// Rotation happened but could not be converted into a same-model
+				// retry; the chain advances as originally decided and no switch
+				// is announced for this abandoned same-model path.
+				this.#discardPendingCredentialSwitch();
 			}
 		}
 		if (outcome === "exhausted") {
@@ -15150,7 +15258,16 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
-			if (managedFallback && !credentialRotated) await this.#markFailedCredential(trigger);
+			// In-budget managed retry (outcome already "retry") still marks the
+			// failed credential so the sticky key advances; announce when that
+			// mark produces a distinct stored row.
+			if (managedFallback && !credentialRotated) {
+				if (await this.#markFailedCredential(trigger)) {
+					this.#emitPendingCredentialSwitch();
+				} else {
+					this.#discardPendingCredentialSwitch();
+				}
+			}
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
 			if (outcome === "advance") {

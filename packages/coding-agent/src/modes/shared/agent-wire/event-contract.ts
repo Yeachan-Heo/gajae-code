@@ -52,6 +52,7 @@ const AGENT_SESSION_EVENT_TYPE_REGISTRY: Record<AgentWireEventType, true> = {
 	subagent_steer_message: true,
 	notice: true,
 	model_fallback_switched: true,
+	credential_switched: true,
 	thinking_level_changed: true,
 	goal_updated: true,
 };

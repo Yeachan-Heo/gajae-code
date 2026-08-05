@@ -216,6 +216,24 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: true,
 				coalesceKey: null,
 			});
+		case "credential_switched":
+			return obs(event, {
+				kind: "rpc_credential_switched",
+				signal: null,
+				evidence: {
+					eventId: str(event.eventId) ?? null,
+					provider: str(event.provider) ?? null,
+					// Opaque stored row ids only — never email/account/key material.
+					from: num(event.from) ?? null,
+					to: num(event.to) ?? null,
+					reason: str(event.reason) ?? null,
+					retryAfterMs: num(event.retryAfterMs) ?? null,
+					timestamp: num(event.timestamp) ?? null,
+				},
+				severity: "info",
+				semantic: true,
+				coalesceKey: null,
+			});
 		case "ttsr_triggered":
 			return obs(event, {
 				kind: "rpc_ttsr",

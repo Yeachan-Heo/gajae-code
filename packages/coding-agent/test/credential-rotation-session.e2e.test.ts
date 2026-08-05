@@ -7,40 +7,68 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 
 const selector = (model: Model) => `${model.provider}/${model.id}`;
 
-function quotaStream(model: Model): AssistantMessageEventStream {
+function emptyUsage(): AssistantMessage["usage"] {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function errorStream(
+	model: Model,
+	options: {
+		status: number;
+		errorMessage: string;
+		providerCode?: string;
+		content?: AssistantMessage["content"];
+	},
+): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message: AssistantMessage = {
 			role: "assistant",
-			content: [],
+			content: options.content ?? [],
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
+			usage: emptyUsage(),
 			stopReason: "error",
-			errorMessage: "rate limit exceeded",
-			errorStatus: 429,
+			errorMessage: options.errorMessage,
+			errorStatus: options.status,
 			timestamp: Date.now(),
-			transportFailure: { kind: "transport", status: 429 },
+			transportFailure: {
+				kind: "transport",
+				status: options.status,
+				...(options.providerCode ? { providerCode: options.providerCode } : {}),
+			},
 		};
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
 	});
 	return stream;
+}
+
+function quotaStream(model: Model): AssistantMessageEventStream {
+	return errorStream(model, { status: 429, errorMessage: "rate limit exceeded" });
+}
+
+function auth401Stream(model: Model): AssistantMessageEventStream {
+	return errorStream(model, { status: 401, errorMessage: "Unauthorized" });
+}
+
+function forbidden403Stream(model: Model): AssistantMessageEventStream {
+	return errorStream(model, { status: 403, errorMessage: "Forbidden", providerCode: "forbidden" });
 }
 
 function successfulStream(model: Model): AssistantMessageEventStream {
@@ -183,5 +211,260 @@ describe("AgentSession credential pin — no mutation on a pinned provider", () 
 		expect(invalidateCredentialMatching).not.toHaveBeenCalled();
 		// The primary is tried once and the chain advances as normal.
 		expect(calls).toEqual([selector(primary), selector(fallback)]);
+	});
+});
+
+/**
+ * Completes the three residual gaps around mid-session credential rotation
+ * (#3723): observable `credential_switched`, 401 rotate-and-retry parity with
+ * 429, and a terminal 403 that never mutates credential state.
+ */
+describe("AgentSession credential rotation — observability and 401 parity (#3723)", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let session: AgentSession | undefined;
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@credential-rotation-obs-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "anthropic-key-1" },
+			{ type: "api_key", key: "anthropic-key-2" },
+			{ type: "api_key", key: "anthropic-key-3" },
+		]);
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+	});
+
+	afterEach(async () => {
+		await session?.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+		vi.restoreAllMocks();
+	});
+
+	function rowIds(): number[] {
+		return authStorage
+			.exportSnapshot()
+			.credentials.filter(entry => entry.provider === "anthropic")
+			.map(entry => entry.id);
+	}
+
+	it("emits credential_switched with opaque row ids on a content-free 429 rotation", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary) throw new Error("Expected bundled test model");
+
+		const ids = rowIds();
+		expect(ids.length).toBeGreaterThanOrEqual(2);
+
+		let attempts = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, _options) => {
+				attempts += 1;
+				// First attempt fails with quota; the rotated credential succeeds.
+				return attempts === 1 ? quotaStream(model) : successfulStream(model);
+			}) satisfies AgentOptions["streamFn"],
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			// Single-entry chain so this exercises non-managed mid-session rotation.
+			modelRoles: { default: selector(primary) },
+			"retry.enabled": true,
+			"retry.maxRetries": 2,
+			"retry.baseDelayMs": 1,
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const switches: Array<Extract<AgentSessionEvent, { type: "credential_switched" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "credential_switched") switches.push(event);
+		});
+
+		await session.prompt("rotate on 429 and announce");
+		await session.waitForIdle();
+
+		expect(attempts).toBe(2);
+		expect(switches).toHaveLength(1);
+		const event = switches[0]!;
+		expect(event.provider).toBe("anthropic");
+		expect(event.reason).toBe("rate_limit");
+		expect(typeof event.from).toBe("number");
+		expect(typeof event.to).toBe("number");
+		expect(event.from).not.toBe(event.to);
+		expect(ids).toContain(event.from);
+		expect(ids).toContain(event.to);
+		// Opacity: the wire payload must not carry key material.
+		expect(JSON.stringify(event)).not.toContain("anthropic-key-");
+		expect(typeof event.eventId).toBe("string");
+		expect(typeof event.timestamp).toBe("number");
+	});
+
+	it("rotates-and-retries the same model on a content-free 401 and emits credential_switched", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+
+		const ids = rowIds();
+		const calls: string[] = [];
+		let primaryAttempts = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, _options) => {
+				calls.push(selector(model));
+				if (selector(model) === selector(primary)) {
+					primaryAttempts += 1;
+					// First primary attempt is a content-free 401; after rotation the
+					// same model succeeds. Fallback must not be reached.
+					return primaryAttempts === 1 ? auth401Stream(model) : successfulStream(model);
+				}
+				return successfulStream(model);
+			}) satisfies AgentOptions["streamFn"],
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.baseDelayMs": 1,
+		});
+		settings.set("modelRoles", { default: [selector(primary), selector(fallback)] });
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const switches: Array<Extract<AgentSessionEvent, { type: "credential_switched" }>> = [];
+		const fallbackSwitches: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "credential_switched") switches.push(event);
+			if (event.type === "model_fallback_switched") fallbackSwitches.push(event);
+		});
+
+		const invalidateCredentialMatching = vi.spyOn(authStorage, "invalidateCredentialMatching");
+
+		await session.prompt("401 should rotate-and-retry same model");
+		await session.waitForIdle();
+
+		expect(invalidateCredentialMatching).toHaveBeenCalled();
+		// Same model, two attempts (failed + rotated success). Fallback unused.
+		expect(primaryAttempts).toBe(2);
+		expect(calls.every(call => call === selector(primary))).toBe(true);
+		expect(fallbackSwitches).toHaveLength(0);
+		expect(switches).toHaveLength(1);
+		expect(switches[0]).toEqual(
+			expect.objectContaining({
+				type: "credential_switched",
+				provider: "anthropic",
+				reason: "auth",
+			}),
+		);
+		expect(ids).toContain(switches[0]!.from);
+		expect(ids).toContain(switches[0]!.to);
+		expect(switches[0]!.from).not.toBe(switches[0]!.to);
+	});
+
+	it("does not mutate credentials or emit credential_switched on a terminal 403", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+
+		const calls: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, _options) => {
+				calls.push(selector(model));
+				return selector(model) === selector(primary) ? forbidden403Stream(model) : successfulStream(model);
+			}) satisfies AgentOptions["streamFn"],
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.baseDelayMs": 1,
+		});
+		settings.set("modelRoles", { default: [selector(primary), selector(fallback)] });
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const switches: Array<Extract<AgentSessionEvent, { type: "credential_switched" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "credential_switched") switches.push(event);
+		});
+
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const invalidateCredentialMatching = vi.spyOn(authStorage, "invalidateCredentialMatching");
+
+		await session.prompt("403 is terminal");
+		await session.waitForIdle();
+
+		expect(markUsageLimitReached).not.toHaveBeenCalled();
+		expect(invalidateCredentialMatching).not.toHaveBeenCalled();
+		expect(switches).toHaveLength(0);
+		// Terminal forbidden never enters retry/fallback admission.
+		expect(calls).toEqual([selector(primary)]);
+	});
+
+	it("does not announce a switch when a single-row pool cannot rotate on 401", async () => {
+		// Replace the multi-row pool with a single credential so invalidation
+		// cannot produce a distinct row.
+		await authStorage.set("anthropic", [{ type: "api_key", key: "only-anthropic-key" }]);
+
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary) throw new Error("Expected bundled test model");
+
+		let attempts = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, _options) => {
+				attempts += 1;
+				return auth401Stream(model);
+			}) satisfies AgentOptions["streamFn"],
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			modelRoles: { default: selector(primary) },
+			"retry.enabled": true,
+			"retry.maxRetries": 3,
+			"retry.baseDelayMs": 1,
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const switches: Array<Extract<AgentSessionEvent, { type: "credential_switched" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "credential_switched") switches.push(event);
+		});
+
+		await session.prompt("single-row 401 must surface");
+		await session.waitForIdle();
+
+		// One attempt only: auth without a distinct alternate does not same-key retry.
+		expect(attempts).toBe(1);
+		expect(switches).toHaveLength(0);
 	});
 });

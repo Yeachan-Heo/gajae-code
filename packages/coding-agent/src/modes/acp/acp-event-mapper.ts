@@ -259,6 +259,23 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					},
 				}),
 			];
+		case "credential_switched":
+			// Opaque row ids only — no email/account/key material on the wire.
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcCredentialSwitched: true,
+						gjcCredentialSwitchEventId: event.eventId,
+						gjcCredentialSwitchProvider: event.provider,
+						gjcCredentialSwitchFrom: event.from,
+						gjcCredentialSwitchTo: event.to,
+						gjcCredentialSwitchReason: event.reason,
+						...(event.retryAfterMs !== undefined ? { gjcCredentialSwitchRetryAfterMs: event.retryAfterMs } : {}),
+						gjcCredentialSwitchTimestamp: event.timestamp,
+					},
+				}),
+			];
 		// These event types are intentionally not represented as ACP session updates.
 		case "agent_start":
 		case "agent_end":

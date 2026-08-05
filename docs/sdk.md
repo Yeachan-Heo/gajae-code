@@ -528,6 +528,8 @@ Model-role selectors may be ordered fallback chains; see [Fallback chains](./mod
 
 `model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` is the canonical session lifecycle event for every real fallback-model switch. It replaces the legacy `retry_fallback_applied` / `retry_fallback_succeeded` event names. Embedding clients can subscribe to this session event; generic WebSocket clients should use only the protocol frames documented above and any adapter-specific status updates they support.
 
+`credential_switched { eventId, provider, from, to, reason, retryAfterMs?, timestamp }` is the canonical session lifecycle event for every accepted same-model mid-session credential rotation. `from`/`to` are opaque stored row ids only — never email, account, project, or key material — so the event is safe across RPC, ACP, and subagent forwarding. Reasons include `rate_limit`, `quota`, and content-free `auth` (HTTP 401 / typed credential faults). A plain `forbidden` (HTTP 403) does not rotate and does not emit this event.
+
 
 ## Managed session-directory adapter guidance
 

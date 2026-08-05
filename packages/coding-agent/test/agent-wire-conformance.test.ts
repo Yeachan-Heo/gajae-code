@@ -37,6 +37,7 @@ const ACP_NOTICE_EVENT_TYPES = [
 	"ttsr_triggered",
 	"notice",
 	"model_fallback_switched",
+	"credential_switched",
 	"thinking_level_changed",
 	"goal_updated",
 ] as const;

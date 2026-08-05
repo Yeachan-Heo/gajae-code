@@ -159,6 +159,8 @@ export class EventController {
 			subagent_steer_message: e => this.#handleSubagentSteerMessage(e),
 			notice: e => this.#handleNotice(e),
 			model_fallback_switched: e => this.#handleModelFallbackSwitched(e),
+			// Observability-only: no TUI status line for mid-session credential switches.
+			credential_switched: async () => {},
 			thinking_level_changed: async () => {},
 			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;

@@ -173,13 +173,14 @@ Session-level retry events:
 - `auto_retry_start { attempt, maxAttempts, delayMs, errorMessage }`
 - `auto_retry_end { success, attempt, finalError? }`
 - `model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` — emitted once for each real fallback-model switch
+- `credential_switched { eventId, provider, from, to, reason, retryAfterMs?, timestamp }` — emitted once for each accepted same-model mid-session credential rotation. `from`/`to` are opaque stored row ids only (never email, account, project, or key material). Reasons include `rate_limit`, `quota`, and `auth` (content-free HTTP 401 / typed credential faults). A plain `forbidden` does not rotate and never emits this event. No TUI status line is required.
 
 Propagation:
 
 - emitted through `AgentSession.subscribe(...)`
 - forwarded to extension runner as extension events
 - exposed to external clients through SDK event subscriptions
-- in the TUI, `model_fallback_switched` updates the fallback-model status/notice and `EventController` consumes retry lifecycle events for loader/error UI
+- in the TUI, `model_fallback_switched` updates the fallback-model status/notice and `EventController` consumes retry lifecycle events for loader/error UI; `credential_switched` is handled as a no-op in the TUI handler map
 
 Final failure surfacing:
 
