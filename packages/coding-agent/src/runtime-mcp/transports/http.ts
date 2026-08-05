@@ -49,6 +49,9 @@ export class HttpTransport implements MCPTransport {
 	get connected(): boolean {
 		return this.#connected;
 	}
+	get closeBeforeReconnect(): false {
+		return false;
+	}
 
 	get url(): string {
 		return this.config.url;
@@ -181,11 +184,10 @@ export class HttpTransport implements MCPTransport {
 		try {
 			return await this.#executeRequest<T>(method, params, options);
 		} catch (error) {
-			// Retry once on auth failure if onAuthError is wired
-			if (this.onAuthError && error instanceof Error && /^HTTP (401|403):/.test(error.message)) {
+			// Retry once on auth failure only for explicitly replay-safe requests.
+			if (this.onAuthError && !options?.noReplay && error instanceof Error && /^HTTP (401|403):/.test(error.message)) {
 				const newHeaders = await this.onAuthError();
 				if (newHeaders) {
-					// Persist refreshed headers so subsequent requests use them directly
 					this.config = { ...this.config, headers: newHeaders };
 					try {
 						return await this.#executeRequest<T>(method, params, options);

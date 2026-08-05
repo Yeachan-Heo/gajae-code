@@ -1,9 +1,10 @@
 /**
  * Memory backend abstraction.
  *
- * Backends are mutually exclusive — `resolveMemoryBackend(settings)` returns
- * exactly one. Implementations MUST be self-contained: they own the per-session
- * state they create in `start()` and tear it down on `clear()`.
+ * Backend identities are resolved from config synchronously, while concrete
+ * implementations are activated through the runtime lazy service. Implementations
+ * MUST be self-contained: they own the per-session state they create in
+ * `start()` and tear it down on `clear()`.
  */
 
 import type { AgentMessage } from "@gajae-code/agent-core";

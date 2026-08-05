@@ -5,16 +5,15 @@
  * Handles tool loading and lifecycle.
  */
 import * as path from "node:path";
+import { realpathSync } from "node:fs";
 import * as url from "node:url";
-import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema } from "@gajae-code/ai";
+import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { SourceMeta } from "../capability/types";
 import * as configValue from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import {
-	connectToServer,
-	disconnectServer,
 	getPrompt,
 	listPrompts,
 	listResources,
@@ -23,9 +22,15 @@ import {
 	readResource,
 	serverSupportsPrompts,
 	serverSupportsResources,
-	subscribeToResources,
-	unsubscribeFromResources,
 } from "./client";
+import {
+	MCPConnectionPool,
+	MCPPoolAcquireAbortError,
+	MCPPoolLeaseObsoleteError,
+	MCPPoolLeaseReleaseError,
+	type MCPPoolEvent,
+	type MCPPoolLease,
+} from "./pool";
 import { loadAllMCPConfigs, validateServerConfig } from "./config";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
@@ -64,6 +69,32 @@ type ConnectionTask = {
 	connectionAbort: AbortController;
 	connectionEpoch: number;
 	disconnectEpoch: number;
+};
+
+type ScopedOperation = {
+	id: number;
+	name: string;
+	lifecycleEpoch: number;
+	controller: AbortController;
+	lease?: MCPPoolLease;
+	leaseReady: Promise<MCPPoolLease | undefined>;
+	resolveLeaseReady: (lease: MCPPoolLease | undefined) => void;
+	releasePromise?: Promise<void>;
+	completion: Promise<unknown>;
+};
+type DeferredSharedRebind = {
+	lease: MCPPoolLease;
+	managerEpoch: number;
+};
+type ActiveSharedRebind = {
+	lease: MCPPoolLease;
+	promise: Promise<void>;
+};
+type RetiredLeaseRelease = {
+	name: string;
+	connection: MCPServerConnection;
+	poolKey: string;
+	promise: Promise<void>;
 };
 
 const STARTUP_TIMEOUT_MS = 250;
@@ -149,6 +180,31 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
+function canonicalMCPWorkingDirectory(candidate: string): string {
+	const absolute = path.resolve(candidate);
+	try {
+		return realpathSync.native(absolute);
+	} catch {
+		return absolute;
+	}
+}
+
+export class MCPManagerLifecycleError extends Error {
+	readonly code = "MCP_MANAGER_LIFECYCLE_CLOSED" as const;
+	readonly phase: "disconnect" | "reconnect";
+
+	constructor(phase: "disconnect" | "reconnect", cause?: unknown) {
+		super(
+			`MCP manager is ${phase === "disconnect" ? "disconnecting" : "rotating MCP connections"}${
+				cause instanceof Error ? `: ${cause.message}` : ""
+			}`,
+			cause instanceof Error ? { cause } : undefined,
+		);
+		this.name = "MCPManagerLifecycleError";
+		this.phase = phase;
+	}
+}
+
 /**
  * Stable, total ordering on MCP tools by name.
  *
@@ -199,6 +255,8 @@ export interface MCPDiscoverOptions {
 	onConnecting?: (serverNames: string[]) => void;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
+	/** Idle retention for shared MCP pool entries. */
+	sharedPoolIdleMs?: number;
 }
 
 export interface MCPManagerOptions {
@@ -211,6 +269,16 @@ export interface MCPManagerOptions {
 	 * are ignored and the default applies.
 	 */
 	maxStartupTimeoutMs?: number;
+	/** Connection pool used for every physical MCP open/close. */
+	pool?: MCPConnectionPool;
+	/** Session identity included in per-session pool keys. */
+	sessionId?: string;
+	/** Idle retention for shared pool entries. */
+	sharedPoolIdleMs?: number;
+	/** Test seam for deterministic reconnect backoff scheduling. */
+	sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+	/** Test seam for fencing the acquisition-to-registration replacement race. */
+	afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
 }
 
 /**
@@ -221,12 +289,15 @@ export interface MCPManagerOptions {
 export class MCPManager {
 	static #instance: MCPManager | undefined;
 
-	/** Process-global instance shared by internal URL protocol handlers and tools. */
+	/**
+	 * Process-global compatibility holder used only by legacy lifecycle/test seams.
+	 * Production MCP routing uses the scope-held facade carried through ResolveContext.
+	 */
 	static instance(): MCPManager | undefined {
 		return MCPManager.#instance;
 	}
 
-	/** Install or clear the process-global instance. */
+	/** Install or clear the process-global compatibility holder. */
 	static setInstance(value: MCPManager | undefined): void {
 		MCPManager.#instance = value;
 	}
@@ -237,6 +308,14 @@ export class MCPManager {
 	}
 
 	#connections = new Map<string, MCPServerConnection>();
+	readonly #pool: MCPConnectionPool;
+	readonly #sessionId: string;
+	readonly #leases = new Map<string, MCPPoolLease>();
+	readonly #leaseEventUnsubscribers = new Map<string, () => void>();
+	readonly #leaseByConnection = new WeakMap<MCPServerConnection, MCPPoolLease>();
+	readonly #scopedOperations = new Map<number, ScopedOperation>();
+	readonly #retiredLeaseReleases = new Set<RetiredLeaseRelease>();
+	#nextScopedOperationId = 1;
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingConnectionControllers = new Map<string, AbortController>();
@@ -252,12 +331,16 @@ export class MCPManager {
 	#subscribedResources = new Map<string, Set<string>>();
 	#pendingResourceRefresh = new Map<string, { connection: MCPServerConnection; promise: Promise<void> }>();
 	#pendingReconnections = new Map<string, Promise<MCPServerConnection | null>>();
+	#deferredSharedRebinds = new Map<string, DeferredSharedRebind>();
+	#activeSharedRebinds = new Map<string, ActiveSharedRebind>();
 	#disconnectEpochs = new Map<string, number>();
 	#reconnectBackoffs = new Map<string, AbortController>();
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
 	#epoch = 0;
+	#scopedLifecycle: "open" | "disconnecting" | "reconnecting" = "open";
+	#scopedLifecycleEpoch = 0;
 	readonly #toolsOnly: boolean;
 	#toolsOnlyConfigLoaded = false;
 	#connectionSetSealed = false;
@@ -267,6 +350,24 @@ export class MCPManager {
 	}
 	#assertRawMCPAccessAllowed(): void {
 		if (this.#toolsOnly) throw new Error("Tools-only MCP manager does not allow raw MCP access");
+	}
+	#beginScopedLifecycle(phase: "disconnecting" | "reconnecting"): number {
+		this.#scopedLifecycle = phase;
+		this.#scopedLifecycleEpoch += 1;
+		return this.#scopedLifecycleEpoch;
+	}
+
+	#finishScopedLifecycle(epoch: number): void {
+		if (this.#scopedLifecycleEpoch !== epoch) return;
+		this.#scopedLifecycle = "open";
+		this.#drainDeferredSharedRebinds();
+	}
+
+	#assertScopedAdmission(): number {
+		if (this.#scopedLifecycle !== "open") {
+			throw new MCPManagerLifecycleError(this.#scopedLifecycle === "disconnecting" ? "disconnect" : "reconnect");
+		}
+		return this.#scopedLifecycleEpoch;
 	}
 	#assertConnectionSetMutable(): void {
 		if (this.#connectionSetSealed) throw new Error("MCP manager connection set is sealed");
@@ -278,6 +379,329 @@ export class MCPManager {
 
 	isConnectionSetSealed(): boolean {
 		return this.#connectionSetSealed;
+	}
+
+	async #acquireLease(
+		name: string,
+		resolvedConfig: MCPServerConfig,
+		originalConfig: MCPServerConfig,
+		connectionAbort: AbortController,
+		trackManagerLease = true,
+	): Promise<MCPPoolLease> {
+		const sharedConfig = originalConfig.sharing === "shared";
+		const sharedEligible =
+			sharedConfig &&
+			(resolvedConfig.type === "http" || resolvedConfig.type === "sse" || (resolvedConfig.type === "stdio" && this.#toolsOnly));
+		if (sharedConfig && !sharedEligible) {
+			logger.debug("MCP shared pooling is limited to tools-only stdio and remote HTTP/SSE in W6", { path: `mcp:${name}` });
+		}
+		const lease = await this.#pool.acquire(name, resolvedConfig, {
+			keyConfig: originalConfig,
+			sharingMode: sharedEligible ? "shared" : "per-session",
+			sessionId: sharedEligible ? undefined : this.#sessionId,
+			signal: connectionAbort.signal,
+			advertiseRoots: !this.#toolsOnly,
+			effectiveCwd: resolvedConfig.type === "stdio" ? resolvedConfig.cwd ?? this.cwd : this.cwd,
+			capabilityProfile: this.#toolsOnly ? "tools-only" : "roots",
+			effectiveHeaders:
+				resolvedConfig.type === "http" || resolvedConfig.type === "sse" ? resolvedConfig.headers : undefined,
+			onRequest: (method, params) => this.#handleServerRequest(method, params),
+		});
+		if (trackManagerLease) this.#leaseByConnection.set(lease.connection, lease);
+		if (!this.#toolsOnly) lease.updateRoots(this.#getRoots().roots);
+		return lease;
+	}
+
+	#queueDeferredSharedRebind(name: string, lease: MCPPoolLease, managerEpoch: number): void {
+		if (this.#epoch !== managerEpoch || this.#scopedLifecycle === "disconnecting") return;
+		this.#deferredSharedRebinds.set(name, { lease, managerEpoch });
+	}
+
+	#scheduleSharedRebind(name: string, lease: MCPPoolLease): void {
+		if (this.#scopedLifecycle === "disconnecting") return;
+		const active = this.#activeSharedRebinds.get(name);
+		if (active) {
+			if (active.lease !== lease) this.#queueDeferredSharedRebind(name, lease, this.#epoch);
+			return;
+		}
+		let tracked: Promise<void>;
+		tracked = this.#rebindAfterSharedRestart(name, lease)
+			.catch(error => {
+				logger.debug("MCP shared lease replacement failed", { path: `mcp:${name}`, error });
+			})
+			.finally(() => {
+				const current = this.#activeSharedRebinds.get(name);
+				if (current?.promise !== tracked) return;
+				this.#activeSharedRebinds.delete(name);
+				this.#drainDeferredSharedRebinds();
+			});
+		this.#activeSharedRebinds.set(name, { lease, promise: tracked });
+	}
+
+	#drainDeferredSharedRebinds(): void {
+		if (this.#scopedLifecycle !== "open" || this.#deferredSharedRebinds.size === 0) return;
+		for (const [name, pending] of this.#deferredSharedRebinds.entries()) {
+			if (pending.managerEpoch !== this.#epoch) {
+				this.#deferredSharedRebinds.delete(name);
+				continue;
+			}
+			if (this.#activeSharedRebinds.has(name)) continue;
+			this.#deferredSharedRebinds.delete(name);
+			this.#scheduleSharedRebind(name, pending.lease);
+		}
+	}
+
+
+	#connectionForLease(connection: MCPServerConnection): MCPServerConnection {
+		return this.#leaseByConnection.get(connection)?.connectionForLease() ?? connection;
+	}
+
+	/**
+	 * Register `connection`'s lease as the current lease for `name` and install
+	 * the reconnect trigger. Called only once a connect/reconnect attempt is
+	 * accepted as current; an earlier registered lease is superseded and
+	 * released.
+	 */
+	#registerLease(name: string, connection: MCPServerConnection): void {
+		const lease = this.#leaseByConnection.get(connection);
+		if (!lease) return;
+		const previous = this.#leases.get(name);
+		if (previous === lease) {
+			if (!this.#toolsOnly) lease.updateRoots(this.#getRoots().roots);
+			return;
+		}
+		this.#leaseEventUnsubscribers.get(name)?.();
+		this.#leaseEventUnsubscribers.delete(name);
+		previous?.release().catch(error => {
+			const diagnostic = new MCPPoolLeaseReleaseError(name, previous.key, error);
+			logger.error("MCP stale lease release failed", {
+				path: `mcp:${name}`,
+				serverName: name,
+				poolKey: previous.key,
+				error: diagnostic,
+			});
+		});
+		this.#leases.set(name, lease);
+		if (!this.#toolsOnly) lease.updateRoots(this.#getRoots().roots);
+		this.#leaseEventUnsubscribers.set(
+			name,
+			lease.onEvent((event: MCPPoolEvent) => {
+				if (event.type === "replacement") {
+					if (event.success && !this.#pendingReconnections.has(name)) this.#scheduleSharedRebind(name, lease);
+					return;
+				}
+				if (event.type === "notification") {
+					this.#handleServerNotification(name, event.method, event.params);
+					return;
+				}
+				if (event.type !== "close" || this.#connectionSetSealed) return;
+				void this.reconnectServer(name);
+			}),
+		);
+	}
+
+	async #rebindAfterSharedRestart(name: string, lease: MCPPoolLease): Promise<void> {
+		const managerEpoch = this.#epoch;
+		if (this.#scopedLifecycle === "disconnecting") return;
+		if (this.#scopedLifecycle === "reconnecting") {
+			this.#queueDeferredSharedRebind(name, lease, managerEpoch);
+			return;
+		}
+		const lifecycleEpoch = this.#assertScopedAdmission();
+		const currentLease = this.#leases.get(name);
+		if (currentLease && currentLease !== lease) return;
+		const oldConnection = lease.connection;
+		const config = this.#serverConfigs.get(name) ?? oldConnection.config;
+		const source = this.#sources.get(name) ?? oldConnection._source;
+		if (currentLease === lease) {
+			await this.#releaseLease(name, oldConnection);
+			this.#connections.delete(name);
+		}
+		const lifecycleAfterRelease = this.#scopedLifecycle as "open" | "disconnecting" | "reconnecting";
+		if (lifecycleAfterRelease === "disconnecting" || this.#epoch !== managerEpoch) return;
+		if (lifecycleAfterRelease === "reconnecting") {
+			this.#queueDeferredSharedRebind(name, lease, managerEpoch);
+			return;
+		}
+		if (this.#scopedLifecycleEpoch !== lifecycleEpoch) {
+			this.#queueDeferredSharedRebind(name, lease, managerEpoch);
+			this.#drainDeferredSharedRebinds();
+			return;
+		}
+		try {
+			await this.#connectAndWireServer(
+				name,
+				config,
+				source,
+				managerEpoch,
+				this.#disconnectEpochs.get(name) ?? 0,
+				lifecycleEpoch,
+			);
+		} catch (error) {
+			const lifecycleAfterConnect = this.#scopedLifecycle as "open" | "disconnecting" | "reconnecting";
+			if (error instanceof MCPPoolLeaseObsoleteError) {
+				if (this.#epoch === managerEpoch && lifecycleAfterConnect !== "disconnecting") {
+					this.#queueDeferredSharedRebind(name, lease, managerEpoch);
+					this.#drainDeferredSharedRebinds();
+				}
+				return;
+			}
+			if (this.#epoch !== managerEpoch || lifecycleAfterConnect === "disconnecting") return;
+			if (this.#scopedLifecycleEpoch !== lifecycleEpoch) {
+				this.#queueDeferredSharedRebind(name, lease, managerEpoch);
+				this.#drainDeferredSharedRebinds();
+				return;
+			}
+			logger.debug("MCP shared lease rebind failed", { path: `mcp:${name}`, error });
+		}
+	}
+
+	/**
+	 * Release the lease registered under `name`.
+	 *
+	 * When `connection` is provided, the release only applies if the registered
+	 * lease still belongs to that connection; a stale connect/reconnect task must
+	 * never tear down a newer lease registered under the same server name.
+	 */
+	async #releaseLease(name: string, connection?: MCPServerConnection): Promise<void> {
+		const registered = this.#leases.get(name);
+		if (connection) {
+			// Release exactly the lease that belongs to this connection, whether or
+			// not it is the currently registered one; never tear down a newer lease
+			// registered under the same server name by a later attempt.
+			const lease = this.#leaseByConnection.get(connection);
+			if (!lease) return;
+			if (registered === lease) {
+				this.#leaseEventUnsubscribers.get(name)?.();
+				this.#leaseEventUnsubscribers.delete(name);
+				this.#leases.delete(name);
+			}
+			await lease.release();
+			return;
+		}
+		if (!registered) return;
+		this.#leaseEventUnsubscribers.get(name)?.();
+		this.#leaseEventUnsubscribers.delete(name);
+		this.#leases.delete(name);
+		await registered.release();
+	}
+
+	async #releaseScopedLease(operation: ScopedOperation): Promise<void> {
+		if (!operation.releasePromise) {
+			operation.releasePromise = operation.leaseReady.then(async lease => {
+				if (lease) await lease.release();
+			});
+		}
+		return operation.releasePromise;
+	}
+
+	async #retireScopedOperations(name: string, reason: Error): Promise<void> {
+		const operations = [...this.#scopedOperations.values()].filter(operation => operation.name === name);
+		for (const operation of operations) operation.controller.abort(reason);
+		const releases = await Promise.allSettled(operations.map(operation => this.#releaseScopedLease(operation)));
+		for (const [index, result] of releases.entries()) {
+			if (result.status === "rejected") {
+				const operation = operations[index];
+				this.#logLeaseReleaseFailure(operation?.name ?? name, operation?.lease?.connection, result.reason, operation?.lease?.key);
+			}
+		}
+	}
+
+	async #shutdownScopedOperations(reason: Error): Promise<unknown[]> {
+		const operations = [...this.#scopedOperations.values()];
+		for (const operation of operations) operation.controller.abort(reason);
+		const releases = await Promise.allSettled(operations.map(operation => this.#releaseScopedLease(operation)));
+		const failures: unknown[] = [];
+		for (const [index, result] of releases.entries()) {
+			if (result.status === "rejected") {
+				const operation = operations[index];
+				failures.push(
+					this.#logLeaseReleaseFailure(
+						operation?.name ?? "unknown",
+						operation?.lease?.connection,
+						result.reason,
+						operation?.lease?.key,
+					),
+				);
+			}
+		}
+		await Promise.allSettled(operations.map(operation => operation.completion));
+		return failures;
+	}
+	#leaseReleaseDiagnostic(
+		name: string,
+		connection: MCPServerConnection | undefined,
+		error: unknown,
+		poolKey?: string,
+	): MCPPoolLeaseReleaseError {
+		const lease = connection ? this.#leaseByConnection.get(connection) : this.#leases.get(name);
+		return new MCPPoolLeaseReleaseError(name, poolKey ?? lease?.key ?? "unknown", error);
+	}
+
+	#logLeaseReleaseFailure(
+		name: string,
+		connection: MCPServerConnection | undefined,
+		error: unknown,
+		poolKey?: string,
+	): MCPPoolLeaseReleaseError {
+		const diagnostic = this.#leaseReleaseDiagnostic(name, connection, error, poolKey);
+		logger.error("MCP lease release failed", {
+			path: `mcp:${name}`,
+			serverName: name,
+			poolKey: diagnostic.poolKey,
+			error: diagnostic,
+		});
+		return diagnostic;
+	}
+
+
+	#trackRetiredLeaseRelease(name: string, connection: MCPServerConnection, promise: Promise<void>): void {
+		const lease = this.#leaseByConnection.get(connection);
+		const retired: RetiredLeaseRelease = {
+			name,
+			connection,
+			poolKey: lease?.key ?? "unknown",
+			promise,
+		};
+		this.#retiredLeaseReleases.add(retired);
+		void promise.then(
+			() => {
+				this.#retiredLeaseReleases.delete(retired);
+			},
+			() => {
+				// Keep rejected retired releases for disconnectAll aggregation.
+			},
+		);
+	}
+
+	async #drainRetiredLeaseReleases(): Promise<unknown[]> {
+		const failures: unknown[] = [];
+		for (;;) {
+			const retired = [...this.#retiredLeaseReleases];
+			if (retired.length === 0) {
+				await Promise.resolve();
+				if (this.#retiredLeaseReleases.size === 0) return failures;
+				continue;
+			}
+			const results = await Promise.allSettled(retired.map(item => item.promise));
+			for (const item of retired) this.#retiredLeaseReleases.delete(item);
+			for (const [index, result] of results.entries()) {
+				if (result.status !== "rejected") continue;
+				const item = retired[index];
+				failures.push(
+					result.reason instanceof MCPPoolLeaseReleaseError
+						? result.reason
+						: this.#logLeaseReleaseFailure(item?.name ?? "unknown", item?.connection, result.reason, item?.poolKey),
+				);
+			}
+		}
+	}
+	async #releaseLeasePreservingPrimary(name: string, connection: MCPServerConnection): Promise<void> {
+		try {
+			await this.#releaseLease(name, connection);
+		} catch (cleanupError) {
+			this.#logLeaseReleaseFailure(name, connection, cleanupError);
+		}
 	}
 
 	#isCurrentConnection(
@@ -296,6 +720,8 @@ export class MCPManager {
 	}
 
 	readonly #maxStartupTimeoutMs: number | undefined;
+	readonly #sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+	readonly #afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
 
 	constructor(
 		private cwd: string,
@@ -304,6 +730,11 @@ export class MCPManager {
 	) {
 		this.#toolsOnly = options.toolsOnly === true;
 		this.#maxStartupTimeoutMs = options.maxStartupTimeoutMs;
+		this.#sleep = options.sleep ?? delay;
+		this.#afterLeaseAcquiredForTests = options.afterLeaseAcquiredForTests;
+		this.cwd = canonicalMCPWorkingDirectory(this.cwd);
+		this.#pool = options.pool ?? new MCPConnectionPool({ sharedPoolIdleMs: options.sharedPoolIdleMs });
+		this.#sessionId = options.sessionId ?? crypto.randomUUID();
 	}
 
 	isToolsOnly(): boolean {
@@ -348,31 +779,30 @@ export class MCPManager {
 		}
 	}
 
-	#subscribeAndTrack(name: string, connection: MCPServerConnection, uris: string[], notificationEpoch: number): void {
-		void subscribeToResources(connection, uris)
-			.then(() => {
-				const action = resolveSubscriptionPostAction(
-					this.#notificationsEnabled,
-					this.#notificationsEpoch,
-					notificationEpoch,
-				);
-				if (action === "rollback") {
-					void unsubscribeFromResources(connection, uris).catch(error => {
-						logger.debug("Failed to rollback stale MCP resource subscription", {
-							path: `mcp:${name}`,
-							error,
-						});
-					});
-					return;
-				}
-				if (action === "ignore") {
-					return;
-				}
-				this.#subscribedResources.set(name, new Set(uris));
-			})
-			.catch(error => {
-				logger.debug("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
-			});
+	async #subscribeAndTrack(name: string, connection: MCPServerConnection, uris: string[], notificationEpoch: number): Promise<void> {
+		const lease = this.#leaseByConnection.get(connection);
+		if (!lease) return;
+		try {
+			await lease.setResourceSubscriptions(uris);
+		} catch (error) {
+			logger.error("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
+			return;
+		}
+		const action = resolveSubscriptionPostAction(
+			this.#notificationsEnabled,
+			this.#notificationsEpoch,
+			notificationEpoch,
+		);
+		if (action === "rollback") {
+			try {
+				await lease.setResourceSubscriptions([]);
+			} catch (error) {
+				logger.error("Failed to rollback stale MCP resource subscription", { path: `mcp:${name}`, error });
+			}
+			return;
+		}
+		if (action === "ignore") return;
+		this.#subscribedResources.set(name, new Set(uris));
 	}
 
 	setNotificationsEnabled(enabled: boolean): void {
@@ -395,14 +825,14 @@ export class MCPManager {
 			return;
 		}
 
-		// Unsubscribe from all servers
+		// Unsubscribe from all servers through their leases. Release also clears any
+		// remaining aggregate subscription state, so no physical transport call bypasses the pool.
 		for (const [name, connection] of this.#connections) {
-			const uris = this.#subscribedResources.get(name);
-			if (uris && uris.size > 0) {
-				void unsubscribeFromResources(connection, Array.from(uris)).catch(error => {
-					logger.debug("Failed to unsubscribe MCP resources", { path: `mcp:${name}`, error });
-				});
-			}
+			const lease = this.#leaseByConnection.get(connection);
+			if (!lease) continue;
+			void lease.setResourceSubscriptions([]).catch(error => {
+				logger.error("Failed to unsubscribe MCP resources", { path: `mcp:${name}`, error });
+			});
 		}
 		this.#subscribedResources.clear();
 	}
@@ -519,95 +949,102 @@ export class MCPManager {
 			const connectionAbort = new AbortController();
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
-			const connectionPromise = (async () => {
+			const acquireInitialLease = async (): Promise<MCPPoolLease> => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
-				return connectToServer(name, resolvedConfig, {
-					advertiseRoots: !this.#toolsOnly,
-					signal: connectionAbort.signal,
-					onNotification: this.#toolsOnly
-						? undefined
-						: (method, params) => {
-								this.#handleServerNotification(name, method, params);
-							},
-					onRequest: (method, params) => {
-						return this.#handleServerRequest(method, params);
-					},
-				});
-			})().then(
-				async connection => {
-					// Store original config (without resolved tokens) to keep
-					// cache keys stable and avoid leaking rotating credentials.
-					connection.config = config;
-					if (sources[name]) {
-						connection._source = sources[name];
-					}
-					const stillPending = this.#pendingConnections.get(name) === connectionPromise;
-					const stillCurrent =
-						this.#epoch === connectionEpoch &&
-						(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch &&
-						this.#serverConfigs.get(name) === config &&
-						!connectionAbort.signal.aborted;
-					if (stillPending) {
+				let lease: MCPPoolLease | undefined;
+				try {
+					lease = await this.#acquireLease(name, resolvedConfig, config, connectionAbort);
+					await this.#afterLeaseAcquiredForTests?.(name, lease);
+					return lease;
+				} catch (error) {
+					if (lease) await this.#releaseLeasePreservingPrimary(name, lease.connection);
+					throw error;
+				}
+			};
+			let connectionPromise!: Promise<MCPServerConnection>;
+			connectionPromise = (async () => {
+				try {
+					let lease = await acquireInitialLease();
+					for (;;) {
+						const connection = lease.connection;
+						// Store original config (without resolved tokens) to keep
+						// cache keys stable and avoid leaking rotating credentials.
+						connection.config = config;
+						if (sources[name]) {
+							connection._source = sources[name];
+						}
+						const stillPending = this.#pendingConnections.get(name) === connectionPromise;
+						const stillCurrent =
+							this.#epoch === connectionEpoch &&
+							(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch &&
+							this.#serverConfigs.get(name) === config &&
+							!connectionAbort.signal.aborted;
+						if (!stillPending || !stillCurrent) {
+							const disconnectError = new Error(`Server "${name}" was disconnected during connection`);
+							await this.#releaseLeasePreservingPrimary(name, connection);
+							throw disconnectError;
+						}
+						if (!this.#pool.isCurrentLease(lease)) {
+							const obsoleteError = new MCPPoolLeaseObsoleteError(name, lease.key, lease.generation);
+							await this.#releaseLeasePreservingPrimary(name, connection);
+							if (
+								this.#epoch !== connectionEpoch ||
+								(this.#disconnectEpochs.get(name) ?? 0) !== disconnectEpoch ||
+								this.#serverConfigs.get(name) !== config ||
+								connectionAbort.signal.aborted
+							) {
+								throw obsoleteError;
+							}
+							lease = await acquireInitialLease();
+							continue;
+						}
 						this.#pendingConnections.delete(name);
 						this.#pendingConnectionControllers.delete(name);
-					}
-					if (!stillPending || !stillCurrent) {
-						connection.transport.onClose = undefined;
-						await connection.transport.close().catch(() => {});
-						throw new Error(`Server "${name}" was disconnected during connection`);
-					}
-					this.#connections.set(name, connection);
-					this.#serverConfigs.set(name, config);
+						this.#connections.set(name, connection);
+						this.#registerLease(name, connection);
+						this.#serverConfigs.set(name, config);
 
-					// Wire auth refresh for HTTP transports so 401s trigger token refresh.
-					if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
-						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(config, true);
-							if (refreshed.type === "http" || refreshed.type === "sse") {
-								return refreshed.headers ?? null;
-							}
-							return null;
-						};
-					}
+						// Wire auth refresh for HTTP transports, and reconnect for any transport.
+						if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
+							connection.transport.onAuthError = async () => {
+								const refreshed = await this.#resolveAuthConfig(config, true);
+								if (refreshed.type === "http" || refreshed.type === "sse") {
+									return refreshed.headers ?? null;
+								}
+								return null;
+							};
+						}
 
-					if (!this.#toolsOnly) {
-						// Re-establish connection if the transport closes (server restart,
-						// network interruption).
-						connection.transport.onClose = () => {
-							logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
-							void this.reconnectServer(name);
-						};
+						return connection;
 					}
-
-					return connection;
-				},
-				error => {
+				} catch (error) {
 					if (this.#pendingConnections.get(name) === connectionPromise) {
 						this.#pendingConnections.delete(name);
-						this.#pendingConnectionControllers.delete(name);
+						if (this.#pendingConnectionControllers.get(name) === connectionAbort) {
+							this.#pendingConnectionControllers.delete(name);
+						}
 					}
 					throw error;
-				},
-			);
+				}
+			})();
 			this.#pendingConnections.set(name, connectionPromise);
 
 			const toolsPromise = connectionPromise.then(async connection => {
 				let serverTools: Awaited<ReturnType<typeof listTools>>;
 				try {
-					serverTools = await listTools(connection);
+					serverTools = await listTools(this.#connectionForLease(connection));
 				} catch (error) {
-					connection.transport.onClose = undefined;
 					if (this.#connections.get(name) === connection) this.#connections.delete(name);
-					await connection.transport.close().catch(() => {});
+					await this.#releaseLeasePreservingPrimary(name, connection);
 					throw error;
 				}
 				if (
 					connectionAbort.signal.aborted ||
 					!this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)
 				) {
-					connection.transport.onClose = undefined;
-					await connection.transport.close().catch(() => {});
-					throw new Error(`Server "${name}" was disconnected during tool loading`);
+					const disconnectError = new Error(`Server "${name}" was disconnected during tool loading`);
+					await this.#releaseLeasePreservingPrimary(name, connection);
+					throw disconnectError;
 				}
 				return { connection, serverTools };
 			});
@@ -635,8 +1072,8 @@ export class MCPManager {
 					)
 						return;
 					this.#pendingToolLoads.delete(name);
-					const reconnect = this.#toolsOnly ? undefined : () => this.reconnectServer(name);
-					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
+					const reconnect = () => this.reconnectServer(name);
+					const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, { noReplay: config.sharing === "shared" });
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
 					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
@@ -721,7 +1158,9 @@ export class MCPManager {
 						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
 							this.#pendingToolLoads.delete(task.name);
 						this.#pendingConnectionControllers.delete(task.name);
-						void this.#disconnectServer(task.name).catch(() => {});
+						void this.#disconnectServer(task.name).catch(error => {
+							this.#logLeaseReleaseFailure(task.name, undefined, error);
+						});
 					}
 					// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
 					// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
@@ -743,9 +1182,9 @@ export class MCPManager {
 						continue;
 					}
 					connectedServers.add(name);
-					const reconnect = this.#toolsOnly ? undefined : () => this.reconnectServer(name);
+					const reconnect = () => this.reconnectServer(name);
 					try {
-						allTools.push(...MCPTool.fromTools(connection, serverTools, reconnect));
+						allTools.push(...MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, { noReplay: task.config.sharing === "shared" }));
 					} catch (error) {
 						await this.#cleanupConnectionTasks(connectionTasks);
 						throw error;
@@ -756,7 +1195,9 @@ export class MCPManager {
 					errors.set(name, this.#serverError(message));
 					reportedErrors.add(name);
 					if (this.#toolsOnly && reason instanceof MCPExpectedFailure) {
-						await this.#disconnectServer(name);
+						await this.#disconnectServer(name).catch(error => {
+							this.#logLeaseReleaseFailure(name, this.#connections.get(name), error);
+						});
 					}
 					if ((this.#disconnectEpochs.get(name) ?? 0) !== task.disconnectEpoch) {
 						shouldPublishToolSnapshot = false;
@@ -765,15 +1206,16 @@ export class MCPManager {
 					const cached = cachedTools.get(name);
 					if (cached) {
 						const source = this.#sources.get(name);
-						const reconnect = this.#toolsOnly ? undefined : () => this.reconnectServer(name);
+						const reconnect = () => this.reconnectServer(name);
 						try {
 							allTools.push(
 								...DeferredMCPTool.fromTools(
 									name,
 									cached,
-									() => this.#waitForConnection(name),
+									() => this.#waitForConnection(name).then(connection => this.#connectionForLease(connection)),
 									source,
 									reconnect,
+									{ noReplay: task.config.sharing === "shared" },
 								),
 							);
 						} catch (error) {
@@ -852,9 +1294,9 @@ export class MCPManager {
 				this.#triggerNotificationRefresh(serverName, "prompts");
 				break;
 			default:
-				break;
+				logger.debug("Ignoring unknown MCP notification", { path: `mcp:${serverName}`, method });
+				return;
 		}
-
 		this.#onNotification?.(serverName, method, params);
 	}
 
@@ -950,6 +1392,128 @@ export class MCPManager {
 		return this.#resolveAuthConfig(config);
 	}
 
+	/** Acquire a prepared, pool-owned lease for a scoped transient operation. */
+	async withPreparedLease<T>(
+		name: string,
+		config: MCPServerConfig,
+		fn: (lease: MCPPoolLease) => Promise<T> | T,
+		options: { signal?: AbortSignal } = {},
+	): Promise<T> {
+		this.#assertRawMCPAccessAllowed();
+		const lifecycleEpoch = this.#assertScopedAdmission();
+		const leaseReady = Promise.withResolvers<MCPPoolLease | undefined>();
+		const operation: ScopedOperation = {
+			id: this.#nextScopedOperationId++,
+			name,
+			lifecycleEpoch,
+			controller: new AbortController(),
+			leaseReady: leaseReady.promise,
+			resolveLeaseReady: leaseReady.resolve,
+			completion: Promise.resolve(),
+		};
+		this.#scopedOperations.set(operation.id, operation);
+		const completion = this.#runPreparedLease(operation, config, fn, options);
+		operation.completion = completion;
+		void completion.catch(() => {});
+		try {
+			return await completion;
+		} finally {
+			if (this.#scopedOperations.get(operation.id) === operation) this.#scopedOperations.delete(operation.id);
+		}
+	}
+
+	async #runPreparedLease<T>(
+		operation: ScopedOperation,
+		config: MCPServerConfig,
+		fn: (lease: MCPPoolLease) => Promise<T> | T,
+		options: { signal?: AbortSignal },
+	): Promise<T> {
+		const callerSignal = options.signal;
+		const onAbort = () =>
+			operation.controller.abort(callerSignal?.reason ?? new Error(`MCP operation aborted: ${operation.name}`));
+		if (callerSignal) {
+			if (callerSignal.aborted) onAbort();
+			else callerSignal.addEventListener("abort", onAbort, { once: true });
+		}
+
+		let removeAbortListener: (() => void) | undefined;
+		const abortPromise = new Promise<never>((_resolve, reject) => {
+			const rejectIfAborted = () => {
+				if (operation.controller.signal.aborted) {
+					reject(operation.controller.signal.reason ?? new Error(`MCP operation aborted: ${operation.name}`));
+				}
+			};
+			if (operation.controller.signal.aborted) rejectIfAborted();
+			else {
+				operation.controller.signal.addEventListener("abort", rejectIfAborted, { once: true });
+				removeAbortListener = () => operation.controller.signal.removeEventListener("abort", rejectIfAborted);
+			}
+		});
+
+		let lease: MCPPoolLease | undefined;
+		let result!: T;
+		let failed = false;
+		let primaryError: unknown;
+		try {
+			const resolvedConfigPromise = this.#resolveAuthConfig(config);
+			void resolvedConfigPromise.catch(() => {});
+			const resolvedConfig = await Promise.race([resolvedConfigPromise, abortPromise]);
+			if (operation.lifecycleEpoch !== this.#scopedLifecycleEpoch || this.#scopedLifecycle !== "open") {
+				throw new MCPManagerLifecycleError(
+					this.#scopedLifecycle === "disconnecting" ? "disconnect" : "reconnect",
+				);
+			}
+			lease = await this.#acquireLease(operation.name, resolvedConfig, config, operation.controller, false);
+			operation.lease = lease;
+			operation.resolveLeaseReady(lease);
+
+			const callbackPromise = Promise.resolve().then(() => {
+				if (operation.controller.signal.aborted) {
+					throw operation.controller.signal.reason ?? new Error(`MCP operation aborted: ${operation.name}`);
+				}
+				return fn(lease!);
+			});
+			void callbackPromise.catch(error => {
+				logger.debug("MCP scoped operation callback failed after cancellation", {
+					path: `mcp:${operation.name}`,
+					error,
+				});
+			});
+			result = await Promise.race([callbackPromise, abortPromise]);
+		} catch (error) {
+			failed = true;
+			primaryError = error;
+		} finally {
+			if (!lease) operation.resolveLeaseReady(undefined);
+			removeAbortListener?.();
+		}
+
+		try {
+			await this.#releaseScopedLease(operation);
+		} catch (cleanupError) {
+			const diagnostic = this.#logLeaseReleaseFailure(
+				operation.name,
+				lease?.connection,
+				cleanupError,
+				lease?.key,
+			);
+			if (!failed) throw diagnostic;
+		} finally {
+			callerSignal?.removeEventListener("abort", onAbort);
+		}
+		if (!failed && operation.controller.signal.aborted) {
+			failed = true;
+			primaryError = operation.controller.signal.reason ?? new Error(`MCP operation aborted: ${operation.name}`);
+		}
+		if (failed) throw primaryError;
+		return result;
+	}
+
+
+	/** Read-only test seam for pending retired lease-release records. */
+	get retiredLeaseReleaseCountForTests(): number {
+		return this.#retiredLeaseReleases.size;
+	}
 	/**
 	 * Get all connected server names.
 	 */
@@ -990,20 +1554,14 @@ export class MCPManager {
 		this.#pendingResourceRefresh.delete(name);
 		const connection = this.#connections.get(name);
 
-		const subscribedUris = this.#subscribedResources.get(name);
-		if (subscribedUris && subscribedUris.size > 0 && connection) {
-			void unsubscribeFromResources(connection, Array.from(subscribedUris)).catch(() => {});
-		}
 		this.#subscribedResources.delete(name);
 
 		let closeError: unknown;
 		if (connection) {
-			// Detach onClose to prevent spurious reconnect from close()
-			connection.transport.onClose = undefined;
 			try {
-				await disconnectServer(connection);
+				await this.#releaseLease(name);
 			} catch (error) {
-				closeError = error;
+				closeError = this.#logLeaseReleaseFailure(name, connection, error);
 			}
 			if (this.#connections.get(name) === connection) this.#connections.delete(name);
 		}
@@ -1039,14 +1597,19 @@ export class MCPManager {
 	}
 
 	async #terminateConnectionTask(task: ConnectionTask): Promise<void> {
-		const connection = await task.connectionPromise.catch(() => undefined);
+		const connection = await task.connectionPromise.catch(async error => {
+			if (error instanceof MCPPoolAcquireAbortError && error.cleanup) {
+				await error.cleanup.catch(cleanupError => {
+					logger.error("MCP aborted acquire cleanup failed", { path: `mcp:${task.name}`, error: cleanupError });
+				});
+			}
+			logger.debug("MCP connection task did not publish before cleanup", { path: `mcp:${task.name}`, error });
+			return undefined;
+		});
 		if (!connection || this.#connections.get(task.name) !== connection) return;
 
-		connection.transport.onClose = undefined;
 		try {
-			await disconnectServer(connection);
-		} catch {
-			// Preserve the primary startup failure over best-effort transport cleanup failures.
+			await this.#releaseLeasePreservingPrimary(task.name, connection);
 		} finally {
 			if (this.#connections.get(task.name) === connection) this.#connections.delete(task.name);
 		}
@@ -1054,41 +1617,80 @@ export class MCPManager {
 
 	async #cleanupConnectionTasks(tasks: ConnectionTask[]): Promise<void> {
 		for (const task of tasks) this.#abortConnectionTask(task);
-		await Promise.allSettled(tasks.map(task => this.#terminateConnectionTask(task)));
-		await Promise.allSettled(tasks.map(task => this.#disconnectServer(task.name)));
+		const terminations = await Promise.allSettled(tasks.map(task => this.#terminateConnectionTask(task)));
+		for (const result of terminations) {
+			if (result.status === "rejected") logger.error("MCP startup cleanup failed", { error: result.reason });
+		}
+		const disconnections = await Promise.allSettled(tasks.map(task => this.#disconnectServer(task.name)));
+		for (const [index, result] of disconnections.entries()) {
+			if (result.status === "rejected") {
+				this.#logLeaseReleaseFailure(tasks[index]?.name ?? "unknown", undefined, result.reason);
+			}
+		}
 	}
 
 	/**
 	 * Disconnect from all servers.
 	 */
 	async disconnectAll(): Promise<void> {
-		// Invalidate any in-flight reconnection attempts that outlive this call.
-		// They captured the old epoch; after increment they'll detect staleness.
-		this.#epoch++;
-		// Detach onClose before closing to prevent spurious reconnect attempts
-		for (const conn of this.#connections.values()) {
-			conn.transport.onClose = undefined;
-		}
-		const promises = Array.from(this.#connections.values()).map(conn => disconnectServer(conn));
-		await Promise.allSettled(promises);
+		const lifecycleEpoch = this.#beginScopedLifecycle("disconnecting");
+		this.#deferredSharedRebinds.clear();
+		try {
+			// Invalidate any in-flight reconnection attempts that outlive this call.
+			// They captured the old epoch; after increment they'll detect staleness.
+			this.#epoch++;
+			const scopedReleaseFailures = await this.#shutdownScopedOperations(new Error("MCP manager disconnected"));
+			const releaseResults = await Promise.allSettled(
+				[...this.#leases.keys()].map(async name => {
+					const lease = this.#leases.get(name);
+					try {
+						await this.#releaseLease(name);
+					} catch (error) {
+						throw this.#logLeaseReleaseFailure(name, lease?.connection, error, lease?.key);
+					}
+				}),
+			);
 
-		for (const controller of this.#pendingConnectionControllers.values()) {
-			controller.abort(new Error("MCP manager disconnected"));
+			for (const controller of this.#pendingConnectionControllers.values()) {
+				controller.abort(new Error("MCP manager disconnected"));
+			}
+			this.#pendingConnectionControllers.clear();
+			this.#pendingConnections.clear();
+			this.#pendingToolLoads.clear();
+			for (const controller of this.#reconnectBackoffs.values()) {
+				controller.abort(new Error("MCP manager disconnected"));
+			}
+			this.#reconnectBackoffs.clear();
+			this.#pendingReconnections.clear();
+			const retiredReleaseFailures = await this.#drainRetiredLeaseReleases();
+			this.#deferredSharedRebinds.clear();
+			this.#pendingResourceRefresh.clear();
+			this.#sources.clear();
+			this.#serverConfigs.clear();
+			this.#connections.clear();
+			this.#tools = [];
+			this.#subscribedResources.clear();
+			const releaseFailures = [
+				...scopedReleaseFailures,
+				...releaseResults
+					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+					.map(result => result.reason),
+				...retiredReleaseFailures,
+			];
+			if (releaseFailures.length > 0) {
+				throw new AggregateError(
+					releaseFailures,
+					`MCP manager disconnectAll failed for ${releaseFailures.length} lease${releaseFailures.length === 1 ? "" : "s"}`,
+				);
+			}
+		} finally {
+			this.#finishScopedLifecycle(lifecycleEpoch);
 		}
-		this.#pendingConnectionControllers.clear();
-		this.#pendingConnections.clear();
-		this.#pendingToolLoads.clear();
-		for (const controller of this.#reconnectBackoffs.values()) {
-			controller.abort(new Error("MCP manager disconnected"));
-		}
-		this.#reconnectBackoffs.clear();
-		this.#pendingReconnections.clear();
-		this.#pendingResourceRefresh.clear();
-		this.#sources.clear();
-		this.#serverConfigs.clear();
-		this.#connections.clear();
-		this.#tools = [];
-		this.#subscribedResources.clear();
+	}
+
+	/** Release this manager's session leases and all associated MCP state. */
+	async releaseLeases(): Promise<void> {
+		await this.disconnectAll();
 	}
 
 	/**
@@ -1099,11 +1701,36 @@ export class MCPManager {
 	 * Returns the new connection, or null if reconnection failed.
 	 */
 	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
-		if (this.#toolsOnly || this.#connectionSetSealed) return null;
+		if (this.#connectionSetSealed) return null;
+		if (this.#scopedLifecycle === "disconnecting") return null;
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 
-		const attempt = this.#doReconnect(name);
+		const lease = this.#leases.get(name);
+		const sharedKey = lease?.sharingMode === "shared" ? lease.key : undefined;
+		let attempt: Promise<MCPServerConnection | null>;
+		if (sharedKey && !this.#pool.claimRestart(sharedKey)) {
+			attempt = this.#pool.awaitRestart(sharedKey).then(async success => {
+				if (success) await this.#rebindAfterSharedRestart(name, lease!);
+				return this.#connections.get(name) ?? null;
+			});
+		} else {
+			attempt = this.#doReconnect(name);
+			if (sharedKey) {
+				attempt = attempt.then(
+					result => {
+						this.#pool.broadcastReplacement(sharedKey, result !== null);
+						this.#pool.finishRestart(sharedKey, result === null ? new Error(`MCP restart failed: ${name}`) : undefined);
+						return result;
+					},
+					error => {
+						this.#pool.broadcastReplacement(sharedKey, false);
+						this.#pool.finishRestart(sharedKey, error);
+						throw error;
+					},
+				).finally(() => this.#pool.releaseRestart(sharedKey));
+			}
+		}
 		this.#pendingReconnections.set(name, attempt);
 		return attempt.finally(() => {
 			if (this.#pendingReconnections.get(name) === attempt) this.#pendingReconnections.delete(name);
@@ -1115,25 +1742,46 @@ export class MCPManager {
 		const config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
 		if (!config) return null;
+		const lifecycleEpoch = this.#beginScopedLifecycle("reconnecting");
+		try {
+			return await this.#performReconnect(name, oldConnection, config, source);
+		} finally {
+			this.#finishScopedLifecycle(lifecycleEpoch);
+		}
+	}
 
+	async #performReconnect(
+		name: string,
+		oldConnection: MCPServerConnection | undefined,
+		config: MCPServerConfig,
+		source: SourceMeta | undefined,
+	): Promise<MCPServerConnection | null> {
 		logger.debug("MCP reconnecting", { path: `mcp:${name}` });
 
 		// Close the old transport without removing tools or notifying consumers.
 		// Tools stay available (stale) while we establish the new connection.
 		const reconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
+		await this.#retireScopedOperations(name, new Error(`MCP server reconnecting: ${name}`));
+		const oldLease = this.#leases.get(name);
+		if (oldLease) this.#pool.retireLease(oldLease);
 		if (oldConnection) {
-			// Detach onClose to prevent re-entrant reconnect from the close itself
-			oldConnection.transport.onClose = undefined;
-			const closePromise = oldConnection.transport.close().catch(() => {});
-			if (oldConnection.transport.closeBeforeReconnect) {
-				await closePromise;
+			const releasePromise = this.#releaseLease(name, oldConnection).catch(error => {
+				throw this.#logLeaseReleaseFailure(name, oldConnection, error);
+			});
+			if (oldConnection.transport.closeBeforeReconnect !== false) {
+				try {
+					await releasePromise;
+				} finally {
+					this.#connections.delete(name);
+				}
 			} else {
-				// Fire-and-forget: don't await HTTP/SSE close — HttpTransport.close()
-				// sends a DELETE with config.timeout (30s default), and blocking here
-				// delays the reconnect loop by that amount on every server restart.
-				void closePromise;
+				// Fire-and-forget HTTP/SSE close so a slow DELETE does not delay retries.
+				this.#trackRetiredLeaseRelease(name, oldConnection, releasePromise);
+				void releasePromise.catch(error => {
+					logger.error("MCP reconnect transport cleanup failed", { path: `mcp:${name}`, error });
+				});
+				this.#connections.delete(name);
 			}
-			this.#connections.delete(name);
 		}
 		this.#pendingConnections.delete(name);
 		const backoffAbort = new AbortController();
@@ -1173,7 +1821,9 @@ export class MCPManager {
 							attempt: attempt + 1,
 							error: msg,
 						});
-						await delay(delays[attempt], backoffAbort.signal).catch(() => undefined);
+						await this.#sleep(delays[attempt]!, backoffAbort.signal).catch(error => {
+							if (!backoffAbort.signal.aborted) logger.error("MCP reconnect backoff failed", { path: `mcp:${name}`, error });
+						});
 					} else {
 						logger.error("MCP reconnect failed after retries", { path: `mcp:${name}`, error: msg });
 						// Don't remove stale tools — keep them in the registry so they
@@ -1198,26 +1848,33 @@ export class MCPManager {
 		source: SourceMeta | undefined,
 		globalEpoch: number,
 		disconnectEpoch: number,
+		lifecycleEpoch?: number,
 	): Promise<MCPServerConnection> {
+		const assertLifecycle = (): void => {
+			if (lifecycleEpoch === undefined || (this.#scopedLifecycle === "open" && this.#scopedLifecycleEpoch === lifecycleEpoch)) return;
+			throw new MCPManagerLifecycleError(this.#scopedLifecycle === "disconnecting" ? "disconnect" : "reconnect");
+		};
+		assertLifecycle();
 		const resolvedConfig = await this.#resolveAuthConfig(config);
+		assertLifecycle();
 		const connectionAbort = new AbortController();
 		this.#pendingConnectionControllers.set(name, connectionAbort);
 		let connection: MCPServerConnection;
+		let acquiredLease: MCPPoolLease | undefined;
 		try {
-			connection = await connectToServer(name, resolvedConfig, {
-				signal: connectionAbort.signal,
-				onNotification: (method, params) => {
-					this.#handleServerNotification(name, method, params);
-				},
-				onRequest: (method, params) => {
-					return this.#handleServerRequest(method, params);
-				},
-			});
+			acquiredLease = await this.#acquireLease(name, resolvedConfig, config, connectionAbort);
+			await this.#afterLeaseAcquiredForTests?.(name, acquiredLease);
+			connection = acquiredLease.connection;
+		} catch (error) {
+			if (acquiredLease) await this.#releaseLeasePreservingPrimary(name, acquiredLease.connection);
+			throw error;
 		} finally {
 			if (this.#pendingConnectionControllers.get(name) === connectionAbort) {
 				this.#pendingConnectionControllers.delete(name);
 			}
 		}
+		const lease = acquiredLease;
+		if (!lease) throw new Error(`MCP lease acquisition returned no lease for ${name}`);
 
 		connection.config = config;
 		if (source) connection._source = source;
@@ -1227,13 +1884,21 @@ export class MCPManager {
 		if (
 			!this.#serverConfigs.has(name) ||
 			this.#epoch !== globalEpoch ||
-			(this.#disconnectEpochs.get(name) ?? 0) !== disconnectEpoch
+			(this.#disconnectEpochs.get(name) ?? 0) !== disconnectEpoch ||
+			(lifecycleEpoch !== undefined && (this.#scopedLifecycle !== "open" || this.#scopedLifecycleEpoch !== lifecycleEpoch))
 		) {
-			await connection.transport.close().catch(() => {});
-			throw new Error(`Server "${name}" was disconnected during reconnection`);
+			const disconnectError = new Error(`Server "${name}" was disconnected during reconnection`);
+			await this.#releaseLeasePreservingPrimary(name, connection);
+			throw disconnectError;
+		}
+		if (!this.#pool.isCurrentLease(lease)) {
+			const obsoleteError = new MCPPoolLeaseObsoleteError(name, lease.key, lease.generation);
+			await this.#releaseLeasePreservingPrimary(name, connection);
+			throw obsoleteError;
 		}
 
 		this.#connections.set(name, connection);
+		this.#registerLease(name, connection);
 
 		// Wire auth refresh for HTTP transports, and reconnect for any transport.
 		if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
@@ -1245,19 +1910,15 @@ export class MCPManager {
 				return null;
 			};
 		}
-		connection.transport.onClose = () => {
-			logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
-			void this.reconnectServer(name);
-		};
 		try {
-			const serverTools = await listTools(connection);
+			const serverTools = await listTools(this.#connectionForLease(connection));
 			if (!this.#isCurrentConnection(name, config, globalEpoch, disconnectEpoch, connection)) {
-				connection.transport.onClose = undefined;
-				await connection.transport.close().catch(() => {});
-				throw new Error(`Server "${name}" was disconnected during tool loading`);
+				const disconnectError = new Error(`Server "${name}" was disconnected during tool loading`);
+				await this.#releaseLeasePreservingPrimary(name, connection);
+				throw disconnectError;
 			}
 			const reconnect = () => this.reconnectServer(name);
-			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
+			const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, { noReplay: config.sharing === "shared" });
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
@@ -1265,8 +1926,7 @@ export class MCPManager {
 			return connection;
 		} catch (error) {
 			// Clean up the connection to avoid zombie transports
-			connection.transport.onClose = undefined;
-			await connection.transport.close().catch(() => {});
+			await this.#releaseLeasePreservingPrimary(name, connection);
 			if (this.#connections.get(name) === connection) this.#connections.delete(name);
 			throw error;
 		}
@@ -1280,7 +1940,8 @@ export class MCPManager {
 		if (this.#toolsOnly) return;
 		if (serverSupportsResources(connection.capabilities)) {
 			try {
-				const [resources] = await Promise.all([listResources(connection), listResourceTemplates(connection)]);
+				const facade = this.#connectionForLease(connection);
+				const [resources] = await Promise.all([listResources(facade), listResourceTemplates(facade)]);
 
 				if (this.#notificationsEnabled && connection.capabilities.resources?.subscribe) {
 					const uris = resources.map(r => r.uri);
@@ -1294,7 +1955,7 @@ export class MCPManager {
 
 		if (serverSupportsPrompts(connection.capabilities)) {
 			try {
-				await listPrompts(connection);
+				await listPrompts(this.#connectionForLease(connection));
 				this.#onPromptsChanged?.(name);
 			} catch (error) {
 				logger.debug("Failed to load MCP prompts", { path: `mcp:${name}`, error });
@@ -1316,10 +1977,11 @@ export class MCPManager {
 		connection.tools = undefined;
 
 		// Reload tools
-		const serverTools = await listTools(connection);
+		const facade = this.#connectionForLease(connection);
+		const serverTools = await listTools(facade);
 		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		const reconnect = () => this.reconnectServer(name);
-		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
+		const customTools = MCPTool.fromTools(facade, serverTools, reconnect, { noReplay: connection.config.sharing === "shared" });
 		void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server
@@ -1353,46 +2015,34 @@ export class MCPManager {
 			connection.resourceTemplates = undefined;
 
 			// Reload
-			const [resources] = await Promise.all([listResources(connection), listResourceTemplates(connection)]);
+			const facade = this.#connectionForLease(connection);
+			const [resources] = await Promise.all([listResources(facade), listResourceTemplates(facade)]);
 			if (this.#notificationsEnabled && connection.capabilities.resources?.subscribe) {
+				const lease = this.#leaseByConnection.get(connection);
+				if (!lease) return;
 				const newUris = new Set(resources.map(r => r.uri));
-				const oldUris = this.#subscribedResources.get(name);
 				const notificationEpoch = this.#notificationsEpoch;
-
-				// Unsubscribe URIs that were removed
-				if (oldUris) {
-					const removed = [...oldUris].filter(uri => !newUris.has(uri));
-					if (removed.length > 0) {
-						try {
-							await unsubscribeFromResources(connection, removed);
-						} catch (error) {
-							logger.debug("Failed to unsubscribe stale MCP resources", { path: `mcp:${name}`, error });
-						}
-					}
-				}
-
-				// Subscribe to the current set and update tracking atomically
 				try {
-					const allUris = [...newUris];
-					await subscribeToResources(connection, allUris);
-					const action = resolveSubscriptionPostAction(
-						this.#notificationsEnabled,
-						this.#notificationsEpoch,
-						notificationEpoch,
-					);
-					if (action === "rollback") {
-						await unsubscribeFromResources(connection, allUris).catch(error => {
-							logger.debug("Failed to rollback stale MCP resource subscription", { path: `mcp:${name}`, error });
-						});
-						return;
-					}
-					if (action === "ignore") {
-						return;
-					}
-					this.#subscribedResources.set(name, newUris);
+					await lease.setResourceSubscriptions([...newUris]);
 				} catch (error) {
-					logger.debug("Failed to re-subscribe to MCP resources", { path: `mcp:${name}`, error });
+					logger.error("Failed to re-subscribe to MCP resources", { path: `mcp:${name}`, error });
+					return;
 				}
+				const action = resolveSubscriptionPostAction(
+					this.#notificationsEnabled,
+					this.#notificationsEpoch,
+					notificationEpoch,
+				);
+				if (action === "rollback") {
+					try {
+						await lease.setResourceSubscriptions([]);
+					} catch (error) {
+						logger.error("Failed to rollback stale MCP resource subscription", { path: `mcp:${name}`, error });
+					}
+					return;
+				}
+				if (action === "ignore") return;
+				this.#subscribedResources.set(name, newUris);
 			}
 		};
 
@@ -1415,7 +2065,7 @@ export class MCPManager {
 		if (!connection || !serverSupportsPrompts(connection.capabilities)) return;
 
 		connection.prompts = undefined;
-		await listPrompts(connection);
+		await listPrompts(this.#connectionForLease(connection));
 
 		this.#onPromptsChanged?.(name);
 	}
@@ -1444,7 +2094,7 @@ export class MCPManager {
 		if (this.#toolsOnly) return undefined;
 		const connection = this.#connections.get(name);
 		if (!connection) return undefined;
-		return readResource(connection, uri, options);
+		return readResource(this.#connectionForLease(connection), uri, options);
 	}
 
 	/**
@@ -1469,7 +2119,7 @@ export class MCPManager {
 		if (this.#toolsOnly) return undefined;
 		const connection = this.#connections.get(name);
 		if (!connection) return undefined;
-		return getPrompt(connection, promptName, args, options);
+		return getPrompt(this.#connectionForLease(connection), promptName, args, options);
 	}
 
 	/**
@@ -1598,6 +2248,9 @@ export class MCPManager {
 			}
 		}
 
+		if (resolved.type === "stdio") {
+			resolved = { ...resolved, cwd: canonicalMCPWorkingDirectory(resolved.cwd ?? this.cwd) };
+		}
 		return resolved;
 	}
 }
@@ -1614,7 +2267,9 @@ export async function createMCPManager(
 	result: MCPLoadResult;
 }> {
 	const manager =
-		options?.configPath !== undefined ? new MCPManager(cwd, null, { toolsOnly: true }) : new MCPManager(cwd);
+		options?.configPath !== undefined
+			? new MCPManager(cwd, null, { toolsOnly: true, sharedPoolIdleMs: options?.sharedPoolIdleMs })
+			: new MCPManager(cwd, null, { sharedPoolIdleMs: options?.sharedPoolIdleMs });
 	const result = await manager.discoverAndConnect(options);
 	return { manager, result };
 }

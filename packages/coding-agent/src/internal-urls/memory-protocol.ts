@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, isEnoent } from "@gajae-code/utils";
-import { getMemoryRoot } from "../memories";
+import { getAgentDir, getMemoriesDir, isEnoent } from "@gajae-code/utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { validateRelativePath } from "./skill-protocol";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
@@ -9,6 +8,13 @@ import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 const DEFAULT_MEMORY_FILE = "memory_summary.md";
 const MEMORY_NAMESPACE = "root";
 
+function getMemoryRoot(agentDir: string, cwd: string): string {
+	return path.join(getMemoriesDir(agentDir), encodeProjectPath(cwd));
+}
+
+function encodeProjectPath(cwd: string): string {
+	return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+}
 /**
  * Snapshot of memory roots for every registered session, deduped.
  * Each session has its own cwd (possibly a worktree), so subagents and main

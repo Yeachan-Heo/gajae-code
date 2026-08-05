@@ -1,24 +1,83 @@
 import type { Settings } from "../config/settings";
-import { hindsightBackend } from "../hindsight";
-import { localBackend } from "./local-backend";
-import { offBackend } from "./off-backend";
-import type { MemoryBackend } from "./types";
+import type { MemoryBackend, MemoryBackendId } from "./types";
 
 /**
- * Pick the active memory backend for a Settings instance.
- *
- * Selection rules (single source of truth — every memory consumer routes
- * through this):
- *   - `memory.backend === "hindsight"`  → Hindsight remote memory
- *   - `memory.backend === "local"`      → local pipeline
- *   - everything else                   → no-op
- *
- * `memories.enabled` remains accepted only as a legacy migration input. Once
- * a config is loaded, `memory.backend` is the sole runtime selector.
+ * Resident no-op backend used for the default `memory.backend=off` path.
+ * Keeping this value here lets the identity resolver stay free of concrete
+ * backend imports while preserving the legacy resolver API below.
  */
-export function resolveMemoryBackend(settings: Settings): MemoryBackend {
+export const offBackend: MemoryBackend = {
+	id: "off",
+	async start() {},
+	async buildDeveloperInstructions() {
+		return undefined;
+	},
+	async clear() {},
+	async enqueue() {},
+};
+
+/**
+ * Resolve the configured backend identity without importing any backend
+ * implementation. This is safe for synchronous capability checks and keeps
+ * the default `off` graph resident-free.
+ */
+export function resolveMemoryBackendId(settings: Settings): MemoryBackendId {
 	const id = settings.get("memory.backend");
-	if (id === "hindsight") return hindsightBackend;
-	if (id === "local") return localBackend;
-	return offBackend;
+	if (id === "hindsight" || id === "local") return id;
+	return "off";
+}
+
+/**
+ * Compatibility handles for callers that still resolve a backend object
+ * synchronously. Their implementation methods delegate to the same literal
+ * dynamic imports used by the runtime service; no backend graph is eager.
+ */
+export const localBackend: MemoryBackend = {
+	id: "local",
+	async start(options) {
+		return (await import("./local-backend")).localBackend.start(options);
+	},
+	async buildDeveloperInstructions(agentDir, settings, session) {
+		return (await import("./local-backend")).localBackend.buildDeveloperInstructions(agentDir, settings, session);
+	},
+	async clear(agentDir, cwd, session) {
+		return (await import("./local-backend")).localBackend.clear(agentDir, cwd, session);
+	},
+	async enqueue(agentDir, cwd, session) {
+		return (await import("./local-backend")).localBackend.enqueue(agentDir, cwd, session);
+	},
+};
+
+const hindsightBackend: MemoryBackend = {
+	id: "hindsight",
+	async start(options) {
+		return (await import("../hindsight")).hindsightBackend.start(options);
+	},
+	async buildDeveloperInstructions(agentDir, settings, session) {
+		return (await import("../hindsight")).hindsightBackend.buildDeveloperInstructions(agentDir, settings, session);
+	},
+	async clear(agentDir, cwd, session) {
+		return (await import("../hindsight")).hindsightBackend.clear(agentDir, cwd, session);
+	},
+	async enqueue(agentDir, cwd, session) {
+		return (await import("../hindsight")).hindsightBackend.enqueue(agentDir, cwd, session);
+	},
+	async beforeAgentStartPrompt(session, promptText) {
+		return (await import("../hindsight")).hindsightBackend.beforeAgentStartPrompt?.(session, promptText);
+	},
+	async preCompactionContext(messages, settings, session) {
+		return (await import("../hindsight")).hindsightBackend.preCompactionContext?.(messages, settings, session);
+	},
+};
+
+/** Legacy synchronous resolver. New behavior callers should use the lazy service. */
+export function resolveMemoryBackend(settings: Settings): MemoryBackend {
+	switch (resolveMemoryBackendId(settings)) {
+		case "local":
+			return localBackend;
+		case "hindsight":
+			return hindsightBackend;
+		case "off":
+			return offBackend;
+	}
 }

@@ -6,6 +6,7 @@ import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage, TextContent, ToolCall, UserMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -440,6 +441,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 					systemPrompt: ["test"],
 					tools: [],
 				},
+				appendOnlyContext: createAppendOnlyContextManager(model!.provider),
 			});
 			authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
 			const agentSession = new AgentSession({
@@ -448,6 +450,10 @@ describe("SessionManager compacted cold-spill eviction", () => {
 				settings: Settings.isolated(),
 				modelRegistry: new ModelRegistry(authStorage),
 			});
+			const appendOnly = agent.appendOnlyContext;
+			expect(appendOnly).not.toBeUndefined();
+			appendOnly?.syncMessages([{ role: "user", content: "compaction-provider-marker" }]);
+			expect(appendOnly?.log.length).toBe(1);
 			const getEntriesSpy = vi.spyOn(session, "getEntries");
 			const getBranchSpy = vi.spyOn(session, "getBranch");
 			const getEntrySpy = vi.spyOn(session, "getEntry");
@@ -466,6 +472,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 					false,
 				);
 				const afterPostAppend = session.getObservabilityStatsForTests();
+				expect(appendOnly?.log.length).toBe(0);
 
 				expect(compactionEntry?.type).toBe("compaction");
 				expect(JSON.stringify(compactionEntry)).toContain("agent deterministic summary");
