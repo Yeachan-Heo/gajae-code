@@ -1,6 +1,6 @@
 import { CODEX_GPT_5_6_CONTEXT_CAP, isCodexGpt56Tier, isCodexProductTransport } from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
-import { resolveOpenAICompat } from "./providers/openai-completions-compat";
+import { resolveOpenAICompat } from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 

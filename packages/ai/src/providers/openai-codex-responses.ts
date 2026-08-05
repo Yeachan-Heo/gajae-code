@@ -91,7 +91,9 @@ import {
 	mapOpenAIResponsesStopReason,
 	populateResponsesUsageFromResponse,
 } from "./openai-responses-shared";
+import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
 import { transformMessages } from "./transform-messages";
+export { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
 
 export interface OpenAICodexResponsesOptions extends StreamOptions {
 	reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -138,30 +140,6 @@ const CODEX_WEBSOCKET_FATAL_PATTERNS = ["websocket error:", "websocket closed be
 /** Max total time to spend retrying 429s with server-provided delays (5 minutes). */
 const CODEX_RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
 
-/**
- * Tool names the Codex backend reserves for its own namespaces. Sending a
- * function tool under one of these names is rejected with
- * `Function 'computer.computer' not allowed in namespace 'computer'`.
- * These are renamed on the wire and mapped back on receive so the internal
- * tool name stays canonical everywhere else in the harness.
- */
-const CODEX_RESERVED_TOOL_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
-	["browser", "browser_tool"],
-	["computer", "computer_tool"],
-]);
-const CODEX_CANONICAL_TOOL_NAMES: ReadonlyMap<string, string> = new Map(
-	Array.from(CODEX_RESERVED_TOOL_WIRE_NAMES, ([canonical, wire]) => [wire, canonical]),
-);
-
-/** Maps a canonical tool name to the name Codex accepts on the wire. */
-export function codexToolWireName(name: string): string {
-	return CODEX_RESERVED_TOOL_WIRE_NAMES.get(name) ?? name;
-}
-
-/** Maps a Codex wire tool name back to the canonical harness tool name. */
-export function codexToolCanonicalName(wireName: string): string {
-	return CODEX_CANONICAL_TOOL_NAMES.get(wireName) ?? wireName;
-}
 
 const CODEX_PROGRESS_EVENT_TYPES = new Set([
 	"response.created",

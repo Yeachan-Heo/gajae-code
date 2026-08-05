@@ -25,14 +25,7 @@ import type {
 	UsageProvider,
 	UsageReport,
 } from "./usage";
-import { claudeRankingStrategy, claudeUsageProvider } from "./usage/claude";
-import { googleGeminiCliUsageProvider } from "./usage/gemini";
-import { githubCopilotUsageProvider } from "./usage/github-copilot";
-import { antigravityUsageProvider } from "./usage/google-antigravity";
-import { grokCliRankingStrategy, grokCliUsageProvider } from "./usage/grok-cli";
-import { kimiUsageProvider } from "./usage/kimi";
-import { codexRankingStrategy, openaiCodexUsageProvider } from "./usage/openai-codex";
-import { zaiUsageProvider } from "./usage/zai";
+
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
@@ -529,20 +522,186 @@ async function defaultConfigValueResolver(config: string): Promise<string | unde
 // Usage Providers (defaults)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DEFAULT_USAGE_PROVIDERS: UsageProvider[] = [
-	openaiCodexUsageProvider,
-	kimiUsageProvider,
-	antigravityUsageProvider,
-	googleGeminiCliUsageProvider,
-	claudeUsageProvider,
-	zaiUsageProvider,
-	githubCopilotUsageProvider,
-	grokCliUsageProvider,
+/** A lazy built-in usage-provider descriptor. */
+interface UsageProviderDescriptor {
+	id: Provider;
+	supports?: UsageProvider["supports"];
+	load: () => Promise<UsageProvider>;
+}
+
+function memoizeUsageProvider(loader: () => UsageProvider): () => Promise<UsageProvider> {
+	let promise: Promise<UsageProvider> | undefined;
+	return () => {
+		promise ??= Promise.resolve().then(loader);
+		return promise;
+	};
+}
+
+function supportsOAuthUsage(params: UsageFetchParams): boolean {
+	return params.credential.type === "oauth";
+}
+
+function supportsGoogleGeminiCliUsage(params: UsageFetchParams): boolean {
+	return params.credential.type === "oauth" && Boolean(params.credential.accessToken);
+}
+
+function supportsGithubCopilotUsage(params: UsageFetchParams): boolean {
+	if (params.provider !== "github-copilot") return false;
+	if (params.credential.type === "oauth") {
+		return Boolean(params.credential.refreshToken || params.credential.accessToken);
+	}
+	return Boolean(params.credential.apiKey);
+}
+
+function supportsProvider(provider: Provider): (params: UsageFetchParams) => boolean {
+	return params => params.provider === provider;
+}
+
+/**
+ * Built-in usage providers stay as descriptors so importing AuthStorage does not
+ * parse provider-specific usage implementations. A descriptor's `supports`
+ * predicate is deliberately small and synchronous; the implementation is loaded
+ * only after a request has passed that predicate.
+ */
+const DEFAULT_USAGE_PROVIDER_DESCRIPTORS: readonly UsageProviderDescriptor[] = [
+	{
+		id: "openai-codex",
+		supports: (params: UsageFetchParams) => params.provider === "openai-codex" && supportsOAuthUsage(params),
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/openai-codex") as { openaiCodexUsageProvider: UsageProvider };
+			return module.openaiCodexUsageProvider;
+		}),
+	},
+	{
+		id: "kimi-code",
+		supports: (params: UsageFetchParams) => params.provider === "kimi-code" && supportsOAuthUsage(params),
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/kimi") as { kimiUsageProvider: UsageProvider };
+			return module.kimiUsageProvider;
+		}),
+	},
+	{
+		id: "google-antigravity",
+		supports: supportsProvider("google-antigravity"),
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/google-antigravity") as { antigravityUsageProvider: UsageProvider };
+			return module.antigravityUsageProvider;
+		}),
+	},
+	{
+		id: "google-gemini-cli",
+		supports: (params: UsageFetchParams) => params.provider === "google-gemini-cli" && supportsGoogleGeminiCliUsage(params),
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/gemini") as { googleGeminiCliUsageProvider: UsageProvider };
+			return module.googleGeminiCliUsageProvider;
+		}),
+	},
+	{
+		id: "anthropic",
+		supports: (params: UsageFetchParams) => params.provider === "anthropic" && supportsOAuthUsage(params),
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/claude") as { claudeUsageProvider: UsageProvider };
+			return module.claudeUsageProvider;
+		}),
+	},
+	{
+		id: "zai",
+		supports: (params: UsageFetchParams) => params.provider === "zai" && params.credential.type === "api_key",
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/zai") as { zaiUsageProvider: UsageProvider };
+			return module.zaiUsageProvider;
+		}),
+	},
+	{
+		id: "github-copilot",
+		supports: supportsGithubCopilotUsage,
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/github-copilot") as { githubCopilotUsageProvider: UsageProvider };
+			return module.githubCopilotUsageProvider;
+		}),
+	},
+	{
+		id: "grok-build",
+		supports: supportsProvider("grok-build"),
+		load: memoizeUsageProvider(() => {
+			const module = require("./usage/grok-cli") as { grokCliUsageProvider: UsageProvider };
+			return module.grokCliUsageProvider;
+		}),
+	},
 ];
 
-const DEFAULT_USAGE_PROVIDER_MAP = new Map<Provider, UsageProvider>(
-	DEFAULT_USAGE_PROVIDERS.map(provider => [provider.id, provider]),
+const DEFAULT_USAGE_PROVIDER_DESCRIPTOR_BY_ID = new Map<Provider, UsageProviderDescriptor>(
+	DEFAULT_USAGE_PROVIDER_DESCRIPTORS.map(descriptor => [descriptor.id, descriptor]),
 );
+const DEFAULT_USAGE_PROVIDER_CACHE = new Map<Provider, UsageProvider>();
+
+function resolveDefaultUsageProvider(provider: Provider): UsageProvider | undefined {
+	const descriptor = DEFAULT_USAGE_PROVIDER_DESCRIPTOR_BY_ID.get(provider);
+	if (!descriptor) return undefined;
+	const cached = DEFAULT_USAGE_PROVIDER_CACHE.get(provider);
+	if (cached) return cached;
+	const lazyProvider: UsageProvider = {
+		id: descriptor.id,
+		supports: descriptor.supports,
+		fetchUsage: (params, ctx) => descriptor.load().then(loaded => loaded.fetchUsage(params, ctx)),
+	};
+	DEFAULT_USAGE_PROVIDER_CACHE.set(provider, lazyProvider);
+	return lazyProvider;
+}
+
+const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>([
+	[
+		"openai-codex",
+		{
+			findWindowLimits(report) {
+				const findLimit = (key: "primary" | "secondary"): UsageLimit | undefined => {
+					const direct = report.limits.find(limit => limit.id === `openai-codex:${key}`);
+					if (direct) return direct;
+					const byId = report.limits.find(limit => limit.id.toLowerCase().includes(key));
+					if (byId) return byId;
+					const windowId = key === "secondary" ? "7d" : "1h";
+					return report.limits.find(limit => limit.scope.windowId?.toLowerCase() === windowId);
+				};
+				return { primary: findLimit("primary"), secondary: findLimit("secondary") };
+			},
+			windowDefaults: { primaryMs: 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
+			hasPriorityBoost(primary) {
+				if (!primary) return false;
+				const windowId = primary.scope.windowId?.toLowerCase();
+				const durationMs = primary.window?.durationMs;
+				const isFiveHourWindow =
+					windowId === "5h" ||
+					(typeof durationMs === "number" &&
+						Number.isFinite(durationMs) &&
+						Math.abs(durationMs - 5 * 60 * 60 * 1000) <= 60_000);
+				if (!isFiveHourWindow) return false;
+				const usedFraction = primary.amount.usedFraction;
+				return typeof usedFraction === "number" && Number.isFinite(usedFraction) && usedFraction === 0;
+			},
+		} satisfies CredentialRankingStrategy,
+	],
+	[
+		"anthropic",
+		{
+			findWindowLimits(report) {
+				return {
+					primary: report.limits.find(limit => limit.id === "anthropic:5h"),
+					secondary: report.limits.find(limit => limit.id === "anthropic:7d"),
+				};
+			},
+			windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
+		} satisfies CredentialRankingStrategy,
+	],
+	[
+		"grok-build",
+		{
+			findWindowLimits(report) {
+				return { secondary: report.limits.find(limit => limit.id === "grok-build:7d") };
+			},
+			windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 30 * 24 * 60 * 60 * 1000 },
+		} satisfies CredentialRankingStrategy,
+	],
+]);
 
 const USAGE_CACHE_PREFIX = "usage_cache:";
 // 5 min stale tolerance. Anthropic / OpenAI rate-limit /usage hard at the IP
@@ -679,15 +838,6 @@ function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
 	return getUsagePlanType(report)?.includes("pro") === true;
 }
 
-function resolveDefaultUsageProvider(provider: Provider): UsageProvider | undefined {
-	return DEFAULT_USAGE_PROVIDER_MAP.get(provider);
-}
-
-const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>([
-	["openai-codex", codexRankingStrategy],
-	["anthropic", claudeRankingStrategy],
-	["grok-build", grokCliRankingStrategy],
-]);
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
 	return DEFAULT_RANKING_STRATEGIES.get(provider);
@@ -2577,7 +2727,7 @@ export class AuthStorage {
 		const requests: UsageRequestDescriptor[] = [];
 		const providers = new Set<string>([
 			...this.#data.keys(),
-			...DEFAULT_USAGE_PROVIDERS.map(provider => provider.id),
+			...DEFAULT_USAGE_PROVIDER_DESCRIPTORS.map(descriptor => descriptor.id),
 		]);
 
 		for (const providerId of providers) {
