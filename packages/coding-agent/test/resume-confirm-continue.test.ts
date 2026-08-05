@@ -23,10 +23,10 @@ import {
 	type ResumeSessionIdentity,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionArtifactCapacityError,
-	SessionTranscriptOversizedError,
 	type SessionDestination,
 	type SessionInfo,
 	SessionManager,
+	SessionTranscriptOversizedError,
 } from "../src/session/session-manager";
 
 const SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE =

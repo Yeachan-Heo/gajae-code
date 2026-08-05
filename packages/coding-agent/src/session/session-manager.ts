@@ -76,11 +76,11 @@ import {
 	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
 	fsyncManagedArtifactTree,
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
-	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
@@ -9970,16 +9970,16 @@ export class SessionManager {
 		// owner-only and reparse guards accept.
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (destination.kind === "explicit" || !(storage instanceof FileSessionStorage)) {
-		// Fail closed on oversized transcripts before the full read in the explicit path too (#3851).
-		// A missing file falls through to loadEntriesFromFile, which returns [] and creates
-		// a fresh session — matching the pre-existing behavior.
-		try {
-			const preStat = storage.statSync(filePath);
-			if (preStat.size > RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(preStat.size);
-		} catch (error) {
-			if (error instanceof SessionTranscriptOversizedError) throw error;
-			if (!isEnoent(error)) throw error;
-		}
+			// Fail closed on oversized transcripts before the full read in the explicit path too (#3851).
+			// A missing file falls through to loadEntriesFromFile, which returns [] and creates
+			// a fresh session — matching the pre-existing behavior.
+			try {
+				const preStat = storage.statSync(filePath);
+				if (preStat.size > RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(preStat.size);
+			} catch (error) {
+				if (error instanceof SessionTranscriptOversizedError) throw error;
+				if (!isEnoent(error)) throw error;
+			}
 			const entries = await loadEntriesFromFile(filePath, storage);
 			const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 			const manager = new SessionManager(
@@ -9995,14 +9995,14 @@ export class SessionManager {
 
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
-		if (inspected.reason === "missing") {
-			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
-			await manager.#initSessionFile(filePath);
-			return manager;
+			if (inspected.reason === "missing") {
+				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+				await manager.#initSessionFile(filePath);
+				return manager;
+			}
+			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
+			throw new Error(`Could not open session: ${inspected.reason}`);
 		}
-		if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
-		throw new Error(`Could not open session: ${inspected.reason}`);
-	}
 		const opened = await SessionManager.openExistingStrict(inspected.identity, destination, storage, migrationPolicy);
 		if (opened.kind === "error") {
 			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();

@@ -63,11 +63,11 @@ import {
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionArtifactCapacityError,
-	SessionTranscriptOversizedError,
 	type SessionDestination,
 	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
 	SessionManager,
+	SessionTranscriptOversizedError,
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";

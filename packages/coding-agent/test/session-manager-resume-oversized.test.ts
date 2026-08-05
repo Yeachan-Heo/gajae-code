@@ -9,7 +9,6 @@ import {
 	SessionTranscriptOversizedError,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
-import { TempDir } from "@gajae-code/utils";
 
 const tempDirs: string[] = [];
 
