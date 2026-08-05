@@ -91,7 +91,7 @@ The consensus workflow:
    e. Re-join Architect and Critic verdicts for the same revised Planner artifact/pass (including a fresh disposition stage if new conflicts appear)
    f. Repeat this loop until Critic returns `OKAY` **and** Architect is `CLEAR`/`APPROVE` for the same Planner artifact/pass, or 5 iterations are reached
    g. If 5 iterations are reached without Critic `OKAY` plus Architect `CLEAR`/`APPROVE`, **stop opening further planner/revision passes**. Preserve the best version as a terminal `PLANNING-STUCK` result; do not route it to automatic or explicit execution.
-   h. **Runtime budget (#3165):** native `gjc ralplan --write` refuses a new `planner`/`revision` that would open consensus iteration **> max** (default **5**, overridable via `gjc.ralplan.maxIterations` in project/user `.gjc/settings.json`, integer 1..20). Cap uses the same iteration definition as the HUD (`planner`/`revision` openers in `index.jsonl`). Overflow exits **3**, prints operator-visible **`PLANNING-STUCK`** on stdout (and stderr detail; JSON includes `planning_stuck: true`), and still allows `architect`/`critic` within an already-opened pass plus `post-interview`/`adr`/`final` so the best plan can be escalated to `pending approval` without dispatch. A new `--run-id` starts a fresh budget.
+   h. **Runtime budget (#3165):** native `gjc ralplan --write` refuses a new `planner`/`revision` that would open consensus iteration **> max** (default **5**, overridable via `gjc.ralplan.maxIterations`, integer 1..20, using the workflow-settings precedence below). Cap uses the same iteration definition as the HUD (`planner`/`revision` openers in `index.jsonl`). Overflow exits **3**, prints operator-visible **`PLANNING-STUCK`** on stdout (and stderr detail; JSON includes `planning_stuck: true`), and still allows `architect`/`critic` within an already-opened pass plus `post-interview`/`adr`/`final` so the best plan can be escalated to `pending approval` without dispatch. A new `--run-id` starts a fresh budget.
 6. **Post-ralplan interview** (intent reconciliation gate): After the review join gate has both Critic `OKAY` and Architect `CLEAR`/`APPROVE` for the same Planner artifact/pass, and before the plan is finalized, reconcile the consensus plan against the user's actual intent. The goal is to make sure ralplan did not silently bake in assumptions that conflict with what the user wants.
    a. **Collect open items** from the run: every assumption the Planner/Architect/Critic resolved by assumption rather than by stated fact, every ambiguity flagged during review, and every decision the loop made without explicit user input. Source these from the persisted `planner`/`architect`/`critic`/`revision` stage artifacts, not from memory.
    b. **Cross-check prior context for conflicts**: glob `.gjc/_session-{sessionid}/specs/deep-interview-*.md` and other prior specs/plans/context relevant by topic. For each, list points where the consensus plan contradicts, weakens, or expands beyond a previously crystallized decision, constraint, or non-goal. Cite the conflicting artifact and line/section.
@@ -126,7 +126,29 @@ The consensus workflow:
 - On cap: exit code **3**, marker **`PLANNING-STUCK`** (stdout), no silent re-loop, no automatic or explicit ultragoal/team dispatch. Opener budget is `max(index.jsonl openers, on-disk stage-*-{planner,revision}.md count)` so a missing/empty/malformed ledger cannot fail open after prior openers.
 - Headless/CI: treat `PLANNING-STUCK` / exit 3 as terminal planning failure for orchestration/watchdogs.
 - Interactive: retain the best existing plan as a terminal planning result; residual critic findings stay as caveats.
-- Override example (project `.gjc/settings.json`):
+- **Workflow settings precedence** — ralplan reads all of its settings
+  (`gjc.ralplan.maxIterations`, `gjc.ralplan.maxReviewPassesPerLane`,
+  `gjc.ralplan.autoHandoff`) through one shared resolver in this exact order
+  (first valid value wins):
+  1. project `.gjc/config.yml`
+  2. project `.gjc/settings.json`
+  3. user `<agentDir>/config.yml` (normally `~/.gjc/agent/config.yml`, honoring
+     `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` and XDG)
+  4. user `<configRoot>/settings.json` (normally `~/.gjc/settings.json`;
+     legacy, last-resort fallback)
+  5. built-in default
+
+  `config.yml` uses the nested (schema) form — `gjc: { ralplan: { maxIterations } }`;
+  flat dotted keys (`gjc.ralplan.maxIterations`) are honored only in legacy
+  `settings.json` files. Project configuration beats user configuration. The
+  reported `source` is the canonical path of the winning file, or `default`. The
+  legacy config-root `settings.json` is migrated once into the default global
+  agent `config.yml` (absent-only, default-global-agent-scope only). **Malformed or
+  invalid explicit settings in any layer/format exit 2**
+  (`invalid ralplan settings at <path>: <reason>`) — including
+  `gjc.ralplan.maxIterations`, whose former silent fallback to the default is
+  removed.
+- Override example (project `.gjc/settings.json`; the same keys work in project `.gjc/config.yml` and the user layers):
 
 ```json
 {
@@ -141,7 +163,7 @@ The consensus workflow:
 ## Per-lane review budget (operator contract)
 
 - Default: **1** Architect pass and **1** Critic pass per opener iteration.
-- Override via `gjc.ralplan.maxReviewPassesPerLane`: project `.gjc/settings.json` overrides user settings; the value is an integer **1..10** registered in the public settings schema.
+- Override via `gjc.ralplan.maxReviewPassesPerLane` (integer **1..10**, registered in the public settings schema) using the workflow-settings precedence above; project overrides user.
 - On overflow: exit code **3** with the **`PLANNING-STUCK`** marker and lane-specific JSON/stderr detail.
 - `post-interview`, `adr`, and `final` are always allowed.
 - Identical re-writes dedupe without stuck-signaling — including after a crash between artifact write and ledger append: the identical retry repairs the missing ledger row and returns the dedupe receipt.
