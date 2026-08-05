@@ -2,11 +2,16 @@
 
 ## [Unreleased]
 
-## [0.12.15] - 2026-08-06
+### Added
 
-## [0.12.14] - 2026-08-06
+- Workflow settings (ralplan `maxIterations`/`autoHandoff`/`maxReviewPassesPerLane`, deep-interview `ambiguityThreshold`, ultragoal `nudgeBudget`) now resolve through one shared five-layer precedence: project `.gjc/config.yml` → project `.gjc/settings.json` → user `<agentDir>/config.yml` → legacy `<configRoot>/settings.json` → built-in default. `config.yml` values previously ignored by the workflow runtimes now take effect (`gjc config set gjc.ralplan.maxIterations 7` is honored by ralplan); project configuration beats user configuration, fixing deep-interview's former user-YAML-first inversion.
 
-## [0.12.13] - 2026-08-06
+### Changed
+
+- Registered `gjc.ultragoal.nudgeBudget` in the public settings schema (default 10, non-negative integer).
+- The legacy config-root `~/.gjc/settings.json` workflow keys are migrated once into `~/.gjc/agent/config.yml` on the next default-global-scope load (absent-only, atomic marker, no-clobber `.bak`). Invalid strict ralplan legacy values keep the source active so `gjc ralplan` still fails loudly (exit 2); future-schema `config.yml` targets are never touched.
+- ralplan settings are strict for all three keys: malformed or invalid explicit settings in any layer/format exit 2 (the former silent `maxIterations` fallback is removed). An invalid strict ralplan value in the target `config.yml` is repaired with a valid legacy value during migration.
+- `config.yml` settings use the nested schema form; flat dotted keys are honored only in legacy `settings.json` files so every effective override stays manageable via `Settings`/`gjc config`.
 
 ### Fixed
 - ACP session configuration now emits the spec-defined `category` field on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), so standards-compliant ACP clients such as Paseo discover models, modes, and thinking levels instead of an empty model picker (#3922).
