@@ -217,7 +217,83 @@ type ReplacementCleanupReceipt = {
 	predecessor: SerializedReplacementIdentity;
 };
 
+type LegacyReplacementCleanupIdentity = {
+	dev: bigint;
+	ino: bigint;
+	nlink: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+	sha256: string;
+};
+
 const U64_MAX = 18_446_744_073_709_551_615n;
+
+function parseCanonicalU64(value: unknown): bigint | undefined {
+	if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value) || value.length > 20) return undefined;
+	const parsed = BigInt(value);
+	return parsed <= U64_MAX ? parsed : undefined;
+}
+
+function parseLegacyHexU64(value: string): bigint | undefined {
+	if (!/^[0-9a-f]+$/.test(value) || value.length > 16) return undefined;
+	const parsed = BigInt(`0x${value}`);
+	return parsed <= U64_MAX ? parsed : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function legacyReplacementCleanupReceiptBinding(name: string): { dev: bigint; ino: bigint } | undefined {
+	const match = /^\.gjc-replace-cleanup-([0-9a-f]+)-([0-9a-f]+)\.json$/.exec(name);
+	if (!match?.[1] || !match[2]) return undefined;
+	const dev = parseLegacyHexU64(match[1]);
+	const ino = parseLegacyHexU64(match[2]);
+	return dev !== undefined && ino !== undefined ? { dev, ino } : undefined;
+}
+
+function parseLegacyReplacementCleanupIdentity(value: unknown): LegacyReplacementCleanupIdentity | undefined {
+	const identity = asRecord(value);
+	if (!identity) return undefined;
+	const dev = parseCanonicalU64(identity.dev);
+	const ino = parseCanonicalU64(identity.ino);
+	const nlink = parseCanonicalU64(identity.nlink);
+	const size = parseCanonicalU64(identity.size);
+	const mtimeNs = parseCanonicalU64(identity.mtimeNs);
+	const ctimeNs = parseCanonicalU64(identity.ctimeNs);
+	const sha256 = identity.sha256;
+	if (
+		dev === undefined ||
+		ino === undefined ||
+		nlink === undefined ||
+		size === undefined ||
+		mtimeNs === undefined ||
+		ctimeNs === undefined ||
+		typeof sha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(sha256)
+	)
+		return undefined;
+	return { dev, ino, nlink, size, mtimeNs, ctimeNs, sha256 };
+}
+
+function parseLegacyReplacementCleanupReceipt(
+	bytes: Uint8Array,
+): { predecessor: string; successor: string; identity: LegacyReplacementCleanupIdentity } | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
+	} catch {
+		return undefined;
+	}
+	const receipt = asRecord(value);
+	if (receipt?.version !== 1 || typeof receipt.predecessor !== "string" || typeof receipt.successor !== "string")
+		return undefined;
+	const identity = parseLegacyReplacementCleanupIdentity(receipt.identity);
+	return identity ? { predecessor: receipt.predecessor, successor: receipt.successor, identity } : undefined;
+}
 
 function replacementCleanupReceiptBinding(
 	name: string,
@@ -258,10 +334,18 @@ function replacementReceiptPath(
 }
 
 function replacementReceiptRetirementName(
-	receipt: ManagedFileSnapshot["identity"],
-	predecessor: ManagedFileSnapshot["identity"],
+	receipt: { dev: bigint; ino: bigint },
+	predecessor: { dev: bigint; ino: bigint },
 ): string {
 	return `.gjc-receipt-remove-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}`;
+}
+
+function replacementReceiptPlaceholderRetirementName(
+	placeholder: { dev: bigint; ino: bigint },
+	predecessor: { dev: bigint; ino: bigint },
+	receipt: { dev: bigint; ino: bigint },
+): string {
+	return `.gjc-receipt-placeholder-remove-${placeholder.dev.toString(16)}-${placeholder.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}`;
 }
 
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
@@ -785,14 +869,68 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#recoverReplacementCleanupPlaceholder(
+		receiptPath: string,
+		binding: { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } },
+		placeholder: ManagedFileSnapshot,
+	): boolean {
+		if (placeholder.bytes.byteLength !== 0) return false;
+		const detachedReceiptPath = path.join(
+			this.#baseDir,
+			replacementReceiptRetirementName(binding.receipt, binding.predecessor),
+		);
+		let detachedReceipt: ManagedFileSnapshot;
+		try {
+			detachedReceipt = captureManagedFileNoFollow(detachedReceiptPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		if (detachedReceipt.identity.dev !== binding.receipt.dev || detachedReceipt.identity.ino !== binding.receipt.ino)
+			return false;
+
+		const quarantineName = replacementReceiptPlaceholderRetirementName(
+			placeholder.identity,
+			binding.predecessor,
+			binding.receipt,
+		);
+		const removed = exactUnlink(receiptPath, {
+			dev: placeholder.identity.dev,
+			ino: placeholder.identity.ino,
+			nlink: placeholder.identity.nlink,
+			parentDev: this.#subtreeRoot.dev,
+			parentIno: this.#subtreeRoot.ino,
+			size: BigInt(placeholder.identity.size),
+			mtimeNs: placeholder.identity.mtimeNs,
+			sha256: placeholder.identity.sha256,
+			quarantineName,
+		});
+		if (
+			(!exactUnlinkCompleted(removed) && removed.code !== "not_found") ||
+			removed.retainedSuccessorPath !== undefined ||
+			removed.retainedUnknownPath !== undefined
+		)
+			throw new Error(`managed_replace_receipt_cleanup_pending:${removed.code ?? "unknown"}`);
+		fsyncDirectory(this.#baseDir);
+		return true;
+	}
+
 	#detachReplacementCleanupReceipt(receiptPath: string): void {
 		const binding = replacementCleanupReceiptBinding(path.basename(receiptPath));
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
-		const receipt = captureManagedFileNoFollow(receiptPath);
-		if (receipt.identity.dev !== binding.receipt.dev || receipt.identity.ino !== binding.receipt.ino)
+		let receipt: ManagedFileSnapshot;
+		try {
+			receipt = captureManagedFileNoFollow(receiptPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		if (receipt.identity.dev !== binding.receipt.dev || receipt.identity.ino !== binding.receipt.ino) {
+			if (this.#recoverReplacementCleanupPlaceholder(receiptPath, binding, receipt)) return;
 			throw new Error("managed_replace_cleanup_receipt_invalid");
+		}
 		const predecessor = binding.predecessor;
-		const quarantineName = `.gjc-receipt-remove-${receipt.identity.dev.toString(16)}-${receipt.identity.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}`;
+		const quarantineName = replacementReceiptRetirementName(receipt.identity, predecessor);
 		const detached = exactUnlink(receiptPath, {
 			dev: receipt.identity.dev,
 			ino: receipt.identity.ino,
@@ -815,14 +953,75 @@ export class ManagedSessionDescendantStore {
 		fsyncDirectory(this.#baseDir);
 	}
 
+	#reconcileLegacyReplacementCleanupReceipt(receiptPath: string, name: string): void {
+		const binding = legacyReplacementCleanupReceiptBinding(name);
+		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
+		const receipt = captureManagedFileNoFollow(receiptPath);
+		const parsed = parseLegacyReplacementCleanupReceipt(receipt.bytes);
+		const expectedPredecessor = path.join(
+			this.#baseDir,
+			`.gjc-exact-replace-destination-${binding.dev.toString(16)}-${binding.ino.toString(16)}`,
+		);
+		if (
+			!parsed ||
+			parsed.identity.dev !== binding.dev ||
+			parsed.identity.ino !== binding.ino ||
+			path.resolve(parsed.predecessor) !== expectedPredecessor ||
+			path.dirname(path.resolve(parsed.successor)) !== this.#baseDir
+		)
+			throw new Error("managed_replace_cleanup_receipt_invalid");
+
+		const retired = exactUnlink(expectedPredecessor, {
+			dev: parsed.identity.dev,
+			ino: parsed.identity.ino,
+			nlink: parsed.identity.nlink,
+			parentDev: this.#subtreeRoot.dev,
+			parentIno: this.#subtreeRoot.ino,
+			size: parsed.identity.size,
+			mtimeNs: parsed.identity.mtimeNs,
+			sha256: parsed.identity.sha256,
+			quarantineName: `.gjc-replace-retry-${parsed.identity.dev.toString(16)}-${parsed.identity.ino.toString(16)}`,
+		});
+		if (!exactUnlinkCompleted(retired) && retired.code !== "not_found")
+			throw new Error(`managed_replace_cleanup_pending:${retired.code ?? "unknown"}`);
+
+		const currentReceipt = captureManagedFileNoFollow(receiptPath);
+		if (
+			!sameIdentity(currentReceipt.identity, receipt.identity) ||
+			currentReceipt.identity.sha256 !== receipt.identity.sha256
+		)
+			throw new Error("managed_replace_cleanup_receipt_invalid");
+		const removed = exactUnlink(receiptPath, {
+			dev: currentReceipt.identity.dev,
+			ino: currentReceipt.identity.ino,
+			nlink: currentReceipt.identity.nlink,
+			parentDev: this.#subtreeRoot.dev,
+			parentIno: this.#subtreeRoot.ino,
+			size: BigInt(currentReceipt.identity.size),
+			mtimeNs: currentReceipt.identity.mtimeNs,
+			sha256: currentReceipt.identity.sha256,
+			quarantineName: `.gjc-receipt-remove-${currentReceipt.identity.dev.toString(16)}-${currentReceipt.identity.ino.toString(16)}`,
+		});
+		if (!exactUnlinkCompleted(removed) && removed.code !== "not_found")
+			throw new Error(`managed_replace_receipt_cleanup_pending:${removed.code ?? "unknown"}`);
+		fsyncDirectory(this.#baseDir);
+	}
+
 	#reconcileReplacementCleanupReceipts(): void {
 		if (this.#reconcilingReplacementCleanup) return;
 		this.#reconcilingReplacementCleanup = true;
 		try {
 			for (const name of fs.readdirSync(this.#baseDir)) {
 				if (!name.startsWith(".gjc-replace-cleanup-")) continue;
-				if (!replacementCleanupReceiptBinding(name)) throw new Error("managed_replace_cleanup_receipt_invalid");
-				this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
+				if (replacementCleanupReceiptBinding(name)) {
+					this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
+					continue;
+				}
+				if (legacyReplacementCleanupReceiptBinding(name)) {
+					this.#reconcileLegacyReplacementCleanupReceipt(path.join(this.#baseDir, name), name);
+					continue;
+				}
+				throw new Error("managed_replace_cleanup_receipt_invalid");
 			}
 		} finally {
 			this.#reconcilingReplacementCleanup = false;

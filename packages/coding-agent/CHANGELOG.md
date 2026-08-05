@@ -20,8 +20,11 @@
 
 ### Fixed
 
+- Telegram `notify setup` activation works when `notifications/` is a directory symlink (multi-account shared notification dirs). Transition-lock release previously rejected intermediate directory reparse points, left `telegram-daemon.steal` behind, and failed with "provisional ownership could not be retired safely" while durable settings remained armed. Only intermediate directory components are resolved before native exact unlink; the final basename is rejoined so final-component file symlinks stay `reparse_point` under native `AT_SYMLINK_NOFOLLOW`, including TOCTOU replacement after JS preflight (#3761).
 - A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the durable configuration already carries the attempted bot token, chat id, and enabled state. The wording now follows the stored configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own. A commit that was entered and then failed while the stored configuration is also unreadable is reported as undecided, pointing at `notify status`, instead of guessing either outcome (#3761).
 - Continuing a large managed session on Darwin now batches stale OpenAI Responses replay-metadata patches into one transcript append instead of performing one identity-verified whole-file replacement per patch. Interactive startup also renders before exact MCP connection and explicit `--mpreset` activation, gates every provider turn until both are ready, and refreshes models online only after the UI is usable, preventing `gjc -c` from remaining at `GJC warming workspace` with sustained CPU, multi-gigabyte RSS growth, or avoidable network waits (#3793).
+
+- Managed replacement cleanup now migrates version-one receipts from earlier releases and recovers canonical exchange placeholders left by interrupted cleanup, so a stale receipt cannot permanently block the next managed session mutation with `managed_replace_cleanup_receipt_invalid`.
 
 ## [0.12.11] - 2026-08-03
 
@@ -71,6 +74,7 @@
 
 - Windows automatic tmux resolution now selects `psmux` then `pmux` by canonical command order without rejecting distinct lower-priority aliases; it probes `tmux` only when neither named provider is available (#3725).
 - CI failure extraction now aggregates Bun failure and suite-error summaries across every test invocation in a job log instead of silently using only the first summary.
+- The GitHub status-line lookup now binds terminal links to positive PR numbers and canonical matching HTTP(S) pull-request URLs, rejecting ambiguous or control-bearing targets.
 - Ordinary `ask` selectors now bound long question premises and page through every premise row without skipping rows hidden by overflow indicators (#3675).
 - First-event timeout retries now require a typed, content-free failure from the current clean attempt scope, preventing prior or stale extension activity from suppressing or admitting a later request (#3553).
 - The issue-1979 Korean prose wrap test now cleans up inherited multiplexer env vars (`TMUX`, `TMUX_PANE`, etc.) so it deterministically exercises the plain-terminal render path regardless of the CI runner's terminal session (#1979).

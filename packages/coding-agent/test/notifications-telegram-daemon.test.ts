@@ -2949,7 +2949,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 49 durable callback routing", () => {
+	test("keeps wire protocol 3 through generation 50 durable callback routing", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -2966,8 +2966,10 @@ describe("telegram daemon", () => {
 		// receipts durable before exact-ask routing; generation 46 stages activation;
 		// generation 47 settles failed staged revocation; generation 48 makes receipts
 		// crash-durable, aliases legacy-disjoint, and topic authority exact; generation
-		// 49 drains admitted session handlers before final persistence and ownership release.
-		expect(DAEMON_GENERATION).toBe(49);
+		// 49 drains admitted session handlers before final persistence and ownership release;
+		// generation 50 resolves intermediate notifications-directory symlinks before
+		// native exact unlink while keeping final-component file symlinks fail-closed.
+		expect(DAEMON_GENERATION).toBe(50);
 	});
 	test.each([
 		"1",
