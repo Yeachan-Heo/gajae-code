@@ -2,7 +2,6 @@ import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getConfigRootDir } from "@gajae-code/utils";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -43,6 +42,12 @@ import {
 import { probeGjcTeamAvailability } from "./team-runtime";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
+import {
+	resolveWorkflowSetting,
+	WorkflowSettingError,
+	type WorkflowSettingKey,
+	type WorkflowSettingParseResult,
+} from "./workflow-settings";
 /**
  * Native implementation of `gjc ralplan`.
  *
@@ -387,38 +392,56 @@ function parseMaxIterationsValue(value: unknown): number | null {
 	return parseBoundedPositiveInteger(value, RALPLAN_MAX_ITERATIONS_LIMIT);
 }
 
-async function readSettingsMaxIterations(settingsPath: string): Promise<number | null> {
+/** Adapt a nullable parser to the shared resolver's parse-result shape. */
+function workflowSettingParse<T>(
+	parse: (value: unknown) => T | null,
+	reason: string,
+): (value: unknown) => WorkflowSettingParseResult<T> {
+	return value => {
+		const parsed = parse(value);
+		return parsed === null ? { kind: "invalid", reason } : { kind: "valid", value: parsed };
+	};
+}
+
+/**
+ * Resolve a strict ralplan setting through the shared five-layer resolver.
+ * Malformed/invalid explicit sources in any layer/format fail closed (exit 2)
+ * and never fall through to a lower layer or the built-in default.
+ */
+async function resolveStrictRalplanSetting<T>(
+	cwd: string,
+	key: WorkflowSettingKey,
+	parse: (value: unknown) => WorkflowSettingParseResult<T>,
+	defaultValue: T,
+): Promise<{ value: T; source: string }> {
 	try {
-		const raw = await Bun.file(settingsPath).text();
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		const flat = parseMaxIterationsValue(parsed["gjc.ralplan.maxIterations"]);
-		if (flat !== null) return flat;
-		const gjc = parsed.gjc;
-		if (gjc && typeof gjc === "object") {
-			const ralplan = (gjc as Record<string, unknown>).ralplan;
-			if (ralplan && typeof ralplan === "object") {
-				return parseMaxIterationsValue((ralplan as Record<string, unknown>).maxIterations);
-			}
+		const resolution = await resolveWorkflowSetting(cwd, key, { defaultValue, parse, invalidPolicy: "throw" });
+		return { value: resolution.value, source: resolution.source };
+	} catch (error) {
+		if (error instanceof WorkflowSettingError) {
+			throw new RalplanCommandError(2, `invalid ralplan settings at ${error.path}: ${error.reason}`);
 		}
-		return null;
-	} catch {
-		return null;
+		throw error;
 	}
 }
 
 /**
- * Resolve ralplan consensus iteration cap. Project `./.gjc/settings.json` overrides
- * user settings, else default 5.
+ * Resolve the ralplan consensus iteration cap through the shared resolver.
+ * Project `.gjc/config.yml` and `.gjc/settings.json` beat user layers.
  */
 export async function resolveRalplanMaxIterations(cwd: string): Promise<{ maxIterations: number; source: string }> {
-	const projectPath = path.join(gjcRoot(cwd), "settings.json");
-	const project = await readSettingsMaxIterations(projectPath);
-	if (project !== null) return { maxIterations: project, source: projectPath };
-	const userPath = path.join(getConfigRootDir(), "settings.json");
-	const user = await readSettingsMaxIterations(userPath);
-	if (user !== null) return { maxIterations: user, source: userPath };
-	return { maxIterations: RALPLAN_DEFAULT_MAX_ITERATIONS, source: "default" };
+	const { value, source } = await resolveStrictRalplanSetting(
+		cwd,
+		"gjc.ralplan.maxIterations",
+		workflowSettingParse(
+			parseMaxIterationsValue,
+			`expected gjc.ralplan.maxIterations to be an integer between 1 and ${RALPLAN_MAX_ITERATIONS_LIMIT}`,
+		),
+		RALPLAN_DEFAULT_MAX_ITERATIONS,
+	);
+	return { maxIterations: value, source };
 }
+
 function parseRalplanAutoHandoffTarget(value: unknown): RalplanAutoHandoffTarget | undefined {
 	return typeof value === "string" && RALPLAN_AUTO_HANDOFF_TARGETS.has(value as RalplanAutoHandoffTarget)
 		? (value as RalplanAutoHandoffTarget)
@@ -430,81 +453,24 @@ type RalplanAutoHandoffOptions = {
 	teamAvailabilityProbe?: () => { available: true } | { available: false; reason: string };
 };
 
-type RalplanAutoHandoffSetting =
-	| { kind: "absent" }
-	| { kind: "valid"; value: RalplanAutoHandoffTarget }
-	| { kind: "invalid"; reason: string };
-
-function parsePresentRalplanAutoHandoff(value: unknown): RalplanAutoHandoffSetting {
+function parsePresentRalplanAutoHandoff(value: unknown): WorkflowSettingParseResult<RalplanAutoHandoffTarget> {
 	const target = parseRalplanAutoHandoffTarget(value);
 	return target === undefined
-		? {
-				kind: "invalid",
-				reason: "expected gjc.ralplan.autoHandoff to be one of off, ultragoal, team",
-			}
+		? { kind: "invalid", reason: "expected gjc.ralplan.autoHandoff to be one of off, ultragoal, team" }
 		: { kind: "valid", value: target };
-}
-
-function parseRalplanAutoHandoffSettings(parsed: unknown): RalplanAutoHandoffSetting {
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "absent" };
-	const settings = parsed as Record<string, unknown>;
-	if (Object.hasOwn(settings, "gjc.ralplan.autoHandoff")) {
-		return parsePresentRalplanAutoHandoff(settings["gjc.ralplan.autoHandoff"]);
-	}
-	const gjc = settings.gjc;
-	if (!gjc || typeof gjc !== "object" || Array.isArray(gjc)) return { kind: "absent" };
-	const ralplan = (gjc as Record<string, unknown>).ralplan;
-	if (!ralplan || typeof ralplan !== "object" || Array.isArray(ralplan)) return { kind: "absent" };
-	const ralplanSettings = ralplan as Record<string, unknown>;
-	if (!Object.hasOwn(ralplanSettings, "autoHandoff")) return { kind: "absent" };
-	return parsePresentRalplanAutoHandoff(ralplanSettings.autoHandoff);
-}
-
-async function readSettingsAutoHandoff(settingsPath: string): Promise<RalplanAutoHandoffSetting> {
-	let raw: string;
-	try {
-		raw = await Bun.file(settingsPath).text();
-	} catch (error) {
-		if (getErrorCode(error) === "ENOENT") return { kind: "absent" };
-		return {
-			kind: "invalid",
-			reason: `unable to read settings: ${error instanceof Error ? error.message : String(error)}`,
-		};
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch (error) {
-		return {
-			kind: "invalid",
-			reason: `malformed JSON: ${error instanceof Error ? error.message : String(error)}`,
-		};
-	}
-	return parseRalplanAutoHandoffSettings(parsed);
 }
 
 export async function resolveRalplanAutoHandoff(
 	cwd: string,
 	options: RalplanAutoHandoffOptions = {},
 ): Promise<RalplanAutoHandoffResolution> {
-	const projectPath = path.join(gjcRoot(cwd), "settings.json");
-	const project = await readSettingsAutoHandoff(projectPath);
-	if (project.kind === "invalid") {
-		throw new RalplanCommandError(2, `invalid ralplan settings at ${projectPath}: ${project.reason}`);
-	}
-	if (project.kind === "valid") {
-		return resolveRalplanAutoHandoffTarget(project.value, projectPath, options);
-	}
-	const userPath = path.join(getConfigRootDir(), "settings.json");
-	const user = await readSettingsAutoHandoff(userPath);
-	if (user.kind === "invalid") {
-		throw new RalplanCommandError(2, `invalid ralplan settings at ${userPath}: ${user.reason}`);
-	}
-	return resolveRalplanAutoHandoffTarget(
-		user.kind === "valid" ? user.value : "off",
-		user.kind === "valid" ? userPath : "default",
-		options,
+	const { value, source } = await resolveStrictRalplanSetting(
+		cwd,
+		"gjc.ralplan.autoHandoff",
+		parsePresentRalplanAutoHandoff,
+		"off",
 	);
+	return resolveRalplanAutoHandoffTarget(value, source, options);
 }
 
 function resolveRalplanAutoHandoffTarget(
@@ -533,78 +499,20 @@ function parseMaxReviewPassesPerLaneValue(value: unknown): number | null {
 	return parseBoundedPositiveInteger(value, RALPLAN_MAX_REVIEW_PASSES_PER_LANE_LIMIT);
 }
 
-type RalplanReviewPassesPerLaneSetting =
-	| { kind: "absent" }
-	| { kind: "valid"; value: number }
-	| { kind: "invalid"; reason: string };
-
-function parsePresentMaxReviewPassesPerLane(value: unknown): RalplanReviewPassesPerLaneSetting {
-	const parsed = parseMaxReviewPassesPerLaneValue(value);
-	return parsed === null
-		? {
-				kind: "invalid",
-				reason:
-					"expected gjc.ralplan.maxReviewPassesPerLane to be an integer between 1 and " +
-					RALPLAN_MAX_REVIEW_PASSES_PER_LANE_LIMIT,
-			}
-		: { kind: "valid", value: parsed };
-}
-
-function parseMaxReviewPassesPerLaneSettings(parsed: unknown): RalplanReviewPassesPerLaneSetting {
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "absent" };
-	const settings = parsed as Record<string, unknown>;
-	if (Object.hasOwn(settings, "gjc.ralplan.maxReviewPassesPerLane")) {
-		return parsePresentMaxReviewPassesPerLane(settings["gjc.ralplan.maxReviewPassesPerLane"]);
-	}
-	const gjc = settings.gjc;
-	if (!gjc || typeof gjc !== "object" || Array.isArray(gjc)) return { kind: "absent" };
-	const ralplan = (gjc as Record<string, unknown>).ralplan;
-	if (!ralplan || typeof ralplan !== "object" || Array.isArray(ralplan)) return { kind: "absent" };
-	const ralplanSettings = ralplan as Record<string, unknown>;
-	if (!Object.hasOwn(ralplanSettings, "maxReviewPassesPerLane")) return { kind: "absent" };
-	return parsePresentMaxReviewPassesPerLane(ralplanSettings.maxReviewPassesPerLane);
-}
-
-async function readSettingsMaxReviewPassesPerLane(settingsPath: string): Promise<RalplanReviewPassesPerLaneSetting> {
-	let raw: string;
-	try {
-		raw = await Bun.file(settingsPath).text();
-	} catch (error) {
-		if (getErrorCode(error) === "ENOENT") return { kind: "absent" };
-		return {
-			kind: "invalid",
-			reason: `unable to read settings: ${error instanceof Error ? error.message : String(error)}`,
-		};
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch (error) {
-		return {
-			kind: "invalid",
-			reason: `malformed JSON: ${error instanceof Error ? error.message : String(error)}`,
-		};
-	}
-	return parseMaxReviewPassesPerLaneSettings(parsed);
-}
-
-/** Resolve the per-lane review-pass budget with project-over-user precedence. */
+/** Resolve the per-lane review-pass budget through the shared resolver. */
 export async function resolveRalplanMaxReviewPassesPerLane(
 	cwd: string,
 ): Promise<{ maxReviewPassesPerLane: number; source: string }> {
-	const projectPath = path.join(gjcRoot(cwd), "settings.json");
-	const project = await readSettingsMaxReviewPassesPerLane(projectPath);
-	if (project.kind === "invalid") {
-		throw new RalplanCommandError(2, `invalid ralplan settings at ${projectPath}: ${project.reason}`);
-	}
-	if (project.kind === "valid") return { maxReviewPassesPerLane: project.value, source: projectPath };
-	const userPath = path.join(getConfigRootDir(), "settings.json");
-	const user = await readSettingsMaxReviewPassesPerLane(userPath);
-	if (user.kind === "invalid") {
-		throw new RalplanCommandError(2, `invalid ralplan settings at ${userPath}: ${user.reason}`);
-	}
-	if (user.kind === "valid") return { maxReviewPassesPerLane: user.value, source: userPath };
-	return { maxReviewPassesPerLane: RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE, source: "default" };
+	const { value, source } = await resolveStrictRalplanSetting(
+		cwd,
+		"gjc.ralplan.maxReviewPassesPerLane",
+		workflowSettingParse(
+			parseMaxReviewPassesPerLaneValue,
+			`expected gjc.ralplan.maxReviewPassesPerLane to be an integer between 1 and ${RALPLAN_MAX_REVIEW_PASSES_PER_LANE_LIMIT}`,
+		),
+		RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE,
+	);
+	return { maxReviewPassesPerLane: value, source };
 }
 
 function buildPlanningStuckResult(input: {

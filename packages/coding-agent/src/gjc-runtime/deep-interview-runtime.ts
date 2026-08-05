@@ -1,8 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getConfigRootDir } from "@gajae-code/utils";
-import { YAML } from "bun";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -25,6 +23,7 @@ import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session
 import { runNativeStateCommand } from "./state-runtime";
 import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
+import { resolveWorkflowSetting } from "./workflow-settings";
 
 export * from "./deep-interview-recorder";
 
@@ -346,62 +345,32 @@ interface DeepInterviewSpecWriteSummary {
 	};
 }
 
-async function readSettingsAmbiguityThreshold(
-	settingsPath: string,
-): Promise<{ threshold: number; source: string } | undefined> {
-	let raw: string;
-	try {
-		raw = await fs.readFile(settingsPath, "utf-8");
-	} catch (error) {
-		const err = error as NodeJS.ErrnoException;
-		if (err.code === "ENOENT") return undefined;
-		return undefined;
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch {
-		return undefined;
-	}
-	const candidate = (parsed as { gjc?: { deepInterview?: { ambiguityThreshold?: unknown } } })?.gjc?.deepInterview
-		?.ambiguityThreshold;
-	if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate <= 0 || candidate > 1) {
-		return undefined;
-	}
-	return { threshold: candidate, source: settingsPath };
-}
-
-function modernSettingsPath(): string {
-	const configDir = process.env.GJC_CODING_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
-	if (configDir) return path.join(configDir, "config.yml");
-	return path.join(getConfigRootDir(), "agent", "config.yml");
-}
-
-async function readModernSettingsAmbiguityThreshold(): Promise<{ threshold: number; source: string } | undefined> {
-	const modernConfigPath = modernSettingsPath();
-	let parsed: unknown;
-	try {
-		parsed = YAML.parse(await fs.readFile(modernConfigPath, "utf-8"));
-	} catch {
-		return undefined;
-	}
-	const candidate = (parsed as { gjc?: { deepInterview?: { ambiguityThreshold?: unknown } } })?.gjc?.deepInterview
-		?.ambiguityThreshold;
-	if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate <= 0 || candidate > 1)
-		return undefined;
-	return { threshold: candidate, source: modernConfigPath };
-}
-
+/**
+ * Resolve the configured ambiguity threshold through the shared five-layer
+ * resolver: project `.gjc/config.yml` > project `.gjc/settings.json` > user
+ * `getAgentDir()/config.yml` > legacy config-root `settings.json` > default.
+ * Project configuration beats user configuration, and invalid optional files
+ * continue to lower layers (tolerant contract). Returns `undefined` when the
+ * resolver falls back to the default so the resolution flags (`--quick`/
+ * `--standard`/`--deep`) still apply.
+ */
 async function resolveConfiguredAmbiguityThreshold(
 	cwd: string,
 ): Promise<{ threshold: number; source: string } | undefined> {
-	const modernValue = await readModernSettingsAmbiguityThreshold();
-	if (modernValue) return modernValue;
-	const projectSettings = path.join(cwd, ".gjc", "settings.json");
-	const projectValue = await readSettingsAmbiguityThreshold(projectSettings);
-	if (projectValue) return projectValue;
-	const userSettings = path.join(getConfigRootDir(), "settings.json");
-	return await readSettingsAmbiguityThreshold(userSettings);
+	const resolution = await resolveWorkflowSetting(cwd, "gjc.deepInterview.ambiguityThreshold", {
+		defaultValue: DEFAULT_AMBIGUITY_THRESHOLD,
+		parse: value => {
+			if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > 1) {
+				return {
+					kind: "invalid",
+					reason: "expected gjc.deepInterview.ambiguityThreshold to be a number in (0, 1]",
+				};
+			}
+			return { kind: "valid", value };
+		},
+	});
+	if (resolution.source === "default") return undefined;
+	return { threshold: resolution.value, source: resolution.source };
 }
 
 function englishLanguagePreference(): DeepInterviewLanguagePreference {
