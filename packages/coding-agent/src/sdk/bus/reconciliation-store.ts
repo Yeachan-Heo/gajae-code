@@ -42,6 +42,8 @@ export interface DurableReconciliationRecord extends PromptCorrelation {
  */
 export interface DurableTerminalScopeRecord {
 	selection: "turn" | "owned";
+	/** SHA-256 of the bounded idempotency key; the raw key is never persisted. */
+	idempotencyKeyHash?: string;
 	turnDisposition: "pending" | "stopped" | "uncertain";
 	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
 	automaticDeliveryDisposition: "enabled" | "none";

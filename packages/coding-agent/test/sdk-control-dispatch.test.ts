@@ -477,8 +477,8 @@ test("turn.abort terminal mode validates strictly and forwards normalized input"
 	const calls: Array<Record<string, unknown>> = [];
 	const surface = {
 		abort: () => "legacy",
-		abortTerminal: (input: unknown) => {
-			calls.push(input as Record<string, unknown>);
+		abortTerminal: (input: unknown, idempotencyKey?: string) => {
+			calls.push({ ...(input as Record<string, unknown>), idempotencyKey });
 			return "terminal";
 		},
 	} as unknown as ControlSurface;
@@ -491,16 +491,21 @@ test("turn.abort terminal mode validates strictly and forwards normalized input"
 		});
 
 	expect(await terminal({ mode: "terminal" }, "key-1")).toEqual({ id: "t", ok: true, result: "terminal" });
-	expect(calls).toEqual([{ mode: "terminal", scope: "turn" }]);
+	expect(calls).toEqual([{ mode: "terminal", scope: "turn", idempotencyKey: "key-1" }]);
 	expect(await terminal({ mode: "terminal", scope: "owned" }, "key-2")).toEqual({
 		id: "t",
 		ok: true,
 		result: "terminal",
 	});
 	expect(calls).toEqual([
-		{ mode: "terminal", scope: "turn" },
-		{ mode: "terminal", scope: "owned" },
+		{ mode: "terminal", scope: "turn", idempotencyKey: "key-1" },
+		{ mode: "terminal", scope: "owned", idempotencyKey: "key-2" },
 	]);
+	// Same-key same-input retry replays at the dispatch layer without invoking
+	// the surface again (the durable record covers the evicted/restart window).
+	const replay = await terminal({ mode: "terminal" }, "key-1");
+	expect(replay).toEqual({ id: "t", ok: true, result: "terminal" });
+	expect(calls).toHaveLength(2);
 });
 
 test("turn.abort terminal mode rejects missing/oversized key, invalid mode/scope, and unknown fields", async () => {

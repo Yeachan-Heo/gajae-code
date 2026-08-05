@@ -259,6 +259,7 @@ describe("reconciliation-store", () => {
 		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
 		const scope: DurableTerminalScopeRecord = {
 			selection: "turn",
+			idempotencyKeyHash: "k-hash-1",
 			turnDisposition: "stopped",
 			ownedWorkDisposition: "left_running",
 			automaticDeliveryDisposition: "enabled",

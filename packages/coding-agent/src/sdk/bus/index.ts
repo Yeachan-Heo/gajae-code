@@ -63,7 +63,7 @@ import {
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
-import { findOwnedRegistrationsForTurn } from "../../session/terminal-abort";
+import { findOwnedRegistrationsForTurn, settleOwnedWork } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -2309,7 +2309,8 @@ function sdkControlSurface(
 	}),
 	abortTerminalPrompt: (
 		connectionId: string | undefined,
-		_scope: AbortScope,
+		scope: AbortScope,
+		idempotencyKey?: string,
 	) => Promise<
 		| { ok: true; outcome: "stopped" | "stopped_owned" | "no_active_turn" | "already_terminal" | "no_store" }
 		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" }
@@ -2574,7 +2575,7 @@ function sdkControlSurface(
 			}
 			return await abortOwnedPrompt(requesterConnectionId);
 		},
-		abortTerminal: async input => {
+		abortTerminal: async (input, idempotencyKey) => {
 			// Terminal abort (C04 mode:"terminal", approved plan): stop the root
 			// worker's current turn and block only its own continuation routes.
 			// Left-running owned work (background Bash/task jobs, detached
@@ -2583,7 +2584,7 @@ function sdkControlSurface(
 			// delivery is intentionally NOT suppressed.
 			const requesterConnectionId = controlRequesterContext.getStore();
 			const scope: AbortScope = input.scope === "owned" ? "owned" : "turn";
-			const outcome = await abortTerminalPrompt(requesterConnectionId, scope);
+			const outcome = await abortTerminalPrompt(requesterConnectionId, scope, idempotencyKey);
 			if (!outcome.ok) {
 				return {
 					ok: true,
@@ -3951,6 +3952,8 @@ export function createNotificationsExtension(
 		const PROMPT_TERMINAL_TOMBSTONE_TTL_MS = 15 * 60_000;
 		// SDK-owned terminalization grace; injectable in tests, never a user setting.
 		const PROMPT_TERMINALIZATION_GRACE_MS = 10_000;
+		// Fixed grace for exact owned-job stop before the second quiescence proof.
+		const OWNED_SETTLEMENT_GRACE_MS = 500;
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
 		type PromptLifecycleFrame =
@@ -4496,7 +4499,7 @@ export function createNotificationsExtension(
 					);
 				return { aborted: true, disposition: "cancelled" as const };
 			},
-			async (connectionId, scope) => {
+			async (connectionId, scope, idempotencyKey) => {
 				// Terminal abort stops the root turn through the same durable
 				// terminalization as ordinary client cancel, then verifies the
 				// terminal actually landed before claiming "stopped". The fence
@@ -4509,6 +4512,25 @@ export function createNotificationsExtension(
 					// No file-backed reconciliation owner: terminal admission is
 					// gated off (plan AC 5) before any fence, stop, or cleanup.
 					return { ok: true as const, outcome: "no_store" as const };
+				}
+				// Same-key replay: a durable terminal-scope record already exists
+				// for this bounded idempotency key + selection -> return the stored
+				// dispositions exactly, never re-run cleanup, never a second event.
+				const keyHash = idempotencyKey
+					? crypto.createHash("sha256").update(idempotencyKey).digest("hex")
+					: undefined;
+				if (keyHash) {
+					const existing = durableStore
+						.snapshotTerminalScopes()
+						.find(s => s.idempotencyKeyHash === keyHash && s.selection === scope);
+					if (existing?.turnDisposition === "stopped") {
+						return {
+							ok: true as const,
+							outcome: (existing.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
+								| "stopped"
+								| "stopped_owned",
+						};
+					}
 				}
 				const active = [...promptSubmissions.entries()].find(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
@@ -4546,19 +4568,8 @@ export function createNotificationsExtension(
 						if (!manager) {
 							return { ok: false as const, reason: "owned_unsettled" as const };
 						}
-						ownedStopped = exactJobs.every(reg => {
-							manager.cancel(reg.jobId);
-							const job = manager.getJob(reg.jobId);
-							// Quiescent = terminal (cancelled/completed/failed); running or
-							// paused work proves the capture could not be stopped exactly.
-							return job !== undefined && job.status !== "running" && job.status !== "paused";
-						});
+						ownedStopped = (await settleOwnedWork(manager, exactJobs, OWNED_SETTLEMENT_GRACE_MS)) === "stopped";
 						if (!ownedStopped) return { ok: false as const, reason: "owned_unsettled" as const };
-						// Purge queued deliveries of the exact captured jobs through the
-						// existing exact-key acknowledgement path so no delivery from
-						// stopped work can resume the agent; foreign deliveries are
-						// untouched.
-						manager.acknowledgeDeliveries(exactJobs.map(reg => reg.jobId));
 					}
 				}
 				// Persist the bounded durable terminal-scope record through the
@@ -4591,6 +4602,7 @@ export function createNotificationsExtension(
 								...retained,
 								{
 									selection: scope,
+									...(keyHash ? { idempotencyKeyHash: keyHash } : {}),
 									turnDisposition: "stopped",
 									ownedWorkDisposition,
 									automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",

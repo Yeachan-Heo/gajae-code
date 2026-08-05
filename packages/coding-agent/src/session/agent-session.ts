@@ -475,13 +475,30 @@ function appendCompactionStateContext(summary: string, stateContext: string[]): 
 	return `${summary}\n\n<compaction-state>\n${stateContext.join("\n")}\n</compaction-state>`;
 }
 /**
- * Detect the private owned-completion origin envelope on an async-result
- * delivery message. The envelope is carried in the message details by the SDK
- * session callback and is never part of the public message surface.
+ * Whether an async-result delivery carries an owned-completion origin that the
+ * owning terminal scope's gate authorizes as a fresh-turn resume. The envelope
+ * is carried in the message details by the SDK session callback and is never
+ * part of the public message surface. The gate validates the EXACT registered
+ * five-tuple and the owned-completion policy: scope:"turn" keeps it enabled
+ * (left-running delivery intentionally resumes as a fresh turn), while
+ * scope:"owned" disables it so stopped work can never call followUp/prompt
+ * even if a delivery races the settlement purge. A forged or unregistered
+ * origin fails closed.
  */
-function hasOwnedCompletionEnvelope(message: AgentMessage): boolean {
+function isOwnedCompletionResumeAllowed(message: AgentMessage): boolean {
 	const details = (message as { details?: { ownedCompletions?: OwnedCompletionEnvelope[] } }).details;
-	return (details?.ownedCompletions?.length ?? 0) > 0;
+	const envelope = details?.ownedCompletions?.[0];
+	if (!envelope) return false;
+	const scope = lookupTerminalScope(envelope.lineageIdHash, envelope.promptAttemptEpoch);
+	if (!scope) return false;
+	return (
+		scope.gate.authorizeOwnedCompletion({
+			kind: "owned-completion",
+			lineageIdHash: envelope.lineageIdHash,
+			attemptEpoch: envelope.promptAttemptEpoch,
+			registration: envelope.registration,
+		}) === "allow-new-turn"
+	);
 }
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
@@ -2833,7 +2850,7 @@ export class AgentSession {
 				// aborted turn. Owned-completion deliveries from work deliberately
 				// left running are intentionally allowed to resume the agent through
 				// the normal followUp/prompt path and receive a fresh turn attempt.
-				if (hasOwnedCompletionEnvelope(message)) this.#resumeFromOwnedCompletion();
+				if (isOwnedCompletionResumeAllowed(message)) this.#resumeFromOwnedCompletion();
 				this.agent.followUp(message);
 			},
 			injectIdle: async messages => {
@@ -2845,7 +2862,7 @@ export class AgentSession {
 				if (!first) return;
 				await this.#awaitStartupTurnBarrier();
 				if (this.#isDisposed) return;
-				if (messages.some(hasOwnedCompletionEnvelope)) this.#resumeFromOwnedCompletion();
+				if (messages.some(isOwnedCompletionResumeAllowed)) this.#resumeFromOwnedCompletion();
 				if (messages.length === 1) {
 					await this.agent.prompt(first, this.#managedFallbackPromptOptions());
 				} else {
@@ -10321,6 +10338,14 @@ export class AgentSession {
 					lineageIdHash: scope.lineageIdHash,
 				};
 			}
+			// Advance the attempt epoch so the aborted turn's (lineage, epoch) can
+			// never be reused by a later turn: the terminal scope stays keyed to the
+			// aborted epoch, and any subsequent prompt admission mints a distinct
+			// lineage (AC 27/28 — the fence bounds ONLY the aborted turn). This
+			// mirrors the epoch advance the ordinary abort path performs.
+			this.#promptGeneration++;
+			this.#promptPreflightAbortController.abort();
+			this.#promptPreflightAbortController = new AbortController();
 		}
 		const aborted = this.#runCancellationDomains.abort(handle);
 		if (!aborted.ok) {

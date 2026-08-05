@@ -24,7 +24,8 @@ export interface ControlSurface {
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
 	/** Terminal abort: stop the current root turn (and optionally exact owned work). */
-	abortTerminal?(input: TerminalAbortInput): Promise<ControlValue> | ControlValue;
+	/** Terminal abort: stop the current root turn (and optionally exact owned work). */
+	abortTerminal?(input: TerminalAbortInput, idempotencyKey?: string): Promise<ControlValue> | ControlValue;
 	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
 	answerAsk(id: string, answer: ControlValue): Promise<ControlValue> | ControlValue;
 	answerGate(

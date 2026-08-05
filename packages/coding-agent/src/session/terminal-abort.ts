@@ -50,6 +50,8 @@ export type TurnDeliveryKey = TurnRegistrationKey & {
 export interface OwnedCompletionEnvelope {
 	lineageIdHash: string;
 	promptAttemptEpoch: number;
+	/** Exact registered five-tuple so the final gate can validate source authority. */
+	registration: TurnRegistrationKey;
 }
 
 export type TurnContinuationFenceState = "open" | "closing" | "closed" | "retained" | "released";
@@ -229,6 +231,42 @@ export function classifyOwnedCompletion(
 		terminalScopeId: scope.scopeId,
 	};
 }
+/** Structural subset of AsyncJobManager used by owned-stop settlement (avoids an import cycle). */
+export interface OwnedStopManager {
+	cancel(jobId: string): boolean;
+	getJob(jobId: string): { generation?: string; status?: string } | undefined;
+	acknowledgeDeliveries(jobIds: string[]): number;
+}
+
+/**
+ * Settle exact owned work for `scope:"owned"`: generation-verified cancel, a
+ * fixed grace, a second quiescence proof, then a delivery purge. Returns
+ * "stopped" only when every captured job is terminal after the grace; a reused
+ * job id with a new generation, a missing/evicted record, or still-running/
+ * paused work fails closed to "unsettled" (AC 16/36 — foreign work is never
+ * swept and unprovable quiescence never claims stopped).
+ */
+export async function settleOwnedWork(
+	manager: OwnedStopManager,
+	exactJobs: TurnRegistrationKey[],
+	graceMs: number,
+): Promise<"stopped" | "unsettled"> {
+	const generationExact = exactJobs.every(reg => {
+		const live = manager.getJob(reg.jobId);
+		if (live !== undefined && live.generation !== reg.jobGeneration) return false;
+		manager.cancel(reg.jobId);
+		return true;
+	});
+	if (!generationExact) return "unsettled";
+	await Bun.sleep(graceMs);
+	const quiescent = exactJobs.every(reg => {
+		const job = manager.getJob(reg.jobId);
+		return job !== undefined && job.status !== "running" && job.status !== "paused";
+	});
+	if (!quiescent) return "unsettled";
+	manager.acknowledgeDeliveries(exactJobs.map(reg => reg.jobId));
+	return "stopped";
+}
 export interface LineageBinding {
 	lineageIdHash: string;
 	promptAttemptEpoch: number;
@@ -370,6 +408,7 @@ export function createTurnContinuationSeam(options: {
 			// Owned completion is intentionally NOT suppressed by a closed turn
 			// record. Validate exact source metadata and fail closed otherwise.
 			if (origin.kind !== "owned-completion") return "deny";
+			if (!origin.registration || typeof origin.registration !== "object") return "deny";
 			if (origin.lineageIdHash !== fence.lineageIdHash) return "deny";
 			if (origin.attemptEpoch !== fence.abortedAttemptEpoch) return "deny";
 			const { endpointGeneration, promptAttemptEpoch, jobId, jobGeneration } = origin.registration;
@@ -381,6 +420,18 @@ export function createTurnContinuationSeam(options: {
 				!jobId ||
 				typeof jobGeneration !== "string" ||
 				!jobGeneration
+			)
+				return "deny";
+			// The tuple must be an EXACT registered five-tuple: an unregistered,
+			// forged, or mutated registration fails closed even when the outer
+			// lineage/epoch match the aborted turn (AC 25 — missing/copied/
+			// mismatched origin never authorizes an automatic call).
+			const registered = lookupOwnedRegistration(jobId, jobGeneration);
+			if (!registered) return "deny";
+			if (
+				registered.lineageIdHash !== origin.lineageIdHash ||
+				registered.promptAttemptEpoch !== promptAttemptEpoch ||
+				registered.endpointGeneration !== endpointGeneration
 			)
 				return "deny";
 			return "allow-new-turn";

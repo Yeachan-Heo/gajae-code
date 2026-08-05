@@ -1645,6 +1645,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											ownedCompletion: {
 												lineageIdHash: ownedCompletion.lineageIdHash,
 												promptAttemptEpoch: ownedCompletion.promptAttemptEpoch,
+												registration: ownedCompletion.registration,
 											},
 										}
 									: {}),

@@ -175,4 +175,29 @@ describe("terminal abort registers a turn scope so left-running owned work class
 
 		await promptPromise;
 	}, 20_000);
+
+	it("terminal abort advances the epoch so a later turn's work never binds the aborted scope", async () => {
+		// Turn A spawns a job; terminal abort fences turn A's lineage+epoch.
+		scriptedResponses = [bashCall("echo first", "call-a"), stopReply("ok")];
+		const firstPrompt = session.prompt("first turn").catch(() => {});
+		await waitFor(() => manager.getAllJobs().length > 0, "first job registered");
+		const firstJob = manager.getAllJobs()[0]!;
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? firstJob.id, {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		await firstPrompt;
+		expect(classifyOwnedCompletion(firstJob.id, firstJob.generation)).toBeDefined();
+
+		// Turn B (fresh user prompt) spawns a job in a NEW turn: the epoch
+		// advanced, so its lineage is distinct and the aborted scope must NOT
+		// claim it (AC 27/28 — the fence bounds only the aborted turn).
+		const jobCountBefore = manager.getAllJobs().length;
+		scriptedResponses = [bashCall("echo second", "call-b"), stopReply("ok")];
+		const secondPrompt = session.prompt("second turn").catch(() => {});
+		await waitFor(() => manager.getAllJobs().length > jobCountBefore, "second job registered");
+		const secondJob = manager.getAllJobs().find(job => job.id !== firstJob.id)!;
+		expect(classifyOwnedCompletion(secondJob.id, secondJob.generation)).toBeUndefined();
+		await secondPrompt;
+	}, 20_000);
 });

@@ -15,6 +15,7 @@ import {
 	registerTerminalScope,
 	registerTerminalTurnScope,
 	resolveToolLineage,
+	settleOwnedWork,
 	type TurnRegistrationKey,
 	unbindToolLineage,
 	unregisterOwnedRegistration,
@@ -76,6 +77,7 @@ test("post-close same-turn continuations are denied; pre-close predecessors allo
 });
 
 test("owned completions stay allowed after close (corrected semantics)", () => {
+	registerOwnedRegistration(registration);
 	const { gate } = createTurnContinuationSeam({
 		lineageIdHash: "lineage-a",
 		abortedAttemptEpoch: 7,
@@ -91,9 +93,11 @@ test("owned completions stay allowed after close (corrected semantics)", () => {
 		terminalScopeId: "scope-2",
 	});
 	expect(open.gate.authorizeOwnedCompletion(owned())).toBe("allow-new-turn");
+	unregisterOwnedRegistration(registration);
 });
 
 test("owned completion fails closed on mismatched or missing metadata", () => {
+	registerOwnedRegistration(registration);
 	const { gate } = createTurnContinuationSeam({
 		lineageIdHash: "lineage-a",
 		abortedAttemptEpoch: 7,
@@ -108,6 +112,28 @@ test("owned completion fails closed on mismatched or missing metadata", () => {
 	// A non-owned origin is never admitted as a new turn.
 	expect(gate.authorizeOwnedCompletion({ kind: "ordinary", source: "monitor" })).toBe("deny");
 	expect(gate.authorizeOwnedCompletion(continuation("x"))).toBe("deny");
+	unregisterOwnedRegistration(registration);
+});
+
+test("owned completion gate denies forged or unregistered registration tuples", () => {
+	const { gate } = createTurnContinuationSeam({
+		lineageIdHash: "lineage-a",
+		abortedAttemptEpoch: 7,
+		terminalScopeId: "scope-1",
+	});
+	gate.close("terminal-turn");
+	// The tuple is NOT registered: even with a matching lineage/epoch the gate
+	// must fail closed (AC 25 — missing/copied/mismatched origin never
+	// authorizes an automatic call).
+	expect(gate.authorizeOwnedCompletion(owned())).toBe("deny");
+	// A registered tuple with a FORGED job generation is denied.
+	registerOwnedRegistration(registration);
+	expect(gate.authorizeOwnedCompletion(owned({}, { jobGeneration: "forged-gen" }))).toBe("deny");
+	// A registered tuple with a FORGED endpoint generation is denied.
+	expect(gate.authorizeOwnedCompletion(owned({}, { endpointGeneration: 99 }))).toBe("deny");
+	// The exact registered tuple is allowed.
+	expect(gate.authorizeOwnedCompletion(owned())).toBe("allow-new-turn");
+	unregisterOwnedRegistration(registration);
 });
 
 test("disabled owned completion policy blocks new turns", () => {
@@ -398,4 +424,81 @@ test("findOwnedRegistrationsForTurn returns only exact lineage+epoch registratio
 		lineageIdHash: "lineage-a",
 		promptAttemptEpoch: 8,
 	});
+});
+
+test("settleOwnedWork stops exact jobs, purges deliveries, and returns stopped", async () => {
+	const cancelled: string[] = [];
+	const purged: string[][] = [];
+	const jobs = new Map([
+		["job-1", { generation: "gen-1", status: "running" }],
+		["job-2", { generation: "gen-1", status: "running" }],
+	]);
+	const manager = {
+		cancel: (jobId: string) => {
+			cancelled.push(jobId);
+			const job = jobs.get(jobId);
+			if (job && job.status !== "paused") job.status = "cancelled";
+			return true;
+		},
+		getJob: (jobId: string) => jobs.get(jobId),
+		acknowledgeDeliveries: (jobIds: string[]) => {
+			purged.push(jobIds);
+			return jobIds.length;
+		},
+	};
+	const outcome = await settleOwnedWork(
+		manager,
+		[
+			{ ...registration, jobId: "job-1", jobGeneration: "gen-1" },
+			{ ...registration, jobId: "job-2", jobGeneration: "gen-1" },
+		],
+		5,
+	);
+	expect(outcome).toBe("stopped");
+	expect(cancelled.sort()).toEqual(["job-1", "job-2"]);
+	expect(purged).toEqual([["job-1", "job-2"]]);
+});
+
+test("settleOwnedWork fails closed on a reused id with a new generation (no foreign sweep)", async () => {
+	const cancelled: string[] = [];
+	const purged: string[][] = [];
+	const manager = {
+		cancel: (jobId: string) => {
+			cancelled.push(jobId);
+			return true;
+		},
+		getJob: (jobId: string) => (jobId === "job-1" ? { generation: "gen-2", status: "running" } : undefined),
+		acknowledgeDeliveries: (jobIds: string[]) => {
+			purged.push(jobIds);
+			return jobIds.length;
+		},
+	};
+	const outcome = await settleOwnedWork(manager, [{ ...registration, jobId: "job-1", jobGeneration: "gen-1" }], 5);
+	expect(outcome).toBe("unsettled");
+	// The foreign (reused) job must NOT be cancelled or purged.
+	expect(cancelled).toEqual([]);
+	expect(purged).toEqual([]);
+});
+
+test("settleOwnedWork fails closed when a captured job is still running or missing after grace", async () => {
+	const running = {
+		cancel: () => true,
+		getJob: () => ({ generation: "gen-1", status: "running" }),
+		acknowledgeDeliveries: () => 0,
+	};
+	expect(await settleOwnedWork(running, [registration], 2)).toBe("unsettled");
+
+	const missing = {
+		cancel: () => true,
+		getJob: () => undefined,
+		acknowledgeDeliveries: () => 0,
+	};
+	expect(await settleOwnedWork(missing, [registration], 2)).toBe("unsettled");
+
+	const paused = {
+		cancel: (_jobId: string) => true,
+		getJob: () => ({ generation: "gen-1", status: "paused" }),
+		acknowledgeDeliveries: () => 0,
+	};
+	expect(await settleOwnedWork(paused, [registration], 2)).toBe("unsettled");
 });

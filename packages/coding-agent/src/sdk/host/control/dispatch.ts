@@ -162,7 +162,7 @@ function invokeAbort(surface: ControlSurface, input: ControlInput, idempotencyKe
 	if (new TextEncoder().encode(idempotencyKey).length > 128)
 		invalidInput("terminal abort idempotency key must be at most 128 UTF-8 bytes.");
 	if (!surface.abortTerminal) invalidInput("terminal abort is not supported by this surface.");
-	return surface.abortTerminal({ mode: "terminal", scope });
+	return surface.abortTerminal({ mode: "terminal", scope }, idempotencyKey);
 }
 function invoke(
 	surface: ControlSurface,
