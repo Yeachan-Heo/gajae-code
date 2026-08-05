@@ -90,7 +90,7 @@ export function formatBunRuntimeError(opts: {
  * On macOS, strip /private prefix only when both paths resolve to the same location.
  * This preserves aliases like /private/tmp -> /tmp without rewriting unrelated paths.
  */
-function standardizeMacOSPath(p: string): string {
+export function standardizeMacOSPath(p: string): string {
 	if (process.platform !== "darwin" || !p.startsWith("/private/")) return p;
 	const stripped = p.slice("/private".length);
 	try {
