@@ -815,6 +815,39 @@ describe("fetchLatestPackageVersion", () => {
 		]);
 	});
 
+	it("resolves a non-latest dist-tag and falls back to packument dist-tags.next", async () => {
+		const seen: string[] = [];
+		const result = await fetchLatestPackageVersion(PACKAGE, {
+			...environment({ env: { npm_config_registry: "https://nexus.example.com/npm" } }),
+			channel: "next",
+			fetchImpl: async url => {
+				seen.push(url);
+				return url.endsWith("/next")
+					? respond(null, { ok: false, status: 404, statusText: "Not Found" })
+					: respond({ "dist-tags": { latest: "1.2.3", next: "1.3.0-rc.1" } });
+			},
+		});
+
+		expect(result.version).toBe("1.3.0-rc.1");
+		expect(seen).toEqual([
+			"https://nexus.example.com/npm/@gajae-code/coding-agent/next",
+			"https://nexus.example.com/npm/@gajae-code/coding-agent",
+		]);
+	});
+
+	it("names a missing dist-tag instead of falling back to latest", async () => {
+		const failing = fetchLatestPackageVersion(PACKAGE, {
+			...environment({ env: { npm_config_registry: "https://nexus.example.com/npm" } }),
+			channel: "next",
+			fetchImpl: async url =>
+				url.endsWith("/next")
+					? respond(null, { ok: false, status: 404, statusText: "Not Found" })
+					: respond({ "dist-tags": { latest: "1.2.3" } }),
+		});
+
+		await expect(failing).rejects.toThrow('has no dist-tag "next"');
+	});
+
 	it("reports the original failure when the packument fallback also fails", async () => {
 		const failing = lookup({ env: { npm_config_registry: "https://nexus.example.com" } }, async () =>
 			respond(null, { ok: false, status: 404, statusText: "Not Found" }),
@@ -883,7 +916,7 @@ describe("fetchLatestPackageVersion", () => {
 	it("rejects a response without any version field", async () => {
 		const failing = lookup({}, async () => respond({ name: PACKAGE }));
 
-		await expect(failing).rejects.toThrow("returned no version");
+		await expect(failing).rejects.toThrow('has no dist-tag "latest"');
 	});
 });
 

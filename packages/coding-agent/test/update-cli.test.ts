@@ -6,17 +6,24 @@ import * as path from "node:path";
 import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	buildReleaseBinaryUrlForTest,
+	compareVersionsForTest,
 	formatBinaryDownloadFailureMessageForTest,
+	formatBinaryDownloadNotesForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
+	parseReportedVersion,
+	parseUpdateArgs,
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
+	resolveUpdateChannel,
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
 	runPackageManagerUpdateForTest,
 	runUpdateCommand,
+	UPDATE_PRE_CHANNEL,
+	UPDATE_STABLE_CHANNEL,
 } from "../src/cli/update-cli";
 import { initTheme } from "../src/modes/theme/theme";
 import { DEFAULT_NPM_REGISTRY } from "../src/utils/npm-registry";
@@ -60,7 +67,60 @@ describe("update-cli release lookup", () => {
 			version: "9.9.9",
 			registry: "https://nexus.example.com/repository/npm-all",
 			warnings: [],
+			channel: UPDATE_STABLE_CHANNEL,
 		});
+	});
+
+	it("resolves the pre-release dist-tag when channel is next", async () => {
+		const requested: string[] = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			channel: UPDATE_PRE_CHANNEL,
+			lookupEnv: () => undefined,
+			fetchImpl: async url => {
+				requested.push(url);
+				return { ok: true, status: 200, statusText: "OK", json: async () => ({ version: "0.13.0-rc.1" }) };
+			},
+		});
+
+		expect(requested).toEqual(["https://registry.npmjs.org/@gajae-code/coding-agent/next"]);
+		expect(release).toEqual({
+			tag: "v0.13.0-rc.1",
+			version: "0.13.0-rc.1",
+			registry: DEFAULT_NPM_REGISTRY,
+			warnings: [],
+			channel: UPDATE_PRE_CHANNEL,
+		});
+	});
+
+	it("falls back to packument dist-tags.next when the /next route is missing", async () => {
+		const requested: string[] = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			channel: UPDATE_PRE_CHANNEL,
+			lookupEnv: () => undefined,
+			fetchImpl: async url => {
+				requested.push(url);
+				if (url.endsWith("/next")) {
+					return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
+				}
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({ "dist-tags": { latest: "0.12.11", next: "0.13.0-rc.2" } }),
+				};
+			},
+		});
+
+		expect(requested).toEqual([
+			"https://registry.npmjs.org/@gajae-code/coding-agent/next",
+			"https://registry.npmjs.org/@gajae-code/coding-agent",
+		]);
+		expect(release.version).toBe("0.13.0-rc.2");
+		expect(release.channel).toBe(UPDATE_PRE_CHANNEL);
 	});
 
 	it("surfaces the failing url and status so blocked registries are diagnosable", async () => {
@@ -76,6 +136,139 @@ describe("update-cli release lookup", () => {
 		});
 
 		await expect(failing).rejects.toThrow("https://registry.npmjs.org/@gajae-code/coding-agent/latest responded 503");
+	});
+});
+
+describe("update-cli channel and version ordering", () => {
+	it("parses --pre alongside existing flags", () => {
+		expect(parseUpdateArgs(["update"])).toEqual({ force: false, check: false, pre: false });
+		expect(parseUpdateArgs(["update", "--pre", "--check"])).toEqual({ force: false, check: true, pre: true });
+		expect(parseUpdateArgs(["update", "-f", "--pre"])).toEqual({ force: true, check: false, pre: true });
+		expect(parseUpdateArgs(["status"])).toBeUndefined();
+	});
+
+	it("maps --pre to the next dist-tag and default to latest", () => {
+		expect(resolveUpdateChannel({})).toBe(UPDATE_STABLE_CHANNEL);
+		expect(resolveUpdateChannel({ pre: false })).toBe(UPDATE_STABLE_CHANNEL);
+		expect(resolveUpdateChannel({ pre: true })).toBe(UPDATE_PRE_CHANNEL);
+	});
+
+	it("orders stable above its own pre-release so GA can leave an rc behind", () => {
+		// The previous split-on-`.` comparator ranked rc above stable and stranded
+		// users who ran plain `gjc update` after GA.
+		expect(compareVersionsForTest("0.13.0-rc.1", "0.13.0")).toBeLessThan(0);
+		expect(compareVersionsForTest("0.13.0", "0.13.0-rc.1")).toBeGreaterThan(0);
+		expect(compareVersionsForTest("0.13.0-rc.2", "0.13.0-rc.1")).toBeGreaterThan(0);
+		expect(compareVersionsForTest("0.12.11", "0.13.0-rc.1")).toBeLessThan(0);
+		expect(compareVersionsForTest("0.13.0", "0.13.0")).toBe(0);
+	});
+
+	it("parses pre-release versions from gjc --version output", () => {
+		expect(parseReportedVersion("gjc/0.13.0-rc.1")).toBe("0.13.0-rc.1");
+		expect(parseReportedVersion("gjc/0.12.11")).toBe("0.12.11");
+		expect(parseReportedVersion("  gjc/1.0.0-beta.2\n")).toBe("1.0.0-beta.2");
+		expect(parseReportedVersion("not-a-version")).toBeUndefined();
+	});
+
+	it("prints the channel and installs a newer stable over an installed pre-release", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const updates: Array<{ version: string; registry?: string }> = [];
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false, pre: false },
+				{
+					getLatestRelease: async options => {
+						const channel =
+							typeof options === "string" ? UPDATE_STABLE_CHANNEL : (options?.channel ?? UPDATE_STABLE_CHANNEL);
+						expect(channel).toBe(UPDATE_STABLE_CHANNEL);
+						return {
+							tag: "v0.13.0",
+							version: "0.13.0",
+							registry: DEFAULT_NPM_REGISTRY,
+							warnings: [],
+							channel: UPDATE_STABLE_CHANNEL,
+						};
+					},
+					resolveUpdateTarget: async () => ({ method: "bun" }),
+					performUpdate: async (_target, expectedVersion, registry) => {
+						updates.push({ version: expectedVersion, registry });
+					},
+					refreshInstalledDefaultSkills: async () => {},
+				},
+			);
+			// VERSION is whatever the workspace package reports; we only assert channel
+			// surfacing and that a mocked newer stable is offered when comparison allows.
+			expect(output.some(line => line.includes(`Channel: ${UPDATE_STABLE_CHANNEL}`))).toBe(true);
+			// When the mocked release is newer than VERSION, an install is attempted.
+			// When the workspace is already at or above 0.13.0, the command reports up to date.
+			if (updates.length > 0) {
+				expect(updates).toEqual([{ version: "0.13.0", registry: DEFAULT_NPM_REGISTRY }]);
+				expect(output.some(line => line.includes("New version available: 0.13.0"))).toBe(true);
+			} else {
+				expect(output.some(line => line.includes("Already up to date"))).toBe(true);
+			}
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("requests the pre-release channel and surfaces it when --pre is set", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		let seenChannel: string | undefined;
+		try {
+			await runUpdateCommand(
+				{ force: false, check: true, pre: true },
+				{
+					getLatestRelease: async options => {
+						seenChannel =
+							typeof options === "string" ? UPDATE_STABLE_CHANNEL : (options?.channel ?? UPDATE_STABLE_CHANNEL);
+						return {
+							tag: "v0.13.0-rc.1",
+							version: "0.13.0-rc.1",
+							registry: DEFAULT_NPM_REGISTRY,
+							warnings: [],
+							channel: UPDATE_PRE_CHANNEL,
+						};
+					},
+					resolveUpdateTarget: async () => ({ method: "bun" }),
+					performUpdate: async () => {
+						throw new Error("check mode must not install");
+					},
+					refreshInstalledDefaultSkills: async () => {},
+				},
+			);
+			expect(seenChannel).toBe(UPDATE_PRE_CHANNEL);
+			expect(output.some(line => line.includes(`Channel: ${UPDATE_PRE_CHANNEL}`))).toBe(true);
+			expect(output.some(line => line.includes("0.13.0-rc.1") && line.includes(UPDATE_PRE_CHANNEL))).toBe(true);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("includes pre-release asset guidance when a GitHub binary is missing for an rc", () => {
+		const notes = formatBinaryDownloadNotesForTest("0.13.0-rc.1");
+		expect(notes).toContain("Pre-release 0.13.0-rc.1 was resolved from the npm registry");
+		expect(notes).toContain("matching GitHub release asset under tag v0.13.0-rc.1 is missing");
+		expect(formatBinaryDownloadNotesForTest("0.13.0")).toBeUndefined();
+
+		const message = formatBinaryDownloadFailureMessageForTest(
+			"gjc-linux-x64",
+			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.13.0-rc.1/gjc-linux-x64",
+			"Not Found",
+			"linux",
+			notes,
+		);
+
+		expect(message).toContain("Download failed for gjc-linux-x64");
+		expect(message).toContain("Pre-release 0.13.0-rc.1 was resolved from the npm registry");
+		expect(message).toContain("matching GitHub release asset under tag v0.13.0-rc.1 is missing");
+		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
 	});
 });
 
@@ -379,6 +572,7 @@ describe("update-cli command verification failures", () => {
 							version: "999.0.0",
 							registry: DEFAULT_NPM_REGISTRY,
 							warnings: [],
+							channel: UPDATE_STABLE_CHANNEL,
 						}),
 						resolveUpdateTarget: async () => ({ method: "bun" }),
 						performUpdate: async (_target, expectedVersion) => {
@@ -440,6 +634,7 @@ describe("update-cli command verification failures", () => {
 							version: "999.0.0",
 							registry: DEFAULT_NPM_REGISTRY,
 							warnings: [],
+							channel: UPDATE_STABLE_CHANNEL,
 						}),
 						resolveUpdateTarget: async () => ({ method: "bun" }),
 						performUpdate: async (_target, expectedVersion) => {

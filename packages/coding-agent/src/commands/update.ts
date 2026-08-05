@@ -11,11 +11,15 @@ export default class Update extends Command {
 	static flags = {
 		force: Flags.boolean({ char: "f", description: "Force update", default: false }),
 		check: Flags.boolean({ char: "c", description: "Check for updates without installing", default: false }),
+		pre: Flags.boolean({
+			description: 'Opt into the pre-release channel (npm dist-tag "next")',
+			default: false,
+		}),
 	};
 
 	async run(): Promise<void> {
 		const { flags } = await this.parse(Update);
 		await initTheme();
-		await runUpdateCommand({ force: flags.force, check: flags.check });
+		await runUpdateCommand({ force: flags.force, check: flags.check, pre: flags.pre });
 	}
 }

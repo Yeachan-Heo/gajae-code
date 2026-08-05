@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `gjc update --pre` opts into the pre-release channel (npm dist-tag `next`) while plain `gjc update` / `--check` stay on stable `latest`. Version comparison uses semver pre-release ordering so a user on `X.Y.Z-rc.N` who runs plain `gjc update` after `X.Y.Z` GA installs the stable build instead of being told "Already up to date", and binary installs surface an actionable message when a pre-release exists on npm without matching GitHub release assets (#3850).
+
 ### Fixed
 - ACP session configuration now emits the spec-defined `category` field on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), so standards-compliant ACP clients such as Paseo discover models, modes, and thinking levels instead of an empty model picker (#3922).
 - The ACP session model catalog is now filtered to active providers via `providers.list/active`, falling back to the full catalog on older session hosts, so ACP clients no longer list models for providers without usable credentials (#3922).

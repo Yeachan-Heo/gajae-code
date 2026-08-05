@@ -24,6 +24,20 @@ const PACKAGE = "@gajae-code/coding-agent";
 const NPM_WRAPPER_PACKAGE = "gajae-code";
 const NPM_MANAGED_PACKAGES = [NPM_WRAPPER_PACKAGE, PACKAGE] as const;
 
+/** Stable channel (default). Resolves the npm `latest` dist-tag. */
+export const UPDATE_STABLE_CHANNEL = "latest";
+/** Opt-in pre-release channel for `gjc update --pre`. Resolves npm dist-tag `next`. */
+export const UPDATE_PRE_CHANNEL = "next";
+
+export type UpdateChannel = typeof UPDATE_STABLE_CHANNEL | typeof UPDATE_PRE_CHANNEL;
+
+export interface UpdateCommandOptions {
+	force: boolean;
+	check: boolean;
+	/** When true, resolve the pre-release (`next`) dist-tag instead of `latest`. */
+	pre?: boolean;
+}
+
 interface ReleaseInfo {
 	tag: string;
 	version: string;
@@ -31,6 +45,8 @@ interface ReleaseInfo {
 	registry: string;
 	/** Config problems that did not stop the lookup but changed its outcome. */
 	warnings: string[];
+	/** npm dist-tag that answered the lookup (`latest` or `next`). */
+	channel: string;
 }
 
 /** Result from running the installed binary and parsing its reported version. */
@@ -71,7 +87,7 @@ export interface BinaryReplacementOptions {
  * Parse update subcommand arguments.
  * Returns undefined if not an update command.
  */
-export function parseUpdateArgs(args: string[]): { force: boolean; check: boolean } | undefined {
+export function parseUpdateArgs(args: string[]): UpdateCommandOptions | undefined {
 	if (args.length === 0 || args[0] !== "update") {
 		return undefined;
 	}
@@ -79,7 +95,13 @@ export function parseUpdateArgs(args: string[]): { force: boolean; check: boolea
 	return {
 		force: args.includes("--force") || args.includes("-f"),
 		check: args.includes("--check") || args.includes("-c"),
+		pre: args.includes("--pre"),
 	};
+}
+
+/** Resolve the npm dist-tag channel for an update invocation. */
+export function resolveUpdateChannel(opts: Pick<UpdateCommandOptions, "pre">): UpdateChannel {
+	return opts.pre ? UPDATE_PRE_CHANNEL : UPDATE_STABLE_CHANNEL;
 }
 
 async function getBunGlobalBinDir(): Promise<string | undefined> {
@@ -219,13 +241,18 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
  * The registry comes from npm config (`npm_config_registry`, `.npmrc`,
  * `BUN_CONFIG_REGISTRY`) so the check reaches the same place the install does.
  * Hardcoding the public registry broke every mirrored or firewalled network.
+ *
+ * Pass `channel: "next"` (via `gjc update --pre`) to opt into the pre-release
+ * dist-tag. The default channel is `latest` and never resolves pre-releases.
  */
 async function getLatestRelease(options?: Installer | NpmRegistryLookupOptions): Promise<ReleaseInfo> {
 	const overrides: NpmRegistryLookupOptions = typeof options === "string" ? { installer: options } : (options ?? {});
+	const channel = overrides.channel ?? UPDATE_STABLE_CHANNEL;
 	// The user is deliberately waiting on this command, unlike the startup check.
 	const { version, registry, warnings } = await fetchLatestPackageVersion(PACKAGE, {
 		timeoutMs: 20_000,
 		...overrides,
+		channel,
 	});
 
 	return {
@@ -233,6 +260,7 @@ async function getLatestRelease(options?: Installer | NpmRegistryLookupOptions):
 		version,
 		registry,
 		warnings,
+		channel,
 	};
 }
 
@@ -241,21 +269,21 @@ export function getLatestReleaseForTest(options: NpmRegistryLookupOptions): Prom
 }
 
 /**
- * Compare semver versions. Returns:
+ * Compare semver versions, including pre-release ordering.
+ * Returns:
  * - negative if a < b
  * - 0 if a == b
  * - positive if a > b
+ *
+ * Must be pre-release-aware: a plain split-on-`.` comparator ranks
+ * `0.13.0-rc.1` above `0.13.0`, which would strand users on an rc after GA.
  */
 function compareVersions(a: string, b: string): number {
-	const pa = a.split(".").map(Number);
-	const pb = b.split(".").map(Number);
+	return Bun.semver.order(a, b);
+}
 
-	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-		const na = pa[i] || 0;
-		const nb = pb[i] || 0;
-		if (na !== nb) return na - nb;
-	}
-	return 0;
+export function compareVersionsForTest(a: string, b: string): number {
+	return compareVersions(a, b);
 }
 
 /**
@@ -303,6 +331,18 @@ function resolveGjcPath(): string | undefined {
 }
 
 /**
+ * Parse `gjc --version` output (`gjc/X.Y.Z` or `gjc/X.Y.Z-rc.N`).
+ * Pre-release suffixes must be preserved so update verification can confirm an rc install.
+ */
+export function parseReportedVersion(output: string): string | undefined {
+	const trimmed = output.trim();
+	const slash = trimmed.lastIndexOf("/");
+	if (slash < 0) return undefined;
+	const version = trimmed.slice(slash + 1).trim();
+	return version.length > 0 ? version : undefined;
+}
+
+/**
  * Run the resolved gjc binary and check if it reports the expected version.
  */
 async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
@@ -312,9 +352,8 @@ async function verifyInstalledVersion(expectedVersion: string): Promise<Installe
 		const result = await $`${ompPath} --version`.quiet().nothrow();
 		if (result.exitCode !== 0) return { ok: false, path: ompPath };
 		const output = result.text().trim();
-		// Output format: "gjc/X.Y.Z"
-		const match = output.match(/\/(\d+\.\d+\.\d+)/);
-		const actual = match?.[1];
+		// Output format: "gjc/X.Y.Z" or "gjc/X.Y.Z-rc.N"
+		const actual = parseReportedVersion(output);
 		return { ok: actual === expectedVersion, actual, path: ompPath };
 	} catch {
 		return { ok: false, path: ompPath };
@@ -686,12 +725,34 @@ function formatRegistryProvenance(version: string, registry: string | undefined)
 }
 
 /**
+ * Extra guidance when a pre-release version resolved from npm has no GitHub asset.
+ * Binary installs download `releases/download/v{version}/…`, so a published npm
+ * `next` tag without a matching GitHub pre-release leaves the binary path stuck.
+ */
+function formatPreReleaseAssetNote(version: string): string | undefined {
+	// Semver pre-release identifiers are separated by `-` (e.g. 0.13.0-rc.1).
+	if (!version.includes("-")) return undefined;
+	return `Pre-release ${version} was resolved from the npm registry, but the matching GitHub release asset under tag v${version} is missing. Publish the GitHub pre-release with the same gjc-* assets as stable, or update via bun/npm instead of the binary path.`;
+}
+
+function formatBinaryDownloadNotes(version: string, registry?: string): string | undefined {
+	const notes = [formatRegistryProvenance(version, registry), formatPreReleaseAssetNote(version)].filter(
+		(note): note is string => Boolean(note),
+	);
+	return notes.length > 0 ? notes.join("\n") : undefined;
+}
+
+export function formatBinaryDownloadNotesForTest(version: string, registry?: string): string | undefined {
+	return formatBinaryDownloadNotes(version, registry);
+}
+
+/**
  * Download a release binary to a target path, replacing an existing file.
  */
 async function updateViaBinaryAt(targetPath: string, expectedVersion: string, registry?: string): Promise<void> {
 	const binaryName = getBinaryName();
 	const url = buildReleaseBinaryUrl(expectedVersion);
-	const registryNote = formatRegistryProvenance(expectedVersion, registry);
+	const registryNote = formatBinaryDownloadNotes(expectedVersion, registry);
 	console.log(chalk.dim(`Downloading ${binaryName}…`));
 
 	const verification = await runBinaryUpdateFlow(targetPath, url, expectedVersion, {
@@ -712,7 +773,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string, re
  * Run the update command.
  */
 export interface UpdateCommandDependencies {
-	getLatestRelease?: (installer?: Installer) => Promise<ReleaseInfo>;
+	getLatestRelease?: (options?: Installer | NpmRegistryLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
 	performUpdate?: (target: UpdateTarget, expectedVersion: string, registry?: string) => Promise<void>;
 	refreshInstalledDefaultSkills?: () => Promise<void>;
@@ -730,7 +791,7 @@ async function performUpdate(target: UpdateTarget, expectedVersion: string, regi
 }
 
 export async function runUpdateCommand(
-	opts: { force: boolean; check: boolean },
+	opts: UpdateCommandOptions,
 	deps: UpdateCommandDependencies = {},
 ): Promise<void> {
 	const lookupRelease = deps.getLatestRelease ?? getLatestRelease;
@@ -738,8 +799,10 @@ export async function runUpdateCommand(
 	const update = deps.performUpdate ?? performUpdate;
 	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
 	const exit = deps.exit ?? process.exit;
+	const channel = resolveUpdateChannel(opts);
 
 	console.log(chalk.dim(`Current version: ${VERSION}`));
+	console.log(chalk.dim(`Channel: ${channel}`));
 
 	// Resolve the install target first so the registry lookup can match the
 	// manager that will actually run: the npm-managed path ignores
@@ -757,7 +820,7 @@ export async function runUpdateCommand(
 
 	let release: ReleaseInfo;
 	try {
-		release = await lookupRelease(installer);
+		release = await lookupRelease({ installer, channel });
 	} catch (err) {
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
 		return exit(1);
@@ -769,6 +832,8 @@ export async function runUpdateCommand(
 	// consumer can satisfy without the field.
 	for (const warning of release.warnings ?? []) console.warn(chalk.yellow(`Warning: ${warning}`));
 
+	// Bun.semver.order ranks stable above its own pre-release, so a user on
+	// X.Y.Z-rc.N who runs plain `gjc update` after X.Y.Z GA installs the GA.
 	const comparison = compareVersions(release.version, VERSION);
 
 	if (comparison <= 0 && !opts.force) {
@@ -777,9 +842,9 @@ export async function runUpdateCommand(
 	}
 
 	if (comparison > 0) {
-		console.log(chalk.cyan(`New version available: ${release.version}`));
+		console.log(chalk.cyan(`New version available: ${release.version} (${release.channel ?? channel})`));
 	} else {
-		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
+		console.log(chalk.yellow(`Forcing reinstall of ${release.version} (${release.channel ?? channel})`));
 	}
 
 	if (opts.check) return;
@@ -828,10 +893,13 @@ ${chalk.bold("Usage:")}
 ${chalk.bold("Options:")}
   -c, --check   Check for updates without installing
   -f, --force   Force reinstall even if up to date
+      --pre     Opt into the pre-release channel (npm dist-tag "${UPDATE_PRE_CHANNEL}")
 
 ${chalk.bold("Examples:")}
-  ${APP_NAME} update           Update to latest version
-  ${APP_NAME} update --check   Check if updates are available
-  ${APP_NAME} update --force   Force reinstall
+  ${APP_NAME} update           Update to the latest stable version
+  ${APP_NAME} update --check   Check if a stable update is available
+  ${APP_NAME} update --pre     Install the newest pre-release when published
+  ${APP_NAME} update --pre --check   Check the pre-release channel only
+  ${APP_NAME} update --force   Force reinstall of the resolved channel
 `);
 }
