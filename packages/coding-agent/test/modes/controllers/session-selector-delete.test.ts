@@ -28,7 +28,7 @@ function createSession(id: string, title: string): SessionInfo {
 
 function createSelector(
 	onDelete: (session: SessionInfo) => Promise<boolean>,
-	onSelect: (sessionPath: string) => void = () => {},
+	onSelect: (sessionPath: string) => void | Promise<void> = () => {},
 ): SessionSelectorComponent {
 	return new SessionSelectorComponent(
 		[createSession("session-a", "Alpha"), createSession("session-b", "Beta")],

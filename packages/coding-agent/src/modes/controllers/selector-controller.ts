@@ -2638,9 +2638,15 @@ export class SelectorController {
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
-				async sessionPath => {
+				sessionPath => {
+					// `onSelect` is a void dispatch boundary: close the picker first, then
+					// observe resume failures so a managed-candidate race (or any other
+					// preparation/switch rejection) surfaces as UI error instead of an
+					// unhandled rejection that can kill the process. Do not auto-retry.
 					done();
-					await this.handleResumeSession(sessionPath);
+					void this.handleResumeSession(sessionPath).catch(error => {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					});
 				},
 				() => {
 					done();

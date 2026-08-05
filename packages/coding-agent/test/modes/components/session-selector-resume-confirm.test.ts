@@ -154,4 +154,34 @@ describe("SessionSelectorComponent resume consent", () => {
 		expect(text(component)).toContain("Error: unreadable");
 		expect(results).toEqual([]);
 	});
+
+	it("observes async onSelect rejections without unhandled rejection (#3804)", async () => {
+		const unhandled = vi.fn();
+		process.on("unhandledRejection", unhandled);
+		try {
+			const selected = vi.fn(async () => {
+				throw new Error("Managed session changed before migration authority was adopted.");
+			});
+			const component = new SessionSelectorComponent(
+				[session("one")],
+				selected,
+				() => {},
+				() => {},
+				undefined,
+			);
+			component.handleInput("\n");
+			await Bun.sleep(0);
+			await new Promise<void>(resolve => setImmediate(resolve));
+
+			expect(selected).toHaveBeenCalledWith("/tmp/one.jsonl");
+			expect(text(component)).toContain(
+				"Error: Managed session changed before migration authority was adopted.",
+			);
+			// Picker stays usable for another attempt (no auto-retry of the same candidate).
+			expect(text(component)).toContain("one");
+			expect(unhandled).not.toHaveBeenCalled();
+		} finally {
+			process.off("unhandledRejection", unhandled);
+		}
+	});
 });
