@@ -2986,7 +2986,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 50 durable topic and callback authority", () => {
+	test("keeps wire protocol 3 through generation 51 strict durable topic and callback authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3006,8 +3006,9 @@ describe("telegram daemon", () => {
 		// 49 drains admitted session handlers before final persistence and ownership release;
 		// generation 50 resolves intermediate notifications-directory symlinks before
 		// native exact unlink while keeping final-component file symlinks fail-closed,
-		// and adds shared durable topic authority with archive recovery.
-		expect(DAEMON_GENERATION).toBe(50);
+		// and adds shared durable topic authority with archive recovery; generation 51
+		// binds idempotent archive settlement to Telegram error code 400.
+		expect(DAEMON_GENERATION).toBe(51);
 	});
 	test.each([
 		"1",
@@ -18882,7 +18883,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		expect(routed.every(call => call.body.message_thread_id !== 77)).toBe(true);
 	});
 	test.each([
-		["accepted remote archive", async () => ({ ok: true, result: true }), "inactive", "42", "42", [77]],
+		["accepted remote archive", async () => ({ ok: true, result: true }), "inactive", "42", "42", [77], false],
 		[
 			"already closed remote topic",
 			async () => ({ ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_FOUND" }),
@@ -18890,7 +18891,20 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			"42",
 			"42",
 			[77],
+			false,
 		],
+		...([401, 403, 429, 500] as const).map(
+			errorCode =>
+				[
+					`allowlisted archive text under ${errorCode}`,
+					async () => ({ ok: false, error_code: errorCode, description: "Bad Request: TOPIC_NOT_FOUND" }),
+					"archive_pending",
+					"42",
+					"42",
+					[77],
+					true,
+				] as const,
+		),
 		[
 			"ambiguous remote archive",
 			async () => ({ ok: false, description: "transport unavailable" }),
@@ -18898,6 +18912,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			"42",
 			"42",
 			[77],
+			true,
 		],
 		[
 			"re-paired chat retains an old-chat archive fence",
@@ -18906,8 +18921,9 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			"43",
 			"42",
 			[],
+			false,
 		],
-	] as const)("startup scan reconciles a crash-persisted archive fence after %s", async (_outcome, archiveResult, authorityState, recordChatId, pairedChatId, expectedArchivedTopics) => {
+	] as const)("startup scan reconciles a crash-persisted archive fence after %s", async (_outcome, archiveResult, authorityState, recordChatId, pairedChatId, expectedArchivedTopics, expectsRetryJob) => {
 		const agentDir = tempAgentDir();
 		const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
 		fs.mkdirSync(path.dirname(topicsPath), { recursive: true });
@@ -18955,6 +18971,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		).toEqual([...expectedArchivedTopics]);
 		const persisted = JSON.parse(fs.readFileSync(topicsPath, "utf8"));
 		expect(persisted.topics.S).toMatchObject({ topicId: "77", chatId: recordChatId, authorityState });
+		if (expectsRetryJob) expect(persisted.archiveJobs.S).toMatchObject({ topicId: "77", attempt: 1 });
 	});
 
 	test("failed close publication restores only close authority while retaining a concurrent user rename across restart", async () => {
