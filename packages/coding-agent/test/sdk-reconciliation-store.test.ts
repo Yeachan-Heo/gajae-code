@@ -3,11 +3,15 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	RECONCILIATION_STORE_VERSION,
+	RECONCILIATION_STORE_VERSION_V1,
 	createReconciliationStore,
 	type DurableReconciliationRecord,
+	type DurableTerminalScopeRecord,
 	isSafeReconciliationSessionId,
 	reconciliationStorePath,
 	settleProcessRestart,
+	settleTerminalScopeRestart,
 } from "../src/sdk/bus/reconciliation-store";
 
 describe("reconciliation-store", () => {
@@ -224,5 +228,115 @@ describe("reconciliation-store", () => {
 		expect(store.snapshot()).toHaveLength(1);
 		await store.delete();
 		expect(store.snapshot()).toHaveLength(0);
+	});
+	test("v1 documents migrate to v2 on load and are rewritten durably", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-v1-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const storePath = reconciliationStorePath(sessionFile, "s1");
+		await fs.mkdir(path.dirname(storePath), { recursive: true });
+		await fs.writeFile(
+			storePath,
+			JSON.stringify({
+				version: RECONCILIATION_STORE_VERSION_V1,
+				sessionId: "s1",
+				records: [{ kind: "prompt", commandId: "c1", turnId: "t1", status: "accepted", acceptedAt: 1 }],
+			}),
+		);
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		await store.load();
+		const rewritten = JSON.parse(await fs.readFile(storePath, "utf8"));
+		expect(rewritten.version).toBe(RECONCILIATION_STORE_VERSION);
+		expect(rewritten.records).toHaveLength(1);
+		expect(await store.loadTerminalScopes()).toEqual([]);
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("terminal scope records round-trip through the shared document", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-term-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		const scope: DurableTerminalScopeRecord = {
+			selection: "turn",
+			turnDisposition: "stopped",
+			ownedWorkDisposition: "left_running",
+			automaticDeliveryDisposition: "enabled",
+			resumeOnOwnedCompletion: true,
+			turnContinuationFence: {
+				state: "retained",
+				abortedAttemptEpoch: 3,
+				blockedContinuationIds: ["c-a"],
+				predecessorTombstones: ["p-1"],
+				ownedCompletionPolicy: "enabled",
+			},
+			responseState: "delivered",
+			responsePayloadHash: "hash-1",
+			acceptedAt: 10,
+			terminalAt: 20,
+		};
+		await store.transactTerminalScopes(() => [scope]);
+		await store.transact(() => [
+			{ kind: "prompt", commandId: "c1", turnId: "t1", status: "accepted", acceptedAt: 1 },
+		]);
+		expect(store.snapshotTerminalScopes()).toEqual([scope]);
+		expect(store.snapshot()).toHaveLength(1);
+
+		// A fresh store instance reloads both records and terminal scopes from one document.
+		const reloaded = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		await reloaded.load();
+		expect(reloaded.snapshotTerminalScopes()).toEqual([scope]);
+		expect(reloaded.snapshot()).toHaveLength(1);
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("invalid terminal scope documents are quarantined on load", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-bad-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const storePath = reconciliationStorePath(sessionFile, "s1");
+		await fs.mkdir(path.dirname(storePath), { recursive: true });
+		await fs.writeFile(
+			storePath,
+			JSON.stringify({
+				version: RECONCILIATION_STORE_VERSION,
+				sessionId: "s1",
+				records: [],
+				terminalScopes: [{ selection: "bogus", turnDisposition: "stopped" }],
+			}),
+		);
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		expect(await store.loadTerminalScopes()).toEqual([]);
+		const entries = await fs.readdir(path.dirname(storePath));
+		expect(entries.some(name => name.includes("corrupt"))).toBe(true);
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("settleTerminalScopeRestart maps pending to uncertain and never invents success", () => {
+		const now = 5_000;
+		const pending: DurableTerminalScopeRecord = {
+			selection: "turn",
+			turnDisposition: "pending",
+			ownedWorkDisposition: "left_running",
+			automaticDeliveryDisposition: "enabled",
+			resumeOnOwnedCompletion: true,
+			turnContinuationFence: {
+				state: "retained",
+				abortedAttemptEpoch: 1,
+				blockedContinuationIds: [],
+				predecessorTombstones: [],
+				ownedCompletionPolicy: "enabled",
+			},
+			responseState: "pending",
+			responsePayloadHash: "h",
+			acceptedAt: 1,
+		};
+		const settled = settleTerminalScopeRestart([pending], now)[0];
+		expect(settled.turnDisposition).toBe("uncertain");
+		expect(settled.ownedWorkDisposition).toBe("uncertain");
+		expect(settled.terminalAt).toBe(now);
+		// A durable stopped scope is left untouched.
+		const stopped: DurableTerminalScopeRecord = { ...pending, turnDisposition: "stopped", terminalAt: 2 };
+		expect(settleTerminalScopeRestart([stopped], now)[0]).toBe(stopped);
 	});
 });

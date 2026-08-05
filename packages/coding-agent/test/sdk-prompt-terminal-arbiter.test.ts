@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
 import {
 	type DurableReconciliationRecord,
+	type DurableTerminalScopeRecord,
 	type ReconciliationStore,
 	settleProcessRestart,
 } from "../src/sdk/bus/reconciliation-store";
@@ -11,6 +12,7 @@ class MemoryStore implements ReconciliationStore {
 	readonly path = null;
 	readonly sessionId = "test-session";
 	#records: DurableReconciliationRecord[] = [];
+	#terminalScopes: DurableTerminalScopeRecord[] = [];
 	#failNext = false;
 	#holdNext?: Promise<void>;
 	#onHeld?: () => void;
@@ -38,6 +40,19 @@ class MemoryStore implements ReconciliationStore {
 			await hold;
 		}
 		this.#records = next;
+	}
+	async transactTerminalScopes(
+		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
+	): Promise<void> {
+		this.#terminalScopes = mutator(this.snapshotTerminalScopes());
+	}
+
+	async loadTerminalScopes(): Promise<DurableTerminalScopeRecord[]> {
+		return this.snapshotTerminalScopes();
+	}
+
+	snapshotTerminalScopes(): DurableTerminalScopeRecord[] {
+		return this.#terminalScopes.map(scope => ({ ...scope }));
 	}
 
 	async load(): Promise<DurableReconciliationRecord[]> {

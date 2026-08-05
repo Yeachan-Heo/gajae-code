@@ -14,11 +14,12 @@ import * as path from "node:path";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
 import type { PromptCorrelation } from "./prompt-reconciliation";
 
-export const RECONCILIATION_STORE_VERSION = 1;
+export const RECONCILIATION_STORE_VERSION = 2;
+export const RECONCILIATION_STORE_VERSION_V1 = 1;
 export const RECONCILIATION_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const RECONCILIATION_DIR_NAME = ".sdk-reconciliation";
 
-export type ReconciliationKind = "prompt" | "skill";
+export type ReconciliationKind = "prompt" | "skill" | "terminal";
 
 export interface DurableReconciliationRecord extends PromptCorrelation {
 	kind: ReconciliationKind;
@@ -34,10 +35,41 @@ export interface DurableReconciliationRecord extends PromptCorrelation {
 	skillName?: string;
 }
 
+/**
+ * Durable terminal scope record (approved abort-SDK plan, v2 document).
+ * Bounded origin/fence and owned-settlement fields only; no prompt text and no
+ * suppressed/deferred receipts for left-running turn work.
+ */
+export interface DurableTerminalScopeRecord {
+	selection: "turn" | "owned";
+	turnDisposition: "pending" | "stopped" | "uncertain";
+	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
+	automaticDeliveryDisposition: "enabled" | "none";
+	resumeOnOwnedCompletion: boolean;
+	turnContinuationFence: {
+		state: "retained" | "released";
+		abortedAttemptEpoch: number;
+		blockedContinuationIds: string[];
+		predecessorTombstones: string[];
+		ownedCompletionPolicy: "enabled" | "disabled";
+	};
+	ownedDeliverySettlements?: Array<{
+		keyHash: string;
+		entryIdHash: string;
+		status: "settled" | "absent" | "uncertain";
+		observedAt: number;
+	}>;
+	responseState: "pending" | "sent" | "delivered" | "failed";
+	responsePayloadHash: string;
+	acceptedAt: number;
+	terminalAt?: number;
+}
+
 export interface ReconciliationStoreDocument {
 	version: typeof RECONCILIATION_STORE_VERSION;
 	sessionId: string;
 	records: DurableReconciliationRecord[];
+	terminalScopes?: DurableTerminalScopeRecord[];
 }
 
 export interface ReconciliationStoreFs {
@@ -129,15 +161,97 @@ function isValidRecord(value: unknown): boolean {
 		);
 	});
 }
+/** Terminal scope validation: bounded origin/fence/settlement fields only. */
+function isValidTerminalScope(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	const {
+		selection,
+		turnDisposition,
+		ownedWorkDisposition,
+		automaticDeliveryDisposition,
+		resumeOnOwnedCompletion,
+		turnContinuationFence,
+		ownedDeliverySettlements,
+		responseState,
+		responsePayloadHash,
+		acceptedAt,
+		terminalAt,
+	} = value;
+	if (selection !== "turn" && selection !== "owned") return false;
+	if (turnDisposition !== "pending" && turnDisposition !== "stopped" && turnDisposition !== "uncertain") return false;
+	if (
+		ownedWorkDisposition !== "not_requested" &&
+		ownedWorkDisposition !== "left_running" &&
+		ownedWorkDisposition !== "stopped" &&
+		ownedWorkDisposition !== "uncertain"
+	)
+		return false;
+	if (automaticDeliveryDisposition !== "enabled" && automaticDeliveryDisposition !== "none") return false;
+	if (typeof resumeOnOwnedCompletion !== "boolean") return false;
+	if (!isRecord(turnContinuationFence)) return false;
+	const { state, abortedAttemptEpoch, blockedContinuationIds, predecessorTombstones, ownedCompletionPolicy } =
+		turnContinuationFence;
+	if (state !== "retained" && state !== "released") return false;
+	if (typeof abortedAttemptEpoch !== "number" || !Number.isFinite(abortedAttemptEpoch)) return false;
+	if (!Array.isArray(blockedContinuationIds) || !blockedContinuationIds.every(id => typeof id === "string"))
+		return false;
+	if (!Array.isArray(predecessorTombstones) || !predecessorTombstones.every(id => typeof id === "string"))
+		return false;
+	if (ownedCompletionPolicy !== "enabled" && ownedCompletionPolicy !== "disabled") return false;
+	if (ownedDeliverySettlements !== undefined) {
+		if (!Array.isArray(ownedDeliverySettlements) || ownedDeliverySettlements.length > 256) return false;
+		for (const settlement of ownedDeliverySettlements) {
+			if (!isRecord(settlement)) return false;
+			if (typeof settlement.keyHash !== "string" || !settlement.keyHash) return false;
+			if (typeof settlement.entryIdHash !== "string" || !settlement.entryIdHash) return false;
+			if (settlement.status !== "settled" && settlement.status !== "absent" && settlement.status !== "uncertain")
+				return false;
+			if (typeof settlement.observedAt !== "number" || !Number.isFinite(settlement.observedAt)) return false;
+		}
+	}
+	if (
+		responseState !== "pending" &&
+		responseState !== "sent" &&
+		responseState !== "delivered" &&
+		responseState !== "failed"
+	)
+		return false;
+	if (typeof responsePayloadHash !== "string" || !responsePayloadHash) return false;
+	if (typeof acceptedAt !== "number" || !Number.isFinite(acceptedAt)) return false;
+	if (terminalAt !== undefined && (typeof terminalAt !== "number" || !Number.isFinite(terminalAt))) return false;
+	// An incomplete (pending) scope cannot already be terminal.
+	if (turnDisposition === "pending" && terminalAt !== undefined) return false;
+	return true;
+}
 
 function parseDocument(raw: string, expectedSessionId: string): ReconciliationStoreDocument {
 	const value = JSON.parse(raw) as unknown;
-	if (!isRecord(value) || value.version !== RECONCILIATION_STORE_VERSION)
+	if (
+		!isRecord(value) ||
+		(value.version !== RECONCILIATION_STORE_VERSION && value.version !== RECONCILIATION_STORE_VERSION_V1)
+	)
 		throw new Error("invalid reconciliation store version");
 	if (value.sessionId !== expectedSessionId) throw new Error("session id mismatch");
 	if (!Array.isArray(value.records)) throw new Error("invalid records");
 	if (!value.records.every(isValidRecord)) throw new Error("invalid reconciliation record");
-	return value as unknown as ReconciliationStoreDocument;
+	// v1 documents migrate to v2 (records only; terminalScopes added later).
+	if (value.version === RECONCILIATION_STORE_VERSION_V1)
+		return {
+			version: RECONCILIATION_STORE_VERSION,
+			sessionId: expectedSessionId,
+			records: value.records as DurableReconciliationRecord[],
+		};
+	const terminalScopes = value.terminalScopes;
+	if (terminalScopes !== undefined) {
+		if (!Array.isArray(terminalScopes)) throw new Error("invalid terminal scopes");
+		if (!terminalScopes.every(isValidTerminalScope)) throw new Error("invalid terminal scope");
+	}
+	return {
+		version: RECONCILIATION_STORE_VERSION,
+		sessionId: expectedSessionId,
+		records: value.records as DurableReconciliationRecord[],
+		...(terminalScopes !== undefined ? { terminalScopes: terminalScopes as DurableTerminalScopeRecord[] } : {}),
+	};
 }
 
 /**
@@ -145,6 +259,25 @@ function parseDocument(raw: string, expectedSessionId: string): ReconciliationSt
  * Prompt records preserve a durable pending outcome; skills retain the existing
  * reconciliation-incomplete result.
  */
+/**
+ * Settle incomplete terminal scopes (turnDisposition "pending") to safe
+ * uncertainty after process death. A terminal scope that never finalized its
+ * semantic CAS replays as uncertainty, never as success.
+ */
+export function settleTerminalScopeRestart(
+	scopes: DurableTerminalScopeRecord[],
+	now: number,
+): DurableTerminalScopeRecord[] {
+	return scopes.map(scope => {
+		if (scope.turnDisposition !== "pending" || scope.terminalAt !== undefined) return scope;
+		return {
+			...scope,
+			turnDisposition: "uncertain",
+			ownedWorkDisposition: scope.ownedWorkDisposition === "not_requested" ? "not_requested" : "uncertain",
+			terminalAt: now,
+		};
+	});
+}
 export function settleProcessRestart(
 	records: DurableReconciliationRecord[],
 	now: number,
@@ -184,6 +317,13 @@ export interface ReconciliationStore {
 	load(): Promise<DurableReconciliationRecord[]>;
 	/** Snapshot currently held in memory after last load/transact. */
 	snapshot(): DurableReconciliationRecord[];
+	/** Terminal-scope mutations through the same serialized full-document owner. */
+	transactTerminalScopes(
+		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
+	): Promise<void>;
+	loadTerminalScopes(): Promise<DurableTerminalScopeRecord[]>;
+	/** Snapshot of terminal scopes currently held in memory. */
+	snapshotTerminalScopes(): DurableTerminalScopeRecord[];
 	delete(): Promise<void>;
 }
 
@@ -202,6 +342,7 @@ export function createReconciliationStore(options: {
 			: null;
 
 	let memory: DurableReconciliationRecord[] = [];
+	let terminalMemory: DurableTerminalScopeRecord[] = [];
 	let chain: Promise<void> = Promise.resolve();
 
 	const writeAtomic = async (document: ReconciliationStoreDocument): Promise<void> => {
@@ -233,6 +374,7 @@ export function createReconciliationStore(options: {
 	const load = async (): Promise<DurableReconciliationRecord[]> => {
 		if (!filePath) {
 			memory = [];
+			terminalMemory = [];
 			return memory;
 		}
 		let raw: string;
@@ -243,6 +385,7 @@ export function createReconciliationStore(options: {
 			// so the endpoint never becomes ready as if no prompt had been accepted.
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			memory = [];
+			terminalMemory = [];
 			return memory;
 		}
 		let document: ReconciliationStoreDocument;
@@ -256,15 +399,25 @@ export function createReconciliationStore(options: {
 				// ignore
 			}
 			memory = [];
+			terminalMemory = [];
 			return memory;
 		}
 		const settled = settleProcessRestart(document.records, now());
+		const settledTerminal = settleTerminalScopeRestart(document.terminalScopes ?? [], now());
 		// Restart settlement must be durable before it is observable: a failed rewrite
 		// propagates so the endpoint stays unready instead of serving empty state as if
 		// no prompt had ever been accepted.
-		if (settled.some((record, index) => record !== document.records[index]))
-			await writeAtomic({ version: RECONCILIATION_STORE_VERSION, sessionId, records: settled });
+		const recordsChanged = settled.some((record, index) => record !== document.records[index]);
+		const terminalChanged = settledTerminal.some((scope, index) => scope !== (document.terminalScopes ?? [])[index]);
+		if (recordsChanged || terminalChanged)
+			await writeAtomic({
+				version: RECONCILIATION_STORE_VERSION,
+				sessionId,
+				records: settled,
+				...(document.terminalScopes !== undefined || terminalChanged ? { terminalScopes: settledTerminal } : {}),
+			});
 		memory = settled;
+		terminalMemory = settledTerminal;
 		return memory;
 	};
 
@@ -273,8 +426,34 @@ export function createReconciliationStore(options: {
 	): Promise<void> => {
 		const run = async () => {
 			const next = mutator(memory.map(r => ({ ...r })));
-			await writeAtomic({ version: RECONCILIATION_STORE_VERSION, sessionId, records: next });
+			await writeAtomic({
+				version: RECONCILIATION_STORE_VERSION,
+				sessionId,
+				records: next,
+				...(terminalMemory.length > 0 ? { terminalScopes: terminalMemory } : {}),
+			});
 			memory = next;
+		};
+		const pending = chain.then(run, run);
+		chain = pending.then(
+			() => undefined,
+			() => undefined,
+		);
+		await pending;
+	};
+
+	const transactTerminalScopes = async (
+		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
+	): Promise<void> => {
+		const run = async () => {
+			const next = mutator(terminalMemory.map(s => ({ ...s })));
+			await writeAtomic({
+				version: RECONCILIATION_STORE_VERSION,
+				sessionId,
+				records: memory,
+				...(next.length > 0 ? { terminalScopes: next } : {}),
+			});
+			terminalMemory = next;
 		};
 		const pending = chain.then(run, run);
 		chain = pending.then(
@@ -286,6 +465,7 @@ export function createReconciliationStore(options: {
 
 	const deleteStore = async (): Promise<void> => {
 		memory = [];
+		terminalMemory = [];
 		if (!filePath) return;
 		await fileFs.unlink(filePath).catch(error => {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -298,6 +478,12 @@ export function createReconciliationStore(options: {
 		transact,
 		load,
 		snapshot: () => memory.map(r => ({ ...r })),
+		transactTerminalScopes,
+		loadTerminalScopes: async () => {
+			await load();
+			return terminalMemory.map(s => ({ ...s }));
+		},
+		snapshotTerminalScopes: () => terminalMemory.map(s => ({ ...s })),
 		delete: deleteStore,
 	};
 }
