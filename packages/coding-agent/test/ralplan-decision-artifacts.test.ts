@@ -120,7 +120,7 @@ const ralplanReReviewContractPatterns = [
 	/Critic pass-2\+ only: the current-pass Architect receipt\/path, awaited first per the sequential cadence, so the rule-5 counter-review is evaluable\./u,
 	/gjc\.ralplan\.maxReviewPassesPerLane/u,
 	/Default: \*\*1\*\* Architect pass and \*\*1\*\* Critic pass per opener iteration\./u,
-	/project `\.gjc\/settings\.json` overrides user settings; the value is an integer \*\*1\.\.10\*\* registered in the public settings schema\./u,
+	/Override via `gjc\.ralplan\.maxReviewPassesPerLane` \(integer \*\*1\.\.10\*\*, registered in the public settings schema\) using the workflow-settings precedence above; project overrides user\./u,
 	/On overflow: exit code \*\*3\*\* with the \*\*`PLANNING-STUCK`\*\* marker and lane-specific JSON\/stderr detail\./u,
 	/`post-interview`, `adr`, and `final` are always allowed\./u,
 	/including after a crash between artifact write and ledger append: the identical retry repairs the missing ledger row and returns the dedupe receipt\./u,
