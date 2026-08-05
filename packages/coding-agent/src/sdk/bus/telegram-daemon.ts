@@ -4612,15 +4612,47 @@ export class TelegramNotificationDaemon {
 				includeInternal: false,
 				allWorkspaces: true,
 			});
-			const body =
-				recent.kind === "error"
-					? `Recent sessions could not be verified: ${recent.message}`
-					: recent.entries.length
-						? recent.entries.map(e => `• ${code(e.sessionId)}${e.path ? ` (${code(e.path)})` : ""}`).join("\n")
-						: "No recent sessions.";
-			await replyHtml(
-				recent.kind === "complete" && recent.warnings.length ? `${body}\n\n${recent.warnings.join("\n")}` : body,
-			);
+			if (recent.kind === "error") {
+				await reply(`Recent sessions could not be verified: ${recent.message}`);
+				return true;
+			}
+			if (!recent.entries.length) {
+				await reply("No recent sessions.");
+				return true;
+			}
+			const rows: Array<{ line: string; btn: { text: string; switch_inline_query_current_chat: string } }> = [];
+			for (let i = 0; i < recent.entries.length; i++) {
+				const e = recent.entries[i]!;
+				const num = i + 1;
+				const sid = e.sessionId.slice(0, 12);
+				rows.push({
+					line: `${num}. ${code(sid)}  ${e.title ? code(e.title.slice(0, 60)) : ""}${e.path ? `\n    ${code(e.path)}` : ""}`,
+					btn: {
+						text: `${num}. ${e.title?.slice(0, 35) || sid}`,
+						switch_inline_query_current_chat: `/session_resume ${sid}`,
+					},
+				});
+			}
+			const lines = rows.map(r => r.line);
+			const inline_keyboard = rows.map(r => [r.btn]);
+			const header =
+				recent.warnings.length ?
+					`<b>Recent GJC sessions</b>\n${recent.warnings.map(w => `⚠️ ${w}`).join("\n")}\n`
+				:	"<b>Recent GJC sessions</b>\n";
+			const body = header + lines.join("\n");
+
+			const chunks = splitTelegramHtml(body);
+			for (let i = 0; i < chunks.length; i++) {
+				await this.botApi
+					.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+						text: chunks[i]!,
+						parse_mode: TELEGRAM_PARSE_MODE,
+						...(i === chunks.length - 1 ? { reply_markup: { inline_keyboard } } : {}),
+					})
+					.catch(() => undefined);
+			}
 			return true;
 		}
 
@@ -9473,7 +9505,7 @@ export class TelegramNotificationDaemon {
 		}
 
 		const normalized = text ? normalizeLifecyclePath(text) : undefined;
-		const target = normalized ? ({ kind: "existing_path", path: normalized } as const) : undefined;
+		const target = normalized ? ({ kind: "plain_dir", path: normalized } as const) : undefined;
 		if (!target || !validateLifecycleTarget("session_create", target).ok) {
 			await this.rememberSeenUpdateId(updateId);
 			await this.botApi
@@ -9541,7 +9573,7 @@ export class TelegramNotificationDaemon {
 				});
 			return true;
 		}
-		if (parsed.target.kind !== "existing_path") {
+		if (parsed.target.kind !== "existing_path" && parsed.target.kind !== "plain_dir") {
 			await this.rememberSeenUpdateId(updateId);
 			await this.botApi
 				.call("sendMessage", {
@@ -9617,8 +9649,10 @@ export class TelegramNotificationDaemon {
 				return;
 			}
 			const normalizedPath = target.kind === "existing_path" ? normalizeLifecyclePath(target.path) : undefined;
-			let targetExists = false;
-			if (normalizedPath) {
+			// plain_dir creates missing directories, so only validate existence for existing_path.
+			const needsExistenceCheck = target.kind === "existing_path";
+			let targetExists = !needsExistenceCheck;
+			if (normalizedPath && needsExistenceCheck) {
 				try {
 					const stat = await this.fsImpl.stat?.(normalizedPath);
 					targetExists = stat?.isDirectory?.() === true;

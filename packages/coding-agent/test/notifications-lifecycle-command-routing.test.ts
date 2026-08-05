@@ -120,7 +120,7 @@ describe("lifecycle command routing (G009)", () => {
 		expect(calls.filter(c => c.method === "sendMessage").length).toBe(0);
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
-	test("/session_recent is sent as escaped bullet rows with inline code", async () => {
+	test("/session_recent sends numbered entries with inline keyboard buttons", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
@@ -138,13 +138,27 @@ describe("lifecycle command routing (G009)", () => {
 		expect(sends.length).toBe(1);
 		expect(sends.every(c => c.body?.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
 		expect(sends.every(c => String(c.body?.text).length <= 4096)).toBe(true);
-		const text = sends.map(c => String(c.body?.text)).join("");
+		const text = String(sends[0]!.body?.text ?? "");
 		expect(text).not.toContain("<pre>");
 		expect(text).toContain("<code>s-019</code>");
 		expect(text).toContain(
 			`<code>${cwd.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</code>`,
 		);
-		expect(Array.from(text.matchAll(/^• <code>s-\d{3}<\/code> \(<code>.*<\/code>\)$/gm))).toHaveLength(10);
+		// Numbered entries, not bullet points
+		expect(text).toContain("<b>Recent GJC sessions</b>");
+		expect(text.match(/^\d+\. <code>s-\d{3}<\/code>/m)).not.toBeNull();
+
+		// Inline keyboard
+		const markup = sends[0]!.body?.reply_markup as Record<string, unknown> | undefined;
+		expect(markup).not.toBeUndefined();
+		const kb = markup!.inline_keyboard as Array<Array<Record<string, string>>>;
+		expect(kb.length).toBe(10);
+		for (const row of kb) {
+			expect(row.length).toBe(1);
+			expect(row[0]!.switch_inline_query_current_chat).toMatch(/^\/session_resume s-\d{3}$/);
+			expect(row[0]!.text).toMatch(/^\d+\./);
+		}
+
 		cwdSpy.mockRestore();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
