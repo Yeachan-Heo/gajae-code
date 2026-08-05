@@ -178,6 +178,13 @@ describe("system Handlebars prompt templates", () => {
 		expect(full).toContain("<gjc-runtime>");
 		expect(full).toContain("<routing>");
 		expect(full).toContain("<soul>");
+		expect(full).toContain("Be genuinely helpful");
+		expect(full).toContain("Have an opinion");
+		expect(full).toContain("Do your homework first");
+		expect(full).toContain("Once you’ve assessed an authorized task");
+		expect(full).not.toMatch(
+			/Guardrails\? None|Restrictions\? None|Freedom\? Unlimited|Absolute Obedience|Scope of Freedom|What You Can Do \(Unlimited\)|sexual harassment|violates OpenAI policies|Displaying unverified content|Any topic, any method|just curse away|immediately fired/,
+		);
 		expect(full).not.toContain("<role-agent-surface>");
 
 		// Subagent base prompt drops runtime routing and soul.
@@ -350,7 +357,8 @@ describe("system Handlebars prompt templates", () => {
 			expect(systemPrompt).toHaveLength(2);
 			expect(systemPrompt[0]).toContain("<gajae-code-system-prompt>");
 			expect(systemPrompt[0]).toContain("<soul>");
-			expect(systemPrompt[0]).toContain("The Boss’s Orders = Absolute Obedience");
+			expect(systemPrompt[0]).toContain("Be genuinely helpful");
+			expect(systemPrompt[0]).not.toContain("Absolute Obedience");
 			expect(systemPrompt[0]).toContain("<system-prompt-customization>");
 			expect(systemPrompt[0]).toContain("Project system sentinel.");
 		});
