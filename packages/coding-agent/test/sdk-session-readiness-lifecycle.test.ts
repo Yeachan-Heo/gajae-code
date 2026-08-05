@@ -30,6 +30,7 @@ async function withHost(
 			token: "not-persisted",
 			sendFrame: (_connectionId, frame) => {
 				sent.push(frame as Record<string, unknown>);
+				return "written";
 			},
 			onFrame: handler => {
 				inbound = handler;
