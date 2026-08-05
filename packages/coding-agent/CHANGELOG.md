@@ -5,6 +5,7 @@
 ### Fixed
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
+- MiniMax M3 preset and profile ids canonicalized to `MiniMax-M3` (issue #3896): the `minimax` / `minimax-cn` onboarding presets and the `minimax-eco` / `minimax-medium` / `minimax-pro` builtin model profiles no longer reference the removed lowercase `minimax-m3` / `minimax-v3` first-class catalog ids.
 
 ## [0.12.12] - 2026-08-05
 
