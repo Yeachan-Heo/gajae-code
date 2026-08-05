@@ -21846,7 +21846,7 @@ describe("forum_topic_created user-topic adoption", () => {
 
 		expect(frames).toHaveLength(1);
 		expect((frames[0] as { target?: unknown }).target).toEqual({
-			kind: "existing_path",
+			kind: "plain_dir",
 			path: workspace,
 		});
 	});
@@ -21896,30 +21896,38 @@ describe("forum_topic_created user-topic adoption", () => {
 			),
 		).toBe(true);
 	});
-	test("pending topics reject dir and worktree creates instead of spawning duplicate topics", async () => {
+	test("pending topics accept dir, reject worktree creates", async () => {
 		const { daemon, bot, frames } = await adoptionLifecycleHarness();
 		await authorizePendingTopic(daemon, 58, 998);
-		for (const [updateId, text] of [
-			[59, "/session_create dir /tmp/new-session"],
-			[60, "/session_create worktree /tmp/repo feature"],
-		] as const) {
-			await daemon.handleTelegramUpdate({
-				update_id: updateId,
-				message: {
-					chat: { id: 42 },
-					from: { id: 42, is_bot: false },
-					message_thread_id: 998,
-					text,
-				},
-			});
-		}
-		expect(frames).toHaveLength(0);
+		await daemon.handleTelegramUpdate({
+			update_id: 59,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 998,
+				text: "/session_create dir /tmp/new-session",
+			},
+		});
+		await daemon.handleTelegramUpdate({
+			update_id: 60,
+			message: {
+				chat: { id: 42 },
+				from: { id: 42, is_bot: false },
+				message_thread_id: 998,
+				text: "/session_create worktree /tmp/repo feature",
+			},
+		});
+		expect(frames).toHaveLength(1);
+		expect((frames[0] as { target?: unknown }).target).toEqual({
+			kind: "plain_dir",
+			path: "/tmp/new-session",
+		});
 		expect(
 			bot.calls.filter(
 				call =>
 					call.method === "sendMessage" && String(call.body.text).includes("only with /session_create path <dir>"),
 			),
-		).toHaveLength(2);
+		).toHaveLength(1);
 	});
 	test("direct adoption rejects forged senders and bot messages", async () => {
 		const agentDir = tempAgentDir();
