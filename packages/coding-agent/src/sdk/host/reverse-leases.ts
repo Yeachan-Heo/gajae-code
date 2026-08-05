@@ -57,7 +57,7 @@ interface Outstanding {
 export interface ReverseLeaseOptions {
 	now?: () => number;
 	leaseTtlMs?: number;
-	sendFrame: (connectionId: string, frame: SdkFrame) => void | Promise<void>;
+	sendFrame: (connectionId: string, frame: SdkFrame) => unknown;
 	installDefinitions?: (capability: string, definitions: unknown) => void;
 	onCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
 	onDefinitionsRemoved?: (capability: string) => void;
@@ -245,7 +245,7 @@ export class ReverseLeaseRuntime {
 					return;
 				}
 			}
-			let delivery: void | Promise<void>;
+			let delivery: unknown;
 			try {
 				delivery = this.#sendFrame(lease.connectionId, {
 					type: "reverse_request",

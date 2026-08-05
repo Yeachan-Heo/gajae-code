@@ -1862,6 +1862,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						getActivePromptHandle: () => session.activePromptHandle,
 						abort: () => session.abort(),
 						abortPromptAndWait: (handle, options) => session.abortPromptAndWait(handle, options),
+						getTerminalTurnEpoch: () => session.getTerminalTurnEpoch(),
 						hasPendingMessages: () => session.queuedMessageCount > 0,
 						getPendingMessageCounts: () => session.pendingMessageCounts,
 						getTranscript: () => session.getTranscript(),

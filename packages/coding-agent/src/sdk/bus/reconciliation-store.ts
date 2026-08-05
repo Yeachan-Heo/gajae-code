@@ -47,6 +47,8 @@ export interface DurableTerminalScopeRecord {
 	/** SHA-256 of the canonicalized normalized input; raw input is never persisted. */
 	idempotencyInputHash?: string;
 	turnDisposition: "pending" | "stopped" | "uncertain";
+	/** Whether the correlated agent_end event was published (AC 19). */
+	terminalPublished?: boolean;
 	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
 	automaticDeliveryDisposition: "enabled" | "none";
 	resumeOnOwnedCompletion: boolean;

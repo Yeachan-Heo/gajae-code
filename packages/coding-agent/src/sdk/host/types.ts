@@ -19,7 +19,7 @@ export interface HostEndpointAdapters {
 	sessionId: string;
 	stateRoot: string;
 	token: string;
-	sendFrame: (connectionId: string, frame: SdkFrame) => void | Promise<void>;
+	sendFrame: (connectionId: string, frame: SdkFrame) => "written" | "dropped" | Promise<"written" | "dropped">;
 	onFrame: (handler: (connectionId: string, frame: SdkFrame) => void) => undefined | (() => void);
 }
 

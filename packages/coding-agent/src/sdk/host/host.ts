@@ -50,10 +50,22 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 		connectionId: string,
 		request: SdkFrame,
 		response: SdkFrame,
-		sendTerminal: () => Promise<void>,
+		sendTerminal: () => Promise<unknown>,
 	) => void | Promise<void>;
 	/** Runs only after a successful control response has been sent to the client. */
 	afterControlResponse?: (connectionId: string, request: SdkFrame, response: SdkFrame) => void | Promise<void>;
+	/**
+	 * Classifies the awaited control-response write exactly once: `written`
+	 * (sent), `rejected` (the write threw), or `dropped` (the send adapter
+	 * deliberately skipped delivery). `afterControlResponse` runs only
+	 * on `written`. Used to persist monotonic response-state transitions.
+	 */
+	onControlResponseDelivery?: (
+		connectionId: string,
+		request: SdkFrame,
+		response: SdkFrame,
+		outcome: "written" | "rejected" | "dropped",
+	) => void | Promise<void>;
 	installProviderDefinitions?: (capability: string, definitions: unknown) => void;
 	onProviderDefinitionsRemoved?: (capability: string) => void;
 	onReverseCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
@@ -353,8 +365,8 @@ export class SessionSdkHost {
 			});
 	}
 
-	async #send(connectionId: string, frame: SdkFrame): Promise<void> {
-		await this.#options.sendFrame(connectionId, frame);
+	async #send(connectionId: string, frame: SdkFrame): Promise<"written" | "dropped"> {
+		return await this.#options.sendFrame(connectionId, frame);
 	}
 
 	/**
@@ -395,14 +407,35 @@ export class SessionSdkHost {
 					if (result !== undefined) {
 						const response = { type: "control_response", ...(result as SdkFrame) };
 						let terminalSent = false;
-						const sendTerminal = async (): Promise<void> => {
-							if (terminalSent) return;
+						let sendOutcome: "written" | "rejected" | "dropped" = "dropped";
+						const sendTerminal = async (): Promise<"written" | "rejected" | "dropped"> => {
+							// Repeat calls (early hook send + fallback) return the FIRST,
+							// actual outcome — never a false dropped for an already
+							// written response (early-identity-rotation pattern).
+							if (terminalSent) return sendOutcome;
 							terminalSent = true;
-							await this.#send(connectionId, response);
+							try {
+								const outcome = await this.#send(connectionId, response);
+								sendOutcome = outcome === "written" ? "written" : "dropped";
+							} catch {
+								sendOutcome = "rejected";
+							}
+							return sendOutcome;
 						};
-						await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
-						await sendTerminal();
-						await this.#options.afterControlResponse?.(connectionId, frame, response);
+						try {
+							await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
+							// Fallback: if the before hook did not send early (identity
+							// rotation), the response is always sent here.
+							if (!terminalSent) sendOutcome = await sendTerminal();
+						} finally {
+							// Classify exactly once, immediately after the send attempt and
+							// BEFORE the optional post-write hook, so a rejected/dropped
+							// write (or an afterControlResponse throw) never mislabels it.
+							await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
+						}
+						if (sendOutcome === "written") {
+							await this.#options.afterControlResponse?.(connectionId, frame, response);
+						}
 					}
 					break;
 				}

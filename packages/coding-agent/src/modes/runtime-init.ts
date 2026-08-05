@@ -97,6 +97,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getActivePromptHandle: () => session.activePromptHandle,
 			abort: () => session.abort(),
 			abortPromptAndWait: (handle, abortOptions) => session.abortPromptAndWait(handle, abortOptions),
+			getTerminalTurnEpoch: () => session.getTerminalTurnEpoch(),
 			hasPendingMessages: () => session.queuedMessageCount > 0,
 			getPendingMessageCounts: () => session.pendingMessageCounts,
 			getTranscript: () => session.getTranscript(),

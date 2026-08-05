@@ -35,6 +35,7 @@ describe("SessionSdkHost", () => {
 						: new Set(),
 			sendFrame: (connectionId, frame) => {
 				sent.push({ connectionId, frame });
+				return "written";
 			},
 			onFrame: handler => {
 				receive = handler;
@@ -85,7 +86,9 @@ describe("SessionSdkHost", () => {
 			sessionId: "s",
 			stateRoot: "/tmp/s",
 			token: "t",
-			sendFrame: () => {},
+			sendFrame: () => {
+				return "written";
+			},
 			onFrame: value => {
 				handler = value;
 				return () => {
@@ -115,7 +118,9 @@ describe("SessionSdkHost", () => {
 			sessionId: "retry-stop",
 			stateRoot: "/tmp/retry-stop",
 			token: "t",
-			sendFrame: () => {},
+			sendFrame: () => {
+				return "written";
+			},
 			onFrame: () => () => {
 				unsubscribeAttempts++;
 			},
@@ -150,7 +155,9 @@ describe("SessionSdkHost", () => {
 			sessionId: "concurrent-stop",
 			stateRoot: "/tmp/concurrent-stop",
 			token: "t",
-			sendFrame: () => {},
+			sendFrame: () => {
+				return "written";
+			},
 			onFrame: () => () => {
 				unsubscribeAttempts++;
 			},
@@ -192,6 +199,7 @@ describe("SessionSdkHost", () => {
 			token: "t",
 			sendFrame: (connectionId, frame) => {
 				sent.push({ connectionId, frame });
+				return "written";
 			},
 			onFrame: handler => {
 				receive = handler;
@@ -276,6 +284,7 @@ describe("SessionSdkHost", () => {
 					failSends += 1;
 					throw new Error("connection closed");
 				}
+				return "written";
 			},
 			onFrame: handler => {
 				receive = handler;
@@ -304,6 +313,8 @@ describe("SessionSdkHost", () => {
 		const sent: Array<Record<string, unknown>> = [];
 		const successorReady = Promise.withResolvers<void>();
 		const order: string[] = [];
+		const deliveries: string[] = [];
+		let afterRan = false;
 		const host = new SessionSdkHost({
 			sessionId: "control-drain-order",
 			stateRoot: "/tmp/control-drain-order",
@@ -311,6 +322,7 @@ describe("SessionSdkHost", () => {
 			sendFrame: (_connectionId, frame) => {
 				order.push("send");
 				sent.push(frame);
+				return "written";
 			},
 			onFrame: handler => {
 				receive = handler;
@@ -323,6 +335,12 @@ describe("SessionSdkHost", () => {
 				order.push("ready");
 				await sendTerminal();
 			},
+			onControlResponseDelivery: async (_connectionId, _request, _response, outcome) => {
+				deliveries.push(outcome);
+			},
+			afterControlResponse: async () => {
+				afterRan = true;
+			},
 		});
 		await host.start();
 		receive("client", { type: "control_request", id: "c1", operation: "session.switch", input: {} });
@@ -334,6 +352,11 @@ describe("SessionSdkHost", () => {
 		await new Promise(resolve => setTimeout(resolve, 0));
 		expect(sent).toEqual([expect.objectContaining({ type: "control_response", id: "c1", ok: true })]);
 		expect(order).toEqual(["before", "ready", "send"]);
+		// The EARLY send (inside beforeControlResponse) is classified as written —
+		// the fallback repeat call must not report a false dropped — and the
+		// post-write hook runs for the written response.
+		expect(deliveries).toEqual(["written"]);
+		expect(afterRan).toBe(true);
 		await host.stop();
 	});
 });

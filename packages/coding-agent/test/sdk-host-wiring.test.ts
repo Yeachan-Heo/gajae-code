@@ -2535,6 +2535,9 @@ test("SDK host turn.abort terminal mode fails closed when the turn cannot be fen
 			...(context(cwd, sessionId, "main", live).sessionManager as Record<string, unknown>),
 			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
 		},
+		// The initial-marker seam: a stable epoch so the marker is written
+		// before the fence attempts (and fails closed) on the missing seam.
+		getTerminalTurnEpoch: () => 1,
 	};
 	const handlers = start(
 		sessionContext,
@@ -3347,6 +3350,7 @@ test("SDK host replay gaps are generation-scoped and sequence gaps remain cohere
 		token: "test-token",
 		sendFrame: (_connectionId, frame) => {
 			sent.push(frame);
+			return "written";
 		},
 		onFrame: handler => {
 			receive = handler;

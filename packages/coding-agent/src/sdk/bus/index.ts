@@ -2312,7 +2312,19 @@ function sdkControlSurface(
 		scope: AbortScope,
 		idempotencyKey?: string,
 	) => Promise<
-		| { ok: true; outcome: "stopped" | "stopped_owned" | "no_active_turn" | "already_terminal" | "no_store" }
+		| {
+				ok: true;
+				outcome:
+					| "stopped"
+					| "stopped_owned"
+					| "no_active_turn"
+					| "already_terminal"
+					| "no_store"
+					| "no_effect"
+					| "pending_replay"
+					| "uncertain_replay";
+				stored?: { responseState: string; responsePayloadHash: string; terminalPublished: boolean };
+		  }
 		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" | "conflict" }
 	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
@@ -2606,6 +2618,7 @@ function sdkControlSurface(
 					selection: scope,
 					turn: "no_active_turn",
 					terminal: "terminal_no_effect",
+					...(outcome.stored ? { replay: outcome.stored } : {}),
 				};
 			}
 			if (outcome.outcome === "no_store") {
@@ -2616,6 +2629,31 @@ function sdkControlSurface(
 					selection: scope,
 					turn: "no_store",
 					terminal: "terminal_no_effect",
+				};
+			}
+			if (outcome.outcome === "no_effect") {
+				// Initial marker could not be persisted before any destructive work
+				// (AC 10): process-local no-effect, no fence, no stop.
+				return {
+					ok: true,
+					selection: scope,
+					turn: "no_effect",
+					terminal: "terminal_no_effect",
+				};
+			}
+			if (outcome.outcome === "pending_replay" || outcome.outcome === "uncertain_replay") {
+				// A crashed or restart-settled attempt left a non-stopped durable
+				// marker (AC 4/41): replay safe uncertainty without re-running the
+				// stop/cleanup/event, carrying the stored immutable row.
+				return {
+					ok: true,
+					selection: scope,
+					turn: "uncertain",
+					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					automaticDelivery: scope === "turn" ? "enabled" : "none",
+					resumeOnOwnedCompletion: scope === "turn",
+					reason: outcome.outcome === "pending_replay" ? "replay_pending" : "replay_uncertain",
+					...(outcome.stored ? { replay: outcome.stored } : {}),
 				};
 			}
 			if (outcome.outcome === "stopped_owned") {
@@ -2629,6 +2667,7 @@ function sdkControlSurface(
 					ownedWork: "stopped",
 					automaticDelivery: "none",
 					resumeOnOwnedCompletion: false,
+					...(outcome.stored ? { replay: outcome.stored } : {}),
 				};
 			}
 			return {
@@ -2638,6 +2677,7 @@ function sdkControlSurface(
 				ownedWork: "left_running",
 				automaticDelivery: "enabled",
 				resumeOnOwnedCompletion: true,
+				...(outcome.stored ? { replay: outcome.stored } : {}),
 			};
 		},
 		abortAndPrompt: async text => {
@@ -4293,6 +4333,8 @@ export function createNotificationsExtension(
 				proof?: RunSettlementProof & {
 					terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
 				};
+				/** Whether the correlated agent_end event was published (AC 19). */
+				published?: boolean;
 			},
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
@@ -4374,38 +4416,47 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation) || !runtime) return;
-			if (winner.kind === "failed") {
-				emitPromptLifecycle(correlation, {
-					type: "agent_failed",
-					sessionId: runtime.id,
-					...correlation,
-					error: extra?.error ?? { code: winner.code, message: winner.message },
-					outcome: winner,
-				});
-			} else {
-				emitPromptLifecycle(correlation, {
-					type: "agent_end",
-					sessionId: runtime.id,
-					...correlation,
-					...(extra?.finalText ? { finalText: extra.finalText } : {}),
-					outcome: winner,
-					// Terminal abort: one correlated existing agent_end carries bounded
-					// scope/turn/ownedWork/automatic metadata before the first terminal
-					// success. ownedWork is pre-proof here (owned cleanup settles it in
-					// the terminal response); later owned-completion feedback uses the
-					// ordinary fresh-turn event path, never a second terminal event.
-					...(options.terminal
-						? {
-								terminal: {
-									scope: options.terminal.scope,
-									turn: "stopped",
-									ownedWork: options.terminal.scope === "turn" ? "left_running" : "uncertain",
-									automaticDelivery: options.terminal.scope === "turn" ? "enabled" : "none",
-									resumeOnOwnedCompletion: options.terminal.scope === "turn",
-								},
-							}
-						: {}),
-				});
+			try {
+				if (winner.kind === "failed") {
+					emitPromptLifecycle(correlation, {
+						type: "agent_failed",
+						sessionId: runtime.id,
+						...correlation,
+						error: extra?.error ?? { code: winner.code, message: winner.message },
+						outcome: winner,
+					});
+				} else {
+					emitPromptLifecycle(correlation, {
+						type: "agent_end",
+						sessionId: runtime.id,
+						...correlation,
+						...(extra?.finalText ? { finalText: extra.finalText } : {}),
+						outcome: winner,
+						// Terminal abort: one correlated existing agent_end carries bounded
+						// scope/turn/ownedWork/automatic metadata before the first terminal
+						// success. ownedWork is pre-proof here (owned cleanup settles it in
+						// the terminal response); later owned-completion feedback uses the
+						// ordinary fresh-turn event path, never a second terminal event.
+						...(options.terminal
+							? {
+									terminal: {
+										scope: options.terminal.scope,
+										turn: "stopped",
+										ownedWork: options.terminal.scope === "turn" ? "left_running" : "uncertain",
+										automaticDelivery: options.terminal.scope === "turn" ? "enabled" : "none",
+										resumeOnOwnedCompletion: options.terminal.scope === "turn",
+									},
+								}
+							: {}),
+					});
+				}
+				// The correlated event was published (AC 19): record the outcome so
+				// the durable terminal-scope record carries terminalPublished:true.
+				if (capture) capture.published = true;
+			} catch (error) {
+				// Event publication failed: the semantic terminal stands but the
+				// event bit stays false (no second event is ever emitted on replay).
+				logger.warn(`sdk: prompt terminal event publication failed: ${String(error)}`);
 			}
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
@@ -4534,14 +4585,33 @@ export function createNotificationsExtension(
 						if (existing.selection !== scope || existing.idempotencyInputHash !== inputHash) {
 							return { ok: false as const, reason: "conflict" as const };
 						}
+						// Replay every persisted durable row (AC 18/19/41) WITHOUT
+						// re-running the stop, cleanup, or event, carrying the stored
+						// response state, payload hash, and publication bit so the
+						// client sees the exact immutable row.
+						const storedRow = {
+							responseState: existing.responseState,
+							responsePayloadHash: existing.responsePayloadHash,
+							terminalPublished: existing.terminalPublished === true,
+						};
 						if (existing.turnDisposition === "stopped") {
 							return {
 								ok: true as const,
 								outcome: (existing.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
 									| "stopped"
 									| "stopped_owned",
+								stored: storedRow,
 							};
 						}
+						if (existing.turnDisposition === "pending") {
+							// A crashed attempt left an incomplete marker: replay the
+							// plan's pending row (AC 4/41) — safe uncertainty, NO
+							// re-run of the stop, cleanup, or event.
+							return { ok: true as const, outcome: "pending_replay" as const, stored: storedRow };
+						}
+						// uncertain (restart-settled) or any other durable state: safe
+						// uncertainty replay, never a re-run (AC 41 restart row).
+						return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
 					}
 				}
 				const active = [...promptSubmissions.entries()].find(
@@ -4550,10 +4620,50 @@ export function createNotificationsExtension(
 				if (!active) return { ok: true as const, outcome: "no_active_turn" as const };
 				const [commandId, turnId] = active[0].split(":", 2);
 				if (!commandId || !turnId) return { ok: true as const, outcome: "already_terminal" as const };
+				// Plan ordered step 4: write the bounded INITIAL MARKER (key/input
+				// hashes, pending dispositions, publication false, response pending)
+				// BEFORE any fence/stop/event effect, so a crash between the stop
+				// and the semantic CAS still leaves a same-key retry that replays
+				// deterministically instead of re-running effects. Marker failure is
+				// process-local no-effect (AC 10) — nothing destructive has run yet.
+				const epochSeam = ctx as typeof ctx & { getTerminalTurnEpoch?: () => number | undefined };
+				const markerEpoch = epochSeam.getTerminalTurnEpoch?.();
+				if (markerEpoch === undefined) return { ok: true as const, outcome: "no_effect" as const };
+				try {
+					await durableStore.transactTerminalScopes(scopes => {
+						const retained = scopes.filter(s => !(keyHash && s.idempotencyKeyHash === keyHash));
+						return [
+							...retained,
+							{
+								selection: scope,
+								...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
+								turnDisposition: "pending",
+								terminalPublished: false,
+								ownedWorkDisposition: "not_requested",
+								automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
+								resumeOnOwnedCompletion: scope === "turn",
+								turnContinuationFence: {
+									state: "retained",
+									abortedAttemptEpoch: markerEpoch,
+									blockedContinuationIds: [],
+									predecessorTombstones: [],
+									ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
+								},
+								responseState: "pending",
+								responsePayloadHash: inputHash,
+								acceptedAt: Date.now(),
+							} satisfies DurableTerminalScopeRecord,
+						];
+					});
+				} catch (error) {
+					logger.warn(`sdk: terminal initial marker persistence failed: ${String(error)}`);
+					return { ok: true as const, outcome: "no_effect" as const };
+				}
 				const captured: {
 					proof?: RunSettlementProof & {
 						terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
 					};
+					published?: boolean;
 				} = {};
 				await terminalizePrompt(
 					{ commandId, turnId },
@@ -4584,18 +4694,20 @@ export function createNotificationsExtension(
 						if (!ownedStopped) return { ok: false as const, reason: "owned_unsettled" as const };
 					}
 				}
-				// Persist the bounded durable terminal-scope record through the
-				// same full-document owner (idempotent per selection+epoch).
-				if (terminalScope) {
-					try {
-						await durableStore.transactTerminalScopes(scopes => {
-							const retained = scopes.filter(
-								s =>
-									!(
-										s.selection === scope &&
-										s.turnContinuationFence.abortedAttemptEpoch === terminalScope.abortedAttemptEpoch
-									),
-							);
+				// Semantic CAS: advance the INITIAL MARKER (matched by key hash, or
+				// by selection+epoch when keyless) to the final dispositions through
+				// the same full-document owner (plan step 15). The prompt terminal
+				// is already durable; a failed write fails closed to safe
+				// uncertainty — never a stopped disposition the record cannot prove.
+				try {
+					await durableStore.transactTerminalScopes(scopes =>
+						scopes.map(scopeRecord => {
+							const isMarker =
+								(keyHash !== undefined && scopeRecord.idempotencyKeyHash === keyHash) ||
+								(keyHash === undefined &&
+									scopeRecord.selection === scope &&
+									scopeRecord.turnDisposition === "pending");
+							if (!isMarker) return scopeRecord;
 							const ownedWorkDisposition =
 								scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain";
 							const payloadHash = crypto
@@ -4610,36 +4722,25 @@ export function createNotificationsExtension(
 									}),
 								)
 								.digest("hex");
-							return [
-								...retained,
-								{
-									selection: scope,
-									...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
-									turnDisposition: "stopped",
-									ownedWorkDisposition,
-									automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
-									resumeOnOwnedCompletion: scope === "turn",
-									turnContinuationFence: {
-										state: "retained",
-										abortedAttemptEpoch: terminalScope.abortedAttemptEpoch,
-										blockedContinuationIds: [],
-										predecessorTombstones: [],
-										ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
-									},
-									responseState: "pending",
-									responsePayloadHash: payloadHash,
-									acceptedAt: Date.now(),
-									terminalAt: Date.now(),
-								} satisfies DurableTerminalScopeRecord,
-							];
-						});
-					} catch (error) {
-						// The prompt terminal is already durable; a failed scope-record
-						// write must fail closed to safe uncertainty, never claim a
-						// stopped disposition the durable record cannot prove.
-						logger.warn(`sdk: terminal scope persistence failed: ${String(error)}`);
-						return { ok: false as const, reason: "worker_unsettled" as const };
-					}
+							return {
+								...scopeRecord,
+								turnDisposition: "stopped" as const,
+								terminalPublished: captured.published === true,
+								ownedWorkDisposition,
+								turnContinuationFence: {
+									...scopeRecord.turnContinuationFence,
+									abortedAttemptEpoch:
+										terminalScope?.abortedAttemptEpoch ??
+										scopeRecord.turnContinuationFence.abortedAttemptEpoch,
+								},
+								responsePayloadHash: payloadHash,
+								terminalAt: Date.now(),
+							};
+						}),
+					);
+				} catch (error) {
+					logger.warn(`sdk: terminal scope persistence failed: ${String(error)}`);
+					return { ok: false as const, reason: "worker_unsettled" as const };
 				}
 				if (scope === "owned") {
 					return { ok: true as const, outcome: "stopped_owned" as const };
@@ -4674,10 +4775,11 @@ export function createNotificationsExtension(
 			abandonPrompt(submission);
 		};
 
-		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>) => {
+		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>): "written" | "dropped" => {
 			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
+				// Deliberate drop (AC 17/20): no write, no post-write hook, no fallback.
 				abandonPromptResponse(connectionId, frame);
-				return;
+				return "dropped";
 			}
 			const json = JSON.stringify(frame);
 			if (connectionId.startsWith("seam:")) {
@@ -4694,7 +4796,7 @@ export function createNotificationsExtension(
 					abandonPromptResponse(connectionId, frame);
 					throw error;
 				}
-				return;
+				return "written";
 			}
 			try {
 				server.sendTo(connectionId, json);
@@ -4703,6 +4805,7 @@ export function createNotificationsExtension(
 				abandonPromptResponse(connectionId, frame);
 				throw error;
 			}
+			return "written";
 		};
 
 		/**
@@ -4785,6 +4888,36 @@ export function createNotificationsExtension(
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onRequest: options.onSdkRequest,
+			onControlResponseDelivery: async (_connectionId, request, _response, outcome) => {
+				// Terminal abort: persist the monotonic response-state transition
+				// (AC 18) — pending -> sent on a written response, pending -> failed
+				// on a rejected/dropped write. A same-key retry then replays the
+				// stored disposition with the matching response state.
+				if (
+					request.operation === "turn.abort" &&
+					typeof request.input === "object" &&
+					request.input !== null &&
+					(request.input as { mode?: unknown }).mode === "terminal" &&
+					typeof request.idempotencyKey === "string" &&
+					durableStore
+				) {
+					const keyHash = crypto.createHash("sha256").update(request.idempotencyKey).digest("hex");
+					try {
+						await durableStore.transactTerminalScopes(scopes =>
+							scopes.map(scope =>
+								scope.idempotencyKeyHash === keyHash && scope.responseState === "pending"
+									? {
+											...scope,
+											responseState: outcome === "written" ? ("sent" as const) : ("failed" as const),
+										}
+									: scope,
+							),
+						);
+					} catch (error) {
+						logger.warn(`sdk: terminal response-state persistence failed: ${String(error)}`);
+					}
+				}
+			},
 			beforeControlResponse: async (_connectionId, request, response, sendTerminal) => {
 				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
 				const pending = deferredIdentityRotation;
@@ -4873,32 +5006,6 @@ export function createNotificationsExtension(
 						acknowledgePrompt(connectionId, { commandId: result.commandId, turnId: result.turnId });
 				}
 
-				// Terminal abort: the control response was actually written to the
-				// client — advance the durable terminal-scope record's response
-				// state pending -> sent (AC 18 monotonic; a same-key replay then
-				// returns the same stored payload with responseState:"sent"). A
-				// failed transition never breaks the already-delivered response.
-				if (
-					request.operation === "turn.abort" &&
-					typeof request.input === "object" &&
-					request.input !== null &&
-					(request.input as { mode?: unknown }).mode === "terminal" &&
-					typeof request.idempotencyKey === "string" &&
-					durableStore
-				) {
-					const keyHash = crypto.createHash("sha256").update(request.idempotencyKey).digest("hex");
-					try {
-						await durableStore.transactTerminalScopes(scopes =>
-							scopes.map(scope =>
-								scope.idempotencyKeyHash === keyHash && scope.responseState === "pending"
-									? { ...scope, responseState: "sent" as const }
-									: scope,
-							),
-						);
-					} catch (error) {
-						logger.warn(`sdk: terminal response-state persistence failed: ${String(error)}`);
-					}
-				}
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
 			control: async (connectionId, frame) => {

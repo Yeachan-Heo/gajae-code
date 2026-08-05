@@ -163,6 +163,7 @@ describe("SDK replay capability filter", () => {
 						: undefined,
 			sendFrame: (connectionId, frame) => {
 				sent.push({ connectionId, frame });
+				return "written";
 			},
 			onFrame: handler => {
 				receive = handler;

@@ -10307,8 +10307,17 @@ export class AgentSession {
 		if (outcome.kind === "error") throw outcome.cause;
 	}
 	/**
-	 * Abort a specific active prompt and prove whether its tracked resources settled.
+	 * Private terminal-abort seam: read the CURRENT turn's attempt epoch WITHOUT
+	 * interrupting it. Used to write the durable initial terminal marker BEFORE
+	 * any fence/stop effect (plan ordered step 4). Only the epoch is exposed —
+	 * never the opaque lineage handle — so no private origin metadata leaves the
+	 * session. Fails closed (undefined) when no active turn lineage exists.
 	 */
+	getTerminalTurnEpoch(): number | undefined {
+		const lineageIdHash = this.#turnLineageIdHash;
+		if (!lineageIdHash) return undefined;
+		return this.#promptGeneration;
+	}
 	async abortPromptAndWait(
 		handle: string,
 		options: { graceMs: number; terminal?: { scope: "turn" | "owned" } },

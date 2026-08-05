@@ -81,12 +81,21 @@ Committed on `feat/abort-sdk-terminal` (lore `c04-terminal-*`), base `e92a04e3`:
   unregistered denied); injectors drop denied owned-completion deliveries entirely (AC 36
   zero final calls) and allocate a fresh attempt only on `allow-new-turn`.
 
-Documented remaining work (not silently omitted): the durable record is written at the terminal
-transition but is not yet re-hydrated into a runtime continuation fence on restart, and the
-six-row response replay table across restart/eviction is covered by the dispatch LRU plus the
-durable key-hash replay but not by a full persisted publication-bit state machine. These are
-tracked as follow-ups; the corrected design note, naming rules, boundary comments, and reviewer
-checklist below are the implementation contract.
+Durable contract status (AC 6/18/19/41/42): the record persists selection, the
+continuation fence (epoch + tombstones + policy), dispositions, the
+normalized-input and key hashes, response state, and `terminalPublished`. Same-key
+replay/conflict is deterministic across dispatch-LRU eviction and restart (the v2
+store reloads terminal scopes from the single document), and response state
+advances monotonic `pending -> sent` once the host writes the control response.
+Not wired (tracked): a `pending -> failed` transition on host write rejection
+(no surface-level host failure hook exists), a `sent -> delivered` transition
+(client-acknowledgement protocol), and runtime re-hydration of the continuation
+fence into the process registry. The last is architecturally bounded: lineage
+registries are process-local and the per-session lineage secret regenerates on
+restart, so a restarted session has NO lineage authority for a previous turn —
+the plan's own AC 42 conditions fence installation on "runtime authority being
+present", and missing authority failing closed (no auto-inject) is satisfied by
+the durable replay/conflict gate alone.
 
 ## Reviewer / implementer checklist (mandatory)
 

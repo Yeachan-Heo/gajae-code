@@ -1458,6 +1458,9 @@ export interface ExtensionContextActions {
 		handle: string,
 		options: { graceMs: number; terminal?: { scope: "turn" | "owned" } },
 	) => Promise<RunSettlementProof>;
+	/** Private terminal-abort seam: current turn attempt epoch without interrupting it. */
+	getTerminalTurnEpoch?: () => number | undefined;
+
 	hasPendingMessages: () => boolean;
 	/** Typed pending-message counts per queue; optional for embedders without a counted queue. */
 	getPendingMessageCounts?: () => { steering: number; followUp: number; nextTurn: number };

@@ -22,7 +22,10 @@ test("SDK-RPC-provider-conflict: real ACP clients race atomically for one provid
 		sessionId: "s",
 		stateRoot: "/tmp",
 		token: "token",
-		sendFrame: (connectionId, frame) => server.sendTo(connectionId, JSON.stringify(frame)),
+		sendFrame: (connectionId, frame) => {
+			server.sendTo(connectionId, JSON.stringify(frame));
+			return "written";
+		},
 		onFrame: handler => {
 			onFrame = handler;
 			return () => {

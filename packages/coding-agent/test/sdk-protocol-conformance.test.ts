@@ -138,6 +138,7 @@ describe("SDK v3 TypeScript/Rust wire conformance", () => {
 			token: "token",
 			sendFrame: (_connectionId, value) => {
 				sent.push(value);
+				return "written";
 			},
 			onFrame: handler => {
 				receive = handler;

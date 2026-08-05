@@ -20,7 +20,10 @@ test("reverse transport keeps typed lease frames isolated across reconnect and h
 		sessionId: "s",
 		stateRoot: "/tmp",
 		token: "token",
-		sendFrame: (connectionId, frame) => server.sendTo(connectionId, JSON.stringify(frame)),
+		sendFrame: (connectionId, frame) => {
+			server.sendTo(connectionId, JSON.stringify(frame));
+			return "written";
+		},
 		onFrame: handler => {
 			onFrame = handler;
 			return () => {

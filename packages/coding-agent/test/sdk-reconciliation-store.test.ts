@@ -385,3 +385,62 @@ test("terminal scope response state advances pending -> sent through the shared 
 	expect(reloaded.snapshotTerminalScopes()[0]!.responseState).toBe("sent");
 	await fs.rm(root, { recursive: true, force: true });
 });
+
+test("initial pending marker CASes to stopped through the same owner", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-marker-"));
+	const sessionFile = path.join(root, "s.jsonl");
+	await fs.writeFile(sessionFile, "");
+	const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	// Initial marker (plan step 4): pending, publication false, response pending.
+	await store.transactTerminalScopes(() => [
+		{
+			selection: "turn",
+			idempotencyKeyHash: "k1",
+			idempotencyInputHash: "i1",
+			turnDisposition: "pending",
+			terminalPublished: false,
+			ownedWorkDisposition: "not_requested",
+			automaticDeliveryDisposition: "enabled",
+			resumeOnOwnedCompletion: true,
+			turnContinuationFence: {
+				state: "retained",
+				abortedAttemptEpoch: 3,
+				blockedContinuationIds: [],
+				predecessorTombstones: [],
+				ownedCompletionPolicy: "enabled",
+			},
+			responseState: "pending",
+			responsePayloadHash: "i1",
+			acceptedAt: 1,
+		},
+	]);
+	const marker = store.snapshotTerminalScopes()[0]!;
+	expect(marker.turnDisposition).toBe("pending");
+	expect(marker.terminalPublished).toBe(false);
+	// Semantic CAS (plan step 15): advance the same marker.
+	await store.transactTerminalScopes(scopes =>
+		scopes.map(s =>
+			s.idempotencyKeyHash === "k1"
+				? {
+						...s,
+						turnDisposition: "stopped" as const,
+						terminalPublished: true,
+						ownedWorkDisposition: "left_running" as const,
+						terminalAt: 2,
+					}
+				: s,
+		),
+	);
+	const cas = store.snapshotTerminalScopes()[0]!;
+	expect(cas.turnDisposition).toBe("stopped");
+	expect(cas.terminalPublished).toBe(true);
+	expect(cas.ownedWorkDisposition).toBe("left_running");
+	// Reload keeps the CASed state; restart settlement leaves a stopped scope untouched.
+	const reloaded = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	await reloaded.load();
+	expect(reloaded.snapshotTerminalScopes()[0]!.turnDisposition).toBe("stopped");
+	expect(settleTerminalScopeRestart(reloaded.snapshotTerminalScopes(), 9)[0]).toEqual(
+		reloaded.snapshotTerminalScopes()[0],
+	);
+	await fs.rm(root, { recursive: true, force: true });
+});
