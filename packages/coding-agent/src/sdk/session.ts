@@ -20,12 +20,8 @@ import {
 	type SimpleStreamOptions,
 	streamSimple,
 	type ToolResultMessage,
-} from "@gajae-code/ai";
-import {
-	codexToolWireName,
-	getOpenAICodexTransportDetails,
-	prewarmOpenAICodexResponses,
-} from "@gajae-code/ai/providers/openai-codex-responses";
+} from "@gajae-code/ai/core";
+import { codexToolWireName } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import {
 	$flag,
@@ -63,8 +59,6 @@ import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings } from "../discovery";
-import { disposeAllVmContexts, disposeVmContextsByOwner } from "../eval/js/context-manager";
-import { disposeAllKernelSessions, disposeKernelSessionsByOwner } from "../eval/py/executor";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
@@ -86,6 +80,7 @@ import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injec
 import { currentActivationFingerprint } from "../extensibility/gjc-plugins/lifecycle";
 import {
 	buildPluginMcpConfigs,
+	getGjcPluginToolDeclarations,
 	loadAlwaysOnPluginTools,
 	renderAlwaysOnSystemAppendices,
 } from "../extensibility/gjc-plugins/runtime-adapters";
@@ -100,12 +95,15 @@ import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../e
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
-import { resolveMemoryBackend } from "../memory-backend";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { createLazyService } from "../runtime/lazy-service";
+import {
+	createOptionalRuntimeServices,
+	type OptionalRuntimeServicesOverrides,
+} from "../runtime/optional-runtime-services";
 import { MCPManager } from "../runtime-mcp";
-import { createNotificationsExtension } from "../sdk/bus";
 import {
 	getNotificationConfig,
 	isGenericNotificationHostEligible,
@@ -115,22 +113,14 @@ import {
 } from "../sdk/bus/config";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
-import {
-	collectEnvSecrets,
-	createSecretObfuscator,
-	deobfuscateSessionContext,
-	loadSecrets,
-	obfuscateMessages,
-	type SecretObfuscator,
-} from "../secrets";
+import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
+import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
-import { closeAllConnections } from "../ssh/connection-manager";
-import { unmountAll } from "../ssh/sshfs-mount";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -142,40 +132,22 @@ import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
 import {
-	applyConfiguredSearchTimeout,
-	BashTool,
 	BUILTIN_TOOLS,
+	BUILTIN_TOOL_DESCRIPTORS,
 	computeEssentialBuiltinNames,
 	createTools,
-	discoverStartupLspServers,
-	EditTool,
-	EvalTool,
-	FindTool,
-	getConfiguredSearchProviderPreference,
-	getSearchTools,
 	HIDDEN_TOOLS,
-	isConfigurableSearchProviderId,
-	type LspStartupServerInfo,
-	loadSshTool,
-	ReadTool,
-	ResolveTool,
-	SearchTool,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
-	setPreferredSearchProvider,
-	setSearchFallbackProviders,
+	resolveEffectiveDiscoveryMode,
 	type Tool,
 	type ToolSession,
-	WebSearchTool,
-	WriteTool,
 } from "../tools";
+import type { LspStartupServerInfo } from "../lsp";
 import { ToolContextStore } from "../tools/context";
-import { getImageGenTools } from "../tools/image-gen";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
-import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
+import type { WorkspaceTree } from "../workspace-tree";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -461,6 +433,13 @@ export interface CreateAgentSessionOptions {
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
 	parentTaskPrefix?: string;
+	/**
+	 * W6b: the parent's scope-held MCP facade, handed to a canonical sub-session so
+	 * it can inherit always-on MCP tools without owning the manager. Replaces the
+	 * removed `MCPManager.instance()` inheritance path; the sub-session never
+	 * connects, registers callbacks, or disposes this manager.
+	 */
+	inheritedMcpManager?: import("../runtime-mcp/manager").MCPManager;
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
@@ -470,6 +449,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Settings instance. Default: Settings.init({ cwd, agentDir }) */
 	settings?: Settings;
+	/** Internal/advanced runtime-service injection. Omitted services use session defaults. */
+	runtimeServices?: OptionalRuntimeServicesOverrides;
 
 	/** Whether UI is available (enables interactive tools like ask). Default: false */
 	hasUI?: boolean;
@@ -543,23 +524,15 @@ export type { Tool } from "../tools";
 export { buildDirectoryTree, buildWorkspaceTree, type DirectoryTree, type WorkspaceTree } from "../workspace-tree";
 
 export {
-	// Individual tool classes (for custom usage)
-	BashTool,
-	// Tool classes and factories
 	BUILTIN_TOOLS,
 	createTools,
-	EditTool,
-	EvalTool,
-	FindTool,
 	HIDDEN_TOOLS,
-	loadSshTool,
-	ReadTool,
-	ResolveTool,
-	SearchTool,
 	type ToolSession,
-	WebSearchTool,
-	WriteTool,
 };
+
+export async function loadSshTool(session: ToolSession) {
+	return (await import("../tools/ssh")).loadSshTool(session);
+}
 
 // Helper Functions
 
@@ -744,38 +717,6 @@ function isCustomTool(tool: CustomTool | ToolDefinition): tool is CustomTool {
 
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 
-let sshCleanupRegistered = false;
-
-async function cleanupSshResources(): Promise<void> {
-	const results = await Promise.allSettled([closeAllConnections(), unmountAll()]);
-	for (const result of results) {
-		if (result.status === "rejected") {
-			logger.warn("SSH cleanup failed", { error: String(result.reason) });
-		}
-	}
-}
-
-function registerSshCleanup(): void {
-	if (sshCleanupRegistered) return;
-	sshCleanupRegistered = true;
-	postmortem.register("ssh-cleanup", cleanupSshResources);
-}
-
-let pythonCleanupRegistered = false;
-
-function registerPythonCleanup(): void {
-	if (pythonCleanupRegistered) return;
-	pythonCleanupRegistered = true;
-	postmortem.register("python-cleanup", disposeAllKernelSessions);
-}
-
-let jsVmCleanupRegistered = false;
-
-function registerJsVmCleanup(): void {
-	if (jsVmCleanupRegistered) return;
-	jsVmCleanupRegistered = true;
-	postmortem.register("js-vm-cleanup", disposeAllVmContexts);
-}
 
 /*
  * Append-only context-mode resolution + manager construction live in
@@ -827,7 +768,7 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 				try {
 					await tool.onSession(event, createCustomToolContext(ctx));
 				} catch (err) {
-					logger.warn("Custom tool onSession error", { tool: tool.name, error: String(err) });
+					logger.warn("Custom tool onSession error", { tool: tool.name, error: safeErrorForLog(err) });
 				}
 			}
 		};
@@ -907,11 +848,10 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): ExtensionFactory {
 	return api => {
 		for (const hook of hooks) {
-			// Constrained plugin hooks register exactly their declared event handler
-			// through the standard extension API; the loader already denied every
-			// session-mutation/command/exec capability at load time. At execution we
-			// additionally enforce the declared `target`: a tool-scoped hook only
-			// fires for its declared tool, never for arbitrary tool events.
+			// Constrained hooks have one explicit execution phase. `tool_call` is
+			// pre-execution; an after-phase tool_call hook is registered on the
+			// post-execution tool_result event so it cannot block the tool.
+			const registrationEvent = hook.event === "tool_call" && hook.phase === "after" ? "tool_result" : hook.event;
 			const target = hook.target;
 			const handler = target
 				? (event: { toolName?: string; tool?: { name?: string }; name?: string }, ...rest: unknown[]) => {
@@ -920,7 +860,7 @@ export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): Exte
 						return (hook.handler as (...a: unknown[]) => unknown)(event, ...rest);
 					}
 				: hook.handler;
-			(api.on as (event: string, handler: (...args: unknown[]) => unknown) => void)(hook.event, handler);
+			(api.on as (event: string, handler: (...args: unknown[]) => unknown) => void)(registrationEvent, handler);
 		}
 	};
 }
@@ -984,7 +924,7 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
  * const { session } = await createAgentSession();
  *
  * // With explicit model
- * import { getModel } from '@gajae-code/ai';
+ * import { getModel } from '@gajae-code/ai/core';
  * const { session } = await createAgentSession({
  *   model: getModel('anthropic', 'Anthropic model-opus-4-5'),
  *   thinkingLevel: 'high',
@@ -1038,6 +978,105 @@ class ExactMcpToolNameCollisionError extends Error {
 			.map(name => name.slice(0, MAX_EXACT_MCP_TOOL_NAME_LENGTH));
 		super(`Exact MCP tool name collision: ${names.join(", ")}`);
 	}
+}
+
+class McpManagerCleanupError extends Error {
+	readonly code = "MCP_MANAGER_CLEANUP_FAILED";
+	constructor(cause: unknown) {
+		super(`Owned MCP manager cleanup failed: ${safeErrorDescription(cause)}`, { cause });
+		this.name = "McpManagerCleanupError";
+	}
+}
+
+class McpManagerCleanupDiagnosticError extends Error {
+	readonly code = "MCP_MANAGER_CLEANUP_FAILED";
+	readonly primaryError: unknown;
+	readonly cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED"; cause: unknown };
+	constructor(primaryError: unknown, cleanupError: unknown) {
+		super(safeErrorDescription(primaryError), { cause: primaryError });
+		this.name = "McpManagerCleanupDiagnosticError";
+		this.primaryError = primaryError;
+		this.cleanupDiagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError };
+	}
+}
+
+function safeErrorDescription(value: unknown): string {
+	let isError = false;
+	try {
+		isError = value instanceof Error;
+	} catch {
+		// Hostile proxies can throw from getPrototypeOf during instanceof.
+	}
+	if (isError) {
+		try {
+			const message = (value as { message?: unknown }).message;
+			if (typeof message === "string") return message;
+		} catch {
+			// Hostile error getters must not replace the primary failure.
+		}
+	}
+	try {
+		return String(value);
+	} catch {
+		return "<unprintable error>";
+	}
+}
+
+function safeIsInstanceOf<T extends object>(value: unknown, constructor: abstract new (...args: any[]) => T): boolean {
+	try {
+		return value instanceof constructor;
+	} catch {
+		return false;
+	}
+}
+
+function safeReadProperty(value: unknown, key: string): unknown {
+	if (value === null || (typeof value !== "object" && typeof value !== "function")) return undefined;
+	try {
+		return (value as Record<string, unknown>)[key];
+	} catch {
+		return undefined;
+	}
+}
+
+function safeCleanupDiagnosticForLog(value: unknown): { code: string; cause: string } | undefined {
+	if (value === undefined) return undefined;
+	const code = safeReadProperty(value, "code");
+	const nestedCause = safeReadProperty(value, "cause");
+	return {
+		code: typeof code === "string" ? code : "MCP_MANAGER_CLEANUP_FAILED",
+		cause: safeErrorDescription(nestedCause === undefined ? value : nestedCause),
+	};
+}
+function safeReadCleanupDiagnostic(value: unknown): unknown {
+	if (value === null || (typeof value !== "object" && typeof value !== "function")) return undefined;
+	try {
+		return (value as { cleanupDiagnostic?: unknown }).cleanupDiagnostic;
+	} catch {
+		return undefined;
+	}
+}
+
+function safeErrorForLog(value: unknown): unknown {
+	return safeErrorDescription(value);
+}
+
+function attachMcpCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown {
+	const diagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED" as const, cause: cleanup };
+	if (primary && (typeof primary === "object" || typeof primary === "function")) {
+		try {
+			Object.defineProperty(primary, "cleanupDiagnostic", {
+				value: diagnostic,
+				enumerable: false,
+				configurable: true,
+			});
+			const attached = safeReadCleanupDiagnostic(primary);
+			if (attached === diagnostic) return primary;
+		} catch {
+			// Frozen/proxy errors cannot carry an own diagnostic; preserve both through a typed wrapper.
+		}
+	}
+	return new McpManagerCleanupDiagnosticError(primary, cleanup);
 }
 
 function findExactMcpToolNameCollisions(
@@ -1098,13 +1137,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (isCanonicalSubSession && options.mcpManager?.isToolsOnly()) {
 		throw new Error(MCP_TOOLS_ONLY_MANAGER_SUBSESSION_ERROR);
 	}
+	if (isCanonicalSubSession && options.inheritedMcpManager?.isToolsOnly()) {
+		throw new Error(MCP_TOOLS_ONLY_MANAGER_SUBSESSION_ERROR);
+	}
 	const cwd = options.cwd ?? getProjectDir();
+	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
 
-	registerSshCleanup();
-	registerPythonCleanup();
-	registerJsVmCleanup();
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
@@ -1181,6 +1221,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
 		}
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		const canRefreshModelsBeforeCredentialSelector =
@@ -1188,14 +1229,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!options.modelRegistry && canRefreshModelsBeforeCredentialSelector) {
 			modelRegistry.refreshInBackground();
 		}
-		// Kick off workspace tree discovery early. The native workspace scan returns
-		// both the rendered-tree input and the AGENTS.md directory-context index, so
-		// startup does not perform a second recursive filesystem search. Subagents
-		// inherit the parent's resolved values via options.
+		// Resolve the workspace tree through its runtime service. The compatibility
+		// default starts the native scan at the legacy startup trigger; lazy mode
+		// leaves the service idle until the first-turn prompt barrier. The native scan
+		// returns both rendered-tree input and the AGENTS.md directory-context index.
 		const STARTUP_SCAN_DEADLINE_MS = 5000;
-		const workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
+		const workspaceTreeMode = settings.get("workspaceTree.mode");
+		const emptyWorkspaceTree: WorkspaceTree = {
+			rootPath: path.resolve(cwd),
+			rendered: "",
+			truncated: false,
+			totalLines: 0,
+			agentsMdFiles: [],
+		};
+		let workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
 			? Promise.resolve(options.workspaceTree)
-			: logger.time("buildWorkspaceTree", () => buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }));
+			: workspaceTreeMode === "lazy"
+				? Promise.resolve(emptyWorkspaceTree)
+				: logger.time("buildWorkspaceTree", () =>
+						runtimeServices.workspaceTree.get("legacy-startup").then(runtime => runtime.snapshot),
+				  );
 		workspaceTreePromise.catch(() => {});
 
 		// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
@@ -1213,6 +1266,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		slashCommandsPromise.catch(() => {});
 
 		// Initialize provider preferences from settings
+		const {
+			getConfiguredSearchProviderPreference,
+			setPreferredSearchProvider,
+			setSearchFallbackProviders,
+		} = await import("../web/search/provider");
+		const { isConfigurableSearchProviderId } = await import("../web/search/types");
+		const { applyConfiguredSearchTimeout } = await import("../web/search/providers/utils");
 		const webSearchProvider = getConfiguredSearchProviderPreference(settings);
 		setPreferredSearchProvider(webSearchProvider);
 		const webSearchFallback = settings.get("web_search.fallback");
@@ -1237,6 +1297,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			imageProvider === "alibaba" ||
 			imageProvider === "custom"
 		) {
+			const { setConfiguredImageModel, setPreferredImageProvider } = await import("../tools/image-gen");
 			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
 			setConfiguredImageModel({
 				provider: imageProvider,
@@ -1300,19 +1361,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Load and create secret obfuscator early so resumed session state and prompt warnings
 		// reflect actual loaded secrets, not just the setting toggle.
 		let obfuscator: SecretObfuscator | undefined;
+		let deobfuscateSessionContextFn: typeof import("../secrets").deobfuscateSessionContext | undefined;
+		let obfuscateMessagesFn: typeof import("../secrets").obfuscateMessages | undefined;
 		if (settings.get("secrets.enabled")) {
-			const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
-			const envEntries = collectEnvSecrets();
+			const secrets = await import("../secrets");
+			deobfuscateSessionContextFn = secrets.deobfuscateSessionContext;
+			obfuscateMessagesFn = secrets.obfuscateMessages;
+			const fileEntries = await logger.time("loadSecrets", secrets.loadSecrets, cwd, agentDir);
+			const envEntries = secrets.collectEnvSecrets();
 			const allEntries = [...envEntries, ...fileEntries];
 			if (allEntries.length > 0) {
-				obfuscator = createSecretObfuscator(allEntries);
+				obfuscator = secrets.createSecretObfuscator(allEntries);
 			}
 		}
 		const secretsEnabled = obfuscator?.hasSecrets() === true;
 
 		// Check if session has existing data to restore
 		const existingSession = logger.time("loadSessionContext", () =>
-			deobfuscateSessionContext(sessionManager.buildSessionContext(), obfuscator),
+			deobfuscateSessionContextFn
+				? deobfuscateSessionContextFn(sessionManager.buildSessionContext(), obfuscator)
+				: sessionManager.buildSessionContext(),
 		);
 		const existingBranch = logger.time("getSessionBranch", () => sessionManager.getBranch());
 		const hasExistingSession = existingBranch.length > 0;
@@ -1411,13 +1479,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
 				resolveThinkingLevelForModel(resolvedModel, thinkingLevel),
 			);
-			// Fire-and-forget TLS+H2 handshake to the model's host so it overlaps
-			// with the rest of session setup (extension/skill load, tool registry,
-			// system prompt build). Without this, the first `fetch(...)` pays the
-			// full handshake serially — 100–300 ms transcontinental for
-			// api.anthropic.com from a residential IP. Every session frontend benefits
-			// (interactive, print, SDK, ACP).
-			preconnectModelHost(model.baseUrl);
+			// Keep the legacy startup trigger for the model-host preconnect. The
+			// runtime service preserves the best-effort fetch.preconnect contract while
+			// allowing startup.networkPrewarm=false to skip the call entirely.
+			void runtimeServices.networkPrewarm
+				.get("legacy-startup")
+				.then(prewarm => prewarm.preconnect(resolvedModel.baseUrl))
+				.catch(error => {
+					logger.warn("Model-host prewarm service failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
 		}
 
 		let skills: Skill[];
@@ -1595,6 +1667,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
 			getActiveSkillState: () => session?.getActiveSkillState(),
 			getActiveSkillPhase: () => session?.getActiveSkillPhase(),
@@ -1635,7 +1708,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			isToolDiscoveryEnabled: () => session.isToolDiscoveryEnabled(),
 			getDiscoverableTools: filter => session.getDiscoverableTools(filter),
 			getDiscoverableToolSearchIndex: () => session.getDiscoverableToolSearchIndex(),
-			getSelectedDiscoveredToolNames: () => session.getSelectedDiscoveredToolNames(),
+			getSelectedDiscoveredToolNames: () => session?.getSelectedDiscoveredToolNames() ?? [],
 			activateDiscoveredTools: toolNames => session.activateDiscoveredTools(toolNames),
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
@@ -1673,6 +1746,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			releaseArtifactManager: manager => sessionManager.releaseArtifactManager(manager),
 			ensureArtifactManager: () => sessionManager.ensureArtifactManager(),
 			registerSessionCleanup: cleanup => session?.registerToolSessionTransitionCleanup(cleanup) ?? (() => {}),
+			mcpConfigPath: explicitMcpConfigPath,
 			settings,
 			authStorage,
 			modelRegistry,
@@ -1723,20 +1797,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// below after `customTools` is populated.
 		let mcpManager: MCPManager | undefined = options.mcpManager;
 		let ownsMcpManager = false;
-		const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 		const customTools: CustomTool[] = [];
 		const exactMcpToolNames: string[] = [];
 		const pluginMcpToolNames: string[] = [];
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
 		// Add image tools when the active model or configured image providers can generate images.
+		const { getImageGenTools } = await import("../tools/image-gen");
 		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
 		if (imageGenTools.length > 0) {
 			customTools.push(...(imageGenTools as unknown as CustomTool[]));
 		}
-
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
+			const { getSearchTools } = await import("../web/search");
 			customTools.push(...getSearchTools());
 		}
 
@@ -1748,6 +1822,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				...customTools.map(tool => tool.name),
 			]),
 		];
+		// Registry load performs v1-to-v2 metadata migration without importing
+		// plugin implementations. Keep this declaration phase before any subskill
+		// tool activation so an entry cannot be live on both paths.
+		const gjcToolDeclarations = await getGjcPluginToolDeclarations(cwd);
 
 		const gjcSubskillToolContext = options.gjcSubskillToolContext;
 		if (gjcSubskillToolContext?.parent.trim() && gjcSubskillToolContext.phase.trim()) {
@@ -1794,7 +1872,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// current, so publish nothing rather than a snapshot consumers cannot
 			// validate against.
 			gjcProducersComplete = false;
-			logger.warn("Failed to derive GJC bundle activation generation", { error });
+			logger.warn("Failed to derive GJC bundle activation generation", { error: safeErrorForLog(error) });
 		}
 		const gjcFindings = new GjcRuntimeFindingAccumulator(gjcActivationGeneration);
 
@@ -1805,6 +1883,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const pluginToolResult = await loadAlwaysOnPluginTools({
 				cwd,
 				reservedToolNames: [...getReservedSubskillToolNames(), ...customTools.map(tool => tool.name)],
+				declarations: gjcToolDeclarations,
 			});
 			if (pluginToolResult.tools.length > 0) customTools.push(...pluginToolResult.tools);
 			for (const q of pluginToolResult.quarantine) {
@@ -1813,13 +1892,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		} catch (error) {
 			gjcProducersComplete = false;
-			logger.warn("Failed to load always-on GJC plugin tools", { error });
+			logger.warn("Failed to load always-on GJC plugin tools", { error: safeErrorForLog(error) });
 		}
 
 		const preExactCustomToolNames = customTools.map(tool => tool.name);
 		if (explicitMcpConfigPath !== undefined) {
 			const owned = new MCPManager(cwd, null, {
 				toolsOnly: true,
+				sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
 				...(lifecycleMcpStartupTimeoutMs !== undefined
 					? { maxStartupTimeoutMs: lifecycleMcpStartupTimeoutMs }
 					: {}),
@@ -1852,7 +1932,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
 				if (Object.keys(configs).length > 0) {
-					const owned = new MCPManager(cwd);
+					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					try {
 						const sources = Object.fromEntries(
 							Object.keys(configs).map(name => [
@@ -1866,7 +1947,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// incomplete: its surfaces produced no evidence, so publishing
 							// would present a partial pass as a clear one.
 							gjcProducersComplete = false;
-							logger.warn("GJC plugin MCP connect failed", { path: `mcp:${server}`, error: err });
+							logger.warn("GJC plugin MCP connect failed", { path: `mcp:${server}`, error: safeErrorForLog(err) });
 						}
 						if (result.connectedServers.length > 0) {
 							mcpManager = owned;
@@ -1876,26 +1957,44 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							owned.sealConnectionSet();
 							pluginMcpToolNames.push(...result.tools.map(tool => tool.name));
 						} else {
-							await owned.disconnectAll().catch(() => {});
+							try {
+								await owned.disconnectAll();
+								cleanupOwnedMcpManager = undefined;
+							} catch (cleanupError) {
+								cleanupOwnedMcpManager = undefined;
+								throw new McpManagerCleanupError(cleanupError);
+							}
 						}
 					} catch (error) {
+						if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
 						// Avoid leaking partially-started server processes on failure.
-						await owned.disconnectAll().catch(() => {});
+						let cleanupError: unknown;
+						try {
+							await owned.disconnectAll();
+						} catch (disconnectError) {
+							cleanupError = disconnectError;
+						} finally {
+							cleanupOwnedMcpManager = undefined;
+						}
+						if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
 						throw error;
 					}
 				}
 			} catch (error) {
+				if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
 				gjcProducersComplete = false;
-				logger.warn("Failed to wire GJC plugin MCP servers", { error });
+				const cleanupDiagnostic = safeReadCleanupDiagnostic(error);
+				logger.warn("Failed to wire GJC plugin MCP servers", {
+					error: safeErrorForLog(error),
+					cleanupDiagnostic: safeCleanupDiagnosticForLog(cleanupDiagnostic),
+				});
 			}
 		} else if (isCanonicalSubSession) {
-			// Subagent: inherit the parent's always-on plugin MCP tools WITHOUT
-			// owning the manager (no connect, no callbacks, no disposal). The
-			// top-level session installed its manager as the process-global
-			// instance; reading getTools() surfaces the same always-on tools so the
-			// product decision holds for subagent sessions too.
-			const singleton = MCPManager.instance();
-			const inherited = mcpManager ?? (singleton?.isToolsOnly() ? undefined : singleton);
+			// Subagents inherit the parent's always-on plugin MCP tools WITHOUT
+			// owning the manager (no connect, no callbacks, no disposal). The facade
+			// is carried explicitly by the parent session scope; process-global state
+			// is never consulted for MCP routing.
+			const inherited = mcpManager ?? options.inheritedMcpManager;
 			if (inherited) {
 				try {
 					const inheritedTools = inherited.getTools();
@@ -1909,15 +2008,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						);
 					}
 				} catch (error) {
-					logger.warn("Failed to inherit MCP tools in subagent", { error });
+					logger.warn("Failed to inherit MCP tools in subagent", { error: safeErrorForLog(error) });
 				}
 			}
 		}
-		// Exact-config managers are session-local. Plugin managers keep their
-		// existing top-level singleton behavior for bundled runtime surfaces.
-		if (mcpManager && !mcpManager.isToolsOnly() && !isCanonicalSubSession && explicitMcpConfigPath === undefined) {
-			MCPManager.setInstance(mcpManager);
-		}
+		// MCP routing is scope-held; no process-global manager registration.
 
 		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
 		// Explicit SDK extension factories are still honored; callers use them to
@@ -1940,7 +2035,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		} catch (error) {
 			gjcProducersComplete = false;
-			logger.warn("Failed to load constrained GJC plugin hooks", { error });
+			logger.warn("Failed to load constrained GJC plugin hooks", { error: safeErrorForLog(error) });
 		}
 
 		let notificationCfg: NotificationConfig | undefined;
@@ -1973,39 +2068,57 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getConfig: () => getNotificationConfig(settings),
 			spawnedByGjc,
 		});
-		if (
+		const notificationsExtensionEligible = Boolean(
 			lifecycleStartupCapability ||
-			shouldRegisterGenericNotificationsExtension({
-				env: process.env,
-				cfg: notificationCfg,
-				taskDepth,
-				parentTaskPrefix: options.parentTaskPrefix,
-				currentAgentType: options.currentAgentType,
-				spawnedByGjc,
-			}) ||
-			(shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true))
-		) {
+				shouldRegisterGenericNotificationsExtension({
+					env: process.env,
+					cfg: notificationCfg,
+					taskDepth,
+					parentTaskPrefix: options.parentTaskPrefix,
+					currentAgentType: options.currentAgentType,
+					spawnedByGjc,
+				}),
+		);
+		const sdkHostEligible =
+			shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true);
+		const notificationAdapterService = createLazyService({
+			id: "sdk.notifications.adapters",
+			enabled: () => notificationsExtensionEligible,
+			initialize: async () => ({
+				value: (await import("../sdk/bus")).createNotificationsExtension,
+			}),
+		});
+		if (notificationsExtensionEligible || sdkHostEligible) {
 			inlineExtensions.push(async api => {
 				try {
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
-					createNotificationsExtension(api, {
-						settings,
-						controller: notificationSessionController,
-						spawnedByGjc,
-						sdkHostModeSupported: options.sdkHostModeSupported,
-						ensureProviderDaemon: options.ensureNotificationProviderDaemon,
-						runBtwTurn: async (question, signal) => {
-							if (!session) throw new Error("Ephemeral turns are unavailable.");
-							const { replyText } = await session.runEphemeralTurn({
-								purpose: "btw",
-								turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
-								signal,
-							});
-							return { replyText };
-						},
-					});
+					if (notificationsExtensionEligible) {
+						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
+						createNotificationsExtension(api, {
+							settings,
+							controller: notificationSessionController,
+							spawnedByGjc,
+							sdkHostModeSupported: options.sdkHostModeSupported,
+							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
+							runBtwTurn: async (question, signal) => {
+								if (!session) throw new Error("Ephemeral turns are unavailable.");
+								const { replyText } = await session.runEphemeralTurn({
+									purpose: "btw",
+									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
+									signal,
+								});
+								return { replyText };
+							},
+						});
+					} else if (sdkHostEligible) {
+						registerSdkOnlyNotificationCommand(api);
+						const { createSdkWebSocketTransport } = await import("../sdk/host/websocket-transport");
+						createSdkSessionRuntimeExtension(api, {
+							createTransport: input => createSdkWebSocketTransport(input),
+						});
+					}
 				} catch (error) {
 					lifecycleStartupCapability?.settleFailure(
 						lifecycleStartupCapability.normalizeFailure("registration", "factory_absent", error),
@@ -2211,7 +2324,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (settings.get("goal.enabled")) {
 			for (const name of goalStateToolNames) {
 				if (toolRegistry.has(name)) continue;
-				const goalStateTool = await logger.time(`createTools:${name}:session`, BUILTIN_TOOLS[name], toolSession);
+				const goalStateTool = await logger.time(`createTools:${name}:session`, BUILTIN_TOOL_DESCRIPTORS[name].load, toolSession);
 				if (goalStateTool) {
 					const wrappedGoalStateTool = wrapToolWithMetaNotice(goalStateTool);
 					builtinCandidateTools.push(wrappedGoalStateTool);
@@ -2259,6 +2372,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const reloadSshTool = async (): Promise<AgentTool | null> => {
 			if (!requestedToolNameSet.has("ssh")) return null;
+			const { loadSshTool } = await import("../tools/ssh");
 			const sshTool = (await loadSshTool({
 				...toolSession,
 				cwd: sessionManager.getCwd(),
@@ -2324,11 +2438,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					promptMetadataModel = previousPromptMetadataModel;
 				}
 			})();
-			const memoryInstructions = await resolveMemoryBackend(settings).buildDeveloperInstructions(
-				agentDir,
-				settings,
-				session,
-			);
+			// Lazy memory services stay idle through the initial prompt build. The legacy
+			// startup boundary below is the first activation point; using `peek()` here
+			// avoids an eager default-path initialization before that boundary. Startup
+			// refreshes the prompt after prewarming so enabled backends still publish their
+			// developer instructions before the session is returned.
+			const memoryBackend = runtimeServices.memoryBackend.peek();
+			const memoryInstructions = memoryBackend
+				? await memoryBackend.buildDeveloperInstructions(agentDir, settings, session)
+				: undefined;
 
 			const appendPrompt: string | undefined = memoryInstructions ?? undefined;
 			let pluginSystemAppendices = "";
@@ -2336,7 +2454,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd });
 			} catch (error) {
 				gjcProducersComplete = false;
-				logger.warn("Failed to render GJC plugin system appendices", { error });
+				logger.warn("Failed to render GJC plugin system appendices", { error: safeErrorForLog(error) });
 			}
 
 			// Publication point for GJC bundle runtime evidence. Appendix rendering
@@ -2398,14 +2516,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const explicitRequestedToolNames = hasExplicitToolNames ? normalizedRequested : [];
 		const requestedToolNameSet = new Set(normalizedRequested);
-		// Normalize the user-facing mcp.discoveryMode alias once at session construction.
-		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
-		const effectiveDiscoveryMode: "off" | "mcp-only" | "all" =
-			toolsDiscoveryModeSetting !== "off"
-				? (toolsDiscoveryModeSetting as "mcp-only" | "all")
-				: settings.get("mcp.discoveryMode") || explicitMcpConfigPath !== undefined
-					? "mcp-only"
-					: "off";
+		const effectiveDiscoveryMode = resolveEffectiveDiscoveryMode(settings, explicitMcpConfigPath);
 		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off";
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
@@ -2605,8 +2716,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Final convertToLlm: chain block-images filter with secret obfuscation
 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
 			const converted = convertToLlmWithBlockImages(messages);
-			if (!obfuscator?.hasSecrets()) return converted;
-			return obfuscateMessages(obfuscator, converted);
+			if (!obfuscator?.hasSecrets() || !obfuscateMessagesFn) return converted;
+			return obfuscateMessagesFn(obfuscator, converted);
 		};
 		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal, scope?: AttemptScopeRef) => {
 			// External Agent events dispatch listeners without awaiting them. The
@@ -2728,21 +2839,54 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			getAuthCredentialType: provider =>
 				modelRegistry.getSessionCredentialType(provider, agent.providerSessionId ?? agent.sessionId),
-			streamFn: (streamModel, context, streamOptions) =>
-				streamSimple(streamModel, context, {
-					...streamOptions,
-					onAuthError: async (provider, oldKey, error) => {
-						await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
-							signal: streamOptions?.signal,
-							sessionId: agent.sessionId,
-						});
-						logger.debug("Retrying provider request after credential invalidation", {
-							provider,
-							error: error instanceof Error ? error.message : String(error),
-						});
-						return modelRegistry.getApiKeyForProvider(provider, agent.sessionId);
-					},
-				}),
+			streamFn: async (streamModel, context, streamOptions) => {
+				const requestStartedAt = performance.now();
+				let stream: Awaited<ReturnType<typeof streamSimple>>;
+				try {
+					stream = await streamSimple(streamModel, context, {
+						...streamOptions,
+						onAuthError: async (provider, oldKey, error) => {
+							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
+								signal: streamOptions?.signal,
+								sessionId: agent.sessionId,
+							});
+							logger.debug("Retrying provider request after credential invalidation", {
+								provider,
+								error: error instanceof Error ? error.message : String(error),
+							});
+							return modelRegistry.getApiKeyForProvider(provider, agent.sessionId);
+						},
+					});
+				} catch (error) {
+					const prewarm = await runtimeServices.networkPrewarm.get("first-request");
+					prewarm.recordFirstRequestLatency(performance.now() - requestStartedAt);
+					throw error;
+				}
+				const prewarm = await runtimeServices.networkPrewarm.get("first-request");
+				if (prewarm.enabled) return stream;
+				let recorded = false;
+				const recordLatency = (): void => {
+					if (recorded) return;
+					recorded = true;
+					prewarm.recordFirstRequestLatency(performance.now() - requestStartedAt);
+				};
+				const originalPush = stream.push.bind(stream);
+				stream.push = event => {
+					recordLatency();
+					originalPush(event);
+				};
+				const originalFail = stream.fail.bind(stream);
+				stream.fail = error => {
+					recordLatency();
+					originalFail(error);
+				};
+				const originalEnd = stream.end.bind(stream);
+				stream.end = result => {
+					recordLatency();
+					originalEnd(result);
+				};
+				return stream;
+			},
 			cursorExecHandlers,
 			transformToolCallArguments: (args, _toolName) => {
 				let result = args;
@@ -2809,6 +2953,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			sessionManager,
 			settings,
+			memoryBackend: runtimeServices.memoryBackend,
 			notificationSessionController,
 			evalKernelOwnerId,
 			// Defined only for top-level sessions (creation is gated above).
@@ -2840,7 +2985,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			rebuildSystemPrompt,
 			getMcpServerInstructions:
 				explicitMcpConfigPath === undefined && mcpManager ? () => mcpManager.getServerInstructions() : undefined,
-			workspaceTree: resolvedWorkspaceTree,
+			workspaceTree: options.workspaceTree ?? (workspaceTreeMode === "eager" ? resolvedWorkspaceTree : undefined),
+			workspaceTreeService: options.workspaceTree ? undefined : runtimeServices.workspaceTree,
+			networkPrewarmService: runtimeServices.networkPrewarm,
+			onWorkspaceTreeReady: async tree => {
+				workspaceTreePromise = Promise.resolve(tree);
+				await session?.refreshBaseSystemPrompt();
+			},
 			reloadSshTool,
 			requestedToolNames: requestedToolNameSet,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
@@ -2903,6 +3054,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		if (model?.api === "openai-codex-responses") {
 			const codexModel = model;
+			// W5d: the Codex provider module loads only inside this conditional
+			// branch. Statically-traceable require keeps it lazy AND bundled in
+			// compiled binaries (#1939 pattern).
+			const { getOpenAICodexTransportDetails, prewarmOpenAICodexResponses } =
+				// biome-ignore lint/style/noCommonJs: lazy compiled-safe provider load (W5d)
+				require("@gajae-code/ai/providers/openai-codex-responses") as typeof import(
+					"@gajae-code/ai/providers/openai-codex-responses"
+				);
 			const codexTransport = getOpenAICodexTransportDetails(codexModel, {
 				sessionId: providerSessionId,
 				baseUrl: codexModel.baseUrl,
@@ -2936,27 +3095,46 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// LSP-backed write operations create clients on demand through `getOrCreateClient`.
 		const lspServers =
 			enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")
-				? discoverStartupLspServers(cwd)
+				? (await import("../lsp")).discoverStartupLspServers(cwd)
 				: undefined;
 
-		let memoryBackendStarted = false;
+		let memoryStartupTask: Promise<void> | undefined;
+		// Activation runs through the lazy runtime service so the backend stays off
+		// the startup graph until either this legacy call or a real memory use
+		// triggers it. `deferMemoryBackendStartup` keeps the caller-driven timing.
 		const startMemoryBackend = () => {
-			if (memoryBackendStarted) return;
-			memoryBackendStarted = true;
-			logger.time("startMemoryStartupTask", () =>
-				Promise.resolve(
-					resolveMemoryBackend(settings).start({
-						session,
-						settings,
-						modelRegistry,
-						agentDir,
-						taskDepth,
-						parentHindsightSessionState: options.parentHindsightSessionState,
-					}),
-				),
-			);
+			if (memoryStartupTask) return;
+			memoryStartupTask = logger.time("startMemoryStartupTask", async () => {
+				// The legacy startup call is the sole activation boundary. `prewarm()` records
+				// that trigger while retaining the service's typed diagnostic on initialization
+				// failure; inspect the status so a failed prewarm is still visible to startup.
+				await runtimeServices.memoryBackend.prewarm("legacy-startup");
+				const memoryStatus = runtimeServices.memoryBackend.status();
+				if (memoryStatus.state !== "ready") {
+					if (memoryStatus.error !== undefined) throw memoryStatus.error;
+					throw new Error(`Memory backend did not become ready during legacy startup (state: ${memoryStatus.state}).`);
+				}
+				const memoryBackend = runtimeServices.memoryBackend.peek();
+				if (!memoryBackend) throw new Error("Memory backend became ready without a resident value.");
+				await memoryBackend.start({
+					session,
+					settings,
+					modelRegistry,
+					agentDir,
+					taskDepth,
+					parentHindsightSessionState: options.parentHindsightSessionState,
+				});
+				// Rebuild after activation so the first returned prompt retains the legacy
+				// memory instructions without initializing the backend during prompt build.
+				await session.refreshBaseSystemPrompt();
+			});
 		};
-		if (!options.deferMemoryBackendStartup) startMemoryBackend();
+		// The non-deferred path must JOIN the task so a startup failure rejects
+		// createAgentSession rather than surfacing as an unhandled rejection.
+		if (!options.deferMemoryBackendStartup) {
+			startMemoryBackend();
+			await memoryStartupTask;
+		}
 
 		// Exact-config managers do not receive reactive callbacks; their tools are
 		// registered once in the session-owned catalog.
@@ -3083,42 +3261,35 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Release the subscription if the throw happened after install but before the
 		// dispose-wrap took ownership.
 		releaseCredentialDisabledSubscription();
+		let cleanupDiagnostic: unknown;
 		try {
 			if (hasSession) {
 				await session.dispose();
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
 				await cleanupOwnedMcpManager?.();
+				const [{ disposeKernelSessionsByOwner }, { disposeVmContextsByOwner }] = await Promise.all([
+					import("../eval/py/executor"),
+					import("../eval/js/context-manager"),
+				]);
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 				await disposeVmContextsByOwner(evalKernelOwnerId);
 			}
-		} catch {
-			logger.warn("Failed to clean up createAgentSession resources after startup error");
+		} catch (cleanupError) {
+			cleanupDiagnostic = cleanupError;
+			logger.warn("Failed to clean up createAgentSession resources after startup error", {
+				error: safeErrorForLog(error),
+				cleanupDiagnostic: safeCleanupDiagnosticForLog(cleanupDiagnostic),
+			});
 		} finally {
 			releaseLocalProtocolOverride();
 			try {
 				closeOwnedAuthStorage();
-			} catch {
-				logger.warn("Failed to close owned auth storage after startup error");
+			} catch (authCleanupError) {
+				logger.warn("Failed to close owned auth storage after startup error", { error: authCleanupError });
 			}
 		}
+		if (cleanupDiagnostic !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupDiagnostic);
 		throw error;
-	}
-}
-
-/**
- * Best-effort preconnect to the model's API host. Bun's `fetch.preconnect`
- * primes DNS + TCP + TLS + H2 so the first real request reuses the warm
- * connection. Errors are swallowed: preconnect is an optimization, never a
- * hard dependency.
- */
-function preconnectModelHost(baseUrl: string | undefined): void {
-	if (!baseUrl) return;
-	const preconnect = (globalThis.fetch as typeof fetch & { preconnect?: (url: string) => void }).preconnect;
-	if (typeof preconnect !== "function") return;
-	try {
-		preconnect(baseUrl);
-	} catch {
-		// Best effort.
 	}
 }

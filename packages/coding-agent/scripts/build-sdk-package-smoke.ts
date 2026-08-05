@@ -6,14 +6,17 @@ import * as path from "node:path";
 
 const packageDir = path.resolve(import.meta.dir, "..");
 const packageName = "@gajae-code/coding-agent";
+const agentPackageDir = path.resolve(packageDir, "../agent");
 const aiPackageDir = path.resolve(packageDir, "../ai");
 const bridgeClientPackageDir = path.resolve(packageDir, "../bridge-client");
 const tuiPackageDir = path.resolve(packageDir, "../tui");
-const agentPackageDir = path.resolve(packageDir, "../agent");
 const nativesPackageDir = path.resolve(packageDir, "../natives");
 const linuxX64PackageDir = path.resolve(packageDir, "../natives-linux-x64");
+const utilsPackageDir = path.resolve(packageDir, "../utils");
 const manifestsDir = path.join(packageDir, "test/manifests");
-const baselinePath = path.join(manifestsDir, "sdk-public-surface-v1.json");
+// v2 intentionally removes eager concrete-tool exports to preserve the SDK cold boundary.
+const baselineVersion = 2;
+const baselinePath = path.join(manifestsDir, `sdk-public-surface-v${baselineVersion}.json`);
 const generatedPath = path.join(manifestsDir, "sdk-public-surface.generated.json");
 
 type Surface = { root: string[]; sdk: string[] };
@@ -51,8 +54,9 @@ async function runSmoke(): Promise<Surface> {
 		const tuiTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], tuiPackageDir);
 		const nativesTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], nativesPackageDir);
 		const linuxX64Tarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], stagedLinuxX64Dir);
-		const agentTarballPath = path.isAbsolute(agentTarball) ? agentTarball : path.join(agentPackageDir, agentTarball);
+		const utilsTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], utilsPackageDir);
 		const codingAgentTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], packageDir);
+		const agentTarballPath = path.isAbsolute(agentTarball) ? agentTarball : path.join(agentPackageDir, agentTarball);
 		const aiTarballPath = path.isAbsolute(aiTarball) ? aiTarball : path.join(aiPackageDir, aiTarball);
 		const bridgeClientTarballPath = path.isAbsolute(bridgeClientTarball)
 			? bridgeClientTarball
@@ -64,6 +68,7 @@ async function runSmoke(): Promise<Surface> {
 		const linuxX64TarballPath = path.isAbsolute(linuxX64Tarball)
 			? linuxX64Tarball
 			: path.join(stagedLinuxX64Dir, linuxX64Tarball);
+		const utilsTarballPath = path.isAbsolute(utilsTarball) ? utilsTarball : path.join(utilsPackageDir, utilsTarball);
 		const codingAgentTarballPath = path.isAbsolute(codingAgentTarball)
 			? codingAgentTarball
 			: path.join(packageDir, codingAgentTarball);
@@ -81,6 +86,7 @@ async function runSmoke(): Promise<Surface> {
 						"@gajae-code/tui": `file:${tuiTarballPath}`,
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
 						"@gajae-code/natives-linux-x64": `file:${linuxX64TarballPath}`,
+						"@gajae-code/utils": `file:${utilsTarballPath}`,
 					},
 					overrides: {
 						"@gajae-code/agent-core": `file:${agentTarballPath}`,
@@ -89,6 +95,7 @@ async function runSmoke(): Promise<Surface> {
 						"@gajae-code/tui": `file:${tuiTarballPath}`,
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
 						"@gajae-code/natives-linux-x64": `file:${linuxX64TarballPath}`,
+						"@gajae-code/utils": `file:${utilsTarballPath}`,
 					},
 				},
 				null,

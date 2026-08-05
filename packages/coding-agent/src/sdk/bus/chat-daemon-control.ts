@@ -3,8 +3,17 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as native from "@gajae-code/natives";
-import { Process } from "@gajae-code/natives";
+
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+
+type NativeChatDaemonBindings = Pick<typeof import("@gajae-code/natives"), "exactUnlink">;
+let nativeChatDaemonBindings: NativeChatDaemonBindings | undefined;
+
+
+function nativeChatDaemon(): NativeChatDaemonBindings {
+	if (!nativeChatDaemonBindings) nativeChatDaemonBindings = require("@gajae-code/natives") as NativeChatDaemonBindings;
+	return nativeChatDaemonBindings;
+}
 import type { Settings } from "../../config/settings";
 import type {
 	BuiltInDaemonController,
@@ -198,7 +207,7 @@ export interface ChatDaemonProcessReference {
 
 function defaultProcessReference(pid: number, platform = os.platform()): ChatDaemonProcessReference | undefined {
 	try {
-		const processRef = Process.fromPid(pid);
+		const processRef = nativeProcessBindings().Process.fromPid(pid);
 		if (!processRef || !hasProcessIncarnationAuthority(processRef.incarnation)) return undefined;
 		const incarnation = processRef.incarnation;
 		return {
@@ -213,7 +222,7 @@ function defaultProcessReference(pid: number, platform = os.platform()): ChatDae
 				// re-read the immutable start-time incarnation immediately beforehand so a
 				// PID that exited and was reused since capture is never signaled.
 				if (platform === "darwin") {
-					const current = Process.fromPid(pid) as { incarnation?: unknown } | null;
+					const current = nativeProcessBindings().Process.fromPid(pid) as { incarnation?: unknown } | null;
 					if (!current || current.incarnation !== incarnation) throw new Error("Pinned process is already gone");
 					process.kill(pid, signal);
 					return;
@@ -1012,7 +1021,7 @@ async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockL
 /** Deletes only the exact lease observed by this contender; a successor is retained. */
 function unlinkExactChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): boolean {
 	try {
-		const removed = native.exactUnlink(lock, {
+		const removed = nativeChatDaemon().exactUnlink(lock, {
 			dev: lease.dev,
 			ino: lease.ino,
 			size: lease.size,

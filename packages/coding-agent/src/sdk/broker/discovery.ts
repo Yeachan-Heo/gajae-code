@@ -1,7 +1,16 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { type NativeRetainedBrokerPublication, retainBrokerPublication } from "@gajae-code/natives";
+
+import type { NativeRetainedBrokerPublication } from "@gajae-code/natives";
+
+let nativeRetainBrokerPublication: typeof import("@gajae-code/natives")["retainBrokerPublication"] | undefined;
+
+
+function retainBrokerPublicationNative(): typeof import("@gajae-code/natives")["retainBrokerPublication"] {
+	nativeRetainBrokerPublication ??= (require("@gajae-code/natives") as { retainBrokerPublication: typeof import("@gajae-code/natives")["retainBrokerPublication"] }).retainBrokerPublication;
+	return nativeRetainBrokerPublication;
+}
 import { processIncarnation } from "./process-incarnation";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
 
@@ -13,6 +22,7 @@ export interface RetainedBrokerDiscovery {
 }
 
 function requireRetainedBrokerPublication(agentDir: string): NativeRetainedBrokerPublication {
+	const retainBrokerPublication = retainBrokerPublicationNative();
 	if (typeof retainBrokerPublication !== "function") {
 		throw new Error("Loaded native bindings do not expose retained broker publication authority.");
 	}

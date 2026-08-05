@@ -1,5 +1,5 @@
 import { dlopen, ptr } from "bun:ffi";
-import { Process } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTimeSync } from "../../gjc-runtime/linux-proc";
 
 const DARWIN_PROC_PIDTBSDINFO = 3;
@@ -110,7 +110,7 @@ export function processIncarnation(pid: number, options: ProcessIncarnationOptio
 	const platform = options.platform ?? process.platform;
 	if (platform === process.platform && options.runCommand === undefined) {
 		try {
-			const nativeProcess = Process.fromPid(pid) as { incarnation?: unknown } | null;
+			const nativeProcess = nativeProcessBindings().Process.fromPid(pid) as { incarnation?: unknown } | null;
 			if (isProcessIncarnation(nativeProcess?.incarnation)) return nativeProcess.incarnation;
 		} catch {
 			// Fall through to the platform-specific reader.

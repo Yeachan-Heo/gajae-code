@@ -7,7 +7,7 @@ import {
 	THINKING_CONTROL_MODES,
 	THINKING_EFFORTS,
 	type ThinkingControlMode,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 
 export type Q10ThinkingEffort = Effort;
 export type Q10SettableThinkingLevel = typeof ThinkingLevel.Off | Q10ThinkingEffort;

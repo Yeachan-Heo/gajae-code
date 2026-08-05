@@ -589,32 +589,29 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(getTools).not.toHaveBeenCalled();
 		expect(MCPManager.instance()).toBe(toolsOnlyManager);
 	});
-	it("preserves normal MCP singleton fallback in canonical sub-session shapes", async () => {
+	it("does not route canonical sub-sessions through the process-global MCP manager", async () => {
 		const callerMcpManager = new MCPManager(tempDir);
-		const getTools = vi
-			.spyOn(callerMcpManager, "getTools")
-			.mockReturnValue([createMcpCustomTool("mcp__caller_lookup", "caller", "lookup")] as never);
-		MCPManager.setInstance(callerMcpManager);
-
-		for (const subSessionOptions of [
-			{ taskDepth: 1 },
-			{ parentTaskPrefix: "0-Child" },
-			{ currentAgentType: "executor" },
-		]) {
-			const { session, mcpManager } = await createAgentSession({
-				...createIsolatedSessionOptions(),
-				...subSessionOptions,
-			});
-			try {
-				expect(mcpManager).toBeUndefined();
-				expect(session.getAllToolNames()).toContain("mcp__caller_lookup");
-			} finally {
-				await session.dispose();
+		const getTools = vi.spyOn(callerMcpManager, "getTools").mockReturnValue([createMcpCustomTool("mcp__caller_lookup", "caller", "lookup")] as never);
+		const instanceSpy = vi.spyOn(MCPManager, "instance").mockImplementation(() => {
+			throw new Error("MCPManager.instance() must not route hosted sub-sessions");
+		});
+		try {
+			for (const subSessionOptions of [{ taskDepth: 1 }, { parentTaskPrefix: "0-Child" }, { currentAgentType: "executor" }]) {
+				const { session, mcpManager } = await createAgentSession({
+					...createIsolatedSessionOptions(),
+					...subSessionOptions,
+				});
+				try {
+					expect(mcpManager).toBeUndefined();
+					expect(session.getAllToolNames()).not.toContain("mcp__caller_lookup");
+				} finally {
+					await session.dispose();
+				}
 			}
+		} finally {
+			instanceSpy.mockRestore();
 		}
-
-		expect(getTools).toHaveBeenCalledTimes(3);
-		expect(MCPManager.instance()).toBe(callerMcpManager);
+		expect(getTools).not.toHaveBeenCalled();
 	});
 	it("preserves caller-owned normal MCP manager reuse in canonical sub-session shapes", async () => {
 		const callerMcpManager = new MCPManager(tempDir);
@@ -727,6 +724,178 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		}
 	});
 
+	it("surfaces owned MCP cleanup failure when no plugin server connects", async () => {
+		const cleanupError = new Error("plugin cleanup failed");
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue(createMcpLoadResult([], new Map(), []));
+		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		expect(installed.ok).toBe(true);
+		await expect(createAgentSession(createIsolatedSessionOptions())).rejects.toMatchObject({
+			code: "MCP_MANAGER_CLEANUP_FAILED",
+		});
+		expect(disconnectAll).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves plugin MCP cleanup diagnostics alongside a setup failure", async () => {
+		const startupError = new Error("plugin startup failed");
+		const cleanupError = new Error("plugin cleanup failed");
+		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		expect(installed.ok).toBe(true);
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		try {
+			const cleanupWarning = warning.mock.calls.find(([message]) => message === "Failed to wire GJC plugin MCP servers");
+			expect(cleanupWarning?.[1]).toMatchObject({ error: "plugin startup failed", cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" } });
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("preserves a frozen primary MCP startup error when cleanup also fails", async () => {
+		const startupError = Object.freeze(new Error("frozen MCP startup failure"));
+		const cleanupError = new Error("MCP cleanup failure");
+		const ownedManagers: MCPManager[] = [];
+		vi.spyOn(MCPManager.prototype, "setAuthStorage").mockImplementation(function (this: MCPManager) {
+			ownedManagers.push(this);
+		});
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockRejectedValue(startupError);
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		let failure: unknown;
+		try {
+			await createAgentSession({
+				...createIsolatedSessionOptions(),
+				mcpConfigPath: path.join(tempDir, "frozen-primary-mcp.json"),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		if (!(failure instanceof Error)) throw new Error("Expected frozen primary startup failure");
+		expect(failure).toMatchObject({
+			code: "MCP_MANAGER_CLEANUP_FAILED",
+			cause: startupError,
+			primaryError: startupError,
+			cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError },
+		});
+		expect(ownedManagers).toHaveLength(1);
+		expect(disconnectAll).toHaveBeenCalledTimes(1);
+	});
+	it("preserves a throwing-proxy primary MCP startup error when cleanup also fails", async () => {
+		const trapError = new Error("hostile proxy trap");
+		const startupError = new Proxy(
+			{},
+			{
+				defineProperty: () => true,
+				get: () => {
+					throw trapError;
+				},
+				getPrototypeOf: () => {
+					throw trapError;
+				},
+			},
+		);
+		const cleanupError = new Error("MCP cleanup failure");
+		const ownedManagers: MCPManager[] = [];
+		vi.spyOn(MCPManager.prototype, "setAuthStorage").mockImplementation(function (this: MCPManager) {
+			ownedManagers.push(this);
+		});
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockRejectedValue(startupError);
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		let failure: unknown;
+		try {
+			await createAgentSession({
+				...createIsolatedSessionOptions(),
+				mcpConfigPath: path.join(tempDir, "throwing-proxy-mcp.json"),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		if (!(failure instanceof Error)) throw new Error("Expected typed cleanup diagnostic");
+		expect(failure).toMatchObject({
+			code: "MCP_MANAGER_CLEANUP_FAILED",
+			primaryError: startupError,
+			cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError },
+		});
+		expect((failure as Error & { cause?: unknown }).cause).toBe(startupError);
+		expect(ownedManagers).toHaveLength(1);
+		expect(disconnectAll).toHaveBeenCalledTimes(1);
+	});
+	it("does not throw while warning about a hostile plugin MCP startup error", async () => {
+		const trapError = new Error("hostile proxy trap");
+		const startupError = new Proxy(new Error("hostile plugin startup"), {
+			get: () => {
+				throw trapError;
+			},
+			getPrototypeOf: () => {
+				throw trapError;
+			},
+		});
+		const cleanupError = new Error("plugin cleanup failed");
+		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		expect(installed.ok).toBe(true);
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		try {
+			const cleanupWarning = warning.mock.calls.find(([message]) => message === "Failed to wire GJC plugin MCP servers");
+			expect(cleanupWarning).toBeDefined();
+			expect(cleanupWarning?.[1]).toMatchObject({ error: "<unprintable error>" });
+			const serialized = JSON.stringify(cleanupWarning?.[1]);
+			expect(serialized).toContain("<unprintable error>");
+			expect(serialized).toContain("MCP_MANAGER_CLEANUP_FAILED");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("serializes explicit MCP startup and cleanup proxy diagnostics safely", async () => {
+		const trapError = new Error("explicit MCP hostile trap");
+		const startupError = new Proxy(new Error("explicit MCP startup"), {
+			defineProperty: () => {
+				throw trapError;
+			},
+			get: () => {
+				throw trapError;
+			},
+			getPrototypeOf: () => {
+				throw trapError;
+			},
+		});
+		const cleanupError = new Proxy(new Error("explicit MCP cleanup"), {
+			get: () => {
+				throw trapError;
+			},
+			getPrototypeOf: () => {
+				throw trapError;
+			},
+		});
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockRejectedValue(startupError);
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		let failure: unknown;
+		try {
+			await createAgentSession({
+				...createIsolatedSessionOptions(),
+				mcpConfigPath: path.join(tempDir, "explicit-hostile-mcp.json"),
+			});
+		} catch (error) {
+			failure = error;
+		}
+		if (!(failure instanceof Error)) throw new Error("Expected typed cleanup diagnostic");
+		expect(failure).toMatchObject({
+			code: "MCP_MANAGER_CLEANUP_FAILED",
+			primaryError: startupError,
+			cleanupDiagnostic: { cause: cleanupError },
+		});
+		const warningCall = warning.mock.calls.find(
+			([message]) => message === "Failed to clean up createAgentSession resources after startup error",
+		);
+		expect(warningCall).toBeDefined();
+		const warningContext = warningCall?.[1];
+		const serialized = JSON.stringify(warningContext);
+		expect(serialized.match(/<unprintable error>/g)?.length).toBe(2);
+		expect(serialized).toContain("MCP_MANAGER_CLEANUP_FAILED");
+	});
 	it("rejects unexpected explicit MCP discovery throws after owned manager cleanup", async () => {
 		const startupError = new Error("unexpected MCP discovery failure");
 		const ownedManagers: MCPManager[] = [];

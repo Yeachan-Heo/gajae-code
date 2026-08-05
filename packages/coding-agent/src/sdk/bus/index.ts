@@ -28,11 +28,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
-import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
+import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
+import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+
+type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
+let nativeSdkBusBindingsLoad: Promise<NativeSdkBusBindings> | undefined;
+
+async function sdkBusNatives(): Promise<NativeSdkBusBindings> {
+	nativeSdkBusBindingsLoad ??= Promise.resolve(require("@gajae-code/natives") as NativeSdkBusBindings);
+	return await nativeSdkBusBindingsLoad;
+}
+
+type NotificationServer = NativeNotificationServer;
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
-import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
-import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
@@ -61,10 +69,10 @@ import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "..
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
-import { SessionSdkHost, shouldHostSdk } from "../host";
+import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
-import { projectQ10Models } from "../models.js";
+import type { SdkFrame } from "../host/types";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { ActiveProviderResolutionError } from "../providers.js";
@@ -1895,57 +1903,6 @@ function validateProviderDefinitions(capability: string, definitions: unknown): 
 	}
 }
 
-const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.register", "host_uri.register"]);
-
-const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
-	"model.cycle": "cycleModel",
-	"model.profile.set": "setModelProfile",
-	"thinking.cycle": "cycleThinkingLevel",
-	"queue.steering_mode.set": "setQueueMode",
-	"queue.follow_up_mode.set": "setQueueMode",
-	"queue.interrupt_mode.set": "setQueueMode",
-	"todo.replace": "sdkControl",
-	"permission_mode.set": "sdkControl",
-	"skill.invoke": "invokeSkill",
-	"mode.plan.set": "setPlanMode",
-	"mode.goal.operate": "operateGoal",
-
-	"compaction.auto.set": "sdkControl",
-	"retry.auto.set": "sdkControl",
-	"retry.abort": "sdkControl",
-	"bash.execute": "sdkControl",
-	"bash.abort": "sdkControl",
-	"session.new": "sdkControl",
-	"session.fork": "sdkControl",
-	"session.resume": "sdkControl",
-	"session.close": "sdkControl",
-	"session.switch": "sdkControl",
-	"session.branch": "sdkControl",
-	"session.rename": "sdkControl",
-	"session.handoff": "sdkControl",
-	"session.export_html": "sdkControl",
-	"runtime.reload": "sdkControl",
-	"service_tier.set": "sdkControl",
-	"queue.message.remove": "sdkControl",
-	"queue.message.move": "sdkControl",
-	"queue.message.update": "sdkControl",
-	"extension.set_enabled": "sdkControl",
-	"session.delete": "sdkControl",
-	"session.cwd.move": "sdkControl",
-	"retry.last": "sdkControl",
-	"retry.now": "sdkControl",
-	"bash.background": "sdkControl",
-};
-const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
-	"skill.list/state": "getSkillState",
-	"config.list/get": "getConfigItems",
-	"session.branch_candidates": "getBranchCandidates",
-	"extensions.list": "getExtensions",
-	"artifact.read": "getArtifactRange",
-
-	"runtime.jobs.list": "getJobs",
-};
-
 function hasTerminalArbitrationCapability(
 	workflowGate: WorkflowGateEmitter | undefined,
 ): workflowGate is WorkflowGateEmitter &
@@ -1970,20 +1927,6 @@ function hasTerminalArbitrationCapability(
 	);
 }
 
-function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): Set<string> {
-	const bindings = new Set(ctx.sdkBindings?.() ?? []);
-	const required = kind === "control" ? CONTROL_BINDINGS : QUERY_BINDINGS;
-	const candidates = OPERATIONS.filter(
-		operation =>
-			operation.kind === kind &&
-			(kind !== "control" ||
-				(!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
-					((operation.sdkId !== "workflow.gate_answer" && operation.sdkId !== "workflow.plan_approve") ||
-						hasTerminalArbitrationCapability(ctx.workflowGate)) &&
-					(!required[operation.sdkId] || bindings.has(required[operation.sdkId]!)))),
-	);
-	return new Set(candidates.map(operation => operation.sdkId));
-}
 
 function sdkQuerySurface(
 	ctx: ExtensionContext,
@@ -1996,150 +1939,24 @@ function sdkQuerySurface(
 		followupQueueDepth: 0,
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
-	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
+	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
 ): SessionSurface {
-	const metadata = () => ({
-		sessionId: id,
-		name: ctx.sessionManager.getSessionName(),
-		cwd: ctx.cwd,
-		kind: ctx.sessionMetadata?.kind ?? "main",
-	});
-	const lastAssistantText = () => {
-		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			const { content } = entry.message;
-			if (typeof content === "string") return content;
-			if (Array.isArray(content))
-				return content
-					.filter(
-						(block): block is { type: "text"; text: string } =>
-							block.type === "text" && typeof block.text === "string",
-					)
-					.map(block => block.text)
-					.join("");
-		}
-		return undefined;
-	};
-	const getDiff = async () => {
-		try {
-			const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff"], {
-				cwd: ctx.cwd,
-				maxBuffer: 1024 * 1024,
-			});
-			return stdout
-				.split(/^diff --git /m)
-				.filter(Boolean)
-				.map(section => {
-					const header = section.split("\n", 1)[0] ?? "";
-					const match = /a\/(.+?) b\/(.+)$/.exec(header);
-					return { id: match?.[2] ?? header, path: match?.[2] ?? header, body: `diff --git ${section}` };
-				});
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "") : "";
-			if (/not a git repository/i.test(`${detail}\n${stderr}`))
-				throw new DiffQueryError("not_git_repository", "diff queries require a Git working tree");
-			if (/maxbuffer|ERR_CHILD_PROCESS_STDIO_MAXBUFFER/i.test(detail))
-				throw new DiffQueryError("diff_too_large", "diff exceeds the 1 MiB query limit");
-			throw error;
-		}
-	};
-	return {
-		getTranscriptEntries: () =>
-			typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [],
-		getContextSnapshot: () => ({
-			usage: ctx.getContextUsage(),
-			systemPrompt: ctx.getSystemPrompt(),
-			...getLiveState(),
-		}),
-		getGoalState: () =>
-			typeof (ctx as Partial<ExtensionContext>).getGoalState === "function" ? ctx.getGoalState() : undefined,
-		getTodoState: () =>
-			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
-		getDiff,
-		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () => {
-			const models = ctx.modelRegistry.getAll();
-			const currentModel = ctx.model;
-			const currentThinkingLevel = api.getThinkingLevel();
-			return projectQ10Models({ models, currentModel, currentThinkingLevel });
-		},
-		getModelProfiles: async () => {
-			const profiles = ctx.modelRegistry.getModelProfiles();
-			const catalog = projectModelProfileCatalog(profiles, ctx.modelRegistry.getError());
-			const providers = new Set([...profiles.values()].flatMap(profile => profile.requiredProviders));
-			const authenticatedProviders = new Set<string>();
-			await Promise.all(
-				[...providers].map(async provider => {
-					try {
-						const credential = await ctx.modelRegistry.getApiKeyForProvider(provider, id);
-						if (credential === kNoAuth || isAuthenticated(credential)) authenticatedProviders.add(provider);
-					} catch {
-						// A provider whose credential state cannot be read is not currently configurable.
-					}
-				}),
-			);
-			return catalog.map(item => ({
-				...item,
-				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
-			}));
-		},
-		getSkillState: () => ctx.getSkillState(),
-		getGates: () => {
-			const workflowGate = ctx.workflowGate;
-			if (!workflowGate) return [];
-			return (
-				workflowGate.listWorkflowGateQueryRecords?.() ??
-				workflowGate.listPendingGates?.().map(gate => ({
-					...gate,
-					id: `pending:${gate.gate_id}`,
-					tag: "pending" as const,
-				})) ??
-				[]
-			);
-		},
-		getConfigItems: () => {
-			const items = ctx.getConfigItems();
-			return items && typeof items === "object" && !Array.isArray(items)
-				? { ...(items as Record<string, unknown>), ...Object.fromEntries(configOverrides) }
-				: items;
-		},
-
-		getSessionMetadata: metadata,
-		getStats: () => ctx.sessionManager.getUsageStatistics(),
-		getBranchCandidates: () => ctx.getBranchCandidates(),
-		getLastAssistant: lastAssistantText,
-
-		getCapabilities: () => ({
-			operations: [...installedOperations(ctx, "control"), ...installedOperations(ctx, "query")],
-			hostTools: getInstalledDefinitions("host_tools") !== undefined,
-			promptTerminalOutcomeVersion: 1,
-		}),
-		getAuthProviders: () => [...new Set(ctx.modelRegistry.getAll().map(model => model.provider))],
-		getActiveProviders: () => {
-			try {
-				return ctx.modelRegistry.getActiveProviders();
-			} catch {
-				throw new ActiveProviderResolutionError();
-			}
-		},
-		getTools: () => {
-			const tools = typeof (ctx as Partial<ExtensionContext>).getAllTools === "function" ? ctx.getAllTools() : [];
-			return tools.length > 0 ? tools : (getInstalledDefinitions("host_tools") ?? []);
-		},
-		getQueueMessages: () => ctx.getQueuedMessages(),
-		getExtensions: () => ctx.getExtensions(),
-		getArtifactRange: (id, offset, length) => ctx.getArtifactRange?.(id, offset, length),
-		getJobs: () => ctx.getJobs(),
-		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			promptStatusLookup(selector),
-		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			skillStatusLookup(selector),
-		installedQueries: installedOperations(ctx, "query"),
-	};
+	return createSdkSurfaceFactory({
+		ctx,
+		id,
+		api,
+		getInstalledDefinitions,
+		getLiveState,
+		configOverrides,
+		promptStatusLookup,
+		skillStatusLookup,
+		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
+	}).query;
 }
 
 function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
@@ -2204,6 +2021,11 @@ function sdkControlSurface(
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
 	const bindings = new Set(ctx.sdkBindings?.() ?? []);
+	const surfacePolicy = createSdkSurfaceFactory({
+		ctx,
+		id: ctx.sessionManager.getSessionId(),
+		api,
+	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
 		if (missingExpectedSessionAudits.has(operation)) return;
@@ -2818,7 +2640,7 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
-		installedOperations: installedOperations(ctx, "control"),
+		installedOperations: surfacePolicy.installedControls,
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
 	return surface;
@@ -3605,6 +3427,7 @@ export function createNotificationsExtension(
 		const token = resolveToken();
 		let server: NotificationServer;
 		try {
+			const { NotificationServer, nativeBuildInfo } = await sdkBusNatives();
 			assertNativeRuntimeCompatibility({
 				runtimeVersion: VERSION,
 				nativeVersion: nativeBuildInfo().version,
@@ -3630,6 +3453,7 @@ export function createNotificationsExtension(
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
+		let sdkRuntime: SessionSdkSessionRuntime | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
@@ -4354,22 +4178,27 @@ export function createNotificationsExtension(
 			throw new Error(`${EXISTING_THREAD_BIND_ENV}=1 requires ${missing} to prove the existing-thread binding.`);
 		}
 
-		host = new SessionSdkHost({
-			sessionId: id,
-			stateRoot,
-			token,
+		sdkRuntime = new SessionSdkSessionRuntime({
+			transport: {
+				sessionId: id,
+				stateRoot,
+				token,
+				sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
+				onFrame: handler => {
+					inboundSdkFrame = handler as (connectionId: string, frame: SdkFrame) => void;
+					return () => {
+						inboundSdkFrame = undefined;
+					};
+				},
+				start: async () => await server.start(),
+				stop: async () => await server.stopAndWait(),
+				broadcastFrame: frame => server.pushFrame(JSON.stringify(frame)),
+			},
 			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
 			...(activationGate ? { activationGate } : {}),
-			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
-			onFrame: handler => {
-				inboundSdkFrame = handler;
-				return () => {
-					inboundSdkFrame = undefined;
-				};
-			},
 			onRequest: options.onSdkRequest,
 			beforeControlResponse: async (_connectionId, request, response, sendTerminal) => {
 				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
@@ -4532,6 +4361,7 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		host = sdkRuntime.host;
 
 		// Install the runtime before either transport can expose the host. session_start
 		// is deliberately fire-and-forget, so agent lifecycle events and direct v3
@@ -4662,13 +4492,29 @@ export function createNotificationsExtension(
 				server.sendTo(connectionId, JSON.stringify({ type: responseType, id, ok: false, error }));
 			} catch {}
 		};
+			const sendMalformed = (connectionId: string, message: string): void => {
+				try {
+					server.sendTo(connectionId, JSON.stringify({ type: "protocol_error", ok: false, error: { code: "invalid_frame", message } }));
+				} catch {}
+			};
 		try {
 			server.onSdkFrame((err, inbound) => {
-				if (err || !inbound) return;
+				if (err) {
+					if (inbound?.connectionId) sendMalformed(inbound.connectionId, err.message);
+					return;
+				}
+				if (!inbound) return;
 				try {
 					const frame = JSON.parse(inbound.json) as unknown;
-					if (!frame || typeof frame !== "object") return;
+					if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+						sendMalformed(inbound.connectionId, "SDK frame must be a JSON object.");
+						return;
+					}
 					const typedFrame = frame as Record<string, unknown>;
+					if (typeof typedFrame.type !== "string" || typedFrame.type.length === 0) {
+						sendMalformed(inbound.connectionId, "SDK frame type must be a non-empty string.");
+						return;
+					}
 					if (inbound.connectionId && fencedConnections.has(inbound.connectionId)) {
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
@@ -4680,13 +4526,12 @@ export function createNotificationsExtension(
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
 						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
-						hostCapCache.set(
-							inbound.connectionId,
-							new Set(capabilities.filter((capability): capability is string => typeof capability === "string")),
-						);
+						hostCapCache.set(inbound.connectionId, new Set(capabilities.filter((capability): capability is string => typeof capability === "string")));
 					}
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
-				} catch {}
+				} catch (error) {
+					sendMalformed(inbound.connectionId, error instanceof SyntaxError ? "SDK frame is not valid JSON." : String(error));
+				}
 			});
 			// Required: the negotiated-capability callback is how the TS host learns
 			// each connection's caps for replay-frame gating. If the linked
@@ -5119,7 +4964,7 @@ export function createNotificationsExtension(
 				}
 			});
 
-			await host.start();
+			await sdkRuntime.startHost();
 			lifecycleStartupCapability?.rollback?.recordGeneration(host.generation);
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
@@ -5168,7 +5013,7 @@ export function createNotificationsExtension(
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
-			const endpoint = await server.start();
+			const endpoint = await sdkRuntime.startTransport();
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
 				endpointDigest: endpointAuthorityDigest(endpoint.url, token),

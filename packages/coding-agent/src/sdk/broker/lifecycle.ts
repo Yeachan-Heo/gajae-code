@@ -3,8 +3,17 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
-import * as native from "@gajae-code/natives";
+import type * as native from "@gajae-code/natives";
+
+let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
+
+
+function nativeLifecycle(): typeof import("@gajae-code/natives") {
+	if (!nativeLifecycleBindings) nativeLifecycleBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	return nativeLifecycleBindings;
+}
 import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
@@ -1103,7 +1112,7 @@ function exactUnlinkLifecycleFile(
 	plannedPath: string,
 	parentIdentity?: { dev: bigint; ino: bigint },
 ): NativeExactUnlinkResult {
-	return native.exactUnlink(file, {
+	return nativeLifecycle().exactUnlink(file, {
 		...identity,
 		quarantineName: path.basename(plannedPath),
 		...(parentIdentity ? { parentDev: parentIdentity.dev, parentIno: parentIdentity.ino } : {}),
@@ -1854,7 +1863,7 @@ async function reconcileLifecycleCleanup(
 			});
 		}
 		const currentFile = activeCleanup.lifecycleFiles![index];
-		const result = native.exactUnlink(activePath, {
+		const result = nativeLifecycle().exactUnlink(activePath, {
 			...captured.identity,
 			parentDev: BigInt(activeCleanup.lifecycleParentIdentity!.dev),
 			parentIno: BigInt(activeCleanup.lifecycleParentIdentity!.ino),
@@ -3467,7 +3476,7 @@ async function executeLifecycleResponse(
 				if (stat.isSymbolicLink() || !stat.isDirectory())
 					return fail("terminal_uncertain", "Artifact cleanup target is not an exact directory.");
 				validateManagedArtifactTree(artifactsPath);
-				const tree = native.snapshotDirectoryTree(artifactsPath);
+				const tree = nativeLifecycle().snapshotDirectoryTree(artifactsPath);
 				if (!tree.ok || !tree.snapshot)
 					return fail(
 						"terminal_uncertain",

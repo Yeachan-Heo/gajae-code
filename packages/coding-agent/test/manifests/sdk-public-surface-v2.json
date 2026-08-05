@@ -107,7 +107,6 @@
     "SdkClient",
     "SdkClientError",
     "SdkDiscoveryError",
-    "SessionAppendPersistenceError",
     "SessionArtifactCapacityError",
     "SessionManagedStorageError",
     "SessionManager",
