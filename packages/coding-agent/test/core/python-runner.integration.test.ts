@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { disposeAllKernelSessions, executePythonWithKernel } from "@gajae-code/coding-agent/eval/py/executor";
 import { PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
-import { resolvePythonIntegrationGate } from "@gajae-code/coding-agent/tools";
+import { resolvePythonIntegrationGate } from "@gajae-code/coding-agent/tools/implementations";
 import { TempDir } from "@gajae-code/utils";
 
 const SHOULD_RUN = resolvePythonIntegrationGate(Bun.env);

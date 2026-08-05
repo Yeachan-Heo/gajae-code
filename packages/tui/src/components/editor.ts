@@ -476,6 +476,8 @@ export class Editor implements Component, Focusable {
 	#history: string[] = [];
 	#historyIndex: number = -1; // -1 = not browsing, 0 = most recent, 1 = older, etc.
 	#historyStorage?: HistoryStorage;
+	#historyStorageLoader?: () => Promise<HistoryStorage | undefined>;
+	#historyStorageLoad?: Promise<HistoryStorage | undefined>;
 
 	// Undo stack for editor state changes
 	#undoStack: EditorState[] = [];
@@ -637,9 +639,30 @@ export class Editor implements Component, Focusable {
 
 	setHistoryStorage(storage: HistoryStorage): void {
 		this.#historyStorage = storage;
-		const recent = storage.getRecent(100, getProjectDir());
-		this.#history = recent.map(entry => entry.prompt);
+		const recent = storage.getRecent(100, getProjectDir()).map(entry => entry.prompt);
+		const merged: string[] = [];
+		for (const prompt of [...this.#history, ...recent]) {
+			if (merged.includes(prompt)) continue;
+			merged.push(prompt);
+			if (merged.length >= 100) break;
+		}
+		this.#history = merged;
 		this.#historyIndex = -1;
+	}
+
+	setHistoryStorageLoader(loader: (() => Promise<HistoryStorage | undefined>) | undefined): void {
+		this.#historyStorageLoader = loader;
+		this.#historyStorageLoad = undefined;
+	}
+
+	#ensureHistoryStorage(): Promise<HistoryStorage | undefined> {
+		if (this.#historyStorage) return Promise.resolve(this.#historyStorage);
+		if (!this.#historyStorageLoader) return Promise.resolve(undefined);
+		this.#historyStorageLoad ??= this.#historyStorageLoader().then(storage => {
+			if (storage) this.setHistoryStorage(storage);
+			return storage;
+		});
+		return this.#historyStorageLoad;
 	}
 
 	/**
@@ -662,6 +685,13 @@ export class Editor implements Component, Focusable {
 			stor.add(trimmed, getProjectDir()).catch(error => {
 				logger.error("HistoryStorage add failed", { error: String(error) });
 			});
+		} else {
+			void this.#ensureHistoryStorage().then(storage => {
+				if (!storage) return;
+				return storage.add(trimmed, getProjectDir()).catch(error => {
+					logger.error("HistoryStorage add failed", { error: String(error) });
+				});
+			});
 		}
 	}
 
@@ -683,7 +713,13 @@ export class Editor implements Component, Focusable {
 
 	#navigateHistory(direction: 1 | -1): void {
 		this.#resetKillSequence();
-		if (this.#history.length === 0) return;
+		if (this.#history.length === 0) {
+			void this.#ensureHistoryStorage().then(storage => {
+				if (storage && this.#history.length > 0) this.#navigateHistory(direction);
+				this.invalidate();
+			});
+			return;
+		}
 		const newIndex = this.#historyIndex - direction; // Up(-1) increases index, Down(1) decreases
 		if (newIndex < -1 || newIndex >= this.#history.length) return;
 		this.#historyIndex = newIndex;

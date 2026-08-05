@@ -3,15 +3,17 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	type BisectMarkResult,
-	BisectTool,
-	type BisectVerdict,
 	BUILTIN_TOOLS,
+	type ToolSession,
+} from "@gajae-code/coding-agent/tools";
+import {
+	BisectTool,
+	type BisectMarkResult,
+	type BisectVerdict,
 	classifyExit,
 	parseFirstBadCommit,
 	runBisectController,
-	type ToolSession,
-} from "@gajae-code/coding-agent/tools";
+} from "@gajae-code/coding-agent/tools/implementations";
 
 const FORTY_HEX = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 

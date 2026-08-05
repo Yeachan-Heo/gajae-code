@@ -261,7 +261,6 @@ async function acquireSession(
 	ownerId: string | undefined,
 	timeoutMs?: number,
 ): Promise<JsSession> {
-	ensureVmResourceCleanup();
 	const existing = sessions.get(sessionKey);
 	if (existing && existing.state !== "dead") return await existing.ready.promise;
 
@@ -318,6 +317,7 @@ async function acquireSession(
 		worker.send({ type: "init", snapshot });
 		session.state = "alive";
 		session.ready.resolve(session);
+		ensureVmResourceCleanup();
 		return session;
 	} catch (error) {
 		if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);

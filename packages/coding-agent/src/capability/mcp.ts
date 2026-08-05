@@ -18,6 +18,8 @@ export interface MCPServer {
 	/** Whether explicit runtime MCP consumers should connect automatically (default: true) */
 	autoload?: boolean;
 	/** Connection timeout in milliseconds */
+	/** MCP connection pool identity mode; defaults to one lease per session. */
+	sharing?: "per-session" | "shared";
 	timeout?: number;
 	/** Command to run (for stdio transport) */
 	command?: string;

@@ -275,6 +275,17 @@ export const SETTINGS_SCHEMA = {
 		values: ["copy-retain", "disabled"] as const,
 		default: "copy-retain",
 	},
+	"workspaceTree.mode": {
+		type: "enum",
+		values: ["eager", "lazy"] as const,
+		default: "eager",
+		description: "When to scan the workspace tree used by the first prompt.",
+	},
+	"startup.networkPrewarm": {
+		type: "boolean",
+		default: true,
+		description: "Preconnect the model host during startup before the first request.",
+	},
 	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
 	"sdk.promptDeadlineMs": {
 		type: "number",
@@ -581,6 +592,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"theme.watchFiles": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Watch Theme Files",
+			description: "Reload custom themes when their files change",
+		},
+	},
+
 	symbolPreset: {
 		type: "enum",
 		values: ["unicode", "nerd", "ascii"] as const,
@@ -597,6 +618,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"syntaxHighlighting.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Syntax Highlighting",
+			description: "Highlight code blocks and diffs when rendering",
+		},
+	},
+
 	colorBlindMode: {
 		type: "boolean",
 		default: false,
@@ -608,6 +639,15 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Status line
+	"statusLine.watchGitHead": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Watch Git HEAD",
+			description: "Refresh status-line git data when HEAD changes",
+		},
+	},
 	"statusLine.preset": {
 		type: "enum",
 		values: ["default", "default-usage", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
@@ -1300,6 +1340,15 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
+	"history.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "History",
+			description: "Persist and search submitted prompts in local history",
+		},
+	},
 	"mouse.enabled": {
 		type: "boolean",
 		default: false,
@@ -2989,6 +3038,11 @@ export const SETTINGS_SCHEMA = {
 	"mcp.notificationDebounceMs": {
 		type: "number",
 		default: 500,
+	},
+
+	"mcp.sharedPoolIdleMs": {
+		type: "number",
+		default: 300_000,
 	},
 
 	// ────────────────────────────────────────────────────────────────────────

@@ -25,7 +25,12 @@ const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
 const transportClosedErrors = new WeakMap<LspClient, Error>();
 const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
-const lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
+let lspCleanupOwner: (() => void) | undefined;
+
+function ensureLspCleanup(): void {
+	if (lspCleanupOwner) return;
+	lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
+}
 
 // Idle timeout configuration (disabled by default)
 let idleTimeoutMs: number | null = null;
@@ -628,6 +633,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 
 			// Send initialized notification
 			await sendNotification(client, "initialized", {});
+			ensureLspCleanup();
 			const terminalError = transportClosedErrors.get(client);
 			if (terminalError) throw terminalError;
 
@@ -1029,7 +1035,7 @@ if (typeof process !== "undefined") {
 		void shutdownAll();
 	});
 	process.on("exit", () => {
-		lspCleanupOwner();
+		lspCleanupOwner?.();
 		for (const client of clients.values()) {
 			client.proc.kill();
 		}

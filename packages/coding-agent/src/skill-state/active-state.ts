@@ -43,6 +43,11 @@ export interface WorkflowHudSummary {
 
 export type { WorkflowStateReceipt } from "./workflow-state-contract";
 
+export interface ActiveSubskillToolReference {
+	extensionId: string;
+	expectedDigest: string;
+}
+
 export interface ActiveSubskillEntry {
 	plugin: string;
 	subskillName: string;
@@ -50,8 +55,14 @@ export interface ActiveSubskillEntry {
 	bindsTo: string;
 	phase: string;
 	activationArg: string;
-	filePath: string;
-	toolPaths: string[];
+	/** Registry identity required for persisted v2 activation. */
+	scope?: "user" | "project";
+	extensionId?: string;
+	expectedDigest?: string;
+	toolRefs?: ActiveSubskillToolReference[];
+	/** Legacy paths are accepted only in transient in-memory values; persisted readers reject them. */
+	filePath?: string;
+	toolPaths?: string[];
 }
 
 export interface SkillActiveEntry {
@@ -224,12 +235,24 @@ function normalizeActiveSubskillEntry(raw: unknown): ActiveSubskillEntry | null 
 	const bindsTo = safeString(record.bindsTo).trim();
 	const phase = safeString(record.phase).trim();
 	const activationArg = safeString(record.activationArg).trim();
-	const filePath = safeString(record.filePath).trim();
-	const toolPaths = Array.isArray(record.toolPaths)
-		? record.toolPaths.map(item => safeString(item).trim()).filter(Boolean)
-		: [];
-	if (!plugin || !subskillName || !parent || !bindsTo || !phase || !activationArg || !filePath) return null;
-	return { plugin, subskillName, parent, bindsTo, phase, activationArg, filePath, toolPaths };
+	const scope = record.scope === "user" || record.scope === "project" ? record.scope : undefined;
+	const extensionId = safeString(record.extensionId).trim();
+	const expectedDigest = safeString(record.expectedDigest).trim().toLowerCase();
+	const toolRefs = Array.isArray(record.toolRefs)
+		? record.toolRefs
+				.map(item => {
+					if (!item || typeof item !== "object") return null;
+					const ref = item as Record<string, unknown>;
+					const id = safeString(ref.extensionId).trim();
+					const digest = safeString(ref.expectedDigest).trim().toLowerCase();
+					return id && digest ? { extensionId: id, expectedDigest: digest } : null;
+				})
+				.filter((item): item is ActiveSubskillToolReference => item !== null)
+			: [];
+		// Path-only records are intentionally invalid: runtime must resolve through
+		// the migrated registry, never trust persisted executable paths.
+	if (!plugin || !subskillName || !parent || !bindsTo || !phase || !activationArg || !scope || !extensionId || !expectedDigest) return null;
+	return { plugin, subskillName, parent, bindsTo, phase, activationArg, scope, extensionId, expectedDigest, toolRefs };
 }
 
 function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | undefined {
@@ -241,7 +264,7 @@ function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | u
 }
 
 function activeSubskillEntryKey(entry: ActiveSubskillEntry): string {
-	return [entry.plugin, entry.parent, entry.phase, entry.activationArg].join("\0");
+	return [entry.scope ?? "", entry.plugin, entry.extensionId ?? "", entry.parent, entry.phase, entry.activationArg].join("\0");
 }
 
 function unionActiveSubskillEntries(...entrySets: Array<ActiveSubskillEntry[] | undefined>): ActiveSubskillEntry[] {

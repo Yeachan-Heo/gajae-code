@@ -4,16 +4,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
+	createTools,
+	type ToolSession,
+} from "@gajae-code/coding-agent/tools";
+import {
 	buildPromptModel,
 	commandFromOp,
-	createTools,
 	type DetectedRunner,
 	RecipeTool,
 	resolveCommand,
-	type ToolSession,
 	tasksFromCargoMetadata,
 	titleFromOp,
-} from "@gajae-code/coding-agent/tools";
+} from "@gajae-code/coding-agent/tools/implementations";
 
 const detectedRunners: DetectedRunner[] = [
 	{

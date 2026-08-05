@@ -184,7 +184,7 @@ export class InputController {
 			case "app.plan.toggle":
 				return this.ctx.planModeController.enabled && !this.ctx.goalModeController.enabled;
 			case "app.history.search":
-				return (this.ctx.historyStorage?.getRecent(1).length ?? 0) > 0;
+				return this.ctx.settings.get("history.enabled") !== false;
 			case "app.stt.toggle":
 				return Boolean(this.ctx.settings.get("stt.enabled"));
 			case "app.transcript.browse":

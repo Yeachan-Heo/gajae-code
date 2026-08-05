@@ -8,11 +8,13 @@ import {
 	parseGjcPy,
 	resolveEvalBackends,
 	resolveEvalBackendsFromEnv,
+	type ToolSession,
+} from "@gajae-code/coding-agent/tools";
+import {
 	resolvePythonIntegrationGate,
 	resolvePythonIpcTrace,
 	resolvePythonSkipCheck,
-	type ToolSession,
-} from "@gajae-code/coding-agent/tools";
+} from "@gajae-code/coding-agent/tools/implementations";
 
 const PY_ENV_KEYS = [
 	"GJC_PY",

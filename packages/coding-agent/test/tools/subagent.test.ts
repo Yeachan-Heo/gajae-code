@@ -13,7 +13,8 @@ import { runSubprocess } from "../../src/task/executor";
 import { buildTaskReceipt } from "../../src/task/receipt";
 import type { AgentDefinition } from "../../src/task/types";
 import { createSetupFailureSummary, type SingleResult } from "../../src/task/types";
-import { capCodePointsAndBytes, SubagentTool, type ToolSession } from "../../src/tools";
+import { capCodePointsAndBytes, SubagentTool } from "../../src/tools/implementations";
+import type { ToolSession } from "../../src/tools";
 import type { SubagentToolDetails } from "../../src/tools/subagent";
 import { subagentBodyCacheTestHooks, subagentToolRenderer } from "../../src/tools/subagent-render";
 

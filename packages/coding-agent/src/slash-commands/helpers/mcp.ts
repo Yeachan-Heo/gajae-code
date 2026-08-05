@@ -1,5 +1,5 @@
-import { getMCPConfigPath, logger } from "@gajae-code/utils";
-import { connectToServer, disconnectServer, listPrompts, listResources, listTools } from "../../runtime-mcp/client";
+import { getMCPConfigPath } from "@gajae-code/utils";
+import { listPrompts, listResources, listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
 	readDisabledServers,
@@ -201,30 +201,13 @@ async function withPreparedMcpConnection<T>(
 	config: MCPServerConfig,
 	fn: (connection: MCPServerConnection) => Promise<T>,
 ): Promise<T> {
-	let connection: MCPServerConnection | undefined;
-	try {
-		const manager = new MCPManager(runtime.cwd);
-		// Auth storage must be wired in before prepareConfig so OAuth-backed
-		// servers can refresh credentials and inject Authorization headers.
-		// Without this, `/mcp test|resources|prompts` silently fails for any
-		// server saved by the TUI/reauth path.
-		manager.setAuthStorage(runtime.session.modelRegistry.authStorage);
-		const resolvedConfig = await manager.prepareConfig(config);
-		connection = await connectToServer(name, resolvedConfig);
-		return await fn(connection);
-	} finally {
-		if (connection) {
-			// Await cleanup so the stdio subprocess / HTTP DELETE has actually
-			// released the resource before this helper returns. Fire-and-forget
-			// here races with subsequent connect attempts and turns close
-			// failures into unhandled rejections.
-			try {
-				await disconnectServer(connection);
-			} catch (err) {
-				logger.warn("MCP disconnect after temporary connection failed", { name, err });
-			}
-		}
-	}
+	const manager = new MCPManager(runtime.cwd, null, {
+		sharedPoolIdleMs: runtime.settings.get("mcp.sharedPoolIdleMs"),
+	});
+	// Auth storage must be wired in before the prepared lease so OAuth-backed
+	// servers can refresh credentials and inject Authorization headers.
+	manager.setAuthStorage(runtime.session.modelRegistry.authStorage);
+	return manager.withPreparedLease(name, config, lease => fn(lease.connectionForLease()));
 }
 
 async function collectConnectedMcpLines(
