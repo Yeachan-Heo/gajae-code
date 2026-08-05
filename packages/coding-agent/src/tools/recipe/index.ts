@@ -16,6 +16,8 @@ const recipeSchema = z
 		op: z.string().describe('task name and args, e.g. "test" or "build --release"'),
 	})
 	.strict();
+export { recipeSchema };
+export const RECIPE_DESCRIPTION = prompt.render(recipeDescription, buildPromptModel([]));
 type RecipeParams = z.infer<typeof recipeSchema>;
 
 type RecipeRenderResult = {

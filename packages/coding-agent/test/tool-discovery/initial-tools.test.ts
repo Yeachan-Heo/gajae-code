@@ -8,18 +8,11 @@ import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry"
 import { createAgentSession } from "../../src/sdk/session";
 import type { ToolSession } from "../../src/tools/index";
 import {
-	AskTool,
 	BUILTIN_CAPABILITY_CATALOG,
 	BUILTIN_TOOLS,
-	ComputerTool,
 	computeEssentialBuiltinNames,
 	createTools,
 	DEFAULT_ESSENTIAL_TOOL_NAMES,
-	IrcTool,
-	JobTool,
-	RecipeTool,
-	SshTool,
-	TelegramSendTool,
 } from "../../src/tools/index";
 
 const allToolsSettings = Settings.isolated({
@@ -93,6 +86,7 @@ const toolSession: ToolSession = {
 
 async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summary?: string }>> {
 	const tools = await createTools(toolSession, Object.keys(BUILTIN_TOOLS));
+	const { AskTool, ComputerTool, IrcTool, JobTool, RecipeTool, SshTool, TelegramSendTool } = await import("../../src/tools/implementations");
 	const metadata = new Map(tools.map(tool => [tool.name, { loadMode: tool.loadMode, summary: tool.summary }]));
 	for (const tool of [
 		new AskTool({ ...toolSession, hasUI: true }),

@@ -47,8 +47,8 @@ import {
 	BUILTIN_TOOLS,
 	HIDDEN_TOOLS,
 	createTools,
-	ResolveTool,
 } from "@gajae-code/coding-agent";
+import { ResolveTool } from "@gajae-code/coding-agent/tools/implementations";
 
 // Auth and models setup
 const authStorage = discoverAuthStorage();

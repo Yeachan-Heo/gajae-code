@@ -20,8 +20,9 @@ import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } fro
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
+export const SSH_DESCRIPTION = prompt.render(sshDescriptionBase);
 
-const sshSchema = z.object({
+export const sshSchema = z.object({
 	host: z.string().describe("ssh host"),
 	command: z.string().describe("remote command"),
 	cwd: z.string().optional().describe("remote working directory"),
