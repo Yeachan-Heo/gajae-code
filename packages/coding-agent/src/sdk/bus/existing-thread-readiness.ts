@@ -16,7 +16,7 @@
 
 import type { SessionIndex } from "../broker/session-index";
 import { SdkClient } from "../client/client";
-import { readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
+import type { SdkSessionEndpoint, SdkSessionEndpointScope } from "../client/discovery";
 import type { SessionActivationGate } from "../host";
 import {
 	type ActivatedPreparedSession,
@@ -86,7 +86,11 @@ export interface PreparedSessionActivationInput {
 }
 
 export interface PreparedSessionActivationDeps {
-	readEndpoint?: (repo: string, sessionId: string) => Promise<SdkSessionEndpoint | null>;
+	readEndpoint?: (
+		repo: string,
+		sessionId: string,
+		scope?: SdkSessionEndpointScope,
+	) => Promise<SdkSessionEndpoint | null>;
 	connect?: (endpoint: { url: string; token: string }) => Promise<PreparedSessionActivationClient>;
 }
 
@@ -115,8 +119,12 @@ export async function activatePreparedSession(
 			"session_not_live",
 			"Session activation requires an exact live session endpoint.",
 		);
-	const endpoint = await (deps.readEndpoint ?? readSdkSessionEndpoint)(authority.repo, input.sessionId);
-	if (!endpoint?.url || !endpoint.token)
+	// Deliberately not a second discovery read. The authority proof is bound to
+	// one endpoint file, verified by pid and mtime at one scope; re-resolving here
+	// could connect to a replacement process whose endpoint generation repeats,
+	// and the generation carried below could not tell the two apart.
+	const endpoint = authority.endpoint;
+	if (!endpoint.url || !endpoint.token)
 		throw new SessionActivationError(
 			"session_not_live",
 			"Session activation requires a readable session discovery endpoint.",

@@ -39,6 +39,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isEnoent } from "@gajae-code/utils";
 import { type ChatDaemonKind, chatDaemonPaths } from "./chat-daemon-control";
 
 export const CHAT_DAEMON_COMMAND_VERSION = 1;
@@ -432,8 +433,14 @@ async function publishScopedJsonExclusive(
 	}
 }
 
-async function unlinkScopedEntry(scope: ChatDaemonCommandScope, name: string): Promise<void> {
-	await fs.unlink(entryPath(scope, name)).catch(() => undefined);
+/** Returns whether the entry is gone: unlinked now, or already absent. */
+async function unlinkScopedEntry(scope: ChatDaemonCommandScope, name: string): Promise<boolean> {
+	try {
+		await fs.unlink(entryPath(scope, name));
+		return true;
+	} catch (error) {
+		return isEnoent(error);
+	}
 }
 
 /**
@@ -637,8 +644,13 @@ async function submitAgainstScope(
 		// these documents. Both are out of scope here, and neither is what a
 		// caller may rely on for commit certainty — that comes only from
 		// corroborating the mutation itself.
-		await unlinkScopedEntry(scope, requestName);
-		await unlinkScopedEntry(scope, responseName);
+		// The response claim is what fences an already-settled request: a serve
+		// that finds no response entry re-claims the request and commits it. So the
+		// claim may only be released once the request is *proven* gone. When the
+		// request unlink fails the claim is deliberately left behind — a leaked
+		// response object is inert, whereas releasing it would let a submission the
+		// caller was told was `cancelled` commit later.
+		if (await unlinkScopedEntry(scope, requestName)) await unlinkScopedEntry(scope, responseName);
 	}
 }
 

@@ -16,9 +16,11 @@
  * changes mid-flight leaves no mapping behind.
  */
 
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Settings } from "../../config/settings";
 import type { SessionIndex } from "../broker/session-index";
-import { readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
+import { readSdkSessionEndpoint, type SdkSessionEndpoint, type SdkSessionEndpointScope } from "../client/discovery";
 import {
 	type ChatDaemonCommandOwner,
 	type ChatDaemonCommandSubmission,
@@ -115,17 +117,36 @@ export function assertBoundedSlackRootTs(rootTs: string): void {
 }
 
 /** Proven right to bind one session at one endpoint generation. */
+async function defaultStatEndpoint(endpointPath: string): Promise<{ mtimeMs: number } | undefined> {
+	const stat = await fs.stat(endpointPath).catch(() => undefined);
+	return stat ? { mtimeMs: stat.mtimeMs } : undefined;
+}
+
 export interface SlackSessionBindingAuthority {
 	sessionId: string;
 	endpointGeneration: number;
 	pid: number;
 	repo: string;
+	/**
+	 * The exact endpoint this authority was proven against. Callers must use it
+	 * rather than re-reading discovery: a second read can observe a different
+	 * process whose endpoint generation happens to repeat, and the numeric
+	 * generation alone cannot tell the two apart.
+	 */
+	endpoint: SdkSessionEndpoint;
+	scope: SdkSessionEndpointScope;
+	endpointMtimeMs: number;
 }
 
 export interface SessionBindingAuthorityInput {
 	sessionIndex: SessionIndex;
 	sessionId: string;
-	readEndpoint?: (repo: string, sessionId: string) => Promise<SdkSessionEndpoint | null>;
+	readEndpoint?: (
+		repo: string,
+		sessionId: string,
+		scope?: SdkSessionEndpointScope,
+	) => Promise<SdkSessionEndpoint | null>;
+	statEndpoint?: (endpointPath: string) => Promise<{ mtimeMs: number } | undefined>;
 }
 
 /**
@@ -149,20 +170,43 @@ export async function resolveSessionBindingAuthority(
 	if (!session?.live || session.terminalUncertain) return undefined;
 	if (!Number.isSafeInteger(session.endpointGeneration) || session.endpointGeneration <= 0) return undefined;
 	if (!Number.isSafeInteger(session.pid) || session.pid <= 0) return undefined;
+	// Same scope derivation the runtime's attach() fence uses. Reading a
+	// `.gjc/state/chat/sdk` session at the default scope would either miss it or
+	// prove the wrong endpoint, so an underivable scope is not authority.
+	const repo = path.resolve(session.locator.repo);
+	const defaultStateRoot = path.join(repo, ".gjc", "state");
+	const indexedStateRoot = path.resolve(session.locator.stateRoot);
+	const scope: SdkSessionEndpointScope | undefined =
+		indexedStateRoot === defaultStateRoot
+			? "default"
+			: indexedStateRoot === path.join(defaultStateRoot, "chat")
+				? "chat"
+				: undefined;
+	if (!scope || session.endpointMtimeMs === undefined) return undefined;
+
 	let endpoint: SdkSessionEndpoint | null;
 	try {
-		endpoint = await (input.readEndpoint ?? readSdkSessionEndpoint)(session.locator.repo, input.sessionId);
+		endpoint = await (input.readEndpoint ?? readSdkSessionEndpoint)(session.locator.repo, input.sessionId, scope);
 	} catch {
 		// A malformed discovery record is not authority for anything.
 		return undefined;
 	}
 	if (!endpoint || endpoint.stale === true || !endpoint.url || !endpoint.token) return undefined;
 	if (endpoint.pid === undefined || endpoint.pid !== session.pid) return undefined;
+
+	// The endpoint file must be the exact one the index observed. Without this
+	// the numeric generation is the only fence, and it repeats across processes.
+	const stat = await (input.statEndpoint ?? defaultStatEndpoint)(endpoint.path);
+	if (!stat || stat.mtimeMs !== session.endpointMtimeMs) return undefined;
+
 	return {
 		sessionId: input.sessionId,
 		endpointGeneration: session.endpointGeneration,
 		pid: session.pid,
 		repo: session.locator.repo,
+		endpoint,
+		scope,
+		endpointMtimeMs: session.endpointMtimeMs,
 	};
 }
 

@@ -173,6 +173,7 @@ export class SessionSdkHost {
 	readonly reverse: ReverseLeaseRuntime;
 	readonly #options: SessionSdkHostOptions;
 	#started = false;
+	#stopping = false;
 	#stopPromise?: Promise<"stopped">;
 	#unsubscribe?: () => void;
 	#registration?: { writer: BrokerIndexWriter; generation: number };
@@ -287,7 +288,10 @@ export class SessionSdkHost {
 			if (!authorized) return "not_authorized";
 			// The gate is asynchronous, so the session may have stopped or rolled
 			// while it ran; nothing published below may rest on the earlier proof.
-			if (!this.#started) return "not_prepared";
+			// `#started` stays true across the unregister await inside stop(), so an
+			// activation gate that resolves during shutdown would otherwise pass this
+			// re-check and publish readiness after teardown began.
+			if (!this.#started || this.#stopping) return "not_prepared";
 			if (this.events.generation !== generation) return "generation_changed";
 			if (this.#readyGeneration === generation) return "already";
 		}
@@ -308,6 +312,9 @@ export class SessionSdkHost {
 	}
 
 	async #stopStartedHost(): Promise<"stopped"> {
+		// Fence before the first await: everything after this point is teardown,
+		// and no in-flight activation may publish readiness across it.
+		this.#stopping = true;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		if (this.#registration?.writer.unregister)
@@ -317,6 +324,7 @@ export class SessionSdkHost {
 				endpointGeneration: this.events.generation,
 			});
 		this.#started = false;
+		this.#stopping = false;
 		return "stopped";
 	}
 
@@ -352,6 +360,22 @@ export class SessionSdkHost {
 			switch (frame.type) {
 				case "control_request": {
 					this.#observeRequest("control", connectionId, frame);
+					// Deferred readiness withholds `session_ready`, but the control
+					// dispatcher was still reachable, so the pre-activation interval made
+					// activation optional for input admission. `session_activate` is a
+					// separate frame type and is unaffected by this gate.
+					if (this.prepared) {
+						await this.#send(connectionId, {
+							type: "control_response",
+							id: requiredString(frame, "id"),
+							ok: false,
+							error: {
+								code: "not_activated",
+								message: "The session is prepared and must be activated before it accepts controls.",
+							},
+						});
+						break;
+					}
 					const result = await this.#options.control?.(connectionId, frame);
 					if (result !== undefined) {
 						const response = { type: "control_response", ...(result as SdkFrame) };

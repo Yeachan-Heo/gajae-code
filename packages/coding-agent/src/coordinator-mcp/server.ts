@@ -297,6 +297,8 @@ interface CoordinatorEventInput {
 	metadata?: Record<string, string | number | boolean | null>;
 }
 
+const UNOBSERVED_COMPENSATION_CODE = "broker_compensation_unobserved";
+
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
@@ -2570,6 +2572,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return normalizeRuntimePromptAcknowledgement(result);
 	}
 
+	/**
+	 * The outcome of a failed compensating close is unobserved, not decided: the
+	 * session may still be running. Sealing it under the idempotency key would
+	 * answer that uncertainty forever, so the key stays open for a real retry.
+	 */
+	function isUnobservedCompensation(response: Record<string, unknown>): boolean {
+		const error = asRecord(response.error);
+		return error?.code === UNOBSERVED_COMPENSATION_CODE;
+	}
+
 	function sdkError(error: unknown): Record<string, unknown> {
 		if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
 		return {
@@ -3754,6 +3766,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return response;
 					},
 					true,
+					isUnobservedCompensation,
 				);
 			}
 			if (name === "gjc_coordinator_read_status") {
@@ -4181,7 +4194,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				 * dropped or delivered to a session no consumer has been told is live,
 				 * so it is refused before any broker mutation or idempotency record.
 				 */
-				const preparesExistingThread = args.prepare_existing_thread === true;
+				// Runtime dispatch hands `params.arguments` through unvalidated, so a
+				// client sending the string "true" would coerce to false here and start
+				// an ordinary ready session that accepts the prompt — the opposite of
+				// what the schema promises. Reject a non-boolean before any mutation.
+				const requestedPrepare = (args as Record<string, unknown>).prepare_existing_thread;
+				if (requestedPrepare !== undefined && typeof requestedPrepare !== "boolean")
+					return {
+						ok: false,
+						error: {
+							code: "invalid_input",
+							message: `prepare_existing_thread must be a boolean; received ${typeof requestedPrepare}.`,
+						},
+					};
+				const preparesExistingThread = requestedPrepare === true;
 				if (preparesExistingThread && prompt)
 					return {
 						ok: false,
@@ -4235,13 +4261,27 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							 */
 							if (preparesExistingThread && created.readiness !== "prepared") {
 								const unpreparedId = optionalString(created.sessionId ?? created.session_id);
-								if (unpreparedId)
-									await brokerSession(
+								let compensated = true;
+								if (unpreparedId) {
+									compensated = await brokerSession(
 										cwd,
 										"session.close",
 										{ sessionId: unpreparedId },
 										`${idempotencyKey}:unprepared-close`,
-									).catch(() => undefined);
+									).then(
+										() => true,
+										() => false,
+									);
+								}
+								// A swallowed compensation leaves a live, untracked session while
+								// idempotency seals the failure, so exact retries only replay the
+								// cached error and never reach the session again. Name the session
+								// and mark the outcome unobserved so the key is not sealed.
+								if (!compensated)
+									throw new SdkClientError(
+										UNOBSERVED_COMPENSATION_CODE,
+										`SDK broker did not prepare the requested session, and closing the unprepared session ${unpreparedId} failed; it may still be running.`,
+									);
 								throw new SdkClientError(
 									"broker_request_unavailable",
 									"SDK broker did not prepare the requested session.",
@@ -4330,6 +4370,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return response;
 					},
 					true,
+					isUnobservedCompensation,
 				);
 			}
 			if (name === "gjc_coordinator_activate_session") {

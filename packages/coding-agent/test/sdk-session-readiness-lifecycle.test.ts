@@ -7,7 +7,11 @@ import { type SdkFrame, SESSION_PREPARED_EVENT, type SessionActivationGate, Sess
 type Emitted = { name?: string; sessionId?: string; generation?: number };
 
 async function withHost(
-	options: { readiness?: "immediate" | "deferred"; activationGate?: SessionActivationGate },
+	options: {
+		readiness?: "immediate" | "deferred";
+		activationGate?: SessionActivationGate;
+		control?: (connectionId: string, frame: SdkFrame) => Record<string, unknown> | undefined;
+	},
 	run: (input: {
 		host: SessionSdkHost;
 		events: () => Emitted[];
@@ -35,6 +39,7 @@ async function withHost(
 			},
 			...(options.readiness ? { readiness: options.readiness } : {}),
 			...(options.activationGate ? { activationGate: options.activationGate } : {}),
+			...(options.control ? { control: options.control } : {}),
 		});
 		await host.start();
 		const activeHost = host;
@@ -78,6 +83,57 @@ describe("prepared session readiness lifecycle", () => {
 			expect(host.prepared).toBe(true);
 			expect(host.ready).toBe(false);
 		});
+	});
+
+	test("a prepared session refuses control requests until it is activated", async () => {
+		// Deferred readiness withheld only `session_ready`; the control dispatcher
+		// stayed reachable, so activation was optional for input admission.
+		let dispatched = 0;
+		await withHost(
+			{
+				readiness: "deferred",
+				activationGate: () => false,
+				control: () => {
+					dispatched++;
+					return { id: "c1", ok: true };
+				},
+			},
+			async ({ host, sent, frame }) => {
+				expect(host.prepared).toBe(true);
+				await frame({ type: "control_request", id: "c1", op: "prompt" } as unknown as SdkFrame);
+
+				expect(dispatched).toBe(0);
+				expect(sent).toHaveLength(1);
+				expect(sent[0]).toMatchObject({
+					type: "control_response",
+					id: "c1",
+					ok: false,
+					error: { code: "not_activated" },
+				});
+			},
+		);
+	});
+
+	test("an activated session admits control requests again", async () => {
+		let dispatched = 0;
+		await withHost(
+			{
+				readiness: "deferred",
+				activationGate: () => true,
+				control: () => {
+					dispatched++;
+					return { id: "c1", ok: true };
+				},
+			},
+			async ({ host, sent, frame }) => {
+				expect(await host.activate(host.generation)).toBe("activated");
+				expect(host.prepared).toBe(false);
+				await frame({ type: "control_request", id: "c1", op: "prompt" } as unknown as SdkFrame);
+
+				expect(dispatched).toBe(1);
+				expect(sent.some(value => (value as { ok?: boolean }).ok === false)).toBe(false);
+			},
+		);
 	});
 
 	test("activation before a binding is refused with no readiness publication", async () => {
