@@ -1060,6 +1060,57 @@ function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
 	const normalized = message || "unknown storage error";
 	return truncateHeadBytes(normalized, AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
 }
+const PRE_ADMISSION_SPILL_DIAGNOSTIC_TOOL_MAX_CODE_POINTS = 64;
+const PRE_ADMISSION_SPILL_DIAGNOSTIC_ERROR_MAX_CODE_POINTS = 64;
+const PRE_ADMISSION_SPILL_DIAGNOSTIC_MESSAGE_MAX_CODE_POINTS = 128;
+
+function boundPreAdmissionSpillDiagnostic(value: string, maxCodePoints: number): string {
+	let result = "";
+	let codePoints = 0;
+	for (const character of value) {
+		const codePoint = character.codePointAt(0)!;
+		if (
+			codePoint <= 0x1f ||
+			(codePoint >= 0x7f && codePoint <= 0x9f) ||
+			(codePoint >= 0x202a && codePoint <= 0x202e) ||
+			(codePoint >= 0x2066 && codePoint <= 0x2069)
+		)
+			continue;
+		result += character;
+		codePoints++;
+		if (codePoints === maxCodePoints) break;
+	}
+	return result;
+}
+
+function logPreAdmissionSpillFailure(outcome: string, toolName: string, error: unknown, fallbackMessage: string): void {
+	let errorName = "ArtifactUnavailable";
+	let errorMessage = fallbackMessage;
+	try {
+		if (error instanceof Error) {
+			errorName =
+				boundPreAdmissionSpillDiagnostic(error.name, PRE_ADMISSION_SPILL_DIAGNOSTIC_ERROR_MAX_CODE_POINTS) ||
+				"Error";
+			errorMessage =
+				boundPreAdmissionSpillDiagnostic(error.message, PRE_ADMISSION_SPILL_DIAGNOSTIC_MESSAGE_MAX_CODE_POINTS) ||
+				fallbackMessage;
+		} else if (error !== undefined) {
+			errorMessage =
+				boundPreAdmissionSpillDiagnostic(String(error), PRE_ADMISSION_SPILL_DIAGNOSTIC_MESSAGE_MAX_CODE_POINTS) ||
+				fallbackMessage;
+		}
+	} catch {
+		errorName = "UnknownError";
+		errorMessage = fallbackMessage;
+	}
+	logger.warn("Pre-admission artifact spill preserved inline tool result", {
+		outcome,
+		tool:
+			boundPreAdmissionSpillDiagnostic(toolName, PRE_ADMISSION_SPILL_DIAGNOSTIC_TOOL_MAX_CODE_POINTS) || "unknown",
+		error: errorName,
+		message: errorMessage,
+	});
+}
 
 function summarizeAgentBashArtifactSave(
 	artifactId: string,
@@ -3777,47 +3828,95 @@ export class AgentSession {
 
 	async #spillOversizedToolResultBeforeAdmission(message: ToolResultMessage): Promise<void> {
 		if (!this.settings.get("tools.preAdmissionArtifactSpill")) return;
+		if (message.content.length !== 1 || message.content[0]?.type !== "text") return;
 
-		const textParts = message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
-		if (textParts.length === 0) return;
-		const fullText = textParts.join("\n");
-		const contextWindow = this.model?.contextWindow;
-		const thresholdTokens = Math.min(
-			8_000,
-			contextWindow && contextWindow > 0 ? Math.floor(contextWindow * 0.05) : 8_000,
-		);
-		if (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens) return;
+		const textBlock = message.content[0];
+		const fullText = textBlock.text;
+
+		const detailRecord =
+			message.details && typeof message.details === "object"
+				? (message.details as Record<string, unknown>)
+				: undefined;
+		const existingMeta =
+			detailRecord?.meta && typeof detailRecord.meta === "object"
+				? (detailRecord.meta as Record<string, unknown>)
+				: undefined;
+		const existingTruncation =
+			existingMeta?.truncation && typeof existingMeta.truncation === "object"
+				? (existingMeta.truncation as Record<string, unknown>)
+				: undefined;
+		const existingArtifactId = existingTruncation?.artifactId;
+		if (typeof existingArtifactId === "string") {
+			try {
+				if (existingArtifactId.trim() && (await this.sessionManager.getArtifactPath(existingArtifactId))) return;
+				logPreAdmissionSpillFailure(
+					"existing_artifact_unreachable",
+					message.toolName,
+					undefined,
+					"Existing artifact is not reachable from this session",
+				);
+			} catch (error) {
+				logPreAdmissionSpillFailure(
+					"existing_artifact_unreachable",
+					message.toolName,
+					error,
+					"Existing artifact reachability check failed",
+				);
+			}
+			return;
+		}
+		const fullTextBytes = utf8ByteLength(fullText);
+		const thresholdBytes = this.settings.get("tools.artifactSpillThreshold") * 1024;
+		if (fullTextBytes <= thresholdBytes) return;
+		if (fullTextBytes > DEFAULT_ARTIFACT_MAX_BYTES) {
+			logPreAdmissionSpillFailure(
+				"artifact_too_large",
+				message.toolName,
+				undefined,
+				"Tool result exceeds the exact artifact storage limit",
+			);
+			return;
+		}
 
 		try {
 			const artifactId = await this.sessionManager.saveArtifact(fullText, "tool-result");
-			if (!artifactId) return;
+			if (!artifactId?.trim()) {
+				logPreAdmissionSpillFailure(
+					"artifact_id_missing",
+					message.toolName,
+					undefined,
+					"Artifact storage returned no artifact id",
+				);
+				return;
+			}
+			if (!(await this.sessionManager.getArtifactPath(artifactId))) {
+				logPreAdmissionSpillFailure(
+					"artifact_unreachable",
+					message.toolName,
+					undefined,
+					"Saved artifact is not reachable from this session",
+				);
+				return;
+			}
+
 			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
 			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifactId, digest);
 			const spillMeta = outputMeta()
 				.truncationFromText(preview, {
 					direction: "middle",
 					totalLines: fullText.split("\n").length,
-					totalBytes: Buffer.byteLength(fullText, "utf-8"),
+					totalBytes: fullTextBytes,
 					artifactId,
 				})
 				.get();
-			const existingDetails = message.details;
-			const detailRecord =
-				existingDetails && typeof existingDetails === "object" ? (existingDetails as Record<string, unknown>) : {};
-			const existingMeta =
-				detailRecord.meta && typeof detailRecord.meta === "object"
-					? (detailRecord.meta as Record<string, unknown>)
-					: {};
-			message.details = { ...detailRecord, meta: { ...existingMeta, ...spillMeta } };
-			message.content = [
-				...message.content.filter((block): block is ImageContent => block.type === "image"),
-				{ type: "text", text: preview },
-			];
+			const projectedDetails = detailRecord ?? {};
+			const projectedMeta = existingMeta ?? {};
+			// Admission invariant: the session-owned artifact is canonical; only after
+			// it is reachable may persistence and the provider share this receipt projection.
+			message.details = { ...projectedDetails, meta: { ...projectedMeta, ...spillMeta } };
+			textBlock.text = preview;
 		} catch (error) {
-			logger.warn("Failed to spill oversized tool result before context admission", {
-				toolName: message.toolName,
-				error: error instanceof Error ? error.message : String(error),
-			});
+			logPreAdmissionSpillFailure("artifact_storage_failed", message.toolName, error, "Artifact storage failed");
 		}
 	}
 
