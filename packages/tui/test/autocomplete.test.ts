@@ -513,6 +513,23 @@ async function renderEditorAutocomplete(prefix: string, items: AutocompleteItem[
 		.map(line => Bun.stripANSI(line));
 }
 
+async function renderEditorAbsolutePathAutocomplete(
+	prefix: string,
+	items: AutocompleteItem[],
+	width: number,
+): Promise<string[]> {
+	const editor = new Editor(defaultEditorTheme);
+	editor.setBorderVisible(false);
+	editor.setAutocompleteProvider(new StaticAutocompleteProvider({ prefix, items }));
+	editor.setText(`read ${prefix}`);
+	editor.handleInput("\t");
+	await Bun.sleep(0);
+	return editor
+		.render(width)
+		.slice(1)
+		.map(line => Bun.stripANSI(line));
+}
+
 describe("Editor autocomplete layout", () => {
 	const slashItems: AutocompleteItem[] = [
 		{ value: "go", label: "go", description: "Run immediately" },
@@ -562,5 +579,12 @@ describe("Editor autocomplete layout", () => {
 			"> go                              Run immediately",
 			"  한글명령                        Unicode workflow description",
 		]);
+	});
+
+	it("keeps absolute-path file autocomplete byte-identical to the default layout", async () => {
+		const defaultLines = await renderEditorAutocomplete("@f", slashItems, 120);
+		const absolutePathLines = await renderEditorAbsolutePathAutocomplete("/tmp/f", slashItems, 120);
+
+		expect(absolutePathLines).toEqual(defaultLines);
 	});
 });

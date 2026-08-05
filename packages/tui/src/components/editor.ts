@@ -2838,16 +2838,20 @@ export class Editor implements Component, Focusable {
 		);
 	}
 
-	#isSlashCommandNameAutocompleteSelection(): boolean {
-		if (this.#autocompleteState !== "regular") {
-			return false;
-		}
-
+	#isSlashCommandNameAutocompleteContext(): boolean {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol).trimStart();
 		return (
 			this.#isInSubmittedSlashCommandContext() && textBeforeCursor.startsWith("/") && !textBeforeCursor.includes(" ")
 		);
+	}
+
+	#isSlashCommandNameAutocompleteSelection(): boolean {
+		if (this.#autocompleteState !== "regular") {
+			return false;
+		}
+
+		return this.#isSlashCommandNameAutocompleteContext();
 	}
 
 	#isCompletedSlashCommandAtCursor(): boolean {
@@ -2890,7 +2894,10 @@ export class Editor implements Component, Focusable {
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(
+				suggestions.items,
+				this.#isSlashCommandNameAutocompleteContext() ? "slash-command" : "default",
+			);
 			this.#autocompleteState = "regular";
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
@@ -2901,10 +2908,10 @@ export class Editor implements Component, Focusable {
 		}
 	}
 	#createAutocompleteList(
-		prefix: string,
 		items: Array<{ value: string; label: string; description?: string }>,
+		kind: "slash-command" | "default",
 	): SelectList {
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
+		const layout = kind === "slash-command" ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
 		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
 	}
 
@@ -2982,7 +2989,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			}
 
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, "default");
 			this.#autocompleteState = "force";
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
@@ -3032,7 +3039,10 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(
+				suggestions.items,
+				this.#isSlashCommandNameAutocompleteContext() ? "slash-command" : "default",
+			);
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
