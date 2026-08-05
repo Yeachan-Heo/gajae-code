@@ -4,6 +4,7 @@ import {
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
+	resolveOpenAISdkRequestTimeoutMs,
 } from "../src/utils/idle-iterator";
 
 /**
@@ -125,5 +126,29 @@ describe("getStreamFirstEventTimeoutMs(idleTimeoutMs, fallbackMs)", () => {
 
 	it("falls back to the 100s global default when no fallback or env is provided", () => {
 		expect(getStreamFirstEventTimeoutMs()).toBe(100_000);
+	});
+});
+
+describe("resolveOpenAISdkRequestTimeoutMs(provider, override)", () => {
+	it("uses the Alibaba 600s fallback when neither env nor caller pins a value", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("alibaba-token-plan")).toBe(600_000);
+	});
+
+	it("honors an explicit shorter Alibaba override for pre-headers setup", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("alibaba-token-plan", 5_000)).toBe(5_000);
+	});
+
+	it("floors non-fallback providers at the shared first-event window", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("openai", 5_000)).toBe(120_000);
+	});
+
+	it("disables the SDK request timeout when the first-event watchdog is explicitly off", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("openai", 0)).toBeUndefined();
+		expect(resolveOpenAISdkRequestTimeoutMs("alibaba-token-plan", 0)).toBeUndefined();
+	});
+
+	it("lets PI_STREAM_FIRST_EVENT_TIMEOUT_MS pin Azure setup bounds", () => {
+		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "5000";
+		expect(resolveOpenAISdkRequestTimeoutMs("azure")).toBe(5_000);
 	});
 });

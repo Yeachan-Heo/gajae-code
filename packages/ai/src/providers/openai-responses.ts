@@ -43,6 +43,7 @@ import {
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
+	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -318,6 +319,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.requestMaxRetries,
 				options?.maxRetryDelayMs,
 				options?.attemptScope,
+				options?.streamFirstEventTimeoutMs,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -473,6 +475,7 @@ function createClient(
 	requestMaxRetries?: number,
 	maxRetryDelayMs?: number,
 	attemptScope?: import("../types.js").AttemptScopeRef,
+	streamFirstEventTimeoutOverride?: number,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -543,6 +546,9 @@ function createClient(
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);
+	// Bound HTTP request timeout to the first-event window so a stalled-before-headers
+	// fetch cannot wait the SDK's 10-minute default before the transport watchdog arms.
+	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, streamFirstEventTimeoutOverride);
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -553,6 +559,7 @@ function createClient(
 			fetch: onSseEvent
 				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model, attemptScope))
 				: transformedFetch,
+			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 		}),
 		copilotPremiumRequests,
 		baseUrl,

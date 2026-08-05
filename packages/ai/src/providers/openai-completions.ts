@@ -52,6 +52,7 @@ import {
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
+	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
 import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
@@ -1233,26 +1234,7 @@ async function createClient(
 	// The OpenAI SDK's default is 10 minutes per attempt × `maxRetries`, which
 	// turns a stalled-before-headers fetch into a multi-minute hang invisible
 	// to the agent loop (the iterator watchdog only arms AFTER `create()` returns).
-	// Using the first-event timeout keeps both layers aligned: the SDK gives up
-	// before the agent watchdog would have, surfacing a real error to the catch
-	// in the IIFE.
-	// A caller may raise `StreamOptions.streamFirstEventTimeoutMs` for a slow-
-	// before-headers provider; respect it so the SDK doesn't give up before the
-	// wrapping watchdog arms. Provider-specific fallbacks apply only when the
-	// caller does not pin a value, so an explicit nonzero override must beat that
-	// fallback even when it is shorter. An explicit `0` disables the watchdog,
-	// and the SDK treats `timeout: 0` as an immediate timeout, so do not pass a
-	// request timeout in that case.
-	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
-	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(getOpenAIStreamIdleTimeoutMs(), providerFirstEventFallbackMs);
-	const sdkTimeoutMs =
-		streamFirstEventTimeoutOverride === 0
-			? undefined
-			: streamFirstEventTimeoutOverride !== undefined
-				? providerFirstEventFallbackMs !== undefined
-					? streamFirstEventTimeoutOverride
-					: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride)
-				: envSdkTimeoutMs;
+	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, streamFirstEventTimeoutOverride);
 	return {
 		client: new OpenAI({
 			apiKey,

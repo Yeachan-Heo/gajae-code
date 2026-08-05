@@ -1,5 +1,5 @@
 import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
-import { AzureOpenAI } from "openai";
+import { APIConnectionTimeoutError, AzureOpenAI } from "openai";
 import type {
 	Tool as OpenAITool,
 	ResponseCreateParamsStreaming,
@@ -22,9 +22,11 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import {
+	FirstEventTimeoutError,
 	getOpenAIStreamIdleTimeoutMs,
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
+	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { flattenToolRootCombinators, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
@@ -109,6 +111,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 	(async () => {
 		const startTime = Date.now();
 		let firstTokenTime: number | undefined;
+		let streamConnected = false;
 		const deploymentName = resolveDeploymentName(model, options);
 
 		const output: AssistantMessage = createInitialResponsesAssistantMessage(
@@ -163,6 +166,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				rawRequestDump = { ...rawRequestDump, body: params };
 				openaiStream = await client.responses.create(params, { signal: requestSignal });
 			}
+			streamConnected = true;
 			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 			stream.push({ type: "start", partial: output });
 
@@ -206,10 +210,15 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 		} catch (error) {
 			for (const block of output.content) delete (block as { index?: number }).index;
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
+			const normalizedError =
+				!streamConnected && error instanceof APIConnectionTimeoutError
+					? new FirstEventTimeoutError(AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE)
+					: error;
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.transportFailure = transportFailureFacts(error);
-			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+			output.errorStatus = extractHttpStatusFromError(firstEventTimeoutError ?? normalizedError);
+			output.transportFailure = transportFailureFacts(firstEventTimeoutError ?? normalizedError);
+			output.errorMessage =
+				firstEventTimeoutError?.message ?? (await finalizeErrorMessage(normalizedError, rawRequestDump));
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -308,6 +317,9 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 
 	const baseFetch = wrapOpenAIFetchForBoundedRateLimits(options?.fetch ?? fetch, options?.maxRetryDelayMs);
 	const onSseEvent = options?.onSseEvent;
+	// Bound HTTP request timeout to the first-event window so a stalled-before-headers
+	// fetch cannot wait the SDK's 10-minute default before the transport watchdog arms.
+	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, options?.streamFirstEventTimeoutMs);
 	return new AzureOpenAI({
 		apiKey,
 		apiVersion,
@@ -318,6 +330,7 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 		fetch: onSseEvent
 			? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model, options?.attemptScope))
 			: baseFetch,
+		...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 	});
 }
 

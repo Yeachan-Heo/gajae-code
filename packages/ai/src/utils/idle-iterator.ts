@@ -68,6 +68,37 @@ export function getStreamFirstEventTimeoutMs(
 	return normalizeIdleTimeoutMs($env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS, fallback);
 }
 
+/**
+ * Resolves the OpenAI SDK client `timeout` so stalled-before-headers requests are
+ * bounded by the same first-event window the transport watchdog uses after
+ * `create()` returns. Without this, providers that only arm
+ * `iterateWithIdleTimeout` post-setup can wait the full SDK default (10 minutes
+ * per attempt) before any provider-owned watchdog exists.
+ *
+ * - Explicit `0` disables the request timeout (the SDK treats `timeout: 0` as an
+ *   immediate failure, so callers that disable the first-event watchdog must not
+ *   pass a timeout).
+ * - Providers with a first-event fallback (Alibaba, Kimi) honor an explicit
+ *   nonzero override as-is, even when shorter than the fallback.
+ * - Other providers floor an explicit override at the env/default first-event
+ *   window so a short post-connect first-event budget cannot kill legitimate
+ *   slow setup.
+ */
+export function resolveOpenAISdkRequestTimeoutMs(
+	provider: string,
+	streamFirstEventTimeoutOverride?: number,
+): number | undefined {
+	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(provider);
+	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(getOpenAIStreamIdleTimeoutMs(), providerFirstEventFallbackMs);
+	if (streamFirstEventTimeoutOverride === 0) return undefined;
+	if (streamFirstEventTimeoutOverride !== undefined) {
+		return providerFirstEventFallbackMs !== undefined
+			? streamFirstEventTimeoutOverride
+			: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride);
+	}
+	return envSdkTimeoutMs;
+}
+
 export type Watchdog = NodeJS.Timeout | undefined;
 export class FirstEventTimeoutError extends Error {
 	readonly providerCode = STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;

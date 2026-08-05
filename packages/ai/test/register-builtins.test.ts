@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import "../src/providers/azure-openai-responses";
 import "../src/providers/openai-codex-responses";
 import "../src/providers/openai-completions";
 import "../src/providers/openai-responses";
@@ -11,6 +12,7 @@ import {
 import { stream as streamModel } from "../src/stream";
 import type { AssistantMessage, Context, Model } from "../src/types";
 import type { AssistantMessageEventStream } from "../src/utils/event-stream";
+import { withEnv } from "./helpers";
 
 function createModel(): Model<"bedrock-converse-stream"> {
 	return {
@@ -631,5 +633,124 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		const result = await lazyStream.result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.content[0]).toMatchObject({ type: "text", text: "Still alive" });
+	});
+
+	function getRequestSignal(input: string | URL | Request, init: RequestInit | undefined): AbortSignal | undefined {
+		if (init?.signal) return init.signal;
+		if (input instanceof Request) return input.signal;
+		return undefined;
+	}
+
+	/** Pre-headers hang: fetch never resolves until the SDK/caller aborts the request signal. */
+	function createNeverResolvingFetch(): typeof fetch {
+		async function mockFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+			const signal = getRequestSignal(input, init);
+			if (signal?.aborted) {
+				const reason = signal.reason;
+				throw reason instanceof Error ? reason : new Error(String(reason ?? "request aborted"));
+			}
+			await new Promise<never>((_resolve, reject) => {
+				signal?.addEventListener(
+					"abort",
+					() => {
+						const reason = signal.reason;
+						reject(reason instanceof Error ? reason : new Error(String(reason ?? "request aborted")));
+					},
+					{ once: true },
+				);
+			});
+			throw new Error("never-resolving fetch should not resume");
+		}
+		return Object.assign(mockFetch, { preconnect: globalThis.fetch.preconnect });
+	}
+
+	it("bounds a never-resolving Responses setup on the lazy path with typed first-event facts", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: undefined }, async () => {
+			const model = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(createNeverResolvingFetch());
+
+			const lazyStream = streamModel(model, baseContext, {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+				streamFirstEventTimeoutMs: 5_000,
+			});
+			await flush();
+			expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+			vi.advanceTimersByTime(5_000);
+			await flush(100);
+			const result = await lazyStream.result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("OpenAI responses stream timed out while waiting for the first event");
+			expect(result.transportFailure).toMatchObject({
+				kind: "transport",
+				providerCode: "stream_first_event_timeout",
+			});
+		});
+	});
+
+	it("bounds a never-resolving Azure Responses setup on the lazy path with typed first-event facts", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: "5000" }, async () => {
+			const model: Model<"azure-openai-responses"> = {
+				id: "gpt-5-mini",
+				name: "GPT-5 Mini",
+				api: "azure-openai-responses",
+				provider: "azure",
+				baseUrl: "https://example.openai.azure.com/openai/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 400000,
+				maxTokens: 128000,
+			};
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(createNeverResolvingFetch());
+
+			const lazyStream = streamModel(model, baseContext, {
+				apiKey: "test-key",
+				azureBaseUrl: model.baseUrl,
+				azureApiVersion: "v1",
+				requestMaxRetries: 0,
+			});
+			await flush();
+			expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+			vi.advanceTimersByTime(5_000);
+			await flush(100);
+			const result = await lazyStream.result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("Azure OpenAI responses stream timed out while waiting for the first event");
+			expect(result.transportFailure).toMatchObject({
+				kind: "transport",
+				providerCode: "stream_first_event_timeout",
+			});
+		});
+	});
+
+	it("keeps caller aborts as aborted on a never-resolving Responses lazy setup", async () => {
+		const model = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(createNeverResolvingFetch());
+		const controller = new AbortController();
+
+		const pending = streamModel(model, baseContext, {
+			apiKey: "test-key",
+			requestMaxRetries: 0,
+			streamFirstEventTimeoutMs: 60_000,
+			signal: controller.signal,
+		}).result();
+		await flush();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		controller.abort();
+		const result = await Promise.race([
+			pending,
+			Bun.sleep(200).then(() => {
+				throw new Error("lazy Responses caller abort did not settle during never-resolving setup");
+			}),
+		]);
+		expect(result.stopReason).toBe("aborted");
+		expect((result.errorMessage ?? "").toLowerCase()).toContain("abort");
+		expect(result.transportFailure?.providerCode).not.toBe("stream_first_event_timeout");
 	});
 });

@@ -638,6 +638,67 @@ describe("OpenAI-family first-event timeouts", () => {
 		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
 	});
 
+	it("honors a shorter Alibaba responses caller timeout before response headers", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: undefined }, async () => {
+			let fetchAttempts = 0;
+			const delayedFetch = createDelayedFetch(60_000, createOpenAIResponsesSuccessResponse);
+			global.fetch = Object.assign(
+				async (input: string | URL | Request, init?: RequestInit) => {
+					fetchAttempts++;
+					return delayedFetch(input, init);
+				},
+				{ preconnect: originalFetch.preconnect },
+			);
+
+			const pending = streamOpenAIResponses(alibabaOpenAIResponsesModel, baseContext(), {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+				streamFirstEventTimeoutMs: 5_000,
+			}).result();
+			await flushMicrotasks();
+			vi.advanceTimersByTime(5_000);
+			await flushMicrotasks(100);
+			const result = await pending;
+
+			expect(fetchAttempts).toBe(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("OpenAI responses stream timed out while waiting for the first event");
+			expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		});
+	});
+
+	it("honors an env-pinned Azure responses setup timeout before response headers", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: "5000" }, async () => {
+			let fetchAttempts = 0;
+			const delayedFetch = createDelayedFetch(60_000, createOpenAIResponsesSuccessResponse);
+			global.fetch = Object.assign(
+				async (input: string | URL | Request, init?: RequestInit) => {
+					fetchAttempts++;
+					return delayedFetch(input, init);
+				},
+				{ preconnect: originalFetch.preconnect },
+			);
+
+			const pending = streamAzureOpenAIResponses(azureOpenAIResponsesModel, baseContext(), {
+				apiKey: "test-key",
+				azureBaseUrl: azureOpenAIResponsesModel.baseUrl,
+				azureApiVersion: "v1",
+				requestMaxRetries: 0,
+			}).result();
+			await flushMicrotasks();
+			vi.advanceTimersByTime(5_000);
+			await flushMicrotasks(100);
+			const result = await pending;
+
+			expect(fetchAttempts).toBe(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("Azure OpenAI responses stream timed out while waiting for the first event");
+			expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		});
+	});
+
 	it("does not arm the first-event watchdog before Azure OpenAI responses setup finishes", async () => {
 		await expectDelayedRequestSetupSucceeds(
 			streamFirstEventTimeoutMs =>
