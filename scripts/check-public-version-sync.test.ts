@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
-import { buildDocsIndexOutput, checkLivePublicVersionSync, checkPublicVersionSync } from "./check-public-version-sync";
+import { buildDocsIndexOutputs } from "../packages/coding-agent/scripts/generate-docs-index";
+import { checkLivePublicVersionSync, checkPublicVersionSync } from "./check-public-version-sync";
 import { canonicalJsonBytes, createExpectedEvidence, createFinalEvidence, expectedEvidenceSha256, PUBLIC_PACKAGE_DEFINITIONS } from "./release-evidence";
 
 const tempRoots: string[] = [];
@@ -38,10 +39,14 @@ function packageJson(name: string, version = "1.2.3", homepage = "https://gajae-
 	return JSON.stringify({ name, version, homepage }, null, "\t");
 }
 
-async function addGeneratedDocsIndex(root: string): Promise<void> {
-	const outputPath = path.join(root, "packages/coding-agent/src/internal-urls/docs-index.generated.ts");
-	await fs.mkdir(path.dirname(outputPath), { recursive: true });
-	await Bun.write(outputPath, await buildDocsIndexOutput(root));
+async function addGeneratedDocsOutputs(root: string): Promise<void> {
+	const outputsDir = path.join(root, "packages/coding-agent/src/internal-urls");
+	await fs.mkdir(outputsDir, { recursive: true });
+	const outputs = await buildDocsIndexOutputs(root);
+	await Promise.all([
+		Bun.write(path.join(outputsDir, "docs-index.generated.ts"), outputs.index),
+		Bun.write(path.join(outputsDir, "docs-payload.generated.bin"), outputs.payload),
+	]);
 }
 const SOURCE_SHA = "a".repeat(40);
 const DIFFERENT_SOURCE_SHA = "e".repeat(40);
@@ -180,7 +185,7 @@ describe("public docs/site/version sync guard", () => {
 			"README.md": "# Gajae-Code\n\n## Recent highlights\n",
 			"docs/sdk.md": "# SDK\n\nCurrent docs.\n",
 		});
-		await addGeneratedDocsIndex(root);
+		await addGeneratedDocsOutputs(root);
 
 		await expect(checkPublicVersionSync(root)).resolves.toEqual([]);
 	});
@@ -223,6 +228,64 @@ describe("public docs/site/version sync guard", () => {
 			"docs/sdk.md": "# SDK\n\nCurrent docs.\n",
 			".gitignore": "packages/coding-agent/src/internal-urls/docs-index.generated.ts\n",
 		});
+		await addGeneratedDocsOutputs(root);
+		await $`git -C ${root} init -q`.quiet();
+		await $`git -C ${root} add -A --force`.quiet();
+
+		const committed = await checkPublicVersionSync(root);
+		expect(
+			committed.some(
+				violation =>
+					violation.path.includes("docs-index.generated.ts") && violation.message.includes("git rm --cached"),
+			),
+		).toBe(true);
+
+		await $`git -C ${root} rm --cached -q -- packages/coding-agent/src/internal-urls/docs-index.generated.ts`.quiet();
+
+		// Untracked but still on disk and still current: nothing left to report.
+		await expect(checkPublicVersionSync(root)).resolves.toEqual([]);
+	});
+
+	test("does not report tracking outside a git work tree", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+			"README.md": "# Gajae-Code\n",
+			"docs/sdk.md": "# SDK\n\nCurrent docs.\n",
+		});
+		await addGeneratedDocsOutputs(root);
+
+		await expect(checkPublicVersionSync(root)).resolves.toEqual([]);
+	});
+
+	test("fails when either generated docs output is missing or stale", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+			"docs/sdk.md": "# SDK\n",
+		});
+		await addGeneratedDocsOutputs(root);
+
+		await fs.rm(path.join(root, "packages/coding-agent/src/internal-urls/docs-payload.generated.bin"));
+		let violations = await checkPublicVersionSync(root);
+		expect(violations.some(violation => violation.path.endsWith("docs-payload.generated.bin") && violation.message.includes("missing"))).toBe(true);
+
+		await addGeneratedDocsOutputs(root);
+		await Bun.write(path.join(root, "packages/coding-agent/src/internal-urls/docs-payload.generated.bin"), "stale");
+		violations = await checkPublicVersionSync(root);
+		expect(violations.some(violation => violation.path.endsWith("docs-payload.generated.bin") && violation.message.includes("stale"))).toBe(true);
+	});
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+<<<<<<< HEAD
+			"README.md": "# Gajae-Code\n",
+			"docs/sdk.md": "# SDK\n\nCurrent docs.\n",
+			".gitignore": "packages/coding-agent/src/internal-urls/docs-index.generated.ts\n",
+		});
 		await addGeneratedDocsIndex(root);
 		await $`git -C ${root} init -q`.quiet();
 		await $`git -C ${root} add -A --force`.quiet();
@@ -254,6 +317,20 @@ describe("public docs/site/version sync guard", () => {
 		await addGeneratedDocsIndex(root);
 
 		await expect(checkPublicVersionSync(root)).resolves.toEqual([]);
+=======
+			"docs/sdk.md": "# SDK\n",
+		});
+		await addGeneratedDocsOutputs(root);
+
+		await fs.rm(path.join(root, "packages/coding-agent/src/internal-urls/docs-payload.generated.bin"));
+		let violations = await checkPublicVersionSync(root);
+		expect(violations.some(violation => violation.path.endsWith("docs-payload.generated.bin") && violation.message.includes("missing"))).toBe(true);
+
+		await addGeneratedDocsOutputs(root);
+		await Bun.write(path.join(root, "packages/coding-agent/src/internal-urls/docs-payload.generated.bin"), "stale");
+		violations = await checkPublicVersionSync(root);
+		expect(violations.some(violation => violation.path.endsWith("docs-payload.generated.bin") && violation.message.includes("stale"))).toBe(true);
+>>>>>>> be3b5313 (perf(docs): split embedded manifest from payload)
 	});
 
 	test("live check executes the production final-evidence validator against canonical deployed release state", async () => {

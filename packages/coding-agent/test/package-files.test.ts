@@ -32,6 +32,7 @@ describe("coding-agent package files", () => {
 
 		expect(fileSet.has("src/export/html/template.generated.ts")).toBe(true);
 		expect(fileSet.has("src/internal-urls/docs-index.generated.ts")).toBe(true);
+		expect(fileSet.has("src/internal-urls/docs-payload.generated.bin")).toBe(true);
 		expect(fileSet.has("src/sdk/broker/internal-source.bunfig.toml")).toBe(true);
 		expect(fileSet.has("src/sdk/broker/internal-source-marker-2178.txt")).toBe(true);
 	});

@@ -1027,12 +1027,16 @@ function isDocOrChangelogPath(changedPath: string): boolean {
 	return changedPath.endsWith(".md") || changedPath.startsWith("docs/") || changedPath.startsWith(".gjc/");
 }
 
-/** The generated index embeds every markdown file under `docs/`, so one test gates both sides. */
+/** Docs, their canonical generator, and both fixed outputs share one parity gate. */
 const EMBEDDED_DOCS_GATE_TEST = "packages/coding-agent/test/docs-index-lazy.test.ts";
-const GENERATED_DOCS_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
+const EMBEDDED_DOCS_SOURCE_PATHS = new Set([
+	"packages/coding-agent/scripts/generate-docs-index.ts",
+	"packages/coding-agent/src/internal-urls/docs-index.generated.ts",
+	"packages/coding-agent/src/internal-urls/docs-payload.generated.bin",
+]);
 
 function isEmbeddedDocsSourcePath(changedPath: string): boolean {
-	return (changedPath.startsWith("docs/") && changedPath.endsWith(".md")) || changedPath === GENERATED_DOCS_INDEX;
+	return (changedPath.startsWith("docs/") && changedPath.endsWith(".md")) || EMBEDDED_DOCS_SOURCE_PATHS.has(changedPath);
 }
 
 function isTestFilePath(changedPath: string): boolean {

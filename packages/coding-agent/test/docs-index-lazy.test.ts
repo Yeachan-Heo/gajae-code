@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS } from "../src/internal-urls/docs-index.generated";
+import {
+	EMBEDDED_DOC_FILENAMES,
+	EMBEDDED_DOCS_MANIFEST,
+	EMBEDDED_DOCS_PAYLOAD_PATH,
+} from "../src/internal-urls/docs-index.generated";
 
 function runBunEval(script: string) {
 	const result = Bun.spawnSync({
@@ -32,6 +36,7 @@ async function scanDocsCorpus(): Promise<string[]> {
 
 const REPO_ROOT = path.join(import.meta.dir, "../../..");
 const GENERATED_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
+const GENERATED_PAYLOAD = "packages/coding-agent/src/internal-urls/docs-payload.generated.bin";
 
 /** `git ls-files --error-unmatch <path>`. Exit 0 means git tracks the path. */
 function isTracked(relativePath: string): boolean {
@@ -58,21 +63,86 @@ describe("internal-urls docs index loading", () => {
 		expect(result.loaded).toBe(false);
 	});
 
-	it("loads the generated docs corpus when resolving gjc docs", () => {
+	it("lists docs without reading payload bytes", () => {
 		const stdout = runBunEval(`
+			const originalFile = Bun.file;
+			let payloadBytesRead = 0;
+			Bun.file = function(input, options) {
+				const file = originalFile(input, options);
+				if (!String(input).includes("docs-payload.generated.bin")) return file;
+				return new Proxy(file, {
+					get(target, property) {
+						if (property === "slice") {
+							return (begin, end) => {
+								payloadBytesRead += end - begin;
+								return target.slice(begin, end);
+							};
+						}
+						const value = Reflect.get(target, property, target);
+						return typeof value === "function" ? value.bind(target) : value;
+					},
+				});
+			};
 			const { InternalUrlRouter } = await import("@gajae-code/coding-agent/internal-urls");
 			const resource = await InternalUrlRouter.instance().resolve("gjc://");
 			console.log(JSON.stringify({
 				contentType: resource.contentType,
 				contentLength: resource.content.length,
+				payloadBytesRead,
 			}));
 		`);
-		const result = JSON.parse(stdout.trim()) as { contentType: string; contentLength: number };
+		const result = JSON.parse(stdout.trim()) as {
+			contentType: string;
+			contentLength: number;
+			payloadBytesRead: number;
+		};
 		expect(result.contentType).toBe("text/markdown");
 		expect(result.contentLength).toBeGreaterThan(0);
+		expect(result.payloadBytesRead).toBe(0);
 	});
 
-	it("embeds exactly the docs corpus that exists on disk", async () => {
+	it("range-reads only the requested document bytes", () => {
+		const stdout = runBunEval(`
+			const originalFile = Bun.file;
+			let payloadBytesRead = 0;
+			Bun.file = function(input, options) {
+				const file = originalFile(input, options);
+				if (!String(input).includes("docs-payload.generated.bin")) return file;
+				return new Proxy(file, {
+					get(target, property) {
+						if (property === "slice") {
+							return (begin, end) => {
+								payloadBytesRead += end - begin;
+								return target.slice(begin, end);
+							};
+						}
+						const value = Reflect.get(target, property, target);
+						return typeof value === "function" ? value.bind(target) : value;
+					},
+				});
+			};
+			const { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS_MANIFEST } =
+				await import("./src/internal-urls/docs-index.generated");
+			const { InternalUrlRouter } = await import("@gajae-code/coding-agent/internal-urls");
+			const filename = EMBEDDED_DOC_FILENAMES[0];
+			const resource = await InternalUrlRouter.instance().resolve("gjc://" + filename);
+			console.log(JSON.stringify({
+				expectedBytes: EMBEDDED_DOCS_MANIFEST.find(entry => entry.path === filename).length,
+				payloadBytesRead,
+				resourceBytes: resource.size,
+			}));
+		`);
+		const result = JSON.parse(stdout.trim()) as {
+			expectedBytes: number;
+			payloadBytesRead: number;
+			resourceBytes: number;
+		};
+		expect(result.resourceBytes).toBe(result.expectedBytes);
+		expect(result.payloadBytesRead).toBeGreaterThanOrEqual(result.expectedBytes);
+		expect(result.payloadBytesRead).toBeLessThanOrEqual(result.expectedBytes + 4096);
+	});
+
+	it("embeds exactly the sorted docs corpus that exists on disk", async () => {
 		const onDisk = await scanDocsCorpus();
 
 		expect(
@@ -80,24 +150,29 @@ describe("internal-urls docs index loading", () => {
 			`docs corpus changed without regenerating the index; ${REGENERATE_HINT}`,
 		).toEqual(onDisk);
 		expect(
-			Object.keys(EMBEDDED_DOCS).sort(),
+			EMBEDDED_DOCS_MANIFEST.map(entry => entry.path),
 			`embedded doc keys drifted from the corpus; ${REGENERATE_HINT}`,
 		).toEqual(onDisk);
 	});
 
-	it("keeps every embedded doc byte-identical to its source", async () => {
+	it("keeps every payload range byte-identical to its source", async () => {
 		const onDisk = await scanDocsCorpus();
-		const sources = await Promise.all(
-			onDisk.map(async fileName => ({
-				fileName,
-				source: await Bun.file(path.join(DOCS_DIR, fileName)).text(),
-			})),
-		);
-		const stale = sources
-			.filter(({ fileName, source }) => EMBEDDED_DOCS[fileName] !== source)
-			.map(({ fileName }) => fileName);
+		const payload = Bun.file(EMBEDDED_DOCS_PAYLOAD_PATH);
+		const stale: string[] = [];
+		for (const fileName of onDisk) {
+			const entry = EMBEDDED_DOCS_MANIFEST.find(candidate => candidate.path === fileName);
+			if (!entry) {
+				stale.push(fileName);
+				continue;
+			}
+			const [source, embedded] = await Promise.all([
+				Bun.file(path.join(DOCS_DIR, fileName)).bytes(),
+				payload.slice(entry.offset, entry.offset + entry.length).bytes(),
+			]);
+			if (Buffer.compare(source, embedded) !== 0) stale.push(fileName);
+		}
 
-		expect(stale, `stale embedded docs index for ${stale.join(", ") || "(none)"}; ${REGENERATE_HINT}`).toEqual([]);
+		expect(stale, `stale embedded docs payload for ${stale.join(", ") || "(none)"}; ${REGENERATE_HINT}`).toEqual([]);
 	});
 
 	/**

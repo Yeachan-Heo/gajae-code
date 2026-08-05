@@ -10,9 +10,17 @@
 import * as path from "node:path";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
+type DocsManifestEntry = {
+	path: string;
+	offset: number;
+	length: number;
+	sha256: string;
+};
+
 type DocsIndex = {
 	EMBEDDED_DOC_FILENAMES: readonly string[];
-	EMBEDDED_DOCS: Record<string, string>;
+	EMBEDDED_DOCS_MANIFEST: readonly DocsManifestEntry[];
+	EMBEDDED_DOCS_PAYLOAD_PATH: string;
 };
 
 let docsIndexPromise: Promise<DocsIndex> | undefined;
@@ -20,6 +28,10 @@ let docsIndexPromise: Promise<DocsIndex> | undefined;
 function loadDocsIndex(): Promise<DocsIndex> {
 	if (!docsIndexPromise) docsIndexPromise = import("./docs-index.generated");
 	return docsIndexPromise;
+}
+
+function sha256(content: Uint8Array): string {
+	return new Bun.CryptoHasher("sha256").update(content).digest("hex");
 }
 
 /**
@@ -72,9 +84,9 @@ export class GjcProtocolHandler implements ProtocolHandler {
 			throw new Error("Path traversal (..) is not allowed in gjc:// URLs");
 		}
 
-		const { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS } = await loadDocsIndex();
-		const content = EMBEDDED_DOCS[normalized];
-		if (content === undefined) {
+		const { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS_MANIFEST, EMBEDDED_DOCS_PAYLOAD_PATH } = await loadDocsIndex();
+		const entry = EMBEDDED_DOCS_MANIFEST.find(candidate => candidate.path === normalized);
+		if (entry === undefined) {
 			const lookup = normalized.replace(/\.md$/, "");
 			const suggestions = EMBEDDED_DOC_FILENAMES.filter(
 				f => f.includes(lookup) || lookup.includes(f.replace(/\.md$/, "")),
@@ -86,11 +98,30 @@ export class GjcProtocolHandler implements ProtocolHandler {
 			throw new Error(`Documentation file not found: ${filename}${suffix}`);
 		}
 
+		const payload = Bun.file(EMBEDDED_DOCS_PAYLOAD_PATH);
+		const end = entry.offset + entry.length;
+		// Manifest bounds tie the generated index to the one packaged payload before any range read.
+		if (
+			!Number.isSafeInteger(entry.offset) ||
+			!Number.isSafeInteger(entry.length) ||
+			entry.offset < 0 ||
+			entry.length < 0 ||
+			!Number.isSafeInteger(end) ||
+			end > payload.size
+		) {
+			throw new Error(`Embedded documentation payload bounds are invalid: ${normalized}`);
+		}
+		const bytes = await payload.slice(entry.offset, end).bytes();
+		if (bytes.byteLength !== entry.length || sha256(bytes) !== entry.sha256) {
+			throw new Error(`Embedded documentation payload integrity check failed: ${normalized}`);
+		}
+		const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+
 		return {
 			url: url.href,
 			content,
 			contentType: "text/markdown",
-			size: Buffer.byteLength(content, "utf-8"),
+			size: bytes.byteLength,
 		};
 	}
 }

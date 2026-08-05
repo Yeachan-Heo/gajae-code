@@ -1288,13 +1288,13 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		}
 	});
 
-	// The generated index is a real source file, so it also pulls its owning-package
-	// tasks. The gate must still be selected -- that is the half a docs-only plan
-	// cannot cover on its own.
-	test("a generated-docs-index change also selects the embedded-docs gate", () => {
+	// Each fixed output and its canonical producer must select the same parity gate.
+	test("docs generator and generated-output changes select the embedded-docs gate", () => {
 		for (const changed of [
+			["packages/coding-agent/scripts/generate-docs-index.ts"],
 			["packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
-			["docs/guide.md", "packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
+			["packages/coding-agent/src/internal-urls/docs-payload.generated.bin"],
+			["docs/guide.md", "packages/coding-agent/src/internal-urls/docs-payload.generated.bin"],
 		]) {
 			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
 				expect(tasks.map(task => task.key)).toContain(EMBEDDED_DOCS_GATE_KEY);
