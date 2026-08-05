@@ -565,6 +565,11 @@ export const SETTINGS_SCHEMA = {
 		default: 1,
 		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 10,
 	},
+	"gjc.ultragoal.nudgeBudget": {
+		type: "number",
+		default: 10,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
+	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Appearance
