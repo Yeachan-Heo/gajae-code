@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- `gjc gc` file-lock discovery now budgets the walk **per lock root** and reports a hit entry cap as a **warning**, not a hard error. Truncating one root no longer skips the remaining roots, and a healthy run with only cap warnings exits `0` so scripts/cron/`&&` chains stay usable (#3852).
+
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 
 ## [0.12.12] - 2026-08-05

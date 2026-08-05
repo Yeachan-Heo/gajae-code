@@ -150,24 +150,86 @@ describe("gcProbeToLeasePidStatus", () => {
 
 describe("computeExitCode", () => {
 	test("dry-run with no errors => 0", () => {
-		expect(computeExitCode({ dry_run: true, stores: {} as never, counts: { failed: 0 } as never, errors: [] })).toBe(
-			0,
-		);
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors: [],
+				warnings: [],
+			}),
+		).toBe(0);
 	});
 
 	test("hard discovery errors => 1 (both modes)", () => {
 		const errors = [{ store: "file_locks" as const, scope: "discovery", message: "boom" }];
-		expect(computeExitCode({ dry_run: true, stores: {} as never, counts: { failed: 0 } as never, errors })).toBe(1);
-		expect(computeExitCode({ dry_run: false, stores: {} as never, counts: { failed: 0 } as never, errors })).toBe(1);
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors,
+				warnings: [],
+			}),
+		).toBe(1);
+		expect(
+			computeExitCode({
+				dry_run: false,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors,
+				warnings: [],
+			}),
+		).toBe(1);
+	});
+
+	test("warnings alone never fail the run (#3852)", () => {
+		const warnings = [
+			{
+				store: "file_locks" as const,
+				scope: "/tmp/agent",
+				message: "file lock discovery capped at 20000 entries for root /tmp/agent (scanned 20000)",
+			},
+		];
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors: [],
+				warnings,
+			}),
+		).toBe(0);
+		expect(
+			computeExitCode({
+				dry_run: false,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors: [],
+				warnings,
+			}),
+		).toBe(0);
 	});
 
 	test("prune with a failed intended removal => 1; dry-run ignores failed count", () => {
-		expect(computeExitCode({ dry_run: false, stores: {} as never, counts: { failed: 2 } as never, errors: [] })).toBe(
-			1,
-		);
-		expect(computeExitCode({ dry_run: true, stores: {} as never, counts: { failed: 2 } as never, errors: [] })).toBe(
-			0,
-		);
+		expect(
+			computeExitCode({
+				dry_run: false,
+				stores: {} as never,
+				counts: { failed: 2 } as never,
+				errors: [],
+				warnings: [],
+			}),
+		).toBe(1);
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 2 } as never,
+				errors: [],
+				warnings: [],
+			}),
+		).toBe(0);
 	});
 });
 
@@ -232,6 +294,26 @@ describe("collectGcReport", () => {
 		expect(report.errors).toHaveLength(1);
 		expect(report.errors[0]?.scope).toBe("collect");
 		expect(computeExitCode(report)).toBe(1);
+	});
+
+	test("adapter warnings aggregate without becoming errors (#3852)", async () => {
+		const adapter: GcStoreAdapter = {
+			store: "file_locks",
+			async collect() {
+				return {
+					records: [],
+					errors: [],
+					warnings: [{ store: "file_locks", scope: "/tmp/root", message: "capped" }],
+				};
+			},
+			async prune() {
+				return { removed: false };
+			},
+		};
+		const report = await collectGcReport([adapter], ctx(), false);
+		expect(report.errors).toEqual([]);
+		expect(report.warnings).toEqual([{ store: "file_locks", scope: "/tmp/root", message: "capped" }]);
+		expect(computeExitCode(report)).toBe(0);
 	});
 });
 
