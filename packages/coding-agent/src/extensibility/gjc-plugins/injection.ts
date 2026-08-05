@@ -13,13 +13,11 @@ async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promis
 
 import { readVisibleSkillActiveState } from "../../skill-state/active-state";
 import { initialPhaseForSkill } from "../../skill-state/initial-phase";
+import { sanitizePromptBody } from "./prompt-appendix";
+import { resolveValidatedActiveSubskill } from "./subskill-authority";
 import { readActiveSubskillsForParent } from "./state";
 import { GJC_SUBSKILL_PARENT_AGENTS, type LoadedSubskillActivation } from "./types";
 
-export async function readSubskillBody(filePath: string): Promise<string> {
-	const content = await Bun.file(filePath).text();
-	return content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
-}
 
 function escapeAttribute(value: string): string {
 	return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -36,7 +34,7 @@ export function wrapSubskillBlock(
 	},
 	body: string,
 ): string {
-	return `\n\n---\n\n<gjc-subskill plugin="${escapeAttribute(activation.plugin)}" name="${escapeAttribute(activation.subskillName)}" parent="${escapeAttribute(activation.parent)}" phase="${escapeAttribute(activation.phase)}" arg="${escapeAttribute(activation.activationArg)}">\n${body}\n</gjc-subskill>`;
+	return `\n\n---\n\n<gjc-subskill plugin="${escapeAttribute(activation.plugin)}" name="${escapeAttribute(activation.subskillName)}" parent="${escapeAttribute(activation.parent)}" phase="${escapeAttribute(activation.phase)}" arg="${escapeAttribute(activation.activationArg)}">\n${sanitizePromptBody(body)}\n</gjc-subskill>`;
 }
 
 export async function resolveCurrentPhaseForParent(input: {
@@ -67,6 +65,8 @@ export async function buildSubskillInjection(input: {
 	skillName: string;
 	activation?: LoadedSubskillActivation;
 	currentPhase?: string;
+	/** Test seam runs after validation; injection uses the exact verified bytes. */
+	beforeInject?: (filePath: string) => Promise<void>;
 }): Promise<{ block: string; details?: LoadedSubskillActivation } | null> {
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const resolvedPhase = await resolveCurrentPhaseForParent({
@@ -76,14 +76,14 @@ export async function buildSubskillInjection(input: {
 		explicitPhase: input.currentPhase,
 	});
 
-	const directActivation = input.activation;
-	if (directActivation?.parent === input.skillName && directActivation.phase === resolvedPhase) {
-		const body = await readSubskillBody(directActivation.filePath);
-		return { block: wrapSubskillBlock(directActivation, body), details: directActivation };
+	if (input.activation?.parent === input.skillName && input.activation.phase === resolvedPhase) {
+		const validated = await resolveValidatedActiveSubskill({ cwd: input.cwd, reference: input.activation });
+		if (validated) {
+			await input.beforeInject?.(validated.activation.filePath);
+			return { block: wrapSubskillBlock(validated.activation, validated.body), details: validated.activation };
+		}
 	}
-
 	if (!resolvedSessionId) return null;
-
 	const [entry] = await readActiveSubskillsForParent({
 		cwd: input.cwd,
 		sessionId: resolvedSessionId,
@@ -91,28 +91,20 @@ export async function buildSubskillInjection(input: {
 		phase: resolvedPhase,
 	});
 	if (!entry) return null;
-
-	const activation: LoadedSubskillActivation = {
-		plugin: entry.plugin,
-		subskillName: entry.subskillName,
-		parent: entry.parent,
-		bindsTo: entry.bindsTo,
-		phase: entry.phase,
-		activationArg: entry.activationArg,
-		filePath: entry.filePath,
-		toolPaths: entry.toolPaths,
-	};
-	const body = await readSubskillBody(activation.filePath);
-	return { block: wrapSubskillBlock(activation, body), details: activation };
+	const validated = await resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true });
+	if (!validated) return null;
+	await input.beforeInject?.(validated.activation.filePath);
+	return { block: wrapSubskillBlock(validated.activation, validated.body), details: validated.activation };
 }
 
 export async function buildAgentSubskillInjection(input: {
 	cwd: string;
 	sessionId?: string;
 	agentName: string;
+	/** Test seam runs after validation; injection uses exact verified bytes. */
+	beforeInject?: (filePath: string) => Promise<void>;
 }): Promise<string> {
 	if (!(GJC_SUBSKILL_PARENT_AGENTS as readonly string[]).includes(input.agentName)) return "";
-
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	if (!resolvedSessionId) return "";
 	const entries = await readActiveSubskillsForParent({
@@ -121,12 +113,14 @@ export async function buildAgentSubskillInjection(input: {
 		parent: input.agentName,
 		phase: "prompt",
 	});
-	if (entries.length === 0) return "";
-
+	const validated = (
+		await Promise.all(entries.map(entry => resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true })))
+	).filter((item): item is NonNullable<typeof item> => item !== null);
+	if (validated.length === 0) return "";
 	const blocks = await Promise.all(
-		entries.map(async entry => {
-			const body = await readSubskillBody(entry.filePath);
-			return wrapSubskillBlock(entry, body);
+		validated.map(async item => {
+			await input.beforeInject?.(item.activation.filePath);
+			return wrapSubskillBlock(item.activation, item.body);
 		}),
 	);
 	return blocks.join("");

@@ -179,7 +179,12 @@ function parseTools(value: unknown, manifestPath: string): GjcPluginToolManifest
 				: manifestSafeProse(entry.description, `tools[${index}].description`, manifestPath);
 		const sha256 =
 			entry.sha256 === undefined ? undefined : manifestString(entry.sha256, `tools[${index}].sha256`, manifestPath);
-		return { name, path, description, sha256, surface: "always-on" };
+		const schemaPath =
+			(entry.schemaPath ?? entry.schema_path) === undefined
+				? undefined
+				: manifestString(entry.schemaPath ?? entry.schema_path, `tools[${index}].schemaPath`, manifestPath);
+		const schema = entry.schema ?? entry.inputSchema ?? entry.input_schema ?? entry.parameters;
+		return { name, path, description, sha256, schema, schemaPath, surface: "always-on" };
 	});
 }
 

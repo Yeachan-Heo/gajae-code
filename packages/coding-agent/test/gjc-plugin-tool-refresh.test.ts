@@ -11,6 +11,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
+import { resolveSubskillActivationForSkillInvocation, toActiveSubskillEntry } from "../src/extensibility/gjc-plugins";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 
@@ -30,7 +31,7 @@ function makeTool(name: string): AgentTool {
 }
 
 async function writeCustomTool(fileName: string, toolName: string): Promise<string> {
-	const toolsDir = path.join(tempDir.path(), "tools");
+	const toolsDir = path.join(tempDir.path(), ".gjc", "gjc-plugins", "refresh-plugin", "tools");
 	await fs.mkdir(toolsDir, { recursive: true });
 	const toolPath = path.join(toolsDir, fileName);
 	await fs.writeFile(
@@ -54,24 +55,26 @@ export default factory;
 }
 
 async function activateSubskill(toolPaths: string[], phase = "planner"): Promise<void> {
+	const pluginRoot = path.join(tempDir.path(), ".gjc", "gjc-plugins", "refresh-plugin");
+	const skillPath = path.join(pluginRoot, "subskills", "design", "SKILL.md");
+	await fs.mkdir(path.dirname(skillPath), { recursive: true });
+	await fs.writeFile(
+		skillPath,
+		`---\nname: design\ndescription: refresh fixture\nbinds_to: ralplan\nphase: ${phase}\nactivation_arg: design\ntools:\n  - tools/${path.basename(toolPaths[0]!)}\n---\nRefresh fixture skill.\n`,
+	);
+	await fs.writeFile(
+		path.join(pluginRoot, "gajae-plugin.json"),
+		JSON.stringify({ kind: "gajae-code-plugin", name: "refresh-plugin", version: "1.0.0", subskills: ["subskills/design/SKILL.md"], tools: [] }),
+	);
+	const result = await resolveSubskillActivationForSkillInvocation({ cwd: tempDir.path(), skillName: "ralplan", args: "--design" });
+	if (!result.activation) throw new Error("refresh fixture activation missing");
 	await syncSkillActiveState({
 		cwd: tempDir.path(),
 		skill: "ralplan",
 		active: true,
 		phase,
 		sessionId: sessionManager.getSessionId(),
-		active_subskills: [
-			{
-				plugin: "refresh-plugin",
-				subskillName: "design",
-				parent: "ralplan",
-				bindsTo: "ralplan",
-				phase,
-				activationArg: "design",
-				filePath: path.join(tempDir.path(), "subskills", "design", "SKILL.md"),
-				toolPaths,
-			},
-		],
+		active_subskills: result.activeSubskillsToPersist.map(toActiveSubskillEntry),
 	});
 }
 

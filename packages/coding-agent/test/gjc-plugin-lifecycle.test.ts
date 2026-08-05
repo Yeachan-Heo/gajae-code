@@ -50,9 +50,13 @@ async function mkSource(): Promise<string> {
 async function rewriteManifest(source: string, version: string, tools: string): Promise<void> {
 	const manifestPath = path.join(source, "gajae-plugin.json");
 	const original = await fs.readFile(manifestPath, "utf8");
+	const normalizedTools = JSON.parse(tools).map((tool: Record<string, unknown>) => ({
+		...tool,
+		parameters: tool.parameters ?? { type: "object", properties: {} },
+	}));
 	const next = original
 		.replace(/"version": "[^"]+"/, `"version": "${version}"`)
-		.replace(/"tools": \[[\s\S]*?\],\n {2}"hooks"/, `"tools": ${tools},\n  "hooks"`);
+		.replace(/"tools": \[[\s\S]*?\],\n {2}"hooks"/, `"tools": ${JSON.stringify(normalizedTools)},\n  "hooks"`);
 	await fs.writeFile(manifestPath, next);
 }
 

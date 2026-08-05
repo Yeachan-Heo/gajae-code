@@ -1,7 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type GjcBundleTransactionDecision, resolveGjcBundleCandidate, runGjcBundleTransaction } from "./installer";
+import { GjcPluginSourceUnavailableError, type GjcBundleTransactionDecision, resolveGjcBundleCandidate, runGjcBundleTransaction } from "./installer";
 import {
 	activationFingerprint,
 	baselineFingerprint,
@@ -256,19 +256,26 @@ async function withSourceAvailability<T>(
 	try {
 		return await run();
 	} catch (error) {
-		// Only a source-resolution failure becomes `source_unavailable`. A
-		// programming bug, an out-of-memory, or a write/rollback fault must keep
-		// propagating: mislabelling those as an unreachable source would hide real
-		// failures behind a benign-looking, retryable error.
-		if (!(error instanceof GjcPluginLoadError)) throw error;
-		return {
-			ok: false,
-			error: fail(
-				"source_unavailable",
-				`The stored source for GJC bundle "${identity.name}" could not be resolved`,
-				`gjc plugin install <source> --${identity.scope}`,
-			),
-		};
+		// Only source resolution failures are retryable. Candidate compilation,
+		// identity, schema, and validation failures remain typed invalid-target
+		// results instead of being mislabeled as unavailable sources.
+		if (error instanceof GjcPluginSourceUnavailableError) {
+			return {
+				ok: false,
+				error: fail(
+					"source_unavailable",
+					`The stored source for GJC bundle "${identity.name}" could not be resolved`,
+					`gjc plugin install <source> --${identity.scope}`,
+				),
+			};
+		}
+		if (error instanceof GjcPluginLoadError) {
+			return {
+				ok: false,
+				error: fail("invalid_target", `Stored source for GJC bundle "${identity.name}" is no longer a valid plugin target`, `gjc plugin install <source> --${identity.scope}`),
+			};
+		}
+		throw error;
 	}
 }
 
@@ -357,28 +364,36 @@ export async function installGjcBundle(
 	// pre-lock preflight refuses after resolving.
 	const declared = await declaredBundleName(source);
 	if (declared) {
-		const registry = await readRegistry(scope, ctx.cwd);
+		const registry = await readRegistry(scope, ctx.cwd, { migrate: false });
 		const existing = registry.plugins.find(p => p.name === declared);
 		if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
 	}
 
-	const result = await runGjcBundleTransaction(source, {
-		scope,
-		cwd: ctx.cwd,
-		decide: async ({ existing, candidate }): Promise<GjcBundleTransactionDecision> => {
-			if (existing) {
-				return {
-					kind: "abort",
-					error: fail(
-						"already_installed_use_upgrade",
-						`GJC bundle "${existing.name}" is already installed in the ${scope} scope`,
-						`gjc plugin upgrade ${existing.name} --${scope}`,
-					),
-				};
-			}
-			return { kind: "commit", entry: candidate };
-		},
-	});
+	let result: Awaited<ReturnType<typeof runGjcBundleTransaction>>;
+	try {
+		result = await runGjcBundleTransaction(source, {
+			scope,
+			cwd: ctx.cwd,
+			decide: async ({ existing, candidate }): Promise<GjcBundleTransactionDecision> => {
+				if (existing) {
+					return {
+						kind: "abort",
+						error: fail(
+							"already_installed_use_upgrade",
+							`GJC bundle "${existing.name}" is already installed in the ${scope} scope`,
+							`gjc plugin upgrade ${existing.name} --${scope}`,
+						),
+					};
+				}
+				return { kind: "commit", entry: candidate };
+			},
+		});
+	} catch (error) {
+		if (error instanceof GjcPluginSourceUnavailableError) {
+			throw new GjcPluginLoadError("missing_file", "GJC plugin source directory not found");
+		}
+		throw error;
+	}
 	if (result.status === "aborted") return { ok: false, error: result.error };
 	return { ok: true, value: { status: "installed", summary: toBundleSummary(result.entry) } };
 }
@@ -556,7 +571,7 @@ async function mutateEntry(
 	mutate: (entry: GjcPluginRegistryEntry) => GjcLifecycleResult<GjcPluginRegistryEntry | null>,
 ): Promise<GjcLifecycleResult<GjcToggleResult>> {
 	return await withRegistryLock(identity.scope, ctx.cwd, async () => {
-		const registry = await readRegistry(identity.scope, ctx.cwd);
+		const registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false });
 		const entry = registry.plugins.find(p => p.name === identity.name);
 		if (!entry) return { ok: false, error: notInstalled(identity) };
 		const outcome = mutate(entry);

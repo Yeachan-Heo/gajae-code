@@ -6,9 +6,9 @@ import {
 	discoverGjcPluginRoots,
 	GjcPluginLoadError,
 	type GjcPluginLoadErrorCode,
-	loadGjcPlugin,
-	loadGjcPlugins,
 } from "../src/extensibility/gjc-plugins";
+import { loadGjcPlugin, loadGjcPlugins } from "../src/extensibility/gjc-plugins/loader";
+import * as gjcPluginBarrel from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const tempRoots: string[] = [];
@@ -40,6 +40,10 @@ afterEach(async () => {
 });
 
 describe("GJC plugin loader", () => {
+	test("does not expose the legacy executable loader through the public barrel", () => {
+		expect(Object.hasOwn(gjcPluginBarrel, "loadGjcPlugin")).toBe(false);
+		expect(Object.hasOwn(gjcPluginBarrel, "loadGjcPlugins")).toBe(false);
+	});
 	test("loads valid skill and agent plugin fixtures", async () => {
 		const skill = await loadGjcPlugin(path.join(fixturesRoot, "valid-skill-plugin"));
 		expect(skill.name).toBe("valid-skill-plugin");

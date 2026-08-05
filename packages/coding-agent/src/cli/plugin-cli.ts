@@ -14,11 +14,14 @@ import {
 	type GjcBundleSummary,
 	GjcPluginLoadError,
 	getGjcBundle,
+	getGjcPluginMigrationStatuses,
 	installGjcBundle,
 	isGjcPluginBundleSource,
 	isGjcPluginSourceShape,
 	listGjcBundles,
+	migrationDoctorCheckMessage,
 	previewGjcBundleUpdate,
+	runGjcPluginMigrationPreflight,
 } from "../extensibility/gjc-plugins";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
 import {
@@ -54,6 +57,7 @@ export interface PluginCommandArgs {
 	flags: {
 		json?: boolean;
 		fix?: boolean;
+		migratePlugins?: boolean;
 		force?: boolean;
 		dryRun?: boolean;
 		local?: boolean;
@@ -118,6 +122,8 @@ export function parsePluginArgs(args: string[]): PluginCommandArgs | undefined {
 			result.flags.json = true;
 		} else if (arg === "--fix") {
 			result.flags.fix = true;
+		} else if (arg === "--migrate-plugins") {
+			result.flags.migratePlugins = true;
 		} else if (arg === "--force") {
 			result.flags.force = true;
 		} else if (arg === "--dry-run") {
@@ -763,8 +769,26 @@ async function handleLink(manager: PluginManager, paths: string[], flags: { json
 	}
 }
 
-async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix?: boolean }): Promise<void> {
+async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix?: boolean; migratePlugins?: boolean }): Promise<void> {
 	const checks = await manager.doctor({ fix: flags.fix });
+	try {
+		const statuses = flags.migratePlugins
+			? await runGjcPluginMigrationPreflight(getProjectDir())
+			: await getGjcPluginMigrationStatuses(getProjectDir(), { migrate: false });
+		for (const status of statuses) {
+			checks.push({
+				name: `gjc-plugin:${status.scope}:${status.plugin}:migration`,
+				status: status.status === "migrated" ? "ok" : "error",
+				message: `${flags.migratePlugins ? "migration pre-flight: " : ""}${migrationDoctorCheckMessage(status)}`,
+			});
+		}
+	} catch (error) {
+		checks.push({
+			name: "gjc-plugin:migration",
+			status: "error",
+			message: `Unable to inspect GJC plugin migration status: ${error instanceof Error ? error.message : String(error)}`,
+		});
+	}
 
 	if (flags.json) {
 		console.log(JSON.stringify(checks, null, 2));
@@ -795,7 +819,7 @@ async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix
 	console.log(`Summary: ${ok} ok, ${warnings} warnings, ${errors} errors${fixed > 0 ? `, ${fixed} fixed` : ""}`);
 
 	if (errors > 0) {
-		if (!flags.fix) {
+		if (!flags.fix && !flags.migratePlugins) {
 			console.log(chalk.dim("\nRun with --fix to attempt automatic repair"));
 		}
 		process.exit(1);

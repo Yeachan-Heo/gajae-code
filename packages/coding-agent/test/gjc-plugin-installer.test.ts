@@ -81,7 +81,7 @@ async function startRejectingGitServer(): Promise<{ url: string; stop: () => Pro
 	};
 }
 
-async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: () => Promise<void> }> {
+async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; repoDir: string; stop: () => Promise<void> }> {
 	const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-git-src-"));
 	tempDirs.push(base);
 	const repoDir = path.join(base, "plugin-repo");
@@ -119,6 +119,7 @@ async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: (
 
 	return {
 		url,
+		repoDir,
 		stop: async () => {
 			if (daemon.exitCode !== null) return;
 			const { promise, resolve } = Promise.withResolvers<void>();
@@ -276,12 +277,66 @@ describe("GJC plugin installer", () => {
 		}
 	});
 
-	test("an invalid git source maps stderr to GjcPluginLoadError(install_conflict)", async () => {
+	test("preview and apply agree on unavailable versus reachable malformed tar and git sources", async () => {
+		const applyToken = (identity: ReturnType<typeof bundleIdentity>) => ({
+			identity,
+			candidateFingerprint: "0".repeat(64),
+			baselineFingerprint: "0".repeat(64),
+			decisionContextFingerprint: "0".repeat(64),
+			reviewedAt: new Date().toISOString(),
+		});
+
+		const validTarDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-classify-tar-"));
+		tempDirs.push(validTarDir);
+		const validTar = path.join(validTarDir, "bundle.tar.gz");
+		expect(spawnSync("tar", ["-czf", validTar, "-C", sixSurface, "."], { env: { ...process.env, COPYFILE_DISABLE: "1" } }).status).toBe(0);
+		const unavailableTarCwd = await mkProjectCwd();
+		expect((await installGjcBundle({ cwd: unavailableTarCwd }, "project", validTar)).ok).toBe(true);
+		await fs.rm(validTar);
+		const tarIdentity = bundleIdentity("project", "valid-six-surface-bundle");
+		expect(await previewGjcBundleUpdate({ cwd: unavailableTarCwd }, tarIdentity)).toMatchObject({ ok: false, error: { code: "source_unavailable" } });
+		expect(await applyGjcBundleUpdate({ cwd: unavailableTarCwd }, applyToken(tarIdentity))).toMatchObject({ ok: false, error: { code: "source_unavailable" } });
+
+		const malformedTarDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-classify-malformed-tar-"));
+		tempDirs.push(malformedTarDir);
+		const validTar2 = path.join(malformedTarDir, "valid.tar.gz");
+		expect(spawnSync("tar", ["-czf", validTar2, "-C", sixSurface, "."], { env: { ...process.env, COPYFILE_DISABLE: "1" } }).status).toBe(0);
+		const malformedSource = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-classify-malformed-source-"));
+		tempDirs.push(malformedSource);
+		await fs.writeFile(path.join(malformedSource, "README.md"), "manifest intentionally absent\n");
+		const malformedTar = path.join(malformedTarDir, "malformed.tar.gz");
+		expect(spawnSync("tar", ["-czf", malformedTar, "-C", malformedSource, "."], { env: { ...process.env, COPYFILE_DISABLE: "1" } }).status).toBe(0);
+		const malformedTarCwd = await mkProjectCwd();
+		expect((await installGjcBundle({ cwd: malformedTarCwd }, "project", validTar2)).ok).toBe(true);
+		await fs.copyFile(malformedTar, validTar2);
+		expect(await previewGjcBundleUpdate({ cwd: malformedTarCwd }, tarIdentity)).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+		expect(await applyGjcBundleUpdate({ cwd: malformedTarCwd }, applyToken(tarIdentity))).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+
+		const unavailableGit = await mkGitDaemonRepo({ kind: "gajae-code-plugin", name: "git-classify", version: "1.0.0", tools: [], subskills: [] });
+		const unavailableGitCwd = await mkProjectCwd();
+		expect((await installGjcBundle({ cwd: unavailableGitCwd }, "project", unavailableGit.url)).ok).toBe(true);
+		await unavailableGit.stop();
+		const gitIdentity = bundleIdentity("project", "git-classify");
+		expect(await previewGjcBundleUpdate({ cwd: unavailableGitCwd }, gitIdentity)).toMatchObject({ ok: false, error: { code: "source_unavailable" } });
+		expect(await applyGjcBundleUpdate({ cwd: unavailableGitCwd }, applyToken(gitIdentity))).toMatchObject({ ok: false, error: { code: "source_unavailable" } });
+
+		const malformedGit = await mkGitDaemonRepo({ kind: "gajae-code-plugin", name: "git-malformed", version: "1.0.0", tools: [], subskills: [] });
+		const malformedGitCwd = await mkProjectCwd();
+		expect((await installGjcBundle({ cwd: malformedGitCwd }, "project", malformedGit.url)).ok).toBe(true);
+		await fs.rm(path.join(malformedGit.repoDir, "gajae-plugin.json"));
+		spawnSync("git", ["add", "-A"], { cwd: malformedGit.repoDir });
+		spawnSync("git", ["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-qm", "remove manifest"], { cwd: malformedGit.repoDir });
+		const malformedGitIdentity = bundleIdentity("project", "git-malformed");
+		expect(await previewGjcBundleUpdate({ cwd: malformedGitCwd }, malformedGitIdentity)).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+		expect(await applyGjcBundleUpdate({ cwd: malformedGitCwd }, applyToken(malformedGitIdentity))).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+		await malformedGit.stop();
+	});
+	test("an unavailable git source maps to a typed missing_file install error", async () => {
 		const cwd = await mkProjectCwd();
 		const rejectingServer = await startRejectingGitServer();
 		try {
 			await expect(installGjcBundle({ cwd }, "project", rejectingServer.url)).rejects.toMatchObject({
-				code: "install_conflict",
+				code: "missing_file",
 				name: "GjcPluginLoadError",
 			});
 		} finally {

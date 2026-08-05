@@ -16,6 +16,9 @@ import { readVisibleSkillActiveState } from "../../skill-state/active-state";
 import type { LoadedSubskillActivation } from "./types";
 
 export function toActiveSubskillEntry(activation: LoadedSubskillActivation): ActiveSubskillEntry {
+	if (!activation.scope || !activation.extensionId || !activation.expectedDigest) {
+		throw new Error(`Cannot persist unvalidated GJC subskill activation for ${activation.plugin}/${activation.subskillName}`);
+	}
 	return {
 		plugin: activation.plugin,
 		subskillName: activation.subskillName,
@@ -23,8 +26,10 @@ export function toActiveSubskillEntry(activation: LoadedSubskillActivation): Act
 		bindsTo: activation.bindsTo,
 		phase: activation.phase,
 		activationArg: activation.activationArg,
-		filePath: activation.filePath,
-		toolPaths: activation.toolPaths,
+		scope: activation.scope,
+		extensionId: activation.extensionId,
+		expectedDigest: activation.expectedDigest,
+		toolRefs: (activation.toolRefs ?? []).map(ref => ({ extensionId: ref.extensionId, expectedDigest: ref.expectedDigest })),
 	};
 }
 

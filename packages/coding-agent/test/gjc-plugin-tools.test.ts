@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { installGjcBundle, resolveSubskillActivationForSkillInvocation, toActiveSubskillEntry } from "../src/extensibility/gjc-plugins";
 import { loadActiveSubskillTools } from "../src/extensibility/gjc-plugins/tools";
 import { syncSkillActiveState } from "../src/skill-state/active-state";
 
@@ -67,8 +68,38 @@ afterEach(async () => {
 	}
 });
 
-describe("GJC plugin sub-skill tools", () => {
-	test("loads an active sub-skill tool unless its name is reserved", async () => {
+	describe("GJC plugin sub-skill tools", () => {
+	test("rechecks the subskill tool digest immediately before import", async () => {
+		const cwd = await makeTempRoot();
+		const fixture = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-skill-plugin");
+		const installed = await installGjcBundle({ cwd }, "project", fixture);
+		expect(installed.ok).toBe(true);
+		const activation = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
+		expect(activation.activation).toBeDefined();
+		await syncSkillActiveState({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			skill: "ralplan",
+			active: true,
+			phase: "planner",
+			active_subskills: activation.activeSubskillsToPersist.map(toActiveSubskillEntry),
+		});
+		const toolPath = path.join(cwd, ".gjc", "gjc-plugins", "valid-skill-plugin", "tools", "domain-note.ts");
+		let mutated = false;
+		const loaded = await loadActiveSubskillTools({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			parent: "ralplan",
+			phase: "planner",
+			beforeImport: async () => {
+				if (mutated) return;
+				mutated = true;
+				await fs.appendFile(toolPath, "\n// changed after initial validation\n");
+			},
+		});
+		expect(loaded).toEqual([]);
+	});
+	test("rejects a path-only active sub-skill record instead of importing an arbitrary tool", async () => {
 		const cwd = await makeTempRoot();
 		const toolPath = await writeTool(cwd, "domain-note.ts", "domain_note");
 		await writeActiveSubskill(cwd, [toolPath]);
@@ -79,16 +110,7 @@ describe("GJC plugin sub-skill tools", () => {
 			parent: "ralplan",
 			phase: "planner",
 		});
-		expect(loaded.map(tool => tool.name)).toEqual(["domain_note"]);
-
-		const reserved = await loadActiveSubskillTools({
-			cwd,
-			sessionId: TEST_SESSION_ID,
-			parent: "ralplan",
-			phase: "planner",
-			reservedToolNames: ["domain_note"],
-		});
-		expect(reserved).toEqual([]);
+		expect(loaded).toEqual([]);
 	});
 
 	test("rejects an active sub-skill tool whose name collides with a built-in reserved name", async () => {

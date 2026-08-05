@@ -5,13 +5,56 @@ import { bindPluginMcpToPublicNetwork } from "../../runtime-mcp/plugin-network-b
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
 import { bundleIdentity } from "./lifecycle-reconciliation";
+import { verifyImplementationHash } from "./metadata";
+import { resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry, registryPathForScope } from "./registry";
 import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
 import type { GjcPluginRegistryEntry, GjcPluginScope } from "./types";
+import { isV2Tool } from "./migration";
+import type { NormalizedToolSurfaceV2, JsonSchema202012 } from "./types";
 
 export interface AlwaysOnPluginTools {
 	tools: CustomTool[];
 	quarantine: SessionQuarantine[];
+}
+
+export interface GjcPluginToolDeclaration extends NormalizedToolSurfaceV2 {
+	plugin: string;
+	scope: GjcPluginScope;
+}
+
+
+function isWithin(root: string, target: string): boolean {
+	const rel = path.relative(root, target);
+	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+async function resolveRuntimeFile(root: string, relativePath: string): Promise<string> {
+	const lexical = resolveWithinRoot(root, relativePath);
+	const [rootReal, fileReal] = await Promise.all([fs.realpath(root), fs.realpath(lexical)]);
+	if (!isWithin(rootReal, fileReal)) throw new Error(`GJC plugin implementation escapes its installed root: ${relativePath}`);
+	return fileReal;
+}
+/**
+ * Return v2 tool declarations without reading or importing implementation
+ * modules. This is the schema-serving path used by discovery and diagnostics.
+ */
+export async function getGjcPluginToolDeclarations(cwd: string): Promise<GjcPluginToolDeclaration[]> {
+	const entries = await loadEffectiveGjcPluginRegistry(cwd);
+	const declarations: GjcPluginToolDeclaration[] = [];
+	for (const entry of entries) {
+		if (!entry.enabled || entry.migration?.status === "failed") continue;
+		for (const surface of entry.surfaces.tools) {
+			if (isV2Tool(surface)) declarations.push({ ...surface, plugin: entry.name, scope: entry.scope } as GjcPluginToolDeclaration);
+		}
+	}
+	return declarations;
+}
+
+/** Serve the canonical schemas keyed by their stable tool surface id. */
+export async function serveGjcPluginSchemas(cwd: string): Promise<Record<string, JsonSchema202012>> {
+	const declarations = await getGjcPluginToolDeclarations(cwd);
+	return Object.fromEntries(declarations.map(declaration => [declaration.extensionId, declaration.schema]));
 }
 
 interface FileSnapshot {
@@ -102,7 +145,18 @@ async function hashFile(snapshot: FileSnapshot): Promise<string> {
 
 async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<SessionQuarantine | null> {
 	for (const file of entry.copiedFiles) {
-		const abs = path.join(entry.pluginRoot, file.relativePath);
+		let abs: string;
+		try {
+			abs = resolveWithinRoot(entry.pluginRoot, file.relativePath);
+		} catch (error) {
+			return {
+				identity: bundleIdentity(entry.scope, entry.name),
+				plugin: entry.name,
+				surfaceId: `plugin:${entry.name}`,
+				code: "runtime_mismatch",
+				message: error instanceof Error ? error.message : String(error),
+			};
+		}
 		const snapshot = await snapshotExistingFile(abs);
 		if (!snapshot) {
 			return {
@@ -176,6 +230,9 @@ async function loadValidatedPluginRegistry(cwd: string): Promise<ValidatedPlugin
 export async function loadAlwaysOnPluginTools(input: {
 	cwd: string;
 	reservedToolNames: string[];
+	declarations?: readonly GjcPluginToolDeclaration[];
+	/** Test seam runs before the final per-import integrity guard. */
+	beforeImport?: (resolvedPath: string) => Promise<void>;
 }): Promise<AlwaysOnPluginTools> {
 	const validated = await loadValidatedPluginRegistry(input.cwd);
 	const { effective } = validated;
@@ -189,24 +246,70 @@ export async function loadAlwaysOnPluginTools(input: {
 	);
 
 	// Map declared (path -> name) for every active always-on tool surface.
-	const declared = new Map<string, { name: string; plugin: string; scope: GjcPluginScope }>();
+	const declaredMetadata = new Map((input.declarations ?? []).map(surface => [`${surface.scope}:${surface.plugin}:${surface.extensionId}`, surface]));
+	const declared = new Map<string, {
+		name: string;
+		plugin: string;
+		scope: GjcPluginScope;
+		pluginRoot: string;
+		relativePath: string;
+		implementationHash?: string;
+	}>();
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const t of entry.surfaces.tools) {
 			if (disabled.has(t.extensionId)) continue;
-			declared.set(path.join(entry.pluginRoot, t.relativePath), {
+			let implementationPath: string;
+			try {
+				implementationPath = await resolveRuntimeFile(entry.pluginRoot, t.relativePath);
+			} catch (error) {
+				quarantine.push({ identity: bundleIdentity(entry.scope, entry.name), plugin: entry.name, surfaceId: t.extensionId, code: "runtime_mismatch", message: error instanceof Error ? error.message : String(error) });
+				continue;
+			}
+			const metadata = declaredMetadata.get(`${entry.scope}:${entry.name}:${t.extensionId}`);
+			declared.set(implementationPath, {
 				name: t.name,
 				plugin: entry.name,
 				scope: entry.scope,
+				pluginRoot: entry.pluginRoot,
+				relativePath: t.relativePath,
+				implementationHash: metadata?.implementationHash ?? ("implementationHash" in t && typeof t.implementationHash === "string" ? t.implementationHash : undefined),
 			});
 		}
 	}
 	if (declared.size === 0) return { tools: [], quarantine };
 
+	// Declaration and activation are separate: all metadata is read first, then
+	// each implementation is hash-checked immediately before the single import.
+	for (const [declaredPath, info] of [...declared]) {
+		if (!info.implementationHash) continue;
+		try {
+			await verifyImplementationHash(declaredPath, info.implementationHash);
+		} catch (error) {
+			quarantine.push({
+				identity: bundleIdentity(info.scope, info.plugin),
+				plugin: info.plugin,
+				surfaceId: `tool:${info.name}`,
+				code: error instanceof Error && "code" in error && (error as { code?: unknown }).code === "hash_mismatch" ? "runtime_mismatch" : "runtime_mismatch",
+				message: error instanceof Error ? error.message : String(error),
+			});
+			declared.delete(declaredPath);
+		}
+	}
+	if (declared.size === 0) return { tools: [], quarantine };
 	const loaded = await loadCustomTools(
 		[...declared.keys()].map(p => ({ path: p })),
 		input.cwd,
 		input.reservedToolNames,
+		undefined,
+		async resolvedPath => {
+			await input.beforeImport?.(resolvedPath);
+			const info = declared.get(path.resolve(resolvedPath));
+			if (!info || !info.implementationHash) throw new Error(`Unregistered or unhashed GJC tool import: ${resolvedPath}`);
+			const finalPath = await resolveRuntimeFile(info.pluginRoot, info.relativePath);
+			if (path.resolve(finalPath) !== path.resolve(resolvedPath)) throw new Error(`GJC tool path drifted before import: ${info.relativePath}`);
+			await verifyImplementationHash(finalPath, info.implementationHash);
+		},
 	);
 
 	// Group loaded tools by their source path for exact-name verification.

@@ -64,6 +64,46 @@ describe("always-on plugin tool runtime activation", () => {
 		expect(res.tools.map(t => t.name)).not.toContain("domain_note");
 		expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
 	});
+	test("rechecks each always-on tool immediately before its import", async () => {
+		const cwd = await mkCwd();
+		const source = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-runtime-race-source-"));
+		tempDirs.push(source);
+		await fs.cp(sixSurface, source, { recursive: true });
+		const lateTool = path.join(source, "tools", "late.ts");
+		await fs.writeFile(
+			lateTool,
+			`import * as fs from "node:fs";
+if (process.env.GJC_LATE_IMPORT_SENTINEL) fs.writeFileSync(process.env.GJC_LATE_IMPORT_SENTINEL, "imported");
+export default pi => ({ name: "late_tool", label: "Late", description: "late", parameters: pi.zod.object({}), async execute() { return { content: [{ type: "text", text: "late" }] }; } });
+`,
+		);
+		const manifestPath = path.join(source, "gajae-plugin.json");
+		const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
+		manifest.tools = [...(manifest.tools as unknown[]), { name: "late_tool", path: "tools/late.ts", description: "late" }];
+		await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+		const installed = await installGjcBundle({ cwd }, "project", source);
+		expect(installed.ok).toBe(true);
+		const lateSentinel = path.join(cwd, "late-imported");
+		process.env.GJC_LATE_IMPORT_SENTINEL = lateSentinel;
+		try {
+			let mutated = false;
+			const result = await loadAlwaysOnPluginTools({
+				cwd,
+				reservedToolNames: [],
+				beforeImport: async resolvedPath => {
+					if (mutated || !resolvedPath.endsWith("domain-note.ts")) return;
+					mutated = true;
+					await fs.appendFile(path.join(path.dirname(resolvedPath), "late.ts"), "\n// changed after batch verification\n");
+				},
+			});
+			expect(result.tools.map(tool => tool.name)).toContain("domain_note");
+			expect(result.tools.map(tool => tool.name)).not.toContain("late_tool");
+			expect(result.quarantine.some(item => item.code === "runtime_mismatch" && item.surfaceId.includes("late_tool"))).toBe(true);
+			expect(await fs.stat(lateSentinel).then(() => true).catch(() => false)).toBe(false);
+		} finally {
+			delete process.env.GJC_LATE_IMPORT_SENTINEL;
+		}
+	});
 
 	test("quarantines runtime_mismatch when factory name != declared name", async () => {
 		const cwd = await mkCwd();

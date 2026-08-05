@@ -1,8 +1,12 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { bundleIdentity } from "./lifecycle-reconciliation";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { type SessionQuarantine, validateSessionBundles, verifyEntryHashes } from "./session-validation";
+import { resolveWithinRoot } from "./paths";
 import { GjcPluginLoadError, type GjcPluginRegistryEntry, type GjcPluginScope } from "./types";
+import { verifyImplementationHash } from "./metadata";
 
 /**
  * Constrained plugin-hook loader.
@@ -35,119 +39,111 @@ const DENIED_API_METHODS = [
 	"exec",
 ] as const;
 
-interface DeclaredHook {
+async function resolveConstrainedHookFile(root: string, relativePath: string): Promise<string> {
+	const lexical = resolveWithinRoot(root, relativePath);
+	const [rootReal, fileReal] = await Promise.all([fs.realpath(root), fs.realpath(lexical)]);
+	const rel = path.relative(rootReal, fileReal);
+	if (rel.startsWith("..") || path.isAbsolute(rel)) throw new GjcPluginLoadError("runtime_mismatch", `GJC plugin hook escapes its installed root: ${relativePath}`);
+	return fileReal;
+}
+
+export interface DeclaredHook {
 	plugin: string;
 	scope: GjcPluginScope;
 	event: string;
 	target?: string;
 	phase?: "before" | "after";
 	relativePath: string;
+	implementationHash?: string;
 }
 
-function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[]): DeclaredHook[] {
+async function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[], invalidHookIds = new Set<string>()): Promise<DeclaredHook[]> {
 	const out: DeclaredHook[] = [];
 	for (const entry of entries) {
 		if (!entry.enabled) continue;
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const h of entry.surfaces.hooks) {
-			if (disabled.has(h.extensionId)) continue;
+			if (disabled.has(h.extensionId) || invalidHookIds.has(`${entry.scope}:${entry.name}:${h.extensionId}`)) continue;
+			const implementationPath = await resolveConstrainedHookFile(entry.pluginRoot, h.relativePath);
 			out.push({
 				plugin: entry.name,
 				scope: entry.scope,
 				event: h.event,
 				target: h.target,
 				phase: h.phase,
-				relativePath: `${entry.pluginRoot}/${h.relativePath}`,
+				relativePath: implementationPath,
+				implementationHash: "implementationHash" in h && typeof h.implementationHash === "string" ? h.implementationHash : undefined,
 			});
 		}
 	}
 	return out;
 }
 
+/** Lazy declaration for one constrained hook. Importing this descriptor is metadata-only. */
+export class ConstrainedPluginHookDescriptor {
+	readonly plugin: string;
+	readonly scope: GjcPluginScope;
+	readonly event: string;
+	readonly target?: string;
+	readonly phase?: "before" | "after";
+	readonly relativePath: string;
+	readonly implementationHash?: string;
+
+	constructor(input: DeclaredHook) {
+		this.plugin = input.plugin;
+		this.scope = input.scope;
+		this.event = input.event;
+		this.target = input.target;
+		this.phase = input.phase;
+		this.relativePath = input.relativePath;
+		this.implementationHash = input.implementationHash;
+	}
+
+	async load(): Promise<ConstrainedPluginHook> {
+		if (this.implementationHash) await verifyImplementationHash(this.relativePath, this.implementationHash);
+		const registered: { event: string; handler: (...a: any[]) => unknown }[] = [];
+		const deny = (method: string) => () => {
+			throw new GjcPluginLoadError("security_policy", `Plugin hook "${this.plugin}" attempted denied API: ${method}`);
+		};
+		const constrainedApi: Record<string, unknown> = {
+			on: (event: string, handler: (...a: any[]) => unknown) => registered.push({ event, handler }),
+			logger,
+		};
+		for (const method of DENIED_API_METHODS) constrainedApi[method] = deny(method);
+		const mod = await import(this.relativePath);
+		const factory = mod.default ?? mod;
+		if (typeof factory !== "function") throw new GjcPluginLoadError("invalid_hook", "Plugin hook must export a default function");
+		await (factory as (api: unknown) => unknown)(constrainedApi);
+		if (registered.length !== 1 || registered[0]?.event !== this.event) {
+			throw new GjcPluginLoadError("runtime_mismatch", `Plugin hook registered ${JSON.stringify(registered.map(r => r.event))}, expected exactly ["${this.event}"]`);
+		}
+		return {
+			plugin: this.plugin,
+			event: this.event,
+			target: this.target,
+			phase: this.phase,
+			handler: registered[0].handler,
+		};
+	}
+}
 async function loadOneHook(
 	declared: DeclaredHook,
 ): Promise<{ hook: ConstrainedPluginHook | null; quarantine: SessionQuarantine | null }> {
-	const registered: { event: string; handler: (...a: any[]) => unknown }[] = [];
-	const deny = (method: string) => () => {
-		throw new GjcPluginLoadError(
-			"security_policy",
-			`Plugin hook "${declared.plugin}" attempted denied API: ${method}`,
-		);
-	};
-	const constrainedApi: Record<string, unknown> = {
-		on(event: string, handler: (...a: any[]) => unknown): void {
-			registered.push({ event, handler });
-		},
-		logger,
-	};
-	for (const method of DENIED_API_METHODS) constrainedApi[method] = deny(method);
-
-	let factory: unknown;
 	try {
-		const mod = await import(declared.relativePath);
-		factory = mod.default ?? mod;
+		return { hook: await new ConstrainedPluginHookDescriptor(declared).load(), quarantine: null };
 	} catch (error) {
+		const code = error instanceof GjcPluginLoadError ? error.code : "invalid_hook";
 		return {
 			hook: null,
 			quarantine: {
 				identity: bundleIdentity(declared.scope, declared.plugin),
 				plugin: declared.plugin,
 				surfaceId: `hook:${declared.event}:${declared.target ?? ""}`,
-				code: "invalid_hook",
-				message: `Failed to import plugin hook: ${error instanceof Error ? error.message : String(error)}`,
-			},
-		};
-	}
-	if (typeof factory !== "function") {
-		return {
-			hook: null,
-			quarantine: {
-				identity: bundleIdentity(declared.scope, declared.plugin),
-				plugin: declared.plugin,
-				surfaceId: `hook:${declared.event}`,
-				code: "invalid_hook",
-				message: "Plugin hook must export a default function",
-			},
-		};
-	}
-	try {
-		await (factory as (api: unknown) => unknown)(constrainedApi);
-	} catch (error) {
-		const code = error instanceof GjcPluginLoadError ? error.code : "security_policy";
-		return {
-			hook: null,
-			quarantine: {
-				identity: bundleIdentity(declared.scope, declared.plugin),
-				plugin: declared.plugin,
-				surfaceId: `hook:${declared.event}`,
 				code,
 				message: error instanceof Error ? error.message : String(error),
 			},
 		};
 	}
-	// Exactly one handler, for the declared event only.
-	if (registered.length !== 1 || registered[0]?.event !== declared.event) {
-		return {
-			hook: null,
-			quarantine: {
-				identity: bundleIdentity(declared.scope, declared.plugin),
-				plugin: declared.plugin,
-				surfaceId: `hook:${declared.event}`,
-				code: "runtime_mismatch",
-				message: `Plugin hook registered ${JSON.stringify(registered.map(r => r.event))}, expected exactly ["${declared.event}"]`,
-			},
-		};
-	}
-	return {
-		hook: {
-			plugin: declared.plugin,
-			event: declared.event,
-			target: declared.target,
-			phase: declared.phase,
-			handler: registered[0].handler,
-		},
-		quarantine: null,
-	};
 }
 
 /**
@@ -159,13 +155,29 @@ export async function loadConstrainedPluginHooks(input: { cwd: string }): Promis
 	const effective = await loadEffectiveGjcPluginRegistry(input.cwd);
 	if (effective.length === 0) return { hooks: [], quarantine: [] };
 	const preQuarantine: SessionQuarantine[] = [];
+	const invalidHookIds = new Set<string>();
 	for (const entry of effective) {
 		if (!entry.enabled) continue;
 		const drift = await verifyEntryHashes(entry);
 		if (drift) preQuarantine.push(drift);
+		for (const hook of entry.surfaces.hooks) {
+			if (entry.disabledSurfaceIds.includes(hook.extensionId)) continue;
+			try {
+				await resolveConstrainedHookFile(entry.pluginRoot, hook.relativePath);
+			} catch (error) {
+				invalidHookIds.add(`${entry.scope}:${entry.name}:${hook.extensionId}`);
+				preQuarantine.push({
+					identity: bundleIdentity(entry.scope, entry.name),
+					plugin: entry.name,
+					surfaceId: hook.extensionId,
+					code: "runtime_mismatch",
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 	}
 	const { active, quarantine } = validateSessionBundles(effective, {}, preQuarantine);
-	const declared = collectDeclaredHooks(active);
+	const declared = await collectDeclaredHooks(active, invalidHookIds);
 	const hooks: ConstrainedPluginHook[] = [];
 	for (const d of declared) {
 		const { hook, quarantine: q } = await loadOneHook(d);

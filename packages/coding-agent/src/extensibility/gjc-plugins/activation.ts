@@ -1,7 +1,7 @@
-import { logger } from "@gajae-code/utils";
-import { loadGjcPlugins } from "./loader";
-import { discoverGjcPluginRoots } from "./paths";
-import { GjcPluginLoadError, type LoadedGjcPlugin, type LoadedSubskillActivation } from "./types";
+import { GjcPluginLoadError } from "./types";
+import type { LoadedSubskillActivation } from "./types";
+import { loadEffectiveGjcPluginRegistry } from "./registry";
+import { resolveValidatedActiveSubskill } from "./subskill-authority";
 
 export interface SubskillActivationResult {
 	cleanedArgs: string;
@@ -17,38 +17,34 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 	skillName: string;
 	args: string;
 }): Promise<SubskillActivationResult> {
-	const roots = await discoverGjcPluginRoots({ cwd: input.cwd });
-	let plugins: LoadedGjcPlugin[];
-	try {
-		plugins = await loadGjcPlugins(roots);
-	} catch (error) {
-		if (error instanceof GjcPluginLoadError) throw error;
-		logger.warn("Skipping GJC plugin activation set after load error", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-		plugins = [];
+	const registry = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const candidates: LoadedSubskillActivation[] = [];
+	for (const entry of registry) {
+		if (!entry.enabled || entry.migration?.status === "failed") continue;
+		for (const surface of entry.surfaces.subskills) {
+			const validated = await resolveValidatedActiveSubskill({
+				cwd: input.cwd,
+				reference: {
+					plugin: entry.name,
+					scope: entry.scope,
+					subskillName: surface.name,
+					parent: surface.parent,
+					phase: surface.phase,
+					activationArg: surface.activationArg,
+					extensionId: surface.extensionId,
+					expectedDigest: surface.sha256,
+				},
+			});
+			if (validated) candidates.push(validated.activation);
+		}
 	}
-
-	const bindings = plugins.flatMap(plugin => plugin.bindings);
+	const candidateActivations = candidates.filter(candidate => candidate.parent === input.skillName);
 	const activationsByArg = new Map<string, LoadedSubskillActivation>();
-	for (const binding of bindings) {
-		if (binding.parent !== input.skillName) continue;
-		activationsByArg.set(binding.activationArg, {
-			activationArg: binding.activationArg,
-			plugin: binding.plugin,
-			subskillName: binding.subskillName,
-			parent: binding.parent,
-			bindsTo: binding.bindsTo,
-			phase: binding.phase,
-			filePath: binding.filePath,
-			toolPaths: binding.toolPaths,
-		});
+	for (const candidate of candidateActivations) {
+		if (activationsByArg.has(candidate.activationArg)) throw new GjcPluginLoadError("duplicate_arg", `Duplicate GJC plugin activation argument: --${candidate.activationArg}`);
+		activationsByArg.set(candidate.activationArg, candidate);
 	}
-
-	const tokens = input.args
-		.trim()
-		.split(/\s+/)
-		.filter(token => token.length > 0);
+	const tokens = input.args.trim().split(/\s+/).filter(token => token.length > 0);
 	let activation: LoadedSubskillActivation | undefined;
 	const cleanedTokens: string[] = [];
 	let consumed = false;
@@ -63,25 +59,11 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 		}
 		cleanedTokens.push(token);
 	}
-
 	return {
 		cleanedArgs: consumed ? cleanedTokens.join(" ") : input.args,
 		activation,
 		activeSubskillsToPersist: activation
-			? bindings
-					.filter(
-						binding => binding.plugin === activation.plugin && binding.activationArg === activation.activationArg,
-					)
-					.map(binding => ({
-						activationArg: binding.activationArg,
-						plugin: binding.plugin,
-						subskillName: binding.subskillName,
-						parent: binding.parent,
-						bindsTo: binding.bindsTo,
-						phase: binding.phase,
-						filePath: binding.filePath,
-						toolPaths: binding.toolPaths,
-					}))
+			? candidates.filter(candidate => candidate.plugin === activation!.plugin && candidate.activationArg === activation!.activationArg)
 			: [],
 	};
 }

@@ -271,6 +271,30 @@ describe("GJC bundle refusal purity", () => {
 		expect(applied.error.message).not.toContain(copy);
 	});
 
+	test("a reachable malformed stored source yields invalid_target for preview and apply", async () => {
+		const cwd = await mkProjectCwd();
+		const copy = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-malformed-source-"));
+		tempDirs.push(copy);
+		await fs.cp(sixSurface, copy, { recursive: true });
+		expect((await installGjcBundle({ cwd }, "project", copy)).ok).toBe(true);
+		const identity = bundleIdentity("project", "valid-six-surface-bundle");
+		await fs.rm(path.join(copy, "gajae-plugin.json"));
+
+		const preview = await previewGjcBundleUpdate({ cwd }, identity);
+		expect(preview).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+		const applied = await applyGjcBundleUpdate(
+			{ cwd },
+			{
+				identity,
+				candidateFingerprint: "0".repeat(64),
+				baselineFingerprint: "0".repeat(64),
+				decisionContextFingerprint: "0".repeat(64),
+				reviewedAt: new Date().toISOString(),
+			},
+		);
+		expect(applied).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+	});
+
 	test("source-shape routing never steals npm or marketplace specs", () => {
 		// The CLI routes on source SHAPE before resolving, so a deleted GJC source
 		// still reaches the lifecycle's typed refusal. That routing must not claim
@@ -400,7 +424,7 @@ describe("GJC bundle refusal purity", () => {
 				kind: "gajae-code-plugin",
 				name: "ordinary-bundle_1.0",
 				version: "1.0.0-beta.1",
-				tools: [{ name: "good_tool", path: "tools/t.ts", description: "Ordinary prose, punctuation: fine!" }],
+				tools: [{ name: "good_tool", path: "tools/t.ts", description: "Ordinary prose, punctuation: fine!", parameters: { type: "object", properties: {} } }],
 				hooks: [{ name: "audit-read", event: "tool_call", target: "read", phase: "before", path: "hooks/h.ts" }],
 			}),
 		);

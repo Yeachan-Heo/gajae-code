@@ -79,18 +79,27 @@ describe("GJC plugin public boundary", () => {
 		expect(offenders).toEqual([]);
 	});
 
-	test("package exports do not expose the writer modules as public subpaths", async () => {
+	test("package exports do not expose writer or legacy loader modules as public subpaths", async () => {
 		const manifest = JSON.parse(await fs.readFile(path.join(import.meta.dir, "..", "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;
 		};
-		// A wildcard subpath would otherwise resolve
-		// `@gajae-code/coding-agent/extensibility/gjc-plugins/installer`, making the
-		// narrowed barrel cosmetic. Both writer modules must be explicitly blocked.
-		expect(manifest.exports["./extensibility/gjc-plugins/installer"]).toBeNull();
-		expect(manifest.exports["./extensibility/gjc-plugins/registry"]).toBeNull();
-		// The block must precede the wildcard, since Node resolves in declaration order.
+		const blocked = [
+			"./extensibility/gjc-plugins/installer",
+			"./extensibility/gjc-plugins/registry",
+			"./extensibility/gjc-plugins/loader",
+			"./extensibility/gjc-plugins/loader.js",
+		];
+		for (const key of blocked) expect(manifest.exports[key]).toBeNull();
 		const keys = Object.keys(manifest.exports);
-		expect(keys.indexOf("./extensibility/gjc-plugins/installer")).toBeLessThan(keys.indexOf("./extensibility/*"));
-		expect(keys.indexOf("./extensibility/gjc-plugins/registry")).toBeLessThan(keys.indexOf("./extensibility/*"));
+		for (const key of blocked) expect(keys.indexOf(key)).toBeLessThan(keys.indexOf("./extensibility/*"));
+
+		for (const suffix of ["loader", "loader.js"]) {
+			const child = Bun.spawnSync(
+				["bun", "-e", `await import(${JSON.stringify(`@gajae-code/coding-agent/extensibility/gjc-plugins/${suffix}`)})`],
+				{ cwd: path.join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" },
+			);
+			expect(child.exitCode).not.toBe(0);
+			expect(child.stderr.toString()).toMatch(/Cannot find module|Package subpath/);
+		}
 	});
 });

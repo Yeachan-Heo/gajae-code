@@ -6,8 +6,8 @@ import { resolveWithinRoot } from "./paths";
 import { parseManifest, parseSubskillFrontmatter } from "./schema";
 import {
 	GJC_PLUGIN_MANIFEST_FILENAME,
-	type GjcPluginAppendixManifestEntry,
 	GjcPluginLoadError,
+	type GjcPluginAppendixManifestEntry,
 	type GjcPluginMcpManifestEntry,
 	type NormalizedAgentAppendixSurface,
 	type NormalizedAppendixSurface,
@@ -16,9 +16,11 @@ import {
 	type NormalizedHookSurface,
 	type NormalizedMcpSurface,
 	type NormalizedSubskillSurface,
+	type NormalizedSubskillToolSurface,
 	type NormalizedToolSurface,
 } from "./types";
 import { validateBinding } from "./validation";
+import { readSchemaDeclaration, schemaHash } from "./metadata";
 
 function sha256(bytes: Buffer | string): string {
 	return createHash("sha256").update(bytes).digest("hex");
@@ -37,6 +39,8 @@ export const surfaceIds = {
 	agentAppendix: (agent: string, plugin: string, name: string): string => `agent-appendix:${agent}:${plugin}:${name}`,
 	subskill: (parent: string, phase: string, activationArg: string): string =>
 		`subskill:${parent}:${phase}:${activationArg}`,
+	subskillTool: (parent: string, phase: string, activationArg: string, relativePath: string): string =>
+		`subskill-tool:${parent}:${phase}:${activationArg}:${relativePath}`,
 } as const;
 
 async function readManifestJson(filePath: string): Promise<unknown> {
@@ -157,6 +161,14 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 	const manifest = parseManifest(await readManifestJson(manifestPath), manifestPath);
 
 	const files = new Map<string, { sha256: string; bytes: number }>();
+	const manifestSubskillTools = manifest.tools.filter(tool => tool.surface === "subskill");
+	const manifestSubskillFiles = new Map<string, { name: string; sha256: string }>();
+	for (const tool of manifestSubskillTools) {
+		const abs = await resolveDeclaredFile(pluginRoot, tool.path);
+		const { sha256: digest, bytes } = await hashFile(abs, tool.path, tool.sha256);
+		files.set(tool.path, { sha256: digest, bytes });
+		manifestSubskillFiles.set(tool.path, { name: tool.name, sha256: digest });
+	}
 
 	const subskills: NormalizedSubskillSurface[] = [];
 	for (const rel of manifest.subskills) {
@@ -190,11 +202,23 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 				: Array.isArray(fmTools) && fmTools.every(t => typeof t === "string")
 					? (fmTools as string[])
 					: [];
+		const toolRefs: NormalizedSubskillToolSurface[] = [];
+		const seenToolRefs = new Set<string>();
+		for (const [toolRel, info] of manifestSubskillFiles) {
+			const extensionId = surfaceIds.subskillTool(fm.binds_to, fm.phase, fm.activation_arg, toolRel);
+			if (seenToolRefs.has(extensionId)) continue;
+			seenToolRefs.add(extensionId);
+			toolRefs.push({ extensionId, relativePath: toolRel, implementationHash: info.sha256 });
+		}
 		for (const toolRel of fmToolPaths) {
 			if (toolRel.trim().length === 0) continue;
 			const toolAbs = await resolveDeclaredFile(pluginRoot, toolRel);
 			const { sha256: toolDigest, bytes: toolBytes } = await hashFile(toolAbs, toolRel);
 			files.set(toolRel, { sha256: toolDigest, bytes: toolBytes });
+			const extensionId = surfaceIds.subskillTool(fm.binds_to, fm.phase, fm.activation_arg, toolRel);
+			if (seenToolRefs.has(extensionId)) continue;
+			seenToolRefs.add(extensionId);
+			toolRefs.push({ extensionId, relativePath: toolRel, implementationHash: toolDigest });
 		}
 		subskills.push({
 			extensionId: surfaceIds.subskill(fm.binds_to, fm.phase, fm.activation_arg),
@@ -205,6 +229,7 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			activationArg: fm.activation_arg,
 			relativePath: rel,
 			sha256: digest,
+			toolRefs,
 		});
 	}
 
@@ -217,12 +242,24 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 		const { sha256: digest, bytes } = await hashFile(abs, tool.path, tool.sha256);
 		files.set(tool.path, { sha256: digest, bytes });
 		if (tool.surface !== "always-on") continue;
+		let schemaPath: string | undefined;
+		if (tool.schemaPath !== undefined) {
+			const schemaAbs = await resolveDeclaredFile(pluginRoot, tool.schemaPath);
+			const schemaFile = await hashFile(schemaAbs, tool.schemaPath);
+			files.set(tool.schemaPath, schemaFile);
+			schemaPath = tool.schemaPath;
+		}
+		const schema = await readSchemaDeclaration(pluginRoot, abs, tool.schema, schemaPath);
 		tools.push({
 			extensionId: surfaceIds.tool(tool.name),
 			name: tool.name,
 			relativePath: tool.path,
 			sha256: digest,
 			description: tool.description,
+			schema,
+			schemaHash: schemaHash(schema),
+			implementationHash: digest,
+			metadataVersion: 2,
 		});
 	}
 
@@ -246,6 +283,12 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 				);
 			}
 		}
+		if (hook.phase && hook.event !== "tool_call" && hook.event !== "tool_result") {
+			throw new GjcPluginLoadError("invalid_hook", `GJC plugin hook "${hook.name}": phase is only supported for tool_call/tool_result events`);
+		}
+		if (hook.event === "tool_result" && hook.phase !== "after") {
+			throw new GjcPluginLoadError("invalid_hook", `GJC plugin hook "${hook.name}": tool_result requires the after phase`);
+		}
 		hooks.push({
 			extensionId: surfaceIds.hook(hook.event, hook.phase, hook.target, hook.name),
 			name: hook.name,
@@ -254,6 +297,7 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			phase: hook.phase,
 			relativePath: hook.path,
 			sha256: digest,
+			implementationHash: digest,
 		});
 	}
 

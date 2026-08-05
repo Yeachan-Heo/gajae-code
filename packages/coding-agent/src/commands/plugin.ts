@@ -39,6 +39,7 @@ export default class Plugin extends Command {
 	static flags = {
 		json: Flags.boolean({ description: "Output JSON" }),
 		fix: Flags.boolean({ description: "Attempt to fix issues (doctor)" }),
+		"migrate-plugins": Flags.boolean({ description: "Run GJC plugin v1-to-v2 migration pre-flight" }),
 		force: Flags.boolean({ description: "Force install" }),
 		"dry-run": Flags.boolean({ description: "Show actions without applying changes" }),
 		local: Flags.boolean({ char: "l", description: "Operate on local plugin directory" }),
@@ -64,6 +65,7 @@ export default class Plugin extends Command {
 			flags: {
 				json: flags.json,
 				fix: flags.fix,
+				migratePlugins: flags["migrate-plugins"],
 				force: flags.force,
 				dryRun: flags["dry-run"],
 				local: flags.local,

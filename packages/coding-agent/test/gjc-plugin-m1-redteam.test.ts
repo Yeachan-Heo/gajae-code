@@ -144,7 +144,7 @@ describe("GJC plugin Milestone 1 red-team QA", () => {
 		);
 		await fs.writeFile(
 			path.join(dir, "gajae-plugin.json"),
-			JSON.stringify(baseManifest({ tools: [{ name: "sentinel", path: "tools/sentinel.ts" }] })),
+			JSON.stringify(baseManifest({ tools: [{ name: "sentinel", path: "tools/sentinel.ts", parameters: { type: "object", properties: {} } }] })),
 		);
 		const prev = process.env.GJC_TEST_IMPORT_SENTINEL;
 		process.env.GJC_TEST_IMPORT_SENTINEL = sentinel;

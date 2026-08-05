@@ -87,6 +87,13 @@ async function fileExists(p: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 // Source resolution
 // ---------------------------------------------------------------------------
+export class GjcPluginSourceUnavailableError extends Error {
+	readonly code = "source_unavailable" as const;
+	constructor() {
+		super("GJC plugin source is unavailable");
+		this.name = "GjcPluginSourceUnavailableError";
+	}
+}
 
 interface ResolvedSource {
 	dir: string;
@@ -105,7 +112,7 @@ function looksLikeGit(source: string): boolean {
 async function resolveLocalPath(source: string): Promise<ResolvedSource> {
 	const abs = path.resolve(source);
 	if (!(await isDirectory(abs))) {
-		throw new GjcPluginLoadError("missing_file", `GJC plugin source directory not found: ${source}`);
+		throw new GjcPluginSourceUnavailableError();
 	}
 	return {
 		dir: abs,
@@ -136,7 +143,7 @@ async function extractTarball(tarPath: string, destRoot: string): Promise<void> 
 	try {
 		raw = await fs.readFile(tarPath);
 	} catch {
-		throw new GjcPluginLoadError("missing_file", "GJC plugin tarball could not be read");
+		throw new GjcPluginSourceUnavailableError();
 	}
 	let buf: Buffer;
 	try {
@@ -254,13 +261,13 @@ function runGit(args: string[], cwd?: string): Promise<string> {
 	// error. Convert it so the lifecycle can report a typed, sanitized source
 	// failure instead of letting an errno escape to the CLI.
 	child.on("error", () => {
-		reject(new GjcPluginLoadError("missing_file", "git is unavailable or could not be started"));
+		reject(new GjcPluginSourceUnavailableError());
 	});
 	child.on("close", code => {
 		if (code === 0) resolve(stdout.trim());
-		// git writes the remote URL into stderr, which can carry credentials, so
-		// the operation is named without echoing the underlying output.
-		else reject(new GjcPluginLoadError("install_conflict", `git ${args[0]} failed`));
+		// A failed clone/ref resolution is a source-access failure. A successful
+		// clone that lacks a manifest is classified later as invalid_target.
+		else reject(new GjcPluginSourceUnavailableError());
 	});
 	return promise;
 }
@@ -297,9 +304,14 @@ async function resolveGit(source: string): Promise<ResolvedSource> {
 }
 
 async function resolveSource(source: string): Promise<ResolvedSource> {
-	if (isTarball(source)) return resolveTarball(source);
-	if (looksLikeGit(source)) return resolveGit(source);
-	return resolveLocalPath(source);
+	try {
+		if (isTarball(source)) return await resolveTarball(source);
+		if (looksLikeGit(source)) return await resolveGit(source);
+		return await resolveLocalPath(source);
+	} catch (error) {
+		if (error instanceof GjcPluginSourceUnavailableError || error instanceof GjcPluginLoadError) throw error;
+		throw new GjcPluginSourceUnavailableError();
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -390,12 +402,12 @@ export async function runGjcBundleTransaction(
 		// root and mutates directory metadata, so a create-only refusal must be
 		// decided before any lock is taken; otherwise "zero mutation" is false.
 		// The locked decision below re-checks, so this is an early-out only.
-		const preflightTarget = await readRegistry(options.scope, options.cwd);
+		const preflightTarget = await readRegistry(options.scope, options.cwd, { migrate: false });
 		const preexisting = preflightTarget.plugins.find(p => p.name === bundle.name);
 		if (preexisting) {
 			// The decision may compare a cross-scope fingerprint, so it must see the
 			// same complete universe the locked decision sees.
-			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd);
+			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd, { migrate: false });
 			const early = await options.decide({
 				targetRegistry: preflightTarget,
 				effective: sortRegistryEntries([...preflightTarget.plugins, ...preflightOther.plugins]),
@@ -419,9 +431,9 @@ export async function runGjcBundleTransaction(
 			// the scope root or sweep orphans, so an existing-target refusal leaves
 			// the filesystem byte-for-byte untouched.
 
-			const targetRegistry = await readRegistry(options.scope, options.cwd);
+			const targetRegistry = await readRegistry(options.scope, options.cwd, { migrate: false });
 			const otherScope: GjcPluginScope = options.scope === "user" ? "project" : "user";
-			const otherRegistry = await readRegistry(otherScope, options.cwd);
+			const otherRegistry = await readRegistry(otherScope, options.cwd, { migrate: false });
 			const effective = sortRegistryEntries([...targetRegistry.plugins, ...otherRegistry.plugins]);
 			const existing = targetRegistry.plugins.find(p => p.name === bundle.name);
 			const candidate = bundleToRegistryEntry(
