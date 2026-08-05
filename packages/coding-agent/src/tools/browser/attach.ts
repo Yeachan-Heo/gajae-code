@@ -1,6 +1,6 @@
 import * as net from "node:net";
 import * as path from "node:path";
-import { Process, ProcessStatus } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { Browser, Page } from "puppeteer-core";
 import { ToolError, throwIfAborted } from "../tool-errors";
 
@@ -164,7 +164,7 @@ export async function findReusableCdp(
 	exe: string,
 	signal?: AbortSignal,
 ): Promise<{ cdpUrl: string; pid: number } | null> {
-	const candidates = Process.fromPath(exe).filter(p => p.status() === ProcessStatus.Running);
+	const candidates = nativeProcessBindings().Process.fromPath(exe).filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
 	for (const proc of candidates) {
 		let args: string[];
 		try {
@@ -194,7 +194,7 @@ export async function findRunningChromeProfile(
 	profile: { userDataDir: string; profileDirectory: string },
 	signal?: AbortSignal,
 ): Promise<RunningChromeProfile | null> {
-	const candidates = Process.fromPath(exe).filter(p => p.status() === ProcessStatus.Running);
+	const candidates = nativeProcessBindings().Process.fromPath(exe).filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
 	for (const proc of candidates) {
 		let args: string[];
 		try {
@@ -253,7 +253,7 @@ export async function pickElectronTarget(browser: Browser, matcher?: string): Pr
  * Single-process variant for our own spawned children.
  */
 export async function gracefulKillTreeOnce(pid: number, gracePeriodMs = 2000): Promise<void> {
-	const process = Process.fromPid(pid);
+	const process = nativeProcessBindings().Process.fromPid(pid);
 	if (!process) return;
 	await process.terminate({ gracefulMs: gracePeriodMs, timeoutMs: 500 });
 }
@@ -263,7 +263,7 @@ export async function gracefulKillTreeOnce(pid: number, gracePeriodMs = 2000): P
  * (single-instance apps may keep an orphan around) and tear them all down.
  */
 export async function killExistingByPath(executablePath: string, signal?: AbortSignal): Promise<number> {
-	const processes = Process.fromPath(executablePath);
+	const processes = nativeProcessBindings().Process.fromPath(executablePath);
 	if (!processes.length) return 0;
 	const results = await Promise.all(
 		processes.map(async process => {

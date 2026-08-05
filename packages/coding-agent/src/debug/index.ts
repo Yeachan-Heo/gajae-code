@@ -3,9 +3,18 @@
  *
  * Provides tools for debugging, bug report generation, and system diagnostics.
  */
+
 import * as fs from "node:fs/promises";
 import * as url from "node:url";
-import { getWorkProfile } from "@gajae-code/natives";
+import type { getWorkProfile as getWorkProfileFn } from "@gajae-code/natives";
+
+let nativeGetWorkProfile: typeof getWorkProfileFn | undefined;
+
+
+function getWorkProfileNative(...args: Parameters<typeof getWorkProfileFn>): ReturnType<typeof getWorkProfileFn> {
+	nativeGetWorkProfile ??= (require("@gajae-code/natives") as { getWorkProfile: typeof getWorkProfileFn }).getWorkProfile;
+	return nativeGetWorkProfile(...args);
+}
 import { Container, Loader, type SelectItem, SelectList, Spacer, Text } from "@gajae-code/tui";
 import { getSessionsDir } from "@gajae-code/utils";
 import { DynamicBorder } from "../modes/components/dynamic-border";
@@ -188,7 +197,7 @@ export class DebugSelectorComponent extends Container {
 
 		try {
 			const cpuProfile = await session.stop();
-			const workProfile = getWorkProfile(30);
+			const workProfile = getWorkProfileNative(30);
 			const result = await createReportBundle({
 				sessionFile: this.ctx.sessionManager.getSessionFile(),
 				settings: this.#getResolvedSettings(),
@@ -216,7 +225,7 @@ export class DebugSelectorComponent extends Container {
 
 	async #handleWorkReport(): Promise<void> {
 		try {
-			const workProfile = getWorkProfile(30);
+			const workProfile = getWorkProfileNative(30);
 
 			if (!workProfile.svg) {
 				this.ctx.showWarning(`No work profile data (${workProfile.sampleCount} samples)`);

@@ -11,7 +11,16 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
-import { openRecoveryFsRoot } from "@gajae-code/natives";
+
+import type { RecoveryFsRoot } from "@gajae-code/natives";
+
+let nativeRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] | undefined;
+
+
+function openRecoveryFsRootNative(): typeof import("@gajae-code/natives")["openRecoveryFsRoot"] {
+	nativeRecoveryFsRoot ??= (require("@gajae-code/natives") as { openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] }).openRecoveryFsRoot;
+	return nativeRecoveryFsRoot;
+}
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
 
@@ -1083,7 +1092,7 @@ export interface ManagedOwnerPredecessorEvidence {
 	predecessorToken: string;
 }
 
-function exactManagedOwnerJson(authority: ReturnType<typeof openRecoveryFsRoot>, name: string): unknown {
+function exactManagedOwnerJson(authority: RecoveryFsRoot, name: string): unknown {
 	const first = authority.read(name, 64 * 1024);
 	if (!first.ok || !first.data) throw new Error("managed_owner_replacement_evidence_unavailable");
 	const second = authority.read(name, 64 * 1024);
@@ -1129,7 +1138,7 @@ export function resolveManagedOwnerPredecessorSync(
 	if (tokens.length !== 1 || receipts.size !== 1) throw new Error("managed_owner_replacement_evidence_ambiguous");
 	const predecessorToken = tokens[0]!;
 	if (!/^[A-Za-z0-9._-]+$/.test(predecessorToken)) throw new Error("managed_owner_replacement_evidence_untrusted");
-	const authority = openRecoveryFsRoot(root);
+	const authority = openRecoveryFsRootNative()(root);
 	try {
 		const binding = exactManagedOwnerJson(authority, `child-${predecessorToken}.binding.json`) as Record<
 			string,

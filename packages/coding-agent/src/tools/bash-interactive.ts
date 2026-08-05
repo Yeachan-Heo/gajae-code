@@ -1,5 +1,5 @@
 import type { AgentToolContext } from "@gajae-code/agent-core";
-import { type PtyRunResult, PtySession } from "@gajae-code/natives";
+import type { PtyRunResult, PtySession as NativePtySession } from "@gajae-code/natives";
 import {
 	type Component,
 	extractPrintableText,
@@ -19,6 +19,14 @@ import { OutputSink, type OutputSummary, type TerminalArtifactPublisher } from "
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 import { resolveBashOutputSinkHeadBytes, resolveBashOutputSinkTailBytes, resolveOutputMaxColumns } from "./output-meta";
 import { formatStatusIcon, replaceTabs } from "./render-utils";
+
+type PtySession = NativePtySession;
+let ptySessionLoad: Promise<typeof import("@gajae-code/natives")["PtySession"]> | undefined;
+
+async function ptySessionNative(): Promise<typeof import("@gajae-code/natives")["PtySession"]> {
+	ptySessionLoad ??= Promise.resolve((require("@gajae-code/natives") as { PtySession: typeof import("@gajae-code/natives")["PtySession"] }).PtySession);
+	return await ptySessionLoad;
+}
 
 export interface BashInteractiveResult extends OutputSummary {
 	exitCode: number | undefined;
@@ -310,6 +318,7 @@ export async function runInteractiveBashPty(
 	});
 	const { default: xterm } = await import("@xterm/headless");
 	const XtermTerminal = xterm.Terminal;
+	const PtySession = await ptySessionNative();
 	const result = await ui.custom<BashInteractiveResult>(
 		(tui, uiTheme, _keybindings, done) => {
 			const session = new PtySession();

@@ -1,8 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent } from "@gajae-code/ai";
-import { htmlToMarkdown } from "@gajae-code/natives";
+import type { ImageContent, TextContent } from "@gajae-code/ai/core";
+import type { htmlToMarkdown as htmlToMarkdownFn } from "@gajae-code/natives";
 import { type Component, Text } from "@gajae-code/tui";
 import { ptree, truncate } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
@@ -27,6 +27,13 @@ import { formatExpandHint, getDomain, replaceTabs } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
+
+let htmlToMarkdownLoad: Promise<typeof htmlToMarkdownFn> | undefined;
+
+async function htmlToMarkdownNative(): Promise<typeof htmlToMarkdownFn> {
+	htmlToMarkdownLoad ??= Promise.resolve((require("@gajae-code/natives") as { htmlToMarkdown: typeof htmlToMarkdownFn }).htmlToMarkdown);
+	return await htmlToMarkdownLoad;
+}
 
 // =============================================================================
 // Types and Constants
@@ -534,7 +541,7 @@ export async function renderHtmlToText(
 ): Promise<{ content: string; ok: boolean; method: string }> {
 	try {
 		signal?.throwIfAborted();
-		const content = await htmlToMarkdown(html, { cleanContent: true });
+		const content = await (await htmlToMarkdownNative())(html, { cleanContent: true });
 		if (content.trim().length > 100 && !isLowQualityOutput(content)) {
 			return { content, ok: true, method: "native" };
 		}

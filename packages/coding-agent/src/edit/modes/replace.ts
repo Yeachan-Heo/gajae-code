@@ -42,18 +42,33 @@ let scoreSequenceFuzzyNative:
 let findBestFuzzyMatchNative:
 	| ((content: string, target: string, threshold: number) => NativeBestFuzzyMatchResult)
 	| undefined;
-void import("@gajae-code/natives")
-	.then(mod => {
-		if (typeof mod.h02ScoreSequenceFuzzy === "function") {
-			scoreSequenceFuzzyNative = mod.h02ScoreSequenceFuzzy;
-		}
-		if (typeof mod.h01FindBestFuzzyMatch === "function") {
-			findBestFuzzyMatchNative = mod.h01FindBestFuzzyMatch;
-		}
-	})
-	.catch(() => {
-		// Native unavailable; fuzzy matching uses the TS fallback.
-	});
+let nativeFuzzyWarmupStarted = false;
+/**
+ * First-use warm-up for the native fuzzy matchers. Deliberately NOT started at
+ * module evaluation: the W5b idle/S1 module-trace gate requires that merely
+ * importing the edit tool never materializes @gajae-code/natives. Callers stay
+ * on the TS fallback until the fire-and-forget load resolves.
+ */
+function warmNativeFuzzy(): void {
+	if (nativeFuzzyWarmupStarted) return;
+	nativeFuzzyWarmupStarted = true;
+	void Promise.resolve()
+		.then(() => {
+			const mod = require("@gajae-code/natives") as {
+				h02ScoreSequenceFuzzy?: typeof scoreSequenceFuzzyNative;
+				h01FindBestFuzzyMatch?: typeof findBestFuzzyMatchNative;
+			};
+			if (typeof mod.h02ScoreSequenceFuzzy === "function") {
+				scoreSequenceFuzzyNative = mod.h02ScoreSequenceFuzzy;
+			}
+			if (typeof mod.h01FindBestFuzzyMatch === "function") {
+				findBestFuzzyMatchNative = mod.h01FindBestFuzzyMatch;
+			}
+		})
+		.catch(() => {
+			// Native unavailable; fuzzy matching uses the TS fallback.
+		});
+}
 
 import { withEditPathMutation } from "../path-mutation-lock";
 import { readEditFileText, serializeEditFileText } from "../read-file";
@@ -524,6 +539,7 @@ export function findMatch(
 
 	// Try fuzzy match
 	const threshold = options.threshold ?? DEFAULT_FUZZY_THRESHOLD;
+	warmNativeFuzzy();
 	const { best, aboveThresholdCount, secondBestScore } =
 		findBestFuzzyMatchNative?.(content, target, threshold) ?? findBestFuzzyMatch(content, target, threshold);
 
@@ -718,6 +734,7 @@ export function seekSequence(
 		return { index: undefined, confidence: 0 };
 	}
 
+	warmNativeFuzzy();
 	const nativeFuzzyResult = scoreSequenceFuzzyNative?.(lines, pattern, start, eof);
 	if (nativeFuzzyResult?.index !== undefined && nativeFuzzyResult.confidence >= SEQUENCE_FUZZY_THRESHOLD) {
 		if (

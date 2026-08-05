@@ -2,12 +2,26 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as native from "@gajae-code/natives";
-import {
-	canonicalExistingDirectoryIdentity,
-	verifyOwnerOnlyPathSecurity,
-	verifyOwnerOnlyPathSecurityExpected,
-} from "@gajae-code/natives";
+
+import type { RecoveryFsRoot } from "@gajae-code/natives";
+
+type NativeManagedScope = Pick<
+	typeof import("@gajae-code/natives"),
+	| "applyOwnerOnlyPathSecurity"
+	| "canonicalExistingDirectoryIdentity"
+	| "exactRestore"
+	| "exactUnlink"
+	| "snapshotDirectoryTree"
+	| "verifyOwnerOnlyPathSecurity"
+	| "verifyOwnerOnlyPathSecurityExpected"
+>;
+
+let nativeManagedScope: NativeManagedScope | undefined;
+
+function nativeScope(): NativeManagedScope {
+	if (!nativeManagedScope) nativeManagedScope = require("@gajae-code/natives") as NativeManagedScope;
+	return nativeManagedScope;
+}
 import { hasFsCode, logger, pathIsWithin } from "@gajae-code/utils";
 import type { ResumeSessionIdentity } from "../session-manager";
 import {
@@ -67,13 +81,13 @@ export interface ManagedScope {
  */
 export interface ManagedCandidateWriteAuthority {
 	readonly rootAuthority: ManagedDirectoryRoot;
-	readonly retainedAuthority?: native.RecoveryFsRoot;
+	readonly retainedAuthority?: RecoveryFsRoot;
 	readonly retainedDirectory?: string;
 }
 
 const managedRoots = new WeakMap<ManagedScope, ReturnType<typeof prepareManagedDirectoryRoot>>();
 const managedDirectoryIdentities = new WeakMap<ManagedScope, { dev: bigint; ino: bigint }>();
-const managedDirectoryAuthorities = new WeakMap<ManagedScope, native.RecoveryFsRoot | undefined>();
+const managedDirectoryAuthorities = new WeakMap<ManagedScope, RecoveryFsRoot | undefined>();
 const boundManagedWriteAuthorities = new WeakMap<ManagedScope, ManagedCandidateWriteAuthority>();
 
 function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandidateWriteAuthority): void {
@@ -107,7 +121,7 @@ function assertRetainedManagedDirectoryIdentity(scope: ManagedScope): void {
 		throw new Error("Managed session directory changed");
 }
 
-export function managedDirectoryAuthorityForScope(scope: ManagedScope): native.RecoveryFsRoot | undefined {
+export function managedDirectoryAuthorityForScope(scope: ManagedScope): RecoveryFsRoot | undefined {
 	if (!managedDirectoryAuthorities.has(scope)) throw new Error("Managed session directory authority was not prepared");
 	return managedDirectoryAuthorities.get(scope);
 }
@@ -323,14 +337,14 @@ function scopeDigest(platform: "posix" | "win32", canonicalPath: string): string
 export const computeManagedScopeDigest = scopeDigest;
 
 function identityFor(cwd: string): NativeIdentity {
-	return canonicalExistingDirectoryIdentity(cwd) as NativeIdentity;
+	return nativeScope().canonicalExistingDirectoryIdentity(cwd) as NativeIdentity;
 }
 
 function verifyExistingManagedScopeDirectory(pathname: string) {
-	if (process.platform !== "win32") return verifyOwnerOnlyPathSecurity(pathname, "directory");
+	if (process.platform !== "win32") return nativeScope().verifyOwnerOnlyPathSecurity(pathname, "directory");
 	const expected = fs.lstatSync(pathname, { bigint: true });
 	if (!expected.isDirectory() || expected.isSymbolicLink()) throw new Error("reparse_point");
-	const verified = verifyOwnerOnlyPathSecurityExpected(pathname, "directory", expected.dev, expected.ino);
+	const verified = nativeScope().verifyOwnerOnlyPathSecurityExpected(pathname, "directory", expected.dev, expected.ino);
 	const current = fs.lstatSync(pathname, { bigint: true });
 	if (
 		!current.isDirectory() ||
@@ -367,7 +381,7 @@ export function canonicalizeTrustedPath(target: string): string {
 	let base = path.resolve(target);
 	const suffix: string[] = [];
 	for (;;) {
-		const identity = canonicalExistingDirectoryIdentity(base) as NativeIdentity;
+		const identity = nativeScope().canonicalExistingDirectoryIdentity(base) as NativeIdentity;
 		if (identity.ok) {
 			const canonicalBase = canonicalExistingPathForIo(base, identity);
 			return suffix.length === 0 ? canonicalBase : path.join(canonicalBase, ...suffix);
@@ -596,7 +610,7 @@ function legacyDirectoryNames(
 	};
 	const names = new Set<string>([encodeAbsolute(canonicalCwd), encodeAbsolute(lexicalCwd)]);
 	const canonicalRoot = (root: string): string => {
-		const identity = canonicalExistingDirectoryIdentity(root);
+		const identity = nativeScope().canonicalExistingDirectoryIdentity(root);
 		return identity.ok ? identity.canonicalPath : pathApi.resolve(root);
 	};
 	const home = os.homedir();
@@ -917,20 +931,20 @@ function reapplyOwnerOnlyManagedTree(directory: string): void {
 		if (stat.isDirectory()) {
 			reapplyOwnerOnlyManagedTree(child);
 			try {
-				native.applyOwnerOnlyPathSecurity(child, "directory");
+				nativeScope().applyOwnerOnlyPathSecurity(child, "directory");
 			} catch {
 				// Best-effort: the managed-tree snapshot re-verifies and reports genuine failures.
 			}
 		} else if (stat.isFile()) {
 			try {
-				native.applyOwnerOnlyPathSecurity(child, "file");
+				nativeScope().applyOwnerOnlyPathSecurity(child, "file");
 			} catch {
 				// Best-effort, as above.
 			}
 		}
 	}
 	try {
-		native.applyOwnerOnlyPathSecurity(directory, "directory");
+		nativeScope().applyOwnerOnlyPathSecurity(directory, "directory");
 	} catch {
 		// Best-effort, as above.
 	}
@@ -2392,7 +2406,7 @@ type NativeDirectorySnapshotApi = {
 };
 function snapshotArtifactTree(pathname: string): NativeDirectoryTreeSnapshot {
 	validateManagedArtifactTree(pathname);
-	const result = (native as unknown as NativeDirectorySnapshotApi).snapshotDirectoryTree(pathname);
+	const result = nativeScope().snapshotDirectoryTree(pathname);
 	if (!result.ok || !result.snapshot) throw new Error(result.ok ? "unsafe_artifacts" : result.code);
 	return result.snapshot;
 }
@@ -2833,7 +2847,7 @@ export function matchesMigrationArtifactRoot(
 		const stat = fs.lstatSync(pathname, { bigint: true });
 		if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== identity.dev || stat.ino !== identity.ino)
 			return false;
-		const observed = native.snapshotDirectoryTree(pathname);
+		const observed = nativeScope().snapshotDirectoryTree(pathname);
 		const expectedRoot = expectedTree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
 		const observedRoot = observed.snapshot?.entries.find(
 			entry => entry.relativePath === "" && entry.kind === "directory",
@@ -2929,7 +2943,7 @@ export function cleanupAuthorityMatches(
 			parentStat.ino !== cleanup.identity.parentIno
 		)
 			return false;
-		const snapshot = native.snapshotDirectoryTree(cleanup.retainedPath);
+		const snapshot = nativeScope().snapshotDirectoryTree(cleanup.retainedPath);
 		const observedRoot = snapshot.snapshot?.entries.find(
 			entry => entry.relativePath === "" && entry.kind === "directory",
 		);
@@ -2962,7 +2976,7 @@ export function detachArtifactRootForMigration(
 ):
 	| { detached: DetachedArtifactRoot; detachOutcome: "clean" }
 	| { detached: DetachedArtifactRoot; detachOutcome: "cleanup_pending"; cleanup: SourceArtifactCleanup } {
-	const result = native.exactUnlink(plan.originalPath, {
+	const result = nativeScope().exactUnlink(plan.originalPath, {
 		...plan.identity,
 		directory: true,
 		detachOnly: true,
@@ -2993,7 +3007,7 @@ export function detachArtifactRootForMigration(
 	const stat = fs.lstatSync(placeholder, { bigint: true });
 	if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(placeholder) !== path.dirname(plan.originalPath))
 		throw new Error("durability_failed");
-	const snapshot = native.snapshotDirectoryTree(placeholder);
+	const snapshot = nativeScope().snapshotDirectoryTree(placeholder);
 	if (!snapshot.ok || !snapshot.snapshot) throw new Error("durability_failed");
 	// Windows directory size/mtime authority is the native tree root, never Bun's
 	// zero-valued directory lstat. Capturing Bun values here would guarantee a
@@ -3166,7 +3180,7 @@ export function restorePreparedArtifactRoot(
 		return;
 	}
 	assertPreparedTree(quarantine.detachedPath);
-	const result = native.exactRestore(quarantine.detachedPath, quarantine.path, {
+	const result = nativeScope().exactRestore(quarantine.detachedPath, quarantine.path, {
 		...artifactIdentity,
 		directory: true,
 	});
@@ -3176,7 +3190,7 @@ export function restorePreparedArtifactRoot(
 function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot, cleanup?: SourceArtifactCleanup): void {
 	if (cleanup && !cleanupAuthorityMatches(cleanup, path.dirname(detached.originalPath)))
 		throw new Error("durability_failed");
-	const result = native.exactRestore(detached.detachedPath, detached.originalPath, {
+	const result = nativeScope().exactRestore(detached.detachedPath, detached.originalPath, {
 		...detached.identity,
 		directory: true,
 	});

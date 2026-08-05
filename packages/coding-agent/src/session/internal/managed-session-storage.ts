@@ -2,31 +2,46 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import {
-	applyOwnerOnlyFdSecurity,
-	applyOwnerOnlyPathSecurity,
-	exactRemoveDirectoryTree,
-	exactReplacePath,
-	exactUnlink,
-	linkNoReplacePath,
-	type NativeDirectoryTreeSnapshot,
-	type NativeExactUnlinkResult,
-	type NativeOwnerOnlySecurityResult,
-	openRecoveryFsRoot,
-	type RecoveryFsRoot,
-	renameNoReplacePath,
-	repairOwnerOnlyPathSecurityExpected,
-	snapshotDirectoryTree,
-	verifyOwnerOnlyFdSecurity,
-	verifyOwnerOnlyPathSecurity,
-	verifyOwnerOnlyPathSecurityExpected,
+
+import type {
+	NativeDirectoryTreeSnapshot,
+	NativeExactUnlinkResult,
+	NativeOwnerOnlySecurityResult,
+	RecoveryFsRoot,
 } from "@gajae-code/natives";
+
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,
 	mayCleanCurrentStaging,
 	type NativePublishOutcome,
 } from "./native-publish-outcome";
+type NativeManagedSessionStorage = Pick<
+	typeof import("@gajae-code/natives"),
+	| "applyOwnerOnlyFdSecurity"
+	| "applyOwnerOnlyPathSecurity"
+	| "exactRemoveDirectoryTree"
+	| "exactReplacePath"
+	| "exactUnlink"
+	| "linkNoReplacePath"
+	| "openRecoveryFsRoot"
+	| "renameNoReplacePath"
+	| "repairOwnerOnlyPathSecurityExpected"
+	| "snapshotDirectoryTree"
+	| "verifyOwnerOnlyFdSecurity"
+	| "verifyOwnerOnlyPathSecurity"
+	| "verifyOwnerOnlyPathSecurityExpected"
+>;
+
+let nativeManagedSessionStorage: NativeManagedSessionStorage | undefined;
+
+
+function nativeSessionStorage(): NativeManagedSessionStorage {
+	if (!nativeManagedSessionStorage) {
+		nativeManagedSessionStorage = require("@gajae-code/natives") as NativeManagedSessionStorage;
+	}
+	return nativeManagedSessionStorage;
+}
 
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
@@ -545,7 +560,7 @@ export function retainManagedDirectoryAuthority(
 	if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("Managed directory authority is unavailable");
 	if (expected && (named.dev !== expected.dev || named.ino !== expected.ino))
 		throw new Error("Managed directory identity changed before retention");
-	const rootAuthority = openRecoveryFsRoot(root.canonicalPath);
+	const rootAuthority = nativeSessionStorage().openRecoveryFsRoot(root.canonicalPath);
 	try {
 		const retainedRoot = rootAuthority.identity();
 		if (
@@ -624,9 +639,9 @@ function securityError(pathname: string, result: NativeSecurity): Error {
 }
 
 function secure(pathname: string, kind: "directory" | "file"): void {
-	const applied = validateNativeSecurityResult(applyOwnerOnlyPathSecurity(pathname, kind), "apply", kind);
+	const applied = validateNativeSecurityResult(nativeSessionStorage().applyOwnerOnlyPathSecurity(pathname, kind), "apply", kind);
 	if (!applied.ok) throw securityError(pathname, applied);
-	const verified = validateNativeSecurityResult(verifyOwnerOnlyPathSecurity(pathname, kind), "verify", kind);
+	const verified = validateNativeSecurityResult(nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, kind), "verify", kind);
 	if (!verified.ok) throw securityError(pathname, verified);
 }
 
@@ -648,7 +663,7 @@ function verifyExistingManagedPathSecurity(
 	expected: fs.BigIntStats,
 ): void {
 	const verified = validateNativeSecurityResult(
-		verifyOwnerOnlyPathSecurityExpected(pathname, kind, expected.dev, expected.ino),
+		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(pathname, kind, expected.dev, expected.ino),
 		"verify",
 		kind,
 	);
@@ -661,7 +676,7 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	const safeKind = kind === "directory" ? named.isDirectory() : named.isFile();
 	if (!safeKind || named.isSymbolicLink()) throw new Error(`Unsafe managed ${kind}: ${pathname}`);
 	const verified = validateNativeSecurityResult(
-		verifyOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
 		"verify",
 		kind,
 	);
@@ -669,7 +684,7 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	if (verified.ok) return;
 	if (verified.code !== "acl_verify_failed") throw securityError(pathname, verified);
 	const repaired = validateNativeSecurityResult(
-		repairOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		nativeSessionStorage().repairOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
 		"verify",
 		kind,
 	);
@@ -734,7 +749,7 @@ export class ManagedSessionDescendantStore {
 		this.#subtreeRoot = Object.freeze({ canonicalPath: this.#baseDir, dev: subtreeStat.dev, ino: subtreeStat.ino });
 		if (process.platform === "linux") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
-			const authority = openRecoveryFsRoot(this.#baseDir);
+			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
 			const retained = authority.identity();
 			if (
 				!retained.ok ||
@@ -833,7 +848,7 @@ export class ManagedSessionDescendantStore {
 				verifyExistingManagedPathSecurity(this.#baseDir, "directory", named);
 			else {
 				const verified = validateNativeSecurityResult(
-					verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
+					nativeSessionStorage().verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
 					"verify",
 					"directory",
 				);
@@ -894,7 +909,7 @@ export class ManagedSessionDescendantStore {
 			binding.predecessor,
 			binding.receipt,
 		);
-		const removed = exactUnlink(receiptPath, {
+		const removed = nativeSessionStorage().exactUnlink(receiptPath, {
 			dev: placeholder.identity.dev,
 			ino: placeholder.identity.ino,
 			nlink: placeholder.identity.nlink,
@@ -931,7 +946,7 @@ export class ManagedSessionDescendantStore {
 		}
 		const predecessor = binding.predecessor;
 		const quarantineName = replacementReceiptRetirementName(receipt.identity, predecessor);
-		const detached = exactUnlink(receiptPath, {
+		const detached = nativeSessionStorage().exactUnlink(receiptPath, {
 			dev: receipt.identity.dev,
 			ino: receipt.identity.ino,
 			nlink: receipt.identity.nlink,
@@ -984,7 +999,7 @@ export class ManagedSessionDescendantStore {
 		)
 			throw new Error("managed_replace_cleanup_receipt_invalid");
 
-		const retired = exactUnlink(expectedPredecessor, {
+		const retired = nativeSessionStorage().exactUnlink(expectedPredecessor, {
 			dev: parsed.identity.dev,
 			ino: parsed.identity.ino,
 			nlink: parsed.identity.nlink,
@@ -1013,7 +1028,7 @@ export class ManagedSessionDescendantStore {
 			currentReceipt.identity.sha256 !== receipt.identity.sha256
 		)
 			throw new Error("managed_replace_cleanup_receipt_invalid");
-		const removed = exactUnlink(receiptPath, {
+		const removed = nativeSessionStorage().exactUnlink(receiptPath, {
 			dev: currentReceipt.identity.dev,
 			ino: currentReceipt.identity.ino,
 			nlink: currentReceipt.identity.nlink,
@@ -1343,7 +1358,7 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
-			const removed = exactUnlink(this.#resolve(relativePath), {
+			const removed = nativeSessionStorage().exactUnlink(this.#resolve(relativePath), {
 				dev: expected.identity.dev,
 				ino: expected.identity.ino,
 				size: BigInt(expected.identity.size),
@@ -1432,7 +1447,7 @@ export class ManagedSessionDescendantStore {
 			if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
 			return captured.snapshot;
 		}
-		const captured = snapshotDirectoryTree(this.#resolve(relativePath));
+		const captured = nativeSessionStorage().snapshotDirectoryTree(this.#resolve(relativePath));
 		if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
 		return captured.snapshot;
 	}
@@ -1498,13 +1513,13 @@ export class ManagedSessionDescendantStore {
 					this.#relative(this.#resolve(destinationRelativePath)),
 					expected,
 				)
-			: renameNoReplacePath(this.#resolve(sourceRelativePath), this.#resolve(destinationRelativePath));
+			: nativeSessionStorage().renameNoReplacePath(this.#resolve(sourceRelativePath), this.#resolve(destinationRelativePath));
 		const outcome = classifyNativePublishOutcome(moved, this.#authority ? "retained_tree" : "direct_rename");
 		if (!outcome.ok)
 			throw new ManagedTreeMoveOutcomeError(publishFailure(outcome).message, mayCleanCurrentStaging(outcome));
 		const movedSnapshot = this.#authority
 			? this.#authority.snapshotManagedTree(this.#relative(this.#resolve(destinationRelativePath)))
-			: snapshotDirectoryTree(this.#resolve(destinationRelativePath));
+			: nativeSessionStorage().snapshotDirectoryTree(this.#resolve(destinationRelativePath));
 		if (
 			!movedSnapshot.ok ||
 			!movedSnapshot.snapshot ||
@@ -1521,7 +1536,7 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
-			const removed = exactRemoveDirectoryTree(this.#resolve(relativePath), expected);
+			const removed = nativeSessionStorage().exactRemoveDirectoryTree(this.#resolve(relativePath), expected);
 			if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
 			this.#assertBound();
 			return;
@@ -1581,15 +1596,15 @@ function secureFileDescriptor(pathname: string, fd: number, operation: "apply" |
 	if (process.platform !== "linux") {
 		if (operation === "apply") secure(pathname, "file");
 		else {
-			const verified = validateNativeSecurityResult(verifyOwnerOnlyPathSecurity(pathname, "file"), "verify", "file");
+			const verified = validateNativeSecurityResult(nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"), "verify", "file");
 			if (!verified.ok) throw securityError(pathname, verified);
 		}
 		return;
 	}
 	const result = validateNativeSecurityResult(
 		operation === "apply"
-			? applyOwnerOnlyFdSecurity(pathname, "file", fd)
-			: verifyOwnerOnlyFdSecurity(pathname, "file", fd),
+		? nativeSessionStorage().applyOwnerOnlyFdSecurity(pathname, "file", fd)
+			: nativeSessionStorage().verifyOwnerOnlyFdSecurity(pathname, "file", fd),
 		operation,
 		"file",
 	);
@@ -1829,7 +1844,7 @@ export async function publishManagedFileNoReplace(
 		assertOwned?.();
 
 		renameAttempted = true;
-		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
+		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(staging, destination));
 		if (renameFlagsUnsupported(outcome)) {
 			// linkat publishes the destination without consuming the staging name, so the
 			// secured staging descriptor stays authoritative across publication exactly as
@@ -1837,7 +1852,7 @@ export async function publishManagedFileNoReplace(
 			// below, after that descriptor is closed: unlinking a still-open name on NFS
 			// silly-renames it instead of removing it, which would leave a second link on
 			// the published inode.
-			outcome = classifyNativePublishOutcome(linkNoReplacePath(staging, destination));
+			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
 			linkPublished = outcome.ok;
 		}
 
@@ -1908,11 +1923,11 @@ export function publishManagedFileNoReplaceSync(
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 		publishedIdentity = identity(staged, createHash("sha256").update(bytes).digest("hex"));
 
-		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
+		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(staging, destination));
 		if (renameFlagsUnsupported(outcome)) {
 			// See publishManagedFileNoReplace: the staging link outlives this publication
 			// and is removed only after the secured descriptor is closed.
-			outcome = classifyNativePublishOutcome(linkNoReplacePath(staging, destination));
+			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
 			linkPublished = outcome.ok;
 		}
 		if (!outcome.ok) throw publishFailure(outcome);
@@ -2010,7 +2025,7 @@ export function replaceManagedFileSync(
 				policy,
 			);
 			const receiptPath = replacementReceiptPath(parent, expectedDestination, publishedReceiptIdentity);
-			const receiptPublish = classifyNativePublishOutcome(renameNoReplacePath(receiptStagingPath, receiptPath));
+			const receiptPublish = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(receiptStagingPath, receiptPath));
 			if (!receiptPublish.ok) throw publishFailure(receiptPublish);
 			const namedReceipt = captureManagedFileNoFollow(receiptPath);
 			if (
@@ -2026,7 +2041,7 @@ export function replaceManagedFileSync(
 				identity: publishedReceiptIdentity,
 				predecessor: expectedDestination,
 			};
-			const replaced = exactReplacePath(
+			const replaced = nativeSessionStorage().exactReplacePath(
 				staging,
 				destination,
 				{
@@ -2069,7 +2084,7 @@ export function replaceManagedFileSync(
 		fsyncDirectory(parent);
 		if (receiptCleanup) {
 			try {
-				const removed = exactUnlink(receiptCleanup.path, {
+				const removed = nativeSessionStorage().exactUnlink(receiptCleanup.path, {
 					dev: receiptCleanup.identity.dev,
 					ino: receiptCleanup.identity.ino,
 					nlink: receiptCleanup.identity.nlink,
@@ -2254,7 +2269,7 @@ export async function acquireManagedLock(
 			if (observed && owner && reclaimable) {
 				try {
 					ManagedLockTestHooks.beforeObservedRetirement?.({ path: lockPath, attemptId: owner.attemptId });
-					const removed = exactUnlink(lockPath, {
+					const removed = nativeSessionStorage().exactUnlink(lockPath, {
 						dev: observed.snapshot.identity.dev,
 						ino: observed.snapshot.identity.ino,
 						size: BigInt(observed.snapshot.identity.size),
@@ -2313,7 +2328,7 @@ export function validateManagedArtifactTree(root: string, limits: ManagedArtifac
 
 /** Flush a copied managed artifact tree, including empty directories, before publishing its receipt. */
 export function fsyncManagedArtifactTree(root: string): NativeDirectoryTreeSnapshot {
-	const before = snapshotDirectoryTree(root);
+	const before = nativeSessionStorage().snapshotDirectoryTree(root);
 	if (!before.ok || !before.snapshot) throw new Error(before.code ?? "unsafe_artifacts");
 	const visit = (pathname: string): void => {
 		const stat = fs.lstatSync(pathname);
@@ -2336,7 +2351,7 @@ export function fsyncManagedArtifactTree(root: string): NativeDirectoryTreeSnaps
 	};
 	validateManagedArtifactTree(root);
 	visit(root);
-	const after = snapshotDirectoryTree(root);
+	const after = nativeSessionStorage().snapshotDirectoryTree(root);
 	if (!after.ok || !after.snapshot || JSON.stringify(after.snapshot) !== JSON.stringify(before.snapshot)) {
 		throw new Error("artifact_tree_changed_during_fsync");
 	}

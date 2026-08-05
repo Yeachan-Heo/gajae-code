@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { type AstFindMatch, astGrep } from "@gajae-code/natives";
+import type { AstFindMatch, astGrep as astGrepFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";
@@ -32,6 +32,13 @@ import {
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
+
+let astGrepLoad: Promise<typeof astGrepFn> | undefined;
+
+async function astGrepNative(): Promise<typeof astGrepFn> {
+	astGrepLoad ??= Promise.resolve((require("@gajae-code/natives") as { astGrep: typeof astGrepFn }).astGrep);
+	return await astGrepLoad;
+}
 const astGrepSchema = z.object({
 	pat: z.string().describe("ast pattern"),
 	paths: z
@@ -58,7 +65,7 @@ async function runMultiTargetAstGrep(
 	let filesSearched = 0;
 	let limitReached = false;
 	for (const target of targets) {
-		const targetResult = await astGrep({
+		const targetResult = await (await astGrepNative())({
 			patterns: options.patterns,
 			path: target.basePath,
 			glob: target.glob,
@@ -152,6 +159,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
 				getArtifactsDir: this.session.getArtifactsDir,
+				mcpManager: this.session.getMcpManager?.(),
 				getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 				internalUrlAction: "search",
 			});
@@ -166,7 +174,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 						limit: DEFAULT_AST_LIMIT,
 						signal,
 					})
-				: await astGrep({
+				: await (await astGrepNative())({
 						patterns,
 						path: resolvedSearchPath,
 						glob: globFilter,

@@ -7,7 +7,7 @@
  * - Convenience helpers: captureText / execText, AbortSignal, timeouts.
  */
 
-import { Process } from "@gajae-code/natives";
+import { nativeProcessBindings } from "./native-process";
 import type { Spawn, Subprocess } from "bun";
 
 type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
@@ -217,7 +217,8 @@ export class ChildProcess<In extends InMask = InMask> {
 	kill(reason?: Exception) {
 		if (reason && !this.#exitReasonPending) this.#exitReasonPending = reason;
 		if (!this.proc.killed)
-			void Process.fromPid(this.proc.pid)
+			void nativeProcessBindings()
+				.Process.fromPid(this.proc.pid)
 				?.terminate()
 				?.catch(e => void e);
 	}

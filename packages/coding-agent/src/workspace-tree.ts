@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { FileType, type GlobMatch, listWorkspace } from "@gajae-code/natives";
+import type { FileType as FileTypeEnum, GlobMatch, listWorkspace as listWorkspaceFn } from "@gajae-code/natives";
 import { formatAge, formatBytes } from "@gajae-code/utils";
 
 /** Defaults for the workspace tree shown in the system prompt. */
@@ -14,6 +14,18 @@ const WORKSPACE_DEFAULTS = {
  * native cap so the system-prompt builder does not need a second pass.
  */
 export const AGENTS_MD_LIMIT = 200;
+
+// Lazy natives binding: loading this module must not materialize
+// @gajae-code/natives (W5b S1/idle module-trace gate). The addon loads only
+// when a workspace scan actually runs.
+let nativeWorkspaceBindings: { FileType: typeof FileTypeEnum; listWorkspace: typeof listWorkspaceFn } | undefined;
+async function workspaceNatives(): Promise<{ FileType: typeof FileTypeEnum; listWorkspace: typeof listWorkspaceFn }> {
+	if (!nativeWorkspaceBindings) {
+		const mod = require("@gajae-code/natives") as { FileType: typeof FileTypeEnum; listWorkspace: typeof listWorkspaceFn };
+		nativeWorkspaceBindings = { FileType: mod.FileType, listWorkspace: mod.listWorkspace };
+	}
+	return nativeWorkspaceBindings;
+}
 
 export interface DirectoryTree {
 	rootPath: string;
@@ -58,6 +70,7 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 	let entries: readonly GlobMatch[];
 	let nativeTruncated: boolean;
 	try {
+		const { listWorkspace } = await workspaceNatives();
 		const result = await listWorkspace({
 			path: rootPath,
 			maxDepth,
@@ -86,6 +99,7 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 export async function buildWorkspaceTree(cwd: string, options: BuildWorkspaceTreeOptions = {}): Promise<WorkspaceTree> {
 	const rootPath = path.resolve(cwd);
 	try {
+		const { listWorkspace } = await workspaceNatives();
 		const result = await listWorkspace({
 			path: rootPath,
 			maxDepth: WORKSPACE_DEFAULTS.maxDepth,
@@ -145,7 +159,8 @@ function assembleTree(rootPath: string, entries: readonly GlobMatch[], opts: Ass
 		const parentPath = slash === -1 ? "" : entry.path.slice(0, slash);
 		const node: Node = {
 			name,
-			isDir: entry.fileType === FileType.Dir,
+			// assembleTree only runs after a native scan, so the binding is set.
+			isDir: entry.fileType === nativeWorkspaceBindings?.FileType.Dir,
 			mtimeMs: entry.mtime ?? 0,
 			size: entry.size ?? 0,
 			depth: parentPath ? parentPath.split("/").length + 1 : 1,

@@ -4,7 +4,14 @@
  * Note: command execution is async to avoid blocking the TUI.
  */
 
-import { executeShell } from "@gajae-code/natives";
+import type { executeShell as executeShellFn } from "@gajae-code/natives";
+
+let executeShellLoad: Promise<typeof executeShellFn> | undefined;
+
+async function executeShellNative(): Promise<typeof executeShellFn> {
+	executeShellLoad ??= Promise.resolve((require("@gajae-code/natives") as { executeShell: typeof executeShellFn }).executeShell);
+	return await executeShellLoad;
+}
 
 /** Cache for successful shell command results (persists for process lifetime). */
 const commandResultCache = new Map<string, string>();
@@ -56,6 +63,7 @@ async function executeCommand(commandConfig: string, cacheScope?: string): Promi
 
 async function runShellCommand(command: string, timeoutMs: number): Promise<string | undefined> {
 	try {
+		const executeShell = await executeShellNative();
 		let output = "";
 		const result = await executeShell({ command, timeoutMs }, (err, chunk) => {
 			if (!err) {

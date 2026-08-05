@@ -7,8 +7,18 @@
  * - Grouped references and symbols
  * - Collapsible/expandable views
  */
+
 import type { RenderResultOptions } from "@gajae-code/agent-core";
-import { type HighlightColors, highlightCode as nativeHighlightCode, supportsLanguage } from "@gajae-code/natives";
+import type { HighlightColors } from "@gajae-code/natives";
+
+type NativeLspRenderBindings = Pick<typeof import("@gajae-code/natives"), "highlightCode" | "supportsLanguage">;
+let nativeLspRenderBindings: NativeLspRenderBindings | undefined;
+
+
+function nativeLspRender(): NativeLspRenderBindings {
+	if (!nativeLspRenderBindings) nativeLspRenderBindings = require("@gajae-code/natives") as NativeLspRenderBindings;
+	return nativeLspRenderBindings;
+}
 import { type Component, Text } from "@gajae-code/tui";
 import { getLanguageFromPath, type Theme } from "../modes/theme/theme";
 import {
@@ -276,7 +286,7 @@ function renderHover(
  * Syntax highlight code using native highlighter.
  */
 function highlightCode(codeText: string, language: string, theme: Theme): string[] {
-	const validLang = language && supportsLanguage(language) ? language : undefined;
+	const validLang = language && nativeLspRender().supportsLanguage(language) ? language : undefined;
 	try {
 		const colors: HighlightColors = {
 			comment: theme.getFgAnsi("syntaxComment"),
@@ -291,7 +301,7 @@ function highlightCode(codeText: string, language: string, theme: Theme): string
 			inserted: theme.getFgAnsi("toolDiffAdded"),
 			deleted: theme.getFgAnsi("toolDiffRemoved"),
 		};
-		return nativeHighlightCode(codeText, validLang, colors).split("\n");
+		return nativeLspRender().highlightCode(codeText, validLang, colors).split("\n");
 	} catch {
 		return codeText.split("\n");
 	}

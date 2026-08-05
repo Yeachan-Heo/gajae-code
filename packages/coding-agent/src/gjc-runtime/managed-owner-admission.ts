@@ -2,17 +2,7 @@ import { Buffer } from "node:buffer";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { openRecoveryFsRoot } from "@gajae-code/natives";
-import {
-	MANAGED_OWNER_CHILD_TOKEN_ENV,
-	MANAGED_OWNER_GENERATION_ENV,
-	MANAGED_OWNER_INCARNATION_ENV,
-	MANAGED_OWNER_RUN_ID_ENV,
-	MANAGED_OWNER_SESSION_ID_ENV,
-	MANAGED_OWNER_STATE_DIR_ENV,
-	type ManagedOwnerBinding,
-	type ManagedOwnerSigabrtReceipt,
-} from "./managed-owner-supervisor";
+import type { ManagedOwnerBinding, ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
 import { assertSafePathComponent } from "./session-layout";
 import { lifecyclePaths } from "./tmux-owner-isolation";
 import {
@@ -20,6 +10,13 @@ import {
 	planUltragoalOwnerLossRecovery,
 	type UltragoalRecoveryDecision,
 } from "./ultragoal-owner-loss-recovery";
+
+const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
+const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
+const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
+const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
+const MANAGED_OWNER_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
+const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 
 export const MANAGED_OWNER_PREDECESSOR_TOKEN_ENV = "GJC_MANAGED_OWNER_PREDECESSOR_TOKEN";
 export const MANAGED_OWNER_PREDECESSOR_GENERATION_ENV = "GJC_MANAGED_OWNER_PREDECESSOR_GENERATION";
@@ -134,6 +131,7 @@ function safeChildToken(value: string): boolean {
 async function readExactJsons(root: string, files: readonly string[]): Promise<unknown[] | null> {
 	if (process.platform !== "linux") return null;
 	try {
+		const { openRecoveryFsRoot } = require("@gajae-code/natives") as Pick<typeof import("@gajae-code/natives"), "openRecoveryFsRoot">;
 		const authority = openRecoveryFsRoot(root);
 		try {
 			const values: unknown[] = [];

@@ -4,7 +4,7 @@
  * Uses brush-core via native bindings for shell execution.
  */
 import * as fs from "node:fs/promises";
-import { executeShell, type MinimizerOptions, Shell } from "@gajae-code/natives";
+import type { MinimizerOptions, Shell as NativeShell } from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
@@ -18,6 +18,16 @@ import {
 import { formatArtifactReference, resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
+
+type NativeShellBindings = Pick<typeof import("@gajae-code/natives"), "Shell" | "executeShell">;
+let nativeShellBindingsLoad: Promise<NativeShellBindings> | undefined;
+
+async function shellNatives(): Promise<NativeShellBindings> {
+	nativeShellBindingsLoad ??= Promise.resolve(require("@gajae-code/natives") as NativeShellBindings);
+	return await nativeShellBindingsLoad;
+}
+
+type Shell = NativeShell;
 
 export interface BashArtifactSaveSummary {
 	artifactId: string;
@@ -278,6 +288,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			...(await sink.dump("Command cancelled")),
 		};
 	}
+	const { Shell, executeShell } = await shellNatives();
 
 	const usePersistentShell = options?.oneShot !== true;
 	const sessionKey = buildSessionKey(shell, configuredPrefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);

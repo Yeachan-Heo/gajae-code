@@ -1,5 +1,13 @@
-import { encodeSixel } from "@gajae-code/natives";
+import type { encodeSixel as encodeSixelFn } from "@gajae-code/natives";
 import { $env, $pickenv } from "@gajae-code/utils";
+
+type NativeEncodeSixel = typeof encodeSixelFn;
+let nativeEncodeSixel: NativeEncodeSixel | undefined;
+
+function encodeSixelNative(...args: Parameters<NativeEncodeSixel>): ReturnType<NativeEncodeSixel> {
+	nativeEncodeSixel ??= (require("@gajae-code/natives") as { encodeSixel: NativeEncodeSixel }).encodeSixel;
+	return nativeEncodeSixel(...args);
+}
 
 export enum ImageProtocol {
 	Kitty = "\x1b_G",
@@ -834,7 +842,7 @@ export function renderImage(
 			const targetWidthPx = Math.max(1, fit.columns * cellDims.widthPx);
 			const targetHeightPx = Math.max(1, fit.rows * cellDims.heightPx);
 			const decoded = new Uint8Array(Buffer.from(base64Data, "base64"));
-			const sequence = encodeSixel(decoded, targetWidthPx, targetHeightPx);
+			const sequence = encodeSixelNative(decoded, targetWidthPx, targetHeightPx);
 			return { sequence, rows: fit.rows };
 		} catch {
 			return null;

@@ -1,7 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import * as natives from "@gajae-code/natives";
+import type * as natives from "@gajae-code/natives";
+
+let findNativesLoad: Promise<typeof import("@gajae-code/natives")> | undefined;
+
+async function findNatives(): Promise<typeof import("@gajae-code/natives")> {
+	findNativesLoad ??= Promise.resolve(require("@gajae-code/natives") as typeof import("@gajae-code/natives"));
+	return await findNativesLoad;
+}
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { isEnoent, prompt, untilAborted } from "@gajae-code/utils";
@@ -158,6 +165,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				const resource = await internalRouter.resolve(rawPattern, {
 					cwd: this.session.cwd,
 					getArtifactsDir: this.session.getArtifactsDir,
+					mcpManager: this.session.getMcpManager?.(),
 					getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 				});
 				if (!resource.sourcePath) {
@@ -205,11 +213,12 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			const timeoutMs = Math.min(MAX_GLOB_TIMEOUT_MS, Math.max(MIN_GLOB_TIMEOUT_MS, requestedTimeoutMs));
 			const timeoutSignal = AbortSignal.timeout(timeoutMs);
 			const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+			const nativeBindings = await findNatives();
 			const formatMatchPath = (matchPath: string, fileType?: natives.FileType): string => {
 				const hadTrailingSlash = matchPath.endsWith("/") || matchPath.endsWith("\\");
 				const absolutePath = path.isAbsolute(matchPath) ? matchPath : path.resolve(searchPath, matchPath);
 				return formatPathRelativeToCwd(absolutePath, this.session.cwd, {
-					trailingSlash: fileType === natives.FileType.Dir || hadTrailingSlash,
+					trailingSlash: fileType === nativeBindings.FileType.Dir || hadTrailingSlash,
 				});
 			};
 
@@ -335,11 +344,11 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 
 			const doGlob = async (useGitignore: boolean) =>
 				untilAborted(combinedSignal, () =>
-					natives.glob(
+					nativeBindings.glob(
 						{
 							pattern: globPattern,
 							path: searchPath,
-							fileType: natives.FileType.File,
+							fileType: nativeBindings.FileType.File,
 							hidden: includeHidden,
 							maxResults: effectiveLimit,
 							sortByMtime: true,

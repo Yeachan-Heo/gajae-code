@@ -2,8 +2,8 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent } from "@gajae-code/ai";
-import { glob, type SummaryResult, summarizeCode } from "@gajae-code/natives";
+import type { ImageContent, TextContent } from "@gajae-code/ai/core";
+import type { glob as globFn, SummaryResult, summarizeCode as summarizeCodeFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { getRemoteDir, logger, prompt, readImageMetadata, untilAborted } from "@gajae-code/utils";
@@ -95,6 +95,14 @@ import {
 } from "./sqlite-reader";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
+
+type NativeReadBindings = Pick<typeof import("@gajae-code/natives"), "glob" | "summarizeCode">;
+let nativeReadBindingsLoad: Promise<NativeReadBindings> | undefined;
+
+async function nativeRead(): Promise<NativeReadBindings> {
+	nativeReadBindingsLoad ??= Promise.resolve(require("@gajae-code/natives") as NativeReadBindings);
+	return await nativeReadBindingsLoad;
+}
 
 // Document types converted to markdown via markit.
 const CONVERTIBLE_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".rtf", ".epub"]);
@@ -1153,6 +1161,7 @@ async function findUniqueSuffixMatch(
 	const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
 	let matches: string[];
+	const { glob } = await nativeRead();
 	try {
 		const result = await untilAborted(combinedSignal, () =>
 			glob({
@@ -2399,6 +2408,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			throwIfAborted(signal);
 			if (countTextLines(code) > MAX_SUMMARY_LINES) return null;
 
+			const summarizeCode = (await nativeRead()).summarizeCode;
 			return summarizeCode({
 				code,
 				path: absolutePath,
@@ -3416,6 +3426,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 			settings: this.session.settings,
 			signal,
+			mcpManager: this.session.getMcpManager?.(),
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
 

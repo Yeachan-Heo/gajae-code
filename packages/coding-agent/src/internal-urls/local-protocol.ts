@@ -3,12 +3,25 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { exactRemoveDirectoryTree, type NativeDirectoryTreeSnapshot, snapshotDirectoryTree } from "@gajae-code/natives";
+
+import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { isEnoent } from "@gajae-code/utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+
+type NativeLocalBindings = Pick<typeof import("@gajae-code/natives"), "exactRemoveDirectoryTree" | "snapshotDirectoryTree">;
+
+let nativeLocalBindings: NativeLocalBindings | undefined;
+
+
+function nativeLocal(): NativeLocalBindings {
+	if (!nativeLocalBindings) {
+		nativeLocalBindings = require("@gajae-code/natives") as NativeLocalBindings;
+	}
+	return nativeLocalBindings;
+}
 
 export interface ManagedLegacyLocalMigrationEntry {
 	readonly relativePath: string;
@@ -323,7 +336,7 @@ async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEnt
 	if (root?.relativePath !== "") throw new Error("Legacy local:// migration manifest has no root");
 	const before = await fs.lstat(legacyRoot, { bigint: true });
 	if (!matchesSnapshot(before, root)) throw new Error("Legacy local:// migration source changed during retirement");
-	const captured = snapshotDirectoryTree(legacyRoot);
+	const captured = nativeLocal().snapshotDirectoryTree(legacyRoot);
 	if (!captured.ok || !captured.snapshot) {
 		throw new Error(`Legacy local:// migration retirement snapshot failed: ${captured.code ?? "unknown"}`);
 	}
@@ -343,7 +356,7 @@ async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEnt
 			throw new Error("Legacy local:// migration retirement authority differs from copied manifest");
 		}
 	}
-	const removed = exactRemoveDirectoryTree(legacyRoot, captured.snapshot);
+	const removed = nativeLocal().exactRemoveDirectoryTree(legacyRoot, captured.snapshot);
 	if (!removed.ok) throw new Error(`Legacy local:// migration retirement failed: ${removed.code}`);
 }
 async function migrateManagedLegacyLocal(

@@ -1,14 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Effort } from "@gajae-code/ai";
-import {
-	detectMacOSAppearance,
-	MacAppearanceObserver,
-	type HighlightColors as NativeHighlightColors,
-	highlightCode as nativeHighlightCode,
-	supportsLanguage as nativeSupportsLanguage,
-} from "@gajae-code/natives";
+import type { Effort } from "@gajae-code/ai/core";
 import type { EditorTheme, MarkdownTheme, SelectListTheme, SymbolTheme } from "@gajae-code/tui";
 import { adjustHsv, getCustomThemesDir, isEnoent, logger } from "@gajae-code/utils";
 import chalk from "chalk";
@@ -17,6 +10,43 @@ import * as z from "zod/v4";
 import { defaultThemes } from "./defaults";
 import { resolveMermaidAscii } from "./mermaid-cache";
 
+type NativeHighlightColors = {
+	comment: string;
+	keyword: string;
+	function: string;
+	variable: string;
+	string: string;
+	number: string;
+	type: string;
+	operator: string;
+	punctuation: string;
+	inserted: string;
+	deleted: string;
+};
+
+type NativeThemeBindings = {
+	detectMacOSAppearance: () => "dark" | "light" | undefined;
+	MacAppearanceObserver: { start(callback: (error: Error | null, appearance: string) => void): { stop(): void } };
+	highlightCode: (code: string, language: string | undefined, colors: NativeHighlightColors) => string;
+	supportsLanguage: (language: string) => boolean;
+};
+
+let nativeThemeBindings: NativeThemeBindings | undefined;
+let nativeThemeBindingsLoad: Promise<void> | undefined;
+
+function loadNativeThemeBindings(): void {
+	if (nativeThemeBindings || nativeThemeBindingsLoad) return;
+	nativeThemeBindingsLoad = Promise.resolve()
+		.then(() => {
+			nativeThemeBindings = require("@gajae-code/natives") as unknown as NativeThemeBindings;
+		})
+		.catch(error => {
+			logger.warn("Native theme bindings unavailable", { error: String(error) });
+		})
+		.finally(() => {
+			nativeThemeBindingsLoad = undefined;
+		});
+}
 export { getLanguageFromPath } from "../../utils/lang-from-path";
 
 // ============================================================================
@@ -1746,10 +1776,9 @@ function detectTerminalBackground(): "dark" | "light" {
 		}
 	}
 
-	// Tier 3: host macOS appearance for known-broken terminal paths only.
-	if (shouldUseMacOSAppearanceFallback()) {
-		const macAppearance = macOSReportedAppearance ?? detectMacOSAppearance();
-		if (macAppearance) return macAppearance;
+	// Tier 3: host macOS appearance is loaded only when the watcher is enabled.
+	if (shouldUseMacOSAppearanceFallback() && macOSReportedAppearance) {
+		return macOSReportedAppearance;
 	}
 
 	return "dark";
@@ -1783,6 +1812,7 @@ var sigwinchHandler: (() => void) | undefined;
 var autoDetectedTheme: boolean = false;
 var autoDarkTheme: string = "red-claw";
 var autoLightTheme: string = "blue-crab";
+var syntaxHighlightingEnabledState = true;
 var onThemeChangeCallback: (() => void) | undefined;
 var themeLoadRequestId: number = 0;
 var previewThemeActive: boolean = false;
@@ -1800,20 +1830,29 @@ export async function initTheme(
 	colorBlindMode?: boolean,
 	darkTheme?: string,
 	lightTheme?: string,
+	syntaxHighlightingEnabled: boolean = true,
 ): Promise<void> {
 	autoDetectedTheme = true;
 	autoDarkTheme = darkTheme ?? "red-claw";
 	autoLightTheme = lightTheme ?? "blue-crab";
+	if (enableWatcher && shouldUseMacOSAppearanceFallback()) {
+		loadNativeThemeBindings();
+		await (nativeThemeBindingsLoad ?? Promise.resolve());
+		if (nativeThemeBindings) {
+			macOSReportedAppearance = nativeThemeBindings.detectMacOSAppearance() ?? undefined;
+		}
+	}
 	const name = getDefaultTheme();
 	previewThemeActive = false;
 	currentThemeName = name;
 	currentSymbolPresetOverride = symbolPreset;
 	currentColorBlindMode = colorBlindMode ?? false;
+	syntaxHighlightingEnabledState = syntaxHighlightingEnabled;
 	try {
 		theme = await loadTheme(name, getCurrentThemeOptions());
 		if (enableWatcher) {
 			await startThemeWatcher();
-			startSigwinchListener();
+			await startSigwinchListener();
 		}
 	} catch (err) {
 		logger.debug("Theme loading failed, falling back to red-claw theme", { error: String(err) });
@@ -2119,12 +2158,16 @@ function reevaluateAutoTheme(debugLabel: string): void {
 
 var macObserver: { stop(): void } | undefined;
 
-function startMacAppearanceObserver(): void {
+async function startMacAppearanceObserver(): Promise<void> {
 	stopMacAppearanceObserver();
 	if (!shouldUseMacOSAppearanceFallback()) return;
+	loadNativeThemeBindings();
+	const ready = nativeThemeBindingsLoad ?? Promise.resolve();
+	await ready;
+	if (!shouldUseMacOSAppearanceFallback() || !nativeThemeBindings) return;
 	try {
-		macOSReportedAppearance = detectMacOSAppearance() ?? undefined;
-		macObserver = MacAppearanceObserver.start((err, appearance) => {
+		macOSReportedAppearance = nativeThemeBindings.detectMacOSAppearance() ?? undefined;
+		macObserver = nativeThemeBindings.MacAppearanceObserver.start((err, appearance) => {
 			if (!err && (appearance === "dark" || appearance === "light")) {
 				macOSReportedAppearance = appearance;
 				reevaluateAutoTheme("macOS fallback");
@@ -2148,13 +2191,13 @@ function stopMacAppearanceObserver(): void {
 // ============================================================================
 
 /** Re-check appearance on SIGWINCH and switch dark/light when using auto-detected theme. */
-function startSigwinchListener(): void {
+async function startSigwinchListener(): Promise<void> {
 	stopSigwinchListener();
 	sigwinchHandler = () => {
 		reevaluateAutoTheme("SIGWINCH");
 	};
 	process.on("SIGWINCH", sigwinchHandler);
-	startMacAppearanceObserver();
+	await startMacAppearanceObserver();
 }
 
 function stopSigwinchListener(): void {
@@ -2362,9 +2405,13 @@ function getHighlightColors(t: Theme): NativeHighlightColors {
  * Returns array of highlighted lines.
  */
 export function highlightCode(code: string, lang?: string): string[] {
-	const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
+	if (!syntaxHighlightingEnabledState) return code.split("\n");
+	const bindings = nativeThemeBindings;
+	loadNativeThemeBindings();
+	const validLang = bindings && lang && bindings.supportsLanguage(lang) ? lang : undefined;
+	if (!bindings) return code.split("\n");
 	try {
-		return nativeHighlightCode(code, validLang, getHighlightColors(theme)).split("\n");
+		return bindings.highlightCode(code, validLang, getHighlightColors(theme)).split("\n");
 	} catch {
 		return code.split("\n");
 	}
@@ -2410,9 +2457,13 @@ export function getMarkdownTheme(): MarkdownTheme {
 		symbols: getSymbolTheme(),
 		resolveMermaidAscii,
 		highlightCode: (code: string, lang?: string): string[] => {
-			const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
+			if (!syntaxHighlightingEnabledState) return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
+			const bindings = nativeThemeBindings;
+			loadNativeThemeBindings();
+			const validLang = bindings && lang && bindings.supportsLanguage(lang) ? lang : undefined;
+			if (!bindings) return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
 			try {
-				return nativeHighlightCode(code, validLang, getHighlightColors(theme)).split("\n");
+				return bindings.highlightCode(code, validLang, getHighlightColors(theme)).split("\n");
 			} catch {
 				return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
 			}

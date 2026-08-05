@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { type GrepMatch, GrepOutputMode, type GrepResult, grep } from "@gajae-code/natives";
+import type { GrepMatch, GrepOutputMode as NativeGrepOutputMode, GrepResult, grep as grepFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";
@@ -37,6 +37,14 @@ import {
 } from "./render-utils";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+
+type GrepOutputMode = NativeGrepOutputMode;
+let searchNativesLoad: Promise<{ GrepOutputMode: typeof import("@gajae-code/natives")["GrepOutputMode"]; grep: typeof grepFn }> | undefined;
+
+async function searchNatives(): Promise<{ GrepOutputMode: typeof import("@gajae-code/natives")["GrepOutputMode"]; grep: typeof grepFn }> {
+	searchNativesLoad ??= Promise.resolve(require("@gajae-code/natives") as { GrepOutputMode: typeof import("@gajae-code/natives")["GrepOutputMode"]; grep: typeof grepFn });
+	return await searchNativesLoad;
+}
 
 const searchSchema = z
 	.object({
@@ -287,6 +295,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					rawPaths: resolvedPaths,
 					cwd: this.session.cwd,
 					getArtifactsDir: this.session.getArtifactsDir,
+					mcpManager: this.session.getMcpManager?.(),
 					getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 					internalUrlAction: "search",
 					trackImmutableSources: true,
@@ -313,6 +322,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const baseDisplayMode = resolveFileDisplayMode(this.session);
 				const immutableDisplayMode = resolveFileDisplayMode(this.session, { immutable: true });
 
+				const { GrepOutputMode, grep } = await searchNatives();
 				const effectiveOutputMode = GrepOutputMode.Content;
 				// Multi-scope = more than one file may match. We fetch up to
 				// INTERNAL_TOTAL_CAP matches from native grep, then in JS group by

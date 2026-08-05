@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Process } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
 import { lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
@@ -94,7 +94,7 @@ function commandDigest(command: readonly string[]): string {
 }
 async function managedOwnerProcessProvenance(pid: number): Promise<string | null> {
 	if (process.platform === "linux") return await readLinuxProcStartTime(pid);
-	return Process.fromPid(pid)?.incarnation ?? null;
+	return nativeProcessBindings().Process.fromPid(pid)?.incarnation ?? null;
 }
 
 async function writeDurableExclusive(file: string, value: object): Promise<void> {
@@ -163,7 +163,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	});
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) throw new Error("managed_owner_child_start_time_unavailable");
-	const childProcess = Process.fromPid(child.pid);
+	const childProcess = nativeProcessBindings().Process.fromPid(child.pid);
 	if (!childProcess) throw new Error("managed_owner_child_reference_unavailable");
 	if (process.platform === "linux" && childProcess.incarnation !== `linux:${childStartTime}`)
 		throw new Error("managed_owner_child_incarnation_mismatch");

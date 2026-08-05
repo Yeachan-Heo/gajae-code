@@ -19,7 +19,16 @@
  * `pi_shell::fixup`, driven by the real `brush-parser` AST. This module is a
  * thin sync wrapper plus user-facing notice formatting.
  */
-import { applyBashFixups as nativeApplyBashFixups } from "@gajae-code/natives";
+
+import type { applyBashFixups as applyBashFixupsFn } from "@gajae-code/natives";
+
+let nativeApplyBashFixups: typeof applyBashFixupsFn | undefined;
+
+
+function applyBashFixupsNative(command: string): ReturnType<typeof applyBashFixupsFn> {
+	nativeApplyBashFixups ??= (require("@gajae-code/natives") as { applyBashFixups: typeof applyBashFixupsFn }).applyBashFixups;
+	return nativeApplyBashFixups(command);
+}
 
 export interface BashFixupResult {
 	/** Possibly-rewritten command. */
@@ -33,5 +42,5 @@ export interface BashFixupResult {
  * or no-op transform, returns the input verbatim with `stripped: []`.
  */
 export function applyBashFixups(command: string): BashFixupResult {
-	return nativeApplyBashFixups(command);
+	return applyBashFixupsNative(command);
 }

@@ -1,10 +1,16 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { openRecoveryFsRoot } from "@gajae-code/natives";
 import type { ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
 import { sessionStateDir, sessionUltragoalDir } from "./session-layout";
 import { appendJsonlIdempotent, writeJsonAtomic } from "./state-writer";
+
+let recoveryFsRootLoad: Promise<typeof import("@gajae-code/natives")["openRecoveryFsRoot"]> | undefined;
+
+async function openRecoveryFsRootNative(): Promise<typeof import("@gajae-code/natives")["openRecoveryFsRoot"]> {
+	recoveryFsRootLoad ??= Promise.resolve((require("@gajae-code/natives") as { openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] }).openRecoveryFsRoot);
+	return await recoveryFsRootLoad;
+}
 
 /** Immutable identity supplied by the owner-loss monitor and coordinator admission. */
 export interface UltragoalRecoveryBinding {
@@ -134,7 +140,7 @@ async function readRecoveryFile(root: string, candidate: string): Promise<string
 	const relative = safeRelativePath(path.resolve(root), path.resolve(candidate));
 	if (!relative) return null;
 	try {
-		const authority = openRecoveryFsRoot(root);
+		const authority = (await openRecoveryFsRootNative())(root);
 		try {
 			const result = authority.read(relative, 4 * 1024 * 1024);
 			return result.ok && result.data ? new TextDecoder().decode(result.data) : null;

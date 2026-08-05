@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import { FileType, glob } from "@gajae-code/natives";
+import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
@@ -19,6 +19,25 @@ import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import type { ForkContextPolicy } from "../task/types";
 import { parseThinkingLevel } from "../thinking";
+
+type DiscoveryNativeModule = {
+	FileType: typeof FileTypeEnum;
+	glob: typeof globFn;
+};
+
+let discoveryNativeModule: DiscoveryNativeModule | undefined;
+let discoveryNativeLoad: Promise<DiscoveryNativeModule> | undefined;
+
+async function discoveryNatives(): Promise<DiscoveryNativeModule> {
+	if (discoveryNativeModule) return discoveryNativeModule;
+	discoveryNativeLoad ??= Promise.resolve(
+		((require("@gajae-code/natives") as { FileType: typeof FileTypeEnum; glob: typeof globFn })),
+	).then(mod => {
+		discoveryNativeModule = { FileType: mod.FileType, glob: mod.glob };
+		return discoveryNativeModule;
+	});
+	return await discoveryNativeLoad;
+}
 
 /**
  * Standard paths for each config source.
@@ -312,10 +331,11 @@ function parseForkContextPolicy(value: unknown): ForkContextPolicy | undefined {
 async function globIf(
 	dir: string,
 	pattern: string,
-	fileType: FileType,
+	fileType: FileTypeEnum,
 	recursive: boolean = true,
 ): Promise<Array<{ path: string }>> {
 	try {
+		const { glob } = await discoveryNatives();
 		const result = await glob({ pattern, path: dir, gitignore: true, hidden: false, fileType, recursive });
 		return result.matches;
 	} catch {
@@ -340,6 +360,37 @@ export function compareSkillOrder(aName: string, aPath: string, bName: string, b
 	return cmp(aPath, bPath);
 }
 
+/** Maximum bytes read per incremental frontmatter scan chunk. */
+export const SKILL_FRONTMATTER_SCAN_BYTES = 4 * 1024;
+/** Maximum total bytes read while seeking the frontmatter closing delimiter. */
+export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
+
+async function readSkillFrontmatter(skillPath: string): Promise<SkillFrontmatter | null> {
+	const file = Bun.file(skillPath);
+	const size = (await fs.promises.stat(skillPath)).size;
+	const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
+	let offset = 0;
+	let prefix = "";
+	const decoder = new TextDecoder();
+	while (offset < scanLimit) {
+		const end = Math.min(offset + SKILL_FRONTMATTER_SCAN_BYTES, scanLimit);
+		const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+		const chunk = decoder.decode(bytes, { stream: end < scanLimit });
+		if (!chunk) break;
+		prefix += chunk;
+		offset = end;
+
+		const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
+		if (!opening) return null;
+		const afterOpening = prefix.slice(opening[0].length);
+		const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
+		if (!closing || closing.index === undefined) continue;
+		const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
+		return parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter;
+	}
+	return null;
+}
+
 export async function scanSkillsFromDir(
 	_ctx: LoadContext,
 	options: ScanSkillsFromDirOptions,
@@ -359,22 +410,25 @@ export async function scanSkillsFromDir(
 	}
 	const loadSkill = async (skillPath: string) => {
 		try {
-			const content = await readFile(skillPath);
-			if (!content) return;
-			const { frontmatter, body } = parseFrontmatter(content, { source: skillPath });
-			if (frontmatter.enabled === false) {
+			const frontmatter = await readSkillFrontmatter(skillPath);
+			if (!frontmatter) {
+				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
+					warnings.push(`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`);
+				}
 				return;
 			}
-			if (requireDescription && !frontmatter.description) {
-				return;
-			}
+			if (frontmatter.enabled === false) return;
+			if (requireDescription && !frontmatter.description) return;
 			const skillDirName = path.basename(path.dirname(skillPath));
 			const rawName = frontmatter.name;
 			const name = typeof rawName === "string" ? rawName.trim() || skillDirName : skillDirName;
 			items.push({
 				name,
 				path: skillPath,
-				content: body,
+				loadContent: async () => {
+					const content = await Bun.file(skillPath).text();
+					return parseFrontmatter(content, { source: skillPath }).body;
+				},
 				frontmatter: frontmatter as SkillFrontmatter,
 				level,
 				_source: createSourceMeta(providerId, skillPath, level),
@@ -468,6 +522,7 @@ export async function loadFilesFromDir<T>(
 	// Use native glob for fast scanning with gitignore support
 	let matches: Array<{ path: string }>;
 	try {
+		const { glob, FileType } = await discoveryNatives();
 		const result = await glob({
 			pattern,
 			path: dir,
@@ -554,6 +609,7 @@ async function readExtensionModuleManifest(
  */
 export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: string): Promise<string[]> {
 	const discovered = new Set<string>();
+	const { FileType } = await discoveryNatives();
 	// Find all candidate files in parallel using glob
 	const [directFiles, indexFiles, packageJsonFiles] = await Promise.all([
 		// 1. Direct *.ts or *.js files
