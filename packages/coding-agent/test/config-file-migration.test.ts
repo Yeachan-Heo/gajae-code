@@ -97,6 +97,22 @@ describe("legacy JSON to YAML config migration", () => {
 		expect(trace).toEqual(["open", "write", "chmod", "temp fsync", "close", "renameNoReplacePath", "parent fsync"]);
 		expect(tempInventory()).toEqual([]);
 	});
+	it("uses the descriptor-observed source mode rather than the pathname snapshot", () => {
+		const originalLstat = fs.lstatSync.bind(fs);
+		vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike) => {
+			const stats = originalLstat(file);
+			if (file === jsonPath) {
+				Object.defineProperty(stats, "mode", {
+					value: (stats.mode & ~0o777) | 0o777,
+				});
+			}
+			return stats;
+		}) as typeof fs.lstatSync);
+
+		migrateJsonToYml(jsonPath, ymlPath);
+
+		expect(fs.statSync(ymlPath).mode & 0o777).toBe(0o640);
+	});
 
 	it("never overwrites an existing YAML file or follows a YAML symlink", () => {
 		fs.writeFileSync(ymlPath, "winner: existing\n");
@@ -146,7 +162,7 @@ describe("legacy JSON to YAML config migration", () => {
 		expect(tempInventory()).toEqual([]);
 	});
 
-	it("fails closed on certified atomic unavailability and malformed outcomes", () => {
+	it("cleans certified non-commits but retains malformed publication outcomes", () => {
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const publish = vi
 			.spyOn(native, "renameNoReplacePath")
@@ -160,9 +176,51 @@ describe("legacy JSON to YAML config migration", () => {
 		migrateJsonToYml(jsonPath, ymlPath);
 		expect(fs.existsSync(ymlPath)).toBe(false);
 		expect(fs.existsSync(jsonPath)).toBe(true);
-		expect(tempInventory()).toEqual([]);
+		expect(tempInventory()).toHaveLength(1);
 		expect(publish).toHaveBeenCalledTimes(2);
 		expect(warning).toHaveBeenCalledTimes(2);
+	});
+	it("retains its identity-bound temp when publication throws and emits sanitized stage/code evidence", () => {
+		const error = new Error(`secret=${JSON.stringify(sourceValue)} path=${jsonPath}`) as NodeJS.ErrnoException;
+		error.code = "EIO";
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation(() => {
+			throw error;
+		});
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		migrateJsonToYml(jsonPath, ymlPath);
+
+		expect(fs.existsSync(ymlPath)).toBe(false);
+		expect(fs.existsSync(jsonPath)).toBe(true);
+		expect(tempInventory()).toHaveLength(1);
+		expect(warning).toHaveBeenCalledTimes(1);
+		expect(warning.mock.calls[0]?.[1]).toEqual({
+			outcomeCode: "migration_failed",
+			stage: "publication",
+			errorCode: "EIO",
+			errorMessage: "Legacy config migration was not proven durable.",
+		});
+		const logged = JSON.stringify(warning.mock.calls);
+		expect(logged).not.toContain(directory);
+		expect(logged).not.toContain("dark");
+	});
+	it("bounds malformed publication diagnostic evidence without deleting the temp", () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		vi.spyOn(native, "renameNoReplacePath").mockReturnValue({
+			phase: "\u001b[31mrename",
+			code: "x".repeat(1_000),
+		} as NativeNoReplaceResult);
+
+		migrateJsonToYml(jsonPath, ymlPath);
+
+		expect(tempInventory()).toHaveLength(1);
+		expect(warning.mock.calls[0]?.[1]).toEqual({
+			outcomeCode: "publication_outcome_indeterminate",
+			stage: "publication",
+			errorCode: "unknown",
+			errorMessage: "Legacy config migration was not proven durable.",
+		});
+		expect(JSON.stringify(warning.mock.calls)).not.toContain("\u001b");
 	});
 	it("never rolls back a committed publication reported with a failure disposition", () => {
 		const originalPublish = native.renameNoReplacePath.bind(native);

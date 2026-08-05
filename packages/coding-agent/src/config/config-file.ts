@@ -22,18 +22,37 @@ function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
-function warningDetails(outcomeCode: string, error?: unknown): Record<string, string> {
-	const rawName = error instanceof Error ? error.name : "";
-	const errorName = /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(rawName) ? rawName : "Error";
+const EVIDENCE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
+
+function sanitizeEvidence(value: unknown, fallback: string): string {
+	return typeof value === "string" && EVIDENCE_TOKEN.test(value) ? value : fallback;
+}
+
+function readEvidence(value: unknown, property: string, fallback: string): string {
+	try {
+		if ((typeof value !== "object" && typeof value !== "function") || value === null) return fallback;
+		return sanitizeEvidence(Reflect.get(value, property), fallback);
+	} catch {
+		return fallback;
+	}
+}
+
+function warningDetails(
+	outcomeCode: string,
+	stage: string,
+	error?: unknown,
+	errorCode?: unknown,
+): Record<string, string> {
 	return {
-		outcomeCode,
-		errorName,
+		outcomeCode: sanitizeEvidence(outcomeCode, "unknown"),
+		stage: sanitizeEvidence(stage, "unknown"),
+		errorCode: sanitizeEvidence(errorCode, readEvidence(error, "code", "unknown")),
 		errorMessage: "Legacy config migration was not proven durable.",
 	};
 }
 
-function warnMigration(outcomeCode: string, error?: unknown): void {
-	logger.warn("migrateJsonToYml: migration not completed", warningDetails(outcomeCode, error));
+function warnMigration(outcomeCode: string, stage: string, error?: unknown, errorCode?: unknown): void {
+	logger.warn("migrateJsonToYml: migration not completed", warningDetails(outcomeCode, stage, error, errorCode));
 }
 
 function isStructuredPublishOutcome(value: NativeNoReplaceResult): boolean {
@@ -120,14 +139,15 @@ export function migrateJsonToYml(jsonPath: string, ymlPath: string): void {
 	let tempIdentity: FileIdentity | undefined;
 	let tempFd: number | undefined;
 	let publicationCommitted = false;
-
+	let cleanupTemp = true;
+	let stage = "destination_identity";
 	try {
 		try {
 			fs.lstatSync(ymlPath);
 			return;
 		} catch (error) {
 			if (!isEnoent(error)) {
-				warnMigration("destination_identity_failed", error);
+				warnMigration("destination_identity_failed", stage, error);
 				return;
 			}
 		}
@@ -136,78 +156,105 @@ export function migrateJsonToYml(jsonPath: string, ymlPath: string): void {
 		try {
 			source = fs.lstatSync(jsonPath);
 		} catch (error) {
-			if (!isEnoent(error)) warnMigration("source_identity_failed", error);
+			if (!isEnoent(error)) warnMigration("source_identity_failed", "source_identity", error);
 			return;
 		}
 		if (!source.isFile() || source.isSymbolicLink()) {
-			warnMigration("source_not_regular");
+			warnMigration("source_not_regular", "source_identity");
 			return;
 		}
 
 		const noFollow = fs.constants.O_NOFOLLOW;
 		if (typeof noFollow !== "number" || noFollow === 0) {
-			warnMigration("no_follow_unsupported");
+			warnMigration("no_follow_unsupported", "source_open");
 			return;
 		}
+		stage = "source_open";
 
 		const sourceFd = fs.openSync(jsonPath, fs.constants.O_RDONLY | noFollow);
 		let content: string | undefined;
+		let sourceMode: number | undefined;
 		try {
 			const openedSource = fs.fstatSync(sourceFd);
 			if (openedSource.isFile() && sameIdentity(source, openedSource)) {
+				sourceMode = openedSource.mode & 0o777;
 				content = fs.readFileSync(sourceFd, "utf8");
 			}
 		} finally {
 			fs.closeSync(sourceFd);
 		}
-		if (content === undefined) {
-			warnMigration("source_identity_changed");
+		if (content === undefined || sourceMode === undefined) {
+			warnMigration("source_identity_changed", "source_read");
 			return;
 		}
 
 		const parsed = JSON.parse(content);
 		if (!parsed) {
-			warnMigration("invalid_json_structure");
+			warnMigration("invalid_json_structure", "source_parse");
 			return;
 		}
 		const bytes = Buffer.from(YAML.stringify(parsed, null, 2), "utf8");
 
+		stage = "temp_create";
 		tempPath = path.join(path.dirname(ymlPath), `.${path.basename(ymlPath)}.${randomUUID()}.tmp`);
 		tempFd = fs.openSync(
 			tempPath,
 			fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
-			source.mode & 0o777,
+			sourceMode,
 		);
 		const openedTemp = fs.fstatSync(tempFd);
 		if (!openedTemp.isFile()) throw new Error("Config migration temp is not a regular file");
 		tempIdentity = openedTemp;
+		stage = "temp_write";
 		writeFully(tempFd, bytes);
-		fs.fchmodSync(tempFd, source.mode & 0o777);
+		fs.fchmodSync(tempFd, sourceMode);
+		stage = "temp_sync";
 		fs.fsyncSync(tempFd);
 		fs.closeSync(tempFd);
 		tempFd = undefined;
 
+		stage = "publication";
 		const publication = native.renameNoReplacePath(tempPath, ymlPath);
 		if (isCommittedPublishOutcome(publication)) {
 			publicationCommitted = true;
 			try {
+				stage = "parent_sync";
 				syncParentDirectory(ymlPath);
 			} catch (error) {
-				warnMigration("published_parent_sync_failed", error);
+				warnMigration("published_parent_sync_failed", stage, error);
 				return;
 			}
-			if (!publication.ok) warnMigration("published_outcome_not_proven");
+			if (!publication.ok) {
+				warnMigration(
+					"published_outcome_not_proven",
+					readEvidence(publication, "phase", "publication"),
+					undefined,
+					readEvidence(publication, "code", "unknown"),
+				);
+			}
 			return;
 		}
 		if (isCertifiedNonCommit(publication)) {
 			if (publication.reason !== "destination_exists") {
-				warnMigration(`not_committed_${publication.reason}`);
+				warnMigration(
+					`not_committed_${publication.reason}`,
+					readEvidence(publication, "phase", "publication"),
+					undefined,
+					readEvidence(publication, "code", "unknown"),
+				);
 			}
 			return;
 		}
-		warnMigration("publication_outcome_indeterminate");
+		cleanupTemp = false;
+		warnMigration(
+			"publication_outcome_indeterminate",
+			readEvidence(publication, "phase", "publication"),
+			undefined,
+			readEvidence(publication, "code", "unknown"),
+		);
 	} catch (error) {
-		warnMigration("migration_failed", error);
+		if (stage === "publication") cleanupTemp = false;
+		warnMigration("migration_failed", stage, error);
 	} finally {
 		if (tempFd !== undefined) {
 			try {
@@ -216,7 +263,7 @@ export function migrateJsonToYml(jsonPath: string, ymlPath: string): void {
 				// The identity check below remains authoritative for cleanup.
 			}
 		}
-		if (!publicationCommitted && tempPath) removeCertifiedTemp(tempPath, tempIdentity);
+		if (!publicationCommitted && cleanupTemp && tempPath) removeCertifiedTemp(tempPath, tempIdentity);
 	}
 }
 
