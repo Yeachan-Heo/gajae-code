@@ -815,7 +815,16 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 	let root: string;
 	let leaveReceiptPlaceholder = false;
 
-	const snapshot = (pathname: string) => {
+	type ReceiptTestSnapshot = {
+		dev: string;
+		ino: string;
+		nlink: string;
+		size: string;
+		mtimeNs: string;
+		ctimeNs: string;
+		sha256: string;
+	};
+	const snapshot = (pathname: string): ReceiptTestSnapshot => {
 		const stat = fs.lstatSync(pathname, { bigint: true });
 		return {
 			dev: stat.dev.toString(),
@@ -827,12 +836,12 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 			sha256: createHash("sha256").update(fs.readFileSync(pathname)).digest("hex"),
 		};
 	};
-	const receiptPath = (predecessor: ReturnType<typeof snapshot>, receipt: ReturnType<typeof snapshot>) =>
+	const receiptPath = (predecessor: ReceiptTestSnapshot, receipt: ReceiptTestSnapshot) =>
 		path.join(
 			root,
 			`.gjc-replace-cleanup-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}-receipt-${BigInt(receipt.dev).toString(16)}-${BigInt(receipt.ino).toString(16)}.json`,
 		);
-	const publishReceipt = (predecessor: ReturnType<typeof snapshot>, contents: string) => {
+	const publishReceipt = (predecessor: ReceiptTestSnapshot, contents: string) => {
 		const pending = path.join(root, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
 		fs.writeFileSync(pending, contents);
 		const receiptIdentity = snapshot(pending);
@@ -840,7 +849,7 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 		fs.renameSync(pending, receipt);
 		return { receipt, receiptIdentity };
 	};
-	const receiptQuarantine = (receipt: ReturnType<typeof snapshot>, predecessor: ReturnType<typeof snapshot>) =>
+	const receiptQuarantine = (receipt: ReceiptTestSnapshot, predecessor: ReceiptTestSnapshot) =>
 		path.join(
 			root,
 			`.gjc-receipt-remove-${BigInt(receipt.dev).toString(16)}-${BigInt(receipt.ino).toString(16)}-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}`,
@@ -857,7 +866,6 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 			const stat = fs.lstatSync(pathname, { bigint: true });
 			const sha256 = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
 			if (
-				!expected.detachOnly ||
 				expected.directory ||
 				!expected.quarantineName ||
 				!stat.isFile() ||
@@ -872,7 +880,7 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 				return { ok: false, code: "identity_mismatch" };
 			const detachedPath = path.join(root, expected.quarantineName);
 			fs.renameSync(pathname, detachedPath);
-			if (leaveReceiptPlaceholder) {
+			if (expected.detachOnly && leaveReceiptPlaceholder) {
 				leaveReceiptPlaceholder = false;
 				fs.writeFileSync(pathname, "");
 				return { ok: false, code: "cleanup_pending", detachedPath, retainedPlaceholderPath: pathname };
@@ -914,6 +922,25 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 		expect(fs.readFileSync(path.join(root, "receipt-detached"), "utf8")).toBe("trigger\n");
 	});
 
+	it("reconciles an exchange placeholder left by an interrupted receipt cleanup", () => {
+		vi.restoreAllMocks();
+		const predecessorPath = path.join(root, "predecessor-real-native");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt, receiptIdentity } = publishReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const firstQuarantine = receiptQuarantine(receiptIdentity, predecessor);
+		fs.renameSync(receipt, firstQuarantine);
+		fs.writeFileSync(receipt, "");
+
+		replay("placeholder-real-native");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.readFileSync(firstQuarantine, "utf8")).toContain("advisory");
+		expect(fs.existsSync(path.join(root, "placeholder-real-native"))).toBe(true);
+	});
 	it("recovers a regular-file cleanup placeholder without deleting either quarantined receipt", () => {
 		const predecessorPath = path.join(root, "predecessor");
 		fs.writeFileSync(predecessorPath, "predecessor\n");
@@ -931,13 +958,12 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 		expect(fs.readFileSync(receipt, "utf8")).toBe("");
 		expect(fs.existsSync(firstQuarantine)).toBe(true);
 
-		expect(() => replay("placeholder-second")).toThrow("managed_replace_cleanup_receipt_invalid");
+		replay("placeholder-second");
 
-		expect(fs.lstatSync(receipt).isFile()).toBe(true);
-		expect(fs.readFileSync(receipt, "utf8")).toBe("");
+		expect(fs.existsSync(receipt)).toBe(false);
 		expect(fs.readFileSync(firstQuarantine, "utf8")).toContain("advisory");
 		expect(fs.readFileSync(predecessorPath, "utf8")).toBe("predecessor\n");
-		expect(fs.existsSync(path.join(root, "placeholder-second"))).toBe(false);
+		expect(fs.existsSync(path.join(root, "placeholder-second"))).toBe(true);
 	});
 
 	it("does not let an alias receipt delete the live transcript", () => {
@@ -987,6 +1013,39 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 
 		expect(() => replay("malformed-receipt")).toThrow("managed_replace_cleanup_receipt_invalid");
 		expect(fs.readFileSync(malformed, "utf8")).toBe("receipt");
+	});
+	it("reconciles a legacy version-one cleanup receipt from an earlier release", () => {
+		vi.restoreAllMocks();
+		const predecessorSeed = path.join(root, ".predecessor");
+		const predecessorContents = "predecessor\n";
+		fs.writeFileSync(predecessorSeed, predecessorContents, { mode: 0o600 });
+		const seedIdentity = snapshot(predecessorSeed);
+		const predecessorPath = path.join(
+			root,
+			`.gjc-exact-replace-destination-${BigInt(seedIdentity.dev).toString(16)}-${BigInt(seedIdentity.ino).toString(16)}`,
+		);
+		fs.renameSync(predecessorSeed, predecessorPath);
+		const predecessor = snapshot(predecessorPath);
+		const receipt = path.join(
+			root,
+			`.gjc-replace-cleanup-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}.json`,
+		);
+		fs.writeFileSync(
+			receipt,
+			JSON.stringify({
+				version: 1,
+				predecessor: predecessorPath,
+				successor: path.join(root, "session.jsonl"),
+				identity: predecessor,
+			}),
+			{ mode: 0o600 },
+		);
+
+		replay("legacy-receipt");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "legacy-receipt"))).toBe(true);
+		expect(fs.existsSync(predecessorPath)).toBe(false);
 	});
 });
 describe.skipIf(process.platform !== "linux")("managed native security result validation", () => {

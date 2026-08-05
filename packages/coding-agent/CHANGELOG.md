@@ -23,6 +23,8 @@
 - A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the durable configuration already carries the attempted bot token, chat id, and enabled state. The wording now follows the stored configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own. A commit that was entered and then failed while the stored configuration is also unreadable is reported as undecided, pointing at `notify status`, instead of guessing either outcome (#3761).
 - Continuing a large managed session on Darwin now batches stale OpenAI Responses replay-metadata patches into one transcript append instead of performing one identity-verified whole-file replacement per patch. Interactive startup also renders before exact MCP connection and explicit `--mpreset` activation, gates every provider turn until both are ready, and refreshes models online only after the UI is usable, preventing `gjc -c` from remaining at `GJC warming workspace` with sustained CPU, multi-gigabyte RSS growth, or avoidable network waits (#3793).
 
+- Managed replacement cleanup now migrates version-one receipts from earlier releases and recovers canonical exchange placeholders left by interrupted cleanup, so a stale receipt cannot permanently block the next managed session mutation with `managed_replace_cleanup_receipt_invalid`.
+
 ## [0.12.11] - 2026-08-03
 
 ### Fixed
