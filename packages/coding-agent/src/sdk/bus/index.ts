@@ -121,7 +121,7 @@ import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
-import { createReconciliationStore } from "./reconciliation-store";
+import { createReconciliationStore, type DurableTerminalScopeRecord } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
 import {
@@ -2307,7 +2307,7 @@ function sdkControlSurface(
 		connectionId: string | undefined,
 		_scope: AbortScope,
 	) => Promise<
-		| { ok: true; outcome: "stopped" | "no_active_turn" | "already_terminal" }
+		| { ok: true; outcome: "stopped" | "no_active_turn" | "already_terminal" | "no_store" }
 		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" }
 	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
@@ -2597,6 +2597,16 @@ function sdkControlSurface(
 					ok: true,
 					selection: scope,
 					turn: "no_active_turn",
+					terminal: "terminal_no_effect",
+				};
+			}
+			if (outcome.outcome === "no_store") {
+				// No file-backed reconciliation owner: terminal admission is gated
+				// off before any fence/stop/cleanup (plan AC 5).
+				return {
+					ok: true,
+					selection: scope,
+					turn: "no_store",
 					terminal: "terminal_no_effect",
 				};
 			}
@@ -4272,6 +4282,11 @@ export function createNotificationsExtension(
 			// so aborting there would cancel the next turn instead of fencing this one.
 			options: { fence?: boolean; terminal?: { scope: AbortScope } } = {},
 			extra?: { finalText?: string; error?: { code: string; message: string } },
+			capture?: {
+				proof?: RunSettlementProof & {
+					terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
+				};
+			},
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
@@ -4339,6 +4354,7 @@ export function createNotificationsExtension(
 					);
 					return;
 				}
+				if (capture) capture.proof = proof;
 			}
 			try {
 				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error);
@@ -4472,20 +4488,87 @@ export function createNotificationsExtension(
 				// owned completion classifies by exact source. A fatal
 				// fail-closed path (no exact run handle or unsettled resources)
 				// reports safe uncertainty, never a fabricated stop.
+				if (!durableStore) {
+					// No file-backed reconciliation owner: terminal admission is
+					// gated off (plan AC 5) before any fence, stop, or cleanup.
+					return { ok: true as const, outcome: "no_store" as const };
+				}
 				const active = [...promptSubmissions.entries()].find(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
 				);
 				if (!active) return { ok: true as const, outcome: "no_active_turn" as const };
 				const [commandId, turnId] = active[0].split(":", 2);
 				if (!commandId || !turnId) return { ok: true as const, outcome: "already_terminal" as const };
+				const captured: {
+					proof?: RunSettlementProof & {
+						terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
+					};
+				} = {};
 				await terminalizePrompt(
 					{ commandId, turnId },
 					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
 					{ fence: true, terminal: { scope } },
+					undefined,
+					captured,
 				);
 				const submission = promptSubmissions.get(promptSubmissionKey({ commandId, turnId }));
 				if (!submission?.terminal || submission.fatal === true)
 					return { ok: false as const, reason: "worker_unsettled" as const };
+				// Persist the bounded durable terminal-scope record through the
+				// same full-document owner (idempotent per selection+epoch).
+				const terminalScope = captured.proof?.terminalScope;
+				if (terminalScope) {
+					try {
+						await durableStore.transactTerminalScopes(scopes => {
+							const retained = scopes.filter(
+								s =>
+									!(
+										s.selection === scope &&
+										s.turnContinuationFence.abortedAttemptEpoch === terminalScope.abortedAttemptEpoch
+									),
+							);
+							const payloadHash = crypto
+								.createHash("sha256")
+								.update(
+									JSON.stringify({
+										selection: scope,
+										turn: "stopped",
+										ownedWork: scope === "turn" ? "left_running" : "uncertain",
+										automaticDelivery: scope === "turn" ? "enabled" : "none",
+										resumeOnOwnedCompletion: scope === "turn",
+									}),
+								)
+								.digest("hex");
+							return [
+								...retained,
+								{
+									selection: scope,
+									turnDisposition: "stopped",
+									ownedWorkDisposition: scope === "turn" ? "left_running" : "uncertain",
+									automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
+									resumeOnOwnedCompletion: scope === "turn",
+									turnContinuationFence: {
+										state: "retained",
+										abortedAttemptEpoch: terminalScope.abortedAttemptEpoch,
+										blockedContinuationIds: [],
+										predecessorTombstones: [],
+										ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
+									},
+									responseState: "pending",
+									responsePayloadHash: payloadHash,
+									acceptedAt: Date.now(),
+									terminalAt: Date.now(),
+								} satisfies DurableTerminalScopeRecord,
+							];
+						});
+					} catch (error) {
+						// The prompt terminal is already durable; a failed scope-record
+						// write must fail closed to safe uncertainty, never claim a
+						// stopped disposition the durable record cannot prove.
+						logger.warn(`sdk: terminal scope persistence failed: ${String(error)}`);
+						return { ok: false as const, reason: "worker_unsettled" as const };
+					}
+				}
 				return { ok: true as const, outcome: "stopped" as const };
 			},
 			{

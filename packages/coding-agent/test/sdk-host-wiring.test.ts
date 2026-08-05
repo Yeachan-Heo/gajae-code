@@ -2474,7 +2474,15 @@ test("SDK host turn.abort terminal mode returns no-effect with no active turn", 
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-noop-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-terminal-noop-${Date.now()}`;
-	const sessionContext = context(cwd, sessionId);
+	const sessionContext = {
+		...context(cwd, sessionId),
+		// Provide a file-backed session so the terminal abort has a reconciliation
+		// owner (the no-store gate only fires for genuinely store-less sessions).
+		sessionManager: {
+			...context(cwd, sessionId).sessionManager,
+			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
+		},
+	};
 	const handlers = start(sessionContext, undefined, () => {}, true);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -2519,7 +2527,15 @@ test("SDK host turn.abort terminal mode fails closed when the turn cannot be fen
 	const sessionId = `sdk-terminal-fence-${Date.now()}`;
 	const live = { idle: true };
 	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
-	const sessionContext = context(cwd, sessionId, "main", live);
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		// File-backed reconciliation owner so the terminal abort reaches the
+		// fence path (and fails closed there) instead of the no-store gate.
+		sessionManager: {
+			...context(cwd, sessionId, "main", live).sessionManager,
+			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
+		},
+	};
 	const handlers = start(
 		sessionContext,
 		undefined,

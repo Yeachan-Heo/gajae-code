@@ -10293,7 +10293,12 @@ export class AgentSession {
 	async abortPromptAndWait(
 		handle: string,
 		options: { graceMs: number; terminal?: { scope: "turn" | "owned" } },
-	): Promise<RunSettlementProof> {
+	): Promise<
+		RunSettlementProof & {
+			terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
+		}
+	> {
+		let registeredScope: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string } | undefined;
 		if (options.terminal) {
 			// Terminal abort (C04 mode:"terminal"): register and synchronously
 			// close the continuation fence for the current turn BEFORE the run is
@@ -10305,24 +10310,40 @@ export class AgentSession {
 			// registered, so nothing is attributed.
 			const lineageIdHash = this.#turnLineageIdHash;
 			if (lineageIdHash) {
-				registerTerminalTurnScope({
+				const scope = registerTerminalTurnScope({
 					lineageIdHash,
 					promptAttemptEpoch: this.#promptGeneration,
 					ownedCompletionPolicy: options.terminal.scope === "owned" ? "disabled" : "enabled",
 				});
+				registeredScope = {
+					scopeId: scope.scopeId,
+					abortedAttemptEpoch: scope.promptAttemptEpoch,
+					lineageIdHash: scope.lineageIdHash,
+				};
 			}
 		}
 		const aborted = this.#runCancellationDomains.abort(handle);
 		if (!aborted.ok) {
 			if (aborted.reason === "quarantined") {
-				return await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+				return {
+					...(await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 })),
+					...(registeredScope ? { terminalScope: registeredScope } : {}),
+				};
 			}
-			return { status: "unfenced", reason: "unknown_run", pending: [] };
+			return {
+				status: "unfenced",
+				reason: "unknown_run",
+				pending: [],
+				...(registeredScope ? { terminalScope: registeredScope } : {}),
+			};
 		}
 		if (handle === this.agent.activeResourceRunId) this.agent.abort();
 		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
 		if (proof.status === "unfenced") this.agent.resourceLedger.quarantine(handle);
-		return proof;
+		return {
+			...proof,
+			...(registeredScope ? { terminalScope: registeredScope } : {}),
+		};
 	}
 
 	/** Atomically interrupt the active run and make text the next prompt. */
