@@ -412,6 +412,7 @@ export interface ExtensionContext {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -1511,6 +1512,7 @@ export interface ExtensionContextActions {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

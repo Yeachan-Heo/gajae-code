@@ -734,6 +734,8 @@ export interface PromptOptions {
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
+	preflightSignal?: AbortSignal;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -7633,8 +7635,12 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared">,
+		options?: Pick<
+			PromptOptions,
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
 		if (typeof args !== "string")
@@ -7666,6 +7672,7 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		options?.onSkillPrepared?.({
 			name: skill.name,
 			path: skill.filePath,
@@ -8535,9 +8542,15 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: Pick<
 			PromptOptions,
-			"streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+			| "streamingBehavior"
+			| "toolChoice"
+			| "followUpQueuePolicy"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "preflightSignal"
 		>,
 	): Promise<void> {
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -8600,7 +8613,12 @@ export class AgentSession {
 		expandedText: string,
 		options?: Pick<
 			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+			| "toolChoice"
+			| "images"
+			| "skipCompactionCheck"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "preflightSignal"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -8612,6 +8630,7 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		await this.#agentEndPublicationPromise;
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
@@ -8821,7 +8840,7 @@ export class AgentSession {
 
 			// Abort can race asynchronous preflight work. The injection signatures were
 			// consumed while building context, but no prompt was accepted, so reset them.
-			if (this.#isPromptPreflightCancelled(generation, preflightSignal)) {
+			if (this.#isPromptPreflightCancelled(generation, preflightSignal) || options?.preflightSignal?.aborted) {
 				this.#resetInjectedContextSignatures();
 				// Ack-waiting callers are told the preflight never ran; direct callers
 				// (aborted after setup) resolve gracefully as before f24f46ff5.
@@ -8839,8 +8858,10 @@ export class AgentSession {
 					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
 				},
 			};
+			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			else options?.onPreflightAccepted?.();
+			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 			if (options?.onFinalPreflight && !(await options.onFinalPreflight({ hasPendingNextTurnMessages }))) {
 				this.#resetInjectedContextSignatures();
 				return;

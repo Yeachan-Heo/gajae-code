@@ -151,13 +151,51 @@ describe("SDK prompt terminal arbiter", () => {
 		);
 	});
 
-	test("settles restart records with pending prompt outcomes and preserves skill restart failures", () => {
+	test("serializes delayed skill claims before exact normal and cancellation finalization", async () => {
+		for (const outcome of [stopped("end_turn"), stopped("cancelled")]) {
+			const store = new MemoryStore();
+			const reconciliation = createKindAwareReconciliation({ store, now: () => 200 });
+			await reconciliation.noteAccepted("skill", correlation, "skill-ref", { skillName: "deep-interview" });
+			const held = Promise.withResolvers<void>();
+			const claimEntered = Promise.withResolvers<void>();
+			store.holdNext(held.promise, claimEntered.resolve);
+
+			const claim = reconciliation.claimPendingOutcome(correlation, outcome, "skill");
+			await claimEntered.promise;
+			const finalize = reconciliation.finalizePromptOutcome(correlation, undefined, undefined, "skill");
+			held.resolve();
+			await Promise.all([claim, finalize]);
+
+			expect(reconciliation.lookup("skill", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome,
+			});
+			expect(store.snapshot()).toMatchObject([
+				{
+					kind: "skill",
+					status: "terminal_ok",
+					outcome,
+					pendingOutcome: undefined,
+				},
+			]);
+		}
+	});
+
+	test("settles restart records with pending prompt and skill outcomes while preserving outcome-less skill failures", () => {
 		const pendingOutcome: SdkPromptTerminalOutcome = stopped("max_tokens");
 		const settled = settleProcessRestart(
 			[
 				{ kind: "prompt", commandId: "pending", turnId: "1", status: "accepted", acceptedAt: 1, pendingOutcome },
 				{ kind: "prompt", commandId: "missing", turnId: "2", status: "in_flight", acceptedAt: 1 },
 				{ kind: "skill", commandId: "skill", turnId: "3", status: "accepted", acceptedAt: 1 },
+				{
+					kind: "skill",
+					commandId: "skill-pending",
+					turnId: "4",
+					status: "in_flight",
+					acceptedAt: 1,
+					pendingOutcome: stopped("cancelled"),
+				},
 			],
 			500,
 		);
@@ -170,5 +208,10 @@ describe("SDK prompt terminal arbiter", () => {
 			error: { code: "prompt_failed" },
 		});
 		expect(settled[2]).toMatchObject({ status: "failed", error: { code: "process_restart" } });
+		expect(settled[3]).toMatchObject({
+			status: "terminal_ok",
+			outcome: stopped("cancelled"),
+			pendingOutcome: undefined,
+		});
 	});
 });

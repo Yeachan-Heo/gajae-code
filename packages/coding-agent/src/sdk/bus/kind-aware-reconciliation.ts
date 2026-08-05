@@ -35,13 +35,15 @@ export interface KindAwareReconciliation {
 	claimPendingOutcome(
 		correlation: PromptCorrelation,
 		outcome: SdkPromptTerminalOutcome,
+		kind?: ReconciliationKind,
 	): Promise<SdkPromptTerminalOutcome>;
 	finalizePromptOutcome(
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
 		recordError?: { code: string; message: string },
+		kind?: ReconciliationKind,
 	): Promise<void>;
-	peekPendingOutcome(correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
+	peekPendingOutcome(correlation: PromptCorrelation, kind?: ReconciliationKind): SdkPromptTerminalOutcome | undefined;
 	lookup(
 		kind: ReconciliationKind,
 		selector: { commandId?: string; turnId?: string; clientRef?: string },
@@ -214,10 +216,11 @@ export function createKindAwareReconciliation(
 	const claimPendingOutcome = async (
 		correlation: PromptCorrelation,
 		outcome: SdkPromptTerminalOutcome,
+		kind: ReconciliationKind = "prompt",
 	): Promise<SdkPromptTerminalOutcome> =>
 		await queueMutation(candidate => {
-			const record = candidate.get(keyOf("prompt", correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== "prompt")
+			const record = candidate.get(keyOf(kind, correlation));
+			if (!record || record.terminalAt !== undefined || record.kind !== kind)
 				return { value: outcome, changed: false };
 			if (record.pendingOutcome !== undefined) return { value: record.pendingOutcome, changed: false };
 			record.pendingOutcome = outcome;
@@ -228,10 +231,11 @@ export function createKindAwareReconciliation(
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
 		recordError?: { code: string; message: string },
+		kind: ReconciliationKind = "prompt",
 	) => {
 		await queueMutation(candidate => {
-			const record = candidate.get(keyOf("prompt", correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== "prompt")
+			const record = candidate.get(keyOf(kind, correlation));
+			if (!record || record.terminalAt !== undefined || record.kind !== kind)
 				return { value: undefined, changed: false };
 			const finalOutcome = outcome ?? record.pendingOutcome;
 			record.terminalAt = now();
@@ -246,8 +250,8 @@ export function createKindAwareReconciliation(
 		});
 	};
 
-	const peekPendingOutcome = (correlation: PromptCorrelation) =>
-		records.get(keyOf("prompt", correlation))?.pendingOutcome;
+	const peekPendingOutcome = (correlation: PromptCorrelation, kind: ReconciliationKind = "prompt") =>
+		records.get(keyOf(kind, correlation))?.pendingOutcome;
 
 	const lookup = (
 		kind: ReconciliationKind,

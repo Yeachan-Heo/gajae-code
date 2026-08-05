@@ -6,8 +6,8 @@
  *
  * Safe session ids only: /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
  * Atomic write: temp + fsync + rename + 0600. Corrupt → quarantine + empty.
- * Non-terminal skill records settle to failed/process_restart on bootstrap; prompt
- * records finalize their pending outcome or a prompt_failed fallback.
+ * Non-terminal records with a pending outcome finalize that exact claim on bootstrap.
+ * Outcome-less skills retain the existing failed/process_restart settlement.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -91,9 +91,8 @@ function isValidRecord(value: unknown): boolean {
 	if (status !== "accepted" && status !== "in_flight" && status !== "terminal_ok" && status !== "failed") return false;
 	if (typeof acceptedAt !== "number" || !Number.isFinite(acceptedAt)) return false;
 	if (terminalAt !== undefined && (typeof terminalAt !== "number" || !Number.isFinite(terminalAt))) return false;
-	// Durable invariants: only prompts carry a pending claim, a finalized record has no
-	// pending claim left, and terminal/active status must agree with `terminalAt`.
-	if (pendingOutcome !== undefined && kind !== "prompt") return false;
+	// Durable invariants: a finalized record has no pending claim left, and
+	// terminal/active status must agree with `terminalAt`.
 	if (pendingOutcome !== undefined && terminalAt !== undefined) return false;
 	const isTerminalStatus = status === "terminal_ok" || status === "failed";
 	if (isTerminalStatus !== (terminalAt !== undefined)) return false;
@@ -142,8 +141,8 @@ function parseDocument(raw: string, expectedSessionId: string): ReconciliationSt
 
 /**
  * Settle non-terminal durable records after process death.
- * Prompt records preserve a durable pending outcome; skills retain the existing
- * reconciliation-incomplete result.
+ * Any record with a durable pending outcome preserves that exact terminal claim;
+ * outcome-less skills retain the existing reconciliation-incomplete result.
  */
 export function settleProcessRestart(
 	records: DurableReconciliationRecord[],
@@ -151,7 +150,7 @@ export function settleProcessRestart(
 ): DurableReconciliationRecord[] {
 	return records.map(record => {
 		if (record.terminalAt !== undefined) return record;
-		if (record.kind === "prompt") {
+		if (record.pendingOutcome !== undefined || record.kind === "prompt") {
 			const outcome: SdkPromptTerminalOutcome = record.pendingOutcome ?? {
 				kind: "failed",
 				code: "prompt_failed",

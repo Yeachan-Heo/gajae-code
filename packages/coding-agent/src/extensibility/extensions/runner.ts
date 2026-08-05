@@ -621,7 +621,7 @@ export class ExtensionRunner {
 			setModelProfile: async name => (await this.#setModelProfileFn?.(name)) ?? false,
 			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
 			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
-			invokeSkill: async (name, args) => await this.#invokeSkillFn?.(name, args),
+			invokeSkill: async (name, args, options) => await this.#invokeSkillFn?.(name, args, options),
 
 			setPlanMode: on => this.#setPlanModeFn?.(on),
 			operateGoal: async (op, objective) => await this.#operateGoalFn?.(op, objective),

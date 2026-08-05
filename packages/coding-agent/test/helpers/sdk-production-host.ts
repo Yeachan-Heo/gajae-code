@@ -17,7 +17,7 @@ import { isolatedNotificationSettings } from "./notification-settings";
 
 export async function startProductionSdkHost(
 	cwd: string,
-	options: { acceptPromptPreflightWithoutExecution?: boolean } = {},
+	options: { acceptPromptPreflightWithoutExecution?: boolean; notificationsInitiallyEnabled?: boolean } = {},
 ): Promise<{
 	endpoint: { url: string; token: string };
 	sessionId: string;
@@ -26,6 +26,7 @@ export async function startProductionSdkHost(
 		question: string,
 		options: string[],
 	) => { registered: true; result: Promise<unknown> } | { registered: false; reason: "authority_unavailable" };
+	runCommand: (text: string) => Promise<void>;
 	triggerGate: (
 		spec: Parameters<
 			NonNullable<
@@ -96,7 +97,7 @@ export async function startProductionSdkHost(
 				};
 			}
 			const priorNotifications = process.env.GJC_NOTIFICATIONS;
-			process.env.GJC_NOTIFICATIONS = "1";
+			process.env.GJC_NOTIFICATIONS = options.notificationsInitiallyEnabled === false ? "0" : "1";
 			try {
 				await initializeExtensions(session, {
 					reportSendError: () => {},
@@ -133,6 +134,7 @@ export async function startProductionSdkHost(
 				observed,
 				triggerAsk,
 				triggerGate,
+				runCommand: async text => await session.prompt(text),
 				stop: () => cleanupFixtureRoot(cleanup),
 			};
 		} catch (error) {

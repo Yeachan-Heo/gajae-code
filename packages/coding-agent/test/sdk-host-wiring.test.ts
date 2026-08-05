@@ -2246,6 +2246,89 @@ test("SDK host terminalizes a cancelled preflight and releases prompt authority"
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
 
+test("SDK host cancels canonical skill invocation before agent start and fences late acceptance", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-preflight-cancelled-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-preflight-cancelled-${Date.now()}`;
+	const preflightStarted = Promise.withResolvers<void>();
+	const releasePreflight = Promise.withResolvers<void>();
+	let executionStarted = false;
+	const sessionContext = context(cwd, sessionId);
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
+		},
+	) => {
+		expect(name).toBe("fixture-skill");
+		expect(args).toBe("cancel before start");
+		preflightStarted.resolve();
+		await releasePreflight.promise;
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		if (options?.preflightSignal?.aborted)
+			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
+		executionStarted = true;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-preflight",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "cancel before start" },
+		}),
+	);
+	await preflightStarted.promise;
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-skill-preflight",
+			operation: "turn.abort",
+			input: {},
+		}),
+	);
+	await waitFor(
+		() =>
+			frames.some(frame => frame.type === "control_response" && frame.id === "skill-preflight") &&
+			frames.some(frame => frame.type === "control_response" && frame.id === "abort-skill-preflight"),
+		"skill preflight cancellation responses",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "skill-preflight")).toMatchObject({
+		ok: false,
+		error: { code: "busy", message: "Skill preflight was cancelled before execution." },
+	});
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "abort-skill-preflight"),
+	).toMatchObject({
+		ok: true,
+		result: { aborted: true, disposition: "preflight_cancelled" },
+	});
+	releasePreflight.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	expect(executionStarted).toBe(false);
+	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
 test("SDK host terminalizes a never-resolving preflight on abort and fences late acceptance", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-never-"));
 	dirs.push(cwd);
@@ -3003,20 +3086,10 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
 	dirs.push(cwd);
-	const sessionId = `sdk-ui-provider-notify-priority-${Date.now()}`;
-	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
-	const messages: Array<{ message: string; level: string }> = [];
-	const sessionContext = {
-		...context(cwd, sessionId),
-		ui: { notify: (message: string, level: string) => messages.push({ message, level }) },
-	};
-	process.env.GJC_NOTIFICATIONS = "0";
-	const handlers = start(sessionContext, undefined, () => {}, false, commands);
+	const host = await startProductionSdkHost(cwd, { notificationsInitiallyEnabled: false });
+	const { sessionId, endpoint } = host;
 	try {
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		expect(getAskAnswerSource(sessionId)).toBeUndefined();
-		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 		sockets.push(socket);
@@ -3040,9 +3113,14 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 			() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "ui"),
 			"UI provider registration",
 		);
+		const priorNotifications = process.env.GJC_NOTIFICATIONS;
 		process.env.GJC_NOTIFICATIONS = "1";
-		await commands.get("notify")!.handler("on", sessionContext);
-		expect(messages).toEqual([{ message: "Notifications enabled for this session.", level: "info" }]);
+		try {
+			await host.runCommand("/notify on");
+		} finally {
+			if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+			else process.env.GJC_NOTIFICATIONS = priorNotifications;
+		}
 
 		const protocolAnswerSource = getAskAnswerSource(sessionId);
 		expect(protocolAnswerSource).toBeDefined();
@@ -3126,7 +3204,7 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		expect(await fallbackAnswer).toBe("Continue");
 		expect(frames.filter(frame => frame.type === "reverse_request")).toHaveLength(1);
 	} finally {
-		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		await host.stop();
 	}
 });
 

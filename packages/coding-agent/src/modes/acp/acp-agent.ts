@@ -82,6 +82,8 @@ interface PromptWaiter {
 	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
 	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
 	deferredFrames: JsonObject[];
+	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
+	cancelAttempt?: Promise<boolean>;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -646,6 +648,14 @@ export function acpSessionStateFromConfig(
 	};
 }
 
+/** Recognize an advertised ACP skill command only when it is the complete, single text prompt. */
+export function acpSkillInvocation(blocks: PromptRequest["prompt"]): { name: string; args: string } | undefined {
+	if (blocks.length !== 1 || blocks[0]?.type !== "text") return undefined;
+	const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/.exec(blocks[0].text.trim());
+	if (!match?.[1]) return undefined;
+	return { name: match[1], args: match[2]?.trim() ?? "" };
+}
+
 /** Convert every ACP prompt block the agent advertises without silently discarding context. */
 export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 	text: string;
@@ -1121,6 +1131,7 @@ export class AcpAgent implements Agent {
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 		const payload = acpPromptPayload(params.prompt);
+		const skillInvocation = acpSkillInvocation(params.prompt);
 		let waiter!: PromptWaiter;
 		const response = new Promise<PromptResponse>((resolve, reject) => {
 			waiter = {
@@ -1136,10 +1147,12 @@ export class AcpAgent implements Agent {
 			record.activePrompt = waiter;
 		});
 		try {
-			const acknowledgement = await record.adapter.prompt({
-				text: payload.text,
-				...(payload.images.length ? { images: payload.images } : {}),
-			});
+			const acknowledgement = skillInvocation
+				? await record.adapter.control("skill.invoke", skillInvocation)
+				: await record.adapter.prompt({
+						text: payload.text,
+						...(payload.images.length ? { images: payload.images } : {}),
+					});
 			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
 			if (!acknowledgementCorrelation)
 				throw new AcpSdkAdapterError(
@@ -1160,6 +1173,7 @@ export class AcpAgent implements Agent {
 					);
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
+			if (waiter.cancelAttempt && (await waiter.cancelAttempt) && waiter.settled) return await response;
 			waiter.deferredFrames.length = 0;
 			waiter.terminal = undefined;
 			waiter.settled = true;
@@ -1172,13 +1186,35 @@ export class AcpAgent implements Agent {
 	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
-		const acknowledgement = await record.adapter.cancel();
-		const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
-		if (result?.aborted !== true)
-			throw new AcpSdkAdapterError(
-				"abort_unacknowledged",
-				"SDK did not acknowledge cancellation of the active prompt.",
-			);
+		const waiter = record.activePrompt;
+		const cancelAttempt = waiter ? Promise.withResolvers<boolean>() : undefined;
+		if (waiter && cancelAttempt) waiter.cancelAttempt = cancelAttempt.promise;
+		try {
+			const acknowledgement = await record.adapter.cancel();
+			const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
+			if (result?.aborted !== true)
+				throw new AcpSdkAdapterError(
+					"abort_unacknowledged",
+					"SDK did not acknowledge cancellation of the active prompt.",
+				);
+			if (
+				result.disposition === "preflight_cancelled" &&
+				waiter &&
+				record.activePrompt === waiter &&
+				!waiter.acknowledged &&
+				!waiter.settled
+			) {
+				record.activePrompt = undefined;
+				waiter.settled = true;
+				waiter.deferredFrames.length = 0;
+				waiter.terminal = undefined;
+				waiter.resolve({ stopReason: "cancelled" });
+			}
+			cancelAttempt?.resolve(true);
+		} catch (error) {
+			cancelAttempt?.resolve(false);
+			throw error;
+		}
 	}
 
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
