@@ -17,6 +17,8 @@
 
 - Anthropic cache-control resolution now falls back to `model.cacheRetention` at the provider boundary, preserving configured retention and request-over-model precedence through special dispatch wrappers such as GitLab Duo. A configured `cacheRetention: "none"` can no longer be dropped and replaced by the new automatic Claude-family cache marker.
 - Anthropic explicit prompt caching now advances its conversation breakpoint during tool-use loops by marking the latest completed assistant tool-use turn while leaving the newest tool result uncached. Previously it kept refreshing only the original human message until another human turn arrived, pinning proxy cache reads to the static tools/system prefix throughout long agentic runs.
+- DeepSeek V4 family models (including namespaced custom openai-completions proxies) now treat GJC `max` as a first-class thinking level instead of silently clamping `:max` to `xhigh`, and `resolveWireReasoningEffort` exposes the request-side wire value after `reasoningEffortMap` for operator diagnostics (#3858).
+
 ## [0.12.12] - 2026-08-05
 
 ### Fixed

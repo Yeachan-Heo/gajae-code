@@ -303,3 +303,36 @@ export function resolveOpenAICompat(
 		toolStrictMode: model.compat.toolStrictMode ?? detected.toolStrictMode,
 	};
 }
+
+/**
+ * Maps a GJC-normalized effort to the string that OpenAI-completions transport
+ * will put on the wire after `reasoningEffortMap` is applied.
+ *
+ * This is the request-side effective value only. Providers that accept the
+ * request without echoing an effort do not confirm backend-normalized effort.
+ */
+export function resolveWireReasoningEffort(
+	model: Model<"openai-completions">,
+	effort: OpenAIReasoningEffort,
+	resolvedBaseUrl?: string,
+): {
+	/** GJC effort used as the map key (already metadata-clamped by callers). */
+	effort: OpenAIReasoningEffort;
+	/** Value sent as `reasoning_effort` / nested OpenRouter effort after mapping. */
+	wire: string;
+	/** True when `reasoningEffortMap` rewrote the GJC level to a different string. */
+	remapped: boolean;
+	/** True when an explicit map entry existed for this effort (vs identity passthrough). */
+	hasMapEntry: boolean;
+} {
+	const compat = resolveOpenAICompat(model, resolvedBaseUrl);
+	const mapped = compat.reasoningEffortMap[effort];
+	const hasMapEntry = mapped !== undefined;
+	const wire = mapped ?? effort;
+	return {
+		effort,
+		wire,
+		remapped: wire !== effort,
+		hasMapEntry,
+	};
+}

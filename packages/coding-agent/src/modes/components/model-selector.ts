@@ -38,7 +38,7 @@ import { compareRankedProviders, type ProviderAuthState } from "../../config/pro
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
-import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
+import { formatSelectorWithEffortDiagnostics, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
 import { getConfiguredImageModel } from "../../tools/image-gen";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
@@ -1445,7 +1445,11 @@ export class ModelSelectorComponent extends Container {
 			});
 			const label = GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase();
 			this.#listContainer.addChild(
-				new Text(`  ${label}: ${formatClampedModelSelector(selectorHead(selector) ?? "", resolved.model)}`, 0, 0),
+				new Text(
+					`  ${label}: ${formatSelectorWithEffortDiagnostics(selectorHead(selector) ?? "", resolved.model)}`,
+					0,
+					0,
+				),
 			);
 		}
 		this.#listContainer.addChild(new Spacer(1));

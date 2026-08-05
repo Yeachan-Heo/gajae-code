@@ -715,12 +715,26 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 	return inferFallbackEfforts(model);
 }
 
+/**
+ * DeepSeek V4's documented provider contract is high/max. GJC still exposes the
+ * full effort ladder (lower levels map upward on the wire), but `max` must remain
+ * a first-class GJC level so selectors like `:max` are not silently clamped to
+ * `xhigh` on custom openai-compatible proxies that only inherit generic metadata.
+ */
+function isDeepSeekV4FamilyModel<TApi extends Api>(model: ApiModel<TApi>): boolean {
+	const canonicalId = getCanonicalModelId(model.id).toLowerCase();
+	const name = model.name.toLowerCase();
+	return canonicalId.includes("deepseek-v4") || name.includes("deepseek-v4");
+}
+
 function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
 	if (model.api === "anthropic-messages") {
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}
-	if (model.name.includes("deepseek-v4")) {
-		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+	if (isDeepSeekV4FamilyModel(model)) {
+		// Keep xhigh as a GJC alias that maps to provider `max`, and also accept
+		// an explicit `:max` so HUD/session state preserve the operator's intent.
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
 	}
 	if (model.api === "bedrock-converse-stream") {
 		return DEFAULT_REASONING_EFFORTS;
