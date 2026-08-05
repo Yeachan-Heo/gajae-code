@@ -60,6 +60,11 @@ function multiplexerEnvEnabled(value: string | undefined): boolean {
 	return normalized !== undefined && normalized.length > 0 && !MULTIPLEXER_DISABLED_ENV_VALUES.has(normalized);
 }
 
+/** Returns whether stdout crosses an SSH transport, where animation bytes can outpace the link. */
+export function isRemoteTerminalSession(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
+}
+
 /**
  * Returns whether the process runs under a terminal multiplexer (tmux, GNU
  * screen, or zellij). Recognizes the same host markers as the renderer's

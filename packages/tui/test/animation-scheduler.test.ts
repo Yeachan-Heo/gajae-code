@@ -42,8 +42,10 @@ describe("shared animation scheduler", () => {
 		expect(__animationSchedulerTestHooks.getActiveTimerCount(80)).toBe(0);
 	});
 
-	it("recomputes all loaders at 80ms while preserving time-dependent colors", () => {
+	it("recomputes time-dependent colors at 80ms on constrained terminals", () => {
 		vi.useFakeTimers();
+		const previousSshConnection = process.env.SSH_CONNECTION;
+		process.env.SSH_CONNECTION = "test";
 		let tick = 0;
 		const defaultRequests = vi.fn();
 		const animatedRequests = vi.fn();
@@ -77,6 +79,8 @@ describe("shared animation scheduler", () => {
 		} finally {
 			defaultLoader.stop();
 			animatedLoader.stop();
+			if (previousSshConnection === undefined) delete process.env.SSH_CONNECTION;
+			else process.env.SSH_CONNECTION = previousSshConnection;
 		}
 	});
 });

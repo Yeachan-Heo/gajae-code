@@ -1,4 +1,5 @@
 import { type AnimationRegistration, registerAnimationCallback } from "../animation-scheduler";
+import { isRemoteTerminalSession, isUnderTerminalMultiplexer } from "../terminal-capabilities";
 import type { TUI } from "../tui";
 import { sliceByColumn, visibleWidth } from "../utils";
 import { Text } from "./text";
@@ -8,13 +9,21 @@ const SPINNER_ADVANCE_MS = 80;
 /**
  * Compatibility options for existing loader call sites.
  *
- * @deprecated `timeDependentColor` no longer selects a faster scheduler. Every
- * colorizer is reevaluated on the shared 80 ms cadence, so both option values
- * now have identical behavior. The field remains accepted to avoid a source
- * break for downstream callers while they remove it.
+ * @deprecated `timeDependentColor` preserves the historical smooth-animation
+ * contract: direct local terminals reevaluate colorizers at 60 fps, while
+ * remote or multiplexed terminals stay on the shared 80 ms cadence to avoid
+ * output churn. The field remains accepted for downstream callers while they
+ * migrate to an explicit animation policy.
  */
 export interface LoaderOptions {
 	timeDependentColor?: boolean;
+}
+
+const SMOOTH_ANIMATION_MS = 16;
+
+function resolveAnimationCadence(options: LoaderOptions): 16 | 80 {
+	if (options.timeDependentColor !== true) return SPINNER_ADVANCE_MS;
+	return isRemoteTerminalSession() || isUnderTerminalMultiplexer() ? SPINNER_ADVANCE_MS : SMOOTH_ANIMATION_MS;
 }
 
 /** Test-only performance counters for advisory baseline tests. */
@@ -45,7 +54,7 @@ export class Loader extends Text {
 		private messageColorFn: (str: string) => string,
 		private message: string = "Loading...",
 		spinnerFrames?: string[],
-		_options: LoaderOptions = {},
+		private options: LoaderOptions = {},
 	) {
 		super("", 1, 0);
 		this.#ui = ui;
@@ -79,7 +88,7 @@ export class Loader extends Text {
 				this.#lastSpinnerTick = now;
 			}
 			this.#updateDisplay();
-		}, SPINNER_ADVANCE_MS);
+		}, resolveAnimationCadence(this.options));
 	}
 
 	stop() {
