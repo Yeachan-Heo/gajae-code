@@ -197,7 +197,7 @@ export class SessionSelectorComponent extends Container {
 
 	constructor(
 		sessions: SessionInfo[],
-		private readonly onSelect: (sessionPath: string) => void,
+		private readonly onSelect: (sessionPath: string) => void | Promise<void>,
 		private readonly onCancel: () => void,
 		private readonly onExit: () => void,
 		private readonly onDelete?: (session: SessionInfo) => Promise<boolean>,
@@ -214,7 +214,7 @@ export class SessionSelectorComponent extends Container {
 		this.#sessionList = new SessionList(sessions);
 		this.#sessionList.onSelect = session => {
 			if (this.inspector) void this.#inspect(session);
-			else this.onSelect(session.path);
+			else this.#dispatchSelect(session.path);
 		};
 		this.#sessionList.onCancel = () => this.#cancel();
 		this.#sessionList.onExit = () => this.#exit();
@@ -241,6 +241,29 @@ export class SessionSelectorComponent extends Container {
 		this.#onRequestRender?.();
 	}
 
+	/**
+	 * Observe async `onSelect` handlers. Callers (e.g. resume) may return a
+	 * Promise; leaving it unobserved turns preparation/switch failures into
+	 * process-killing unhandled rejections. Inline recovery keeps the picker
+	 * usable when the host has not already closed it.
+	 */
+	#dispatchSelect(sessionPath: string): void {
+		void Promise.resolve(this.onSelect(sessionPath)).catch((error: unknown) => {
+			if (this.#state.kind === "settled") {
+				// Host already closed the picker (interactive resume path). Surface the
+				// message only if we still have a render surface; controller catch is
+				// the primary recovery path after `done()`.
+				this.#showError(error instanceof Error ? error.message : String(error));
+				this.#requestRender();
+				return;
+			}
+			this.#state = { kind: "browsing" };
+			this.#sessionList.setInputFrozen(false);
+			this.#showError(error instanceof Error ? error.message : String(error));
+			this.#requestRender();
+		});
+	}
+
 	#settle(selection: SessionSelectionResult): void {
 		if (this.#state.kind === "settled") return;
 		this.#state = { kind: "settled" };
@@ -249,7 +272,7 @@ export class SessionSelectorComponent extends Container {
 		this.#confirmationDialog = null;
 		if (dialog) this.removeChild(dialog);
 		if (this.onSelection) this.onSelection(selection);
-		else if (selection.kind === "selected") this.onSelect(selection.path);
+		else if (selection.kind === "selected") this.#dispatchSelect(selection.path);
 		else this.onCancel();
 	}
 	#cancel(): void {

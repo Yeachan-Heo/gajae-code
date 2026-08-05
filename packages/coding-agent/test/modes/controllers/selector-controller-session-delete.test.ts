@@ -320,6 +320,70 @@ describe("SelectorController session deletion", () => {
 		expect(switchSession).not.toHaveBeenCalled();
 	});
 
+	it("surfaces managed-candidate race from the picker without unhandled rejection (#3804)", async () => {
+		const selected = makeSessionInfo("/tmp/project/legacy/race.jsonl");
+		const identity = {
+			canonicalPath: selected.path,
+			sessionId: "race",
+			dev: 1n,
+			ino: 1n,
+			size: 1,
+			mtimeMs: 1,
+			mtimeNs: 1n,
+			sha256: "before-replacement",
+		};
+		const {
+			ctx,
+			switchSession,
+			prepareManagedCandidateForStrictAdoption,
+			setManagedDestination,
+			listForResumePickerReadOnly,
+		} = createContext("/tmp/project/sessions/a.jsonl");
+		setManagedDestination(true);
+		listForResumePickerReadOnly.mockResolvedValue([selected]);
+		vi.spyOn(SessionManager, "inspectSessionTailReadOnly").mockResolvedValue({ kind: "resumable", identity });
+		prepareManagedCandidateForStrictAdoption.mockRejectedValue(
+			new Error("Managed session changed before migration authority was adopted."),
+		);
+		const errorShown = Promise.withResolvers<void>();
+		const showError = vi.fn(() => errorShown.resolve());
+		ctx.showError = showError;
+		const controller = new SelectorController(ctx);
+		const unhandled = vi.fn();
+		process.on("unhandledRejection", unhandled);
+
+		try {
+			await controller.showSessionSelector();
+			const selector = ctx.editorContainer.children[0];
+			if (!(selector instanceof SessionSelectorComponent)) {
+				throw new Error("Expected session selector component");
+			}
+
+			// Legacy five-argument path: Enter selects immediately via void onSelect.
+			selector.handleInput("\n");
+			await errorShown.promise;
+			// Give the event loop a tick so an unobserved rejection would fire.
+			await new Promise<void>(resolve => setImmediate(resolve));
+
+			expect(showError).toHaveBeenCalledWith(
+				"Managed session changed before migration authority was adopted.",
+			);
+			expect(unhandled).not.toHaveBeenCalled();
+			// Strict fence: one preparation attempt, no switch, no auto-retry.
+			expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledTimes(1);
+			expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledWith(
+				selected.path,
+				"copy-retain",
+				identity,
+			);
+			expect(switchSession).not.toHaveBeenCalled();
+			// Current session remains the active one after recovery.
+			expect(ctx.sessionManager.getSessionFile()).toBe("/tmp/project/sessions/a.jsonl");
+		} finally {
+			process.off("unhandledRejection", unhandled);
+		}
+	});
+
 	it("lists sessions through the active manager's captured destination authority", async () => {
 		const { ctx, listForResumePickerReadOnly } = createContext("/tmp/project/sessions/a.jsonl");
 		const controller = new SelectorController(ctx);
