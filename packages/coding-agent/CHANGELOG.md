@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `gjc gc --disk` starts an opt-in disk-retention pass alongside the existing PID-liveness reaper. The first surface reclaims excess `~/.gjc/natives/<version>/` caches: keep the running natives version plus N older predecessors (`--natives-keep-versions`, default 2), report reclaimable bytes in dry-run, and delete only with `--prune`. Non-semver entries, newer-than-current caches, and the current version stay fail-closed. Session transcripts, blobs, backups, and worktrees are intentionally out of scope for this slice (#3853).
+
 ### Fixed
 - ACP session configuration now emits the spec-defined `category` field on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), so standards-compliant ACP clients such as Paseo discover models, modes, and thinking levels instead of an empty model picker (#3922).
 - The ACP session model catalog is now filtered to active providers via `providers.list/active`, falling back to the full catalog on older session hosts, so ACP clients no longer list models for providers without usable credentials (#3922).

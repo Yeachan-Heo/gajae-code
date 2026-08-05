@@ -17,6 +17,13 @@ import { getAgentDir } from "@gajae-code/utils";
 import { SessionIndex } from "../sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 
+import {
+	collectGcDiskReport,
+	DEFAULT_NATIVES_KEEP_VERSIONS,
+	type GcDiskDeps,
+	type GcDiskReport,
+	resolveGcDiskCollectOptions,
+} from "./gc-disk";
 import { buildGcReportText } from "./gc-render";
 
 export type GcStore =
@@ -152,6 +159,11 @@ export interface GcReport {
 	/** Partial-result notices that do not fail the run (e.g. walk caps). */
 	warnings: GcWarning[];
 	session_index?: GcSessionIndexHealth;
+	/**
+	 * Present only when `--disk` was requested. Disk retention is a separate
+	 * opt-in axis from PID liveness and never runs implicitly.
+	 */
+	disk?: GcDiskReport;
 }
 
 export interface GcRunResult {
@@ -258,19 +270,32 @@ interface ParsedGcArgs {
 	json: boolean;
 	prune: boolean;
 	repairSessionIndex: boolean;
+	disk: boolean;
+	nativesKeepVersions: number | undefined;
 	help: boolean;
 }
 
 class GcUsageError extends Error {}
 
+function parsePositiveIntFlag(flag: string, raw: string | undefined): number {
+	if (raw === undefined || raw.trim() === "") throw new GcUsageError(`${flag}_requires_non_negative_integer`);
+	if (!/^\d+$/.test(raw.trim())) throw new GcUsageError(`${flag}_requires_non_negative_integer`);
+	const value = Number(raw.trim());
+	if (!Number.isInteger(value) || value < 0) throw new GcUsageError(`${flag}_requires_non_negative_integer`);
+	return value;
+}
+
 function parseGcArgs(argv: string[]): ParsedGcArgs {
 	let json = false;
 	let prune = false;
 	let repairSessionIndex = false;
+	let disk = false;
+	let nativesKeepVersions: number | undefined;
 
 	let dryRun = false;
 	let help = false;
-	for (const arg of argv) {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
 		switch (arg) {
 			case "--json":
 			case "-j":
@@ -283,7 +308,15 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 			case "--repair-session-index":
 				repairSessionIndex = true;
 				break;
-
+			case "--disk":
+				disk = true;
+				break;
+			case "--natives-keep-versions": {
+				const next = argv[i + 1];
+				nativesKeepVersions = parsePositiveIntFlag("--natives-keep-versions", next);
+				i++;
+				break;
+			}
 			case "--dry-run":
 				dryRun = true;
 				break;
@@ -292,14 +325,25 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 				help = true;
 				break;
 			default:
+				if (arg.startsWith("--natives-keep-versions=")) {
+					nativesKeepVersions = parsePositiveIntFlag(
+						"--natives-keep-versions",
+						arg.slice("--natives-keep-versions=".length),
+					);
+					break;
+				}
 				throw new GcUsageError(`unknown_flag:${arg}`);
 		}
 	}
 	if (repairSessionIndex && prune) throw new GcUsageError("repair_session_index_cannot_combine_with_prune");
 	if (repairSessionIndex && dryRun) throw new GcUsageError("repair_session_index_cannot_combine_with_dry_run");
+	if (repairSessionIndex && disk) throw new GcUsageError("repair_session_index_cannot_combine_with_disk");
+	if (nativesKeepVersions !== undefined && !disk) {
+		throw new GcUsageError("natives_keep_versions_requires_disk");
+	}
 	// Explicit --dry-run always wins over --prune/--force.
 	if (dryRun) prune = false;
-	return { json, prune, repairSessionIndex, help };
+	return { json, prune, repairSessionIndex, disk, nativesKeepVersions, help };
 }
 
 /**
@@ -372,11 +416,17 @@ export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext
  * - hard discovery errors => 1 (both modes)
  * - prune mode with a failed intended removal => 1
  * - warnings alone never fail the run
+ * - disk pass discovery errors => 1
+ * - disk prune mode with a failed intended removal => 1
  * - otherwise => 0
  */
 export function computeExitCode(report: GcReport): number {
 	if (report.errors.length > 0) return 1;
 	if (!report.dry_run && report.counts.failed > 0) return 1;
+	if (report.disk) {
+		if (report.disk.errors.length > 0) return 1;
+		if (!report.disk.dry_run && report.disk.counts.failed > 0) return 1;
+	}
 	return 0;
 }
 
@@ -419,6 +469,7 @@ export async function runGjcGcCommand(
 	cwd: string = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 	adapters?: GcStoreAdapter[],
+	diskDeps?: GcDiskDeps,
 ): Promise<GcRunResult> {
 	let parsed: ParsedGcArgs;
 	try {
@@ -437,6 +488,59 @@ export async function runGjcGcCommand(
 	const report = await collectGcReport(resolvedAdapters, ctx, parsed.prune);
 	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
 	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, resolveGcAgentDir(env));
+
+	if (parsed.disk) {
+		try {
+			const options = await resolveGcDiskCollectOptions(
+				{
+					...diskDeps,
+					...(parsed.nativesKeepVersions !== undefined ? { keepVersions: parsed.nativesKeepVersions } : {}),
+				},
+				env,
+			);
+			report.disk = await collectGcDiskReport(options, parsed.prune);
+		} catch (error) {
+			// Fail closed: surface resolution failures without mutating disk state.
+			report.disk = {
+				dry_run: !parsed.prune,
+				policy: {
+					natives_keep_versions:
+						parsed.nativesKeepVersions ?? diskDeps?.keepVersions ?? DEFAULT_NATIVES_KEEP_VERSIONS,
+					natives_current_version: diskDeps?.currentNativesVersion ?? "unknown",
+					natives_dir: diskDeps?.nativesDir ?? env.GJC_NATIVES_DIR ?? "",
+				},
+				surfaces: { natives_versions: [] },
+				counts: {
+					discovered: 0,
+					kept: 0,
+					would_remove: 0,
+					removed: 0,
+					failed: 0,
+					reclaimable_bytes: 0,
+					reclaimed_bytes: 0,
+					by_surface: {
+						natives_versions: {
+							discovered: 0,
+							kept: 0,
+							would_remove: 0,
+							removed: 0,
+							failed: 0,
+							reclaimable_bytes: 0,
+							reclaimed_bytes: 0,
+						},
+					},
+				},
+				errors: [
+					{
+						surface: "natives_versions",
+						scope: "resolve",
+						message: error instanceof Error ? error.message : String(error),
+					},
+				],
+			};
+		}
+	}
+
 	const sessionIndexFailed =
 		report.session_index?.status === "corrupt" ||
 		report.session_index?.status === "unsupported" ||
@@ -448,20 +552,24 @@ export async function runGjcGcCommand(
 
 export function gcHelpText(): string {
 	return [
-		"gjc gc - garbage-collect stale GJC session/PID records",
+		"gjc gc - garbage-collect stale GJC session/PID records and optional disk caches",
 		"",
 		"USAGE",
-		"  $ gjc gc [--prune|--force] [--repair-session-index] [--json]",
-
+		"  $ gjc gc [--prune|--force] [--disk] [--natives-keep-versions <n>] [--repair-session-index] [--json]",
 		"",
 		"FLAGS",
-		"  --prune, --force  Actually remove stale records (default: dry-run report only)",
+		"  --prune, --force  Actually remove eligible records (default: dry-run report only)",
 		"  --dry-run         Force report-only mode (overrides --prune/--force)",
+		"  --disk            Opt-in disk-retention pass (natives version caches; dry-run unless --prune)",
+		"  --natives-keep-versions <n>  With --disk: keep current natives version plus <n> older predecessors (default: 2)",
 		"  -j, --json        Emit machine-readable JSON",
 		"  --repair-session-index  Explicitly quarantine a corrupt session-index suffix and retain its valid prefix",
 		"",
-		"Liveness-only: a record is removed only when its owning process is dead",
+		"Liveness: a PID-backed record is removed only when its owning process is dead",
 		"(ESRCH). Live / permission-denied / unknown processes are always kept.",
+		"",
+		"Disk (--disk): reclaims aged on-disk cache directories. First surface is",
+		"~/.gjc/natives/<version>/; sessions, blobs, backups, and worktrees are follow-ups.",
 		"",
 	].join("\n");
 }

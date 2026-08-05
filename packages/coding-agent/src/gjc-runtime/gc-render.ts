@@ -3,6 +3,7 @@
  * `gc-runtime.ts`; this module owns the human-readable grouped report.
  */
 
+import { formatBytes, GC_DISK_SURFACES, type GcDiskCandidate } from "./gc-disk";
 import type { GcRecord, GcReport, GcStore } from "./gc-runtime";
 import { GC_STORES } from "./gc-runtime";
 
@@ -15,7 +16,11 @@ const STORE_HEADINGS: Record<GcStore, string> = {
 	local_roots: "Session local roots",
 };
 
-function actionLabel(record: GcRecord): string {
+const DISK_SURFACE_HEADINGS: Record<(typeof GC_DISK_SURFACES)[number], string> = {
+	natives_versions: "Natives version caches",
+};
+
+function actionLabel(record: { action: GcRecord["action"]; error?: string; reason: string }): string {
 	switch (record.action) {
 		case "would_remove":
 			return "would remove";
@@ -36,6 +41,13 @@ function renderRecord(record: GcRecord): string {
 	const pidStatus = record.pid_status ? ` (${record.pid_status})` : "";
 	const note = record.detail ? ` — ${record.detail}` : "";
 	return `  [${actionLabel(record)}] ${target}${pid}${pidStatus} :: ${record.status} — ${record.reason}${note}`;
+}
+
+function renderDiskCandidate(candidate: GcDiskCandidate): string {
+	const size = formatBytes(candidate.bytes);
+	const trunc = candidate.bytes_truncated ? "~" : "";
+	const note = candidate.detail ? ` — ${candidate.detail}` : "";
+	return `  [${actionLabel(candidate)}] ${candidate.path} (${trunc}${size}) :: ${candidate.status} — ${candidate.reason}${note}`;
 }
 
 export function buildGcReportText(report: GcReport): string {
@@ -69,6 +81,33 @@ export function buildGcReportText(report: GcReport): string {
 			lines.push("  Upgrade GJC before attempting a repair; no index data was changed.");
 		if (index.status === "repaired")
 			lines.push("  Restart or re-register hosts whose only registration was in the quarantined suffix.");
+		lines.push("");
+	}
+
+	if (report.disk) {
+		const disk = report.disk;
+		lines.push(
+			`Disk retention (${disk.dry_run ? "dry run" : "prune"}): current natives=${disk.policy.natives_current_version} keep_predecessors=${disk.policy.natives_keep_versions}`,
+		);
+		lines.push(`  natives dir: ${disk.policy.natives_dir}`);
+		for (const surface of GC_DISK_SURFACES) {
+			const candidates = disk.surfaces[surface];
+			lines.push(`  ${DISK_SURFACE_HEADINGS[surface]} (${candidates.length})`);
+			if (candidates.length === 0) {
+				lines.push("    (none)");
+			} else {
+				for (const candidate of candidates) lines.push(`  ${renderDiskCandidate(candidate)}`);
+			}
+		}
+		if (disk.errors.length > 0) {
+			lines.push(`  Disk errors (${disk.errors.length})`);
+			for (const err of disk.errors) lines.push(`    [${err.surface}/${err.scope}] ${err.message}`);
+		}
+		const d = disk.counts;
+		lines.push(
+			`  Disk summary: discovered=${d.discovered} kept=${d.kept} ` +
+				`${disk.dry_run ? `would_remove=${d.would_remove} reclaimable=${formatBytes(d.reclaimable_bytes)}` : `removed=${d.removed} reclaimed=${formatBytes(d.reclaimed_bytes)} failed=${d.failed}`}`,
+		);
 		lines.push("");
 	}
 
