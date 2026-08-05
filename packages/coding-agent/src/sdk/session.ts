@@ -1177,12 +1177,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage.setRuntimePreferredCredentialSelector(provider, options.preferredCredentialSelector.selector);
 			runtimePreferredCredentialSelectorInstalled = true;
 		};
+		const preferredCredentialProvider = options.preferredCredentialSelector
+			? (options.preferredCredentialSelector.provider ??
+				authStorage.resolveRuntimePreferredCredentialSelectorProvider(options.preferredCredentialSelector.selector))
+			: undefined;
 		const earlyCredentialSelectorProvider = options.credentialSelector?.provider ?? options.model?.provider;
 		if (earlyCredentialSelectorProvider) {
 			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
 		}
-		const earlyPreferredCredentialSelectorProvider =
-			options.preferredCredentialSelector?.provider ?? options.model?.provider;
+		const earlyPreferredCredentialSelectorProvider = preferredCredentialProvider ?? options.model?.provider;
 		if (earlyPreferredCredentialSelectorProvider) {
 			installRuntimePreferredCredentialSelector(earlyPreferredCredentialSelectorProvider);
 		}
@@ -1280,21 +1283,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						? options.credentialSelector.selector
 						: undefined
 					: undefined;
+			const preferredCredentialSelector =
+				options.preferredCredentialSelector && !runtimePreferredCredentialSelectorInstalled
+					? options.preferredCredentialSelector.provider === undefined ||
+						options.preferredCredentialSelector.provider === candidate.provider
+						? options.preferredCredentialSelector.selector
+						: undefined
+					: undefined;
 			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
 			}
-			if (
-				options.preferredCredentialSelector?.provider &&
-				options.preferredCredentialSelector.provider !== candidate.provider
-			) {
+			if (preferredCredentialProvider && preferredCredentialProvider !== candidate.provider) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
 			}
 			const key = await modelRegistry
-				.getApiKey(candidate, providerSessionId, { credentialSelector })
+				.getApiKey(candidate, providerSessionId, { credentialSelector, preferredCredentialSelector })
 				.catch(error => {
-					if (credentialSelector) {
+					if (credentialSelector || preferredCredentialSelector) {
 						logger.debug("Credential selector did not match model availability candidate", {
 							provider: candidate.provider,
 							model: candidate.id,
@@ -1369,13 +1376,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					{ managedFallback: defaultModelEntries.length > 1 },
 				);
 				model = restoredDefaultResolution.model;
+				if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
+					model = undefined;
+				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 			});
 		}
 
 		// If still no model, try settings default.
 		// Skip settings fallback when an explicit model was requested.
-		if (!hasExplicitModel && !model && defaultRoleSpec.model) {
+		if (
+			!hasExplicitModel &&
+			!model &&
+			defaultRoleSpec.model &&
+			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
+		) {
 			const settingsDefaultModel = defaultRoleSpec.model;
 			logger.time("resolveSettingsDefaultModel", () => {
 				// defaultRoleSpec.model already comes from modelRegistry.getAvailable(),
@@ -2139,7 +2154,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 		if (options.preferredCredentialSelector && !runtimePreferredCredentialSelectorInstalled) {
-			const credentialProvider = options.preferredCredentialSelector.provider ?? model?.provider;
+			const credentialProvider = preferredCredentialProvider ?? model?.provider;
 			if (!credentialProvider) {
 				throw new Error(
 					`--prefer-credential ${options.preferredCredentialSelector.raw} requires a resolved model or an explicit provider prefix`,
@@ -2149,6 +2164,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!options.modelRegistry && !canRefreshModelsBeforeCredentialSelector) {
 				modelRegistry.refreshInBackground();
 			}
+		}
+		if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
+			throw new Error(
+				`--prefer-credential ${options.preferredCredentialSelector?.raw ?? ""} matches ${preferredCredentialProvider}, but the resolved model uses ${model.provider}`,
+			);
 		}
 		const customCommandsResult: CustomCommandsLoadResult = { commands: [], errors: [] };
 

@@ -296,6 +296,40 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("unqualified preferred credential overrides a default model from another provider", async () => {
+		const bedrockModel = modelRegistry.getAll().find(candidate => candidate.provider === "amazon-bedrock");
+		if (!bedrockModel) throw new Error("Expected a bundled amazon-bedrock model");
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "token-test-primary",
+				refresh: "refresh-test-primary",
+				expires: Date.now() + 60 * 60_000,
+				email: "primary@example.test",
+			},
+		]);
+		const preferredRow = authStorage.exportSnapshot().credentials.find(entry => entry.provider === "anthropic");
+		if (!preferredRow) throw new Error("Expected an anthropic credential row");
+		const settings = Settings.isolated();
+		settings.setModelRole("default", `${bedrockModel.provider}/${bedrockModel.id}`);
+
+		const { session } = await createAgentSession({
+			...buildSessionOptions(),
+			settings,
+			preferredCredentialSelector: {
+				selector: { kind: "id", value: String(preferredRow.id) },
+				raw: `id:${preferredRow.id}`,
+			},
+		});
+		try {
+			expect(session.model?.provider).toBe("anthropic");
+			expect(authStorage.hasRuntimePreferredCredentialSelector("anthropic")).toBe(true);
+			expect(authStorage.hasRuntimePreferredCredentialSelector("amazon-bedrock")).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("persists model substitution metadata on new session model_change", async () => {
 		const effectiveModel: Model = {
 			id: "gpt-5.5",

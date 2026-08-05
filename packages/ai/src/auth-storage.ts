@@ -622,6 +622,8 @@ type AuthApiKeyOptions = {
 	signal?: AbortSignal;
 	/** Pin selection to one stored credential instead of using round-robin/ranking. */
 	credentialSelector?: AuthCredentialSelector;
+	/** Prefer one stored OAuth credential while preserving fallback. */
+	preferredCredentialSelector?: AuthCredentialSelector;
 };
 export type AuthCredentialSelectorKind = "id" | "email" | "account" | "project";
 
@@ -1139,6 +1141,26 @@ export class AuthStorage {
 		return this.#runtimePreferredCredentialSelectors.has(resolveOAuthStorageProvider(provider));
 	}
 
+	/** Resolve an unqualified preferred selector to exactly one active OAuth provider. */
+	resolveRuntimePreferredCredentialSelectorProvider(selector: AuthCredentialSelector): string {
+		const providers = [...this.#data.entries()]
+			.filter(([, entries]) =>
+				entries.some(
+					entry => entry.credential.type === "oauth" && this.#credentialMatchesSelector(entry, selector),
+				),
+			)
+			.map(([provider]) => provider);
+		if (providers.length === 0) {
+			throw new Error(`No active credential found matching ${this.#formatCredentialSelector(selector)}`);
+		}
+		if (providers.length > 1) {
+			throw new Error(
+				`Preferred credential selector ${this.#formatCredentialSelector(selector)} matches multiple providers; use provider/${this.#formatCredentialSelector(selector)}`,
+			);
+		}
+		return providers[0]!;
+	}
+
 	/**
 	 * Opaque stored row id of the credential this session is currently using.
 	 *
@@ -1467,6 +1489,13 @@ export class AuthStorage {
 
 	#getCredentialSelector(provider: string, options?: AuthApiKeyOptions): AuthCredentialSelector | undefined {
 		return options?.credentialSelector ?? this.#runtimeCredentialSelectors.get(resolveOAuthStorageProvider(provider));
+	}
+
+	#getPreferredCredentialSelector(provider: string, options?: AuthApiKeyOptions): AuthCredentialSelector | undefined {
+		return (
+			options?.preferredCredentialSelector ??
+			this.#runtimePreferredCredentialSelectors.get(resolveOAuthStorageProvider(provider))
+		);
 	}
 
 	#assertCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector): void {
@@ -3332,7 +3361,10 @@ export class AuthStorage {
 					.map(selection => ({ selection, usage: null, usageChecked: false }));
 
 		if (!selectedCredential) {
-			const preferredSelector = this.#runtimePreferredCredentialSelectors.get(resolveOAuthStorageProvider(provider));
+			const preferredSelector = this.#getPreferredCredentialSelector(provider, options);
+			if (preferredSelector) {
+				this.#assertPreferredCredentialSelectorUsable(resolveOAuthStorageProvider(provider), preferredSelector);
+			}
 			const preferredSelection = preferredSelector
 				? this.#findCredentialBySelector(provider, preferredSelector)
 				: undefined;
