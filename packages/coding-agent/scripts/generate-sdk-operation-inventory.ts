@@ -37,6 +37,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:registerToolSessionCleanup":
 		"internal tool lifecycle cleanup registration, not a user-facing SDK control seam",
+	"agent_session:registerToolSessionTransitionCleanup":
+		"internal tool transition cleanup registration for shared artifact-manager ownership, not a user-facing SDK control seam",
 	"agent_session:nextToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setForcedToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillState": "internal accessor/plumbing, not a user-facing control seam",
