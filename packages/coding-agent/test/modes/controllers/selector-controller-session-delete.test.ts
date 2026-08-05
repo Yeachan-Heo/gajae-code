@@ -365,17 +365,11 @@ describe("SelectorController session deletion", () => {
 			// Give the event loop a tick so an unobserved rejection would fire.
 			await new Promise<void>(resolve => setImmediate(resolve));
 
-			expect(showError).toHaveBeenCalledWith(
-				"Managed session changed before migration authority was adopted.",
-			);
+			expect(showError).toHaveBeenCalledWith("Managed session changed before migration authority was adopted.");
 			expect(unhandled).not.toHaveBeenCalled();
 			// Strict fence: one preparation attempt, no switch, no auto-retry.
 			expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledTimes(1);
-			expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledWith(
-				selected.path,
-				"copy-retain",
-				identity,
-			);
+			expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledWith(selected.path, "copy-retain", identity);
 			expect(switchSession).not.toHaveBeenCalled();
 			// Current session remains the active one after recovery.
 			expect(ctx.sessionManager.getSessionFile()).toBe("/tmp/project/sessions/a.jsonl");

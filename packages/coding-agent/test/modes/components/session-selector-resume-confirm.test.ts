@@ -174,9 +174,7 @@ describe("SessionSelectorComponent resume consent", () => {
 			await new Promise<void>(resolve => setImmediate(resolve));
 
 			expect(selected).toHaveBeenCalledWith("/tmp/one.jsonl");
-			expect(text(component)).toContain(
-				"Error: Managed session changed before migration authority was adopted.",
-			);
+			expect(text(component)).toContain("Error: Managed session changed before migration authority was adopted.");
 			// Picker stays usable for another attempt (no auto-retry of the same candidate).
 			expect(text(component)).toContain("one");
 			expect(unhandled).not.toHaveBeenCalled();
