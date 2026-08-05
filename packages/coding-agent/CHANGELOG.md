@@ -6,6 +6,7 @@
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 - MiniMax M3 preset and profile ids canonicalized to `MiniMax-M3` (issue #3896): the `minimax` / `minimax-cn` onboarding presets and the `minimax-eco` / `minimax-medium` / `minimax-pro` builtin model profiles no longer reference the removed lowercase `minimax-m3` / `minimax-v3` first-class catalog ids.
+- Deep-interview round identity and input caps are now Unicode-canonical. Question text, selected options, and custom input are canonicalized to NFC before hashing and persisting, so the same Korean answer arriving in decomposed form (macOS-sourced pastes and some IME/clipboard paths emit NFD) no longer produces a second `answer_hash` — the documented append-or-merge no-op holds, and intent-review approval evidence still matches the user's recorded answer. Free-text caps are measured on the NFC form, so decomposed Hangul is charged the same character budget as the identical composed text instead of 2–3 code points per syllable (#3871).
 
 ## [0.12.12] - 2026-08-05
 

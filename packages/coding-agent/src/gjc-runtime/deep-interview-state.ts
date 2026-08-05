@@ -97,13 +97,34 @@ export function hashContent(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 32);
 }
 
+/**
+ * Canonicalize interview prose to NFC.
+ *
+ * Hangul, unlike most Latin prose, routinely reaches the interview in both
+ * composed and decomposed form (macOS-sourced pastes and some IME/clipboard
+ * paths emit NFD), and the two forms are the same text for the user while
+ * being different JavaScript strings. Canonicalizing at the identity and
+ * length boundaries keeps one round per answer and keeps the character caps
+ * script-fair: decomposed Hangul otherwise costs two to three code points per
+ * syllable against the same budget.
+ */
+export function canonicalizeDeepInterviewText(value: string): string {
+	return value.normalize("NFC");
+}
+
 export function questionHash(questionText: string): string {
-	return hashContent(questionText);
+	return hashContent(canonicalizeDeepInterviewText(questionText));
 }
 
 export function answerHash(selectedOptions: string[] | undefined, customInput: string | undefined): string {
 	return createHash("sha256")
-		.update(JSON.stringify({ selected: selectedOptions ?? [], custom: customInput ?? null }))
+		.update(
+			JSON.stringify({
+				selected: (selectedOptions ?? []).map(canonicalizeDeepInterviewText),
+				custom:
+					customInput === undefined || customInput === null ? null : canonicalizeDeepInterviewText(customInput),
+			}),
+		)
 		.digest("hex");
 }
 
@@ -471,10 +492,13 @@ export function assertDeepInterviewStructuredResponseWithinLimit(value: unknown)
 /**
  * Assert a free-text input is within its size cap. Never inspects content for shell
  * metacharacters — free-text fields accept prose verbatim; this only bounds length.
+ * The cap is measured on the NFC form so decomposed Hangul is charged the same
+ * budget as the identical composed text.
  */
 export function assertDeepInterviewInputWithinLimit(value: string, max: number, fieldName = "input"): void {
 	if (typeof value !== "string") throw new Error(`${fieldName} must be a string`);
-	if (deepInterviewCharacterCount(value) > max) throw new Error(`${fieldName} exceeds max length ${max}`);
+	if (deepInterviewCharacterCount(canonicalizeDeepInterviewText(value)) > max)
+		throw new Error(`${fieldName} exceeds max length ${max}`);
 }
 
 /** Validate user-supplied deep-interview prose before an envelope is persisted. */

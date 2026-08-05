@@ -11,6 +11,7 @@ import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentManifest,
 	assertDeepInterviewStructuredResponseWithinLimit,
+	canonicalizeDeepInterviewText,
 	createDeepInterviewIntentManifest,
 	type DeepInterviewEstablishedFact,
 	type DeepInterviewIntentItem,
@@ -106,16 +107,19 @@ export function buildAnswerShell(
 	input: DeepInterviewAnswerInput,
 	now: string = new Date().toISOString(),
 ): DeepInterviewRoundRecord {
+	const questionText = canonicalizeDeepInterviewText(input.questionText);
+	const selectedOptions = input.selectedOptions?.map(canonicalizeDeepInterviewText);
+	const customInput = input.customInput === undefined ? undefined : canonicalizeDeepInterviewText(input.customInput);
 	return {
 		round_key: deriveRoundKey(input.interviewId, input),
 		round_id: input.round_id,
 		round: input.round,
 		question_id: input.questionId,
-		question_text: input.questionText,
-		question_hash: questionHash(input.questionText),
-		answer_hash: answerHash(input.selectedOptions, input.customInput),
-		selected_options: input.selectedOptions,
-		custom_input: input.customInput,
+		question_text: questionText,
+		question_hash: questionHash(questionText),
+		answer_hash: answerHash(selectedOptions, customInput),
+		selected_options: selectedOptions,
+		custom_input: customInput,
 		component: input.component,
 		dimension: input.dimension,
 		ambiguity_at_ask: input.ambiguity,
