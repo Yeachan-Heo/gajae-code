@@ -21,6 +21,7 @@ import {
 	resolveTelemetry,
 	type TelemetryHookContext,
 } from "@gajae-code/agent-core/telemetry";
+import type { AgentRunCoverage, AgentRunSummary } from "@gajae-code/agent-core/run-collector";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
 import type { Message } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
@@ -693,6 +694,159 @@ describe("agent-loop OTEL instrumentation", () => {
 		expect(cost && "usd" in cost ? cost.usd : undefined).toBe(0.05);
 		expect(cost && "usd" in cost ? cost.inputUsd : undefined).toBe(0.01);
 		expect(cost && "usd" in cost ? cost.outputUsd : undefined).toBe(0.04);
+	});
+
+	it("usage-only mode (spans: false) fires onChatUsage and cost hooks without creating spans (C3)", async () => {
+		const mock = createMockModel({
+			...MOCK_IDENT,
+			responses: [
+				{
+					content: ["ok"],
+					stopReason: "stop",
+					usage: { input: 40, output: 20, totalTokens: 60 },
+				},
+			],
+		});
+		const events: ChatUsageEvent[] = [];
+		const spanStarts: unknown[] = [];
+		let resolveCalls = 0;
+		const runEnds: Array<{ summary: AgentRunSummary; coverage: AgentRunCoverage }> = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			telemetry: {
+				spans: false,
+				resolveAttributes: () => {
+					resolveCalls += 1;
+					throw new Error("resolveAttributes must not run in usage-only mode");
+				},
+				costEstimator: () => ({ usd: 0.02, inputUsd: 0.01, outputUsd: 0.01 }),
+				onSpanStart: ctx => {
+					spanStarts.push(ctx);
+				},
+				onChatUsage: event => {
+					events.push(event);
+				},
+				onRunEnd: (summary, coverage) => {
+					runEnds.push({ summary, coverage });
+				},
+			},
+		};
+		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+		expect(spanStarts).toHaveLength(0);
+		expect(events).toHaveLength(1);
+		expect(events[0]?.usage.totalTokens).toBe(60);
+		const cost = events[0]?.cost;
+		expect(cost && "usd" in cost ? cost.usd : undefined).toBe(0.02);
+		// The placeholder span is non-recording: no real span context was created.
+		expect(events[0]?.span.isRecording()).toBe(false);
+		expect(resolveCalls).toBe(0);
+		expect(events[0]?.attributes).toBeUndefined();
+		expect(runEnds).toHaveLength(1);
+		expect(runEnds[0]?.summary.chats.total).toBe(1);
+		expect(runEnds[0]?.summary.usage.inputTokens).toBe(40);
+		expect(runEnds[0]?.summary.usage.outputTokens).toBe(20);
+		expect(runEnds[0]?.summary.usage.totalTokens).toBe(60);
+		expect(runEnds[0]?.coverage.modelsUsed).toEqual(["mock-model"]);
+		expect(runEnds[0]?.coverage.providersUsed).toEqual(["mock-provider"]);
+	});
+
+	it("usage-only mode still emits usage through recordManualChatTelemetry (C3)", async () => {
+		const events: ChatUsageEvent[] = [];
+		let resolveCalls = 0;
+		const telemetry = resolveTelemetry(
+			{
+				spans: false,
+				resolveAttributes: () => {
+					resolveCalls += 1;
+					throw new Error("resolveAttributes must not run in usage-only mode");
+				},
+				onChatUsage: event => {
+					events.push(event);
+				},
+			},
+			undefined,
+		);
+		const mock = createMockModel({ ...MOCK_IDENT, responses: [] });
+		const span = await recordManualChatTelemetry(telemetry, {
+			model: mock.model,
+			responseModel: "manual-model",
+			stepNumber: 0,
+			usage: { input: 5, output: 3, totalTokens: 8 } as never,
+		});
+		expect(span).toBeUndefined();
+		expect(events).toHaveLength(1);
+		expect(events[0]?.usage.totalTokens).toBe(8);
+		expect(resolveCalls).toBe(0);
+		expect(events[0]?.attributes).toBeUndefined();
+	});
+
+	it("usage-only mode delivers onRunEnd exactly once for a failed run", async () => {
+		const mock = createMockModel({ ...MOCK_IDENT, responses: [] });
+		const runEnds: Array<{ summary: AgentRunSummary; coverage: AgentRunCoverage }> = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			syncContextBeforeModelCall: () => {
+				throw new Error("usage-only sync failure");
+			},
+			telemetry: {
+				spans: false,
+				onRunEnd: (summary, coverage) => runEnds.push({ summary, coverage }),
+			},
+		};
+		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		const stream = agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream);
+
+		await expect(Array.fromAsync(stream)).rejects.toThrow("usage-only sync failure");
+		expect(runEnds).toHaveLength(1);
+		expect(runEnds[0]?.summary.chats.total).toBe(0);
+	});
+
+	it("usage-only mode delivers onRunEnd exactly once and counts tools", async () => {
+		const mock = createMockModel({
+			...MOCK_IDENT,
+			responses: [
+				{
+					content: [{ type: "toolCall", id: "tc-usage-only", name: "echo", arguments: { value: "x" } }],
+					usage: { input: 10, output: 4, totalTokens: 14 },
+				},
+				{
+					content: ["done"],
+					usage: { input: 8, output: 3, totalTokens: 11 },
+				},
+			],
+		});
+		const runEnds: Array<{ summary: AgentRunSummary; coverage: AgentRunCoverage }> = [];
+		const echoSchema = z.object({ value: z.string() });
+		const echoTool: AgentTool<typeof echoSchema> = {
+			name: "echo",
+			label: "Echo",
+			description: "echoes input",
+			parameters: echoSchema,
+			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			telemetry: {
+				spans: false,
+				onRunEnd: (summary, coverage) => runEnds.push({ summary, coverage }),
+			},
+		};
+		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [echoTool] };
+		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+		expect(runEnds).toHaveLength(1);
+		expect(runEnds[0]?.summary.chats.total).toBe(2);
+		expect(runEnds[0]?.summary.tools.total).toBe(1);
+		expect(runEnds[0]?.summary.tools.ok).toBe(1);
+		expect(runEnds[0]?.summary.usage.totalTokens).toBe(25);
+		expect(runEnds[0]?.coverage.toolsAvailable).toEqual(["echo"]);
+		expect(runEnds[0]?.coverage.toolsInvoked).toEqual(["echo"]);
+		expect(runEnds[0]?.coverage.toolsUnused).toEqual([]);
 	});
 
 	it("propagates unavailable cost reason to onChatUsage", async () => {

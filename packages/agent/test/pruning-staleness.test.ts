@@ -6,8 +6,8 @@ import {
 	DEFAULT_PRUNE_CONFIG,
 	type PruneConfig,
 	pruneAssistantToolArguments,
-	pruneToolOutputs,
 } from "../src/compaction/pruning";
+import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 
 /**
  * Staleness-aware pruning: superseded tool results (same target read/searched

@@ -9,6 +9,7 @@
  */
 
 import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
+import { createHash } from "node:crypto";
 import { sanitizeText } from "@gajae-code/utils";
 import type { AgentMessage } from "../types";
 import { estimateEntryTokens, estimateTextTokensHeuristic } from "./compaction";
@@ -40,26 +41,52 @@ export const DEFAULT_PRUNE_CONFIG: PruneConfig = {
 	staleOverridableTools: ["read"],
 };
 
-export interface PrunedOriginal {
+export interface ToolOutputPruneDigest {
 	entryId: string;
-	toolName?: string;
-	originalText: string;
-	tokens: number;
-	/** Whether originalText captures all-text result content without omission. */
-	complete?: boolean;
+	sha256: string;
+	bytes: number;
 }
 
-export interface PruneResult {
+export interface ToolOutputPruneReplacement {
+	entryId: string;
+	replacementText: string;
+	/** Text-only results are the only entries safe to evict to an artifact. */
+	complete: boolean;
+	tokens: number;
+}
+
+export interface ToolOutputPrunePlan {
 	prunedCount: number;
 	tokensSaved: number;
-	originals: PrunedOriginal[];
-	/**
-	 * The mutated message entries. Callers whose entry source returns
-	 * materialized copies (not live references) must write these back into
-	 * their canonical store by id.
-	 */
-	prunedEntries: SessionMessageEntry[];
+	/** Digest-only identity records; no original output text is retained. */
+	digests: readonly ToolOutputPruneDigest[];
+	/** Immutable replacement proposals keyed by entry id. */
+	replacements: readonly ToolOutputPruneReplacement[];
 }
+
+export interface ToolOutputPruneEvictionHandle {
+	v: 1;
+	artifactId: string;
+	uri: string;
+	encoding: "utf-8";
+	bytes: number;
+	sha256: string;
+	complete: true;
+}
+
+export interface ToolOutputPruneCommitReplacement {
+	replacementText?: string;
+	eviction?: ToolOutputPruneEvictionHandle;
+}
+
+export interface ToolOutputPruneCommitOptions {
+	replacements?: ReadonlyMap<string, ToolOutputPruneCommitReplacement>;
+}
+
+export type ToolOutputCommitOutcome =
+	| { entryId: string; outcome: "committed" }
+	| { entryId: string; outcome: "mismatch"; diagnostic: string }
+	| { entryId: string; outcome: "unavailable"; diagnostic: string };
 
 const ERROR_DIGEST_MAX_CHARS = 240;
 const TAIL_DIGEST_MAX_CHARS = 160;
@@ -75,7 +102,7 @@ function createGenericPrunedNotice(tokens: number): string {
 	return `[Output truncated - ${tokens} tokens]`;
 }
 
-function capturedTextContent(message: ToolResultMessage): { text: string; complete: boolean } {
+export function extractToolOutputText(message: ToolResultMessage): { text: string; complete: boolean } {
 	if (typeof message.content === "string") return { text: message.content, complete: true };
 	const textBlocks: string[] = [];
 	let complete = true;
@@ -87,7 +114,7 @@ function capturedTextContent(message: ToolResultMessage): { text: string; comple
 }
 
 function firstTextContent(message: ToolResultMessage): string {
-	return capturedTextContent(message).text;
+	return extractToolOutputText(message).text;
 }
 
 function firstErrorLine(text: string): string | undefined {
@@ -159,7 +186,7 @@ function resultDigest(message: ToolResultMessage, call?: ToolCall): string | und
 	return summary ? `summary=${truncateField(summary, ERROR_DIGEST_MAX_CHARS)}` : undefined;
 }
 
-function createPrunedNotice(tokens: number, message?: ToolResultMessage, call?: ToolCall, artifact?: string): string {
+export function createPrunedNotice(tokens: number, message?: ToolResultMessage, call?: ToolCall, artifact?: string): string {
 	const generic = createGenericPrunedNotice(tokens);
 	const digest =
 		truncateField(message ? (resultDigest(message, call) ?? "") : "", DIGEST_TOTAL_MAX_CHARS) || undefined;
@@ -727,11 +754,8 @@ function recentTurnFenceStart(entries: SessionEntry[], protectRecentTurns: numbe
 }
 
 /**
- * Read-only pass that collects the tool-result entries that {@link pruneToolOutputs}
- * would prune, plus the total estimated token savings. Shared by the mutating
- * prune and the non-mutating {@link estimateToolOutputPruneSavings} so the
- * maintenance gate (Finding 13) can decide whether pruning is worth a cache-epoch
- * reset without rewriting history.
+ * Read-only candidate collection shared by the digest-only plan and the
+ * non-mutating {@link estimateToolOutputPruneSavings} gate.
  */
 function collectToolOutputPruneCandidates(
 	entries: SessionEntry[],
@@ -780,7 +804,7 @@ function collectToolOutputPruneCandidates(
 		}
 
 		const call = callsById.get(message.toolCallId);
-		const captured = capturedTextContent(message);
+		const captured = extractToolOutputText(message);
 		const notice = createPrunedNotice(tokens, message, call);
 		const savings = estimatePrunedSavings(tokens, notice);
 		const errorNoticeGrows = message.isError === true && notice.length > captured.text.length;
@@ -816,11 +840,8 @@ function minimumSavings(config: PruneConfig, options: PruneToolOutputsOptions = 
 }
 
 /**
- * Estimate the conservative final token savings {@link pruneToolOutputs} would
- * achieve, without mutating entries or invoking the artifact-reference planner.
- * When `artifactRefMaxChars` is present, the estimate budgets that full length
- * for every complete candidate so the real artifact-backed prune cannot save
- * less than the estimate.
+ * Estimate conservative savings for a digest-only prune plan without mutating
+ * entries or invoking artifact publication.
  */
 export function estimateToolOutputPruneSavings(
 	entries: SessionEntry[],
@@ -855,40 +876,19 @@ export function shouldRunMaintenancePrune(args: {
 }
 
 const MAX_ARTIFACT_REF_CHARS = 16_384;
-const ARTIFACT_REF_PREFIX_PATTERN = /^artifact:\/\/\d+/;
-
-function isValidArtifactRef(value: string): boolean {
-	return ARTIFACT_REF_PREFIX_PATTERN.exec(value)?.[0] === value;
-}
 
 export interface PruneToolOutputsOptions {
 	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
 	relaxedMinimum?: number;
-	/**
-	 * Conservative maximum ASCII length of every planned artifact reference.
-	 * Required when `artifactRef` is provided so estimation and final admission
-	 * use the same worst-case notice size.
-	 */
+	/** Conservative maximum ASCII length of every planned artifact reference. */
 	artifactRefMaxChars?: number;
-	/**
-	 * Plan a numeric `artifact://<id>` reference for a candidate's original
-	 * text. The callback may reserve an in-memory identifier, but MUST NOT publish
-	 * files or mutate session entries; publish only the originals returned by a
-	 * successful {@link pruneToolOutputs} result.
-	 */
-	artifactRef?: (candidate: PrunedOriginal) => string | undefined;
 }
 
-interface PlannedToolOutputPruneCandidate extends ToolOutputPruneCandidate {
-	original: PrunedOriginal;
-}
+interface PlannedToolOutputPruneCandidate extends ToolOutputPruneCandidate {}
 
 function artifactRefMaxChars(options: PruneToolOutputsOptions): number {
 	const maxChars = options.artifactRefMaxChars;
-	if (maxChars === undefined) {
-		if (options.artifactRef) throw new Error("artifactRefMaxChars is required when artifactRef is provided");
-		return 0;
-	}
+	if (maxChars === undefined) return 0;
 	if (!Number.isSafeInteger(maxChars) || maxChars <= 0 || maxChars > MAX_ARTIFACT_REF_CHARS) {
 		throw new RangeError(`artifactRefMaxChars must be an integer between 1 and ${MAX_ARTIFACT_REF_CHARS}`);
 	}
@@ -902,13 +902,6 @@ function planToolOutputPruneCandidates(
 	const maxArtifactChars = artifactRefMaxChars(options);
 	const artifactBudget = maxArtifactChars > 0 ? "x".repeat(maxArtifactChars) : undefined;
 	return candidates.flatMap(candidate => {
-		const original: PrunedOriginal = {
-			entryId: candidate.entry.id,
-			toolName: (candidate.entry.message as ToolResultMessage).toolName,
-			originalText: candidate.originalText,
-			tokens: candidate.tokens,
-			complete: candidate.complete,
-		};
 		const notice = createPrunedNotice(
 			candidate.tokens,
 			candidate.entry.message as ToolResultMessage,
@@ -918,63 +911,89 @@ function planToolOutputPruneCandidates(
 		const savings = estimatePrunedSavings(candidate.tokens, notice);
 		const errorNoticeGrows =
 			(candidate.entry.message as ToolResultMessage).isError === true &&
-			notice.length > original.originalText.length;
-		return savings > 0 && !errorNoticeGrows ? [{ ...candidate, notice, savings, original }] : [];
+			notice.length > candidate.originalText.length;
+		return savings > 0 && !errorNoticeGrows ? [{ ...candidate, notice, savings }] : [];
 	});
 }
 
-export function pruneToolOutputs(
+function emptyToolOutputPrunePlan(): ToolOutputPrunePlan {
+	return { prunedCount: 0, tokensSaved: 0, digests: [], replacements: [] };
+}
+
+/**
+ * Build a digest-only pruning plan. This function is deliberately read-only:
+ * candidates are inspected in private locals and the returned plan never keeps
+ * references to the source entries or their original output text.
+ */
+export function planToolOutputPrune(
 	entries: SessionEntry[],
 	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
 	options: PruneToolOutputsOptions = {},
-): PruneResult {
+): ToolOutputPrunePlan {
 	const { candidates, tokensSaved: baseTokensSaved } = collectToolOutputPruneCandidates(entries, config);
 	const minimum = minimumSavings(config, options);
+	if (baseTokensSaved < minimum || candidates.length === 0) return emptyToolOutputPrunePlan();
 
-	if (baseTokensSaved < minimum || candidates.length === 0) {
-		return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
-	}
+	const planned = planToolOutputPruneCandidates(candidates, options);
+	const tokensSaved = planned.reduce((total, candidate) => total + candidate.savings, 0);
+	if (tokensSaved < minimum || planned.length === 0) return emptyToolOutputPrunePlan();
 
-	const plannedCandidates = planToolOutputPruneCandidates(candidates, options);
-	const plannedTokensSaved = plannedCandidates.reduce((total, candidate) => total + candidate.savings, 0);
-	if (plannedTokensSaved < minimum || plannedCandidates.length === 0) {
-		return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
-	}
-
-	const maxArtifactChars = artifactRefMaxChars(options);
-	const candidatesWithArtifacts = plannedCandidates.map(candidate => {
-		const artifact = candidate.complete ? options.artifactRef?.(candidate.original) : undefined;
-		if (artifact !== undefined && !isValidArtifactRef(artifact)) {
-			throw new Error(
-				`artifactRef must be a numeric artifact://<id> reference for entry ${candidate.original.entryId}`,
-			);
-		}
-		if (artifact !== undefined && artifact.length > maxArtifactChars) {
-			throw new Error(`artifactRef exceeded artifactRefMaxChars for entry ${candidate.original.entryId}`);
-		}
-		const notice = createPrunedNotice(
-			candidate.tokens,
-			candidate.entry.message as ToolResultMessage,
-			candidate.call,
-			artifact,
-		);
-		return { ...candidate, notice, savings: estimatePrunedSavings(candidate.tokens, notice) };
+	const digests = planned.map(candidate => ({
+		entryId: candidate.entry.id,
+		bytes: Buffer.byteLength(candidate.originalText, "utf8"),
+		sha256: createHash("sha256").update(candidate.originalText, "utf8").digest("hex"),
+	}));
+	const replacements = planned.map(candidate => ({
+		entryId: candidate.entry.id,
+		replacementText: candidate.notice,
+		complete: candidate.complete,
+		tokens: candidate.tokens,
+	}));
+	return Object.freeze({
+		prunedCount: planned.length,
+		tokensSaved,
+		digests: Object.freeze(digests),
+		replacements: Object.freeze(replacements),
 	});
-	const tokensSaved = candidatesWithArtifacts.reduce((total, candidate) => total + candidate.savings, 0);
-	if (tokensSaved < minimum) {
-		throw new Error("artifact-backed prune savings fell below the conservative admission estimate");
-	}
+}
 
-	const prunedAt = Date.now();
-	const prunedEntries: SessionMessageEntry[] = [];
-	const originals: PrunedOriginal[] = [];
-	for (const candidate of candidatesWithArtifacts) {
-		const message = candidate.entry.message as ToolResultMessage;
-		message.content = [{ type: "text", text: candidate.notice }];
-		message.prunedAt = prunedAt;
-		prunedEntries.push(candidate.entry);
-		originals.push(candidate.original);
-	}
-
-	return { prunedCount: candidatesWithArtifacts.length, tokensSaved, originals, prunedEntries };
+/**
+ * Re-check and commit a digest-only plan against the supplied live entries.
+ * Each entry is mutated only after its canonical full-text digest matches.
+ */
+export function commitToolOutputPrune(
+	entries: SessionEntry[],
+	plan: ToolOutputPrunePlan,
+	options: ToolOutputPruneCommitOptions = {},
+): ToolOutputCommitOutcome[] {
+	const byId = new Map(entries.filter((e): e is SessionMessageEntry => e.type === "message").map(e => [e.id, e]));
+	const proposals = new Map(plan.replacements.map(replacement => [replacement.entryId, replacement]));
+	return plan.digests.map(digest => {
+		const entry = byId.get(digest.entryId);
+		if (!entry) return { entryId: digest.entryId, outcome: "unavailable", diagnostic: "entry not found" };
+		const message = entry.message as ToolResultMessage;
+		const captured = extractToolOutputText(message);
+		const bytes = Buffer.byteLength(captured.text, "utf8");
+		const sha = createHash("sha256").update(captured.text, "utf8").digest("hex");
+		if (bytes !== digest.bytes || sha !== digest.sha256) {
+			return { entryId: digest.entryId, outcome: "mismatch", diagnostic: "tool output changed before commit" };
+		}
+		const proposal = proposals.get(digest.entryId);
+		if (!proposal) return { entryId: digest.entryId, outcome: "unavailable", diagnostic: "replacement proposal missing" };
+		const override = options.replacements?.get(digest.entryId);
+		const replacementText = override?.replacementText ?? proposal.replacementText;
+		message.content = [{ type: "text", text: replacementText }];
+		message.prunedAt = Date.now();
+		if (override?.eviction) {
+			const details =
+				message.details && typeof message.details === "object" && !Array.isArray(message.details)
+					? (message.details as Record<string, unknown>)
+					: {};
+			const meta = details.meta && typeof details.meta === "object" && !Array.isArray(details.meta)
+					? (details.meta as Record<string, unknown>)
+					: {};
+			message.details = { ...details, meta: { ...meta, eviction: override.eviction } };
+		}
+		return { entryId: digest.entryId, outcome: "committed" };
+	});
 }

@@ -1521,11 +1521,17 @@ async function runLoopBody(
 					awaitEventDrain: (invocationSignal: AbortSignal) =>
 						stream.waitForConsumerDrain(AbortSignal.any([loopSignal, invocationSignal])),
 				};
-				const maintenanceOutcome = await config.maintainContext(currentContext, lifecycle);
+				const maintenanceResult = await config.maintainContext(currentContext, lifecycle);
+				const maintenance = typeof maintenanceResult === "string" ? { outcome: maintenanceResult } : maintenanceResult;
 				// A callback can settle after its loop has been cancelled. Never let a
 				// stale "not-needed" fall through to streamAssistantResponse, which
 				// invokes the provider before it observes the aborted signal.
-				const outcome = loopSignal.aborted ? "aborted" : maintenanceOutcome;
+				const outcome = loopSignal.aborted ? "aborted" : maintenance.outcome;
+				if (maintenance.releaseCurrentContext) {
+					currentContext.messages.length = 0;
+					newMessages.length = 0;
+					convertedContextCache.delete(config);
+				}
 
 				if (outcome !== "not-needed") {
 					publishAgentEnd(
@@ -2440,6 +2446,7 @@ async function streamAssistantResponse(
 		});
 	} catch (err) {
 		failChatSpan(telemetry, chatSpan, {
+			stepNumber: chatStepNumber,
 			errorObject: err,
 			responseHeaders: capturedHeaders,
 			baseUrl: config.model.baseUrl,

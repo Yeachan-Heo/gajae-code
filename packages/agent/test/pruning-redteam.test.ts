@@ -4,8 +4,8 @@ import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/c
 import {
 	type PruneConfig,
 	pruneAssistantToolArguments,
-	pruneToolOutputs,
 } from "@gajae-code/agent-core/compaction/pruning";
+import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 import type { ToolCall, ToolResultMessage } from "@gajae-code/ai/types";
 
 const timestamp = "2026-06-11T00:00:00.000Z";

@@ -198,6 +198,11 @@ export type ManagedAttemptOutcomeHandler = (
  */
 export type MidRunMaintenanceOutcome = "not-needed" | "pruned" | "compacted" | "promoted" | "failed" | "aborted";
 
+export interface ContextMaintenanceResult {
+	outcome: MidRunMaintenanceOutcome;
+	releaseCurrentContext?: boolean;
+}
+
 /**
  * Configuration for the agent loop.
  */
@@ -380,7 +385,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 			signal: AbortSignal;
 			awaitEventDrain: (invocationSignal: AbortSignal) => Promise<void>;
 		},
-	) => Promise<MidRunMaintenanceOutcome> | MidRunMaintenanceOutcome;
+	) => Promise<ContextMaintenanceResult | MidRunMaintenanceOutcome> | ContextMaintenanceResult | MidRunMaintenanceOutcome;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.

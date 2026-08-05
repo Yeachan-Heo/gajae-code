@@ -297,7 +297,7 @@ export class AppendOnlyContextManager {
 
 		const newMsgs = messagesToSync.slice(this.#lastSyncCount);
 		for (const msg of newMsgs) {
-			this.log.append(msg);
+			this.log.append(cloneJson(msg));
 		}
 
 		this.#lastSyncCount = messagesToSync.length;
@@ -341,6 +341,18 @@ export class AppendOnlyContextManager {
 		this.log.replaceTail(message);
 	}
 
+
+	/** Release provider-normalized retainers as one history-rewrite transaction. */
+	releaseAfterHistoryRewrite(options: { preserveSeededPrefix?: boolean } = {}): void {
+		const seeded = options.preserveSeededPrefix === true ? this.#seededPrefixCount : 0;
+		const prefix = seeded > 0 ? this.log.entries().slice(0, seeded) : [];
+		this.log.clear();
+		if (prefix.length > 0) this.log.extend(prefix);
+		this.#lastSyncCount = prefix.length;
+		this.#seededPrefixCount = prefix.length;
+		this.#syncedHashes = this.#hashRange(prefix, 0, prefix.length);
+		this.invalidate();
+	}
 	invalidate(): void {
 		this.prefix.invalidate();
 	}
@@ -384,7 +396,7 @@ export class AppendOnlyContextManager {
 	/** F9: reset the log to a new provider-visible baseline after seeded compaction/rebase. */
 	#rebaseToBaseline(messages: readonly unknown[], seededPrefixCount = 0): void {
 		this.log.clear();
-		this.log.extend([...messages]);
+		this.log.extend(messages.map(message => cloneJson(message)));
 		this.#lastSyncCount = messages.length;
 		this.#seededPrefixCount = seededPrefixCount;
 		this.#syncedHashes = this.#hashRange(messages, 0, messages.length);

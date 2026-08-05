@@ -41,6 +41,7 @@ import {
 	type Attributes,
 	type AttributeValue,
 	context,
+	INVALID_SPAN_CONTEXT,
 	type Span,
 	SpanKind,
 	SpanStatusCode,
@@ -321,6 +322,12 @@ export interface TelemetryHookContext extends TelemetryAttributeContext {
  */
 export interface AgentTelemetryConfig {
 	/**
+	 * Emit OTEL spans. Default `true`. Set `false` for usage-only telemetry
+	 * (contract C3): `onChatUsage` / `costEstimator` / `onCostDelta` still fire
+	 * per chat step, but no span is created and no span/attribute work runs.
+	 */
+	readonly spans?: boolean;
+	/**
 	 * Override the tracer instance. When omitted, the loop calls
 	 * `trace.getTracer(tracerName ?? DEFAULT_TRACER_NAME)` lazily on first use.
 	 */
@@ -412,6 +419,8 @@ export interface AgentTelemetryConfig {
 export interface AgentTelemetry {
 	readonly config: AgentTelemetryConfig;
 	readonly tracer: Tracer;
+	/** False when the config disables span emission (usage-only telemetry, C3). */
+	readonly spansEnabled: boolean;
 	readonly captureMessageContent: boolean;
 	readonly contentCapture: ResolvedTelemetryContentCapture;
 	readonly conversationId: string | undefined;
@@ -427,11 +436,13 @@ export function resolveTelemetry(
 ): AgentTelemetry | undefined {
 	if (!config) return undefined;
 	const tracer = config.tracer ?? trace.getTracer(config.tracerName ?? DEFAULT_TRACER_NAME);
+	const spansEnabled = config.spans !== false;
 	const contentCaptureFromEnv = config.captureMessageContent === undefined;
 	const contentCapture = resolveContentCapture(config.captureMessageContent);
 	const telemetry = {
 		config,
 		tracer,
+		spansEnabled,
 		captureMessageContent: contentCapture === "full",
 		contentCapture,
 		conversationId: config.conversationId ?? sessionId,
@@ -502,7 +513,7 @@ function startSpan(
 		readonly toolName?: string;
 	},
 ): Span | undefined {
-	if (!telemetry) return undefined;
+	if (!telemetry || !telemetry.spansEnabled) return undefined;
 	const attrCtx = buildTelemetryAttributeContext(telemetry, kind, options);
 	const attrs: Attributes = {};
 	const operation = kindToOperation(kind);
@@ -700,7 +711,8 @@ function safeOnSpanEnd(telemetry: AgentTelemetry | undefined, ctx: TelemetryHook
  * Returns `undefined` when telemetry is disabled.
  */
 export function startInvokeAgentSpan(telemetry: AgentTelemetry | undefined, model: Model): Span | undefined {
-	const agentName = telemetry?.agent ? normalizeAgentIdentity(telemetry, telemetry.agent).name : undefined;
+	if (!telemetry || !telemetry.spansEnabled) return undefined;
+	const agentName = telemetry.agent ? normalizeAgentIdentity(telemetry, telemetry.agent).name : undefined;
 	const name = agentName ? `invoke_agent ${agentName}` : "invoke_agent";
 	return startSpan(telemetry, "invoke_agent", name, { spanKind: SpanKind.INTERNAL, model });
 }
@@ -724,6 +736,16 @@ export function startChatSpan(
 		readonly request: ChatRequestSnapshot;
 	},
 ): Span | undefined {
+	if (!telemetry) return undefined;
+	if (!telemetry.spansEnabled) {
+		telemetry.collector.beginChatWithoutSpan({
+			stepNumber: options.stepNumber,
+			model,
+			provider: normalizeProviderName(telemetry, model.provider),
+		});
+		telemetry.collector.noteAvailableTools(options.request.tools);
+		return undefined;
+	}
 	const span = startSpan(telemetry, "chat", `chat ${model.id}`, {
 		spanKind: SpanKind.CLIENT,
 		model,
@@ -732,13 +754,13 @@ export function startChatSpan(
 		attributes: buildChatRequestAttributes(options.stepNumber, options.request, model.provider),
 	});
 	if (span) {
-		telemetry?.collector.beginChat(span, {
+		telemetry.collector.beginChat(span, {
 			stepNumber: options.stepNumber,
 			model,
 			provider: normalizeProviderName(telemetry, model.provider),
 		});
-		telemetry?.collector.noteAvailableTools(options.request.tools);
-		if (telemetry && telemetry.contentCapture !== "none") {
+		telemetry.collector.noteAvailableTools(options.request.tools);
+		if (telemetry.contentCapture !== "none") {
 			applyContentCaptureForRequest(telemetry, span, options.request);
 		}
 	}
@@ -1143,7 +1165,31 @@ export async function finishChatSpan(
 		readonly baseUrl?: string;
 	},
 ): Promise<void> {
-	if (!span) return;
+	// Usage-only mode (spans disabled): the chat span is absent but usage/cost
+	// hooks must still fire per contract C3. Cost estimation and the usage
+	// event run against a non-recording placeholder span.
+	if (!span) {
+		if (!telemetry || telemetry.spansEnabled) return;
+		const placeholder = trace.wrapSpanContext(INVALID_SPAN_CONTEXT);
+		const usageCost = applyCostEstimate(telemetry, placeholder, message, options.serviceTier, options.stepNumber);
+		await emitChatUsage(telemetry, placeholder, {
+			model: message.model,
+			provider: message.provider,
+			serviceTier: options.serviceTier,
+			stepNumber: options.stepNumber,
+			usage: message.usage,
+			applied: usageCost,
+			headers: options.responseHeaders,
+		}).catch(err => {
+			emitTelemetryWarning(telemetry, {
+				code: "on_chat_usage_failed",
+				message: "onChatUsage rejected; swallowing telemetry callback failure",
+				error: err,
+			});
+		});
+		telemetry.collector.endChatWithoutSpan(options.stepNumber, message, usageCost);
+		return;
+	}
 	applyChatResponseAttributes(span, message);
 	applyUsageAttributes(span, message.usage);
 	applyGatewayAttributes(span, options.responseHeaders, options.baseUrl);
@@ -1193,24 +1239,29 @@ export function failChatSpan(
 	options: {
 		readonly errorObject: unknown;
 		readonly errorType?: string;
+		readonly stepNumber?: number;
 		readonly responseHeaders?: Readonly<Record<string, string>>;
 		readonly baseUrl?: string;
 	},
 ): void {
-	if (!span) return;
-	applyGatewayAttributes(span, options.responseHeaders, options.baseUrl);
 	const err = options.errorObject;
+	const errorType = options.errorType ?? (err instanceof Error ? err.name || "Error" : "Error");
+	if (!span) {
+		if (telemetry && !telemetry.spansEnabled) {
+			telemetry.collector.failChatWithoutSpan(options.stepNumber, { errorType });
+		}
+		return;
+	}
+	applyGatewayAttributes(span, options.responseHeaders, options.baseUrl);
 	if (err instanceof Error) {
 		span.recordException(err);
-		span.setAttribute(GenAIAttr.ErrorType, options.errorType ?? err.name ?? "Error");
+		span.setAttribute(GenAIAttr.ErrorType, errorType);
 		span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
 	} else {
-		span.setAttribute(GenAIAttr.ErrorType, options.errorType ?? "Error");
+		span.setAttribute(GenAIAttr.ErrorType, errorType);
 		span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
 	}
-	telemetry?.collector.failChat(span, {
-		errorType: options.errorType ?? (err instanceof Error ? err.name || "Error" : "Error"),
-	});
+	telemetry?.collector.failChat(span, { errorType });
 	span.end();
 }
 
@@ -1346,6 +1397,7 @@ function applyCostEstimateForUsage(
 		readonly usage: Usage | undefined;
 	},
 ): AppliedCostEstimate {
+	const applySpanAttributes = telemetry.spansEnabled;
 	const estimator = telemetry.config.costEstimator;
 	if (!estimator || !input.usage) return EMPTY_COST;
 	const provider = normalizeProviderName(telemetry, input.provider);
@@ -1369,7 +1421,7 @@ function applyCostEstimateForUsage(
 	}
 	if (!result) return EMPTY_COST;
 	if ("unavailable" in result) {
-		span.setAttribute(PiGenAIAttr.CostUnavailableReason, result.unavailable);
+		if (applySpanAttributes) span.setAttribute(PiGenAIAttr.CostUnavailableReason, result.unavailable);
 		const cost: AppliedCostEstimate = {
 			costUsd: undefined,
 			inputUsd: undefined,
@@ -1391,9 +1443,11 @@ function applyCostEstimateForUsage(
 		});
 		return cost;
 	}
-	span.setAttribute(PiGenAIAttr.CostEstimatedUsd, result.usd);
-	if (result.inputUsd != null) span.setAttribute(PiGenAIAttr.CostInputUsd, result.inputUsd);
-	if (result.outputUsd != null) span.setAttribute(PiGenAIAttr.CostOutputUsd, result.outputUsd);
+	if (applySpanAttributes) {
+		span.setAttribute(PiGenAIAttr.CostEstimatedUsd, result.usd);
+		if (result.inputUsd != null) span.setAttribute(PiGenAIAttr.CostInputUsd, result.inputUsd);
+		if (result.outputUsd != null) span.setAttribute(PiGenAIAttr.CostOutputUsd, result.outputUsd);
+	}
 	const cost: AppliedCostEstimate = {
 		costUsd: result.usd,
 		inputUsd: result.inputUsd,
@@ -1468,10 +1522,12 @@ async function emitChatUsage(
 		serviceTier: input.serviceTier,
 		usage: buildUsageSnapshot(input.usage),
 		cost: costEstimateFromApplied(input.applied),
-		attributes: resolveDynamicAttributes(
-			telemetry,
-			buildTelemetryAttributeContext(telemetry, "chat", { stepNumber: input.stepNumber }),
-		),
+		attributes: telemetry.spansEnabled
+			? resolveDynamicAttributes(
+					telemetry,
+					buildTelemetryAttributeContext(telemetry, "chat", { stepNumber: input.stepNumber }),
+				)
+			: undefined,
 		headers: input.headers,
 	};
 	try {
@@ -1561,7 +1617,34 @@ export async function recordManualChatTelemetry(
 			stepNumber: options.stepNumber,
 			attributes: options.attributes,
 		});
-	if (!span) return undefined;
+	if (!span) {
+		// Usage-only mode (spans disabled): still emit usage/cost per C3.
+		if (!telemetry || telemetry.spansEnabled) return undefined;
+		const placeholder = trace.wrapSpanContext(INVALID_SPAN_CONTEXT);
+		const applied = applyCostEstimateForUsage(telemetry, placeholder, {
+			model: options.responseModel ?? options.model.id,
+			provider: options.model.provider,
+			serviceTier: options.serviceTier,
+			stepNumber: options.stepNumber,
+			usage: options.usage,
+		});
+		await emitChatUsage(telemetry, placeholder, {
+			model: options.responseModel ?? options.model.id,
+			provider: options.model.provider,
+			serviceTier: options.serviceTier,
+			stepNumber: options.stepNumber,
+			usage: options.usage,
+			applied,
+			headers: options.responseHeaders,
+		}).catch(err => {
+			emitTelemetryWarning(telemetry, {
+				code: "on_chat_usage_failed",
+				message: "onChatUsage rejected; swallowing telemetry callback failure",
+				error: err,
+			});
+		});
+		return undefined;
+	}
 	if (options.span && options.attributes) span.setAttributes(options.attributes);
 	if (options.stepNumber != null) span.setAttribute(PiGenAIAttr.AgentStepNumber, options.stepNumber);
 	span.setAttribute(GenAIAttr.ResponseModel, options.responseModel ?? options.model.name);
@@ -1709,6 +1792,7 @@ export async function instrumentedCompleteSimple<TApi extends Api>(
 		});
 	} catch (err) {
 		failChatSpan(telemetry, chatSpan, {
+			stepNumber,
 			errorObject: err,
 			responseHeaders: capturedHeaders,
 			baseUrl: model.baseUrl,
@@ -1732,6 +1816,11 @@ export function startExecuteToolSpan(
 		readonly parent?: Span;
 	},
 ): Span | undefined {
+	if (!telemetry) return undefined;
+	if (!telemetry.spansEnabled) {
+		telemetry.collector.beginToolWithoutSpan({ toolCallId: options.toolCallId, toolName: options.toolName });
+		return undefined;
+	}
 	const attrs: Attributes = {
 		[GenAIAttr.ToolName]: options.toolName,
 		[GenAIAttr.ToolCallId]: options.toolCallId,
@@ -1746,8 +1835,8 @@ export function startExecuteToolSpan(
 		attributes: attrs,
 	});
 	if (span) {
-		telemetry?.collector.beginTool(span, { toolCallId: options.toolCallId, toolName: options.toolName });
-		if (telemetry && telemetry.contentCapture !== "none") {
+		telemetry.collector.beginTool(span, { toolCallId: options.toolCallId, toolName: options.toolName });
+		if (telemetry.contentCapture !== "none") {
 			const args = serializeToolCallArgumentsForTelemetry(telemetry, options.args);
 			if (args) span.setAttribute(GenAIAttr.ToolCallArguments, args);
 		}
@@ -1775,7 +1864,30 @@ export function finishExecuteToolSpan(
 		readonly toolName: string;
 	},
 ): void {
-	if (!span) return;
+	const status: ToolStatus = options.status ?? (options.isError ? "error" : "ok");
+	let errorType: string | undefined;
+	// `status` is the source of truth for the wire-level `error.type`. The
+	// underlying `errorObject` (if any) still gets a `recordException` so the
+	// stack trace is preserved, but the attribute reflects the run-level
+	// category (`tool_blocked`, `tool_aborted`, …) instead of the JS class
+	// name. This keeps dashboards groupable on one column.
+	if (status !== "ok") {
+		errorType =
+			status === "error" && options.errorObject instanceof Error
+				? options.errorObject.name || "Error"
+				: STATUS_ERROR_TYPE[status];
+	}
+	if (!span) {
+		if (telemetry && !telemetry.spansEnabled) {
+			telemetry.collector.endToolWithoutSpan({
+				toolCallId: options.toolCallId,
+				toolName: options.toolName,
+				status,
+				errorType,
+			});
+		}
+		return;
+	}
 	if (telemetry && telemetry.contentCapture !== "none" && options.result !== undefined) {
 		const result = serializeToolCallResultForTelemetry(telemetry, options.result);
 		if (result) span.setAttribute(GenAIAttr.ToolCallResult, result);
@@ -1789,22 +1901,10 @@ export function finishExecuteToolSpan(
 		toolCallId: options.toolCallId,
 		toolName: options.toolName,
 	});
-	const status: ToolStatus = options.status ?? (options.isError ? "error" : "ok");
-	let errorType: string | undefined;
-	// `status` is the source of truth for the wire-level `error.type`. The
-	// underlying `errorObject` (if any) still gets a `recordException` so the
-	// stack trace is preserved, but the attribute reflects the run-level
-	// category (`tool_blocked`, `tool_aborted`, …) instead of the JS class
-	// name. This keeps dashboards groupable on one column.
 	if (status !== "ok") {
-		errorType =
-			status === "error" && options.errorObject instanceof Error
-				? options.errorObject.name || "Error"
-				: STATUS_ERROR_TYPE[status];
-		span.setAttribute(GenAIAttr.ErrorType, errorType);
+		span.setAttribute(GenAIAttr.ErrorType, errorType ?? STATUS_ERROR_TYPE[status]);
 		span.setAttribute(EXECUTE_TOOL_STATUS_ATTR, status);
-		const msg =
-			options.errorObject instanceof Error ? options.errorObject.message : (options.errorMessage ?? errorType);
+		const msg = options.errorObject instanceof Error ? options.errorObject.message : (options.errorMessage ?? errorType);
 		span.setStatus({ code: SpanStatusCode.ERROR, message: msg });
 	} else {
 		span.setAttribute(EXECUTE_TOOL_STATUS_ATTR, status);
@@ -1862,13 +1962,18 @@ export function finishInvokeAgentSpan(
 	span: Span | undefined,
 	options: { readonly stepCount: number; readonly errorObject?: unknown },
 ): { readonly summary: AgentRunSummary; readonly coverage: AgentRunCoverage } | undefined {
-	if (!span) return undefined;
-	applyInvokeAgentFinish(span, options.stepCount);
 	let snapshot: { readonly summary: AgentRunSummary; readonly coverage: AgentRunCoverage } | undefined;
 	if (telemetry) {
 		snapshot = telemetry.collector.snapshot({ stepCount: options.stepCount });
-		applyAggregateAttributes(span, snapshot.summary, snapshot.coverage);
 	}
+	if (!span) {
+		if (telemetry && snapshot && telemetry.collector.markRunEnded()) {
+			fireOnRunEnd(telemetry, snapshot.summary, snapshot.coverage);
+		}
+		return snapshot;
+	}
+	applyInvokeAgentFinish(span, options.stepCount);
+	if (telemetry && snapshot) applyAggregateAttributes(span, snapshot.summary, snapshot.coverage);
 	safeOnSpanEnd(telemetry, {
 		span,
 		kind: "invoke_agent",
@@ -1999,7 +2104,7 @@ export function recordHandoff(
 		readonly attributes?: Attributes;
 	},
 ): void {
-	if (!telemetry) return;
+	if (!telemetry || !telemetry.spansEnabled) return;
 	const attrs: Attributes = {};
 	const fromAgent = options.fromAgent ? normalizeAgentIdentity(telemetry, options.fromAgent) : undefined;
 	const toAgent = normalizeAgentIdentity(telemetry, options.toAgent);
