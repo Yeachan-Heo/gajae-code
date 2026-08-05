@@ -1,0 +1,1 @@
+{"deepseek-v3.2":{"id":"deepseek-v3.2","name":"DeepSeek V3.2","api":"openai-completions","provider":"qianfan","baseUrl":"https://qianfan.baidubce.com/v2","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":98304,"maxTokens":32768}}

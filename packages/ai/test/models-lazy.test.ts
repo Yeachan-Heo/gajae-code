@@ -22,49 +22,66 @@ function runIsolationScript(script: string): unknown {
 }
 
 describe("bundled models catalog lazy loading", () => {
-	it("does not read models.json until the first synchronous accessor call", () => {
+	it("enumerates without parsing bodies and reads only the requested provider shard once", () => {
 		const modelsUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/models.ts")).href;
 		const modelsJsonPath = path.resolve(import.meta.dir, "../src/models.json");
-		// The catalog is embedded via `import ... with { type: "file" }` and read
-		// lazily with fs.readFileSync. The lazy contract is therefore observable as
-		// "no filesystem read of models.json at import time; exactly one read on
-		// first accessor use" (module-cache presence no longer discriminates,
-		// because the file-type import registers the path eagerly without parsing).
+		const openAIShardPath = path.resolve(import.meta.dir, "../src/model-shards/openai.json");
 		const result = runIsolationScript(`
 import { createRequire } from "node:module";
 const require = createRequire(${JSON.stringify(modelsUrl)});
 const fs = require("node:fs");
 const realReadFileSync = fs.readFileSync;
-let catalogReads = 0;
+const bodyReads = [];
 fs.readFileSync = function (file, ...args) {
-	if (String(file).endsWith("models.json")) catalogReads += 1;
+	const fileName = String(file);
+	if (fileName.includes("/model-shards/") || fileName.endsWith("/models.json")) {
+		bodyReads.push(fileName);
+	}
 	return realReadFileSync.call(this, file, ...args);
 };
 const modelsModule = await import(${JSON.stringify(modelsUrl)});
-const before = catalogReads > 0;
-const directCatalog = JSON.parse(realReadFileSync(${JSON.stringify(modelsJsonPath)}, "utf8"));
+const readsAfterImport = bodyReads.length;
 const providers = modelsModule.getBundledProviders();
+const readsAfterEnumeration = bodyReads.length;
 const model = modelsModule.getBundledModel("openai", "gpt-4o-mini");
-const after = catalogReads > 0;
-modelsModule.getBundledProviders();
+const readsAfterLookup = bodyReads.length;
+modelsModule.getBundledModel("openai", "gpt-4o-mini");
+modelsModule.getBundledModels("openai");
+const readsAfterRepeat = bodyReads.length;
+const directCatalog = JSON.parse(realReadFileSync(${JSON.stringify(modelsJsonPath)}, "utf8"));
 console.log(JSON.stringify({
-	before,
-	after,
-	catalogReads,
+	readsAfterImport,
+	readsAfterEnumeration,
+	readsAfterLookup,
+	readsAfterRepeat,
+	bodyReads,
 	providers,
 	directProviders: Object.keys(directCatalog),
 	model,
 	directModel: directCatalog.openai["gpt-4o-mini"],
+	fullCatalogBytes: fs.statSync(${JSON.stringify(modelsJsonPath)}).size,
+	shardBytes: fs.statSync(${JSON.stringify(openAIShardPath)}).size,
 }));
 `);
 
-		expect(result).toMatchObject({ before: false, after: true, catalogReads: 1 });
-		expect((result as { providers: string[]; directProviders: string[] }).providers).toEqual(
-			(result as { providers: string[]; directProviders: string[] }).directProviders,
-		);
-		expect((result as { model: unknown; directModel: unknown }).model).toEqual(
-			(result as { model: unknown; directModel: unknown }).directModel,
-		);
+		expect(result).toMatchObject({
+			readsAfterImport: 0,
+			readsAfterEnumeration: 0,
+			readsAfterLookup: 1,
+			readsAfterRepeat: 1,
+			bodyReads: [openAIShardPath],
+		});
+		const measured = result as {
+			providers: string[];
+			directProviders: string[];
+			model: unknown;
+			directModel: unknown;
+			fullCatalogBytes: number;
+			shardBytes: number;
+		};
+		expect(measured.providers).toEqual(measured.directProviders);
+		expect(measured.model).toEqual(measured.directModel);
+		expect(measured.shardBytes).toBeLessThan(measured.fullCatalogBytes * 0.4);
 	});
 
 	it("keeps public accessors synchronous", () => {

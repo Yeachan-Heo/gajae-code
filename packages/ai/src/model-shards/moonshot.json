@@ -1,0 +1,1 @@
+{"kimi-k2.5":{"id":"kimi-k2.5","name":"Kimi K2.5","api":"openai-completions","provider":"moonshot","baseUrl":"https://api.moonshot.ai/v1","reasoning":true,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":262144,"maxTokens":65536,"thinking":{"mode":"effort","minLevel":"minimal","maxLevel":"high"}}}

@@ -1,18 +1,13 @@
 import { readFileSync } from "node:fs";
 import { getOpenAIModelCost } from "./model-pricing";
 import { isRetiredModelKey } from "./model-retirements";
+import { bundledProviderNames, bundledProviderShardPaths } from "./model-shards.generated";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
-// `with { type: "file" }` is embedded by `bun build --compile` and resolves to
-// the bunfs path inside standalone binaries (and to the on-disk path in dev).
-// A plain `createRequire` of a `.json` listed as an extra compile entrypoint is
-// NOT emitted into the bunfs, and its cwd-fallback masks the failure whenever
-// the process runs inside a repo checkout — see PR body for the minimal repro.
-import modelsJsonPath from "./models.json" with { type: "file" };
 import type { Api, KnownProvider, Model, Usage } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
 /**
- * Static bundled model registry loaded lazily from `models.json`.
+ * Static bundled model registry loaded lazily from deterministic provider shards.
  *
  * This module intentionally exposes compile-time defaults only.
  * It does not include runtime discovery, models.dev overlays, or on-disk cache state.
@@ -21,28 +16,21 @@ import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-ca
  */
 type BundledCatalog = typeof import("./models.json");
 
-let bundledCatalog: BundledCatalog | undefined;
 let providerNames: KnownProvider[] | undefined;
 const providerModelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
-
-function getBundledCatalog(): BundledCatalog {
-	// TS types a .json import as its contents; at runtime `with { type: "file" }`
-	// yields the file path (bunfs path in compiled binaries, disk path in dev).
-	bundledCatalog ??= JSON.parse(readFileSync(modelsJsonPath as unknown as string, "utf8")) as BundledCatalog;
-	return bundledCatalog;
-}
 
 function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>> | undefined {
 	const cached = providerModelRegistry.get(provider);
 	if (cached) return cached;
-	const models = getBundledCatalog()[provider];
-	if (!models) return undefined;
+	const shardPath = bundledProviderShardPaths[provider];
+	if (!shardPath) return undefined;
+	const models = JSON.parse(readFileSync(shardPath as unknown as string, "utf8")) as Record<string, Model<Api>>;
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
 		if (isRetiredModelKey(provider, id)) {
 			continue;
 		}
-		providerModels.set(id, applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>)));
+		providerModels.set(id, applyBundledCompatDefaults(enrichModelThinking(model)));
 	}
 	providerModelRegistry.set(provider, providerModels);
 	return providerModels;
@@ -81,9 +69,8 @@ export function getBundledModel<TApi extends Api = Api>(provider: GeneratedProvi
 }
 
 export function getBundledProviders(): KnownProvider[] {
-	// Defensive copy: the old eager path returned a fresh Array.from(...), so
-	// callers may freely mutate their result without corrupting enumeration.
-	providerNames ??= Object.keys(getBundledCatalog()) as KnownProvider[];
+	// Defensive copy: callers may freely mutate their result without corrupting enumeration.
+	providerNames ??= bundledProviderNames.slice() as KnownProvider[];
 	return providerNames.slice();
 }
 
