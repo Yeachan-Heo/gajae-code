@@ -1961,6 +1961,90 @@ describe("ModelRegistry", () => {
 			expect(model?.name).toBe("MiniMax-M3");
 		});
 
+		test("#3856: namespaced custom model id inherits canonical leaf metadata when omitted", () => {
+			// Proxy wire IDs often namespace the upstream model (`vendor/model-id`).
+			// When contextWindow/maxTokens are omitted, inherit from the bundled leaf
+			// id while retaining the namespaced wire id for the request.
+			writeRawModelsJson({
+				clinepass: {
+					baseUrl: "https://api.cline.bot/api/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					auth: "apiKey",
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+					},
+					models: [
+						{
+							id: "cline-pass/deepseek-v4-flash",
+							name: "DeepSeek V4 Flash via ClinePass",
+							reasoning: true,
+							input: ["text"],
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("clinepass", "cline-pass/deepseek-v4-flash");
+			expect(model?.id).toBe("cline-pass/deepseek-v4-flash");
+			expect(model?.name).toBe("DeepSeek V4 Flash via ClinePass");
+			expect(model?.contextWindow).toBe(1_000_000);
+			expect(model?.maxTokens).toBe(384_000);
+			expect(model?.reasoning).toBe(true);
+			expect(model?.baseUrl).toBe("https://api.cline.bot/api/v1");
+		});
+
+		test("#3856: true unknown namespaced custom models still use generic defaults", () => {
+			writeRawModelsJson({
+				clinepass: {
+					baseUrl: "https://api.cline.bot/api/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "cline-pass/totally-unknown-model-xyz",
+							name: "Unknown via ClinePass",
+							reasoning: false,
+							input: ["text"],
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("clinepass", "cline-pass/totally-unknown-model-xyz");
+			expect(model?.id).toBe("cline-pass/totally-unknown-model-xyz");
+			expect(model?.contextWindow).toBe(128_000);
+			expect(model?.maxTokens).toBe(16_384);
+		});
+
+		test("#3856: explicit contextWindow on namespaced custom model is preserved", () => {
+			writeRawModelsJson({
+				clinepass: {
+					baseUrl: "https://api.cline.bot/api/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "cline-pass/deepseek-v4-flash",
+							name: "DeepSeek V4 Flash via ClinePass",
+							reasoning: true,
+							input: ["text"],
+							contextWindow: 512_000,
+							maxTokens: 32_000,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("clinepass", "cline-pass/deepseek-v4-flash");
+			expect(model?.contextWindow).toBe(512_000);
+			expect(model?.maxTokens).toBe(32_000);
+		});
+
 		test("same-id replacement uses configured compat without bundled compat leak", () => {
 			writeRawModelsJson({
 				"minimax-code": {

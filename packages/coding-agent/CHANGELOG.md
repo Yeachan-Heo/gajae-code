@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Custom OpenAI-compatible models whose wire id is namespaced (for example `cline-pass/deepseek-v4-flash`) now inherit capability metadata from the bundled leaf model when `contextWindow` / `maxTokens` are omitted, instead of silently falling back to the generic 128K / 16K defaults. True unknown leaf ids still default; explicit limits remain authoritative (#3856).
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
 
 ## [0.12.12] - 2026-08-05
