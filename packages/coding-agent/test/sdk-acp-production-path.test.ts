@@ -560,6 +560,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			mcpServers: [],
 		}),
 	).rejects.toMatchObject({ code: "unsupported" });
+	expect(await agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" })).toEqual({});
+	await expect(agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" })).rejects.toMatchObject({
+		code: "unsupported",
+		message: "ACP plan mode is not available because this ACP session has no host plan-mode lifecycle.",
+	});
+	expect(controlOperations).not.toContain("mode.plan.set");
+	expect(lifecycleInputs).toEqual([expect.objectContaining({ cwd, modelPreset: "codex-medium" })]);
 
 	let firstSettled = false;
 	const firstPrompt = agent

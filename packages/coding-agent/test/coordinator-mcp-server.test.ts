@@ -3176,6 +3176,7 @@ it("emits one bounded question.opened event and records its Codex wake", async (
 			),
 		),
 	).toMatchObject({ event_kind: "question.opened", question_id: "gate-opened" });
+	});
 });
 
 it("keeps parallel pending questions isolated when one answer is submitted", async () => {
