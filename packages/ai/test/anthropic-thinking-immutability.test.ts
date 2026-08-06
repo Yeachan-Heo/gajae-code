@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	convertAnthropicMessages,
+	isAnthropicMaskedProxyRejection,
 	isAnthropicThinkingBlockMutationError,
 	isAnthropicThinkingSignatureInvalidError,
 } from "@gajae-code/ai/providers/anthropic";
@@ -391,5 +392,44 @@ describe("Anthropic thinking replay 400 classification", () => {
 			'400 {"type":"error","error":{"type":"invalid_request_error","message":"thinking.budget_tokens: Input should be greater than or equal to 1024"}}',
 		);
 		expect(isAnthropicThinkingSignatureInvalidError(budgetError)).toBe(false);
+	});
+
+	// The masked classifier carries no thinking evidence of its own — the caller
+	// pairs it with `hasNativeThinkingBlocks` — so its whole contract is which
+	// payloads it claims.
+	describe("masked proxy rejection classifier", () => {
+		const maskedBody =
+			'{"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}';
+
+		it("claims the statusless masked body and its passthrough 400 form", () => {
+			expect(isAnthropicMaskedProxyRejection(new Error(maskedBody))).toBe(true);
+			expect(isAnthropicMaskedProxyRejection(status400(`400 ${maskedBody}`))).toBe(true);
+		});
+
+		it("leaves a forwarded invalid_request_error body to the strict matchers", () => {
+			const forwarded = new Error(
+				'{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified."}}',
+			);
+			expect(isAnthropicMaskedProxyRejection(forwarded)).toBe(false);
+		});
+
+		it("does not claim non-400 statuses", () => {
+			const serverError = Object.assign(new Error(maskedBody), { status: 500 });
+			expect(isAnthropicMaskedProxyRejection(serverError)).toBe(false);
+			const rateLimited = Object.assign(new Error(maskedBody), { status: 429 });
+			expect(isAnthropicMaskedProxyRejection(rateLimited)).toBe(false);
+		});
+
+		it("does not claim other statusless api_error payloads", () => {
+			const overloaded = new Error('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}');
+			expect(isAnthropicMaskedProxyRejection(overloaded)).toBe(false);
+			const otherApiError = new Error('{"type":"error","error":{"type":"api_error","message":"Internal error."}}');
+			expect(isAnthropicMaskedProxyRejection(otherApiError)).toBe(false);
+		});
+
+		it("rejects non-Error inputs", () => {
+			expect(isAnthropicMaskedProxyRejection(undefined)).toBe(false);
+			expect(isAnthropicMaskedProxyRejection(null)).toBe(false);
+		});
 	});
 });

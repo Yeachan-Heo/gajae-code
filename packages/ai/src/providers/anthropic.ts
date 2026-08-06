@@ -447,7 +447,7 @@ export function isAnthropicThinkingSignatureInvalidError(error: unknown): boolea
  * this with a request that actually replays signed thinking blocks before
  * treating it as a thinking-replay rejection.
  */
-function isAnthropicMaskedProxyRejection(error: unknown): boolean {
+export function isAnthropicMaskedProxyRejection(error: unknown): boolean {
 	const status = extractHttpStatusFromError(error);
 	if (status !== undefined && status !== 400) return false;
 	const message = error instanceof Error ? error.message : String(error);
