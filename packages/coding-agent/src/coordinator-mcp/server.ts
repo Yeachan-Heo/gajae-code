@@ -3740,14 +3740,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			projection.applied_reports_revision,
 			projection.applied_session_revision,
 			projection.applied_active_revision,
+			projection.applied_events_revision,
 		];
+		const terminalRevisions = Object.values(transaction.canonical.turns)
+			.map(turn => turn.terminal_fence?.epoch)
+			.filter((revision): revision is number => revision !== undefined);
+		const reportRevisions = Object.values(transaction.outbox)
+			.filter(event => event.kind === "report.written")
+			.map(event => event.transaction_revision);
 		if (
-			!Number.isSafeInteger(transaction.revision) ||
-			!appliedRevisions.every(revision => Number.isSafeInteger(revision) && revision >= 0)
+			!appliedRevisions.every(revision => Number.isSafeInteger(revision) && revision >= 0) ||
+			![...terminalRevisions, ...reportRevisions].every(revision => Number.isSafeInteger(revision) && revision > 0)
 		)
 			throw new Error("state_corrupt");
-		const pending = appliedRevisions.some(revision => revision < transaction.revision - 1);
-		if (!pending) return false;
+		const terminalRevision = Math.max(0, ...terminalRevisions);
+		const reportRevision = Math.max(0, ...reportRevisions);
+		const pendingTerminal =
+			projection.applied_turns_revision < terminalRevision ||
+			projection.applied_session_revision < terminalRevision ||
+			projection.applied_active_revision < terminalRevision ||
+			projection.applied_events_revision < terminalRevision;
+		const pendingReport =
+			projection.applied_reports_revision < reportRevision || projection.applied_events_revision < reportRevision;
+		if (!pendingTerminal && !pendingReport) return false;
 		await repairCanonicalProjections(sessionId);
 		return true;
 	}

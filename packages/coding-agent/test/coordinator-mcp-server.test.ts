@@ -938,6 +938,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const terminalAt = Date.parse("2026-08-06T09:04:29.000Z");
+		let terminalReady = false;
 		const server = await createSdkControlServer(root, controls, [], (query, input = {}) => {
 			if (query === "Q12") return { ok: true, page: { items: [], complete: true, revision: "q12" } };
 			if (query === "context.get")
@@ -955,7 +956,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					page: {
 						items: [
 							{
-								status: "terminal_ok",
+								status: terminalReady ? "terminal_ok" : "in_flight",
 								commandId: input.commandId,
 								turnId: input.turnId,
 								acceptedAt: terminalAt - 1_000,
@@ -976,6 +977,14 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			allow_mutation: true,
 		});
 		const sessionStatesPath = path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states");
+		const stateBeforeReads = await fs.readFile(path.join(sessionStatesPath, "visible-session.json"), "utf8");
+		for (let index = 0; index < 2; index++)
+			await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+				ok: true,
+				turn: { status: "active" },
+			});
+		expect(await fs.readFile(path.join(sessionStatesPath, "visible-session.json"), "utf8")).toBe(stateBeforeReads);
+		terminalReady = true;
 		const sessionStatesBackup = `${sessionStatesPath}.backup`;
 		await fs.rename(sessionStatesPath, sessionStatesBackup);
 		await fs.writeFile(sessionStatesPath, "blocks projection");
@@ -983,6 +992,29 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const projectionFailure = await server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id });
 		expect(projectionFailure).toMatchObject({ ok: false });
 		expect(String(projectionFailure.reason)).toContain("EEXIST");
+		const namespaceIds = await fs.readdir(path.join(root, ".gjc", "coordinator-state", "v1"));
+		expect(namespaceIds).toHaveLength(1);
+		const canonicalTransactionFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"v1",
+			namespaceIds[0]!,
+			"sessions",
+			"visible-session",
+			"transaction.v1.json",
+		);
+		const failedTransaction = JSON.parse(await fs.readFile(canonicalTransactionFile, "utf8")) as {
+			canonical: {
+				turns: Record<string, { terminal_fence: { epoch: number; status: string } | null }>;
+			};
+			projection: { applied_session_revision: number };
+		};
+		const failedCanonicalTurn = failedTransaction.canonical.turns[String(sent.turn_id)]!;
+		expect(failedCanonicalTurn.terminal_fence).toMatchObject({ status: "completed" });
+		expect(failedTransaction.projection.applied_session_revision).toBeLessThan(
+			failedCanonicalTurn.terminal_fence!.epoch,
+		);
 
 		await fs.rm(sessionStatesPath);
 		await fs.rename(sessionStatesBackup, sessionStatesPath);
@@ -996,23 +1028,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			summary: { active_turns: 0 },
 		});
-		const namespaceIds = await fs.readdir(path.join(root, ".gjc", "coordinator-state", "v1"));
-		expect(namespaceIds).toHaveLength(1);
-		const transaction = JSON.parse(
-			await fs.readFile(
-				path.join(
-					root,
-					".gjc",
-					"coordinator-state",
-					"v1",
-					namespaceIds[0]!,
-					"sessions",
-					"visible-session",
-					"transaction.v1.json",
-				),
-				"utf8",
-			),
-		) as {
+		const transaction = JSON.parse(await fs.readFile(canonicalTransactionFile, "utf8")) as {
 			revision: number;
 			projection: {
 				applied_turns_revision: number;
@@ -1021,10 +1037,10 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				applied_active_revision: number;
 			};
 		};
-		expect(transaction.projection.applied_turns_revision).toBe(transaction.revision - 1);
-		expect(transaction.projection.applied_reports_revision).toBe(transaction.revision - 1);
-		expect(transaction.projection.applied_session_revision).toBe(transaction.revision - 1);
-		expect(transaction.projection.applied_active_revision).toBe(transaction.revision - 1);
+		const appliedRevisions = Object.values(transaction.projection);
+		expect(new Set(appliedRevisions).size).toBe(1);
+		for (const revision of appliedRevisions)
+			expect(revision).toBeGreaterThanOrEqual(failedCanonicalTurn.terminal_fence!.epoch);
 	});
 	it("fences concurrent terminal reconciliation to one queued-turn promotion", async () => {
 		const root = await tempRoot();
