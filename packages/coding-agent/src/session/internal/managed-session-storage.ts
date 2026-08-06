@@ -489,9 +489,15 @@ export interface ManagedLockRetirementTestEvent {
 	readonly attemptId: string;
 }
 
-/** Test-only seam immediately before exact retirement of one observed lock identity. */
+export interface ManagedLockReleaseTestEvent {
+	readonly path: string;
+	readonly fd: number;
+}
+
+/** Test-only seams around managed lock retirement and release verification. */
 export const ManagedLockTestHooks: {
 	beforeObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
+	beforeReleaseDescriptorVerification?: (event: ManagedLockReleaseTestEvent) => void;
 } = {};
 
 /** Captured configured-root authority for managed paths only. */
@@ -1776,6 +1782,34 @@ function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean 
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
+function openVerifiedLockReleaseDescriptor(pathname: string, expected: fs.BigIntStats): number {
+	const identityFailure: NativeSecurity = { ok: false, code: "identity_mismatch" };
+	const namedBefore = fs.lstatSync(pathname, { bigint: true });
+	if (!namedBefore.isFile() || namedBefore.isSymbolicLink() || !sameFileIdentity(expected, namedBefore))
+		throw securityError(pathname, identityFailure);
+
+	const replacementFd = fs.openSync(pathname, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+	try {
+		const openedBefore = fs.fstatSync(replacementFd, { bigint: true });
+		if (!sameFileIdentity(expected, openedBefore) || !sameFileIdentity(namedBefore, openedBefore))
+			throw securityError(pathname, identityFailure);
+		secureFileDescriptor(pathname, replacementFd, "verify");
+		const openedAfter = fs.fstatSync(replacementFd, { bigint: true });
+		const namedAfter = fs.lstatSync(pathname, { bigint: true });
+		if (
+			!namedAfter.isFile() ||
+			namedAfter.isSymbolicLink() ||
+			!sameFileIdentity(expected, openedAfter) ||
+			!sameFileIdentity(openedAfter, namedAfter)
+		)
+			throw securityError(pathname, identityFailure);
+		return replacementFd;
+	} catch (error) {
+		fs.closeSync(replacementFd);
+		throw error;
+	}
+}
+
 /** Create a managed directory and fail closed unless its owner-only mode/ACL verifies. */
 export function ensureManagedDirectory(
 	pathname: string,
@@ -2284,20 +2318,40 @@ export async function acquireManagedLock(
 				assertOwned,
 				async release(): Promise<void> {
 					clearInterval(heartbeat);
+					let releaseFd = fd;
+					let replacementFd: number | undefined;
 					try {
 						assertOwned();
-						secureFileDescriptor(lockPath, fd, "verify", true);
+						ManagedLockTestHooks.beforeReleaseDescriptorVerification?.({ path: lockPath, fd });
+						try {
+							secureFileDescriptor(lockPath, fd, "verify", true);
+						} catch (error) {
+							if (
+								process.platform !== "linux" ||
+								managedSecurityFailureClassification(error) !== "identity_mismatch"
+							)
+								throw error;
+							replacementFd = openVerifiedLockReleaseDescriptor(lockPath, lockIdentity);
+							releaseFd = replacementFd;
+						}
 						const now = Date.now();
 						// A released record is the only live-process reclaim authority. Expiry alone
 						// never authorizes stealing from a holder whose process is still present.
-						writeLockDescriptor(fd, {
+						writeLockDescriptor(releaseFd, {
 							...record,
 							released: true,
 							heartbeatAt: now,
 							leaseExpiresAt: now,
 						});
+						if (replacementFd !== undefined) {
+							const opened = fs.fstatSync(replacementFd, { bigint: true });
+							const named = fs.lstatSync(lockPath, { bigint: true });
+							if (!sameFileIdentity(lockIdentity, opened) || !sameFileIdentity(opened, named))
+								throw securityError(lockPath, { ok: false, code: "identity_mismatch" });
+						}
 						fsyncDirectory(locksDirectory);
 					} finally {
+						if (replacementFd !== undefined) fs.closeSync(replacementFd);
 						released = true;
 						closeDescriptor();
 					}

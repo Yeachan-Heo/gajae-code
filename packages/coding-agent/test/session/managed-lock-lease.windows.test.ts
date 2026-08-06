@@ -8,6 +8,7 @@ const temporaryDirectories: string[] = [];
 
 afterEach(() => {
 	ManagedLockTestHooks.beforeObservedRetirement = undefined;
+	ManagedLockTestHooks.beforeReleaseDescriptorVerification = undefined;
 	for (const directory of temporaryDirectories.splice(0)) {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
@@ -70,6 +71,27 @@ describe("managed migration lock lease ownership", () => {
 
 		expect(() => first.assertOwned()).toThrow("migration_busy");
 		await first.release().catch(() => undefined);
+	});
+
+	it("reacquires exact Linux release authority when the retained descriptor identity is lost", async () => {
+		if (process.platform !== "linux") return;
+		const locks = createLockRoot("release-descriptor-recovery");
+		const first = await acquireManagedLock(locks, "migration");
+		const decoy = path.join(locks, "decoy");
+		fs.writeFileSync(decoy, "decoy", { mode: 0o600 });
+		let injected = false;
+		ManagedLockTestHooks.beforeReleaseDescriptorVerification = ({ fd }) => {
+			if (injected) return;
+			injected = true;
+			fs.closeSync(fd);
+			const replacement = fs.openSync(decoy, fs.constants.O_WRONLY);
+			expect(replacement).toBe(fd);
+		};
+
+		await first.release();
+		expect(injected).toBe(true);
+		expect(readLock(first.path).released).toBe(true);
+		expect(fs.readFileSync(decoy, "utf8")).toBe("decoy");
 	});
 
 	it("preserves a successor installed after a released lock was observed", async () => {
