@@ -18,6 +18,7 @@ import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
+import type { SdkPromptTerminalOutcome, TurnPromptReconciliation } from "../sdk/prompt-status";
 import {
 	type ActivatedPreparedSession,
 	requestPreparedSessionActivation,
@@ -1600,6 +1601,79 @@ async function markTurnFailedForUnavailableSession(turn: TurnRecord, reason: str
 	return failed;
 }
 
+const SDK_PROMPT_STOP_REASONS = new Set(["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"]);
+const SDK_PROMPT_FAILURE_CODES = new Set(["prompt_failed", "prompt_deadline_exceeded"]);
+
+function sdkPromptTerminalOutcome(value: unknown): SdkPromptTerminalOutcome | null {
+	const outcome = asRecord(value);
+	if (!outcome) return null;
+	if (
+		outcome.kind === "stopped" &&
+		typeof outcome.reason === "string" &&
+		SDK_PROMPT_STOP_REASONS.has(outcome.reason) &&
+		(outcome.provenance === "agent" || outcome.provenance === "client_cancel")
+	)
+		return outcome as SdkPromptTerminalOutcome;
+	if (
+		outcome.kind === "failed" &&
+		typeof outcome.code === "string" &&
+		SDK_PROMPT_FAILURE_CODES.has(outcome.code) &&
+		typeof outcome.message === "string" &&
+		(outcome.provenance === "agent_failed" || outcome.provenance === "deadline")
+	)
+		return outcome as SdkPromptTerminalOutcome;
+	return null;
+}
+
+function markTurnTerminalFromPromptStatus(turn: TurnRecord, promptStatus: TurnPromptReconciliation): TurnRecord | null {
+	if (promptStatus.status !== "terminal_ok" && promptStatus.status !== "failed") return null;
+	const rawOutcome = promptStatus.outcome;
+	const outcome = sdkPromptTerminalOutcome(rawOutcome);
+	if (rawOutcome !== undefined && !outcome) return null;
+	const failed = promptStatus.status === "failed" || outcome?.kind === "failed";
+	const cancelled = outcome?.kind === "stopped" && outcome.reason === "cancelled";
+	const status: TurnStatus = failed ? "failed" : cancelled ? "cancelled" : "completed";
+	const statusError = promptStatus.status === "failed" ? promptStatus.error : null;
+	const errorMessage =
+		outcome?.kind === "failed"
+			? outcome.message
+			: statusError && typeof statusError.message === "string"
+				? statusError.message
+				: "SDK prompt failed.";
+	const errorCode =
+		outcome?.kind === "failed"
+			? outcome.code
+			: statusError && typeof statusError.code === "string"
+				? statusError.code
+				: "prompt_failed";
+	const terminalDate = new Date(promptStatus.terminalAt);
+	const timestamp = Number.isNaN(terminalDate.getTime()) ? new Date().toISOString() : terminalDate.toISOString();
+	return {
+		...turn,
+		status,
+		delivery: { ...turn.delivery, prompt_acknowledged: true, state: "acknowledged" },
+		final_response: reportableFinalResponse(turn.final_response)
+			? turn.final_response
+			: {
+					text: failed ? errorMessage : cancelled ? "SDK prompt was cancelled." : null,
+					format: "markdown",
+					source: "sdk_prompt_status",
+					artifact_path: null,
+					truncated: false,
+				},
+		error: failed
+			? {
+					code: errorCode,
+					message: errorMessage,
+					recoverable: errorCode === "prompt_deadline_exceeded",
+				}
+			: null,
+		liveness: { checked_at: timestamp, live: true, reason: "sdk_prompt_terminal" },
+		updated_at: timestamp,
+		completed_at: timestamp,
+	};
+}
+
 async function markTurnTerminalFromSessionState(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState,
@@ -2568,6 +2642,68 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
+	async function queryPromptStatus(
+		session: Record<string, unknown>,
+		turn: TurnRecord,
+	): Promise<TurnPromptReconciliation | null> {
+		const commandId = turn.delivery.runtime_command_id;
+		const runtimeTurnId = turn.delivery.runtime_turn_id;
+		if (!commandId || !runtimeTurnId) return null;
+		const item = asRecord(
+			sdkQueryPageItem(
+				await querySession(session, "turn.prompt_status", { commandId, turnId: runtimeTurnId }),
+				"turn.prompt_status",
+			),
+		);
+		if (!item || typeof item.status !== "string") return null;
+		if (item.status === "unknown") return item as unknown as TurnPromptReconciliation;
+		if (item.commandId !== commandId || item.turnId !== runtimeTurnId) return null;
+		if (item.status === "accepted" || item.status === "in_flight") return item as unknown as TurnPromptReconciliation;
+		if (
+			(item.status === "terminal_ok" || item.status === "failed") &&
+			typeof item.terminalAt === "number" &&
+			Number.isFinite(item.terminalAt) &&
+			item.terminalAt > 0
+		) {
+			if (item.status === "failed") {
+				const error = asRecord(item.error);
+				if (!error || typeof error.code !== "string" || typeof error.message !== "string") return null;
+			}
+			return item as unknown as TurnPromptReconciliation;
+		}
+		return null;
+	}
+	async function brokerSessionTerminalReason(
+		session: Record<string, unknown>,
+		sessionId: string,
+	): Promise<string | null> {
+		const cwd = optionalString(session.cwd);
+		const persistedWorkspace = optionalString(session.broker_workspace);
+		const persistedGeneration =
+			typeof session.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session.endpoint_incarnation);
+		if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
+			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
+		const workspace = await canonicalBrokerWorkspace(cwd);
+		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
+			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
+		const matches = (await listSessions(workspace)).filter(candidate => brokerSessionId(candidate) === sessionId);
+		if (matches.length === 0) return "broker_session_not_indexed";
+		if (matches.length !== 1)
+			throw new SdkClientError("endpoint_stale", "Broker session identity is not unique in its bound workspace.");
+		const brokerRecord = matches[0]!;
+		const generation = brokerEndpointGeneration(brokerRecord);
+		const incarnation = brokerEndpointIncarnation(brokerRecord, sessionId);
+		if (generation === null || incarnation === null)
+			throw new SdkClientError("endpoint_stale", "Broker session has no usable endpoint incarnation.");
+		if (generation !== persistedGeneration || incarnation !== persistedIncarnation) return "broker_session_replaced";
+		return brokerRecord.live === false ? "broker_session_not_live" : null;
+	}
+
 	function requirePromptAcknowledgement(result: unknown): RuntimePromptAcknowledgement {
 		return normalizeRuntimePromptAcknowledgement(result);
 	}
@@ -3191,6 +3327,42 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					live: null,
 					reason: error instanceof SdkClientError ? error.code : "unavailable",
 				};
+				if (ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
+					let brokerReason: string | null = null;
+					try {
+						brokerReason = await brokerSessionTerminalReason(session, resolvedTurn.session_id);
+					} catch {
+						// A broker lookup failure is not terminal proof. Preserve the SDK
+						// advisory and let a later read reconcile against fresh authority.
+					}
+					if (brokerReason) {
+						advisoryStatus = { authority: "sdk_broker", live: false, reason: brokerReason };
+						const unavailable = await markTurnFailedForUnavailableSession(resolvedTurn, brokerReason);
+						resolvedTurn = await projectTerminalTransition(unavailable, {
+							desiredState: "stale",
+							reason: "session_unavailable",
+							live: false,
+						});
+						sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
+					}
+				}
+			}
+			if (ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
+				let promptStatus: TurnPromptReconciliation | null = null;
+				try {
+					promptStatus = await queryPromptStatus(session, resolvedTurn);
+				} catch {
+					// Q26 unavailability is uncertainty, not terminal proof.
+				}
+				const terminal = promptStatus ? markTurnTerminalFromPromptStatus(resolvedTurn, promptStatus) : null;
+				if (terminal) {
+					resolvedTurn = await projectTerminalTransition(terminal, {
+						desiredState: terminal.status === "failed" ? "errored" : "completed",
+						reason: terminal.status === "failed" ? "reported_failure" : null,
+						live: true,
+					});
+					sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
+				}
 			}
 		} else {
 			advisoryStatus = { authority: "sdk", live: null, reason: "session_record_missing" };
@@ -3224,7 +3396,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			(sessionState.state === "completed" || sessionState.state === "errored")
 		) {
 			resolvedTurn = await markTurnTerminalFromSessionState(resolvedTurn, sessionState);
-			await projectTerminalTransition(resolvedTurn, {
+			resolvedTurn = await projectTerminalTransition(resolvedTurn, {
 				desiredState: sessionState.state,
 				reason: sessionState.reason ? "terminal_uncertain" : null,
 				live: sessionState.live,
@@ -3232,7 +3404,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 		} else if (!session && ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
 			resolvedTurn = await markTurnFailedForUnavailableSession(resolvedTurn, "session_record_missing");
-			await projectTerminalTransition(resolvedTurn, {
+			resolvedTurn = await projectTerminalTransition(resolvedTurn, {
 				desiredState: "stale",
 				reason: "session_unavailable",
 				live: false,
@@ -3247,7 +3419,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				promptAckTimeoutMs,
 			);
 			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
-				await projectTerminalTransition(resolvedTurn, {
+				resolvedTurn = await projectTerminalTransition(resolvedTurn, {
 					desiredState: "stale",
 					reason: "terminal_uncertain",
 					live: resolvedTurn.liveness.live,
@@ -3339,6 +3511,36 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		});
 		return keyDigest;
 	}
+	function attachCanonicalReport(
+		transaction: CoordinatorSessionTransactionV1,
+		report: CanonicalReportSnapshotV1,
+		revision: number,
+	): void {
+		if (transaction.canonical.reports[report.report_id]) return;
+		transaction.canonical.reports[report.report_id] = report;
+		const reportEventId = deterministicOutboxId(
+			report.session_id,
+			revision,
+			"report.written",
+			"report",
+			report.report_id,
+		);
+		transaction.outbox[reportEventId] = {
+			id: reportEventId,
+			transaction_revision: revision,
+			kind: "report.written",
+			entity: "report",
+			entity_id: report.report_id,
+			payload: {
+				session_id: report.session_id,
+				turn_id: report.turn_id,
+				report_id: report.report_id,
+				status: report.status,
+				created_at: report.created_at,
+			},
+			emitted: false,
+		};
+	}
 
 	/** Commits terminal fencing, question revocation, report, and promotion together before legacy projection. */
 	async function commitTerminalTransition(
@@ -3349,9 +3551,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			report?: CanonicalReportSnapshotV1;
 			promoteQueuedTurn?: boolean;
 		},
-	): Promise<{ promotedTurnId: string | null; desiredState: CoordinatorSessionStateValue }> {
+	): Promise<{
+		promotedTurnId: string | null;
+		desiredState: CoordinatorSessionStateValue;
+		committedTurn: TurnRecord;
+	}> {
 		await ensureQuestionTransaction(turn.session_id);
 		return await withAdmittedSessionTransaction(questionPaths, turn.session_id, async transaction => {
+			const existing = transaction.canonical.turns[turn.turn_id];
+			if (existing && TERMINAL_TURN_STATUSES.has(existing.status as TurnStatus)) {
+				if (input.report) attachCanonicalReport(transaction, input.report, transaction.revision + 1);
+				return {
+					promotedTurnId:
+						transaction.canonical.queue.selected_promotion?.from_turn_id === turn.turn_id
+							? transaction.canonical.queue.selected_promotion.to_turn_id
+							: null,
+					desiredState: transaction.canonical.desired_session_state,
+					committedTurn: turnFromCanonical(existing),
+				};
+			}
 			const terminalEpoch = transaction.revision + 1;
 			transaction.canonical.turns[turn.turn_id] = {
 				schema_version: 1,
@@ -3390,7 +3608,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					reason: input.reason ?? "terminal_uncertain",
 				});
 			}
-			if (input.report) transaction.canonical.reports[input.report.report_id] = input.report;
+			if (input.report) attachCanonicalReport(transaction, input.report, terminalEpoch);
 			const next =
 				input.promoteQueuedTurn === false
 					? null
@@ -3427,31 +3645,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 				emitted: false,
 			};
-			if (input.report) {
-				const reportEventId = deterministicOutboxId(
-					turn.session_id,
-					terminalEpoch,
-					"report.written",
-					"report",
-					input.report.report_id,
-				);
-				transaction.outbox[reportEventId] ??= {
-					id: reportEventId,
-					transaction_revision: terminalEpoch,
-					kind: "report.written",
-					entity: "report",
-					entity_id: input.report.report_id,
-					payload: {
-						session_id: turn.session_id,
-						turn_id: turn.turn_id,
-						report_id: input.report.report_id,
-						status: input.report.status,
-						created_at: input.report.created_at,
-					},
-					emitted: false,
-				};
-			}
-			return { promotedTurnId: next?.turn_id ?? null, desiredState: next ? "running" : input.desiredState };
+			return {
+				promotedTurnId: next?.turn_id ?? null,
+				desiredState: next ? "running" : input.desiredState,
+				committedTurn: turnFromCanonical(transaction.canonical.turns[turn.turn_id]!),
+			};
 		});
 	}
 
@@ -3523,9 +3721,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		turn: TurnRecord,
 
 		input: Parameters<typeof commitTerminalTransition>[1] & { live?: boolean | null },
-	): Promise<void> {
-		await commitTerminalTransition(turn, input);
+	): Promise<TurnRecord> {
+		const committed = await commitTerminalTransition(turn, input);
 		await repairCanonicalProjections(turn.session_id);
+		return committed.committedTurn;
 	}
 
 	async function commitCanonicalTurn(
@@ -3674,6 +3873,39 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					live: false,
 				});
 				continue;
+			}
+			let promptStatus: TurnPromptReconciliation | null = null;
+			let promptStatusUnavailable = false;
+			try {
+				promptStatus = await queryPromptStatus(session, resolvedTurn);
+			} catch {
+				promptStatusUnavailable = true;
+			}
+			const terminal = promptStatus ? markTurnTerminalFromPromptStatus(resolvedTurn, promptStatus) : null;
+			if (terminal) {
+				await projectTerminalTransition(terminal, {
+					desiredState: terminal.status === "failed" ? "errored" : "completed",
+					reason: terminal.status === "failed" ? "reported_failure" : null,
+					live: true,
+				});
+				continue;
+			}
+			if (promptStatusUnavailable) {
+				let brokerReason: string | null = null;
+				try {
+					brokerReason = await brokerSessionTerminalReason(session, resolvedTurn.session_id);
+				} catch {
+					// Neither SDK nor broker authority produced terminal proof.
+				}
+				if (brokerReason) {
+					const unavailable = await markTurnFailedForUnavailableSession(resolvedTurn, brokerReason);
+					await projectTerminalTransition(unavailable, {
+						desiredState: "stale",
+						reason: "session_unavailable",
+						live: false,
+					});
+					continue;
+				}
 			}
 			resolvedTurn = await reconcileRuntimeAcknowledgement(
 				namespaceDir,
@@ -5033,7 +5265,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									evidence_paths: evidence.map(item => item.path),
 									created_at: report.created_at,
 								};
-								await projectTerminalTransition(turn, {
+								turn = await projectTerminalTransition(turn, {
 									desiredState: terminalStatus === "failed" ? "errored" : "completed",
 									reason: terminalStatus === "failed" ? "reported_failure" : null,
 									report: canonicalReport,

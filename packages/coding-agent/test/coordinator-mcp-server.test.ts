@@ -172,7 +172,7 @@ async function createSdkControlServer(
 	root: string,
 	controls: SdkControl[],
 	queries: string[] = [],
-	queryResult: (query: string, cursor?: string) => unknown = query =>
+	queryResult: (query: string, input?: Record<string, unknown>, cursor?: string) => unknown = query =>
 		query === "context.get"
 			? {
 					type: "query_response",
@@ -305,9 +305,9 @@ async function createSdkControlServer(
 						}
 						return { ok: true, result: { sessionId: String(input.sessionId ?? "visible-session") } };
 					},
-					query: async (query: string, _input: Record<string, unknown>, cursor?: string) => {
+					query: async (query: string, input: Record<string, unknown>, cursor?: string) => {
 						queries.push(query);
-						return queryResult(query, cursor);
+						return queryResult(query, input, cursor);
 					},
 					request: async (frame: Record<string, unknown>) => {
 						serverOptions.sessionFrames?.push(frame);
@@ -756,7 +756,484 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			advisory_status: { authority: "sdk", live: true, is_streaming: true },
 		});
-		expect(queries).toEqual(["Q12", "context.get"]);
+		expect(queries).toEqual(["Q12", "context.get", "turn.prompt_status"]);
+	});
+	it("reconciles authoritative SDK prompt outcomes into terminal Coordinator turns", async () => {
+		for (const testCase of [
+			{
+				name: "deadline failure",
+				promptStatus: {
+					status: "failed",
+					error: { code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." },
+					outcome: {
+						kind: "failed",
+						code: "prompt_deadline_exceeded",
+						message: "Prompt deadline exceeded.",
+						provenance: "deadline",
+					},
+				},
+				expectedStatus: "failed",
+				expectedError: { code: "prompt_deadline_exceeded", recoverable: true },
+			},
+			{
+				name: "client cancellation",
+				promptStatus: {
+					status: "terminal_ok",
+					outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				},
+				expectedStatus: "cancelled",
+				expectedError: null,
+			},
+			{
+				name: "normal completion",
+				promptStatus: {
+					status: "terminal_ok",
+					outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+				},
+				expectedStatus: "completed",
+				expectedError: null,
+			},
+			{
+				name: "completion without outcome detail",
+				promptStatus: {
+					status: "terminal_ok",
+				},
+				expectedStatus: "completed",
+				expectedError: null,
+			},
+		] as const) {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			const promptStatusSelectors: Record<string, unknown>[] = [];
+			const terminalAt = Date.parse("2026-08-06T09:04:29.000Z");
+			const server = await createSdkControlServer(root, controls, [], (query, input = {}) => {
+				if (query === "Q12")
+					return { ok: true, page: { items: [], complete: true, revision: `q12-${testCase.name}` } };
+				if (query === "context.get")
+					return {
+						type: "query_response",
+						id: "query-context",
+						ok: true,
+						page: { items: [{ isStreaming: false }], complete: true, revision: "context" },
+					};
+				if (query === "turn.prompt_status") {
+					promptStatusSelectors.push(input);
+					return {
+						type: "query_response",
+						id: "query-prompt-status",
+						ok: true,
+						page: {
+							items: [
+								{
+									...testCase.promptStatus,
+									commandId: input.commandId,
+									turnId: input.turnId,
+									acceptedAt: terminalAt - 2_000,
+									startedAt: terminalAt - 1_000,
+									terminalAt,
+								},
+							],
+							complete: true,
+							revision: "prompt-status",
+						},
+					};
+				}
+				throw new Error(`unexpected query: ${query}`);
+			});
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: testCase.name,
+				idempotency_key: `prompt-terminal-${testCase.name}`,
+				allow_mutation: true,
+			});
+			if (testCase.name === "deadline failure")
+				await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
+					ok: true,
+					summary: { active_turns: 0 },
+				});
+
+			const result = await server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id });
+			expect(result).toMatchObject({
+				ok: true,
+				turn: {
+					status: testCase.expectedStatus,
+					error: testCase.expectedError,
+					liveness: { live: true, reason: "sdk_prompt_terminal" },
+					completed_at: "2026-08-06T09:04:29.000Z",
+				},
+			});
+			expect(promptStatusSelectors).toEqual([
+				{
+					commandId: (sent.turn as { delivery: { runtime_command_id: string } }).delivery.runtime_command_id,
+					turnId: (sent.turn as { delivery: { runtime_turn_id: string } }).delivery.runtime_turn_id,
+				},
+			]);
+			await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
+				ok: true,
+				summary: { active_turns: 0 },
+			});
+		}
+	});
+	it("does not terminalize from nonterminal, unknown, or identity-mismatched Q26 records", async () => {
+		for (const q26Record of [
+			{ status: "unknown" },
+			{ status: "accepted" },
+			{ status: "in_flight", startedAt: Date.now() },
+			{
+				status: "terminal_ok",
+				commandId: "different-command",
+				turnId: "different-turn",
+				terminalAt: Date.now(),
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		]) {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			const server = await createSdkControlServer(root, controls, [], (query, input = {}) => {
+				if (query === "Q12") return { ok: true, page: { items: [], complete: true, revision: "q12" } };
+				if (query === "context.get")
+					return {
+						type: "query_response",
+						id: "query-context",
+						ok: true,
+						page: { items: [{ isStreaming: false }], complete: true, revision: "context" },
+					};
+				if (query === "turn.prompt_status")
+					return {
+						type: "query_response",
+						id: "query-prompt-status",
+						ok: true,
+						page: {
+							items: [
+								{
+									commandId: input.commandId,
+									turnId: input.turnId,
+									acceptedAt: Date.now() - 1_000,
+									...q26Record,
+								},
+							],
+							complete: true,
+							revision: "prompt-status",
+						},
+					};
+				throw new Error(`unexpected query: ${query}`);
+			});
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: `q26-${q26Record.status}`,
+				idempotency_key: `q26-${q26Record.status}-${String(q26Record.commandId ?? "bound")}`,
+				allow_mutation: true,
+			});
+
+			await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+				ok: true,
+				turn: { status: "active" },
+			});
+		}
+	});
+
+	it("surfaces projection failure and repairs the already-fenced terminal turn on retry", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const terminalAt = Date.parse("2026-08-06T09:04:29.000Z");
+		const server = await createSdkControlServer(root, controls, [], (query, input = {}) => {
+			if (query === "Q12") return { ok: true, page: { items: [], complete: true, revision: "q12" } };
+			if (query === "context.get")
+				return {
+					type: "query_response",
+					id: "query-context",
+					ok: true,
+					page: { items: [{ isStreaming: false }], complete: true, revision: "context" },
+				};
+			if (query === "turn.prompt_status")
+				return {
+					type: "query_response",
+					id: "query-prompt-status",
+					ok: true,
+					page: {
+						items: [
+							{
+								status: "terminal_ok",
+								commandId: input.commandId,
+								turnId: input.turnId,
+								acceptedAt: terminalAt - 1_000,
+								terminalAt,
+							},
+						],
+						complete: true,
+						revision: "prompt-status",
+					},
+				};
+			throw new Error(`unexpected query: ${query}`);
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "projection failure",
+			idempotency_key: "projection-failure",
+			allow_mutation: true,
+		});
+		const sessionStatesPath = path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states");
+		const sessionStatesBackup = `${sessionStatesPath}.backup`;
+		await fs.rename(sessionStatesPath, sessionStatesBackup);
+		await fs.writeFile(sessionStatesPath, "blocks projection");
+
+		const projectionFailure = await server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id });
+		expect(projectionFailure).toMatchObject({ ok: false });
+		expect(String(projectionFailure.reason)).toContain("EEXIST");
+
+		await fs.rm(sessionStatesPath);
+		await fs.rename(sessionStatesBackup, sessionStatesPath);
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "completed", completed_at: "2026-08-06T09:04:29.000Z" },
+		});
+		await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
+			ok: true,
+			summary: { active_turns: 0 },
+		});
+	});
+	it("fences concurrent terminal reconciliation to one queued-turn promotion", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const terminalAt = Date.parse("2026-08-06T09:04:29.000Z");
+		const server = await createSdkControlServer(root, controls, [], (query, input = {}) => {
+			if (query === "Q12") return { ok: true, page: { items: [], complete: true, revision: "q12" } };
+			if (query === "context.get")
+				return {
+					type: "query_response",
+					id: "query-context",
+					ok: true,
+					page: { items: [{ isStreaming: false }], complete: true, revision: "context" },
+				};
+			if (query === "turn.prompt_status")
+				return {
+					type: "query_response",
+					id: "query-prompt-status",
+					ok: true,
+					page: {
+						items: [
+							{
+								status: "terminal_ok",
+								commandId: input.commandId,
+								turnId: input.turnId,
+								acceptedAt: terminalAt - 1_000,
+								terminalAt,
+							},
+						],
+						complete: true,
+						revision: "prompt-status",
+					},
+				};
+			throw new Error(`unexpected query: ${query}`);
+		});
+		await registerSdkSession(server, root);
+		const active = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "active",
+			idempotency_key: "concurrent-active",
+			allow_mutation: true,
+		});
+		const firstQueued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "first queued",
+			queue: true,
+			idempotency_key: "concurrent-queued-1",
+			allow_mutation: true,
+		});
+		const secondQueued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "second queued",
+			queue: true,
+			idempotency_key: "concurrent-queued-2",
+			allow_mutation: true,
+		});
+
+		const reads = await Promise.all(
+			Array.from({ length: 8 }, () => server.callTool("gjc_coordinator_read_turn", { turn_id: active.turn_id })),
+		);
+		for (const result of reads) expect(result).toMatchObject({ ok: true, turn: { status: "completed" } });
+		const stateRoot = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const activePointer = JSON.parse(
+			await fs.readFile(path.join(stateRoot, "active-turns", "visible-session.json"), "utf8"),
+		) as { turn_id: string };
+		expect(activePointer.turn_id).toBe(String(firstQueued.turn_id));
+		await expect(
+			fs.readFile(path.join(stateRoot, "turns", `${String(firstQueued.turn_id)}.json`), "utf8").then(JSON.parse),
+		).resolves.toMatchObject({ status: "active" });
+		await expect(
+			fs.readFile(path.join(stateRoot, "turns", `${String(secondQueued.turn_id)}.json`), "utf8").then(JSON.parse),
+		).resolves.toMatchObject({ status: "queued" });
+	});
+	it("attaches a later report without replacing the authoritative Q26 terminal winner", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const terminalAt = Date.parse("2026-08-06T09:04:29.000Z");
+		const server = await createSdkControlServer(root, controls, [], (query, input = {}) => {
+			if (query === "Q12") return { ok: true, page: { items: [], complete: true, revision: "q12" } };
+			if (query === "context.get")
+				return {
+					type: "query_response",
+					id: "query-context",
+					ok: true,
+					page: { items: [{ isStreaming: false }], complete: true, revision: "context" },
+				};
+			if (query === "turn.prompt_status")
+				return {
+					type: "query_response",
+					id: "query-prompt-status",
+					ok: true,
+					page: {
+						items: [
+							{
+								status: "terminal_ok",
+								commandId: input.commandId,
+								turnId: input.turnId,
+								acceptedAt: terminalAt - 1_000,
+								terminalAt,
+								outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+							},
+						],
+						complete: true,
+						revision: "prompt-status",
+					},
+				};
+			throw new Error(`unexpected query: ${query}`);
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "cancel then report",
+			idempotency_key: "cancel-then-report",
+			allow_mutation: true,
+		});
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "cancelled" },
+		});
+
+		const reported = await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			status: "completed",
+			summary: "late report",
+			idempotency_key: "late-terminal-report",
+			allow_mutation: true,
+		});
+		expect(reported).toMatchObject({
+			ok: true,
+			report: { status: "completed", summary: "late report" },
+			turn: { status: "cancelled" },
+		});
+		await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
+			ok: true,
+			summary: { active_turns: 0, reports: 1 },
+		});
+	});
+	it("keeps an active turn nonterminal when the SDK is unavailable but the broker still reports it live", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const queries: string[] = [];
+		const brokerSessions = [
+			{
+				sessionId: "visible-session",
+				locator: { repo: root },
+				live: true,
+				endpointGeneration: 1,
+				pid: 101,
+				endpointMtimeMs: 1,
+			},
+		];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			queries,
+			() => ({
+				type: "query_response",
+				id: "query-1",
+				ok: false,
+				error: { code: "unavailable", message: "session endpoint unavailable" },
+			}),
+			brokerSessions,
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "prompt-live-broker",
+			allow_mutation: true,
+		});
+
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "active" },
+			advisory_status: { authority: "sdk", live: null, reason: "unavailable" },
+		});
+		expect(controls).toContainEqual({
+			operation: "session.list",
+			input: { cwd: root },
+			idempotencyKey: undefined,
+		});
+	});
+
+	it("terminalizes an active turn when the SDK is unavailable and broker authority says the session is gone", async () => {
+		for (const [brokerState, expectedReason] of [
+			["not-indexed", "broker_session_not_indexed"],
+			["not-live", "broker_session_not_live"],
+			["replaced", "broker_session_replaced"],
+		] as const) {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			const queries: string[] = [];
+			const brokerSessions = [
+				{
+					sessionId: "visible-session",
+					locator: { repo: root },
+					live: true,
+					endpointGeneration: 1,
+					pid: 101,
+					endpointMtimeMs: 1,
+				},
+			];
+			const server = await createSdkControlServer(
+				root,
+				controls,
+				queries,
+				() => ({
+					type: "query_response",
+					id: "query-1",
+					ok: false,
+					error: { code: "unavailable", message: "session endpoint unavailable" },
+				}),
+				brokerSessions,
+			);
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "work",
+				idempotency_key: `prompt-${brokerState}`,
+				allow_mutation: true,
+			});
+			if (brokerState === "not-indexed") brokerSessions.splice(0);
+			else if (brokerState === "not-live") brokerSessions[0]!.live = false;
+			else brokerSessions[0]!.endpointGeneration = 2;
+
+			await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+				ok: true,
+				turn: {
+					status: "failed",
+					error: { code: "session_unavailable", message: expectedReason, recoverable: true },
+					liveness: { live: false, reason: expectedReason },
+				},
+				advisory_status: { authority: "sdk_broker", live: false, reason: expectedReason },
+			});
+			await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
+				ok: true,
+				summary: { active_turns: 0 },
+			});
+		}
 	});
 	it("uses the generation-bound broker endpoint when a stale local endpoint file is absent", async () => {
 		const root = await tempRoot();
@@ -776,7 +1253,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			advisory_status: { authority: "sdk", live: true, is_streaming: true },
 		});
-		expect(queries).toEqual(["Q12", "context.get"]);
+		expect(queries).toEqual(["Q12", "context.get", "turn.prompt_status"]);
 	});
 
 	it("passes a resolved mpreset into the SDK lifecycle create request and persists it with the session", async () => {
@@ -1374,7 +1851,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			root,
 			controls,
 			[],
-			(query, cursor) => {
+			(query, _input, cursor) => {
 				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
 				q12Calls.push(cursor);
 				return cursor
