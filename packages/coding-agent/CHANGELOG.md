@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Coordinator turn reads now reconcile authoritative terminal SDK prompt outcomes into one atomically fenced durable winner, repair interrupted projections, and preserve uncertain or still-live prompts as active, so cancelled Deep Interview turns no longer leave durable Coordinator turns stuck indefinitely (#3939).
 - ACP session configuration now emits the spec-defined `category` field on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), so standards-compliant ACP clients such as Paseo discover models, modes, and thinking levels instead of an empty model picker (#3922).
 - The ACP session model catalog is now filtered to active providers via `providers.list/active`, falling back to the full catalog on older session hosts, so ACP clients no longer list models for providers without usable credentials (#3922).
 
