@@ -43,12 +43,14 @@ function capturePayload(
 	model: Model<"anthropic-messages">,
 	input: Context,
 	onPayload?: (payload: Payload) => Payload | undefined,
+	cacheRetention?: "none" | "short" | "long",
 ): Promise<Payload> {
 	const { promise, resolve } = Promise.withResolvers<Payload>();
 	streamAnthropic(model, input, {
 		apiKey: "sk-ant-api-test",
 		isOAuth: false,
 		signal: abortedSignal(),
+		cacheRetention,
 		onPayload: payload => {
 			const replacement = onPayload?.(payload as Payload);
 			resolve((replacement ?? payload) as Payload);
@@ -125,6 +127,73 @@ describe("Anthropic prompt caching", () => {
 		});
 		// Non-Claude models on unknown compatible endpoints still get no generated caching.
 		expect(nonClaude.cache_control).toBeUndefined();
+	});
+	it("classifies the dispatched model id and honors every cache opt-out", async () => {
+		const proxyUrl = "https://proxy.example.test/anthropic";
+		const cases: Array<{
+			name: string;
+			model: Model<"anthropic-messages">;
+			options?: { cacheRetention?: "none" | "short" | "long" };
+			expected: CacheControl | undefined;
+		}> = [
+			{
+				name: "prefixed claude id on non-canonical gateway",
+				model: { ...canonicalModel, id: "anthropic/claude-sonnet-4-5", baseUrl: proxyUrl },
+				expected: { type: "ephemeral" },
+			},
+			{
+				name: "uppercase claude id on non-canonical gateway",
+				model: { ...canonicalModel, id: "CLAUDE-OPUS-5", baseUrl: proxyUrl },
+				expected: { type: "ephemeral" },
+			},
+			{
+				name: "non-canonical claude with explicit long retention opt-in",
+				model: { ...canonicalModel, baseUrl: proxyUrl, compat: { supportsLongCacheRetention: true } },
+				expected: { type: "ephemeral", ttl: "1h" },
+			},
+			{
+				name: "promptCacheMode none disables automatic caching",
+				model: { ...canonicalModel, baseUrl: proxyUrl, compat: { promptCacheMode: "none" } },
+				expected: undefined,
+			},
+			{
+				name: "per-request cacheRetention none disables caching on canonical",
+				model: canonicalModel,
+				options: { cacheRetention: "none" },
+				expected: undefined,
+			},
+			{
+				name: "id containing -claude- but not starting claude- is not cached",
+				model: { ...canonicalModel, id: "my-claude-helper", baseUrl: proxyUrl },
+				expected: undefined,
+			},
+			{
+				name: "wireModelId override does not drive the decision; dispatched id governs",
+				model: {
+					...canonicalModel,
+					id: "local-alias",
+					wireModelId: "claude-sonnet-4-5",
+					baseUrl: proxyUrl,
+				},
+				expected: undefined,
+			},
+			{
+				name: "wireModelId override to a non-claude wire id still follows dispatched id",
+				model: {
+					...canonicalModel,
+					id: "claude-sonnet-4-5",
+					wireModelId: "local-alias",
+					baseUrl: proxyUrl,
+				},
+				expected: { type: "ephemeral" },
+			},
+		];
+
+		for (const { name, model, options, expected } of cases) {
+			const payload = await capturePayload(model, context(), undefined, options?.cacheRetention);
+			expect(payload.model, name).toBe(model.id);
+			expect(cacheControls(payload), name).toEqual(expected ? [expected] : []);
+		}
 	});
 
 	it("counts top-level automatic and caller controls together without mutating a callback replacement", async () => {
