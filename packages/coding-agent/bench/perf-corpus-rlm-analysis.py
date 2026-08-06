@@ -2144,7 +2144,7 @@ def run_analysis(
                 authenticated_input_changed = authenticated_input_changed or (
                     _sha256_bytes(current_raw) != authenticated_file_hashes[entry.name]
                 )
-            except EvidenceError:
+            except (EvidenceError, OSError):
                 authenticated_input_changed = True
             if authenticated_input_changed:
                 global_findings.append(

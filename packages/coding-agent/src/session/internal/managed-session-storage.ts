@@ -7,6 +7,7 @@ import {
 	applyOwnerOnlyPathSecurity,
 	exactRemoveDirectoryTree,
 	exactReplacePath,
+	exactRestore,
 	exactUnlink,
 	linkNoReplacePath,
 	type NativeDirectoryTreeSnapshot,
@@ -1101,20 +1102,38 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const source = this.#resolve(sourceRelativePath);
 		const destination = this.#resolve(destinationRelativePath);
-		const moved = this.#authority
-			? this.#authority.renameManagedFileNoReplace(
-					this.#relative(source),
-					this.#relative(destination),
-					expected.identity.dev.toString(),
-					expected.identity.ino.toString(),
-					expected.identity.size.toString(),
-					expected.identity.mtimeNs.toString(),
-					expected.identity.ctimeNs.toString(),
-					expected.identity.sha256,
-				)
-			: renameNoReplacePath(source, destination);
-		const outcome = classifyNativePublishOutcome(moved, this.#authority ? "retained_file" : "direct_rename");
-		if (!outcome.ok) throw publishFailure(outcome);
+		if (this.#authority) {
+			const moved = this.#authority.renameManagedFileNoReplace(
+				this.#relative(source),
+				this.#relative(destination),
+				expected.identity.dev.toString(),
+				expected.identity.ino.toString(),
+				expected.identity.size.toString(),
+				expected.identity.mtimeNs.toString(),
+				expected.identity.ctimeNs.toString(),
+				expected.identity.sha256,
+			);
+			const outcome = classifyNativePublishOutcome(moved, "retained_file");
+			if (!outcome.ok) throw publishFailure(outcome);
+		} else {
+			const sourceParent = path.dirname(source);
+			if (sourceParent !== path.dirname(destination)) throw new Error("managed_move_parent_mismatch");
+			const parent = fs.lstatSync(sourceParent, { bigint: true });
+			const moved = exactRestore(source, destination, {
+				dev: expected.identity.dev,
+				ino: expected.identity.ino,
+				nlink: expected.identity.nlink,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+				size: BigInt(expected.identity.size),
+				mtimeNs: expected.identity.mtimeNs,
+				sha256: expected.identity.sha256,
+			});
+			if (!moved.ok)
+				throw new Error(
+					moved.code === "collision" ? "destination_conflict" : (moved.code ?? "managed_move_failed"),
+				);
+		}
 		const published = this.readExpected(destinationRelativePath);
 		if (
 			!published ||

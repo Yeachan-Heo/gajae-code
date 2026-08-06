@@ -519,6 +519,43 @@ describe("managed no-replace move", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+	it.skipIf(process.platform === "linux")(
+		"rejects a substituted staged source before publishing an authority-absent move",
+		async () => {
+			const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-move-source-swap-")));
+			try {
+				const sessionDir = path.join(root, "session");
+				const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+				await store.publishNoReplace(".successor.recovery-staging", Buffer.from("successor\n"));
+				const staged = store.readExpected(".successor.recovery-staging");
+				if (!staged) throw new Error("Expected staged managed successor");
+
+				const source = path.join(sessionDir, ".successor.recovery-staging");
+				const destination = path.join(sessionDir, "session.jsonl");
+				const retained = path.join(sessionDir, "retained-original");
+				const exactRestorePath = native.exactRestore;
+				const exactRestore = vi
+					.spyOn(native, "exactRestore")
+					.mockImplementation((sourcePath, destinationPath, identity) => {
+						fs.renameSync(sourcePath, retained);
+						fs.writeFileSync(sourcePath, "substituted\n");
+						return exactRestorePath(sourcePath, destinationPath, identity);
+					});
+				try {
+					expect(() =>
+						store.moveExpectedNoReplace(".successor.recovery-staging", "session.jsonl", staged),
+					).toThrow("identity_mismatch");
+					expect(fs.existsSync(destination)).toBe(false);
+					expect(fs.readFileSync(source, "utf8")).toBe("substituted\n");
+					expect(fs.readFileSync(retained, "utf8")).toBe("successor\n");
+				} finally {
+					exactRestore.mockRestore();
+				}
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
