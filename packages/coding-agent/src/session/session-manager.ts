@@ -75,6 +75,7 @@ import {
 import {
 	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
+	exactUnlinkCompleted,
 	fsyncManagedArtifactTree,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
@@ -643,6 +644,8 @@ async function fsyncDirectoryPath(directoryPath: string): Promise<void> {
 	const directory = await fs.promises.open(directoryPath, "r");
 	try {
 		await directory.sync();
+	} catch (error) {
+		if (process.platform !== "win32" || (error as NodeJS.ErrnoException | undefined)?.code !== "EPERM") throw error;
 	} finally {
 		await directory.close();
 	}
@@ -4811,6 +4814,10 @@ export class SessionManager {
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#recoveryPromotionTranscriptPath: string | undefined;
+	#recoverySourceRetirementCleanup:
+		| { readonly kind: "managed"; readonly relativePath: string; readonly snapshot: ManagedFileSnapshot }
+		| { readonly kind: "explicit"; readonly identity: ResumeSessionIdentity }
+		| undefined;
 	#memoryGuardParticipantIngressToken: symbol | undefined;
 	#fileEntries: FileEntry[] = [];
 	#pendingStrictAdoption:
@@ -7666,6 +7673,31 @@ export class SessionManager {
 	}
 
 	/** Close the persistent writer after flushing all pending data. */
+	async #retryRecoverySourceRetirementCleanup(): Promise<void> {
+		const cleanup = this.#recoverySourceRetirementCleanup;
+		if (!cleanup) return;
+		try {
+			if (cleanup.kind === "managed")
+				this.#managedTranscriptStore().removeExpected(cleanup.relativePath, cleanup.snapshot);
+			else {
+				const removed = native.exactUnlink(cleanup.identity.canonicalPath, {
+					dev: cleanup.identity.dev,
+					ino: cleanup.identity.ino,
+					size: BigInt(cleanup.identity.size),
+					mtimeNs: cleanup.identity.mtimeNs,
+					sha256: cleanup.identity.sha256,
+					quarantineName: `.gjc-recovery-retire-${process.pid}-${crypto.randomUUID()}`,
+				});
+				if (!exactUnlinkCompleted(removed)) throw new Error(removed.code ?? "recovery_source_retire_failed");
+				await fsyncDirectoryPath(path.dirname(cleanup.identity.canonicalPath));
+			}
+			this.#recoverySourceRetirementCleanup = undefined;
+		} catch (error) {
+			logger.warn("Recovery source retirement retry failed; retaining exact cleanup authority", {
+				error: toError(error).message,
+			});
+		}
+	}
 	async close(): Promise<void> {
 		// Drain any uncommitted prepared successors before releasing resources so
 		// dispose/shutdown retains exact cleanup authority (#3138).
@@ -7676,6 +7708,7 @@ export class SessionManager {
 				error: toError(error).message,
 			});
 		}
+		await this.#retryRecoverySourceRetirementCleanup();
 		await this.#queuePersistTask(async () => {
 			if (this.#persistWriter) {
 				await this.#closePersistWriterInternal();
@@ -7711,6 +7744,7 @@ export class SessionManager {
 				error: toError(error).message,
 			});
 		}
+		await this.#retryRecoverySourceRetirementCleanup();
 		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
 		await this.#queuePersistTask(async () => {
 			const writer = this.#persistWriter;
@@ -10603,17 +10637,162 @@ export class SessionManager {
 			"retain-and-throw",
 		);
 		try {
+			const promotionName = path.basename(promotionPath);
+			const stagingName = `.${promotionName}.${crypto.randomUUID()}.recovery-staging`;
 			if (this.destination.kind === "managed") {
 				const store = this.#managedTranscriptStore();
 				const sourceName = path.basename(context.identity.canonicalPath);
 				const sourceSnapshot = store.readExpected(sourceName);
 				if (!sourceSnapshot) throw new Error("Recovery transcript authority changed before publication.");
-				await store.publishNoReplace(path.basename(promotionPath), promotedSource.content);
-				store.removeExpected(sourceName, sourceSnapshot);
+				const intendedDigest = crypto.createHash("sha256").update(promotedSource.content).digest("hex");
+				const existing = store.readExpected(promotionName);
+				if (existing) {
+					if (
+						!existing.bytes.equals(Buffer.from(promotedSource.content)) ||
+						existing.identity.sha256 !== intendedDigest
+					)
+						throw new Error("Recovery successor authority conflicts with promotion.");
+				} else {
+					await store.publishNoReplace(stagingName, promotedSource.content);
+					const stagedSnapshot = store.readExpected(stagingName);
+					if (!stagedSnapshot) throw new Error("Recovery successor staging identity is unavailable.");
+					try {
+						store.moveExpectedNoReplace(stagingName, promotionName, stagedSnapshot);
+					} catch (error) {
+						const final = store.readExpected(promotionName);
+						if (
+							final &&
+							final.identity.dev === stagedSnapshot.identity.dev &&
+							final.identity.ino === stagedSnapshot.identity.ino &&
+							final.identity.size === stagedSnapshot.identity.size &&
+							final.identity.mtimeNs === stagedSnapshot.identity.mtimeNs &&
+							final.identity.sha256 === stagedSnapshot.identity.sha256
+						)
+							store.removeExpected(promotionName, final);
+						else {
+							const remaining = store.readExpected(stagingName);
+							if (
+								remaining &&
+								remaining.identity.dev === stagedSnapshot.identity.dev &&
+								remaining.identity.ino === stagedSnapshot.identity.ino &&
+								remaining.identity.sha256 === stagedSnapshot.identity.sha256
+							)
+								store.removeExpected(stagingName, stagedSnapshot);
+						}
+						throw error;
+					}
+				}
+				// A verified successor is retry-safe. Source-retirement failure retains a
+				// recoverable duplicate and does not wedge promotion.
+				try {
+					store.removeExpected(sourceName, sourceSnapshot);
+				} catch (error) {
+					this.#recoverySourceRetirementCleanup = {
+						kind: "managed",
+						relativePath: sourceName,
+						snapshot: sourceSnapshot,
+					};
+					logger.warn("Recovery source retirement failed after successor commit; exact retry scheduled", {
+						error: toError(error).message,
+					});
+				}
 			} else {
-				await writeOwnerOnlyFileNoReplace(promotionPath, promotedSource.content);
-				await fs.promises.rm(context.identity.canonicalPath, { force: true });
-				await fsyncDirectoryPath(path.dirname(context.identity.canonicalPath));
+				const directory = path.dirname(promotionPath);
+				const intendedDigest = crypto.createHash("sha256").update(promotedSource.content).digest("hex");
+				const retireSource = () =>
+					native.exactUnlink(context.identity.canonicalPath, {
+						dev: context.identity.dev,
+						ino: context.identity.ino,
+						size: BigInt(context.identity.size),
+						mtimeNs: context.identity.mtimeNs,
+						sha256: context.identity.sha256,
+						quarantineName: `.gjc-recovery-retire-${process.pid}-${crypto.randomUUID()}`,
+					});
+				const existing = inspectResumeSessionFile(promotionPath, this.storage);
+				if (!("kind" in existing)) {
+					if (
+						!Buffer.from(existing.content).equals(Buffer.from(promotedSource.content)) ||
+						existing.identity.sha256 !== intendedDigest
+					)
+						throw new Error("Recovery successor authority conflicts with promotion.");
+					fsyncResumeSessionIdentity(existing.identity);
+					const retired = retireSource();
+					if (exactUnlinkCompleted(retired))
+						await fsyncDirectoryPath(path.dirname(context.identity.canonicalPath));
+					else {
+						this.#recoverySourceRetirementCleanup = { kind: "explicit", identity: context.identity };
+						logger.warn("Recovery source retirement failed after successor commit; exact retry scheduled", {
+							code: retired.code,
+						});
+					}
+				} else {
+					const stagingPath = path.join(directory, stagingName);
+					await writeOwnerOnlyFileNoReplace(stagingPath, promotedSource.content);
+					const staged = await fs.promises.lstat(stagingPath, { bigint: true });
+					const stagedIdentity = {
+						dev: staged.dev,
+						ino: staged.ino,
+						size: staged.size,
+						mtimeNs: staged.mtimeNs,
+						sha256: intendedDigest,
+					};
+					let published = false;
+					try {
+						const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(stagingPath, promotionPath));
+						if (!outcome.ok) throw new Error(formatNativePublishDiagnostic(outcome));
+						published = true;
+						const final = await fs.promises.lstat(promotionPath, { bigint: true });
+						const finalDigest = crypto
+							.createHash("sha256")
+							.update(await fs.promises.readFile(promotionPath))
+							.digest("hex");
+						if (
+							final.dev !== stagedIdentity.dev ||
+							final.ino !== stagedIdentity.ino ||
+							final.size !== stagedIdentity.size ||
+							final.mtimeNs !== stagedIdentity.mtimeNs ||
+							finalDigest !== stagedIdentity.sha256
+						)
+							throw new Error("Recovery successor final identity changed during promotion.");
+						await fsyncDirectoryPath(directory);
+					} catch (error) {
+						const rollbackPath = published ? promotionPath : stagingPath;
+						const candidate = await fs.promises.lstat(rollbackPath, { bigint: true }).catch(() => undefined);
+						if (
+							candidate &&
+							candidate.dev === stagedIdentity.dev &&
+							candidate.ino === stagedIdentity.ino &&
+							candidate.size === stagedIdentity.size &&
+							candidate.mtimeNs === stagedIdentity.mtimeNs
+						) {
+							const digest = crypto
+								.createHash("sha256")
+								.update(await fs.promises.readFile(rollbackPath))
+								.digest("hex");
+							if (digest === stagedIdentity.sha256) {
+								const removed = native.exactUnlink(rollbackPath, {
+									...stagedIdentity,
+									quarantineName: `.gjc-recovery-rollback-${process.pid}-${crypto.randomUUID()}`,
+								});
+								if (!exactUnlinkCompleted(removed))
+									throw new Error(removed.code ?? "recovery_successor_rollback_failed", { cause: error });
+								await fsyncDirectoryPath(directory);
+							}
+						}
+						throw error;
+					}
+					// A failed retirement retains a durable verified duplicate and is reconciled
+					// as success, leaving later exact cleanup to recovery.
+					const retired = retireSource();
+					if (exactUnlinkCompleted(retired))
+						await fsyncDirectoryPath(path.dirname(context.identity.canonicalPath));
+					else {
+						this.#recoverySourceRetirementCleanup = { kind: "explicit", identity: context.identity };
+						logger.warn("Recovery source retirement failed after successor commit; exact retry scheduled", {
+							code: retired.code,
+						});
+					}
+				}
 			}
 		} catch (error) {
 			transition.dispose();

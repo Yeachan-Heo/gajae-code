@@ -501,6 +501,25 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 		fs.closeSync(unrelatedFd);
 	});
 });
+describe("managed no-replace move", () => {
+	it("retains the exact staged source when the final name already exists", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-move-collision-")));
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			await store.publishNoReplace(".successor.recovery-staging", Buffer.from("successor\n"));
+			await store.publishNoReplace("session.jsonl", Buffer.from("existing\n"));
+			const staged = store.readExpected(".successor.recovery-staging");
+			if (!staged) throw new Error("Expected staged managed successor");
+
+			expect(() => store.moveExpectedNoReplace(".successor.recovery-staging", "session.jsonl", staged)).toThrow();
+			expect(fs.readFileSync(path.join(sessionDir, ".successor.recovery-staging"), "utf8")).toBe("successor\n");
+			expect(fs.readFileSync(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("existing\n");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
 
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
 	it("atomically replaces an existing file through the Darwin path", () => {

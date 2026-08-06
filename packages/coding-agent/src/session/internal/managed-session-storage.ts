@@ -96,7 +96,7 @@ function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
 	return new ManagedPublishError(classification, outcome);
 }
 
-function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
+export function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 	return (
 		result.ok ||
 		(result.code === "cleanup_pending" &&
@@ -1064,6 +1064,45 @@ export class ManagedSessionDescendantStore {
 			return;
 		}
 		await publishManagedFileNoReplace(resolved, bytes, undefined, this.#root, this.#policy);
+	}
+	/**
+	 * Move an exact captured file to an absent name without reopening the source
+	 * pathname as authority. The rename changes ctime, so its stable identity is
+	 * rechecked after publication.
+	 */
+	moveExpectedNoReplace(
+		sourceRelativePath: string,
+		destinationRelativePath: string,
+		expected: ManagedFileSnapshot,
+	): void {
+		this.#beforeMutation();
+		this.#assertBound();
+		const source = this.#resolve(sourceRelativePath);
+		const destination = this.#resolve(destinationRelativePath);
+		const moved = this.#authority
+			? this.#authority.renameManagedFileNoReplace(
+					this.#relative(source),
+					this.#relative(destination),
+					expected.identity.dev.toString(),
+					expected.identity.ino.toString(),
+					expected.identity.size.toString(),
+					expected.identity.mtimeNs.toString(),
+					expected.identity.ctimeNs.toString(),
+					expected.identity.sha256,
+				)
+			: renameNoReplacePath(source, destination);
+		const outcome = classifyNativePublishOutcome(moved, this.#authority ? "retained_file" : "direct_rename");
+		if (!outcome.ok) throw publishFailure(outcome);
+		const published = this.readExpected(destinationRelativePath);
+		if (
+			!published ||
+			!sameStableIdentityIgnoringCtime(published.identity, expected.identity) ||
+			published.identity.sha256 !== expected.identity.sha256
+		) {
+			throw new Error("managed_move_identity_mismatch");
+		}
+		if (!this.#authority) fsyncDirectory(this.#baseDir);
+		this.#assertBound();
 	}
 
 	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): void {

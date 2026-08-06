@@ -58,7 +58,10 @@ import {
 	GjcTeamTaskStore,
 	withGjcTeamTaskMutation,
 } from "../../src/gjc-runtime/team-store";
-import { workerMemoryGuardLedgerPath } from "../../src/gjc-runtime/team-worker-memory-guard";
+import {
+	readTeamWorkerMemoryGuardLedger,
+	workerMemoryGuardLedgerPath,
+} from "../../src/gjc-runtime/team-worker-memory-guard";
 import {
 	gjcContinuationReservationDigest,
 	isValidGjcContinuationAck,
@@ -449,16 +452,10 @@ afterEach(async () => {
 	clearPsmuxDetectionCache();
 	__setBinaryResolverForTests(null);
 	__setExecutableIdentityResolverForTests(null);
-	for (const session of [
-		"gjc-worktree-team",
-		"gjc-fail-team",
-		"gjc-split-fail-team",
-		"gjc-named-team",
-		"gjc-cleanup-team",
-		"gjc-dirty-cleanup-team",
-	]) {
-		Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
-	}
+	// Team launches attach to an existing leader session; this suite creates no
+	// real tmux sessions. The tests that exercise tmux use per-test fake
+	// binaries, so probing a host tmux here is both unrelated and can hang on
+	// Windows when that runtime is unavailable or unresponsive.
 	const roots = new Set(cleanupRoots);
 	if (cleanupRoot) roots.add(cleanupRoot);
 	cleanupRoots.clear();
@@ -3849,6 +3846,62 @@ describe("resolveGjcWorkerCommand invocation authority", () => {
 });
 
 describe("team worker memory guard wiring", () => {
+	async function applyMemoryGuardWithStartupAck(input: {
+		teamName: string;
+		stateDir: string;
+		env: NodeJS.ProcessEnv;
+		token: string;
+	}): Promise<Record<string, unknown>> {
+		const before = Number.parseInt(await fs.readFile(path.join(cleanupRoot!, "tmux-split-count"), "utf8"), 10);
+		const config = await readTeamConfig(input.stateDir);
+		const oldPaneId = config.workers.find(worker => worker.id === "worker-1")?.pane_id;
+		expect(oldPaneId).toBeTruthy();
+		const markerAbort = new AbortController();
+		const successorAck = waitForFileText(
+			path.join(cleanupRoot!, "tmux-last-split"),
+			text => text.trim() === `${before + 1}\t${oldPaneId}\t%${before + 2}`,
+			markerAbort.signal,
+		).then(() =>
+			executeGjcTeamApiOperation(
+				"worker-startup-ack",
+				{
+					team_name: input.teamName,
+					worker_id: "worker-1",
+					protocol_version: "1",
+					replacement_token: input.token,
+				},
+				cleanupRoot!,
+				input.env,
+			),
+		);
+		const replacement = executeGjcTeamApiOperation(
+			"apply-worker-memory-guard",
+			{
+				team_name: input.teamName,
+				worker_id: "worker-1",
+				platform: "linux",
+				automatic_action_allowed: true,
+				reason: "post-ack-injected-failure",
+				replacement_token: input.token,
+			},
+			cleanupRoot!,
+			input.env,
+		);
+		try {
+			const result = await replacement;
+			if (process.platform !== "linux") {
+				markerAbort.abort(new Error("advisory host: no successor pane launch expected"));
+				await successorAck.catch(() => {});
+				return result;
+			}
+			await successorAck;
+			return result;
+		} catch (error) {
+			markerAbort.abort(error);
+			await successorAck.catch(() => {});
+			throw error;
+		}
+	}
 	it("launches per-worker ledgers and publishes the worker ledger path to tmux commands", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
@@ -4043,6 +4096,123 @@ describe("team worker memory guard wiring", () => {
 		expect(task.claim?.owner).toBe("worker-2");
 	}, 15_000);
 
+	it("persists post-ACK publication failures in the retry budget with a stable incident", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const env = {
+			GJC_SESSION_ID: TEST_SESSION_ID,
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_WORKER_COMMAND: "true",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			GJC_TEAM_MEMORY_GUARD_STARTUP_TIMEOUT_MS: "5000",
+		};
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Post ACK retry ledger",
+			teamName: "memory-guard-post-ack-retry-team",
+			cwd: cleanupRoot,
+			platform: "linux",
+			env,
+		});
+		const claim = await claimGjcTeamTask("memory-guard-post-ack-retry-team", "worker-1", cleanupRoot, env, "task-1");
+		expect(claim.ok).toBe(true);
+		__setGjcTeamRuntimeTestSeamsForTests({
+			memoryGuardHostPlatform: "linux",
+			memoryGuardReplacementPhase: phase => {
+				if (phase === "heartbeat_publication") throw new Error("injected_heartbeat_publication_failure");
+			},
+		});
+		const first = (await applyMemoryGuardWithStartupAck({
+			teamName: "memory-guard-post-ack-retry-team",
+			stateDir: snapshot.state_dir,
+			env,
+			token: "post-ack-retry-1",
+		})) as { result: string; ledger: { retry_count: number; last_incident_id?: string } };
+		expect(first).toMatchObject({ result: "retrying", ledger: { retry_count: 1 } });
+		expect(first.ledger.last_incident_id).toBeTruthy();
+		const second = (await applyMemoryGuardWithStartupAck({
+			teamName: "memory-guard-post-ack-retry-team",
+			stateDir: snapshot.state_dir,
+			env,
+			token: "post-ack-retry-2",
+		})) as { result: string; ledger: { retry_count: number; last_incident_id?: string } };
+		expect(second).toMatchObject({ result: "blocked", ledger: { retry_count: 2 } });
+		expect(second.ledger.last_incident_id).toBe(first.ledger.last_incident_id);
+		const persisted = (await Bun.file(workerMemoryGuardLedgerPath(snapshot.state_dir, "worker-1")).json()) as {
+			retry_count: number;
+			last_incident_id?: string;
+		};
+		expect(persisted).toMatchObject({ retry_count: 2, last_incident_id: first.ledger.last_incident_id });
+		const actions = await readTeamWorkerMemoryGuardLedger(path.join(snapshot.state_dir, "workers", "worker-1"));
+		expect(actions.slice(-2)).toMatchObject([
+			{ incident_id: first.ledger.last_incident_id, attempt: 1, result: "failed" },
+			{ incident_id: first.ledger.last_incident_id, attempt: 2, result: "blocked" },
+		]);
+	}, 30_000);
+
+	it("blocks manual recovery when post-ACK rollback cannot prove successor termination", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const env = {
+			GJC_SESSION_ID: TEST_SESSION_ID,
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_WORKER_COMMAND: "true",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			GJC_TEAM_MEMORY_GUARD_STARTUP_TIMEOUT_MS: "5000",
+		};
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Ambiguous post ACK rollback",
+			teamName: "memory-guard-ambiguous-rollback-team",
+			cwd: cleanupRoot,
+			platform: "linux",
+			env,
+		});
+		const claim = await claimGjcTeamTask(
+			"memory-guard-ambiguous-rollback-team",
+			"worker-1",
+			cleanupRoot,
+			env,
+			"task-1",
+		);
+		expect(claim.ok).toBe(true);
+		__setGjcTeamRuntimeTestSeamsForTests({
+			memoryGuardHostPlatform: "linux",
+			memoryGuardReplacementPhase: phase => {
+				if (phase === "heartbeat_publication" || phase === "rollback_successor_termination")
+					throw new Error(`injected_${phase}`);
+			},
+		});
+		const result = (await applyMemoryGuardWithStartupAck({
+			teamName: "memory-guard-ambiguous-rollback-team",
+			stateDir: snapshot.state_dir,
+			env,
+			token: "ambiguous-rollback-1",
+		})) as {
+			result: string;
+			lifecycle_mutated: boolean;
+			ledger: {
+				state: string;
+				retry_count: number;
+				last_reason?: string;
+				last_replacement?: { rollback?: { successor_terminated: boolean; predecessor_state_restored: boolean } };
+			};
+		};
+		expect(result).toMatchObject({
+			result: "blocked",
+			lifecycle_mutated: true,
+			ledger: {
+				state: "blocked",
+				retry_count: 2,
+				last_replacement: { rollback: { successor_terminated: false, predecessor_state_restored: true } },
+			},
+		});
+		expect(result.ledger.last_reason).toContain("rollback_failed:injected_rollback_successor_termination");
+		const task = await readGjcTeamTask("memory-guard-ambiguous-rollback-team", "task-1", cleanupRoot, env);
+		expect(task.status).toBe("blocked");
+	}, 30_000);
 	it("caps Linux replacement retries and blocks the claimed task on the terminal failure", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);

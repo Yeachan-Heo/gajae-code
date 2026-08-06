@@ -237,6 +237,11 @@ def _read_file_bytes(path: Path, maximum_bytes: int) -> tuple[bytes, os.stat_res
     return bytes(raw), before
 
 
+def _rescan_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    return identity if os.name == "nt" else (*identity, info.st_ctime_ns)
+
+
 def _canonical_digest(value: Any) -> str:
     return _sha256_bytes(
         json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2070,6 +2075,11 @@ def run_analysis(
             authenticated_file_stats,
         ) = _validate_sealed_inputs(input_real, prereg, expected_bindings)
         hashes.update(sealed_hashes)
+        authenticated_file_hashes = {
+            ATTEMPT_LEDGER_FILENAME: sealed_hashes["attemptLedgerSha256"],
+            RAW_MANIFEST_FILENAME: sealed_hashes["rawManifestSha256"],
+            **{filename: binding["sha256"] for filename, binding in raw_bindings.items()},
+        }
     except (EvidenceError, FileNotFoundError) as error:
         finding = _finding(
             "SEALED_INPUT_INVALID",
@@ -2113,7 +2123,7 @@ def run_analysis(
     entry_info: dict[str, os.stat_result] = {}
     for entry in sorted(scanned_entries, key=lambda item: item.name):
         try:
-            info = entry.stat(follow_symlinks=False)
+            info = (input_real / entry.name).lstat()
             scanned_total_size += info.st_size
             entry_info[entry.name] = info
         except OSError as error:
@@ -2127,26 +2137,23 @@ def run_analysis(
             continue
         present_names.add(entry.name)
         authenticated_info = authenticated_file_stats.get(entry.name)
-        if authenticated_info is not None and (
-            info.st_dev,
-            info.st_ino,
-            info.st_size,
-            info.st_mtime_ns,
-            info.st_ctime_ns,
-        ) != (
-            authenticated_info.st_dev,
-            authenticated_info.st_ino,
-            authenticated_info.st_size,
-            authenticated_info.st_mtime_ns,
-            authenticated_info.st_ctime_ns,
-        ):
-            global_findings.append(
-                _finding(
-                    "AUTHENTICATED_INPUT_METADATA_DRIFT",
-                    "PROTOCOL",
-                    f"authenticated input changed after byte capture: {entry.name}",
+        if authenticated_info is not None:
+            authenticated_input_changed = _rescan_file_identity(info) != _rescan_file_identity(authenticated_info)
+            try:
+                current_raw, _ = _read_file_bytes(input_real / entry.name, bounds["maximumBytesPerFile"])
+                authenticated_input_changed = authenticated_input_changed or (
+                    _sha256_bytes(current_raw) != authenticated_file_hashes[entry.name]
                 )
-            )
+            except EvidenceError:
+                authenticated_input_changed = True
+            if authenticated_input_changed:
+                global_findings.append(
+                    _finding(
+                        "AUTHENTICATED_INPUT_METADATA_DRIFT",
+                        "PROTOCOL",
+                        f"authenticated input changed after byte capture: {entry.name}",
+                    )
+                )
         if entry.name not in expected_names or not entry.name.endswith(".json"):
             global_findings.append(
                 _finding(

@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import { type LinuxProcPidProbeResult, probeLinuxProcPid } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
@@ -133,13 +133,31 @@ async function openClaimsDatabase(
 	const paths = memoryGuardClaimPaths(stateDir, sessionId);
 	await prepareClaimDirectory(paths.root);
 	const database = new Database(paths.databaseFile, { create: true });
-	configureClaimsDatabase(database);
-	await enforceDatabaseModes(paths.databaseFile);
-	return { database, databaseFile: paths.databaseFile };
+	try {
+		configureClaimsDatabase(database);
+		await enforceDatabaseModes(paths.databaseFile);
+		return { database, databaseFile: paths.databaseFile };
+	} catch (error) {
+		database.close(true);
+		throw error;
+	}
+}
+
+function withClaimStatement<T>(database: Database, query: string, operation: (statement: Statement) => T): T {
+	const statement = database.prepare(query);
+	try {
+		return operation(statement);
+	} finally {
+		statement.finalize();
+	}
 }
 
 function readEpoch(database: Database): number {
-	const row = database.prepare("SELECT value FROM meta WHERE key = 'epoch'").get() as { value: string } | null;
+	const row = withClaimStatement(
+		database,
+		"SELECT value FROM meta WHERE key = 'epoch'",
+		statement => statement.get() as { value: string } | null,
+	);
 	if (!row || !/^\d+$/.test(row.value)) throw new Error("memory_guard_claim_epoch_invalid");
 	const value = Number(row.value);
 	if (!Number.isSafeInteger(value) || value < 0) throw new Error("memory_guard_claim_epoch_invalid");
@@ -149,16 +167,18 @@ function readEpoch(database: Database): number {
 function allocateEpoch(database: Database): number {
 	const next = readEpoch(database) + 1;
 	if (!Number.isSafeInteger(next) || next <= 0) throw new Error("memory_guard_claim_epoch_overflow");
-	database.prepare("UPDATE meta SET value = ? WHERE key = 'epoch'").run(String(next));
+	withClaimStatement(database, "UPDATE meta SET value = ? WHERE key = 'epoch'", statement =>
+		statement.run(String(next)),
+	);
 	return next;
 }
 
 function readClaimRows(database: Database): PersistedMemoryGuardClaimRow[] {
-	const rows = database
-		.prepare(
-			"SELECT resource, epoch, session_id, generation, run_id, child_token, pid, process_start_time, tty_device, acquired_at FROM claims ORDER BY resource ASC",
-		)
-		.all() as PersistedMemoryGuardClaimRow[];
+	const rows = withClaimStatement(
+		database,
+		"SELECT resource, epoch, session_id, generation, run_id, child_token, pid, process_start_time, tty_device, acquired_at FROM claims ORDER BY resource ASC",
+		statement => statement.all() as PersistedMemoryGuardClaimRow[],
+	);
 	for (const row of rows) {
 		if (!MEMORY_GUARD_CLAIM_RESOURCES.includes(row.resource)) throw new Error("memory_guard_claim_resource_invalid");
 		if (!Number.isSafeInteger(row.epoch) || row.epoch <= 0) throw new Error("memory_guard_claim_epoch_invalid");
@@ -208,22 +228,23 @@ function insertClaimRow(
 	owner: MemoryGuardClaimOwner,
 	acquiredAt: string,
 ): void {
-	database
-		.prepare(
-			"INSERT INTO claims(resource, epoch, session_id, generation, run_id, child_token, pid, process_start_time, tty_device, acquired_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		)
-		.run(
-			resource,
-			epoch,
-			owner.sessionId,
-			owner.generation,
-			owner.runId,
-			owner.childToken,
-			owner.pid,
-			owner.processStartTime,
-			owner.ttyDevice,
-			acquiredAt,
-		);
+	withClaimStatement(
+		database,
+		"INSERT INTO claims(resource, epoch, session_id, generation, run_id, child_token, pid, process_start_time, tty_device, acquired_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		statement =>
+			statement.run(
+				resource,
+				epoch,
+				owner.sessionId,
+				owner.generation,
+				owner.runId,
+				owner.childToken,
+				owner.pid,
+				owner.processStartTime,
+				owner.ttyDevice,
+				acquiredAt,
+			),
+	);
 }
 
 function deleteExactClaimRow(
@@ -232,21 +253,22 @@ function deleteExactClaimRow(
 	epoch: number,
 	owner: MemoryGuardClaimOwner,
 ): number {
-	return database
-		.prepare(
-			"DELETE FROM claims WHERE resource = ? AND epoch = ? AND session_id = ? AND generation = ? AND run_id = ? AND child_token = ? AND pid = ? AND process_start_time = ? AND tty_device = ?",
-		)
-		.run(
-			resource,
-			epoch,
-			owner.sessionId,
-			owner.generation,
-			owner.runId,
-			owner.childToken,
-			owner.pid,
-			owner.processStartTime,
-			owner.ttyDevice,
-		).changes;
+	return withClaimStatement(
+		database,
+		"DELETE FROM claims WHERE resource = ? AND epoch = ? AND session_id = ? AND generation = ? AND run_id = ? AND child_token = ? AND pid = ? AND process_start_time = ? AND tty_device = ?",
+		statement =>
+			statement.run(
+				resource,
+				epoch,
+				owner.sessionId,
+				owner.generation,
+				owner.runId,
+				owner.childToken,
+				owner.pid,
+				owner.processStartTime,
+				owner.ttyDevice,
+			).changes,
+	);
 }
 
 function rollbackQuietly(database: Database): void {
@@ -299,7 +321,7 @@ export async function acquireMemoryGuardClaims(
 		}
 		throw new Error("memory_guard_claim_rows_changed");
 	} finally {
-		database.close();
+		database.close(true);
 	}
 }
 
@@ -320,7 +342,7 @@ export async function releaseMemoryGuardClaims(stateDir: string, claim: MemoryGu
 		rollbackQuietly(database);
 		throw error;
 	} finally {
-		database.close();
+		database.close(true);
 	}
 }
 
@@ -355,6 +377,7 @@ export async function probeMemoryGuardClaimsReleased(
 				database.exec("COMMIT");
 				await enforceDatabaseModes(databaseFile);
 				const proof = issueMemoryGuardClaimsLease({ writerEpoch, ttyEpoch, owner, claimStorePath: databaseFile });
+				database.close(true);
 				await releaseMemoryGuardClaims(stateDir, proof);
 				return proof;
 			} catch (error) {
@@ -364,7 +387,7 @@ export async function probeMemoryGuardClaimsReleased(
 		}
 		throw new Error("memory_guard_claim_rows_changed");
 	} finally {
-		database.close();
+		database.close(true);
 	}
 }
 
@@ -384,6 +407,6 @@ export async function readMemoryGuardClaimsForTest(
 			claims: readClaimRows(database),
 		};
 	} finally {
-		database.close();
+		database.close(true);
 	}
 }

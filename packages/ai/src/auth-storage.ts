@@ -4541,25 +4541,44 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#authCredentialsTableExists(): boolean {
-		const row = this.#db
-			.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'auth_credentials'")
-			.get() as { present?: number } | undefined;
-		return row?.present === 1;
+		const stmt = this.#db.prepare(
+			"SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'auth_credentials'",
+		);
+		try {
+			const row = stmt.get() as { present?: number } | undefined;
+			return row?.present === 1;
+		} finally {
+			stmt.finalize();
+		}
 	}
 
 	#readAuthSchemaVersion(): number | null {
-		const row = this.#db.prepare("SELECT version FROM auth_schema_version WHERE id = 1").get() as
-			| { version?: number }
-			| undefined;
-		return typeof row?.version === "number" ? row.version : null;
+		const stmt = this.#db.prepare("SELECT version FROM auth_schema_version WHERE id = 1");
+		try {
+			const row = stmt.get() as { version?: number } | undefined;
+			return typeof row?.version === "number" ? row.version : null;
+		} finally {
+			stmt.finalize();
+		}
 	}
 
 	#writeAuthSchemaVersion(version: number): void {
-		this.#db.prepare("INSERT OR REPLACE INTO auth_schema_version(id, version) VALUES (1, ?)").run(version);
+		const stmt = this.#db.prepare("INSERT OR REPLACE INTO auth_schema_version(id, version) VALUES (1, ?)");
+		try {
+			stmt.run(version);
+		} finally {
+			stmt.finalize();
+		}
 	}
 
 	#inferAuthSchemaVersion(): number {
-		const cols = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
+		const stmt = this.#db.prepare("PRAGMA table_info(auth_credentials)");
+		let cols: Array<{ name?: string }>;
+		try {
+			cols = stmt.all() as Array<{ name?: string }>;
+		} finally {
+			stmt.finalize();
+		}
 		const hasDisabledCause = cols.some(column => column.name === "disabled_cause");
 		const hasIdentityKey = cols.some(column => column.name === "identity_key");
 		const hasAccountId = cols.some(column => column.name === "account_id");
@@ -4607,7 +4626,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	#migrateAuthSchemaV0ToV1(): void {
 		const migrate = this.#db.transaction(() => {
-			const v0Cols = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
+			const v0ColsStmt = this.#db.prepare("PRAGMA table_info(auth_credentials)");
+			let v0Cols: Array<{ name?: string }>;
+			try {
+				v0Cols = v0ColsStmt.all() as Array<{ name?: string }>;
+			} finally {
+				v0ColsStmt.finalize();
+			}
 			const hasDisabled = v0Cols.some(col => col.name === "disabled");
 
 			this.#db.run("ALTER TABLE auth_credentials RENAME TO auth_credentials_v0");
@@ -4684,17 +4709,25 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#backfillCredentialIdentityKeys(): void {
-		const rows = this.#db
-			.prepare(
-				"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
-			)
-			.all() as AuthRow[];
+		const selectStmt = this.#db.prepare(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
+		);
+		let rows: AuthRow[];
+		try {
+			rows = selectStmt.all() as AuthRow[];
+		} finally {
+			selectStmt.finalize();
+		}
 		if (rows.length === 0) return;
 
-		const updateIdentity = this.#db.prepare("UPDATE auth_credentials SET identity_key = ? WHERE id = ?");
-		for (const row of rows) {
-			const identityKey = resolveRowCredentialIdentityKey(row.provider, row);
-			updateIdentity.run(identityKey, row.id);
+		const updateIdentityStmt = this.#db.prepare("UPDATE auth_credentials SET identity_key = ? WHERE id = ?");
+		try {
+			for (const row of rows) {
+				const identityKey = resolveRowCredentialIdentityKey(row.provider, row);
+				updateIdentityStmt.run(identityKey, row.id);
+			}
+		} finally {
+			updateIdentityStmt.finalize();
 		}
 	}
 
@@ -4927,9 +4960,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	updateAuthCredential(id: number, credential: AuthCredential): void {
 		try {
-			const providerRow = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(id) as
-				| { provider?: string }
-				| undefined;
+			const providerStmt = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?");
+			let providerRow: { provider?: string } | undefined;
+			try {
+				providerRow = providerStmt.get(id) as { provider?: string } | undefined;
+			} finally {
+				providerStmt.finalize();
+			}
 			const provider = providerRow?.provider ?? "";
 			const serialized = serializeCredential(provider, credential);
 			if (!serialized) return;
@@ -5092,6 +5129,6 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#upsertCacheStmt.finalize();
 		this.#deleteCachePrefixStmt.finalize();
 		this.#deleteExpiredCacheStmt.finalize();
-		this.#db.close();
+		this.#db.close(true);
 	}
 }

@@ -14,6 +14,7 @@ import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
+import { dlopen, FFIType, ptr, read } from "bun:ffi";
 import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
 import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
@@ -71,6 +72,7 @@ const CANONICAL_RUNNER_EXEC_ARGV: readonly (readonly string[])[] = [
 	["--expose-gc"],
 	["--smol", "--expose-gc"],
 ];
+const MAXIMUM_DISTINCT_CHILD_PID_ATTEMPTS = 3;
 
 function isCanonicalRunnerExecArgv(value: readonly string[]): boolean {
 	return CANONICAL_RUNNER_EXEC_ARGV.some(
@@ -78,7 +80,44 @@ function isCanonicalRunnerExecArgv(value: readonly string[]): boolean {
 	);
 }
 
+function windowsWideString(value: number): string {
+	const codeUnits: number[] = [];
+	for (let offset = 0; offset < 32_767 * 2; offset += 2) {
+		const codeUnit = read.u16(value, offset);
+		if (codeUnit === 0) return String.fromCharCode(...codeUnits);
+		codeUnits.push(codeUnit);
+	}
+	throw new Error("kernel process arguments unavailable");
+}
+
+function windowsProcessArguments(): string[] {
+	const kernel32 = dlopen("kernel32.dll", {
+		GetCommandLineW: { args: [], returns: FFIType.ptr },
+		LocalFree: { args: [FFIType.ptr], returns: FFIType.ptr },
+	});
+	const shell32 = dlopen("shell32.dll", {
+		CommandLineToArgvW: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
+	});
+	let argumentsPointer = 0;
+	try {
+		const argumentCount = new Uint32Array(1);
+		const commandLine = kernel32.symbols.GetCommandLineW();
+		argumentsPointer = shell32.symbols.CommandLineToArgvW(commandLine, ptr(argumentCount));
+		if (!argumentsPointer || argumentCount[0] === 0 || argumentCount[0] > 32_767) {
+			throw new Error("kernel process arguments unavailable");
+		}
+		return Array.from({ length: argumentCount[0] }, (_, index) =>
+			windowsWideString(read.ptr(argumentsPointer, index * 8)),
+		);
+	} finally {
+		if (argumentsPointer) kernel32.symbols.LocalFree(argumentsPointer);
+		shell32.close();
+		kernel32.close();
+	}
+}
+
 function kernelProcessArguments(): string[] {
+	if (process.platform === "win32") return windowsProcessArguments();
 	if (process.platform === "linux") {
 		return fs
 			.readFileSync(`/proc/${process.pid}/cmdline`, "utf8")
@@ -559,28 +598,54 @@ function isolatedMemoryEntry(surface: MemorySurface): string {
 	}
 	return import.meta.path;
 }
+export function spawnWithDistinctChildPid<T extends { childPid: number }>(
+	seenChildPids: ReadonlySet<number>,
+	spawn: () => T,
+	maximumAttempts = MAXIMUM_DISTINCT_CHILD_PID_ATTEMPTS,
+): T {
+	if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) {
+		throw new Error("memory baseline child PID retry limit must be a positive integer");
+	}
+	for (let attempt = 0; attempt < maximumAttempts; attempt++) {
+		const child = spawn();
+		if (!Number.isSafeInteger(child.childPid) || child.childPid <= 0) {
+			throw new Error("memory baseline child returned an invalid PID");
+		}
+		if (!seenChildPids.has(child.childPid)) return child;
+	}
+	throw new Error(`memory baseline child PID was reused after ${maximumAttempts} attempts`);
+}
+
 
 function buildIsolatedMemoryFixtures(
 	profile: MemoryWorkloadProfile,
 	targetDurationMs: number,
 	memorySurfaceOrder: readonly MemorySurface[],
 ): PerfCorpusFixtureResult[] {
+	const seenChildPids = new Set<number>();
 	return memorySurfaceOrder.map((surface, ordinal) => {
-		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface), MEMORY_CHILD_ARGUMENT], {
-			env: {
-				...process.env,
-				GJC_MEMORY_CHILD_SURFACE: surface,
-				GJC_MEMORY_PROFILE: profile,
-				GJC_MEMORY_DURATION_MS: String(targetDurationMs),
-				GJC_MEMORY_SURFACE_ORDINAL: String(ordinal),
-			},
+		const child = spawnWithDistinctChildPid(seenChildPids, () => {
+			const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface), MEMORY_CHILD_ARGUMENT], {
+				env: {
+					...process.env,
+					GJC_MEMORY_CHILD_SURFACE: surface,
+					GJC_MEMORY_PROFILE: profile,
+					GJC_MEMORY_DURATION_MS: String(targetDurationMs),
+					GJC_MEMORY_SURFACE_ORDINAL: String(ordinal),
+				},
+			});
+			if (result.exitCode !== 0) {
+				throw new Error(
+					`memory baseline child failed for ${surface}: ${new TextDecoder().decode(result.stderr).trim()}`,
+				);
+			}
+			const fixture = JSON.parse(new TextDecoder().decode(result.stdout)) as PerfCorpusFixtureResult;
+			const childPid = fixture.memoryBaseline?.childPid;
+			if (childPid === undefined) throw new Error(`memory baseline child omitted PID for ${surface}`);
+			return { childPid, fixture };
 		});
-		if (result.exitCode !== 0) {
-			throw new Error(
-				`memory baseline child failed for ${surface}: ${new TextDecoder().decode(result.stderr).trim()}`,
-			);
-		}
-		return JSON.parse(new TextDecoder().decode(result.stdout)) as PerfCorpusFixtureResult;
+		seenChildPids.add(child.childPid);
+		return child.fixture;
 	});
 }
 
@@ -724,7 +789,7 @@ function computePerfCorpusBenchmark(
 	return report;
 }
 
-export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+function runCanonicalPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
 	return computePerfCorpusBenchmark(authenticateCanonicalRunnerEntrypoint(), options);
 }
 
@@ -737,7 +802,7 @@ if (CANONICAL_RUNNER_MODULE_MAIN) {
 		if (!workload) throw new Error(`memory baseline workload unavailable for ${childSurface}`);
 		process.stdout.write(`${JSON.stringify(buildMemoryFixture(workload, profile, durationTargetMs))}\n`);
 	} else {
-		const report = runPerfCorpusBenchmark({ isolatedMemory: true });
+		const report = runCanonicalPerfCorpusBenchmark({ isolatedMemory: true });
 		process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 	}
 }

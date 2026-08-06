@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- SQLite-backed authentication storage now finalizes temporary and cached statements and closes its owned database connection, allowing settings directories and WAL files to be removed immediately on Windows.
+
 ## [0.12.12] - 2026-08-05
 
 ### Fixed

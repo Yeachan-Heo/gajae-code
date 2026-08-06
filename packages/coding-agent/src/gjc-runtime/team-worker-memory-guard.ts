@@ -28,6 +28,11 @@ export interface GjcTeamWorkerMemoryGuardReplacement {
 	old_pane_id?: string;
 	new_pane_id?: string;
 	recorded_at: string;
+	rollback?: {
+		successor_terminated: boolean;
+		predecessor_state_restored: boolean;
+		reason?: string;
+	};
 }
 
 export interface GjcTeamWorkerMemoryGuardLedger {
@@ -81,7 +86,7 @@ const ledgerKeys = new Set([
 	"updated_at",
 ]);
 const checkpointKeys = new Set(["kind", "files", "head", "commit", "recorded_at"]);
-const replacementKeys = new Set(["old_pane_id", "new_pane_id", "recorded_at"]);
+const replacementKeys = new Set(["old_pane_id", "new_pane_id", "recorded_at", "rollback"]);
 const absentPidProbeKeys = new Set(["kind"]);
 const livePidProbeKeys = new Set(["kind", "start_time"]);
 const unverifiablePidProbeKeys = new Set(["kind", "reason"]);
@@ -156,6 +161,16 @@ export function isCanonicalGjcTeamWorkerMemoryGuardCheckpoint(
 	);
 }
 
+function isCanonicalGjcTeamWorkerMemoryGuardReplacementRollback(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		hasExactKeys(value, new Set(["successor_terminated", "predecessor_state_restored", "reason"])) &&
+		typeof value.successor_terminated === "boolean" &&
+		typeof value.predecessor_state_restored === "boolean" &&
+		(value.reason === undefined || isNonEmptyString(value.reason))
+	);
+}
+
 export function isCanonicalGjcTeamWorkerMemoryGuardReplacement(
 	value: unknown,
 ): value is GjcTeamWorkerMemoryGuardReplacement {
@@ -164,7 +179,8 @@ export function isCanonicalGjcTeamWorkerMemoryGuardReplacement(
 		hasExactKeys(value, replacementKeys) &&
 		(value.old_pane_id === undefined || isNonEmptyString(value.old_pane_id)) &&
 		(value.new_pane_id === undefined || isNonEmptyString(value.new_pane_id)) &&
-		isTimestamp(value.recorded_at)
+		isTimestamp(value.recorded_at) &&
+		(value.rollback === undefined || isCanonicalGjcTeamWorkerMemoryGuardReplacementRollback(value.rollback))
 	);
 }
 

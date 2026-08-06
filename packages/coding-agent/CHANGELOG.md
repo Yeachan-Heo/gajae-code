@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Repaired Windows memory-release regressions in the v0.12.12 profiling and runtime paths: authenticated perf-corpus execution now recovers the real Windows command line, avoids reused child PIDs, revalidates sealed input bytes across Windows metadata APIs, and documents only the supported canonical runner; SQLite-backed settings and memory-guard claims finalize statements and close owned databases; checkpoint durability tolerates only Windows directory-`fsync` `EPERM`; recovery promotion is failure-atomic; and post-ACK team cutover failures consume the durable retry budget instead of looping ambiguously.
+
 ## [0.12.12] - 2026-08-05
 
 ### Added

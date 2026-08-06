@@ -629,6 +629,18 @@ export interface GjcTeamRuntimeTestSeams {
 	) => { exitCode?: number } | Promise<{ exitCode?: number }>;
 	continuationBeforeDispatch?: () => Promise<void>;
 	continuationAckPoll?: () => Promise<void>;
+	memoryGuardReplacementPhase?: (
+		phase:
+			| "post_ack_authority"
+			| "successor_pane_recheck"
+			| "heartbeat_publication"
+			| "config_publication"
+			| "lifecycle_publication"
+			| "predecessor_termination"
+			| "rollback_successor_termination"
+			| "rollback_predecessor_restoration",
+	) => void | Promise<void>;
+	memoryGuardHostPlatform?: NodeJS.Platform;
 }
 
 let gjcTeamRuntimeTestSeams: GjcTeamRuntimeTestSeams | undefined;
@@ -1697,12 +1709,16 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	let ledger = ledgers.get(worker.id) ?? (await readWorkerMemoryGuardLedger(dir, worker.id, input.platform));
 	const nowIso = now();
 	const currentTaskId = task?.id;
-	const incidentId = input.incidentId ?? stableHash(`${worker.id}:${currentTaskId ?? "none"}:${nowIso}`).slice(0, 16);
+	const memoryGuardHostPlatform = gjcTeamRuntimeTestSeams?.memoryGuardHostPlatform ?? process.platform;
+	const incidentId =
+		input.incidentId ??
+		(ledger.retry_count > 0 ? ledger.last_incident_id : undefined) ??
+		stableHash(`${worker.id}:${currentTaskId ?? "none"}:${nowIso}`).slice(0, 16);
 	const baseReason = input.reason?.trim() || "memory_guard_requested";
 	if (!authority.valid || !Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= currentTimeMs()) {
 		const noClaimReason =
-			process.platform !== "linux" || input.platform !== "linux"
-				? `unsupported_platform:${input.platform}:host:${process.platform}:${baseReason}`
+			memoryGuardHostPlatform !== "linux" || input.platform !== "linux"
+				? `unsupported_platform:${input.platform}:host:${memoryGuardHostPlatform}:${baseReason}`
 				: "worker_has_no_exact_active_claim";
 		ledger = {
 			...ledger,
@@ -1754,14 +1770,14 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			automatic_action_allowed: input.allowAutomaticAction,
 			updated_at: nowIso,
 		};
-	if (process.platform !== "linux" || input.platform !== "linux") {
+	if (memoryGuardHostPlatform !== "linux" || input.platform !== "linux") {
 		ledger = {
 			...ledger,
 			platform: input.platform,
 			state: "advisory",
 			current_task_id: currentTaskId,
 			last_incident_id: incidentId,
-			last_reason: `unsupported_platform:${input.platform}:host:${process.platform}:${baseReason}`,
+			last_reason: `unsupported_platform:${input.platform}:host:${memoryGuardHostPlatform}:${baseReason}`,
 			last_pid_probe: input.pidProbe,
 			updated_at: nowIso,
 		};
@@ -1916,7 +1932,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		newPaneId = await relaunchWorkerPaneForMemoryGuard({
 			config,
 			worker,
-			platform: process.platform,
+			platform: memoryGuardHostPlatform,
 			startupAckPath,
 			replacementToken,
 			startupAckTimeoutMs,
@@ -1966,48 +1982,10 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			ledger,
 		};
 	}
-	const postAckInventory = await readGjcContinuationAuthorityInventory(dir);
-	const postAckAuthority = postAckInventory.valid
-		? selectGjcContinuationWorkerAuthority(postAckInventory, worker.id)
-		: { valid: false as const, taskCount: 0, claimCount: 0 };
-	if (
-		!postAckAuthority.valid ||
-		postAckAuthority.task.id !== task?.id ||
-		postAckAuthority.claim.token !== task?.claim?.token ||
-		postAckAuthority.claim.leased_until !== task?.claim?.leased_until ||
-		Date.parse(postAckAuthority.claim.leased_until) <= currentTimeMs()
-	) {
-		executeTeamTmuxMutation(config, { type: "kill-pane", paneId: newPaneId });
-		await restorePredecessorStartupState();
-		return {
-			ok: true,
-			result: "advisory",
-			lifecycle_mutated: false,
-			reason: "worker_claim_authority_changed_after_startup",
-		};
-	}
-	const successorPane = probePaneTeamTarget(config, newPaneId);
-	if (!successorPane.exists || !successorPane.belongsToTeamTarget || !successorPane.pid) {
-		executeTeamTmuxMutation(config, { type: "kill-pane", paneId: newPaneId });
-		await restorePredecessorStartupState();
-		return {
-			ok: true,
-			result: "advisory",
-			lifecycle_mutated: false,
-			reason: "successor_pane_unavailable_after_startup",
-		};
-	}
 	const heartbeatPath = path.join(dir, "workers", safePathSegment("worker_id", worker.id), "heartbeat.json");
 	const previousHeartbeat = (await Bun.file(heartbeatPath).exists())
 		? await Bun.file(heartbeatPath).text()
 		: undefined;
-	const successorHeartbeat: WorkerHeartbeatFile = {
-		pid: successorPane.pid,
-		last_turn_at: now(),
-		turn_count: 0,
-		alive: true,
-		process_start_time: await readLinuxProcessStartTime(successorPane.pid),
-	};
 	const nextConfig: GjcTeamConfig = {
 		...config,
 		workers: config.workers.map(candidate =>
@@ -2017,35 +1995,144 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		),
 		updated_at: nowIso,
 	};
-	const rollbackReplacement = async (): Promise<void> => {
-		executeTeamTmuxMutation(config, { type: "kill-pane", paneId: newPaneId });
-		if (previousHeartbeat === undefined) await fs.rm(heartbeatPath, { force: true });
-		else await Bun.write(heartbeatPath, previousHeartbeat);
-		await syncTeamConfigAndManifest(dir, config);
-		await restorePredecessorStartupState();
+	let predecessorTerminationStarted = false;
+	const rollbackReplacement = async () => {
+		const failures: string[] = [];
+		let successorTerminated = false;
+		let predecessorStateRestored = false;
+		try {
+			await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("rollback_successor_termination");
+			executeTeamTmuxMutation(config, { type: "kill-pane", paneId: newPaneId });
+			successorTerminated = true;
+		} catch (error) {
+			failures.push(error instanceof Error && error.message ? error.message : "successor_termination_failed");
+		}
+		if (predecessorTerminationStarted) {
+			failures.push("predecessor_termination_ambiguous");
+		} else {
+			try {
+				await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("rollback_predecessor_restoration");
+				if (previousHeartbeat === undefined) await fs.rm(heartbeatPath, { force: true });
+				else await Bun.write(heartbeatPath, previousHeartbeat);
+				await syncTeamConfigAndManifest(dir, config);
+				await restorePredecessorStartupState();
+				predecessorStateRestored = true;
+			} catch (error) {
+				failures.push(error instanceof Error && error.message ? error.message : "predecessor_restoration_failed");
+			}
+		}
+		return {
+			successor_terminated: successorTerminated,
+			predecessor_state_restored: predecessorStateRestored,
+			...(failures.length ? { reason: failures.join(";") } : {}),
+		};
+	};
+	const finalizePostAckFailure = async (error: unknown): Promise<Record<string, unknown>> => {
+		const primaryReason =
+			error instanceof Error && error.message
+				? `memory_guard_replacement_commit_failed:${error.message}`
+				: "memory_guard_replacement_commit_failed";
+		const rollback = await rollbackReplacement();
+		const ambiguousRollback = !rollback.successor_terminated || !rollback.predecessor_state_restored;
+		const reason = rollback.reason ? `${primaryReason};rollback_failed:${rollback.reason}` : primaryReason;
+		const retried = withMemoryGuardRetry(ledger, {
+			platform: input.platform,
+			reason,
+			incidentId,
+			currentTaskId,
+			pidProbe: input.pidProbe,
+			nowIso,
+		});
+		ledger = {
+			...retried.ledger,
+			...(ambiguousRollback ? { state: "blocked" as const, retry_count: ledger.retry_limit } : {}),
+			last_replacement: {
+				old_pane_id: worker.pane_id,
+				new_pane_id: newPaneId,
+				recorded_at: nowIso,
+				rollback,
+			},
+		};
+		await writeWorkerMemoryGuardLedger(dir, ledger);
+		const finalBlocked = retried.finalBlocked || ambiguousRollback;
+		if (finalBlocked)
+			await input.withTaskMutation(taskMutation =>
+				finalizeWorkerMemoryGuardBlockedState({
+					teamName: input.teamName,
+					dir,
+					worker,
+					task,
+					taskMutation,
+					reason,
+					cwd: input.cwd,
+					env: input.env,
+				}),
+			);
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: finalBlocked ? "blocked" : "replace",
+			result: finalBlocked ? "blocked" : "failed",
+			reason,
+		});
+		return {
+			ok: true,
+			result: finalBlocked ? "blocked" : "retrying",
+			lifecycle_mutated: finalBlocked,
+			ledger,
+		};
 	};
 	try {
+		await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("post_ack_authority");
+		const postAckInventory = await readGjcContinuationAuthorityInventory(dir);
+		const postAckAuthority = postAckInventory.valid
+			? selectGjcContinuationWorkerAuthority(postAckInventory, worker.id)
+			: { valid: false as const, taskCount: 0, claimCount: 0 };
+		if (
+			!postAckAuthority.valid ||
+			postAckAuthority.task.id !== task?.id ||
+			postAckAuthority.claim.token !== task?.claim?.token ||
+			postAckAuthority.claim.leased_until !== task?.claim?.leased_until ||
+			Date.parse(postAckAuthority.claim.leased_until) <= currentTimeMs()
+		)
+			throw new Error("worker_claim_authority_changed_after_startup");
+		await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("successor_pane_recheck");
+		const successorPane = probePaneTeamTarget(config, newPaneId);
+		if (!successorPane.exists || !successorPane.belongsToTeamTarget || !successorPane.pid)
+			throw new Error("successor_pane_unavailable_after_startup");
+		const successorHeartbeat: WorkerHeartbeatFile = {
+			pid: successorPane.pid,
+			last_turn_at: now(),
+			turn_count: 0,
+			alive: true,
+			process_start_time: await readLinuxProcessStartTime(successorPane.pid),
+		};
+		await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("heartbeat_publication");
 		await writeJsonFile(heartbeatPath, successorHeartbeat);
+		await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("config_publication");
 		await syncTeamConfigAndManifest(dir, nextConfig);
+		await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("lifecycle_publication");
 		await writeLifecycleRecord(workerRuntime, dir, { ...worker, pane_id: newPaneId }, "ready", {
 			pane_id: newPaneId,
 			started_at: nowIso,
 			stop_reason: undefined,
 			stopped_at: undefined,
 		});
+		await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("successor_pane_recheck");
 		const cutoverPane = probePaneTeamTarget(config, newPaneId);
 		if (!cutoverPane.exists || !cutoverPane.belongsToTeamTarget || cutoverPane.pid !== successorHeartbeat.pid)
 			throw new Error(`memory_guard_successor_pane_changed:${worker.id}`);
 		if (worker.pane_id && !config.dry_run) {
+			predecessorTerminationStarted = true;
+			await gjcTeamRuntimeTestSeams?.memoryGuardReplacementPhase?.("predecessor_termination");
 			executeTeamTmuxMutation(config, { type: "kill-pane", paneId: worker.pane_id });
 		}
 	} catch (error) {
-		await rollbackReplacement();
-		throw new Error(
-			error instanceof Error && error.message
-				? `memory_guard_replacement_commit_failed:${error.message}`
-				: "memory_guard_replacement_commit_failed",
-		);
+		return finalizePostAckFailure(error);
 	}
 	ledger = {
 		...ledger,
