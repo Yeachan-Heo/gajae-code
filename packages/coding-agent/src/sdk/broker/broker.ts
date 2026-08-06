@@ -891,12 +891,7 @@ export class Broker {
 							"Indexed session requires durable locator authority before deletion",
 						);
 				}
-				return error(
-					"invalid_input",
-					requestedSessionId
-						? "session.delete requires an existing indexed session or its durable deletion locator."
-						: "sessionId is required.",
-				);
+				return { ok: true, result: requestedSessionId ? { sessionId: requestedSessionId } : undefined };
 			}
 			if (
 				cleanup &&
