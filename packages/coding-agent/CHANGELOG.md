@@ -5,6 +5,7 @@
 ### Fixed
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
+- Custom `anthropic-messages` providers can now configure `compat.promptCacheMode` (`none`, `explicit`, or `automatic`) and `compat.supportsLongCacheRetention` at provider, model, and model-override levels. This makes the automatic Claude-family caching default safely overridable for compatible endpoints that require block-level cache markers or do not support 1-hour retention.
 
 ## [0.12.12] - 2026-08-05
 

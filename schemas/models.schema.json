@@ -214,6 +214,17 @@
 									"all_strict",
 									"none"
 								]
+							},
+							"supportsLongCacheRetention": {
+								"type": "boolean"
+							},
+							"promptCacheMode": {
+								"type": "string",
+								"enum": [
+									"none",
+									"explicit",
+									"automatic"
+								]
 							}
 						},
 						"additionalProperties": false
@@ -627,6 +638,17 @@
 												"all_strict",
 												"none"
 											]
+										},
+										"supportsLongCacheRetention": {
+											"type": "boolean"
+										},
+										"promptCacheMode": {
+											"type": "string",
+											"enum": [
+												"none",
+												"explicit",
+												"automatic"
+											]
 										}
 									},
 									"additionalProperties": false
@@ -998,6 +1020,17 @@
 											"enum": [
 												"all_strict",
 												"none"
+											]
+										},
+										"supportsLongCacheRetention": {
+											"type": "boolean"
+										},
+										"promptCacheMode": {
+											"type": "string",
+											"enum": [
+												"none",
+												"explicit",
+												"automatic"
 											]
 										}
 									},
