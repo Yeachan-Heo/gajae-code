@@ -737,7 +737,13 @@ export function acpRequestFailure(error: unknown): unknown {
 	}
 }
 
-/** Registers a permission provider only when the ACP client requires prompts. */
+/**
+ * Registers the permission reverse channel whenever a form-less client needs
+ * to answer selector asks. The permission mode (prompt vs allow) only gates
+ * tool-authorization prompts via `permission_mode.set`; workflow questions
+ * still need a channel, so form-less clients always get the permission
+ * capability and the bus installs the permission-backed ask source on it.
+ */
 export function acpProviderRegistrations(
 	capabilities: ClientCapabilities | undefined,
 	env: NodeJS.ProcessEnv = process.env,
@@ -757,7 +763,7 @@ export function acpProviderRegistrations(
 				]
 			: []),
 		...(capabilities?.terminal ? [{ capability: "terminal", definitions: [] }] : []),
-		...(resolveAcpPermissionMode(capabilities, env) === "prompt"
+		...(resolveAcpPermissionMode(capabilities, env) === "prompt" || !capabilities?.elicitation?.form
 			? [{ capability: "permission", definitions: [] }]
 			: []),
 		...(capabilities?.elicitation?.form ? [{ capability: "ui", definitions: [] }] : []),

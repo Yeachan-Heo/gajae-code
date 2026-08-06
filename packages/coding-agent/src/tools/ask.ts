@@ -577,6 +577,8 @@ export const OTHER_OPTION = "Other (type your own)";
 export const ASK_CLARIFICATION_OPTION = "Ask about these choices";
 export const RECOMMENDED_SUFFIX = " (Recommended)";
 const REMOTE_NAVIGATION_FORWARD = "\u0000ask-navigation-forward";
+const HEADLESS_CHECKBOX_CHECKED = "[x]";
+const HEADLESS_CHECKBOX_UNCHECKED = "[ ]";
 const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
 
@@ -948,8 +950,8 @@ async function askSingleQuestion(
 	const promptWithProgress = navigation?.progressText ? `${question} (${navigation.progressText})` : question;
 	if (multi) {
 		const selected = new Set<string>(selectedOptions);
-		const checkedCheckbox = theme?.checkbox?.checked ?? "[x]";
-		const uncheckedCheckbox = theme?.checkbox?.unchecked ?? "[ ]";
+		const checkedCheckbox = theme?.checkbox?.checked ?? HEADLESS_CHECKBOX_CHECKED;
+		const uncheckedCheckbox = theme?.checkbox?.unchecked ?? HEADLESS_CHECKBOX_UNCHECKED;
 		let cursorIndex = Math.min(Math.max(recommended ?? 0, 0), Math.max(optionLabels.length - 1, 0));
 		const firstSelected = selectedOptions[0];
 		if (firstSelected) {
@@ -1374,7 +1376,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							? [theme.checkbox.checked, theme.checkbox.unchecked].filter(
 									(prefix): prefix is string => typeof prefix === "string",
 								)
-							: [];
+							: [HEADLESS_CHECKBOX_CHECKED, HEADLESS_CHECKBOX_UNCHECKED];
 						const selectedValue =
 							remoteValue === undefined
 								? value
@@ -1655,7 +1657,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					navigation: options?.navigation,
 					scrollTitleRows: DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					otherOptionLabel,
-					autoSelectOnTimeout: !intentContract(q.deepInterview) && !intentReview(q.deepInterview),
+					autoSelectOnTimeout:
+						!intentContract(q.deepInterview) &&
+						!intentReview(q.deepInterview) &&
+						(q.workflowGate === undefined || q.workflowGate.kind === "question"),
 					clarificationOptionLabel,
 					onRemoteState: state => {
 						activeRemoteRequest = {

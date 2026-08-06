@@ -26,13 +26,20 @@ function providerNames(capabilities: unknown, env: NodeJS.ProcessEnv = {}): stri
 	return acpProviderRegistrations(capabilities as never, env).map(provider => provider.capability);
 }
 
-test("ACP registers a permission provider only for prompt handling", () => {
+test("ACP registers the permission channel for form-less clients regardless of permission mode", () => {
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "prompt" } } })).toContain("permission");
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } } })).not.toContain("permission");
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "always-allow" } } })).not.toContain("permission");
+	// Form-less clients always get the permission channel so selector asks can
+	// be answered even in auto/always-allow mode (the mode only gates tools).
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } } })).toContain("permission");
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "always-allow" } } })).toContain("permission");
 	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "prompt" })).toContain("permission");
-	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "auto" })).not.toContain("permission");
+	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "auto" })).toContain("permission");
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "invalid" } } })).toContain("permission");
+	// A form-eliciting client in allow mode keeps only the ui channel.
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } }, elicitation: { form: {} } })).not.toContain(
+		"permission",
+	);
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } }, elicitation: { form: {} } })).toContain("ui");
 });
 
 test("ACP registers the SDK UI provider only for clients with form elicitation", () => {
