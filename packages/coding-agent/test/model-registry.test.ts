@@ -1963,18 +1963,11 @@ describe("ModelRegistry", () => {
 			expect(model?.name).toBe("MiniMax-M3");
 		});
 
-<<<<<<< HEAD
-		test("#3856: namespaced custom model id inherits canonical leaf metadata when omitted", () => {
-			// Proxy wire IDs often namespace the upstream model (`vendor/model-id`).
-			// When contextWindow/maxTokens are omitted, inherit from the bundled leaf
-			// id while retaining the namespaced wire id for the request.
-=======
 		test("#3856/#3858: namespaced custom DeepSeek V4 proxy inherits leaf metadata and keeps :max", () => {
 			// Proxy wire IDs often namespace the upstream model (`vendor/model-id`).
 			// When limits/compat are omitted, inherit from the bundled leaf id while
 			// retaining the namespaced wire id. DeepSeek V4 must expose `max` so a
 			// profile `:max` suffix is not silently rewritten to GJC `xhigh`.
->>>>>>> 754961da6 (fix(models): surface DeepSeek V4 proxy max effort and wire mapping)
 			writeRawModelsJson({
 				clinepass: {
 					baseUrl: "https://api.cline.bot/api/v1",
@@ -2004,15 +1997,12 @@ describe("ModelRegistry", () => {
 			expect(model?.maxTokens).toBe(384_000);
 			expect(model?.reasoning).toBe(true);
 			expect(model?.baseUrl).toBe("https://api.cline.bot/api/v1");
-<<<<<<< HEAD
-=======
 			expect(model?.thinking?.maxLevel).toBe(Effort.Max);
 			expect(getOpenAICompat(model)?.reasoningEffortMap).toMatchObject({
 				high: "high",
 				xhigh: "max",
 				max: "max",
 			});
->>>>>>> 754961da6 (fix(models): surface DeepSeek V4 proxy max effort and wire mapping)
 		});
 
 		test("#3856: true unknown namespaced custom models still use generic defaults", () => {

@@ -936,12 +936,8 @@ function getCustomReferenceCandidateIds(modelId: string): string[] {
 	}
 	// Namespaced wire IDs (e.g. `cline-pass/deepseek-v4-flash`) keep the full id for
 	// the API request, but should still try the leaf segment against bundled
-<<<<<<< HEAD
-	// references so capability metadata is not silently replaced by 128K/16K defaults.
-=======
 	// references so capability metadata (thinking levels, reasoningEffortMap,
 	// context windows) is not silently replaced by generic defaults.
->>>>>>> 754961da6 (fix(models): surface DeepSeek V4 proxy max effort and wire mapping)
 	// Only an exact leaf match in the reference map inherits; unknown leaves stay defaulted.
 	const slashIndex = trimmedId.lastIndexOf("/");
 	if (slashIndex >= 0 && slashIndex < trimmedId.length - 1) {
