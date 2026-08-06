@@ -178,7 +178,11 @@ function shouldSendOpenAIResponsesSessionHeaders(
 	if (cacheRetention === "none" || isKnownProvider(model.provider)) {
 		return false;
 	}
-	return model.compat?.supportsResponsesSessionAffinity === true && !isCanonicalOpenAIAffinityOrigin(baseUrl);
+	return (
+		Boolean(baseUrl?.trim()) &&
+		model.compat?.supportsResponsesSessionAffinity === true &&
+		!isCanonicalOpenAIAffinityOrigin(baseUrl)
+	);
 }
 
 function isOpenAIHostBaseUrl(baseUrl: string): boolean {

@@ -288,7 +288,7 @@ function assertResponsesSessionAffinitySupported(
 	if (api !== "openai-responses") {
 		throw new Error(`Provider ${providerName}: ${source} is only supported with the openai-responses API.`);
 	}
-	if (!isKnownProvider(providerName) && isCanonicalOpenAIAffinityBaseUrl(baseUrl)) {
+	if (!isKnownProvider(providerName) && (!baseUrl?.trim() || isCanonicalOpenAIAffinityBaseUrl(baseUrl))) {
 		throw new Error(
 			`Provider ${providerName}: ${source} requires a genuinely custom base URL for unknown provider IDs.`,
 		);

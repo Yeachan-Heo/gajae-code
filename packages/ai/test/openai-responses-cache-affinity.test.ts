@@ -150,6 +150,20 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.sessionId).toBeNull();
 		expect(captured.clientRequestId).toBeNull();
 	});
+	it("does not set affinity headers for an unknown provider without an explicit base URL", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{
+				...model,
+				provider: "openai-relay",
+				baseUrl: "",
+				compat: { ...model.compat, supportsResponsesSessionAffinity: true },
+			},
+		);
+
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+	});
 
 	it("allows an explicit opt-in on the known openai provider when it uses a custom relay", async () => {
 		const captured = await captureOpenAIResponseHeaders(

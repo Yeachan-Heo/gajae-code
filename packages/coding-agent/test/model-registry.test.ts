@@ -4540,6 +4540,19 @@ describe("ModelRegistry", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		expect(String(registry.getError()?.message)).toContain("requires a genuinely custom base URL");
 	});
+	test("rejects unknown-provider responses affinity without a base URL", () => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("requires a genuinely custom base URL");
+	});
 	test("rejects responses affinity on non-Responses APIs", () => {
 		writeRawModelsConfig({
 			providers: {
