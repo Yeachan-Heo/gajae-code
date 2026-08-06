@@ -11205,6 +11205,62 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 	expect(ask).toBeTruthy();
 	expect(ask!.body.reply_markup?.inline_keyboard?.length).toBeGreaterThan(0);
 });
+test("private chat without Threaded Mode: concurrent frames all deliver flat", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	// Verbatim Bot API rejection for a paired private chat whose bot has no
+	// Threaded Mode; the slow response makes a second frame join the shared
+	// in-flight create instead of issuing its own.
+	bot.call = (async (method: string, body: unknown) => {
+		bot.calls.push({ method, body: body as never });
+		if (method === "createForumTopic") {
+			await Bun.sleep(30);
+			return { ok: false, error_code: 400, description: "Bad Request: the chat is not a forum" };
+		}
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as never;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		sound: "none",
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await Promise.all([
+		daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+		daemon.handleSessionMessage(session as never, {
+			type: "action_needed",
+			sessionId: "S",
+			id: "ask1",
+			kind: "ask",
+			question: "Proceed?",
+			options: ["Yes", "No"],
+		}),
+	]);
+	// A later frame must not re-attempt the refused capability.
+	await daemon.handleSessionMessage(session as never, {
+		type: "context_update",
+		sessionId: "S",
+		lastMessage: "hello world",
+	});
+
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	const sends = bot.calls.filter(call => call.method === "sendMessage");
+	expect(sends.every(call => call.body.message_thread_id === undefined)).toBe(true);
+	expect(sends.some(call => String(call.body.text).includes("Proceed?"))).toBe(true);
+	expect(sends.some(call => String(call.body.text).includes("hello world"))).toBe(true);
+});
 test("topic creation transport failures fail closed without flat delivery", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();

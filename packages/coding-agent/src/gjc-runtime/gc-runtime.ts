@@ -78,9 +78,18 @@ export interface GcError {
 	message: string;
 }
 
+/** Non-fatal discovery partials (e.g. traversal caps). Does not affect exit code. */
+export interface GcWarning {
+	store: GcStore;
+	scope: string;
+	message: string;
+}
+
 export interface GcCollectResult {
 	records: GcRecord[];
 	errors: GcError[];
+	/** Optional partial-result notices; omitted by adapters that have none. */
+	warnings?: GcWarning[];
 }
 
 export interface GcPruneOutcome {
@@ -140,6 +149,8 @@ export interface GcReport {
 	stores: Record<GcStore, GcRecord[]>;
 	counts: GcCounts;
 	errors: GcError[];
+	/** Partial-result notices that do not fail the run (e.g. walk caps). */
+	warnings: GcWarning[];
 	session_index?: GcSessionIndexHealth;
 }
 
@@ -298,12 +309,14 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext, prune: boolean): Promise<GcReport> {
 	const stores = emptyStores();
 	const errors: GcError[] = [];
+	const warnings: GcWarning[] = [];
 
 	for (const adapter of adapters) {
 		try {
 			const result = await adapter.collect(ctx);
 			stores[adapter.store].push(...result.records);
 			errors.push(...result.errors);
+			if (result.warnings) warnings.push(...result.warnings);
 		} catch (error) {
 			errors.push({
 				store: adapter.store,
@@ -350,7 +363,7 @@ export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext
 		}
 	}
 
-	return { dry_run: !prune, stores, counts: computeCounts(stores, errors), errors };
+	return { dry_run: !prune, stores, counts: computeCounts(stores, errors), errors, warnings };
 }
 
 /**
@@ -358,6 +371,7 @@ export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext
  * - usage/parse error => 2
  * - hard discovery errors => 1 (both modes)
  * - prune mode with a failed intended removal => 1
+ * - warnings alone never fail the run
  * - otherwise => 0
  */
 export function computeExitCode(report: GcReport): number {
