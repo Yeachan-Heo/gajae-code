@@ -106,5 +106,6 @@ Available Tools (default-enabled unless noted):
 
 Useful Commands:
   ${APP_NAME} --list-models        - List configured provider models
+  ${APP_NAME} models               - Alias for --list-models (never starts an agent)
   ${APP_NAME} --help               - Show this help`;
 }

@@ -929,9 +929,9 @@ function getCustomReferenceCandidateIds(modelId: string): string[] {
 	const minimaxM = /^minimax-m(\d+(?:\.\d+)*)$/i.exec(modelId.trim());
 	const queue = minimaxM ? [`MiniMax-M${minimaxM[1]}`, modelId] : [modelId];
 	if (minimaxM) {
-		// MiniMax catalogs include lowercase wire ids plus display-cased aliases.
-		// Custom providers should keep the lowercase wire id while inheriting the
-		// canonical display casing when the alias exists.
+		// First-class MiniMax catalogs expose canonical `MiniMax-M*` ids only,
+		// but custom providers may still use lowercase wire ids. Normalize to
+		// the canonical display casing so metadata inheritance keeps working.
 	}
 	for (let index = 0; index < queue.length; index += 1) {
 		const candidate = queue[index]?.trim();

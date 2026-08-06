@@ -159,7 +159,6 @@ export interface ForkContextSeed {
 	messages: Message[];
 	agentMessages: AgentMessage[];
 	metadata: ForkContextSeedMetadata;
-	cacheIdentity?: string;
 	appendOnlyPrefixSnapshot?: StablePrefixSnapshot;
 }
 
@@ -167,7 +166,6 @@ export interface ForkContextSeedOptions {
 	maxMessages: number;
 	maxTokens: number;
 	preserveLatestUser?: boolean;
-	cacheIdentity?: string;
 	signal?: AbortSignal;
 }
 
@@ -3118,7 +3116,6 @@ export class AgentSession {
 					maxTokens,
 					skippedReasons: {},
 				},
-				cacheIdentity: options.cacheIdentity ?? this.sessionId,
 			};
 		}
 		const transformedMessages = await this.#transformContext([...this.messages], options.signal);
@@ -3318,7 +3315,6 @@ export class AgentSession {
 				maxTokens,
 				skippedReasons,
 			},
-			cacheIdentity: options.cacheIdentity ?? this.sessionId,
 			appendOnlyPrefixSnapshot,
 		};
 	}

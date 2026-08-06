@@ -13,7 +13,12 @@ import {
 	getEmbeddedDefaultGjcSkills,
 	installDefaultGjcDefinitions,
 } from "@gajae-code/coding-agent/defaults/gjc-defaults";
-import { loadSkills, resetActiveSkillsForTests, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import {
+	buildSkillPromptMessage,
+	loadSkills,
+	resetActiveSkillsForTests,
+	setActiveSkills,
+} from "@gajae-code/coding-agent/extensibility/skills";
 import { parseInternalUrl } from "@gajae-code/coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@gajae-code/coding-agent/internal-urls/skill-protocol";
 import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
@@ -592,7 +597,7 @@ Project executor override body.
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
 		expect(content).toContain(
-			"default to English unless `{{ARGUMENTS}}` makes another user/session language obvious",
+			"default to English unless the appended `User:` request makes another user/session language obvious",
 		);
 		expect(content).toContain('"language": "<existing language object from active state, if present>"');
 		expect(content).toContain("progress reports, and spec prose");
@@ -613,6 +618,20 @@ Project executor override body.
 		]) {
 			expect(content).not.toContain(forbidden);
 		}
+	});
+
+	it("renders deep-interview arguments once through the loader-owned User field", async () => {
+		const skill = getEmbeddedDefaultGjcSkills().find(skill => skill.name === "deep-interview");
+		if (!skill) throw new Error("missing bundled deep-interview skill");
+		const request = "한국어로 인터뷰해 주세요";
+		const rendered = await buildSkillPromptMessage(skill, request);
+		const empty = await buildSkillPromptMessage(skill, "");
+
+		expect(rendered.message).not.toContain("{{ARGUMENTS}}");
+		expect(rendered.message.split(request)).toHaveLength(2);
+		expect(rendered.message).toEndWith(`Skill: ${skill.filePath}\nUser: ${request}`);
+		expect(empty.message).not.toContain("{{ARGUMENTS}}");
+		expect(empty.message).toEndWith(`Skill: ${skill.filePath}`);
 	});
 
 	it("keeps bundled ralplan stage artifacts on CLI write path", () => {
@@ -643,11 +662,14 @@ Project executor override body.
 		const initial = await installDefaultGjcDefinitions({ targetRoot });
 		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");
 		const installedDeepInterview = await Bun.file(deepInterviewSkillPath).text();
+		const bundledDeepInterview = getEmbeddedDefaultGjcSkills().find(skill => skill.name === "deep-interview");
+		if (!bundledDeepInterview) throw new Error("missing bundled deep-interview skill");
 
 		expect(initial.written).toBe(9);
 		expect(initial.total).toBe(9);
 		expect(initial.skipped).toBe(0);
 		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(5);
+		expect(installedDeepInterview).toBe(bundledDeepInterview.content);
 
 		const installedResearchFragment = await Bun.file(
 			path.join(targetRoot, "skill-fragments", "deep-interview", "auto-research-greenfield.md"),

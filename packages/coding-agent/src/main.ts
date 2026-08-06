@@ -1839,6 +1839,9 @@ export async function runRootCommand(
 				} catch {
 					logger.warn("Failed to dispose session after interactive error");
 				}
+				if (error !== null && typeof error === "object" && "code" in error && error.code === "cancelled") {
+					return;
+				}
 				throw error;
 			}
 
