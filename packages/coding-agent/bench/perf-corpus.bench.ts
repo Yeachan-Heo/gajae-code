@@ -14,7 +14,7 @@ import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
-import { dlopen, FFIType, ptr, read } from "bun:ffi";
+import { dlopen, FFIType, ptr, read, type Pointer } from "bun:ffi";
 import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
 import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
@@ -80,7 +80,7 @@ function isCanonicalRunnerExecArgv(value: readonly string[]): boolean {
 	);
 }
 
-function windowsWideString(value: number): string {
+function windowsWideString(value: Pointer): string {
 	const codeUnits: number[] = [];
 	for (let offset = 0; offset < 32_767 * 2; offset += 2) {
 		const codeUnit = read.u16(value, offset);
@@ -98,7 +98,7 @@ function windowsProcessArguments(): string[] {
 	const shell32 = dlopen("shell32.dll", {
 		CommandLineToArgvW: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
 	});
-	let argumentsPointer = 0;
+	let argumentsPointer: Pointer | null = null;
 	try {
 		const argumentCount = new Uint32Array(1);
 		const commandLine = kernel32.symbols.GetCommandLineW();

@@ -1096,7 +1096,7 @@ export class ManagedSessionDescendantStore {
 		const published = this.readExpected(destinationRelativePath);
 		if (
 			!published ||
-			!sameStableIdentityIgnoringCtime(published.identity, expected.identity) ||
+			!sameReplacementIdentity(published.identity, expected.identity) ||
 			published.identity.sha256 !== expected.identity.sha256
 		) {
 			throw new Error("managed_move_identity_mismatch");

@@ -3846,6 +3846,10 @@ describe("resolveGjcWorkerCommand invocation authority", () => {
 });
 
 describe("team worker memory guard wiring", () => {
+	function expectRecord(value: unknown): asserts value is Record<string, unknown> {
+		if (value === null || typeof value !== "object" || Array.isArray(value))
+			throw new Error("Expected team API operation result to be a record");
+	}
 	async function applyMemoryGuardWithStartupAck(input: {
 		teamName: string;
 		stateDir: string;
@@ -3889,6 +3893,7 @@ describe("team worker memory guard wiring", () => {
 		);
 		try {
 			const result = await replacement;
+			expectRecord(result);
 			if (process.platform !== "linux") {
 				markerAbort.abort(new Error("advisory host: no successor pane launch expected"));
 				await successorAck.catch(() => {});
