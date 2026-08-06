@@ -126,32 +126,38 @@ describe("Anthropic prompt caching", () => {
 		baseUrl: "https://proxy.example.test/anthropic",
 		compat: { promptCacheMode: "explicit" },
 	};
+	const automaticCompatibleModel: Model<"anthropic-messages"> = {
+		...canonicalModel,
+		baseUrl: "https://proxy.example.test/anthropic",
+		compat: { promptCacheMode: "automatic" },
+	};
 
-	it("defaults canonical Anthropic and Claude-family models to automatic caching", async () => {
+	it("defaults canonical Anthropic to automatic and compatible Claude gateways to explicit caching", async () => {
 		const nonClaudeModel: Model<"anthropic-messages"> = {
 			...canonicalModel,
 			id: "custom-compatible-model",
 			name: "Custom compatible model",
 			baseUrl: "https://proxy.example.test/anthropic",
 		};
-		const [canonical, proxiedClaude, explicit, nonClaude] = await Promise.all([
+		const [canonical, proxiedClaude, automatic, nonClaude] = await Promise.all([
 			capturePayload(canonicalModel, context()),
 			capturePayload({ ...canonicalModel, baseUrl: "https://proxy.example.test/anthropic" }, context()),
-			capturePayload(explicitCompatibleModel, context()),
+			capturePayload(automaticCompatibleModel, context()),
 			capturePayload(nonClaudeModel, context()),
 		]);
 
 		expect(canonical.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		// Claude-family models behind non-canonical Anthropic-compatible gateways
-		// get top-level automatic caching; without explicit long-retention support
-		// they fall back to the default ~5m breakpoint (no ttl).
-		expect(proxiedClaude.cache_control).toEqual({ type: "ephemeral" });
-		expect(explicit.cache_control).toBeUndefined();
-		expect(explicit.tools?.every(tool => !(tool as { cache_control?: CacheControl }).cache_control)).toBe(true);
-		expect(!Array.isArray(explicit.system) || explicit.system.every(block => !block.cache_control)).toBe(true);
-		expect((explicit.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control).toEqual({
+		// Compatible Claude gateways default to explicit block markers because many
+		// proxies add their own controls or do not understand the root field.
+		expect(proxiedClaude.cache_control).toBeUndefined();
+		expect(
+			(proxiedClaude.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control,
+		).toEqual({
 			type: "ephemeral",
 		});
+		// A verified gateway can explicitly opt into top-level automatic caching.
+		expect(automatic.cache_control).toEqual({ type: "ephemeral" });
+		expect(cacheControls(automatic)).toEqual([{ type: "ephemeral" }]);
 		// Non-Claude models on unknown compatible endpoints still get no generated caching.
 		expect(nonClaude.cache_control).toBeUndefined();
 	});
@@ -179,7 +185,7 @@ describe("Anthropic prompt caching", () => {
 				expected: { type: "ephemeral", ttl: "1h" },
 			},
 			{
-				name: "promptCacheMode none disables automatic caching",
+				name: "promptCacheMode none disables generated caching",
 				model: { ...canonicalModel, baseUrl: proxyUrl, compat: { promptCacheMode: "none" } },
 				expected: undefined,
 			},

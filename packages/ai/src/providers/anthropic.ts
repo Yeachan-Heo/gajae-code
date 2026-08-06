@@ -504,9 +504,13 @@ function getCacheControl(
 			? "none"
 			: promptCacheMode === "explicit"
 				? "explicit"
-				: promptCacheMode === "automatic" || isCanonicalApi || isClaudeFamilyModel(model)
+				: promptCacheMode === "automatic"
 					? "automatic"
-					: "none";
+					: isCanonicalApi
+						? "automatic"
+						: isClaudeFamilyModel(model)
+							? "explicit"
+							: "none";
 	if (mode === "none") return { mode };
 
 	const supportsLongCacheRetention = isCanonicalApi

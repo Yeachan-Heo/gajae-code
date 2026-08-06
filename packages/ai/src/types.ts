@@ -951,10 +951,10 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsLongCacheRetention?: boolean;
 	/**
 	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
-	 * Canonical Anthropic and Claude-family models default to `"automatic"`;
-	 * noncanonical non-Claude endpoints default to `"none"`. Set `"automatic"` to
-	 * opt an otherwise unknown compatible endpoint into top-level caching, `"none"`
-	 * to opt out, or `"explicit"` for endpoints that require block-level markers.
+	 * Canonical Anthropic defaults to `"automatic"`; Claude-family models on
+	 * noncanonical compatible endpoints default to `"explicit"`; non-Claude
+	 * compatible endpoints default to `"none"`. Set `"automatic"` to opt into
+	 * top-level caching, `"none"` to opt out, or `"explicit"` for block markers.
 	 */
 	promptCacheMode?: "none" | "explicit" | "automatic";
 }

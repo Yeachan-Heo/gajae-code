@@ -4,14 +4,14 @@ import { streamAnthropic } from "@gajae-code/ai/providers/anthropic";
 import type { Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 
 type CacheControl = { type: string; ttl?: string };
-type ContentBlock = { type: string; cache_control?: CacheControl };
+type ContentBlock = { type: string; text?: string; cache_control?: CacheControl };
 type PayloadMessage = { role: string; content: string | ContentBlock[] };
 type Payload = { messages: PayloadMessage[]; system?: unknown[]; tools?: unknown[] };
 type Placement = "oldPlacement" | "newPlacement";
 type Anchor = { path: string; sha256: string; cacheableTokenEstimate: number; prefix: string[] };
 type EvalArtifact = {
-	schemaVersion: 3;
-	issue: 2383;
+	schemaVersion: 4;
+	issue: 3670;
 	status: "pass";
 	evidenceType: "deterministic-sequential-three-request-provider-payload-simulation";
 	source: {
@@ -278,17 +278,15 @@ async function buildArtifact(): Promise<EvalArtifact> {
 				const estimate = Math.max(...turn.map(anchor => anchor.cacheableTokenEstimate));
 				if (estimate < 1024) throw new Error(`Turn is below the documented 1,024-token cache minimum: ${estimate}`);
 				return {
-					anchors: await Promise.all(
-						turn.map(async anchor => ({ path: anchor.path, sha256: await sha256(anchor.path) })),
-					),
+					anchors: await Promise.all(turn.map(anchor => ({ path: anchor.path, sha256: anchor.sha256 }))),
 					cacheableTokenEstimateAtLeast: estimate,
 				};
 			}),
 		);
 	const lowerBounds = (values: number[]) => values;
 	return {
-		schemaVersion: 3,
-		issue: 2383,
+		schemaVersion: 4,
+		issue: 3670,
 		status: "pass",
 		evidenceType: "deterministic-sequential-three-request-provider-payload-simulation",
 		source: {
@@ -301,7 +299,7 @@ async function buildArtifact(): Promise<EvalArtifact> {
 			"git rev-parse HEAD:packages/ai/src/providers/anthropic.ts",
 			"git hash-object packages/ai/src/providers/anthropic.ts",
 			"sha256sum packages/ai/src/providers/anthropic.ts",
-			"WRITE_ARCHITECTURE_2383_EVAL=1 bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
+			"WRITE_ISSUE_3670_EVAL=1 bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
 			"bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
 		],
 		perTurn: { oldPlacement: await perTurn("oldPlacement"), newPlacement: await perTurn("newPlacement") },
@@ -331,7 +329,7 @@ describe("Anthropic cache placement eval (deterministic sequential three-request
 	});
 	it("binds immutable source/fixture evidence and simulates documented explicit cache retention", async () => {
 		const derivedArtifact = await buildArtifact();
-		if (process.env.WRITE_ARCHITECTURE_2383_EVAL === "1")
+		if (process.env.WRITE_ISSUE_3670_EVAL === "1")
 			await Bun.write(artifactPath, `${JSON.stringify(derivedArtifact, null, "\t")}\n`);
 		const artifact = (await Bun.file(artifactPath).json()) as EvalArtifact;
 		expect(artifact).toEqual(derivedArtifact);
@@ -356,21 +354,19 @@ describe("Anthropic cache placement eval (deterministic sequential three-request
 		const evidence = await deriveEvidence();
 		for (const placement of ["oldPlacement", "newPlacement"] as const) {
 			expect(evidence.payloads[placement]).toHaveLength(3);
-			expect(evidence.anchors[placement].map(turn => turn.map(anchor => anchor.path))).toEqual(
-				artifact.perTurn[placement].map(turn => turn.anchors.map(anchor => anchor.path)),
-			);
 			for (const [turnIndex, turn] of evidence.anchors[placement].entries()) {
+				const artifactTurn = artifact.perTurn[placement][turnIndex]!;
+				expect(artifactTurn.anchors).toEqual(turn.map(anchor => ({ path: anchor.path, sha256: anchor.sha256 })));
 				const estimate = Math.max(...turn.map(anchor => anchor.cacheableTokenEstimate));
-				expect(estimate).toBeGreaterThanOrEqual(
-					artifact.perTurn[placement][turnIndex]!.cacheableTokenEstimateAtLeast,
-				);
-				for (const anchor of artifact.perTurn[placement][turnIndex]!.anchors)
-					expect(await sha256(anchor.path)).toBe(anchor.sha256);
+				expect(estimate).toBeGreaterThanOrEqual(artifactTurn.cacheableTokenEstimateAtLeast);
 			}
 		}
-		expect(await sha256(`${artifact.perTurn.newPlacement[0]!.anchors[0]!.path}!`)).not.toBe(
-			artifact.perTurn.newPlacement[0]!.anchors[0]!.sha256,
-		);
+		const tamperedPayload = structuredClone(evidence.payloads.newPlacement[0]!);
+		const tamperedUserBlocks = tamperedPayload.messages[0]!.content as ContentBlock[];
+		tamperedUserBlocks[0]!.text = `${tamperedUserBlocks[0]!.text ?? ""}!`;
+		const tamperedAnchors = await anchors(tamperedPayload);
+		expect(tamperedAnchors[0]!.path).toBe(evidence.anchors.newPlacement[0]![0]!.path);
+		expect(tamperedAnchors[0]!.sha256).not.toBe(evidence.anchors.newPlacement[0]![0]!.sha256);
 		for (const [turn, oldRead] of evidence.retention.oldPlacement.reads.entries()) {
 			if (turn > 0) expect(evidence.retention.newPlacement.reads[turn]).toBeGreaterThan(oldRead);
 			else expect(evidence.retention.newPlacement.reads[turn]).toBe(oldRead);

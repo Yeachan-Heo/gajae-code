@@ -284,7 +284,7 @@ providers:
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
 - `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, or `openai-models-list`
-- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints now use top-level automatic caching by default but omit `ttl` (the provider's ~5m default) unless `compat.supportsLongCacheRetention: true` explicitly opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
+- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models use top-level automatic caching and emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints default to explicit block markers because compatible proxies commonly inject, rewrite, or reject top-level cache controls; they omit `ttl` unless `compat.supportsLongCacheRetention: true` opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
 
@@ -811,7 +811,7 @@ Prompt-cache modes:
 - `explicit` — emit block-level breakpoints instead. Use this for endpoints that reject top-level `cache_control` but support Anthropic's explicit content-block markers.
 - `none` — emit no generated Anthropic cache controls. Per-request or configured `cacheRetention: none` also disables generated caching.
 
-Without an explicit mode, canonical Anthropic endpoints and Claude-family model ids default to `automatic`; unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`.
+Without an explicit mode, canonical Anthropic endpoints default to `automatic`, Claude-family model ids on non-canonical compatible endpoints default to `explicit`, and unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`. Set `promptCacheMode: automatic` only when a gateway is known to pass through Anthropic's top-level cache control without adding conflicting block markers.
 
 ```yaml
 providers:

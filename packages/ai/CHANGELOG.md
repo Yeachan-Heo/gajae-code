@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Anthropic prompt caching now defaults to top-level automatic caching (`cache_control: { type: "ephemeral" }`) for every Claude-family model, including through non-canonical Anthropic-compatible gateways (Cloudflare AI Gateway, GitHub Copilot, GitLab Duo, Vercel AI Gateway, zenmux, etc.), instead of only `api.anthropic.com`. Non-Claude models on unknown compatible endpoints keep the previous no-cache default; `compat.promptCacheMode: "none"`, `compat.promptCacheMode: "explicit"`, and configured or per-request `cacheRetention: "none"` still opt out. Non-canonical Claude models get the default ~5m cache lifetime unless the endpoint sets `compat.supportsLongCacheRetention: true`.
+- Anthropic prompt caching now defaults to top-level automatic caching (`cache_control: { type: "ephemeral" }`) on the canonical Anthropic API and explicit block-level caching for Claude-family models on non-canonical Anthropic-compatible gateways (Cloudflare AI Gateway, GitHub Copilot, GitLab Duo, Vercel AI Gateway, zenmux, CLIProxyAPI, etc.). Explicit mode is the safer compatible default because gateways commonly inject, rewrite, or reject the top-level field; verified gateways can opt into it with `compat.promptCacheMode: "automatic"`. Non-Claude models on unknown compatible endpoints keep the no-cache default; `promptCacheMode: "none"` and configured or per-request `cacheRetention: "none"` still opt out. Non-canonical Claude models get the default ~5m lifetime unless the endpoint sets `compat.supportsLongCacheRetention: true`.
 
 ### Fixed
 

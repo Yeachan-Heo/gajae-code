@@ -1149,9 +1149,15 @@ describe("anthropic stream envelope handling", () => {
 		);
 		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
 		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
-		// Claude-family models through Anthropic-compatible gateways get automatic
-		// caching; without explicit long-retention support the default ~5m breakpoint applies.
-		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
+		// Claude-family models through compatible gateways default to explicit
+		// block caching; without long-retention opt-in the marker uses ~5m.
+		expect(cacheControls[2]).toBeUndefined();
+		const proxiedControl = (
+			payloads[2] as { messages?: Array<{ content?: Array<{ cache_control?: { ttl?: string; type: string } }> }> }
+		).messages
+			?.at(-1)
+			?.content?.at(-1)?.cache_control;
+		expect(proxiedControl).toEqual({ type: "ephemeral" });
 		// Non-Claude models on unknown compatible endpoints receive no generated caching.
 		expect(cacheControls[3]).toBeUndefined();
 	});
@@ -1201,9 +1207,15 @@ describe("anthropic stream envelope handling", () => {
 		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
 		// Models without long-cache support fall back to the default ~5m breakpoint.
 		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
-		// Claude-family models through Anthropic-compatible gateways get automatic
-		// caching; without explicit long-retention support the default ~5m breakpoint applies.
-		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
+		// Claude-family models through compatible gateways default to explicit
+		// block caching; without long-retention opt-in the marker uses ~5m.
+		expect(cacheControls[2]).toBeUndefined();
+		const proxiedControl = (
+			payloads[2] as { messages?: Array<{ content?: Array<{ cache_control?: { ttl?: string; type: string } }> }> }
+		).messages
+			?.at(-1)
+			?.content?.at(-1)?.cache_control;
+		expect(proxiedControl).toEqual({ type: "ephemeral" });
 		// Non-Claude models on unknown compatible endpoints receive no generated caching.
 		expect(cacheControls[3]).toBeUndefined();
 	});
