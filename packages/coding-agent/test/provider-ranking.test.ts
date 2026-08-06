@@ -101,6 +101,8 @@ describe("famous provider list", () => {
 			"opencode-go",
 			"zai",
 			"glm-zcode",
+			"cline-pass",
+			"commandcode-goat",
 			"alibaba-token-plan",
 			"qwen-portal",
 			"kimi-code",

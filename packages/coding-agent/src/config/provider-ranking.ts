@@ -41,6 +41,8 @@ export const FAMOUS_PROVIDER_ORDER: readonly string[] = [
 	"opencode-go",
 	"zai",
 	"glm-zcode",
+	"cline-pass",
+	"commandcode-goat",
 	"alibaba-token-plan",
 	"qwen-portal",
 	"kimi-code",

@@ -1918,14 +1918,55 @@ describe("ModelRegistry", () => {
 			expect(discovered?.headers?.["X-Model"]).toBeUndefined();
 		});
 
-		test("provider presets load through the model registry with expected OpenAI-compatible settings", async () => {
+		test("provider presets discover ClinePass and Command Code catalogs without hardcoded model rows", async () => {
 			const presetModelsPath = path.join(tempDir, "preset-models.yml");
 			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({ preset: "cline-pass", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({ preset: "commandcode-goat", modelsPath: presetModelsPath });
+			authStorage.setRuntimeApiKey("commandcode-goat", "test-key");
+
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(
+						JSON.stringify({
+							"cline-pass": {
+								models: {
+									"cline-pass/live-coder": {
+										id: "cline-pass/live-coder",
+										name: "Live Coder",
+										tool_call: true,
+										reasoning: true,
+										modalities: { input: ["text", "image"], output: ["text"] },
+										limit: { context: 1_000_000, output: 64_000 },
+										cost: { input: 0.4, output: 1.6, cache_read: 0.04, cache_write: 0.5 },
+									},
+								},
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://api.commandcode.ai/provider/v1/models") {
+					return new Response(JSON.stringify({ data: [{ id: "claude-opus-5.5" }, { id: "Qwen/Qwen3.8-Max" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
 
 			const registry = new ModelRegistry(authStorage, presetModelsPath);
+			expect(registry.find("cline-pass", "cline-pass/live-coder")).toBeUndefined();
+			expect(registry.find("commandcode-goat", "claude-opus-5.5")).toBeUndefined();
+
+			await registry.refreshProvider("cline-pass", "online");
+			await registry.refreshProvider("commandcode-goat", "online");
+
 			const minimax = registry.find("minimax-code", "MiniMax-M3");
 			const glm = registry.find("glm-proxy", "glm-4.6");
+			const clinePass = registry.find("cline-pass", "cline-pass/live-coder");
 
 			expect(minimax?.api).toBe("openai-completions");
 			// #614: preset-onboarded models inherit the bundled canonical display
@@ -1939,6 +1980,21 @@ describe("ModelRegistry", () => {
 			expect(glm?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
 			expect(getOpenAICompat(glm)?.thinkingFormat).toBe("zai");
 			expect(getOpenAICompat(glm)?.supportsReasoningEffort).toBe(false);
+			expect(clinePass).toMatchObject({
+				name: "Live Coder",
+				api: "openai-completions",
+				baseUrl: "https://api.cline.bot/api/v1",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 1_000_000,
+				maxTokens: 64_000,
+			});
+			expect(registry.find("commandcode-goat", "claude-opus-5.5")).toMatchObject({
+				api: "anthropic-messages",
+				baseUrl: "https://api.commandcode.ai/provider/v1",
+			});
+			expect(registry.find("commandcode-goat", "claude-opus-5.5")?.headers?.Authorization).toBeUndefined();
+			expect(registry.find("commandcode-goat", "Qwen/Qwen3.8-Max")?.api).toBe("openai-completions");
 		});
 
 		test("#614: custom provider referencing a bundled model id inherits canonical display name", () => {
@@ -3036,6 +3092,7 @@ describe("ModelRegistry", () => {
 			await registry.refresh();
 			const llamaModels = getModelsForProvider(registry, "llama.cpp");
 			expect(llamaModels.some(m => m.id === "llama-3.2:3b")).toBe(true);
+			expect(llamaModels.every(model => model.headers?.Authorization === undefined)).toBe(true);
 			const apiKey = await registry.getApiKey(llamaModels[0]);
 			expect(apiKey).toBe("test-llama-key");
 			expect(apiKey).not.toBe(kNoAuth);

@@ -257,8 +257,27 @@
 									"ollama",
 									"llama.cpp",
 									"lm-studio",
-									"openai-models-list"
+									"openai-models-list",
+									"models-dev"
 								]
+							},
+							"apiByModelPrefix": {
+								"type": "object",
+								"propertyNames": {
+									"type": "string",
+									"minLength": 1
+								},
+								"additionalProperties": {
+									"type": "string",
+									"enum": [
+										"openai-completions",
+										"anthropic-messages"
+									]
+								}
+							},
+							"modelsDevProvider": {
+								"type": "string",
+								"minLength": 1
 							}
 						},
 						"required": [

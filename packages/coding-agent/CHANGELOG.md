@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added first-class `cline-pass` and `commandcode-goat` provider presets with documented API endpoints, environment-variable credentials, non-hardcoded live model discovery from models.dev and the Command Code Provider API, and prefix-based Claude routing.
+
 ## [0.12.15] - 2026-08-06
 
 ## [0.12.14] - 2026-08-06

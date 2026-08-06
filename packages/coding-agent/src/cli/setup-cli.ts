@@ -113,7 +113,7 @@ function rejectProviderFlagsOutsideProvider(component: SetupComponent, flags: Se
 	console.error(chalk.red("Provider setup flags require the explicit `provider` component."));
 	console.error(
 		chalk.dim(
-			`Run: ${APP_NAME} setup provider --preset <minimax|glm> or ${APP_NAME} setup provider --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <id>`,
+			`Run: ${APP_NAME} setup provider --preset <id> (see --help for presets) or ${APP_NAME} setup provider --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <id>`,
 		),
 	);
 	process.exit(1);
@@ -731,6 +731,8 @@ ${chalk.bold("Components:")}
 ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset minimax
   ${APP_NAME} setup provider --preset glm
+  ${APP_NAME} setup provider --preset cline-pass
+  ${APP_NAME} setup provider --preset commandcode-goat
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
 
 ${chalk.bold("Hermes example:")}
@@ -743,7 +745,7 @@ ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
   -f, --force       Overwrite existing default workflow skill files
   --json            Output status as JSON
-  --preset          Provider preset: minimax, minimax-cn, or glm (aliases include minimax-code and zai)
+  --preset          Provider preset id (run setup provider --help to list available presets)
   --compat          Provider compatibility: openai or anthropic
   --provider        Provider id to add to models.yml
   --base-url        Provider API base URL

@@ -2154,7 +2154,8 @@ export class ModelRegistry {
 				: strategy;
 		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, refreshStrategy, {
 			cacheDbPath: this.#cacheDbPath,
-			requiresAuth: provider => !this.#isCredentiallessProvider(provider.provider),
+			requiresAuth: provider =>
+				provider.discovery.type !== "models-dev" && !this.#isCredentiallessProvider(provider.provider),
 			peekApiKey: async provider =>
 				preflightCompleted
 					? preflightApiKey
@@ -2244,6 +2245,8 @@ export class ModelRegistry {
 			case "lm-studio":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
+			case "models-dev":
+				return this.#discoverModelsDevProvider(providerConfig);
 		}
 	}
 
@@ -2624,22 +2627,22 @@ export class ModelRegistry {
 		const baseUrl = this.#normalizeLlamaCppBaseUrl(providerConfig.baseUrl);
 		const modelsUrl = `${baseUrl}/models`;
 
-		const headers: Record<string, string> = { ...(providerConfig.headers ?? {}) };
+		const requestHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 		const apiKey =
 			discoveryApiKey ??
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider));
 		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
-			headers.Authorization = `Bearer ${apiKey}`;
+			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
 		const [response, serverMetadata] = await Promise.all([
 			fetch(modelsUrl, {
-				headers,
+				headers: requestHeaders,
 				signal: AbortSignal.timeout(250),
 			}),
-			this.#discoverLlamaCppServerMetadata(baseUrl, headers),
+			this.#discoverLlamaCppServerMetadata(baseUrl, requestHeaders),
 		]);
 		if (!response.ok) {
 			throw new Error(`HTTP ${response.status} from ${modelsUrl}`);
@@ -2662,12 +2665,71 @@ export class ModelRegistry {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: serverMetadata?.contextWindow ?? 128000,
 					maxTokens: Math.min(serverMetadata?.contextWindow ?? Number.POSITIVE_INFINITY, 8192),
-					headers,
+					headers: providerConfig.headers,
 					compat: {
 						supportsStore: false,
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: false,
 					},
+				}),
+			);
+		}
+		return this.#applyProviderModelOverrides(providerConfig.provider, discovered);
+	}
+
+	#resolveDiscoveredModelApi(providerConfig: DiscoveryProviderConfig, modelId: string): Api {
+		let api = providerConfig.api;
+		let matchedPrefixLength = -1;
+		for (const [prefix, routedApi] of Object.entries(providerConfig.discovery.apiByModelPrefix ?? {})) {
+			if (modelId.startsWith(prefix) && prefix.length > matchedPrefixLength) {
+				api = routedApi;
+				matchedPrefixLength = prefix.length;
+			}
+		}
+		return api;
+	}
+
+	async #discoverModelsDevProvider(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
+		const baseUrl = providerConfig.baseUrl;
+		if (!baseUrl) throw new Error(`Provider "${providerConfig.provider}" requires baseUrl for models.dev discovery.`);
+		const response = await fetch("https://models.dev/api.json", {
+			headers: { Accept: "application/json" },
+			signal: AbortSignal.timeout(5_000),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status} from https://models.dev/api.json`);
+		const payload: unknown = await response.json();
+		if (!isRecord(payload)) return [];
+		const catalogProvider = payload[providerConfig.discovery.modelsDevProvider ?? providerConfig.provider];
+		if (!isRecord(catalogProvider) || !isRecord(catalogProvider.models)) return [];
+
+		const discovered: Model<Api>[] = [];
+		for (const [catalogId, value] of Object.entries(catalogProvider.models)) {
+			if (!isRecord(value) || value.tool_call !== true || value.status === "deprecated") continue;
+			const id = typeof value.id === "string" && value.id.trim() ? value.id : catalogId;
+			const limit = isRecord(value.limit) ? value.limit : {};
+			const cost = isRecord(value.cost) ? value.cost : {};
+			const modalities = isRecord(value.modalities) ? value.modalities : {};
+			const inputModalities = Array.isArray(modalities.input) ? modalities.input : [];
+			const outputModalities = Array.isArray(modalities.output) ? modalities.output : [];
+			discovered.push(
+				enrichModelThinking({
+					id,
+					name: typeof value.name === "string" && value.name.trim() ? value.name : id,
+					api: this.#resolveDiscoveredModelApi(providerConfig, id),
+					provider: providerConfig.provider,
+					baseUrl,
+					reasoning: value.reasoning === true,
+					input: inputModalities.includes("image") ? ["text", "image"] : ["text"],
+					output: outputModalities.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: toPositiveNumberOrUndefined(cost.input) ?? 0,
+						output: toPositiveNumberOrUndefined(cost.output) ?? 0,
+						cacheRead: toPositiveNumberOrUndefined(cost.cache_read) ?? 0,
+						cacheWrite: toPositiveNumberOrUndefined(cost.cache_write) ?? 0,
+					},
+					contextWindow: toPositiveNumberOrUndefined(limit.context) ?? UNK_CONTEXT_WINDOW,
+					maxTokens: toPositiveNumberOrUndefined(limit.output) ?? UNK_MAX_TOKENS,
+					headers: providerConfig.headers,
 				}),
 			);
 		}
@@ -2683,7 +2745,7 @@ export class ModelRegistry {
 		const requestBaseUrl = baseUrl;
 		modelsUrl.pathname = `${modelsUrl.pathname.replace(/\/+$/g, "")}/models`;
 
-		const headers: Record<string, string> = { ...(providerConfig.headers ?? {}) };
+		const requestHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 		// Resolve with the same baseUrl context completion requests use so an
 		// endpoint-scoped (or config-pinned) credential wins here exactly as it
 		// does for chat completions.
@@ -2693,12 +2755,12 @@ export class ModelRegistry {
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
 		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
-			headers.Authorization = `Bearer ${apiKey}`;
+			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
 		const response = await fetch(modelsUrl, {
-			headers,
-			signal: AbortSignal.timeout(250),
+			headers: requestHeaders,
+			signal: AbortSignal.timeout(5_000),
 		});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
@@ -2710,26 +2772,33 @@ export class ModelRegistry {
 			}
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
-		const payload = (await response.json()) as { data?: Array<{ id: string }> };
+		const payload = (await response.json()) as {
+			data?: Array<{ id: string; name?: string; context_length?: number }>;
+		};
 		const models = payload.data ?? [];
 		const discovered: Model<Api>[] = [];
 		for (const item of models) {
 			const id = item.id;
 			if (!id) continue;
+			const referenceModel = resolveCustomModelReference(id);
+			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
 			discovered.push(
 				enrichModelThinking({
 					id,
-					name: id,
-					api: providerConfig.api,
+					name: item.name ?? referenceModel?.name ?? id,
+					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
-					reasoning: false,
-					input: ["text"],
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: 128000,
-					maxTokens: 8192,
-					headers,
+					reasoning: referenceModel?.reasoning ?? false,
+					thinking: referenceModel?.thinking,
+					input: referenceModel?.input ?? ["text"],
+					output: referenceModel?.output,
+					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: item.context_length ?? referenceModel?.contextWindow ?? UNK_CONTEXT_WINDOW,
+					maxTokens: referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
+					headers: providerConfig.headers,
 					compat: {
+						...referenceModel?.compat,
 						supportsStore: false,
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: false,
