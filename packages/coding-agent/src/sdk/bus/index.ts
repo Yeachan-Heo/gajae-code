@@ -57,6 +57,7 @@ import type {
 	AskSettlement,
 	AskSettlementResult,
 } from "../../tools";
+import { RECOMMENDED_SUFFIX } from "../../tools/ask";
 import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
@@ -1754,6 +1755,150 @@ function createSdkUiAskAnswerSource(
 		if (typeof value !== "string") return undefined;
 		if (request.interaction !== "selector") return value;
 		const interaction = choices.get(value);
+		if (!interaction) return undefined;
+		if (interaction.kind === "value") return interaction.value;
+		let settled: Promise<AskSettlementResult> | undefined;
+		return {
+			source: "remote",
+			interaction,
+			settle(settlement) {
+				if (!settled) {
+					settled = Promise.resolve(
+						settlement.kind === "commit"
+							? { kind: "committed", ack: { status: "failed", reason: "unsupported" } }
+							: settlement.kind === "invalid"
+								? { kind: "invalid_closed" }
+								: { kind: "resolved_without_commit" },
+					);
+				}
+				return settled;
+			},
+		};
+	};
+	return {
+		async awaitAnswer(question, options, signal) {
+			const answer = await awaitAnswerRequest({ question, options, interaction: "selector", controls: [] }, signal);
+			if (!answer || typeof answer === "string") return answer;
+			return answer.interaction.kind === "value" ? answer.interaction.value : undefined;
+		},
+		awaitAnswerRequest,
+	};
+}
+
+/**
+ * Ask-answer source that bridges workflow-gate asks to the ACP permission
+ * channel (`session/request_permission`). Used when the client does not
+ * advertise ACP form elicitation (e.g. Paseo): the gate question is sent as
+ * a permission request whose options are the answer choices, and the
+ * selected optionId maps back to the answer. Only selector asks are bridged;
+ * free-text asks have no permission-option representation and stay
+ * unanswered (unchanged from today). Auto-approval follows the client's
+ * permission mode, so gates never self-approve under `prompt`.
+ */
+export function createSdkPermissionAskAnswerSource(
+	requestPermission: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>,
+): AskAnswerSource {
+	const awaitAnswerRequest = async (
+		request: AskAnswerRequest,
+		signal?: AbortSignal,
+	): Promise<AskAnswerSourceResult> => {
+		if (signal?.aborted) return undefined;
+		if (request.interaction !== "selector") return undefined;
+		// AskTool appends its synthetic "Other"/clarification transition entries
+		// at the end; a free-text editor this channel cannot complete. Remove
+		// exactly those trailing entries so a legitimate option that happens to
+		// share a transition label is preserved and recommendedIndex stays valid.
+		const transitionCount =
+			typeof request.transitionCount === "number" &&
+			Number.isInteger(request.transitionCount) &&
+			request.transitionCount > 0
+				? Math.min(request.transitionCount, request.options.length)
+				: 0;
+		const bridgedOptions =
+			transitionCount > 0 ? request.options.slice(0, request.options.length - transitionCount) : request.options;
+		const recommendedLabel =
+			typeof request.recommendedIndex === "number" &&
+			Number.isInteger(request.recommendedIndex) &&
+			request.recommendedIndex >= 0 &&
+			request.recommendedIndex < bridgedOptions.length
+				? bridgedOptions[request.recommendedIndex]
+				: undefined;
+		const selectedOptions = request.selectedOptions;
+		const markSelection = selectedOptions !== undefined && selectedOptions.length > 0;
+		const choices = new Map<string, AskRemoteInteraction>();
+		const options: Array<Record<string, unknown>> = bridgedOptions.map((label, index) => {
+			const optionId = `option:${index}`;
+			choices.set(optionId, { kind: "value", value: label });
+			const selected = markSelection && selectedOptions?.includes(label) === true;
+			const name = markSelection ? `${selected ? "[x] " : "[ ] "}${label}` : label;
+			return {
+				optionId,
+				name: label === recommendedLabel ? `${name}${RECOMMENDED_SUFFIX}` : name,
+				kind: "allow_once",
+			};
+		});
+		for (const control of request.controls) {
+			if (!control.enabled) continue;
+			const optionId = `control:${control.id}`;
+			choices.set(optionId, { kind: "control", controlId: control.id });
+			options.push({ optionId, name: control.label, kind: "allow_once" });
+		}
+		const requestController = new AbortController();
+		const onRequestAbort = () => requestController.abort();
+		signal?.addEventListener("abort", onRequestAbort, { once: true });
+		const {
+			promise: requestPromise,
+			resolve: resolveRequest,
+			reject: rejectRequest,
+		} = Promise.withResolvers<unknown>();
+		const timeoutTimer =
+			request.timeoutMs === undefined
+				? undefined
+				: setTimeout(() => {
+						requestController.abort();
+						resolveRequest(undefined);
+					}, request.timeoutMs);
+		void requestPermission(
+			{
+				toolCall: {
+					toolCallId: crypto.randomUUID(),
+					toolName: "ask",
+					title: request.question,
+					rawInput: { question: request.question },
+				},
+				options,
+			},
+			requestController.signal,
+		).then(
+			value => {
+				resolveRequest(value);
+			},
+			error => {
+				rejectRequest(error);
+			},
+		);
+		let response: unknown;
+		try {
+			response = await requestPromise;
+		} catch (error) {
+			if (requestController.signal.aborted && !signal?.aborted) return undefined;
+			throw error;
+		} finally {
+			if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+			signal?.removeEventListener("abort", onRequestAbort);
+		}
+		if (signal?.aborted) return undefined;
+		// The configured ask timeout elapsed with no answer: return without an
+		// answer so the ask tool's own auto-selection-on-timeout policy (and its
+		// timed-out settlement) stays authoritative instead of a fabricated pick.
+		if (requestController.signal.aborted) return undefined;
+		if (!isRecord(response)) return undefined;
+		// ACP clients (e.g. Paseo) return `{ outcome: { outcome, optionId } }`;
+		// accept the flat legacy shape as well.
+		const outcome = isRecord(response.outcome) ? response.outcome : response;
+		if (outcome.outcome === "cancelled") return undefined;
+		if (outcome.outcome !== "selected" || typeof outcome.optionId !== "string") return undefined;
+		const interaction = choices.get(outcome.optionId);
 		if (!interaction) return undefined;
 		if (interaction.kind === "value") return interaction.value;
 		let settled: Promise<AskSettlementResult> | undefined;
@@ -3631,6 +3776,17 @@ export function createNotificationsExtension(
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
+		let disposePermissionAnswerSource: (() => void) | undefined;
+		let permissionCapabilityActive = false;
+		const installPermissionAnswerSource = () => {
+			if (disposeUiAnswerSource || disposePermissionAnswerSource) return;
+			disposePermissionAnswerSource = registerAskAnswerSource(
+				id,
+				createSdkPermissionAskAnswerSource(
+					async (params, signal) => await host!.reverse.request("permission", "request", params, signal),
+				),
+			);
+		};
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
@@ -3658,6 +3814,11 @@ export function createNotificationsExtension(
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
+				permissionCapabilityActive = true;
+				// Clients without ACP form elicitation (e.g. Paseo) still surface
+				// workflow-gate asks through the permission channel; a client that
+				// advertises `elicitation.form` keeps the richer `ui` source instead.
+				installPermissionAnswerSource();
 				return;
 			}
 			if (capability === "ui") {
@@ -3668,6 +3829,8 @@ export function createNotificationsExtension(
 						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
 					),
 				);
+				disposePermissionAnswerSource?.();
+				disposePermissionAnswerSource = undefined;
 				return;
 			}
 			if (capability !== "fs") return;
@@ -3704,11 +3867,19 @@ export function createNotificationsExtension(
 			ctx.setSdkClientBridge?.(bridge);
 		};
 		const removeProviderDefinitions = (capability: string) => {
-			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
+			if (capability === "permission") {
+				ctx.setSdkPermissionProvider?.(undefined);
+				permissionCapabilityActive = false;
+				disposePermissionAnswerSource?.();
+				disposePermissionAnswerSource = undefined;
+			}
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 			if (capability === "ui") {
 				disposeUiAnswerSource?.();
 				disposeUiAnswerSource = undefined;
+				// The permission lease may still be live; restore its ask source so
+				// later headless asks keep an ACP answer channel.
+				if (permissionCapabilityActive) installPermissionAnswerSource();
 			}
 		};
 

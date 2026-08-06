@@ -146,6 +146,10 @@ export interface AskAnswerRequest {
 	 * labels. Remote transports render the selection state so a toggle is visible.
 	 */
 	selectedOptions?: readonly string[];
+	/** Milliseconds before a remote source auto-selects; absent means no timeout. */
+	timeoutMs?: number;
+	/** Number of trailing synthetic transition entries (Other/clarification) appended by the ask tool. */
+	transitionCount?: number;
 }
 
 export type AskRemoteInteraction =
