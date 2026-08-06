@@ -20,7 +20,7 @@ const ReasoningEffortMapSchema = z.object({
 	max: z.string().optional(),
 });
 
-export const OpenAICompatSchema = z.object({
+export const ModelCompatSchema = z.object({
 	supportsStore: z.boolean().optional(),
 	supportsDeveloperRole: z.boolean().optional(),
 	sendSessionHeaders: z.boolean().optional(),
@@ -48,7 +48,12 @@ export const OpenAICompatSchema = z.object({
 	extraBody: z.record(z.string(), z.unknown()).optional(),
 	supportsStrictMode: z.boolean().optional(),
 	toolStrictMode: z.enum(["all_strict", "none"]).optional(),
+	supportsLongCacheRetention: z.boolean().optional(),
+	promptCacheMode: z.enum(["none", "explicit", "automatic"]).optional(),
 });
+
+// Backward-compatible export for callers that imported the original schema name.
+export const OpenAICompatSchema = ModelCompatSchema;
 
 export const GJC_MODEL_EFFORT_IDS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const GJC_MODEL_ASSIGNMENT_TARGET_IDS = ["default", "executor", "architect", "planner", "critic"] as const;
@@ -146,7 +151,7 @@ const ModelDefinitionSchema = z
 		contextWindow: z.number().optional(),
 		maxTokens: z.number().optional(),
 		headers: z.record(z.string(), z.string()).optional(),
-		compat: OpenAICompatSchema.optional(),
+		compat: ModelCompatSchema.optional(),
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
@@ -173,7 +178,7 @@ export const ModelOverrideSchema = z
 		contextWindow: z.number().optional(),
 		maxTokens: z.number().optional(),
 		headers: z.record(z.string(), z.string()).optional(),
-		compat: OpenAICompatSchema.optional(),
+		compat: ModelCompatSchema.optional(),
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
@@ -221,7 +226,7 @@ const ProviderConfigSchema = z
 			])
 			.optional(),
 		headers: z.record(z.string(), z.string()).optional(),
-		compat: OpenAICompatSchema.optional(),
+		compat: ModelCompatSchema.optional(),
 		webSearch: z.enum(["on", "off", "auto"]).optional(),
 		authHeader: z.boolean().optional(),
 		auth: ProviderAuthSchema.optional(),

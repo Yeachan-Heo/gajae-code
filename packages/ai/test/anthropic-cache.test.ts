@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
 import { normalizeCacheControlTtlOrdering, streamAnthropic } from "@gajae-code/ai/providers/anthropic";
-import type { Context, Model, TJsonSchema } from "@gajae-code/ai/types";
+import { clearGitLabDuoDirectAccessCache, streamGitLabDuo } from "@gajae-code/ai/providers/gitlab-duo";
+import type { CacheRetention, Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 
 const canonicalModel: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -43,16 +44,44 @@ function capturePayload(
 	model: Model<"anthropic-messages">,
 	input: Context,
 	onPayload?: (payload: Payload) => Payload | undefined,
+	cacheRetention?: CacheRetention,
 ): Promise<Payload> {
 	const { promise, resolve } = Promise.withResolvers<Payload>();
 	streamAnthropic(model, input, {
 		apiKey: "sk-ant-api-test",
 		isOAuth: false,
 		signal: abortedSignal(),
+		cacheRetention,
 		onPayload: payload => {
 			const replacement = onPayload?.(payload as Payload);
 			resolve((replacement ?? payload) as Payload);
 			return replacement;
+		},
+	});
+	return promise;
+}
+function captureGitLabPayload(model: Model<"anthropic-messages">, cacheRetention?: CacheRetention): Promise<Payload> {
+	clearGitLabDuoDirectAccessCache();
+	const { promise, resolve } = Promise.withResolvers<Payload>();
+	streamGitLabDuo(model, context(), {
+		apiKey: "glpat-test",
+		signal: abortedSignal(),
+		cacheRetention,
+		fetch: async input => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url === "https://gitlab.com/api/v4/ai/third_party_agents/direct_access") {
+				return new Response(
+					JSON.stringify({ token: "direct-token", headers: { "x-gitlab-instance-id": "test" } }),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected GitLab Duo fetch: ${url}`);
+		},
+		onPayload: payload => {
+			resolve(payload as Payload);
 		},
 	});
 	return promise;
@@ -98,21 +127,128 @@ describe("Anthropic prompt caching", () => {
 		compat: { promptCacheMode: "explicit" },
 	};
 
-	it("defaults canonical Anthropic to automatic and requires compatible endpoints to opt into explicit caching", async () => {
-		const [canonical, compatible, explicit] = await Promise.all([
+	it("defaults canonical Anthropic and Claude-family models to automatic caching", async () => {
+		const nonClaudeModel: Model<"anthropic-messages"> = {
+			...canonicalModel,
+			id: "custom-compatible-model",
+			name: "Custom compatible model",
+			baseUrl: "https://proxy.example.test/anthropic",
+		};
+		const [canonical, proxiedClaude, explicit, nonClaude] = await Promise.all([
 			capturePayload(canonicalModel, context()),
 			capturePayload({ ...canonicalModel, baseUrl: "https://proxy.example.test/anthropic" }, context()),
 			capturePayload(explicitCompatibleModel, context()),
+			capturePayload(nonClaudeModel, context()),
 		]);
 
 		expect(canonical.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		expect(compatible.cache_control).toBeUndefined();
+		// Claude-family models behind non-canonical Anthropic-compatible gateways
+		// get top-level automatic caching; without explicit long-retention support
+		// they fall back to the default ~5m breakpoint (no ttl).
+		expect(proxiedClaude.cache_control).toEqual({ type: "ephemeral" });
 		expect(explicit.cache_control).toBeUndefined();
 		expect(explicit.tools?.every(tool => !(tool as { cache_control?: CacheControl }).cache_control)).toBe(true);
 		expect(!Array.isArray(explicit.system) || explicit.system.every(block => !block.cache_control)).toBe(true);
 		expect((explicit.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control).toEqual({
 			type: "ephemeral",
 		});
+		// Non-Claude models on unknown compatible endpoints still get no generated caching.
+		expect(nonClaude.cache_control).toBeUndefined();
+	});
+	it("classifies the dispatched model id and honors every cache opt-out", async () => {
+		const proxyUrl = "https://proxy.example.test/anthropic";
+		const cases: Array<{
+			name: string;
+			model: Model<"anthropic-messages">;
+			options?: { cacheRetention?: "none" | "short" | "long" };
+			expected: CacheControl | undefined;
+		}> = [
+			{
+				name: "prefixed claude id on non-canonical gateway",
+				model: { ...canonicalModel, id: "anthropic/claude-sonnet-4-5", baseUrl: proxyUrl },
+				expected: { type: "ephemeral" },
+			},
+			{
+				name: "uppercase claude id on non-canonical gateway",
+				model: { ...canonicalModel, id: "CLAUDE-OPUS-5", baseUrl: proxyUrl },
+				expected: { type: "ephemeral" },
+			},
+			{
+				name: "non-canonical claude with explicit long retention opt-in",
+				model: { ...canonicalModel, baseUrl: proxyUrl, compat: { supportsLongCacheRetention: true } },
+				expected: { type: "ephemeral", ttl: "1h" },
+			},
+			{
+				name: "promptCacheMode none disables automatic caching",
+				model: { ...canonicalModel, baseUrl: proxyUrl, compat: { promptCacheMode: "none" } },
+				expected: undefined,
+			},
+			{
+				name: "per-request cacheRetention none disables caching on canonical",
+				model: canonicalModel,
+				options: { cacheRetention: "none" },
+				expected: undefined,
+			},
+			{
+				name: "id containing -claude- but not starting claude- is not cached",
+				model: { ...canonicalModel, id: "my-claude-helper", baseUrl: proxyUrl },
+				expected: undefined,
+			},
+			{
+				name: "promptCacheMode automatic opts a non-Claude endpoint into top-level caching",
+				model: {
+					...canonicalModel,
+					id: "custom-compatible-model",
+					baseUrl: proxyUrl,
+					compat: { promptCacheMode: "automatic" },
+				},
+				expected: { type: "ephemeral" },
+			},
+			{
+				name: "wireModelId override does not drive the decision; dispatched id governs",
+				model: {
+					...canonicalModel,
+					id: "local-alias",
+					wireModelId: "claude-sonnet-4-5",
+					baseUrl: proxyUrl,
+				},
+				expected: undefined,
+			},
+			{
+				name: "wireModelId override to a non-claude wire id still follows dispatched id",
+				model: {
+					...canonicalModel,
+					id: "claude-sonnet-4-5",
+					wireModelId: "local-alias",
+					baseUrl: proxyUrl,
+				},
+				expected: { type: "ephemeral" },
+			},
+		];
+
+		for (const { name, model, options, expected } of cases) {
+			const payload = await capturePayload(model, context(), undefined, options?.cacheRetention);
+			expect(payload.model, name).toBe(model.id);
+			expect(cacheControls(payload), name).toEqual(expected ? [expected] : []);
+		}
+	});
+	it("preserves configured cache retention through GitLab Duo and lets request options win", async () => {
+		const gitlabModel: Model<"anthropic-messages"> = {
+			...canonicalModel,
+			id: "duo-chat-sonnet-4-6",
+			name: "Duo Chat Sonnet 4.6",
+			provider: "gitlab-duo",
+			baseUrl: "https://cloud.gitlab.com/ai/v1/proxy/anthropic/",
+			cacheRetention: "none",
+		};
+
+		const configuredNone = await captureGitLabPayload(gitlabModel);
+		const requestOverride = await captureGitLabPayload(gitlabModel, "short");
+
+		expect(configuredNone.model).toBe("claude-sonnet-4-6");
+		expect(cacheControls(configuredNone)).toEqual([]);
+		expect(requestOverride.model).toBe("claude-sonnet-4-6");
+		expect(cacheControls(requestOverride)).toEqual([{ type: "ephemeral" }]);
 	});
 
 	it("counts top-level automatic and caller controls together without mutating a callback replacement", async () => {

@@ -233,7 +233,7 @@ Built-in profiles are grouped by provider mix and tier:
 - `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
 - `claude-opus` — Anthropic OAuth preset centered on `claude-opus-5`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
-- Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen-3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
+- Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
 - Combos: `opus-codex`, `codex-opencodego`, and `fable-opus-codex`
 
 The `eco`, `medium`, and `pro` Codex profile mappings are current product judgments: Eco assigns Terra low/Luna low/Luna high/Terra xhigh/Terra high to default/executor/planner/critic/architect; Medium assigns Sol low/Terra low/Terra high/Sol xhigh/Sol high; Pro assigns Sol medium/Terra medium/Sol high/Sol max/Sol xhigh; and LunaMaxxing assigns Luna medium/Luna xhigh/Luna max/Luna max/Luna max. `opus-codex` retains the Medium Codex executor, critic, and architect roles but uses `anthropic/claude-sonnet-5` for planner; `codex-opencodego` retains the Medium Codex default and architect roles; and `fable-opus-codex` uses the Pro Codex executor and architect roles with `anthropic/claude-opus-5:medium` for planner. The descriptive repeated local exact-edit evidence informs only selected executor-style TypeScript tasks; it does not evaluate or prove default, planner, architect, or critic performance. See [GPT-5.6 Codex preset benchmark](./gpt-5.6-codex-preset-benchmark.md). The Alibaba Pro role evidence and its limits are recorded separately in [Alibaba Token Plan Pro profile benchmark](./alibaba-token-plan-pro-profile-benchmark.md). Cursor Eco uses Composer 2.5 for every role; Medium keeps standard Composer for default/planning and spends the Fast premium on execution, criticism, and architecture; Pro uses Composer 2.5 Fast throughout. Composer does not expose a strength value through the current Cursor RPC, so these profiles use exact model IDs without inert generic effort suffixes. See [Cursor Composer profile tiers](./cursor-composer-profile-tiers.md). Effort suffixes are clamped to each model's supported thinking range at preview and activation time. Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-2.5`, `minimax-code/MiniMax-M3`). User-defined profiles override built-ins by exact profile name.
@@ -284,7 +284,7 @@ providers:
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
 - `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, or `openai-models-list`
-- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` (`ttl: "1h"`) because the ~5m default is too fragile for long-running subagent workflows. The 1h marker is only emitted on the canonical Anthropic API (`api.anthropic.com`) for models advertising `supportsLongCacheRetention`; proxies, gateways, and incapable models fall back to the default ephemeral (~5m) breakpoint. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
+- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints now use top-level automatic caching by default but omit `ttl` (the provider's ~5m default) unless `compat.supportsLongCacheRetention: true` explicitly opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
 
@@ -803,7 +803,32 @@ Provider-level `compat` is the baseline; per-model `compat` is deep-merged on to
 
 ### Anthropic compatibility (`anthropic-messages`)
 
-For `anthropic-messages` models the runtime uses a separate `AnthropicCompat` shape (`packages/ai/src/types.ts`). The `models.yml` schema currently exposes only the strict-tools opt-out as a top-level provider field (see below); the remaining Anthropic-side knobs (`disableAdaptiveThinking`, `supportsEagerToolInputStreaming`, `supportsLongCacheRetention`) are set by built-in catalog metadata and are not user-configurable from `models.yml`.
+For `anthropic-messages` models, `compat.promptCacheMode` and `compat.supportsLongCacheRetention` are configurable at provider, model, and `modelOverrides` levels. Provider-level `compat` is the baseline; model and override values merge on top.
+
+Prompt-cache modes:
+
+- `automatic` — emit one top-level `cache_control` marker and let the Anthropic-compatible endpoint advance the breakpoint as the conversation grows.
+- `explicit` — emit block-level breakpoints instead. Use this for endpoints that reject top-level `cache_control` but support Anthropic's explicit content-block markers.
+- `none` — emit no generated Anthropic cache controls. Per-request or configured `cacheRetention: none` also disables generated caching.
+
+Without an explicit mode, canonical Anthropic endpoints and Claude-family model ids default to `automatic`; unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`.
+
+```yaml
+providers:
+  corp-anthropic:
+    baseUrl: https://proxy.example.com/anthropic
+    apiKeyEnv: CORP_ANTHROPIC_API_KEY
+    api: anthropic-messages
+    compat:
+      promptCacheMode: explicit
+      supportsLongCacheRetention: false
+    models:
+      - id: claude-sonnet-4-5
+        contextWindow: 200000
+        maxTokens: 8192
+```
+
+Other Anthropic-side compatibility knobs such as `disableAdaptiveThinking` and `supportsEagerToolInputStreaming` remain built-in catalog metadata rather than `models.yml` fields. `disableStrictTools` stays a provider-level setting (below).
 
 ### Strict tool schemas (`disableStrictTools`)
 

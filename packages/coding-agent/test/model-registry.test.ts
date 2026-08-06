@@ -125,9 +125,9 @@ describe("ModelRegistry", () => {
 	}
 
 	function getOpenAICompat(model: Model | undefined): OpenAICompat | undefined {
-		// All custom-model compat overrides flow through OpenAICompatSchema regardless of
-		// the underlying api ("openai-completions" vs "openai-responses"), so we can read
-		// the field for any model in this fixture.
+		// All custom-model compat overrides flow through ModelCompatSchema regardless of
+		// the underlying API, so OpenAI-specific fields can be read for any model in
+		// this fixture.
 		return model?.compat as OpenAICompat | undefined;
 	}
 
@@ -3679,6 +3679,47 @@ describe("ModelRegistry", () => {
 
 			expect(model).toBeDefined();
 			expect((model?.compat as { disableStrictTools?: boolean } | undefined)?.disableStrictTools).toBe(true);
+		});
+	});
+	describe("Anthropic prompt-cache compatibility", () => {
+		test("propagates provider, model, and override prompt-cache settings", () => {
+			writeRawModelsJson({
+				"proxy-anthropic": {
+					baseUrl: "https://proxy.example.com/anthropic",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					compat: { promptCacheMode: "explicit", supportsLongCacheRetention: false },
+					models: [
+						{ id: "claude-inherited" },
+						{
+							id: "claude-model-override",
+							compat: { promptCacheMode: "automatic", supportsLongCacheRetention: true },
+						},
+						{ id: "claude-provider-override" },
+					],
+					modelOverrides: {
+						"claude-provider-override": { compat: { promptCacheMode: "none" } },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const inherited = registry.find("proxy-anthropic", "claude-inherited");
+			const modelOverride = registry.find("proxy-anthropic", "claude-model-override");
+			const providerOverride = registry.find("proxy-anthropic", "claude-provider-override");
+
+			expect(inherited?.compat).toMatchObject({
+				promptCacheMode: "explicit",
+				supportsLongCacheRetention: false,
+			});
+			expect(modelOverride?.compat).toMatchObject({
+				promptCacheMode: "automatic",
+				supportsLongCacheRetention: true,
+			});
+			expect(providerOverride?.compat).toMatchObject({
+				promptCacheMode: "none",
+				supportsLongCacheRetention: false,
+			});
 		});
 	});
 

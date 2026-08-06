@@ -306,11 +306,11 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 	}),
 	profile("alibaba-token-plan-qwen-deepseek", ["alibaba-token-plan"], {
-		default: "alibaba-token-plan/qwen-3.8-max:high",
+		default: "alibaba-token-plan/qwen3.8-max:high",
 		executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
 		planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
-		architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
-		critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
+		architect: "alibaba-token-plan/qwen3.8-max:xhigh",
+		critic: "alibaba-token-plan/qwen3.8-max:xhigh",
 	}),
 	profile("alibaba-token-plan-glm-deepseek", ["alibaba-token-plan"], {
 		default: "alibaba-token-plan/glm-5.2:high",

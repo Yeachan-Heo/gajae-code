@@ -6,6 +6,15 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { applyOpsToPhases, type TodoPhase, TodoWriteTool } from "@gajae-code/coding-agent/tools";
 import { todoWriteToolRenderer } from "../../src/tools/todo-write";
 
+function captureValidationError(run: () => void): string {
+	try {
+		run();
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	throw new Error("Expected validation to throw");
+}
+
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	let phases = initialPhases;
 	return {
@@ -244,6 +253,71 @@ describe("TodoWriteTool ops operations", () => {
 		const result = await tool.execute("call-2", { ops: [{ op: "drop", phase: "Work" }] });
 		const tasks = result.details?.phases[0]?.tasks ?? [];
 		expect(tasks.map(task => task.status)).toEqual(["abandoned", "abandoned"]);
+	});
+});
+
+describe("TodoWriteTool raw argument rejection codes", () => {
+	const tool = new TodoWriteTool(createSession());
+	const call = (arguments_: Record<string, unknown>) => ({
+		type: "toolCall" as const,
+		id: "call-raw",
+		name: tool.name,
+		arguments: arguments_,
+	});
+
+	it("rejects an unknown root key with the root-shape correction", () => {
+		expect(() => validateToolArguments(tool, call({ ops: [{ op: "done", task: "x" }], extraRootKey: true }))).toThrow(
+			"todo_write root accepts only an ops array of operation entries",
+		);
+	});
+
+	it("rejects an unknown operation-entry key with the entry-shape correction", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x", bogusOpKey: "y" }] })),
+		);
+		expect(message).toContain("todo_write operation entries accept only op, list, task, phase, items, and text keys");
+		expect(message).not.toContain("bogusOpKey");
+	});
+
+	it("rejects a done entry without a task or phase target", () => {
+		expect(() => validateToolArguments(tool, call({ ops: [{ op: "done" }] }))).toThrow(
+			"todo_write done and drop entries require a task or phase target",
+		);
+	});
+
+	it("rejects a drop entry without a task or phase target", () => {
+		expect(() => validateToolArguments(tool, call({ ops: [{ op: "drop" }] }))).toThrow(
+			"todo_write done and drop entries require a task or phase target",
+		);
+	});
+
+	it("rejects an unknown init list-entry key with the init-shape correction", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(
+				tool,
+				call({ ops: [{ op: "init", list: [{ phase: "Execution", items: ["status"], bogusInitKey: 1 }] }] }),
+			),
+		);
+		expect(message).toContain("todo_write init list entries accept only phase and items keys");
+		expect(message).not.toContain("bogusInitKey");
+	});
+
+	it("keeps valid payloads accepted at the validation boundary", () => {
+		const parsed = validateToolArguments(
+			tool,
+			call({ ops: [{ op: "init", list: [{ phase: "Execution", items: ["status"] }] }] }),
+		) as { ops: Array<{ op: string; list?: Array<{ phase: string; items: string[] }> }> };
+		expect(parsed.ops[0]?.op).toBe("init");
+		expect(parsed.ops[0]?.list?.[0]).toEqual({ phase: "Execution", items: ["status"] });
+
+		expect(() => validateToolArguments(tool, call({ ops: [{ op: "done", task: "status" }] }))).not.toThrow();
+		expect(() => validateToolArguments(tool, call({ ops: [{ op: "drop", phase: "Execution" }] }))).not.toThrow();
+	});
+
+	it("keeps passthrough behavior for non-array ops instead of a raw rejection", () => {
+		const message = captureValidationError(() => validateToolArguments(tool, call({ ops: "not-an-array" })));
+		expect(message).toContain('Validation failed for tool "todo_write"');
+		expect(message).not.toContain("raw arguments rejected before coercion");
 	});
 });
 

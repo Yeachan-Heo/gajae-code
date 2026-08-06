@@ -743,7 +743,11 @@ export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: inf
 export type RawArgumentRejectionCode =
 	| "ask-intent-review-requires-positive-round"
 	| "ask-intent-contract-requires-non-empty-authority"
-	| "ask-deep-interview-metadata-requires-deep-interview-gate";
+	| "ask-deep-interview-metadata-requires-deep-interview-gate"
+	| "todo-write-unknown-root-key"
+	| "todo-write-unknown-op-entry-key"
+	| "todo-write-done-drop-requires-target"
+	| "todo-write-unknown-init-entry-key";
 
 export type RawArgumentValidationResult =
 	| { outcome: "passthrough" }
@@ -947,8 +951,10 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsLongCacheRetention?: boolean;
 	/**
 	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
-	 * Canonical Anthropic defaults to `"automatic"`; noncanonical endpoints default
-	 * to `"none"` and must explicitly opt into generated `"explicit"` markers.
+	 * Canonical Anthropic and Claude-family models default to `"automatic"`;
+	 * noncanonical non-Claude endpoints default to `"none"`. Set `"automatic"` to
+	 * opt an otherwise unknown compatible endpoint into top-level caching, `"none"`
+	 * to opt out, or `"explicit"` for endpoints that require block-level markers.
 	 */
 	promptCacheMode?: "none" | "explicit" | "automatic";
 }

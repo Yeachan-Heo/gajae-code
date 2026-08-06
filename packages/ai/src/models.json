@@ -89,8 +89,8 @@
 				"maxLevel": "xhigh"
 			}
 		},
-		"qwen-3.8-max": {
-			"id": "qwen-3.8-max",
+		"qwen3.8-max": {
+			"id": "qwen3.8-max",
 			"name": "Qwen3.8 Max",
 			"api": "openai-responses",
 			"provider": "alibaba-token-plan",
@@ -3952,7 +3952,7 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "max"
 			}
 		},
 		"claude-opus-5": {
@@ -4740,7 +4740,7 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "max"
 			}
 		},
 		"claude-sonnet-4-5": {
@@ -9866,7 +9866,7 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "max"
 			}
 		},
 		"gemini-2.5-pro": {
@@ -60352,7 +60352,7 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "max"
 			}
 		},
 		"deepseek-v4-flash": {
@@ -75349,7 +75349,7 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "max"
 			}
 		},
 		"arcee-ai/trinity-large-preview": {
@@ -81626,7 +81626,7 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "max"
 			}
 		},
 		"anthropic/claude-sonnet-5-free": {
@@ -81651,7 +81651,7 @@
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"minLevel": "minimal",
-				"maxLevel": "high"
+				"maxLevel": "max"
 			}
 		},
 		"baidu/ernie-5.0-thinking-preview": {

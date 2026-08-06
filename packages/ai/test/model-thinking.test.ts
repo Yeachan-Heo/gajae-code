@@ -137,6 +137,11 @@ describe("model thinking metadata", () => {
 			api: "anthropic-messages",
 			provider: "anthropic",
 		});
+		const sonnet5Bedrock = createModel({
+			id: "us.anthropic.claude-sonnet-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
 
 		expect(opus45.thinking?.mode).toBe("anthropic-budget-effort");
 		expect(opus46.thinking?.mode).toBe("anthropic-adaptive");
@@ -156,7 +161,7 @@ describe("model thinking metadata", () => {
 		expect(sonnet5.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			minLevel: Effort.Minimal,
-			maxLevel: Effort.High,
+			maxLevel: Effort.Max,
 		});
 		// Older Opus adaptive models expose max but not the newer xhigh literal.
 		expect(() => mapEffortToAnthropicAdaptiveEffort(opus46, Effort.XHigh)).toThrow(/not supported/);
@@ -169,7 +174,22 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(opus47Bedrock, Effort.Max)).toBe("max");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.XHigh)).toThrow(/not supported/);
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.Max)).toThrow(/not supported/);
+		// Sonnet 5 officially exposes both Anthropic's real xhigh and max presets.
 		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.High)).toBe("high");
+		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.Max)).toBe("max");
+		expect(requireSupportedEffort(sonnet5, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(requireSupportedEffort(sonnet5, Effort.Max)).toBe(Effort.Max);
+		expect(clampThinkingLevelForModel(sonnet5, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(clampThinkingLevelForModel(sonnet5, Effort.Max)).toBe(Effort.Max);
+		// Older Sonnet generations stay fail-closed: no xhigh, no max.
+		expect(() => requireSupportedEffort(sonnet46, Effort.XHigh)).toThrow(/not supported/);
+		expect(() => requireSupportedEffort(sonnet46, Effort.Max)).toThrow(/not supported/);
+		// Bedrock Converse lacks the Messages-only xhigh preset, so Bedrock
+		// Sonnet 5 stays clamped to high (no xhigh, no max).
+		expect(sonnet5Bedrock.thinking?.maxLevel).toBe(Effort.High);
+		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet5Bedrock, Effort.XHigh)).toThrow(/not supported/);
+		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet5Bedrock, Effort.Max)).toThrow(/not supported/);
 	});
 
 	it("classifies Fable 5 as adaptive thinking with xhigh support (discovery metadata regression)", () => {

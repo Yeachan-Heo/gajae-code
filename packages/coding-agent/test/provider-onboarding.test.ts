@@ -162,7 +162,7 @@ describe("provider onboarding setup core", () => {
 		expect(result.compatibility).toBe("openai");
 		expect(result.preset).toBe("alibaba-token-plan");
 		expect(result.presetName).toBe("Alibaba Token Plan");
-		expect(result.modelIds).toEqual(["qwen3.8-max-preview", "qwen-3.8-max", "glm-5.2", "deepseek-v4-pro"]);
+		expect(result.modelIds).toEqual(["qwen3.8-max-preview", "qwen3.8-max", "glm-5.2", "deepseek-v4-pro"]);
 		expect(result.credentialSource).toBe("env");
 
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as { providers?: Record<string, unknown> };
@@ -174,7 +174,7 @@ describe("provider onboarding setup core", () => {
 			compat: { supportsDeveloperRole: false },
 			models: [
 				{ id: "qwen3.8-max-preview", api: "openai-responses" },
-				{ id: "qwen-3.8-max", api: "openai-responses" },
+				{ id: "qwen3.8-max", api: "openai-responses" },
 				{ id: "glm-5.2", api: "openai-completions" },
 				{ id: "deepseek-v4-pro", api: "openai-completions" },
 			],

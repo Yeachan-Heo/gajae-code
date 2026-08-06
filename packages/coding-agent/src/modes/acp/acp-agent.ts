@@ -403,8 +403,8 @@ function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
 }
 
 const ACP_CONFIG_OPTIONS = [
-	{ id: MODEL_CONFIG_ID, name: "Model", options: [] },
-	{ id: THINKING_CONFIG_ID, name: "Thinking", options: [] },
+	{ id: MODEL_CONFIG_ID, name: "Model", category: "model", options: [] },
+	{ id: THINKING_CONFIG_ID, name: "Thinking", category: "thought_level", options: [] },
 	{
 		id: "steeringMode",
 		name: "Steering queue",
@@ -466,16 +466,121 @@ function modelPresetConfigOptions(query: unknown, current: string): { value: str
 	return [...options].map(([value, name]) => ({ value, name }));
 }
 
-function modelConfigOptions(query: unknown, current: string | undefined): { value: string; name: string }[] {
+function modelConfigOptions(
+	query: unknown,
+	current: string | undefined,
+	activeProviders?: ReadonlySet<string>,
+): { value: string; name: string }[] {
 	const options = new Map<string, string>();
 	for (const item of pageItems(query)) {
 		const model = object(item);
 		if (!model || typeof model.provider !== "string" || typeof model.id !== "string") continue;
+		if (activeProviders !== undefined && !activeProviders.has(model.provider)) continue;
 		const value = `${model.provider}/${model.id}`;
 		options.set(value, typeof model.name === "string" ? model.name : value);
 	}
 	if (current && !options.has(current)) options.set(current, current);
 	return [...options].map(([value, name]) => ({ value, name }));
+}
+const MAX_ACTIVE_PROVIDER_PAGES = 100;
+
+/**
+ * Unsupported-query compatibility fallback. Session hosts without
+ * `providers.list/active` reject the unknown named query as either
+ * `operation_not_session_owned` (host knows the registry but not the query)
+ * or `invalid_request` (pre-Q29 host that predates the registry entry). Both
+ * keep the full catalog authoritative on the first page; every other failure
+ * mode fails closed so the active-provider contract is never silently
+ * widened.
+ */
+function isUnsupportedQueryError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		((error as { code?: unknown }).code === "operation_not_session_owned" ||
+			(error as { code?: unknown }).code === "invalid_request")
+	);
+}
+
+function queryPage(query: unknown): { items?: unknown; complete?: unknown; continuationCursor?: unknown } | undefined {
+	const response = object(query);
+	const result = object(response?.result) ?? response;
+	return object(result?.page);
+}
+
+/**
+ * Collect every page of `providers.list/active` (Q29, GJC >= 0.12.8) and
+ * return the providers with usable stored credentials or credentialless
+ * connection kinds, mirroring the TUI model picker's
+ * `modelRegistry.getAvailable()`. The openwebui-gjc-adapter applies the same
+ * filter to `/v1/models`. Q29 pages are byte-bounded and can span multiple
+ * pages when custom provider ids inflate the payload, so all pages are
+ * consumed before the provider set is built. Returns undefined only when the
+ * session host rejects the query with `operation_not_session_owned`; any
+ * other query failure or malformed page is thrown.
+ */
+export async function collectActiveProviderIds(
+	adapter: Pick<AcpSdkAdapter, "query">,
+): Promise<ReadonlySet<string> | undefined> {
+	const providers = new Set<string>();
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_ACTIVE_PROVIDER_PAGES; pageCount++) {
+		let response: unknown;
+		try {
+			response = await adapter.query("providers.list/active", {}, cursor);
+		} catch (error) {
+			if (cursor === undefined && isUnsupportedQueryError(error)) return undefined;
+			throw error;
+		}
+		const page = queryPage(response);
+		if (!page) throw new AcpSdkAdapterError("protocol_error", "providers.list/active returned no page.");
+		const items = page.items;
+		if (!Array.isArray(items))
+			throw new AcpSdkAdapterError("protocol_error", "providers.list/active returned a malformed page.");
+		for (const item of items) {
+			const record = object(item);
+			if (!record || typeof record.provider !== "string") continue;
+			const connectionKind = record.connectionKind;
+			if (connectionKind === "credential" || connectionKind === "credentialless") providers.add(record.provider);
+		}
+		if (page.complete === true) return providers;
+		if (typeof page.continuationCursor !== "string")
+			throw new AcpSdkAdapterError(
+				"protocol_error",
+				"providers.list/active page is incomplete without a continuation cursor.",
+			);
+		cursor = page.continuationCursor;
+	}
+	throw new AcpSdkAdapterError("protocol_error", "providers.list/active exceeded the page budget.");
+}
+const MAX_MODEL_CATALOG_PAGES = 100;
+
+/**
+ * Collect every page of `models.list/current` (Q10) into one catalog so the
+ * active-provider filter never drops models that only appear on later pages.
+ * The SDK pages Q10 at a fixed byte target (256 KiB), which a fully
+ * configured catalog can exceed. Returns the same
+ * `{ result: { page: { items } } }` envelope `pageItems` consumes.
+ */
+export async function collectModelCatalog(adapter: Pick<AcpSdkAdapter, "query">): Promise<unknown> {
+	const items: unknown[] = [];
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_MODEL_CATALOG_PAGES; pageCount++) {
+		const response = await adapter.query("models.list/current", {}, cursor);
+		const page = queryPage(response);
+		if (!page) throw new AcpSdkAdapterError("protocol_error", "models.list/current returned no page.");
+		if (!Array.isArray(page.items))
+			throw new AcpSdkAdapterError("protocol_error", "models.list/current returned a malformed page.");
+		items.push(...page.items);
+		if (page.complete === true) return { result: { page: { items } } };
+		if (typeof page.continuationCursor !== "string")
+			throw new AcpSdkAdapterError(
+				"protocol_error",
+				"models.list/current page is incomplete without a continuation cursor.",
+			);
+		cursor = page.continuationCursor;
+	}
+	throw new AcpSdkAdapterError("protocol_error", "models.list/current exceeded the page budget.");
 }
 
 const THINKING_CONFIG_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => ({
@@ -484,7 +589,12 @@ const THINKING_CONFIG_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhi
 }));
 
 /** Maps live canonical SDK config and the selected model catalog into the ACP 1.2.1 session state surface. */
-export function acpSessionStateFromConfig(query: unknown, modelCatalogQuery?: unknown, modelPreset?: string) {
+export function acpSessionStateFromConfig(
+	query: unknown,
+	modelCatalogQuery?: unknown,
+	modelPreset?: string,
+	activeProviders?: ReadonlySet<string>,
+) {
 	const values = configValues(query);
 	const useModelPresets = modelPreset !== undefined;
 	const currentModeId = values.get(MODE_CONFIG_ID) === ACP_PLAN_MODE_ID ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
@@ -493,6 +603,7 @@ export function acpSessionStateFromConfig(query: unknown, modelCatalogQuery?: un
 			{
 				id: MODE_CONFIG_ID,
 				name: "Mode",
+				category: "mode" as const,
 				type: "select" as const,
 				currentValue: currentModeId,
 				options: [
@@ -510,7 +621,7 @@ export function acpSessionStateFromConfig(query: unknown, modelCatalogQuery?: un
 					option.id === MODEL_CONFIG_ID
 						? useModelPresets
 							? modelPresetConfigOptions(modelCatalogQuery, value)
-							: modelConfigOptions(modelCatalogQuery, value)
+							: modelConfigOptions(modelCatalogQuery, value, activeProviders)
 						: option.id === THINKING_CONFIG_ID
 							? THINKING_CONFIG_OPTIONS
 							: [...option.options];
@@ -1799,8 +1910,13 @@ export class AcpAgent implements Agent {
 		const modelPreset = this.#startupOptions?.modelPreset;
 		const [config, modelCatalog] = await Promise.all([
 			record.adapter.query("config.list/get"),
-			record.adapter.query(modelPreset === undefined ? "models.list/current" : "models.profiles.list"),
+			modelPreset === undefined ? collectModelCatalog(record.adapter) : record.adapter.query("models.profiles.list"),
 		]);
+		// Resolve usable providers in parallel. Only an older session host that
+		// rejects `providers.list/active` with `operation_not_session_owned`
+		// falls back to the full catalog; operational failures fail closed so
+		// the active-provider contract is not silently widened.
+		const activeProviders = modelPreset === undefined ? await collectActiveProviderIds(record.adapter) : undefined;
 		record.authFailure = undefined;
 		if (modelPreset !== undefined) {
 			const activePreset = configValues(config).get(MODEL_PRESET_CONFIG_KEY);
@@ -1815,7 +1931,7 @@ export class AcpAgent implements Agent {
 					throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 			}
 		}
-		return acpSessionStateFromConfig(config, modelCatalog, modelPreset);
+		return acpSessionStateFromConfig(config, modelCatalog, modelPreset, activeProviders);
 	}
 
 	async #publishAvailableCommands(id: string, adapter: AcpSdkAdapter): Promise<void> {
