@@ -477,6 +477,27 @@ function recommendedIndexFromGateOptions(options: readonly unknown[]): number | 
 type RetireStatus = "retired" | "already_terminal" | "claimed" | "stale";
 type DirectControlOutcome = "accepted" | "rejected" | "unknown";
 
+interface PresentationRetentionOptions {
+	publish?: boolean;
+	sourceEpoch?: number;
+}
+
+type PreparedDirectControl =
+	| { status: "retired"; ordinal: number }
+	| {
+			status: "queued";
+			ordinal: number;
+			/** Exact proof retained from a previously published route, if any. */
+			terminalProof?: "retired" | "already_terminal";
+	  };
+
+interface DirectControlPreparationLease {
+	gateId: string;
+	presentation: UnattendedGatePresentation;
+	presentationGeneration: number;
+	sourceEpoch?: number;
+}
+
 function parseRetireStatus(status: string): RetireStatus {
 	if (status === "retired" || status === "already_terminal" || status === "claimed" || status === "stale")
 		return status;
@@ -494,9 +515,20 @@ export class PresentationArbiter {
 	private readonly queue: string[] = [];
 	private readonly retries = new Map<string, { attempts: number; exhausted: boolean; nextAt: number }>();
 	private readonly retiredProofs = new Map<string, WorkflowGateTerminalProof>();
+	/** Gate ids that have had a successfully registered presentation in this retention lifetime. */
+	private readonly publishedGateIds = new Set<string>();
 	private readonly directControls = new Map<string, number>();
+	/** Binds an in-flight direct control to the exact retained presentation it retired. */
+	private readonly directControlPreparations = new WeakMap<object, DirectControlPreparationLease>();
+	/** Retained presentation identity generations fence same-gate replays. */
+	private readonly presentationGenerations = new WeakMap<UnattendedGatePresentation, number>();
+	private readonly presentationSourceEpochs = new WeakMap<UnattendedGatePresentation, number | undefined>();
+	private presentationGeneration = 0;
 	/** Explicit terminal proof for a direct control fenced before native publication. */
 	private readonly queuedDirectControls = new Set<string>();
+	/** Retained presentations that must wait for committed notification policy. */
+	private readonly deferredPublications = new Map<string, number | undefined>();
+	private publicationSuspended = false;
 	private retryTimer: ReturnType<typeof setTimeout> | undefined;
 	private retryTimerGateId: string | undefined;
 	private retryTimerGeneration = 0;
@@ -530,6 +562,15 @@ export class PresentationArbiter {
 		this.terminalCancellationTimers.delete(gateId);
 	}
 
+	#clearRetry(gateId: string): void {
+		this.retries.delete(gateId);
+		this.#clearTerminalCancellation(gateId);
+		if (this.retryTimerGateId !== gateId) return;
+		if (this.retryTimer) clearTimeout(this.retryTimer);
+		this.retryTimer = undefined;
+		this.retryTimerGateId = undefined;
+	}
+
 	#scheduleTerminalCancellation(gateId: string): void {
 		const presentation = this.presentations.get(gateId);
 		if (presentation?.workflowGateId || this.terminalCancellationTimers.has(gateId)) return;
@@ -549,7 +590,14 @@ export class PresentationArbiter {
 		this.#observeHead();
 		const gateId = this.queue[0];
 		const retry = gateId ? this.retries.get(gateId) : undefined;
-		if (!this.active && gateId && !this.directControls.has(gateId) && !retry?.exhausted) {
+		if (
+			!this.publicationSuspended &&
+			!this.active &&
+			gateId &&
+			!this.deferredPublications.has(gateId) &&
+			!this.directControls.has(gateId) &&
+			!retry?.exhausted
+		) {
 			if (retry && retry.nextAt > Date.now()) this.#scheduleRetry(gateId);
 			else this.reissue(gateId);
 		}
@@ -580,6 +628,8 @@ export class PresentationArbiter {
 		if (
 			!gateId ||
 			!this.presentations.has(gateId) ||
+			this.publicationSuspended ||
+			this.deferredPublications.has(gateId) ||
 			this.active ||
 			this.directControls.has(gateId) ||
 			retry?.exhausted
@@ -594,7 +644,14 @@ export class PresentationArbiter {
 
 	/** Explicit production recovery for a previously exhausted endpoint queue head. */
 	recover(gateId = this.queue[0]): void {
-		if (!gateId || this.queue[0] !== gateId || !this.presentations.has(gateId)) return;
+		if (
+			!gateId ||
+			this.queue[0] !== gateId ||
+			!this.presentations.has(gateId) ||
+			this.publicationSuspended ||
+			this.deferredPublications.has(gateId)
+		)
+			return;
 		this.retries.delete(gateId);
 		this.#clearTerminalCancellation(gateId);
 
@@ -604,6 +661,34 @@ export class PresentationArbiter {
 
 	hasActivePresentation(): boolean {
 		return this.active !== undefined;
+	}
+
+	#bindDirectControl(
+		gateId: string,
+		presentation: UnattendedGatePresentation,
+		prepared: PreparedDirectControl,
+	): PreparedDirectControl {
+		const presentationGeneration = this.presentationGenerations.get(presentation);
+		if (presentationGeneration === undefined)
+			throw new Error(`workflow gate ${gateId} presentation lacks a retention generation`);
+		this.directControlPreparations.set(prepared, {
+			gateId,
+			presentation,
+			presentationGeneration,
+			sourceEpoch: this.presentationSourceEpochs.get(presentation),
+		});
+		return prepared;
+	}
+
+	#isCurrentDirectControl(gateId: string, prepared: PreparedDirectControl): boolean {
+		const lease = this.directControlPreparations.get(prepared);
+		if (!lease || lease.gateId !== gateId) return false;
+		const presentation = this.presentations.get(gateId);
+		return (
+			presentation === lease.presentation &&
+			this.presentationGenerations.get(presentation) === lease.presentationGeneration &&
+			this.presentationSourceEpochs.get(presentation) === lease.sourceEpoch
+		);
 	}
 
 	retireForDirectControl(gateId: string): RetireStatus {
@@ -621,29 +706,38 @@ export class PresentationArbiter {
 		return status;
 	}
 
-	prepareDirectControl(
-		gateId: string,
-	): { status: "retired" | "queued"; ordinal: number } | { status: "claimed" | "stale" } {
+	prepareDirectControl(gateId: string): PreparedDirectControl | { status: "claimed" | "stale" } {
 		const ordinal = this.queue.indexOf(gateId);
+		const presentation = this.presentations.get(gateId);
 		if (this.active?.gateId === gateId) {
 			const status = this.retireForDirectControl(gateId);
-			return status === "retired"
-				? { status, ordinal }
-				: { status: status === "already_terminal" ? "stale" : status };
+			if (status !== "retired") return { status: status === "already_terminal" ? "stale" : status };
+			if (!presentation) return { status: "stale" };
+			return this.#bindDirectControl(gateId, presentation, { status, ordinal });
 		}
-		if (!this.presentations.has(gateId) || ordinal < 0 || this.directControls.has(gateId)) return { status: "stale" };
+		if (!presentation || ordinal < 0 || this.directControls.has(gateId)) return { status: "stale" };
+		const terminalProof = this.retiredProofs.get(gateId);
+		if (terminalProof !== "retired" && terminalProof !== "already_terminal" && this.publishedGateIds.has(gateId))
+			return { status: "stale" };
 		// Fence the queued entry before awaiting durable resolution; promotion cannot
 		// republish it until the control has a known terminal outcome.
 		this.directControls.set(gateId, ordinal);
 		this.queuedDirectControls.add(gateId);
-		return { status: "queued", ordinal };
+		return this.#bindDirectControl(
+			gateId,
+			presentation,
+			terminalProof === "retired" || terminalProof === "already_terminal"
+				? { status: "queued", ordinal, terminalProof }
+				: { status: "queued", ordinal },
+		);
 	}
 
-	finishDirectControl(
-		gateId: string,
-		prepared: { status: "retired" | "queued"; ordinal: number },
-		outcome: DirectControlOutcome,
-	): void {
+	finishDirectControl(gateId: string, prepared: PreparedDirectControl, outcome: DirectControlOutcome): void {
+		// The emitter may have been replaced while the durable resolution was in
+		// flight. Never let that old completion act on a replacement presentation
+		// that happens to reuse the same gate id.
+		if (!this.#isCurrentDirectControl(gateId, prepared)) return;
+		this.directControlPreparations.delete(prepared);
 		if (outcome === "accepted") {
 			this.directControls.delete(gateId);
 			this.complete(gateId);
@@ -659,7 +753,6 @@ export class PresentationArbiter {
 		}
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
-		this.retiredProofs.delete(gateId);
 		if (!this.presentations.has(gateId)) return;
 		const current = this.queue.indexOf(gateId);
 		if (current >= 0) this.queue.splice(current, 1);
@@ -673,7 +766,29 @@ export class PresentationArbiter {
 		private readonly tag: string,
 	) {}
 
-	retain(presentation: UnattendedGatePresentation): void {
+	/** Gate retention remains available while notification publication is suspended. */
+	setPublicationSuspended(suspended: boolean): void {
+		this.publicationSuspended = suspended;
+		if (!suspended) this.#promote();
+	}
+
+	/** Publish only deferred presentations from the still-authoritative source. */
+	activateDeferred(sourceEpoch?: number): void {
+		for (const [gateId, deferredEpoch] of this.deferredPublications) {
+			if (sourceEpoch !== undefined && deferredEpoch !== undefined && deferredEpoch !== sourceEpoch) continue;
+			this.deferredPublications.delete(gateId);
+			this.#clearRetry(gateId);
+		}
+		this.#promote();
+	}
+
+	retain(presentation: UnattendedGatePresentation, options: PresentationRetentionOptions = {}): void {
+		if (options.publish === false || this.publicationSuspended) {
+			this.deferredPublications.set(presentation.gateId, options.sourceEpoch);
+			this.#clearRetry(presentation.gateId);
+		} else {
+			this.deferredPublications.delete(presentation.gateId);
+		}
 		const existing = this.presentations.get(presentation.gateId);
 		if (
 			existing &&
@@ -692,6 +807,7 @@ export class PresentationArbiter {
 			if (!isTerminalProof(status)) return;
 			this.routes.delete(active.actionId);
 			this.active = undefined;
+			this.retiredProofs.set(presentation.gateId, status);
 		}
 		const alreadyPresent = existing !== undefined;
 		if (existing?.multi && presentation.multi) {
@@ -700,6 +816,8 @@ export class PresentationArbiter {
 			);
 		}
 		if (!alreadyPresent) this.queue.push(presentation.gateId);
+		this.presentationGenerations.set(presentation, ++this.presentationGeneration);
+		this.presentationSourceEpochs.set(presentation, options.sourceEpoch);
 		this.presentations.set(presentation.gateId, presentation);
 		// A fresh durable replay is explicit production recovery after transient N-API exhaustion.
 		if (alreadyPresent) this.recover(presentation.gateId);
@@ -721,6 +839,9 @@ export class PresentationArbiter {
 		if (!presentation?.multi || !presentation.options.includes(label)) return false;
 		this.routes.delete(actionId);
 		if (this.active?.actionId === actionId) this.active = undefined;
+		// Native claim resolution terminalized the published route; preserve that
+		// exact proof if the replacement publication cannot be registered.
+		this.retiredProofs.set(presentation.gateId, "already_terminal");
 		const selected = new Set(presentation.selectedOptions);
 		if (selected.has(label)) selected.delete(label);
 		else selected.add(label);
@@ -740,6 +861,8 @@ export class PresentationArbiter {
 		const presentation = this.presentations.get(gateId);
 		if (!presentation) return;
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -757,6 +880,8 @@ export class PresentationArbiter {
 		const presentation = this.presentations.get(gateId);
 		if (!presentation) return;
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -787,6 +912,8 @@ export class PresentationArbiter {
 		const presentation = this.presentations.get(gateId);
 		if (!presentation) return;
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -809,7 +936,14 @@ export class PresentationArbiter {
 
 	reissue(gateId: string): string | undefined {
 		const presentation = this.presentations.get(gateId);
-		if (!presentation || this.directControls.has(gateId) || this.active) return undefined;
+		if (
+			!presentation ||
+			this.publicationSuspended ||
+			this.deferredPublications.has(gateId) ||
+			this.directControls.has(gateId) ||
+			this.active
+		)
+			return undefined;
 		const actionId = `${presentation.workflowGateId ? "gate-interaction" : "ask"}:${crypto.randomUUID()}`;
 		this.routes.set(actionId, gateId);
 		try {
@@ -861,6 +995,10 @@ export class PresentationArbiter {
 			);
 			if (lease.actionId !== actionId) throw new Error("native arbitrated action id mismatch");
 			this.active = { actionId, gateId, registrationEpoch: lease.registrationEpoch };
+			this.publishedGateIds.add(gateId);
+			// A replacement route now has its own exact proof; do not reuse a
+			// terminal proof retained for the route it replaced.
+			this.retiredProofs.delete(gateId);
 			this.retries.delete(gateId);
 			presentation.onActivated?.(actionId, lease);
 			return actionId;
@@ -902,6 +1040,11 @@ export class PresentationArbiter {
 		if (isTerminalProof(status)) {
 			this.routes.delete(actionId);
 			this.active = undefined;
+			// Preserve the exact lease proof after removing the route. A later
+			// terminalization must not fall back to a broad publication-suspended
+			// heuristic and misclassify a previously published lease as not_published.
+			this.publishedGateIds.add(gateId);
+			this.retiredProofs.set(gateId, status);
 			void reason;
 			return true;
 		}
@@ -916,13 +1059,17 @@ export class PresentationArbiter {
 			if (routeGateId !== gateId) continue;
 			if (!this.closeInteraction(actionId, "gate_complete"))
 				throw new Error(`workflow gate ${gateId} presentation lacks exact terminal proof`);
-			proof = "retired";
+			proof = this.retiredProofs.get(gateId) ?? proof;
 		}
 		const presentation = this.presentations.get(gateId);
 		if (!proof && this.queuedDirectControls.has(gateId)) proof = "not_published";
+		if (!proof && this.deferredPublications.has(gateId)) proof = "not_published";
+		if (!proof && this.publicationSuspended && presentation) proof = "not_published";
 		if (!proof && presentation)
 			throw new Error(`workflow gate ${gateId} presentation lacks an active terminal lease`);
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -948,7 +1095,11 @@ export class PresentationArbiter {
 	}
 
 	dispose(): void {
+		const publicationSuspended = this.publicationSuspended;
+		this.publicationSuspended = true;
 		for (const gateId of [...this.presentations.keys()]) this.cancel(gateId, "session_shutdown");
+		this.deferredPublications.clear();
+		this.publicationSuspended = publicationSuspended;
 	}
 }
 
@@ -995,6 +1146,8 @@ interface SessionRuntime {
 	policySuspended: boolean;
 	/** Monotonic policy epoch fences asynchronous notification delivery. */
 	policyGeneration: number;
+	/** Monotonic source lease epoch for workflow-gate presentation retention. */
+	workflowGatePublicationEpoch: number;
 	/** True only after the exact host generation was registered with the broker index. */
 	brokerRegistrationActive: boolean;
 	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
@@ -1081,8 +1234,6 @@ interface SessionRuntime {
 	 * remote clients. Cleared after flush or when replaced by a newer turn.
 	 */
 	pendingSettled?: { text: string; messageRef?: string };
-	/** Durable gates emitted while ownership is provisional; presented only after stable activation. */
-	deferredGatePresentations: Array<() => void>;
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
 	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
@@ -2210,8 +2361,11 @@ function sdkControlSurface(
 		missingExpectedSessionAudits.add(operation);
 		logger.warn("workflow_control_missing_expected_session_id", { operation });
 	};
-	const reconcileUnknownGateFailure = (gateId: string): "pending" | "terminal" | "unavailable" => {
-		const pending = ctx.workflowGate?.listPendingGates;
+	const reconcileUnknownGateFailure = (
+		workflowGate: WorkflowGateEmitter,
+		gateId: string,
+	): "pending" | "terminal" | "unavailable" => {
+		const pending = workflowGate.listPendingGates;
 		if (!pending) return "unavailable";
 		try {
 			return pending().some(gate => gate.gate_id === gateId) ? "pending" : "terminal";
@@ -2220,12 +2374,12 @@ function sdkControlSurface(
 			return "unavailable";
 		}
 	};
-	const reconcileDirectControlFailure = (gateId: string): DirectControlOutcome => {
-		const durable = reconcileUnknownGateFailure(gateId);
+	const reconcileDirectControlFailure = (workflowGate: WorkflowGateEmitter, gateId: string): DirectControlOutcome => {
+		const durable = reconcileUnknownGateFailure(workflowGate, gateId);
 		if (durable === "pending") return "rejected";
 		if (durable === "terminal") return "accepted";
 		try {
-			ctx.workflowGate?.quarantineGate?.(gateId);
+			workflowGate.quarantineGate?.(gateId);
 		} catch {
 			// The local arbiter still fails closed when the durable fence is unavailable.
 		}
@@ -2492,9 +2646,8 @@ function sdkControlSurface(
 				throw Object.assign(new Error("The active action is already being answered."), { code: "action_claimed" });
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
-			if (
-				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
-			) {
+			const terminalProof = prepared.status === "retired" ? "retired" : (prepared.terminalProof ?? "not_published");
+			if (workflowGate.prepareTerminalization(id, terminalProof) !== true) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow gate lacks a terminalization proof."), { code: "resource_gone" });
 			}
@@ -2507,7 +2660,7 @@ function sdkControlSurface(
 					return resolution;
 				}
 			} catch (error) {
-				const outcome = reconcileDirectControlFailure(id);
+				const outcome = reconcileDirectControlFailure(workflowGate, id);
 				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
@@ -2516,7 +2669,7 @@ function sdkControlSurface(
 					});
 				throw error;
 			}
-			const outcome = reconcileDirectControlFailure(id);
+			const outcome = reconcileDirectControlFailure(workflowGate, id);
 			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
@@ -2564,9 +2717,8 @@ function sdkControlSurface(
 				throw Object.assign(new Error("The active action is already being answered."), { code: "action_claimed" });
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
-			if (
-				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
-			) {
+			const terminalProof = prepared.status === "retired" ? "retired" : (prepared.terminalProof ?? "not_published");
+			if (workflowGate.prepareTerminalization(id, terminalProof) !== true) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow plan lacks a terminalization proof."), { code: "resource_gone" });
 			}
@@ -2579,7 +2731,7 @@ function sdkControlSurface(
 					return resolution;
 				}
 			} catch (error) {
-				const outcome = reconcileDirectControlFailure(id);
+				const outcome = reconcileDirectControlFailure(workflowGate, id);
 				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
@@ -2588,7 +2740,7 @@ function sdkControlSurface(
 					});
 				throw error;
 			}
-			const outcome = reconcileDirectControlFailure(id);
+			const outcome = reconcileDirectControlFailure(workflowGate, id);
 			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
@@ -3616,6 +3768,7 @@ export function createNotificationsExtension(
 			throw error;
 		}
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? true, tag);
+		gatePresentations.setPublicationSuspended(true);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
@@ -4576,6 +4729,7 @@ export function createNotificationsExtension(
 			verbosity: "lean",
 			stream: false,
 			policyGeneration: 0,
+			workflowGatePublicationEpoch: 0,
 			sessionTag: tag,
 			busy: false,
 			pendingPromptCorrelations,
@@ -4595,7 +4749,6 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
-			deferredGatePresentations: [],
 			deferredInboundControls: [],
 			notificationRootRegistration: undefined,
 		};
@@ -5291,6 +5444,7 @@ export function createNotificationsExtension(
 			// Attach dynamically so the SDK bus presents every durable gate.
 			const attachWorkflowGate = (gate: WorkflowGateEmitter | undefined): void => {
 				if (activeRuntime.workflowGate === gate) return;
+				const sourceEpoch = ++activeRuntime.workflowGatePublicationEpoch;
 				activeRuntime.disposeGateListener();
 				activeRuntime.workflowGate?.setRuntimeTurnProvider?.(null);
 				activeRuntime.disposeAckRecoveryParticipant();
@@ -5305,6 +5459,8 @@ export function createNotificationsExtension(
 				}
 				activeRuntime.workflowGate = gate;
 				gate.setRuntimeTurnProvider?.(() => activeRuntime.activePromptCorrelation?.turnId);
+				const isCurrentSource = (): boolean =>
+					activeRuntime.workflowGate === gate && activeRuntime.workflowGatePublicationEpoch === sourceEpoch;
 				if (hasTerminalArbitrationCapability(gate)) {
 					const controller: WorkflowGateTerminalController = {
 						completeGateInteractions: gateId => gatePresentations.complete(gateId),
@@ -5321,6 +5477,7 @@ export function createNotificationsExtension(
 						? Gate
 						: never,
 				): void => {
+					if (!isCurrentSource()) return;
 					const rawGateOptions = g.options ?? [];
 					const options = rawGateOptions.map(o => String((o as { label?: unknown }).label ?? ""));
 					const recommendedIndex = recommendedIndexFromGateOptions(rawGateOptions);
@@ -5333,25 +5490,27 @@ export function createNotificationsExtension(
 						typeof g.context?.stage_state === "object" && g.context.stage_state !== null
 							? (g.context.stage_state as Record<string, unknown>)
 							: {};
-					gatePresentations.retain({
-						gateId: g.gate_id,
-						workflowGateId: g.gate_id,
-						sessionId: id,
-						question,
-						options,
-						...(recommendedIndex === undefined ? {} : { recommendedIndex }),
-						controls: [],
-						multi: stageState.multi === true,
-						allowEmpty: stageState.allow_empty === true,
-						navigationLabel: stageState.navigation_label === "Next" ? "Next" : "Done",
-						selectedOptions: [],
-					});
+					gatePresentations.retain(
+						{
+							gateId: g.gate_id,
+							workflowGateId: g.gate_id,
+							sessionId: id,
+							question,
+							options,
+							...(recommendedIndex === undefined ? {} : { recommendedIndex }),
+							controls: [],
+							multi: stageState.multi === true,
+							allowEmpty: stageState.allow_empty === true,
+							navigationLabel: stageState.navigation_label === "Next" ? "Next" : "Done",
+							selectedOptions: [],
+						},
+						{
+							publish: !activeRuntime.policySuspended,
+							sourceEpoch,
+						},
+					);
 				};
 				activeRuntime.disposeGateListener = gate.onGateEmitted(g => {
-					if (activeRuntime.policySuspended) {
-						activeRuntime.deferredGatePresentations.push(() => presentGate(g));
-						return;
-					}
 					presentGate(g);
 				});
 				if (gate.setAckRecoveryParticipant) {
@@ -5445,6 +5604,7 @@ export function createNotificationsExtension(
 			if (policy.mode === "provisional") {
 				runtime.policyGeneration++;
 				runtime.policySuspended = true;
+				runtime.gatePresentations?.setPublicationSuspended(true);
 				runtime.redact = true;
 				runtime.verbosity = "lean";
 				runtime.stream = false;
@@ -5470,9 +5630,13 @@ export function createNotificationsExtension(
 		activate: binding => {
 			const runtime = runtimes.get(binding.sessionId);
 			if (!runtime || runtime.stopping) return;
+			// Activation is only valid after the controller commits a stable policy;
+			// never expose deferred presentations while provisional policy is held.
+			if (runtime.policySuspended) return;
 			runtime.enableNotifications();
+			runtime.gatePresentations?.setPublicationSuspended(false);
+			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
-			for (const present of runtime.deferredGatePresentations.splice(0)) present();
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		ensureTelegramDaemon: async binding => {

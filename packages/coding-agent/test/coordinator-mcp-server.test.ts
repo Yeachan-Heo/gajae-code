@@ -83,6 +83,7 @@ function sharedAskGate(
 	gateId: string,
 	runtimeTurnId: string,
 	stage: WorkflowGate["stage"] = "deep-interview",
+	kind: WorkflowGate["kind"] = "question",
 ): WorkflowGate & { id: string; tag: "pending" } {
 	const labels = ["Continue", "Stop"];
 	const schema = buildAskGateAnswerSchema({ multi: false, allowEmpty: false }, labels);
@@ -93,7 +94,7 @@ function sharedAskGate(
 		gate_id: gateId,
 		runtime_turn_id: runtimeTurnId,
 		stage,
-		kind: "question",
+		kind,
 		schema,
 		schema_hash: schemaHash(schema),
 		required: true,
@@ -1381,7 +1382,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					? {
 							ok: true,
 							page: {
-								items: [sharedAskGate("gate-q12", runtimeTurnId, "ralplan")],
+								items: [sharedAskGate("gate-q12", runtimeTurnId, "ralplan", "approval")],
 								complete: true,
 								revision: "q12-r1",
 							},
@@ -1428,10 +1429,12 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			question_id: "gate-q12",
 			status: "pending",
 			stage: "ralplan",
+			kind: "approval",
 		});
 		expect(JSON.stringify(question)).not.toContain("codec");
 		if (typeof question.answer_binding !== "string") throw new Error("missing answer binding");
 		expect(question.answer_binding).toMatch(/^[A-Za-z0-9_-]{43}$/);
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toEqual([]);
 
 		const answer = await server.callTool("gjc_coordinator_submit_question_answer", {
 			session_id: "visible-session",
@@ -1482,7 +1485,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		let runtimeTurnId = "unbound";
 		const gates = () => [
 			{ ...sharedAskGate("bad-runtime", runtimeTurnId), runtime_turn_id: "" },
-			{ ...sharedAskGate("unsupported", runtimeTurnId), kind: "approval" },
+			{ ...sharedAskGate("unsupported", runtimeTurnId, "ultragoal"), kind: "execution" },
 		];
 		const server = await createSdkControlServer(root, controls, [], query =>
 			query === "Q12"

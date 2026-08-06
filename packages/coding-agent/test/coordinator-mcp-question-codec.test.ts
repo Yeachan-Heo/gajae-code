@@ -7,6 +7,7 @@ import {
 	translateCoordinatorAskAnswer,
 	validateCoordinatorAskAnswer,
 } from "../src/coordinator-mcp/question-gate-codec";
+import { approvalGate } from "../src/modes/shared/agent-wire/approval-gate";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -18,13 +19,13 @@ function askSchema(labels: string[], multi: boolean, allowEmpty: boolean) {
 	return buildAskGateAnswerSchema({ multi, allowEmpty }, labels);
 }
 
-function gate(): WorkflowGate {
+function gate(stage: WorkflowGate["stage"] = "deep-interview", kind: WorkflowGate["kind"] = "question"): WorkflowGate {
 	const labels = ["Keep current plan", "Revise scope"];
 	return {
 		type: "workflow_gate",
 		gate_id: "wg_issue_2550_deep-interview_000001",
-		stage: "deep-interview",
-		kind: "question",
+		stage,
+		kind,
 		schema: askSchema(labels, false, false),
 		schema_hash: schemaHash(askSchema(labels, false, false)),
 		required: true,
@@ -45,11 +46,42 @@ function gate(): WorkflowGate {
 	};
 }
 
+function lifecycleApprovalGate(): WorkflowGate {
+	const input = approvalGate({ title: "Approve the plan?" });
+	return {
+		...gate("ralplan", "approval"),
+		...input,
+		gate_id: "wg_ralplan_approval_lifecycle_000001",
+		schema_hash: schemaHash(input.schema),
+	};
+}
+
 describe("coordinator MCP ask-gate codec", () => {
-	it("decodes canonical ask gates for every workflow stage", () => {
-		for (const stage of ["deep-interview", "ralplan", "ultragoal"] as const) {
-			expect(decodeAskGateV1({ ...gate(), stage })).not.toBeNull();
+	it("decodes exactly the supported stage/kind pairs", () => {
+		const positivePairs = [
+			["deep-interview", "question"],
+			["ralplan", "question"],
+			["ultragoal", "question"],
+			["ralplan", "approval"],
+		] as const;
+		for (const [stage, kind] of positivePairs) {
+			expect(decodeAskGateV1(gate(stage, kind)), `${stage}/${kind}`).not.toBeNull();
 		}
+
+		const negativePairs = [
+			["deep-interview", "approval"],
+			["deep-interview", "execution"],
+			["ralplan", "execution"],
+			["ultragoal", "approval"],
+			["ultragoal", "execution"],
+		] as const;
+		for (const [stage, kind] of negativePairs) {
+			expect(decodeAskGateV1(gate(stage, kind)), `${stage}/${kind}`).toBeNull();
+		}
+	});
+
+	it("rejects the ralplan approval lifecycle-decision schema", () => {
+		expect(decodeAskGateV1(lifecycleApprovalGate())).toBeNull();
 	});
 
 	it("projects a pending Q12 ask without exposing the private codec or binding after it is answered", () => {

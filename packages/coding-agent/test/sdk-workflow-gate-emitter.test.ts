@@ -706,6 +706,66 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await persistentSession.dispose();
 		}
 	});
+	it("keeps a canonical subagent emitter local without publishing or persisting it", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-local-subagent-emitter-"));
+		tempDirs.push(tempDir);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			parentTaskPrefix: "0-Subagent",
+			currentAgentType: "planner",
+		});
+		const gatePath = path.join(sessionStateDir(tempDir, session.sessionId), "workflow-gates.json");
+		const publications: Array<WorkflowGateEmitter | undefined> = [];
+		const stopListening = registerWorkflowGateEmitterListener(session.sessionId, emitter => {
+			publications.push(emitter);
+		});
+		try {
+			const emitter = session.getWorkflowGateEmitter();
+			expect(emitter).toBeDefined();
+			expect(publications).toEqual([undefined]);
+			expect(fs.existsSync(gatePath)).toBe(false);
+			await Bun.sleep(0);
+			expect(session.getToolByName("ask")).toBeDefined();
+
+			attachTerminalController(emitter!);
+			let gate: { gate_id: string } | undefined;
+			const detachGateListener = emitter!.onGateEmitted!(emitted => {
+				gate = emitted;
+			});
+			const advance = emitter!.emitGate({
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["approve"] },
+			});
+			await Promise.resolve();
+			expect(gate).toBeDefined();
+			expect(fs.existsSync(gatePath)).toBe(false);
+			expect(
+				await emitter!.resolveGate!({
+					gate_id: gate!.gate_id,
+					answer: "approve",
+					idempotency_key: "local-subagent-gate",
+				}),
+			).toMatchObject({ status: "accepted" });
+			await expect(advance).resolves.toBe("approve");
+			detachGateListener();
+		} finally {
+			await session.dispose();
+			expect(publications).toEqual([undefined]);
+			stopListening();
+		}
+	});
 	// Real persisted-session rotation performs disk load, emitter fencing, and authority reminting; keep a local budget without weakening the suite default.
 	it("fences old workflow gates and remints authority after a session switch", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-session-switch-"));

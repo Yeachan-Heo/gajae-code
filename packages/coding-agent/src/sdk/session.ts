@@ -2831,6 +2831,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
 			taskDepth,
+			workflowGatePublication: isCanonicalSubSession ? "local" : "endpoint",
 			toolRegistry,
 			workflowGateToolSession: toolSession,
 			transformContext,
