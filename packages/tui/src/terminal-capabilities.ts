@@ -4,9 +4,9 @@ import { $env, $pickenv } from "@gajae-code/utils";
 type NativeEncodeSixel = typeof encodeSixelFn;
 let nativeEncodeSixel: NativeEncodeSixel | undefined;
 
-function encodeSixelNative(...args: Parameters<NativeEncodeSixel>): ReturnType<NativeEncodeSixel> {
+function encodeSixelNative(bytes: Uint8Array, targetWidthPx: number, targetHeightPx: number): string {
 	nativeEncodeSixel ??= (require("@gajae-code/natives") as { encodeSixel: NativeEncodeSixel }).encodeSixel;
-	return nativeEncodeSixel(...args);
+	return nativeEncodeSixel(bytes, targetWidthPx, targetHeightPx);
 }
 
 export enum ImageProtocol {

@@ -1,5 +1,6 @@
 import type { AgentTool } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult, TSchema } from "@gajae-code/ai/types";
+import { $which } from "@gajae-code/utils";
 import type { ToolFactory, ToolSession } from ".";
 import { selectAskParameters } from "./ask-contract";
 import { isComputerCallable, isComputerLoadablePlatform } from "./computer-policy";
@@ -245,7 +246,7 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "todo_write") return !context.includeYield && Boolean(session.settings.get("todo.enabled"));
 	if (name === "find") return Boolean(session.settings.get("find.enabled"));
 	if (name === "search") return Boolean(session.settings.get("search.enabled"));
-	if (name === "github") return Boolean(session.settings.get("github.enabled"));
+	if (name === "github") return Boolean(session.settings.get("github.enabled")) && Boolean($which("gh"));
 	if (name === "ast_grep") return Boolean(session.settings.get("astGrep.enabled"));
 	if (name === "ast_edit") return Boolean(session.settings.get("astEdit.enabled"));
 	if (name === "render_mermaid") return Boolean(session.settings.get("renderMermaid.enabled"));
@@ -255,8 +256,15 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "skill" || name === "skill_discovery") return Boolean(session.settings.get("skill.enabled"));
 	if (name === "browser") return Boolean(session.settings.get("browser.enabled"));
 	if (name === "computer") return isComputerCallable(session);
-	if (name === "checkpoint" || name === "rewind") return Boolean(session.settings.get("checkpoint.enabled"));
-	if (name === "irc") return Boolean(session.settings.get("irc.enabled"));
+	if (name === "checkpoint" || name === "rewind")
+		return Boolean(session.settings.get("checkpoint.enabled")) && (session.taskDepth ?? 0) === 0;
+	if (name === "irc")
+		return (
+			Boolean(session.settings.get("irc.enabled")) && Boolean(session.agentRegistry) && Boolean(session.getAgentId)
+		);
+	if (name === "ask")
+		return Boolean(session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.());
+	if (name === "cron") return process.env.CLAUDE_CODE_DISABLE_CRON !== "1";
 	if (name === "recipe") return Boolean(session.settings.get("recipe.enabled"));
 	if (name === "task") {
 		const maxDepth = session.settings.get("task.maxRecursionDepth") ?? 2;

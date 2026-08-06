@@ -28,13 +28,17 @@ import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
-let htmlToMarkdownLoad: Promise<typeof htmlToMarkdownFn> | undefined;
+type NativeHtmlBindings = { htmlToMarkdown: typeof htmlToMarkdownFn };
+let nativeHtmlBindings: NativeHtmlBindings | undefined;
 
-async function htmlToMarkdownNative(): Promise<typeof htmlToMarkdownFn> {
-	htmlToMarkdownLoad ??= Promise.resolve(
-		(require("@gajae-code/natives") as { htmlToMarkdown: typeof htmlToMarkdownFn }).htmlToMarkdown,
-	);
-	return await htmlToMarkdownLoad;
+/**
+ * Lazy native access for HTML conversion. The module is cached, never the
+ * function: binding the export once would freeze the first-seen implementation
+ * for the process.
+ */
+function nativeHtml(): NativeHtmlBindings {
+	nativeHtmlBindings ??= require("@gajae-code/natives") as NativeHtmlBindings;
+	return nativeHtmlBindings;
 }
 
 // =============================================================================
@@ -543,7 +547,7 @@ export async function renderHtmlToText(
 ): Promise<{ content: string; ok: boolean; method: string }> {
 	try {
 		signal?.throwIfAborted();
-		const content = await (await htmlToMarkdownNative())(html, { cleanContent: true });
+		const content = await nativeHtml().htmlToMarkdown(html, { cleanContent: true });
 		if (content.trim().length > 100 && !isLowQualityOutput(content)) {
 			return { content, ok: true, method: "native" };
 		}

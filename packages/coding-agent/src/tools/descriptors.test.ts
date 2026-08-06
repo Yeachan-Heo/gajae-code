@@ -271,7 +271,9 @@ describe("tool descriptor compatibility gate", () => {
 	test("availability predicates retain every createTools settings branch", () => {
 		const session = makeSession();
 		const context = availabilityContext();
-		const unavailableByDefault = new Set(["debug", "github", "search_tool_bm25", "goal"]);
+		// `ask`, `irc` and `github` need session capabilities the bare fixture never provides:
+		// a UI or workflow gate, an agent registry, and an installed `gh`.
+		const unavailableByDefault = new Set(["ask", "debug", "github", "irc", "search_tool_bm25", "goal"]);
 		for (const [name, descriptor] of Object.entries(BUILTIN_TOOL_DESCRIPTORS)) {
 			expect(descriptor.isAvailable(session, context)).toBe(!unavailableByDefault.has(name));
 		}
@@ -324,6 +326,43 @@ describe("tool descriptor compatibility gate", () => {
 		expect(BUILTIN_TOOL_DESCRIPTORS.todo_write.isAvailable(session, yieldContext)).toBe(false);
 		expect(BUILTIN_TOOL_DESCRIPTORS.todo_write.isAvailable(session, context)).toBe(true);
 		expect(BUILTIN_TOOL_DESCRIPTORS.eval.isAvailable(session, availabilityContext({ allowEval: false }))).toBe(false);
+	});
+
+	test("conditional descriptors mirror their factory guards", () => {
+		const context = availabilityContext();
+		const uiSession = makeSession();
+		uiSession.hasUI = true;
+		expect(BUILTIN_TOOL_DESCRIPTORS.ask.isAvailable(uiSession, context)).toBe(true);
+		const gateSession = makeSession();
+		gateSession.workflowGateEligible = true;
+		expect(BUILTIN_TOOL_DESCRIPTORS.ask.isAvailable(gateSession, context)).toBe(true);
+		const emitterSession = makeSession();
+		emitterSession.getWorkflowGateEmitter = () => ({});
+		expect(BUILTIN_TOOL_DESCRIPTORS.ask.isAvailable(emitterSession, context)).toBe(true);
+
+		const ircSession = makeSession();
+		ircSession.agentRegistry = {};
+		ircSession.getAgentId = () => "agent";
+		expect(BUILTIN_TOOL_DESCRIPTORS.irc.isAvailable(ircSession, context)).toBe(true);
+		ircSession.getAgentId = undefined;
+		expect(BUILTIN_TOOL_DESCRIPTORS.irc.isAvailable(ircSession, context)).toBe(false);
+
+		const subagentSession = makeSession();
+		subagentSession.taskDepth = 1;
+		expect(BUILTIN_TOOL_DESCRIPTORS.checkpoint.isAvailable(subagentSession, context)).toBe(false);
+		expect(BUILTIN_TOOL_DESCRIPTORS.rewind.isAvailable(subagentSession, context)).toBe(false);
+		expect(BUILTIN_TOOL_DESCRIPTORS.checkpoint.isAvailable(makeSession(), context)).toBe(true);
+
+		const cronSession = makeSession();
+		const previous = process.env.CLAUDE_CODE_DISABLE_CRON;
+		process.env.CLAUDE_CODE_DISABLE_CRON = "1";
+		try {
+			expect(BUILTIN_TOOL_DESCRIPTORS.cron.isAvailable(cronSession, context)).toBe(false);
+		} finally {
+			if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_CRON;
+			else process.env.CLAUDE_CODE_DISABLE_CRON = previous;
+		}
+		expect(BUILTIN_TOOL_DESCRIPTORS.cron.isAvailable(cronSession, context)).toBe(true);
 	});
 
 	test("descriptor creation is side-effect free; materialization registers cleanup exactly once", () => {
@@ -401,6 +440,7 @@ describe("tool descriptor compatibility gate", () => {
 	});
 	test("deferred raw argument validators run before first implementation load", async () => {
 		const session = makeSession({ "tools.discoveryMode": "all" });
+		session.hasUI = true;
 		const tools = await createTools(session);
 		const ask = tools.find(tool => tool.name === "ask");
 		const todo = tools.find(tool => tool.name === "todo_write");
@@ -422,6 +462,7 @@ describe("tool descriptor compatibility gate", () => {
 
 	test("deferred ask validator recovers the canonical round-zero pair", async () => {
 		const session = makeSession({ "tools.discoveryMode": "all" });
+		session.hasUI = true;
 		session.getDeepInterviewAskStage = () => "topology";
 		const [ask] = (await createTools(session)).filter(tool => tool.name === "ask");
 		if (!ask) throw new Error("expected deferred ask tool");
