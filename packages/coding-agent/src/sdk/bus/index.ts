@@ -58,7 +58,11 @@ import type {
 	AskSettlementResult,
 } from "../../tools";
 import { RECOMMENDED_SUFFIX } from "../../tools/ask";
-import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
+import {
+	GJC_ASK_TIMEOUT_CODE,
+	registerAskAnswerSource,
+	registerWorkflowGateEmitterListener,
+} from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
@@ -1816,6 +1820,12 @@ export function createSdkPermissionAskAnswerSource(
 				: 0;
 		const bridgedOptions =
 			transitionCount > 0 ? request.options.slice(0, request.options.length - transitionCount) : request.options;
+		// An ask with no model-supplied choices leaves only the synthetic
+		// transition entries; do not send an unanswerable permission request.
+		// An ask with no model-supplied choices leaves only the synthetic
+		// transition entries; do not send an unanswerable permission request
+		// unless an enabled control can still commit something.
+		if (bridgedOptions.length === 0 && !request.controls.some(control => control.enabled)) return undefined;
 		const recommendedLabel =
 			typeof request.recommendedIndex === "number" &&
 			Number.isInteger(request.recommendedIndex) &&
@@ -1877,21 +1887,23 @@ export function createSdkPermissionAskAnswerSource(
 				rejectRequest(error);
 			},
 		);
+		const askTimeoutError = Object.assign(new Error("ask timed out"), { code: GJC_ASK_TIMEOUT_CODE });
 		let response: unknown;
 		try {
 			response = await requestPromise;
 		} catch (error) {
-			if (requestController.signal.aborted && !signal?.aborted) return undefined;
+			if (requestController.signal.aborted && !signal?.aborted) throw askTimeoutError;
 			throw error;
 		} finally {
 			if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
 			signal?.removeEventListener("abort", onRequestAbort);
 		}
 		if (signal?.aborted) return undefined;
-		// The configured ask timeout elapsed with no answer: return without an
-		// answer so the ask tool's own auto-selection-on-timeout policy (and its
-		// timed-out settlement) stays authoritative instead of a fabricated pick.
-		if (requestController.signal.aborted) return undefined;
+		// The configured ask timeout elapsed with no answer: throw the marked
+		// timeout error so the ask tool distinguishes it from a genuine
+		// cancellation (which must never auto-select) and its own
+		// auto-selection-on-timeout policy stays authoritative.
+		if (requestController.signal.aborted) throw askTimeoutError;
 		if (!isRecord(response)) return undefined;
 		// ACP clients (e.g. Paseo) return `{ outcome: { outcome, optionId } }`;
 		// accept the flat legacy shape as well.

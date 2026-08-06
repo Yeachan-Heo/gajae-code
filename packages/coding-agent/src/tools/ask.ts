@@ -61,6 +61,7 @@ import type {
 	AskSettlementResult,
 	ToolSession,
 } from ".";
+import { GJC_ASK_TIMEOUT_CODE } from "./ask-answer-registry";
 
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError } from "./tool-errors";
@@ -586,6 +587,10 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function isAskTimeoutError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && (error as { code?: unknown }).code === GJC_ASK_TIMEOUT_CODE;
+}
+
 async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>, required: boolean): Promise<void> {
 	if (required) {
 		await persistence;
@@ -894,16 +899,10 @@ async function askSingleQuestion(
 				? await untilAborted(signal, () => ui.select(prompt, optionsToShow, dialogOptions))
 				: await ui.select(prompt, optionsToShow, dialogOptions);
 		} catch (error) {
-			// A headless remote source that waits out the ask timeout surfaces as
-			// a remote-cancellation failure; classify only that cancellation as a
-			// timeout so the caller's auto-select-on-timeout policy stays
-			// authoritative and unrelated provider errors still surface.
-			if (
-				!signal?.aborted &&
-				error instanceof ToolAbortError &&
-				typeof timeout === "number" &&
-				Date.now() - startMs >= timeout
-			) {
+			// A remote source signals its own timeout with the marked error; a
+			// genuine cancellation (even past the deadline) is not a timeout and
+			// must not auto-select.
+			if (!signal?.aborted && isAskTimeoutError(error)) {
 				timeoutTriggered = true;
 				choice = undefined;
 			} else {

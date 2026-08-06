@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createSdkPermissionAskAnswerSource } from "../src/sdk/bus/index";
+import { GJC_ASK_TIMEOUT_CODE } from "../src/tools/ask-answer-registry";
 
 test("bridges selector asks to the ACP permission channel and maps optionId to the answer", async () => {
 	const requests: Array<Record<string, unknown>> = [];
@@ -64,6 +65,43 @@ test("preserves legitimate options that match transition labels", async () => {
 	});
 	const options = (requests[0] as { options: Array<{ optionId: string; name: string }> }).options;
 	expect(options.map(option => option.name)).toEqual(["Yes", "Ask about these choices (Recommended)"]);
+});
+test("skips the permission request when only synthetic transitions remain", async () => {
+	let called = false;
+	const source = createSdkPermissionAskAnswerSource(async () => {
+		called = true;
+		return { outcome: { outcome: "selected", optionId: "option:0" } };
+	});
+	const result = await source.awaitAnswerRequest!({
+		question: "Describe the change",
+		options: ["Other (type your own)"],
+		interaction: "selector",
+		controls: [],
+		transitionCount: 1,
+	});
+	expect(result).toBeUndefined();
+	expect(called).toBe(false);
+});
+test("sends the request when an enabled control can commit an empty selection", async () => {
+	const requests: Array<Record<string, unknown>> = [];
+	const source = createSdkPermissionAskAnswerSource(async params => {
+		requests.push(params);
+		return { outcome: { outcome: "selected", optionId: "control:navigation_forward" } };
+	});
+	const result = await source.awaitAnswerRequest!({
+		question: "Select any:",
+		options: ["Other (type your own)"],
+		interaction: "selector",
+		controls: [{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: true }],
+		transitionCount: 1,
+	});
+	expect(requests).toHaveLength(1);
+	const options = (requests[0] as { options: Array<{ optionId: string }> }).options;
+	expect(options.map(option => option.optionId)).toEqual(["control:navigation_forward"]);
+	expect(result && typeof result === "object" ? result.interaction : undefined).toEqual({
+		kind: "control",
+		controlId: "navigation_forward",
+	});
 });
 
 test("marks selected options in multi-select reissues", async () => {
@@ -144,18 +182,19 @@ test("decorates the recommended option name", async () => {
 	]);
 });
 
-test("returns without an answer when the permission ask times out", async () => {
+test("signals its own timeout with the marked error", async () => {
 	const { promise: neverAnswer } = Promise.withResolvers<never>();
 	const source = createSdkPermissionAskAnswerSource(() => neverAnswer);
-	const answer = await source.awaitAnswerRequest!({
-		question: "Proceed?",
-		options: ["Yes", "No"],
-		interaction: "selector",
-		controls: [],
-		recommendedIndex: 0,
-		timeoutMs: 50,
-	});
-	expect(answer).toBeUndefined();
+	await expect(
+		source.awaitAnswerRequest!({
+			question: "Proceed?",
+			options: ["Yes", "No"],
+			interaction: "selector",
+			controls: [],
+			recommendedIndex: 0,
+			timeoutMs: 50,
+		}),
+	).rejects.toMatchObject({ code: GJC_ASK_TIMEOUT_CODE });
 });
 
 test("aborts the underlying permission request on timeout", async () => {
@@ -173,13 +212,14 @@ test("aborts the underlying permission request on timeout", async () => {
 		await aborted;
 		return { outcome: { outcome: "selected", optionId: "option:0" } };
 	});
-	const answer = await source.awaitAnswerRequest!({
-		question: "Proceed?",
-		options: ["Yes", "No"],
-		interaction: "selector",
-		controls: [],
-		timeoutMs: 50,
-	});
+	await expect(
+		source.awaitAnswerRequest!({
+			question: "Proceed?",
+			options: ["Yes", "No"],
+			interaction: "selector",
+			controls: [],
+			timeoutMs: 50,
+		}),
+	).rejects.toMatchObject({ code: GJC_ASK_TIMEOUT_CODE });
 	expect(sawAbortSignal).toBe(true);
-	expect(answer).toBeUndefined();
 });
