@@ -234,6 +234,9 @@ describe("ModelRegistry runtime provider registration", () => {
 		registry.registerProvider(
 			"relay",
 			{
+				// Unknown provider IDs still require a genuinely custom base URL when
+				// enabling affinity, even on a transport-only re-registration.
+				baseUrl: "https://relay.example.com/v1",
 				api: "openai-responses",
 				compat: { supportsResponsesSessionAffinity: true },
 			},
