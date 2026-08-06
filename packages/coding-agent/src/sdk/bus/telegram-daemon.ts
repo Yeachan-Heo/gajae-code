@@ -385,6 +385,10 @@ const BTW_QUESTION_LIMIT_TEXT = "Question must be at most 4096 Unicode scalar va
 type ParsedBtwCommand = { kind: "question"; question: string } | { kind: "ignored" };
 type TelegramFileDownload = { bytes: Buffer } | { failure: "download_failed" | "too_large" };
 class ThreadedModeCapabilityRefusal extends Error {}
+/** Telegram answered `createForumTopic` with an explicit `ok: false` rejection. */
+class TopicCreationRejected extends Error {}
+/** The transport suppressed `createForumTopic` (no response body to classify). */
+class TopicCreationSuppressed extends Error {}
 
 async function prepareTelegramImageAttachment(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
 	if (frame.type !== "image_attachment") return frame;
@@ -424,7 +428,7 @@ function isThreadedModeCapabilityRefusal(response: unknown): boolean {
 	return (
 		ok === false &&
 		typeof description === "string" &&
-		/(?:threaded mode|forum topics? (?:is|are) (?:disabled|not enabled)|(?:not allowed|not permitted|cannot|can't) create forum topics?)/i.test(
+		/(?:threaded mode|forum topics? (?:is|are) (?:disabled|not enabled)|(?:not allowed|not permitted|cannot|can't) create forum topics?|chat is not a forum)/i.test(
 			description,
 		)
 	);
@@ -5070,6 +5074,8 @@ export class TelegramNotificationDaemon {
 	private readonly flatIdentitySent = new Set<string>();
 	/** Cached delivery boundary for the private owner chat or validation forum. */
 	private pairedChatPrivacy: PairedChatPrivacy | undefined;
+	/** Latched once Telegram confirms this chat cannot host forum topics. */
+	private topicCapabilityRefused = false;
 	/** Bot username from getMe, cached once at owner startup for group/forum command targeting. */
 	private botUsername: string | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
@@ -7838,8 +7844,6 @@ export class TelegramNotificationDaemon {
 		let acceptedTopicId: string | undefined;
 		let acceptedTopicCompensated = false;
 		let acceptedTopicArchiveAttempted = false;
-		let creationSuppressed = false;
-		let creationRejected = false;
 		let adoptedTopicId: number | undefined;
 		const adoptionIntentCandidate = this.#adoptionIntents.bySession(sessionId);
 		try {
@@ -7878,10 +7882,10 @@ export class TelegramNotificationDaemon {
 					const res = (await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name })) as
 						| { result?: { message_thread_id?: unknown } }
 						| undefined;
-					if (res === undefined) {
-						creationSuppressed = true;
-						return undefined;
-					}
+					// Classification must travel with the rejection, not through
+					// closure flags: `getOrCreateTopic` shares one in-flight create
+					// promise, so every other awaiter observes only the error.
+					if (res === undefined) throw new TopicCreationSuppressed();
 					if (isThreadedModeCapabilityRefusal(res)) throw new ThreadedModeCapabilityRefusal();
 					const response = res as {
 						ok?: unknown;
@@ -7889,8 +7893,8 @@ export class TelegramNotificationDaemon {
 					};
 					const tid = response.result?.message_thread_id;
 					if (typeof tid !== "number" || !Number.isSafeInteger(tid) || tid <= 0) {
-						creationRejected = response.ok === false;
-						if (!creationRejected) this.#malformedTopicCreateEndpoints.set(sessionId, creationEndpointKey);
+						if (response.ok === false) throw new TopicCreationRejected();
+						this.#malformedTopicCreateEndpoints.set(sessionId, creationEndpointKey);
 						throw new Error("createForumTopic: invalid message_thread_id");
 					}
 					acceptedTopicId = String(tid);
@@ -8011,7 +8015,12 @@ export class TelegramNotificationDaemon {
 		} catch (err) {
 			if (adoptedTopicId !== undefined) this.#adoptionIntents.releaseClaim(adoptedTopicId, sessionId);
 			if (adoptionIntentCandidate) this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch);
-			if (creationSuppressed || creationRejected || err instanceof ThreadedModeCapabilityRefusal) {
+			if (
+				err instanceof TopicCreationSuppressed ||
+				err instanceof TopicCreationRejected ||
+				err instanceof ThreadedModeCapabilityRefusal
+			) {
+				if (err instanceof ThreadedModeCapabilityRefusal) this.topicCapabilityRefused = true;
 				if (this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch)) await this.persistTopics();
 				return undefined;
 			}
@@ -9517,6 +9526,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async pairedChatAllowsTopics(): Promise<boolean> {
+		if (this.topicCapabilityRefused) return false;
 		const privacy = await this.resolvePairedChatPrivacy();
 		return privacy === "private" || privacy === "validation-forum";
 	}
