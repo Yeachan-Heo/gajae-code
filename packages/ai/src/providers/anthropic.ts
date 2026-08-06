@@ -471,7 +471,7 @@ function getCacheControl(
 			? "none"
 			: promptCacheMode === "explicit"
 				? "explicit"
-				: isCanonicalApi || isClaudeFamilyModel(model)
+				: promptCacheMode === "automatic" || isCanonicalApi || isClaudeFamilyModel(model)
 					? "automatic"
 					: "none";
 	if (mode === "none") return { mode };

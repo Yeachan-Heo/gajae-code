@@ -947,10 +947,10 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsLongCacheRetention?: boolean;
 	/**
 	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
-	 * Canonical Anthropic defaults to `"automatic"`; noncanonical endpoints default
-	 * to `"automatic"` for Claude-family models and `"none"` otherwise. Set
-	 * `"none"` to opt out of generated markers, or `"explicit"` for block-level
-	 * breakpoints on endpoints that reject top-level `cache_control`.
+	 * Canonical Anthropic and Claude-family models default to `"automatic"`;
+	 * noncanonical non-Claude endpoints default to `"none"`. Set `"automatic"` to
+	 * opt an otherwise unknown compatible endpoint into top-level caching, `"none"`
+	 * to opt out, or `"explicit"` for endpoints that require block-level markers.
 	 */
 	promptCacheMode?: "none" | "explicit" | "automatic";
 }

@@ -284,7 +284,7 @@ providers:
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
 - `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, or `openai-models-list`
-- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` (`ttl: "1h"`) because the ~5m default is too fragile for long-running subagent workflows. The 1h marker is only emitted on the canonical Anthropic API (`api.anthropic.com`) for models advertising `supportsLongCacheRetention`; proxies, gateways, and incapable models fall back to the default ephemeral (~5m) breakpoint. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
+- `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints now use top-level automatic caching by default but omit `ttl` (the provider's ~5m default) unless `compat.supportsLongCacheRetention: true` explicitly opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
 
@@ -803,7 +803,32 @@ Provider-level `compat` is the baseline; per-model `compat` is deep-merged on to
 
 ### Anthropic compatibility (`anthropic-messages`)
 
-For `anthropic-messages` models the runtime uses a separate `AnthropicCompat` shape (`packages/ai/src/types.ts`). The `models.yml` schema currently exposes only the strict-tools opt-out as a top-level provider field (see below); the remaining Anthropic-side knobs (`disableAdaptiveThinking`, `supportsEagerToolInputStreaming`, `supportsLongCacheRetention`) are set by built-in catalog metadata and are not user-configurable from `models.yml`.
+For `anthropic-messages` models, `compat.promptCacheMode` and `compat.supportsLongCacheRetention` are configurable at provider, model, and `modelOverrides` levels. Provider-level `compat` is the baseline; model and override values merge on top.
+
+Prompt-cache modes:
+
+- `automatic` — emit one top-level `cache_control` marker and let the Anthropic-compatible endpoint advance the breakpoint as the conversation grows.
+- `explicit` — emit block-level breakpoints instead. Use this for endpoints that reject top-level `cache_control` but support Anthropic's explicit content-block markers.
+- `none` — emit no generated Anthropic cache controls. Per-request or configured `cacheRetention: none` also disables generated caching.
+
+Without an explicit mode, canonical Anthropic endpoints and Claude-family model ids default to `automatic`; unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`.
+
+```yaml
+providers:
+  corp-anthropic:
+    baseUrl: https://proxy.example.com/anthropic
+    apiKeyEnv: CORP_ANTHROPIC_API_KEY
+    api: anthropic-messages
+    compat:
+      promptCacheMode: explicit
+      supportsLongCacheRetention: false
+    models:
+      - id: claude-sonnet-4-5
+        contextWindow: 200000
+        maxTokens: 8192
+```
+
+Other Anthropic-side compatibility knobs such as `disableAdaptiveThinking` and `supportsEagerToolInputStreaming` remain built-in catalog metadata rather than `models.yml` fields. `disableStrictTools` stays a provider-level setting (below).
 
 ### Strict tool schemas (`disableStrictTools`)
 

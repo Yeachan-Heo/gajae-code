@@ -168,6 +168,16 @@ describe("Anthropic prompt caching", () => {
 				expected: undefined,
 			},
 			{
+				name: "promptCacheMode automatic opts a non-Claude endpoint into top-level caching",
+				model: {
+					...canonicalModel,
+					id: "custom-compatible-model",
+					baseUrl: proxyUrl,
+					compat: { promptCacheMode: "automatic" },
+				},
+				expected: { type: "ephemeral" },
+			},
+			{
 				name: "wireModelId override does not drive the decision; dispatched id governs",
 				model: {
 					...canonicalModel,
