@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { generateToolCatalogData, ToolCatalogGenerationError } from "../../scripts/generate-tool-catalog";
-import { TOOL_CATALOG } from "./tool-catalog.generated";
+import { TOOL_CATALOG } from "../../src/tools/tool-catalog.generated";
+
 describe("generated tool catalog", () => {
 	test("committed advertised metadata is reproducible from eager implementations", async () => {
 		const regenerated = await generateToolCatalogData();
