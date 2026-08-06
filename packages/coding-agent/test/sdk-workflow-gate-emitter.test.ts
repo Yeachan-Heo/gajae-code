@@ -755,6 +755,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			stopListening();
 
 			const successorEmitter = session.getWorkflowGateEmitter()!;
+			attachTerminalController(successorEmitter);
 			expect(session.sessionId).not.toBe(previousSessionId);
 			expect(successorEmitter).not.toBe(previousEmitter);
 			expect(oldEndpointEmitter).toBeUndefined();

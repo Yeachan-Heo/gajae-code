@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { AuthStorage, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { localBackend } from "@gajae-code/coding-agent/memory-backend";
+import { localBackend } from "@gajae-code/coding-agent/memory-backend/local-backend";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
@@ -56,11 +56,11 @@ describe("createAgentSession memory startup", () => {
 			expect(startSpy).not.toHaveBeenCalled();
 			expect(startDeferredMemoryBackend).toBeFunction();
 
-			startDeferredMemoryBackend?.();
+			await startDeferredMemoryBackend?.();
 			expect(startSpy).toHaveBeenCalledTimes(1);
 			expect(startSpy.mock.calls[0]?.[0].session).toBe(session);
 
-			startDeferredMemoryBackend?.();
+			await startDeferredMemoryBackend?.();
 			expect(startSpy).toHaveBeenCalledTimes(1);
 		} finally {
 			await session.dispose();

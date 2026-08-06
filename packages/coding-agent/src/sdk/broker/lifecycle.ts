@@ -2446,6 +2446,14 @@ async function launchInput(
 	} catch {
 		return fail("invalid_input", "Lifecycle worktree does not exist.");
 	}
+	let modelPreset = text(input.modelPreset);
+	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
+		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
+	if (modelPreset !== undefined) {
+		const validatedModelPreset = validateBrokerModelPreset(broker.settings.agentDir, modelPreset);
+		if (typeof validatedModelPreset !== "string") return validatedModelPreset;
+		modelPreset = validatedModelPreset;
+	}
 	const worktree = lifecycleWorktreeTarget(input);
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
@@ -2474,9 +2482,6 @@ async function launchInput(
 	const requested = sessionId(input);
 	if (requested !== undefined && !isCanonicalSessionId(requested))
 		return fail("invalid_input", "sessionId must be a canonical safe identifier.");
-	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
-		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
-	const modelPreset = text(input.modelPreset);
 	if (input.mcpServers !== undefined && !isSessionLifecycleMcpServers(input.mcpServers))
 		return fail("invalid_input", "mcpServers must contain unique valid stdio, HTTP, or SSE server definitions.");
 	const mcpServers = input.mcpServers as SessionLifecycleMcpServer[] | undefined;
@@ -3077,11 +3082,6 @@ async function executeLifecycleResponse(
 
 		const launch = await launchInput(broker, operation, input);
 		if ("ok" in launch) return launch;
-		if (launch.modelPreset) {
-			const validatedModelPreset = validateBrokerModelPreset(broker.settings.agentDir, launch.modelPreset);
-			if (typeof validatedModelPreset !== "string") return validatedModelPreset;
-			launch.modelPreset = validatedModelPreset;
-		}
 		if (!hasProcessIncarnationAuthority())
 			return fail(
 				"incarnation_unavailable",

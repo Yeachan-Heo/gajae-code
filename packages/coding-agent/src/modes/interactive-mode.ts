@@ -1012,7 +1012,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				.then(({ HistoryStorage }) => HistoryStorage.openAsync())
 				.then(storage => {
 					this.historyStorage = storage;
-					this.editor.setHistoryStorage(storage);
+					if (!this.#stopped) this.editor.setHistoryStorage(storage);
 					return storage;
 				})
 				.catch(error => {

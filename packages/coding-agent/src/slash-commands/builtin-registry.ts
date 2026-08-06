@@ -566,22 +566,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
 			const action = verb || "status";
-			// Session-local controls are delegated only when an extension registered the
-			// command. SDK-only sessions still consume `/notify on|off` here so the
-			// input cannot fall through as a model prompt when adapters are disabled.
-			// Without a session the builtin cannot know whether an extension owns the
-			// command, so it must pass through rather than swallow the input.
-			if (action === "on" || action === "off") {
-				if (!runtime.session || runtime.session.extensionRunner?.getCommand("notify")) {
-					return { prompt: command.text };
-				}
-				await runtime.output(
-					action === "on"
-						? "Notifications are unavailable in this session; start a new session with notifications configured."
-						: "Notifications are already disabled for this session.",
-				);
-				return commandConsumed();
-			}
+			// Session-local notification controls are extension-owned. Always pass them
+			// through so this builtin cannot shadow the live per-session command.
+			if (action === "on" || action === "off") return { prompt: command.text };
 			const stateRoot = path.join(runtime.cwd, ".gjc", "state");
 			switch (action) {
 				case "status": {
@@ -1693,9 +1680,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const verb = (command.args.trim().split(/\s+/)[0] ?? "").toLowerCase() || "view";
-			const backend = await runtime.session.memoryBackend.get("memory-slash-command");
 			switch (verb) {
 				case "view": {
+					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
 					const payload = await backend.buildDeveloperInstructions(
 						runtime.settings.getAgentDir(),
 						runtime.settings,
@@ -1708,6 +1695,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				}
 				case "clear":
 				case "reset": {
+					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
 					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
 					await runtime.session.refreshBaseSystemPrompt();
 					await runtime.output("Memory cleared.");
@@ -1715,6 +1703,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				}
 				case "enqueue":
 				case "rebuild": {
+					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
 					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
 					await runtime.output("Memory consolidation enqueued.");
 					return commandConsumed();

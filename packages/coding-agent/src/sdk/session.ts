@@ -492,7 +492,7 @@ export interface CreateAgentSessionResult {
 	/** Starts a deferred exact-config MCP connection. Present only when deferMcpConfigStartup was requested. */
 	startDeferredMcpConfig?: () => Promise<DeferredMcpConfigStartupResult>;
 	/** Starts a deferred memory backend. Present only when deferMemoryBackendStartup was requested. */
-	startDeferredMemoryBackend?: () => void;
+	startDeferredMemoryBackend?: () => Promise<void>;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
 	/** LSP servers configured for lazy startup in interactive mode */
@@ -3096,8 +3096,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Activation runs through the lazy runtime service so the backend stays off
 		// the startup graph until either this legacy call or a real memory use
 		// triggers it. `deferMemoryBackendStartup` keeps the caller-driven timing.
-		const startMemoryBackend = () => {
-			if (memoryStartupTask) return;
+		const startMemoryBackend = (): Promise<void> => {
+			if (memoryStartupTask) return memoryStartupTask;
 			memoryStartupTask = logger.time("startMemoryStartupTask", async () => {
 				// The legacy startup call is the sole activation boundary. `prewarm()` records
 				// that trigger while retaining the service's typed diagnostic on initialization
@@ -3124,13 +3124,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// memory instructions without initializing the backend during prompt build.
 				await session.refreshBaseSystemPrompt();
 			});
+			return memoryStartupTask;
 		};
 		// The non-deferred path must JOIN the task so a startup failure rejects
 		// createAgentSession rather than surfacing as an unhandled rejection.
-		if (!options.deferMemoryBackendStartup) {
-			startMemoryBackend();
-			await memoryStartupTask;
-		}
+		if (!options.deferMemoryBackendStartup) await startMemoryBackend();
 
 		// Exact-config managers do not receive reactive callbacks; their tools are
 		// registered once in the session-owned catalog.

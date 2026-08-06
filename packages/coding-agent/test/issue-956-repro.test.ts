@@ -75,9 +75,7 @@ describe("issue #956: interactive /mcp test", () => {
 		const requestRender = vi.fn();
 		const addChild = vi.fn();
 		const refreshMCPTools = vi.fn();
-		const connectToServer = vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
 		const listTools = vi.spyOn(mcpClient, "listTools").mockResolvedValue([{ name: "search_issues" }] as never);
-		const disconnectServer = vi.spyOn(mcpClient, "disconnectServer").mockResolvedValue();
 		const controller = new MCPCommandController({
 			chatContainer: { addChild },
 			ui: { requestRender },
@@ -86,7 +84,9 @@ describe("issue #956: interactive /mcp test", () => {
 			showStatus,
 			session: { refreshMCPTools },
 			mcpManager: {
-				prepareConfig: vi.fn(async config => config),
+				withPreparedLease: vi.fn(
+					async (_name, _config, run) => await run({ connectionForLease: () => connection }),
+				),
 				getConnectionStatus: vi.fn(() => "connected"),
 			},
 		} as never);
@@ -94,13 +94,7 @@ describe("issue #956: interactive /mcp test", () => {
 		await controller.handle("/mcp test github");
 
 		expect(showError).not.toHaveBeenCalled();
-		expect(connectToServer).toHaveBeenCalledWith(
-			"github",
-			expect.objectContaining({ command: "github-mcp-server", args: ["serve"] }),
-			expect.objectContaining({ signal: expect.any(AbortSignal) }),
-		);
 		expect(listTools).toHaveBeenCalledWith(connection, expect.objectContaining({ signal: expect.any(AbortSignal) }));
-		expect(disconnectServer).toHaveBeenCalledWith(connection);
 		expect(requestRender).toHaveBeenCalled();
 	});
 });

@@ -32,20 +32,18 @@ type NativeThemeBindings = {
 };
 
 let nativeThemeBindings: NativeThemeBindings | undefined;
-let nativeThemeBindingsLoad: Promise<void> | undefined;
+let nativeThemeBindingsUnavailable = false;
 
-function loadNativeThemeBindings(): void {
-	if (nativeThemeBindings || nativeThemeBindingsLoad) return;
-	nativeThemeBindingsLoad = Promise.resolve()
-		.then(() => {
-			nativeThemeBindings = require("@gajae-code/natives") as unknown as NativeThemeBindings;
-		})
-		.catch(error => {
-			logger.warn("Native theme bindings unavailable", { error: String(error) });
-		})
-		.finally(() => {
-			nativeThemeBindingsLoad = undefined;
-		});
+/** Load the native syntax/appearance helpers at first feature use, not at module startup. */
+function loadNativeThemeBindings(): NativeThemeBindings | undefined {
+	if (nativeThemeBindings || nativeThemeBindingsUnavailable) return nativeThemeBindings;
+	try {
+		nativeThemeBindings = require("@gajae-code/natives") as unknown as NativeThemeBindings;
+	} catch (error) {
+		nativeThemeBindingsUnavailable = true;
+		logger.warn("Native theme bindings unavailable", { error: String(error) });
+	}
+	return nativeThemeBindings;
 }
 
 export { getLanguageFromPath } from "../../utils/lang-from-path";
@@ -1837,11 +1835,8 @@ export async function initTheme(
 	autoDarkTheme = darkTheme ?? "red-claw";
 	autoLightTheme = lightTheme ?? "blue-crab";
 	if (enableWatcher && shouldUseMacOSAppearanceFallback()) {
-		loadNativeThemeBindings();
-		await (nativeThemeBindingsLoad ?? Promise.resolve());
-		if (nativeThemeBindings) {
-			macOSReportedAppearance = nativeThemeBindings.detectMacOSAppearance() ?? undefined;
-		}
+		const bindings = loadNativeThemeBindings();
+		if (bindings) macOSReportedAppearance = bindings.detectMacOSAppearance() ?? undefined;
 	}
 	const name = getDefaultTheme();
 	previewThemeActive = false;
@@ -2162,13 +2157,11 @@ var macObserver: { stop(): void } | undefined;
 async function startMacAppearanceObserver(): Promise<void> {
 	stopMacAppearanceObserver();
 	if (!shouldUseMacOSAppearanceFallback()) return;
-	loadNativeThemeBindings();
-	const ready = nativeThemeBindingsLoad ?? Promise.resolve();
-	await ready;
-	if (!shouldUseMacOSAppearanceFallback() || !nativeThemeBindings) return;
+	const bindings = loadNativeThemeBindings();
+	if (!shouldUseMacOSAppearanceFallback() || !bindings) return;
 	try {
-		macOSReportedAppearance = nativeThemeBindings.detectMacOSAppearance() ?? undefined;
-		macObserver = nativeThemeBindings.MacAppearanceObserver.start((err, appearance) => {
+		macOSReportedAppearance = bindings.detectMacOSAppearance() ?? undefined;
+		macObserver = bindings.MacAppearanceObserver.start((err, appearance) => {
 			if (!err && (appearance === "dark" || appearance === "light")) {
 				macOSReportedAppearance = appearance;
 				reevaluateAutoTheme("macOS fallback");
@@ -2407,8 +2400,7 @@ function getHighlightColors(t: Theme): NativeHighlightColors {
  */
 export function highlightCode(code: string, lang?: string): string[] {
 	if (!syntaxHighlightingEnabledState) return code.split("\n");
-	const bindings = nativeThemeBindings;
-	loadNativeThemeBindings();
+	const bindings = loadNativeThemeBindings();
 	const validLang = bindings && lang && bindings.supportsLanguage(lang) ? lang : undefined;
 	if (!bindings) return code.split("\n");
 	try {
@@ -2459,8 +2451,7 @@ export function getMarkdownTheme(): MarkdownTheme {
 		resolveMermaidAscii,
 		highlightCode: (code: string, lang?: string): string[] => {
 			if (!syntaxHighlightingEnabledState) return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
-			const bindings = nativeThemeBindings;
-			loadNativeThemeBindings();
+			const bindings = loadNativeThemeBindings();
 			const validLang = bindings && lang && bindings.supportsLanguage(lang) ? lang : undefined;
 			if (!bindings) return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
 			try {

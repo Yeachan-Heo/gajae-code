@@ -11733,7 +11733,7 @@ export class AgentSession {
 			...DEFAULT_PRUNE_CONFIG,
 			minimumSavings: overThreshold ? 0 : DEFAULT_PRUNE_CONFIG.minimumSavings,
 		});
-		const artifactManager = this.sessionManager.getArtifactManager();
+		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		const published = new Map<string, ToolOutputPruneEvictionHandle>();
 
 		// Publish exact text one candidate at a time. The plan carries only digests and
@@ -11757,6 +11757,7 @@ export class AgentSession {
 						outcome: outcome.outcome,
 						diagnostic: "diagnostic" in outcome ? outcome.diagnostic : undefined,
 					});
+					if (outcome.outcome === "failed") break;
 				}
 			}
 		}

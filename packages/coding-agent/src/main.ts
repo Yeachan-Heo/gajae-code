@@ -1740,7 +1740,7 @@ export async function runRootCommand(
 				startDeferredModelProfiles = async () => {
 					try {
 						const result = await applyDeferredStartupModelProfilesForRoot(profileArgs);
-						startDeferredMemoryBackend?.();
+						await startDeferredMemoryBackend?.();
 						ready.resolve();
 						return result;
 					} catch (error) {
@@ -1750,7 +1750,7 @@ export async function runRootCommand(
 				};
 			} else {
 				const { recoverableErrors } = await applyStartupModelProfilesForRoot(profileArgs);
-				startDeferredMemoryBackend?.();
+				await startDeferredMemoryBackend?.();
 				for (const recoverableError of recoverableErrors) {
 					notifs.push({ kind: "error", message: recoverableError });
 				}

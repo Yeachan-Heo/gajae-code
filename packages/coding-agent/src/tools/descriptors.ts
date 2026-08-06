@@ -111,6 +111,11 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		return this.#loadPromise;
 	}
 
+	/** Materialize this facade for contract tests without exposing it in production dispatch. */
+	async materializeForTests(): Promise<AgentTool<any, any, any>> {
+		return await this.#get();
+	}
+
 	get name(): string {
 		return this.#tool?.name ?? this.descriptor.metadata.name;
 	}

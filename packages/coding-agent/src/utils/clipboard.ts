@@ -1,11 +1,11 @@
 import { execSync } from "node:child_process";
 import type { ClipboardImage } from "@gajae-code/natives";
 
-let nativeClipboardLoad: Promise<typeof import("@gajae-code/natives")> | undefined;
+let nativeClipboardModule: typeof import("@gajae-code/natives") | undefined;
 
-async function nativeClipboard(): Promise<typeof import("@gajae-code/natives")> {
-	nativeClipboardLoad ??= Promise.resolve(require("@gajae-code/natives") as typeof import("@gajae-code/natives"));
-	return await nativeClipboardLoad;
+function nativeClipboard(): typeof import("@gajae-code/natives") {
+	nativeClipboardModule ??= require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	return nativeClipboardModule;
 }
 
 import { logger } from "@gajae-code/utils";
@@ -67,7 +67,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 			}
 		}
 
-		await (await nativeClipboard()).copyToClipboard(text);
+		nativeClipboard().copyToClipboard(text);
 	} catch {
 		// Ignore — clipboard copy is best-effort
 	}
@@ -159,5 +159,5 @@ export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
 		return null;
 	}
 
-	return (await (await nativeClipboard()).readImageFromClipboard()) ?? null;
+	return (await nativeClipboard().readImageFromClipboard()) ?? null;
 }
