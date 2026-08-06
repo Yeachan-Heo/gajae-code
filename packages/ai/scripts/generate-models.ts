@@ -131,7 +131,7 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 		compat: { supportsDeveloperRole: false },
 	};
 	const qwen: Model<"openai-responses"> = {
-		id: "qwen-3.8-max",
+		id: "qwen3.8-max",
 		name: "Qwen3.8 Max",
 		api: "openai-responses",
 		provider: "alibaba-token-plan",
@@ -143,6 +143,17 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 		maxTokens: 65_536,
 		compat: { supportsDeveloperRole: false },
 	};
+	const legacyQwenIndex = models.findIndex(
+		model => model.provider === "alibaba-token-plan" && model.id === "qwen-3.8-max",
+	);
+	if (legacyQwenIndex >= 0) {
+		const canonicalQwen = models.find(model => model.provider === "alibaba-token-plan" && model.id === qwen.id);
+		if (canonicalQwen) {
+			models.splice(legacyQwenIndex, 1);
+		} else {
+			Object.assign(models[legacyQwenIndex]!, qwen);
+		}
+	}
 	for (const metadata of [deepseek, qwen]) {
 		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === metadata.id);
 		if (existing) {

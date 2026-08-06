@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- `todo_write` now rejects malformed raw arguments with bounded, authority-controlled correction codes instead of a generic rejection: unknown root keys, unknown operation-entry keys, done/drop entries without a task or phase target, and unknown init list-entry keys each surface a fixed message naming the accepted shape without echoing the offending input, while recoverable payloads keep the passthrough/coercion path and the existing ask-tool codes are untouched (#3916).
+- The Alibaba Token Plan onboarding preset and `alibaba-token-plan-qwen-deepseek` profile now reference the provider-supported `qwen3.8-max` model id instead of `qwen-3.8-max`, preventing the built-in profile from selecting an HTTP 400 unsupported model (#3909).
 - `/model` reasoning menu header now shows the highlighted reasoning level (not the model id), seeds the cursor from the role badge when re-editing the same model, and uses a provider-neutral label for `max` instead of "Opus maximum reasoning" (#3847).
 - Resume listing now reverse-scans for buried but canonically valid `header_patch` titles, so a persisted manual title remains visible in the picker after later transcript growth instead of falling back to an empty/line-1 projection (#3633).
 - Custom OpenAI-compatible models whose wire id is namespaced (for example `cline-pass/deepseek-v4-flash`) now inherit capability metadata from the bundled leaf model when `contextWindow` / `maxTokens` are omitted, instead of silently falling back to the generic 128K / 16K defaults. True unknown leaf ids still default; explicit limits remain authoritative (#3856).

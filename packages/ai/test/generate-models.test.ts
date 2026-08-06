@@ -50,7 +50,7 @@ describe("injectAlibabaTokenPlanModels", () => {
 				maxTokens: 384_000,
 			}),
 			expect.objectContaining({
-				id: "qwen-3.8-max",
+				id: "qwen3.8-max",
 				name: "Qwen3.8 Max",
 				api: "openai-responses",
 				provider: "alibaba-token-plan",

@@ -109,7 +109,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Minimal,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
-			model("alibaba-token-plan", "qwen-3.8-max", {
+			model("alibaba-token-plan", "qwen3.8-max", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Minimal,
 				maxLevel: ThinkingLevel.XHigh,
@@ -639,11 +639,11 @@ describe("model profile activation", () => {
 		[
 			"alibaba-token-plan-qwen-deepseek",
 			{
-				default: "alibaba-token-plan/qwen-3.8-max:high",
+				default: "alibaba-token-plan/qwen3.8-max:high",
 				executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
 				planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
-				critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
-				architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+				critic: "alibaba-token-plan/qwen3.8-max:xhigh",
+				architect: "alibaba-token-plan/qwen3.8-max:xhigh",
 			},
 		],
 		[
