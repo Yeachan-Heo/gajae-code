@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ModelsConfigSchema } from "@gajae-code/coding-agent/config/models-config-schema";
+import modelsSchema from "../../../schemas/models.schema.json" with { type: "json" };
 
 describe("models config Anthropic prompt-cache compatibility", () => {
 	test("accepts prompt-cache compatibility at provider, model, and override levels", () => {
@@ -49,9 +50,8 @@ describe("models config Anthropic prompt-cache compatibility", () => {
 		expect(invalidLongRetention.success).toBe(false);
 	});
 
-	test("generated JSON schema exposes Anthropic prompt-cache compatibility", async () => {
-		const schema = (await import("../../../schemas/models.schema.json")) as Record<string, unknown>;
-		const text = JSON.stringify(schema);
+	test("generated JSON schema exposes Anthropic prompt-cache compatibility", () => {
+		const text = JSON.stringify(modelsSchema);
 
 		expect(text).toContain('"promptCacheMode"');
 		expect(text).toContain('"explicit"');
