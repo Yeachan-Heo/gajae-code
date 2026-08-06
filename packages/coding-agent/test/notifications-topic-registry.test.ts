@@ -562,8 +562,8 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generation 53 at serving epoch 5", () => {
-	expect(DAEMON_GENERATION).toBe(53);
+test("publishes generation 54 at serving epoch 5", () => {
+	expect(DAEMON_GENERATION).toBe(54);
 	expect(SERVING_EPOCH).toBe(5);
 });
 test("archives pending topics into retained inactive records", async () => {
