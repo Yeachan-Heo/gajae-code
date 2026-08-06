@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Agent, canContinuePersistedHistory } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage, canContinuePersistedHistory } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAssistantMessage } from "./helpers";
 
@@ -48,5 +48,85 @@ describe("persisted continuation tail", () => {
 		withFollowUp.followUp(userMessage());
 		await expect(withFollowUp.continue()).resolves.toBeUndefined();
 		expect(withFollowUp.hasQueuedMessages()).toBe(false);
+	});
+
+	it("routes the direct-dequeue follow-up batch through onFollowUpConsumed before the loop", async () => {
+		const consumed: AgentMessage[][] = [];
+		const seen: string[] = [];
+		const mock = createMockModel({
+			handler: context => {
+				for (const message of context.messages) {
+					if (typeof message.content === "string") seen.push(message.content);
+				}
+				return { content: ["resumed"] };
+			},
+		});
+		const agent = new Agent({
+			streamFn: mock.stream,
+			onFollowUpConsumed: messages => consumed.push([...messages]),
+		});
+		agent.replaceMessages([assistantMessage()]);
+		const queued = userMessage();
+		agent.followUp(queued);
+		await agent.continue();
+		// The direct-dequeue path (agent.ts continue) must invoke the same
+		// consumption hook the in-loop getFollowUpMessages path uses, so
+		// owned-completion settlement and denial filtering apply there too
+		// (review threads P1/P2).
+		expect(consumed).toHaveLength(1);
+		expect(consumed[0]).toContainEqual(queued);
+		expect(seen).toContain("resume");
+	});
+
+	it("filters messages removed by onFollowUpConsumed before the loop sees them", async () => {
+		const seen: string[] = [];
+		const mock = createMockModel({
+			handler: context => {
+				for (const message of context.messages) {
+					if (typeof message.content === "string") seen.push(message.content);
+				}
+				return { content: ["resumed"] };
+			},
+		});
+		const agent = new Agent({
+			streamFn: mock.stream,
+			onFollowUpConsumed: messages => {
+				// Mirror the owned-completion drop filter: denied envelopes are
+				// spliced out of the batch in place.
+				for (let i = messages.length - 1; i >= 0; i--) {
+					const message = messages[i];
+					if (message.role === "user" && typeof message.content === "string" && message.content === "denied") {
+						messages.splice(i, 1);
+					}
+				}
+			},
+		});
+		agent.replaceMessages([assistantMessage()]);
+		agent.followUp({ role: "user", content: "allowed", timestamp: 1 });
+		agent.followUp({ role: "user", content: "denied", timestamp: 2 });
+		await agent.continue();
+		expect(seen).toContain("allowed");
+		expect(seen).not.toContain("denied");
+	});
+
+	it("skips the loop entirely when onFollowUpConsumed empties the batch", async () => {
+		// The hook can filter EVERY queued entry (all denied by a scope:"owned"
+		// abort): continue() must not start an empty provider run against
+		// existing history — the zero-final-call guarantee (review thread P1).
+		const mock = createMockModel({
+			handler: () => {
+				throw new Error("loop must not run with an emptied batch");
+			},
+		});
+		const agent = new Agent({
+			streamFn: mock.stream,
+			onFollowUpConsumed: messages => {
+				messages.splice(0, messages.length);
+			},
+		});
+		agent.replaceMessages([assistantMessage()]);
+		agent.followUp(userMessage());
+		await expect(agent.continue()).resolves.toBeUndefined();
+		expect(mock.calls).toHaveLength(0);
 	});
 });

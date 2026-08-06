@@ -11,6 +11,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { lookupOwnedRegistration, registerOwnedRegistration } from "@gajae-code/coding-agent/session/terminal-abort";
 import { TempDir } from "@gajae-code/utils";
 
 const CLEANUP_NOTICE =
@@ -358,6 +359,20 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			},
 			{ ownerId: "owner" },
 		);
+		const predecessorEndpointId = sessionManager.getSessionId();
+		const ownerJob = ownerManager.getJob(ownerJobId);
+		if (!ownerJob) throw new Error("Expected owner job");
+		registerOwnedRegistration(
+			{
+				endpointId: predecessorEndpointId,
+				endpointGeneration: 0,
+				lineageIdHash: "switch-rollback-lineage",
+				promptAttemptEpoch: 1,
+				jobId: ownerJobId,
+				jobGeneration: ownerJob.generation,
+			},
+			{ isJobTerminal: () => false },
+		);
 		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
 		const validation = vi
 			.spyOn(internalUrls, "initializeLocalRoot")
@@ -366,6 +381,11 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		await expect(session.switchSession(copiedFile)).rejects.toThrow("injected successor validation failure");
 		expect(session.sessionFile).toBe(previousFile);
 		expect(ownerManager.getJob(ownerJobId)?.status).toBe("running");
+		// Rekey moved the manager mapping, but rollback restored the
+		// predecessor while the job remains live. Its predecessor tuple must
+		// survive too; otherwise scope:"owned" can claim stopped_owned without
+		// cancelling/classifying this job (review thread P1).
+		expect(lookupOwnedRegistration(ownerJobId, ownerJob.generation, predecessorEndpointId)).toBeDefined();
 		expect(producerCleanupCalls).toBe(0);
 		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "release");
 
@@ -373,6 +393,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		await expect(session.switchSession(copiedFile)).resolves.toBe(true);
 		expect(session.sessionFile).toBe(copiedFile);
 		expect(ownerManager.getJob(ownerJobId)?.status).toBe("cancelled");
+		expect(lookupOwnedRegistration(ownerJobId, ownerJob.generation, predecessorEndpointId)).toBeUndefined();
 		expect(producerCleanupCalls).toBe(1);
 		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "commit");
 	});

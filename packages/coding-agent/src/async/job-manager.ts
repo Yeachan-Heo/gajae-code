@@ -1,4 +1,11 @@
 import { logger } from "@gajae-code/utils";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	resolveToolLineage,
+	retireOwnedRegistrationForDeadLetter,
+	unregisterOwnedRegistration,
+} from "../session/terminal-abort";
 import type { AgentProgress, AgentSource } from "../task/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
@@ -160,7 +167,13 @@ export interface SubagentRecord {
 	 * file, followed by a separately available runner (`no_runner` otherwise).
 	 */
 	resumable: boolean;
-	queued?: { ownerId?: string; seq: number; message?: string; createdAt: number };
+	queued?: { ownerId?: string; seq: number; message?: string; resumeToolCallId?: string; createdAt: number };
+	/** Last queued-resume seq for a CANCELLED queued resume (rec.queued is
+	 *  cleared on cancel): retained on the record so owned settlement's second
+	 *  proof can still see the generation as provably cancelled, without a
+	 *  separate FIFO-capped evidence set that could evict an in-flight
+	 *  settlement's generation (review thread P2). */
+	terminalQueuedSeq?: number;
 	/** Resolved model the subagent was asked to use, e.g. "openai-codex/gpt-5.5". */
 	requestedModel?: string;
 	/** Model actually used after auth fallback (#985); equals requestedModel when no fallback. */
@@ -187,7 +200,12 @@ export interface ResumeDescriptor {
  * In-memory resume runner bound to the session that originally launched a
  * subagent. Never serialized: process restart drops it so resume fails closed.
  */
-export type ResumeRunner = (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined;
+export type ResumeRunner = (
+	subagentId: string,
+	message?: string,
+	descriptor?: ResumeDescriptor,
+	resumeToolCallId?: string,
+) => string | undefined;
 
 function sessionFileFromResumeDescriptorData(data: unknown): string | null {
 	if (typeof data !== "object" || data === null) return null;
@@ -429,6 +447,82 @@ export class AsyncJobManager {
 		return AsyncJobManager.#instance;
 	}
 
+	static readonly #byEndpoint = new Map<string, AsyncJobManager>();
+
+	/** Register a manager for a top-level session endpoint so concurrent
+	 *  sessions' owned work can be settled in the ABORTING endpoint's manager
+	 *  instead of the last-created process-global instance (review thread P1).
+	 *  Returns TRUE when the mapping was installed (or already held by this
+	 *  manager); returns FALSE when the endpoint id is already held by a
+	 *  FOREIGN live manager — a second top-level session constructed or
+	 *  resumed under that endpoint must then fail construction instead of
+	 *  silently replacing the first manager, which would make the first
+	 *  session's tools resolve the second manager and let same-id jobs be
+	 *  queried, registered, or cancelled across sessions (review thread P1). */
+	static registerForEndpoint(endpointId: string, manager: AsyncJobManager): boolean {
+		const holder = AsyncJobManager.#byEndpoint.get(endpointId);
+		if (holder !== undefined && holder !== manager) return false;
+		AsyncJobManager.#byEndpoint.set(endpointId, manager);
+		return true;
+	}
+
+	static forEndpoint(endpointId: string | undefined): AsyncJobManager | undefined {
+		if (endpointId === undefined) return undefined;
+		return AsyncJobManager.#byEndpoint.get(endpointId);
+	}
+
+	static unregisterForEndpoint(endpointId: string): void {
+		AsyncJobManager.#byEndpoint.delete(endpointId);
+	}
+
+	/** Reverse lookup: the endpoint this manager is registered under, if any
+	 *  (review thread P1 — endpoint-scoped lineage resolution). */
+	static endpointIdOf(manager: AsyncJobManager | undefined): string | undefined {
+		if (!manager) return undefined;
+		for (const [endpointId, candidate] of AsyncJobManager.#byEndpoint) {
+			if (candidate === manager) return endpointId;
+		}
+		return undefined;
+	}
+
+	/** Re-register a manager under a successor endpoint id after a committed
+	 *  session-identity transition (newSession / switchSession / handoff).
+	 *  Lineage bindings made after the transition use the successor id, so the
+	 *  process-global endpoint registry must follow — otherwise
+	 *  `endpointIdOf()` keeps resolving the predecessor and a queued subagent
+	 *  resume can neither resolve its lineage nor register its owned tuple
+	 *  (review thread P1). Returns TRUE when the mapping was moved (or no move
+	 *  was needed); returns FALSE when the successor endpoint is owned by a
+	 *  FOREIGN live manager — the transition must then abort or roll back
+	 *  BEFORE retiring predecessor state, because leaving this manager under
+	 *  the predecessor while tools resolve the successor to the foreign
+	 *  manager sends jobs to the wrong session and owned aborts lose their
+	 *  causal set (review thread P1). */
+	static rekeyForEndpoint(
+		predecessorEndpointId: string,
+		successorEndpointId: string,
+		manager: AsyncJobManager | undefined,
+	): boolean {
+		if (!manager || predecessorEndpointId === successorEndpointId) return true;
+		if (AsyncJobManager.#byEndpoint.get(predecessorEndpointId) !== manager) return true;
+		const successorOwner = AsyncJobManager.#byEndpoint.get(successorEndpointId);
+		if (successorOwner !== undefined && successorOwner !== manager) return false;
+		AsyncJobManager.#byEndpoint.delete(predecessorEndpointId);
+		AsyncJobManager.#byEndpoint.set(successorEndpointId, manager);
+		return true;
+	}
+
+	/** Remove every endpoint registration owned by the manager. Disposal-safe:
+	 *  covers registrations whose key drifted from the session's current id
+	 *  (provider session ids, mid-transition teardown) and stale predecessor
+	 *  keys, so teardown cannot leave a dead manager behind. */
+	static unregisterManager(manager: AsyncJobManager | undefined): void {
+		if (!manager) return;
+		for (const [endpointId, candidate] of [...AsyncJobManager.#byEndpoint]) {
+			if (candidate === manager) AsyncJobManager.#byEndpoint.delete(endpointId);
+		}
+	}
+
 	/** Install or clear the process-global instance. */
 	static setInstance(value: AsyncJobManager | undefined): void {
 		AsyncJobManager.#instance = value;
@@ -437,6 +531,7 @@ export class AsyncJobManager {
 	/** Reset the process-global instance. Test-only. */
 	static resetForTests(): void {
 		AsyncJobManager.#instance = undefined;
+		AsyncJobManager.#byEndpoint.clear();
 	}
 
 	readonly #jobs = new Map<string, AsyncJob>();
@@ -936,6 +1031,17 @@ export class AsyncJobManager {
 	 * so cross-agent cancellation is rejected at the manager level.
 	 */
 	cancel(id: string, filter?: AsyncJobFilter): boolean {
+		if (id.startsWith("queued:")) {
+			// A queued resume (no real job yet): owned settlement cancels it by
+			// removing the queued subagent record and publishing the terminal
+			// (review thread P1).
+			const colon = id.lastIndexOf(":");
+			const subagentId = colon > "queued:".length ? id.slice("queued:".length, colon) : undefined;
+			if (!subagentId) return false;
+			const rec = this.getSubagentRecord(subagentId);
+			if (rec?.status !== "queued") return false;
+			return this.cancelSubagent(subagentId, filter);
+		}
 		const job = this.#jobs.get(id);
 		if (!job) return false;
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
@@ -1463,6 +1569,7 @@ export class AsyncJobManager {
 		subagentId: string,
 		filter?: AsyncJobFilter,
 		message?: string,
+		resumeToolCallId?: string,
 	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; queued?: boolean; reason?: string } {
 		const rec = this.getSubagentRecord(subagentId, filter);
 		if (!rec) return { ok: false, reason: "not_found" };
@@ -1487,24 +1594,70 @@ export class AsyncJobManager {
 		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
 			const seq = ++this.#resumeSeq;
 			rec.status = "queued";
-			rec.queued = { ownerId: rec.ownerId, seq, message, createdAt: Date.now() };
+			rec.queued = {
+				ownerId: rec.ownerId,
+				seq,
+				message,
+				...(resumeToolCallId ? { resumeToolCallId } : {}),
+				createdAt: Date.now(),
+			};
 			this.#resumeQueue.push({
 				subagentId: rec.subagentId,
 				ownerId: rec.ownerId,
 				seq,
 				message,
+				...(resumeToolCallId ? { resumeToolCallId } : {}),
 				createdAt: rec.queued.createdAt,
 			});
+			// Register the QUEUED generation as owned work of the resume request's
+			// turn: no real job exists until #startResume drains it, so without a
+			// registration a scope:"owned" abort of the requesting turn would see
+			// an empty causal set, report stopped_owned, and then the queue would
+			// drain and launch the resumed subagent anyway (review thread P1).
+			if (resumeToolCallId) {
+				const lineage = resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this));
+				if (lineage) {
+					const queuedGeneration = `queued:${rec.subagentId}:${seq}`;
+					registerOwnedRegistration({
+						...(lineage.endpointId ? { endpointId: lineage.endpointId } : {}),
+						lineageIdHash: lineage.lineageIdHash,
+						promptAttemptEpoch: lineage.promptAttemptEpoch,
+						endpointGeneration: lineage.endpointGeneration,
+						jobId: queuedGeneration,
+						jobGeneration: queuedGeneration,
+					});
+				}
+			}
 			this.#notifyChange();
 			return { ok: true, queued: true, status: "queued" };
 		}
-		return this.#startResume(rec, message, descriptor);
+		return this.#startResume(rec, message, descriptor, resumeToolCallId);
+	}
+
+	#retireQueuedOwned(rec: SubagentRecord): void {
+		const seq = rec.queued?.seq ?? rec.terminalQueuedSeq;
+		if (seq === undefined) return;
+		const queuedGeneration = `queued:${rec.subagentId}:${seq}`;
+		// Resolve the registration with the resume lineage's ENDPOINT identity:
+		// task ids are session-scoped and each manager's resume sequence starts
+		// locally, so concurrent sessions can both register an identical
+		// queued:<subagent>:<seq> generation — an endpoint-less lookup could
+		// retrieve and unregister the OTHER session's tuple (review thread P1).
+		const endpointId = rec.queued?.resumeToolCallId
+			? (resolveToolLineage(rec.queued.resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId ??
+				// Fall back to the manager's own registered endpoint when the
+				// binding itself predates endpoint keying or is not found.
+				AsyncJobManager.endpointIdOf(this))
+			: AsyncJobManager.endpointIdOf(this);
+		const registration = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointId);
+		if (registration) unregisterOwnedRegistration(registration);
 	}
 
 	#startResume(
 		rec: SubagentRecord,
 		message: string | undefined,
 		descriptor: ResumeDescriptor | undefined,
+		resumeToolCallId?: string,
 	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
 		if (this.#isOwnerSubagentShutdownFenced(rec.ownerId)) {
 			return { ok: false, status: rec.status, reason: "owner_shutdown_in_progress" };
@@ -1515,16 +1668,40 @@ export class AsyncJobManager {
 		// never renders the prior run's tool/output as live before it emits again.
 		this.#subagentProgress.delete(rec.subagentId);
 		const runner = this.#resolveResumeRunner(rec, descriptor);
-		const newJobId = runner?.(rec.subagentId, message, descriptor);
-		if (!newJobId) return { ok: false, reason: "resume_failed" };
+		const newJobId = runner?.(rec.subagentId, message, descriptor, resumeToolCallId);
+		if (!newJobId) {
+			// The queued resume FAILED to start: retire its owned registration
+			// so the tuple does not accumulate indefinitely (review thread P2).
+			this.#retireQueuedOwned(rec);
+			return { ok: false, reason: "resume_failed" };
+		}
 		if (prevJobId && prevJobId !== newJobId) rec.historicalJobIds.push(prevJobId);
 		rec.terminalGeneration = undefined;
 		rec.currentJobId = newJobId;
 		rec.currentJobGeneration = this.#jobs.get(newJobId)?.generation;
 		rec.status = this.#jobs.get(newJobId)?.status ?? "running";
 		rec.queued = undefined;
-		if (queuedGeneration)
+		if (queuedGeneration) {
 			this.#waitGenerationAliases.set(queuedGeneration, this.#jobs.get(newJobId)?.generation ?? newJobId);
+			// The queued resume's owned registration is superseded by the real
+			// job's registration (bound by the task tool): remove it so the
+			// causal set has exactly one tuple per job. The EXACT stored tuple
+			// is looked up first — unregisterOwnedRegistration now verifies the
+			// full five-tuple before deleting (review thread P1). The lookup is
+			// ENDPOINT-qualified via the resume lineage: concurrent sessions
+			// mint the same queued:<subagent>:<seq> generation, and the
+			// remaining endpoint-less fallback scan could retrieve and
+			// unregister the OTHER session's tuple (review thread P1).
+			const resumeEndpoint = resumeToolCallId
+				? (resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId ??
+					// The binding may have been evicted (8192-cap FIFO): fall back
+					// to the manager's own endpoint so the lookup never degrades
+					// into the cross-endpoint scan (review thread P2).
+					AsyncJobManager.endpointIdOf(this))
+				: undefined;
+			const queuedReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, resumeEndpoint);
+			if (queuedReg) unregisterOwnedRegistration(queuedReg);
+		}
 		this.#notifyChange();
 		return { ok: true, status: rec.status, jobId: newJobId };
 	}
@@ -1546,15 +1723,22 @@ export class AsyncJobManager {
 				continue;
 			}
 			try {
-				const result = this.#startResume(rec, entry.message, this.#descriptorForRecord(rec));
+				const result = this.#startResume(
+					rec,
+					entry.message,
+					this.#descriptorForRecord(rec),
+					rec.queued?.resumeToolCallId,
+				);
 				if (!result.ok) {
 					if (result.reason === "owner_shutdown_in_progress") {
 						index += 1;
 						continue;
 					}
 					const queuedSeq = rec.queued?.seq;
-					if (queuedSeq !== undefined)
+					if (queuedSeq !== undefined) {
+						this.#retireQueuedOwned(rec);
 						this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
+					}
 				}
 				this.#resumeQueue.splice(index, 1);
 			} catch (error) {
@@ -1563,8 +1747,10 @@ export class AsyncJobManager {
 					continue;
 				}
 				const queuedSeq = rec.queued?.seq;
-				if (queuedSeq !== undefined)
+				if (queuedSeq !== undefined) {
+					this.#retireQueuedOwned(rec);
 					this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
+				}
 				this.#resumeQueue.splice(index, 1);
 			}
 		}
@@ -1594,8 +1780,16 @@ export class AsyncJobManager {
 			const queuedSeq = rec.queued?.seq;
 			if (idx !== -1) this.#resumeQueue.splice(idx, 1);
 			rec.status = "cancelled";
-			if (queuedSeq !== undefined)
+			if (queuedSeq !== undefined) {
 				this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "cancelled");
+				// rec.queued is cleared below; retain terminal evidence ON THE
+				// RECORD so owned settlement can prove the queued generation was
+				// cancelled even when an in-flight settlement outlives any
+				// bounded evidence set (review thread P2). The owned tuple is
+				// retired at this terminal state too.
+				rec.terminalQueuedSeq = queuedSeq;
+				this.#retireQueuedOwned(rec);
+			}
 			rec.queued = undefined;
 			this.#subagentProgress.delete(rec.subagentId);
 			this.#notifyChange();
@@ -1620,7 +1814,67 @@ export class AsyncJobManager {
 	}
 
 	getJob(id: string): AsyncJob | undefined {
+		if (id.startsWith("queued:")) {
+			const colon = id.lastIndexOf(":");
+			const subagentId = colon > "queued:".length ? id.slice("queued:".length, colon) : undefined;
+			if (!subagentId) return undefined;
+			const rec = this.getSubagentRecord(subagentId);
+			if (!rec) return undefined;
+			const liveSeq = rec.queued?.seq;
+			const terminalSeq = rec.terminalQueuedSeq;
+			// A failed queued resume publishes its terminalGeneration (the
+			// queued id) via #publishQueuedTerminal — that is retained
+			// failed-generation evidence for the settlement proof.
+			const terminalQueuedId = terminalSeq !== undefined ? `queued:${subagentId}:${terminalSeq}` : undefined;
+			const publishedQueuedId = rec.terminalGeneration?.startsWith("queued:") ? rec.terminalGeneration : undefined;
+			if (liveSeq === undefined && terminalQueuedId === undefined && publishedQueuedId === undefined)
+				return undefined;
+			const resolvedQueuedId =
+				liveSeq !== undefined ? `queued:${subagentId}:${liveSeq}` : (terminalQueuedId ?? publishedQueuedId);
+			if (resolvedQueuedId === undefined || id !== resolvedQueuedId) return undefined;
+			if (liveSeq === undefined) {
+				// The queued resume reached a TERMINAL state (cancelled or
+				// failed, rec.queued cleared): the generation is provably
+				// terminal so owned settlement's second proof succeeds
+				// (review thread P2).
+				return {
+					id,
+					generation: id,
+					type: "task",
+					status: rec.status === "failed" ? "failed" : "cancelled",
+					startTime: Date.now(),
+					label: `terminal queued resume ${subagentId}`,
+					abortController: new AbortController(),
+					promise: Promise.resolve(),
+				};
+			}
+			if (id !== `queued:${subagentId}:${liveSeq}`) return undefined;
+			return {
+				id,
+				generation: id,
+				type: "task",
+				// A still-queued resume is NOT quiescent ("paused" fails the owned
+				// settlement's second proof); once cancelled it is terminal.
+				status: rec.status === "cancelled" ? "cancelled" : "paused",
+				startTime: rec.queued?.createdAt ?? Date.now(),
+				label: `queued resume ${subagentId}`,
+				abortController: new AbortController(),
+				promise: Promise.resolve(),
+			};
+		}
 		return this.#jobs.get(id);
+	}
+
+	/**
+	 * The EXECUTION promise of the job record whose generation matches the
+	 * captured generation, or undefined when the record is gone or rebound.
+	 * The promise settles only when the job's function actually unwinds — the
+	 * eagerly-updated cancel status is not proof of quiescence (review P1).
+	 */
+	getJobPromise(id: string, generation: string): Promise<void> | undefined {
+		const job = this.#jobs.get(id);
+		if (!job || job.generation !== generation) return undefined;
+		return job.promise;
 	}
 
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
@@ -2185,6 +2439,12 @@ export class AsyncJobManager {
 			lastError: delivery.lastError,
 		});
 		this.#deadLetteredDeliveryOwners.set(delivery.jobId, delivery.ownerId);
+		// The dead-lettered delivery never injects a message and has no later
+		// consumption boundary: retire the exact owned registration so the
+		// terminal tuple does not occupy the global registries until a future
+		// job-record eviction makes it invisible to settlement scans (review
+		// thread P2).
+		retireOwnedRegistrationForDeadLetter(AsyncJobManager.endpointIdOf(this), delivery.jobId, delivery.generation);
 		while (this.#deadLetteredDeliveries.size > MAX_DEAD_LETTERED_DELIVERIES) {
 			const oldestJobId = this.#deadLetteredDeliveries.keys().next().value;
 			if (oldestJobId === undefined) return;

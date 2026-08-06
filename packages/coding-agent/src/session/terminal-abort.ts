@@ -34,6 +34,13 @@ export type DeliveryOrigin =
 
 /** Exact causal registration key bound before a job/subagent handle escapes. */
 export interface TurnRegistrationKey {
+	/** Endpoint (top-level session) identity that owns this job: the registry is
+	 *  process-global and job ids/generations restart per AsyncJobManager, so
+	 *  two concurrent sessions both mint bg_1/job:1 — without the endpoint in
+	 *  the key the second registration would overwrite the first and an owned
+	 *  abort of the first turn could find an empty causal set (review thread
+	 *  P1). Absent (legacy/test fixtures) = a default scope. */
+	endpointId?: string;
 	endpointGeneration: number;
 	lineageIdHash: string;
 	promptAttemptEpoch: number;
@@ -138,18 +145,106 @@ export interface ActiveTerminalScope {
 
 const MAX_ACTIVE_TERMINAL_SCOPES = 1024;
 const MAX_OWNED_REGISTRATIONS = 8192;
+const MAX_RETAINED_OWNERSHIP_TUPLES = 2048;
+const MAX_RETAINED_ATTEMPT_POLICIES = 2048;
 const activeScopes = new Map<string, ActiveTerminalScope>();
+/**
+ * Compact authorization evidence for registrations evicted by the 8,192 cap:
+ * a TERMINAL job may still have an owned-completion envelope queued but not
+ * yet consumed/acknowledged, and evicting its registration would remove the
+ * authorizeOwnedCompletion authority (the queued result would be denied after
+ * a scope:"turn" abort, losing the promised fresh completion). Evicted tuples
+ * are retained here (bounded, FIFO) and removed once the delivery settles
+ * (unregisterOwnedRegistration) — review thread P2.
+ */
+const retainedOwnershipTuples = new Map<string, TurnRegistrationKey>();
 const activeScopeByAttempt = new Map<string, string>();
 const ownedRegistrations = new Map<string, TurnRegistrationKey>();
+/**
+ * Compact attempt-policy tombstones for scopes evicted by the cap: when a
+ * scope is evicted, its ownedCompletionPolicy is retained so a still-running
+ * owned completion from that attempt keeps classifying correctly (fresh
+ * resume for scope:"turn", drop for scope:"owned") instead of degrading to
+ * ordinary (review thread P2). Bounded; oldest tombstone evicted first.
+ */
+const retainedAttemptPolicies = new Map<string, { ownedCompletionPolicy: "enabled" | "disabled" }>();
+/** Attempts whose owned-registration set is KNOWN incomplete (registry
+ *  saturation skipped a registration under the 8192 cap). Bounded by the
+ *  number of saturation events — fail-closed authority for those attempts.
+ */
+const incompleteOwnedAttempts = new Set<string>();
+/** Evicted call key → its attempt marker until that tool call settles/registers. */
+const incompleteToolCallWindows = new Map<string, string>();
+/**
+ * Coarser fail-closed saturation authority: once the registry has EVER been
+ * saturated, no later attempt's exact causal set can be proven complete
+ * (older markers may have been retired by the FIFO bound while their skipped
+ * work stayed live). Any scope:"owned" abort then fails closed to
+ * uncertainty rather than reporting stopped_owned over a possibly-incomplete
+ * set (review thread P2).
+ */
+let ownedRegistrySaturationEver = false;
+/**
+ * EvictKeys whose TERMINAL tuple could not move into the retained evidence
+ * (its cap is full): the tuple stays in the LIVE map so authorizeOwnedCompletion
+ * still finds it, and the eviction scan skips these keys so a later
+ * registration does not re-evict the same protected tuple (review thread P2).
+ */
+const retentionBacklog = new Set<string>();
 
 /** Register one active terminal scope (scopeId -> seam). Bounded; evicts oldest. */
-export function registerTerminalScope(scope: ActiveTerminalScope): void {
+export function registerTerminalScope(scope: ActiveTerminalScope): boolean {
 	if (activeScopes.size >= MAX_ACTIVE_TERMINAL_SCOPES) {
 		const oldest = activeScopes.keys().next().value;
-		if (oldest !== undefined) unregisterTerminalScope(oldest);
+		if (oldest !== undefined) {
+			const evicted = activeScopes.get(oldest);
+			if (evicted) {
+				if (retainedAttemptPolicies.size >= MAX_RETAINED_ATTEMPT_POLICIES) {
+					// Evict only a tombstone whose attempt has NO remaining
+					// registrations (its owned completions have settled) — never
+					// by age alone while a registration could still classify and
+					// require the policy (review thread P2).
+					let evictPolicyKey: string | undefined;
+					for (const [candidateKey] of retainedAttemptPolicies) {
+						const separator = candidateKey.lastIndexOf("\u0000");
+						const lineage = candidateKey.slice(0, separator);
+						const epoch = Number(candidateKey.slice(separator + 1));
+						const hasRegistrations =
+							[...ownedRegistrations.values()].some(
+								reg => reg.lineageIdHash === lineage && reg.promptAttemptEpoch === epoch,
+							) ||
+							// A TERMINAL job awaiting delivery may have been
+							// evicted into the retained evidence; its attempt is
+							// NOT settled and its policy must survive (review P2).
+							[...retainedOwnershipTuples.values()].some(
+								reg => reg.lineageIdHash === lineage && reg.promptAttemptEpoch === epoch,
+							);
+						if (!hasRegistrations) {
+							evictPolicyKey = candidateKey;
+							break;
+						}
+					}
+					if (evictPolicyKey === undefined) {
+						// Every retained tombstone still has LIVE registrations:
+						// evicting the OLDEST ACTIVE scope would drop ITS policy
+						// while its work remains registered/classifiable, changing
+						// its later completion from fresh/drop to ordinary. FAIL
+						// the NEW scope admission instead — the oldest scope keeps
+						// its policy (review thread P2).
+						return false;
+					}
+					retainedAttemptPolicies.delete(evictPolicyKey);
+				}
+				retainedAttemptPolicies.set(`${evicted.lineageIdHash}\u0000${evicted.abortedAttemptEpoch}`, {
+					ownedCompletionPolicy: evicted.fence.ownedCompletionPolicy,
+				});
+			}
+			unregisterTerminalScope(oldest);
+		}
 	}
 	activeScopes.set(scope.scopeId, scope);
 	activeScopeByAttempt.set(`${scope.lineageIdHash}\u0000${scope.abortedAttemptEpoch}`, scope.scopeId);
+	return true;
 }
 
 /** Look up the active terminal scope for an aborted attempt (exact lineage+epoch). */
@@ -166,23 +261,168 @@ export function unregisterTerminalScope(scopeId: string): void {
 }
 
 /** Record an exact owned registration before its handle escapes (bounded). */
-export function registerOwnedRegistration(key: TurnRegistrationKey): void {
-	const mapKey = `${key.jobId}\u0000${key.jobGeneration}`;
-	if (ownedRegistrations.has(mapKey)) return;
+export function registerOwnedRegistration(
+	key: TurnRegistrationKey,
+	options?: { isJobTerminal?: (candidate: TurnRegistrationKey) => boolean | undefined },
+): void {
+	// Key by (endpoint, jobId, jobGeneration): job ids and generations restart
+	// per AsyncJobManager, so CONCURRENT sessions' bg_1/job:1 must coexist —
+	// the endpoint identity prevents the second registration from overwriting
+	// the first (review thread P1). A same-ENDPOINT (jobId, jobGeneration)
+	// rebind (replaced manager within one session) still overwrites the stale
+	// entry; a same-turn re-registration (exact tuple) is a no-op.
+	const mapKey = `${key.endpointId ?? ""}\u0000${key.jobId}\u0000${key.jobGeneration}`;
+	const existing = ownedRegistrations.get(mapKey);
+	if (
+		existing &&
+		existing.lineageIdHash === key.lineageIdHash &&
+		existing.promptAttemptEpoch === key.promptAttemptEpoch &&
+		existing.endpointId === key.endpointId
+	) {
+		return;
+	}
 	if (ownedRegistrations.size >= MAX_OWNED_REGISTRATIONS) {
-		const oldest = ownedRegistrations.keys().next().value;
-		if (oldest !== undefined) ownedRegistrations.delete(oldest);
+		// Prefer evicting a TERMINAL registration: its job already finished, so
+		// a long-lived LIVE job must never be dropped by shorter finished jobs —
+		// otherwise scope:"owned" would omit it from the exact causal set and
+		// could report stopped_owned while it keeps running (review thread P2).
+		let evictKey: string | undefined;
+		if (options?.isJobTerminal) {
+			for (const [candidateKey, candidate] of ownedRegistrations) {
+				// Skip tuples already protected in the retention backlog (their
+				// pending authorization must not be re-evicted, review thread P2).
+				if (retentionBacklog.has(candidateKey)) continue;
+				if (options.isJobTerminal(candidate) === true) {
+					evictKey = candidateKey;
+					break;
+				}
+			}
+		}
+		if (evictKey === undefined) {
+			// ALL retained registrations are live: evicting any of them would lose
+			// a still-running job's ownership authority. FAIL CLOSED instead —
+			// do not evict, skip the new registration, and record the new
+			// attempt as registration-incomplete so a later scope:"owned" abort
+			// of it returns uncertainty rather than stopped_owned over an
+			// incomplete set (review thread P2).
+			ownedRegistrySaturationEver = true;
+			markAttemptRegistrationIncomplete(key.lineageIdHash, key.promptAttemptEpoch);
+			// Retiring an oldest marker is safe for fail-closed correctness only
+			// because ownedRegistrySaturationEver above keeps every owned abort
+			// uncertain — no marker deletion can lose the last evidence that a
+			// skipped job is still live (review thread P2).
+			return;
+		}
+		const evictedTuple = ownedRegistrations.get(evictKey);
+		ownedRegistrations.delete(evictKey);
+		if (evictedTuple) {
+			if (retainedOwnershipTuples.size >= MAX_RETAINED_OWNERSHIP_TUPLES) {
+				// Retained evidence at cap: NEVER drop a pending authorization by
+				// age — keep the terminal tuple in the LIVE map (backlogged) so
+				// authorizeOwnedCompletion still finds it while its completion
+				// envelope is queued (review thread P2). The live map only
+				// transiently exceeds its cap under pathological concurrent
+				// pending deliveries; the backlog is cleared as deliveries settle.
+				retentionBacklog.add(evictKey);
+				ownedRegistrations.set(evictKey, evictedTuple);
+				// The pending tuple cannot move to retained evidence, so the new
+				// registration has NO eviction headroom: FAIL CLOSED instead of
+				// inserting it and letting both the live map and the backlog grow
+				// without bound while deliveries stay stalled (review thread P2).
+				ownedRegistrySaturationEver = true;
+				markAttemptRegistrationIncomplete(key.lineageIdHash, key.promptAttemptEpoch);
+				return;
+			}
+			retainedOwnershipTuples.set(evictKey, evictedTuple);
+		}
 	}
 	ownedRegistrations.set(mapKey, key);
 }
 
+/** Record an attempt whose owned-registration set is KNOWN incomplete — the
+ *  shared bounded fail-closed authority (saturation skip or evicted in-flight
+ *  lineage binding). FIFO-capped so a long-running daemon never grows the set
+ *  without bound (review thread P2). */
+function markAttemptRegistrationIncomplete(lineageIdHash: string, attemptEpoch: number): void {
+	const incompleteKey = `${lineageIdHash}\u0000${attemptEpoch}`;
+	// A marker can be cleared only once its affected call is known unable to
+	// register. FIFO aging loses that authority while a delayed in-flight tool
+	// may still launch, allowing scope:"owned" to claim stopped_owned over a
+	// live unregistered job (review thread P2).
+	incompleteOwnedAttempts.add(incompleteKey);
+}
+
+/** Whether an attempt's owned registration set is KNOWN incomplete (registry
+ *  saturation skipped its registration) — a scope:"owned" abort of it must
+ *  fail closed to uncertainty (review thread P2). */
+export function isOwnedAttemptRegistrationIncomplete(lineageIdHash: string, attemptEpoch: number): boolean {
+	// The coarse saturation flag subsumes the per-attempt markers: after any
+	// saturation event no attempt's exact set can be proven complete (review
+	// thread P2).
+	return ownedRegistrySaturationEver || incompleteOwnedAttempts.has(`${lineageIdHash}\u0000${attemptEpoch}`);
+}
+
 /** Exact (jobId, jobGeneration) lookup for completion-origin classification. */
-export function lookupOwnedRegistration(jobId: string, jobGeneration: string): TurnRegistrationKey | undefined {
-	return ownedRegistrations.get(`${jobId}\u0000${jobGeneration}`);
+export function lookupOwnedRegistration(
+	jobId: string,
+	jobGeneration: string,
+	endpointId?: string,
+): TurnRegistrationKey | undefined {
+	const prefix = `${endpointId ?? ""}\u0000${jobId}\u0000${jobGeneration}`;
+	if (endpointId !== undefined) {
+		const exact = ownedRegistrations.get(prefix);
+		if (exact) return exact;
+		// The live entry may have been evicted by the cap with its compact
+		// authorization evidence retained (pending delivery — review P2).
+		const retained = retainedOwnershipTuples.get(prefix);
+		if (retained) return retained;
+	}
+	// An ENDPOINT-qualified lookup NEVER falls back to the cross-endpoint scan:
+	// with concurrent sessions reusing bg_1/job:1, the scan could return
+	// another session's registration — B's monitor would attach A's ownership
+	// envelope, or B's Job/Bash settlement would unregister A's tuple while A's
+	// job keeps running (review thread P1). The scan is reserved for callers
+	// that OMIT an endpoint (legacy callers/tests).
+	if (endpointId === undefined) {
+		for (const reg of ownedRegistrations.values()) {
+			if (reg.jobId === jobId && reg.jobGeneration === jobGeneration) return reg;
+		}
+		for (const reg of retainedOwnershipTuples.values()) {
+			if (reg.jobId === jobId && reg.jobGeneration === jobGeneration) return reg;
+		}
+	}
+	return undefined;
 }
 
 export function unregisterOwnedRegistration(key: TurnRegistrationKey): void {
-	ownedRegistrations.delete(`${key.jobId}\u0000${key.jobGeneration}`);
+	const mapKey = `${key.endpointId ?? ""}\u0000${key.jobId}\u0000${key.jobGeneration}`;
+	// Only remove the EXACT five-tuple: the (jobId, jobGeneration) pair may
+	// have been REBOUND to another lineage/epoch/endpoint (which
+	// registerOwnedRegistration explicitly allows), and deleting by the pair
+	// alone would drop the replacement job's authoritative registration — a
+	// later scope:"owned" abort could then omit it and report stopped_owned
+	// while it stays active (review thread P1).
+	const matches = (r: TurnRegistrationKey) =>
+		r.lineageIdHash === key.lineageIdHash &&
+		r.promptAttemptEpoch === key.promptAttemptEpoch &&
+		r.endpointGeneration === key.endpointGeneration &&
+		r.jobId === key.jobId &&
+		r.jobGeneration === key.jobGeneration;
+	const existing = ownedRegistrations.get(mapKey);
+	if (existing) {
+		if (!matches(existing)) return;
+		ownedRegistrations.delete(mapKey);
+	}
+	// The registration may already have been EVICTED into the retained
+	// evidence (a TERMINAL job whose envelope is still queued) while its
+	// delivery now settles; settle the retained tuple too. Without this the
+	// stale evidence would fill the FIFO and evict authorization for
+	// genuinely queued completions (review thread P2).
+	const retained = retainedOwnershipTuples.get(mapKey);
+	if (retained && matches(retained)) {
+		retainedOwnershipTuples.delete(mapKey);
+	}
+	retentionBacklog.delete(mapKey);
 }
 /**
  * Enumerate every exact owned registration belonging to one aborted turn
@@ -190,6 +430,19 @@ export function unregisterOwnedRegistration(key: TurnRegistrationKey): void {
  * capture the exact causal job set; foreign/unclassified work is never
  * returned and is never swept.
  */
+/** Retire EVERY owned registration owned by a disposing endpoint (live,
+ * retained-evidence, and backlogged tuples): after the endpoint's manager is
+ * unregistered the tuples can no longer reach a delivery settlement boundary,
+ * and future managers deliberately cannot classify foreign-endpoint tuples as
+ * terminal for eviction — repeatedly disposing distinct sessions with pending
+ * jobs would accumulate tuples until the 8192-entry registry saturates and
+ * all later owned aborts fail closed (review thread P2). */
+export function retireOwnedRegistrationsForEndpoint(endpointId: string): void {
+	for (const reg of [...ownedRegistrations.values(), ...retainedOwnershipTuples.values()]) {
+		if (reg.endpointId === endpointId) unregisterOwnedRegistration(reg);
+	}
+}
+
 export function findOwnedRegistrationsForTurn(lineageIdHash: string, attemptEpoch: number): TurnRegistrationKey[] {
 	const matches: TurnRegistrationKey[] = [];
 	for (const key of ownedRegistrations.values()) {
@@ -238,22 +491,60 @@ export function classifyOwnedCompletion(
  * (policy disabled), forged/unregistered tuple, or vanished scope — must be
  * dropped/partitioned out so stopped work can never call followUp/prompt.
  */
-export function isOwnedCompletionEnvelopeAllowed(envelope: OwnedCompletionEnvelope): boolean {
+/**
+ * Classify an owned-completion envelope into three states. A registration
+ * without a terminal scope (no abort yet) is ORDINARY — normal delivery;
+ * only a scope with the owned policy disabled DROPS, and a turn-scope
+ * enabled policy is FRESH (new-turn resume). This lets the batch keep
+ * ownership on the entry and reclassify at flush/abort time (review
+ * thread P1: a completion finished before the abort must not become an
+ * unpurgeable ordinary entry that can still resume the agent).
+ */
+export function classifyOwnedEnvelope(envelope: OwnedCompletionEnvelope): "ordinary" | "fresh" | "drop" {
 	const scope = lookupTerminalScope(envelope.lineageIdHash, envelope.promptAttemptEpoch);
-	if (!scope) return false;
-	return (
-		scope.gate.authorizeOwnedCompletion({
+	if (scope) {
+		return scope.gate.authorizeOwnedCompletion({
 			kind: "owned-completion",
 			lineageIdHash: envelope.lineageIdHash,
 			attemptEpoch: envelope.promptAttemptEpoch,
 			registration: envelope.registration,
 		}) === "allow-new-turn"
+			? "fresh"
+			: "drop";
+	}
+	// The scope was evicted by the cap but its attempt-policy tombstone
+	// survives: classify by the retained policy while the registration is
+	// still exact (review thread P2).
+	const retained = retainedAttemptPolicies.get(`${envelope.lineageIdHash}\u0000${envelope.promptAttemptEpoch}`);
+	if (!retained) return "ordinary";
+	if (retained.ownedCompletionPolicy === "disabled") return "drop";
+	const registered = lookupOwnedRegistration(
+		envelope.registration.jobId,
+		envelope.registration.jobGeneration,
+		envelope.registration.endpointId,
 	);
+	// Compare EVERY tuple component against the authoritative registration: a
+	// (jobId, jobGeneration) may have been REBOUND to another lineage/epoch
+	// since the envelope was built, and classifying the stale envelope as fresh
+	// would resume work under the wrong ownership (review thread P2).
+	if (!registered) return "ordinary";
+	if (registered.endpointGeneration !== envelope.registration.endpointGeneration) return "ordinary";
+	if (registered.lineageIdHash !== envelope.lineageIdHash) return "ordinary";
+	if (registered.promptAttemptEpoch !== envelope.promptAttemptEpoch) return "ordinary";
+	if (registered.jobId !== envelope.registration.jobId) return "ordinary";
+	if (registered.jobGeneration !== envelope.registration.jobGeneration) return "ordinary";
+	return "fresh";
+}
+
+/** Whether an envelope must be kept in the batch (not an owned-scope drop). */
+export function isOwnedCompletionEnvelopeAllowed(envelope: OwnedCompletionEnvelope): boolean {
+	return classifyOwnedEnvelope(envelope) !== "drop";
 }
 /** Structural subset of AsyncJobManager used by owned-stop settlement (avoids an import cycle). */
 export interface OwnedStopManager {
 	cancel(jobId: string): boolean;
 	getJob(jobId: string): { generation?: string; status?: string } | undefined;
+	getJobPromise?(jobId: string, generation: string): Promise<void> | undefined;
 	acknowledgeDeliveries(jobIds: string[]): number;
 }
 
@@ -277,33 +568,68 @@ export async function settleOwnedWork(
 		return true;
 	});
 	if (!generationExact) return "unsettled";
+	const deadline = Date.now() + graceMs;
 	await Bun.sleep(graceMs);
 	// Second proof: every captured job must still be the EXACT captured
 	// generation and terminal (cancelled/completed/failed). A reused job id
 	// with a NEW generation during the grace, a missing/evicted record, or a
 	// still-running/paused job fails closed — foreign work is never swept and
-	// unprovable quiescence never claims stopped.
-	const quiescent = exactJobs.every(reg => {
-		const job = manager.getJob(reg.jobId);
-		return (
-			job !== undefined &&
-			job.generation === reg.jobGeneration &&
-			job.status !== "running" &&
-			job.status !== "paused"
-		);
-	});
-	if (!quiescent) return "unsettled";
+	// unprovable quiescence never claims stopped. Additionally, the ACTUAL job
+	// promise must settle within the grace: AsyncJobManager.cancel() updates
+	// status to "cancelled" eagerly while the job function may still be
+	// unwinding, so the status alone is not proof of quiescence (review P1).
+	const quiescent = await Promise.all(
+		exactJobs.map(async reg => {
+			const job = manager.getJob(reg.jobId);
+			if (!job || job.generation !== reg.jobGeneration) return false;
+			if (job.status === "running" || job.status === "paused") return false;
+			const promise = manager.getJobPromise?.(reg.jobId, reg.jobGeneration);
+			if (!promise) return true; // no promise exposed — fall back to status
+			let settled = false;
+			try {
+				await Promise.race([
+					promise.then(
+						() => {
+							settled = true;
+						},
+						() => {
+							settled = true;
+						},
+					),
+					Bun.sleep(Math.max(0, deadline - Date.now())),
+				]);
+			} catch {
+				// ignore: a rejected promise still counts as unwound
+			}
+			return settled;
+		}),
+	);
+	if (!quiescent.every(Boolean)) return "unsettled";
 	manager.acknowledgeDeliveries(exactJobs.map(reg => reg.jobId));
+	// The jobs are terminal and their deliveries are suppressed: the owned
+	// registrations are settled, so remove them — otherwise they occupy the
+	// attempt indefinitely and the retained-policy tombstone eviction cannot
+	// distinguish live work from finished work (review thread P2).
+	for (const reg of exactJobs) unregisterOwnedRegistration(reg);
 	return "stopped";
 }
 export interface LineageBinding {
 	lineageIdHash: string;
 	promptAttemptEpoch: number;
 	endpointGeneration: number;
+	/** Endpoint (top-level session) identity that minted this binding. */
+	endpointId?: string;
 }
 
 const MAX_LINEAGE_BINDINGS = 8192;
+// Keyed by (endpointId, toolCallId): concurrent sessions receive the SAME
+// provider-local toolCallId, and a toolCallId-only key lets the later
+// session's beforeToolCall overwrite the first session's binding — the first
+// session's background Bash/task job would then be attributed to the second
+// session's endpoint and lineage (review thread P1).
 const lineageByToolCall = new Map<string, LineageBinding>();
+const toolCallLineageKey = (endpointId: string | undefined, toolCallId: string) =>
+	`${endpointId ?? ""}\u0000${toolCallId}`;
 
 /**
  * Bind immutable lineage/attempt metadata to an attempt-scoped tool call
@@ -314,17 +640,70 @@ const lineageByToolCall = new Map<string, LineageBinding>();
 export function bindToolLineage(toolCallId: string, binding: LineageBinding): void {
 	if (lineageByToolCall.size >= MAX_LINEAGE_BINDINGS) {
 		const oldest = lineageByToolCall.keys().next().value;
-		if (oldest !== undefined) lineageByToolCall.delete(oldest);
+		if (oldest !== undefined) {
+			const evicted = lineageByToolCall.get(oldest);
+			lineageByToolCall.delete(oldest);
+			if (evicted) {
+				// An evicted binding may belong to an IN-FLIGHT tool call whose
+				// background tool has not yet reached registerOwnedIfLineaged:
+				// its job would then launch with no owned registration and no
+				// evidence. Mark the evicted attempt's registration authority
+				// incomplete so a later scope:"owned" abort of THAT attempt fails
+				// closed to uncertainty instead of reporting stopped_owned
+				// over an incomplete causal set.
+				const incompleteKey = `${evicted.lineageIdHash}\u0000${evicted.promptAttemptEpoch}`;
+				markAttemptRegistrationIncomplete(evicted.lineageIdHash, evicted.promptAttemptEpoch);
+				incompleteToolCallWindows.set(oldest, incompleteKey);
+				// Deliberately NOT setting the coarse ownedRegistrySaturationEver
+				// flag here: the per-attempt marker above is scoped to the
+				// evicted attempt, while the coarse flag is
+				// process-lifetime. Every tool call binds a lineage entry and
+				// production never unbinds it (bindings intentionally survive
+				// the tool call so resumed registrations re-use the original id
+				// and task batches register one job per item), so a healthy
+				// long-running daemon inevitably reaches the 8,192 cap and the
+				// first eviction is ordinary historical churn — the evicted
+				// call and its job have settled long ago. A process-lifetime
+				// flag on ANY eviction would make every subsequent scope:"owned"
+				// abort fail with uncertainty forever, even when all evicted
+				// calls settled (review thread P2).
+			}
+		}
 	}
-	lineageByToolCall.set(toolCallId, binding);
+	lineageByToolCall.set(toolCallLineageKey(binding.endpointId, toolCallId), binding);
 }
 
-export function resolveToolLineage(toolCallId: string | undefined): LineageBinding | undefined {
-	return toolCallId === undefined ? undefined : lineageByToolCall.get(toolCallId);
+export function resolveToolLineage(toolCallId: string | undefined, endpointId?: string): LineageBinding | undefined {
+	if (toolCallId === undefined) return undefined;
+	if (endpointId !== undefined) return lineageByToolCall.get(toolCallLineageKey(endpointId, toolCallId));
+	// Legacy endpoint-less callers: match by toolCallId. Prefer a binding whose
+	// endpoint equals the caller's, else the first match (review thread P1 —
+	// endpoint-aware callers must pass their endpoint to disambiguate
+	// concurrent sessions).
+	for (const [key, binding] of lineageByToolCall) {
+		if (key.endsWith(`\u0000${toolCallId}`)) return binding;
+	}
+	return undefined;
 }
 
-export function unbindToolLineage(toolCallId: string): void {
-	lineageByToolCall.delete(toolCallId);
+/** Close an evicted tool's registration window after its execution settles. */
+export function settleToolLineageRegistrationWindow(toolCallId: string, endpointId?: string): void {
+	const key = toolCallLineageKey(endpointId, toolCallId);
+	const incompleteKey = incompleteToolCallWindows.get(key);
+	if (incompleteKey !== undefined) {
+		incompleteToolCallWindows.delete(key);
+		incompleteOwnedAttempts.delete(incompleteKey);
+	}
+}
+
+export function unbindToolLineage(toolCallId: string, endpointId?: string): void {
+	if (endpointId !== undefined) {
+		lineageByToolCall.delete(toolCallLineageKey(endpointId, toolCallId));
+		return;
+	}
+	for (const key of lineageByToolCall.keys()) {
+		if (key.endsWith(`\u0000${toolCallId}`)) lineageByToolCall.delete(key);
+	}
 }
 
 /**
@@ -346,25 +725,62 @@ export function mintTurnLineageIdHash(sessionId: string, promptAttemptEpoch: num
  * registry failure never breaks ordinary registration.
  */
 export function registerOwnedIfLineaged(
-	manager: { getJob?(id: string): { generation?: string } | undefined },
+	manager: { getJob?(id: string): { generation?: string; status?: string } | undefined },
 	toolCallId: string | undefined,
 	jobId: string,
+	endpointId?: string,
 ): void {
 	try {
-		const lineage = resolveToolLineage(toolCallId);
-		if (!lineage) return;
-		const jobGeneration = manager.getJob?.(jobId)?.generation;
+		const lineage = resolveToolLineage(toolCallId, endpointId);
+		if (!lineage) {
+			if (toolCallId !== undefined) settleToolLineageRegistrationWindow(toolCallId, endpointId);
+			return;
+		}
+		const job = manager.getJob?.(jobId);
+		const jobGeneration = job?.generation;
 		if (!jobGeneration) return;
-		registerOwnedRegistration({
-			endpointGeneration: lineage.endpointGeneration,
-			lineageIdHash: lineage.lineageIdHash,
-			promptAttemptEpoch: lineage.promptAttemptEpoch,
-			jobId,
-			jobGeneration,
-		});
+		registerOwnedRegistration(
+			{
+				...(lineage.endpointId ? { endpointId: lineage.endpointId } : {}),
+				endpointGeneration: lineage.endpointGeneration,
+				lineageIdHash: lineage.lineageIdHash,
+				promptAttemptEpoch: lineage.promptAttemptEpoch,
+				jobId,
+				jobGeneration,
+			},
+			{
+				// Only FINISHED jobs are evictable under the cap, so a long-lived
+				// live job's ownership tuple is never dropped by shorter completed
+				// jobs (review thread P2). The check is scoped to the CANDIDATE's
+				// OWN endpoint: a candidate from another session (same reusable
+				// job id bg_1) must not be judged terminal using THIS manager's
+				// unrelated bg_1 record (review thread P2).
+				isJobTerminal: candidate => {
+					if ((candidate.endpointId ?? "") !== (lineage.endpointId ?? "")) return undefined;
+					const status = manager.getJob?.(candidate.jobId)?.status;
+					return status === "completed" || status === "cancelled" || status === "failed" || status === "evicted";
+				},
+			},
+		);
 	} catch {
 		// ignore: never break ordinary registration
 	}
+}
+
+/** Retire the exact (endpoint, jobId, jobGeneration) owned registration when
+ *  its completion delivery is dead-lettered by the manager (delivery-queue
+ *  overflow or retry exhaustion): no message is injected and no later
+ *  consumption boundary will settle it, so the terminal tuple would otherwise
+ *  occupy the global registries until saturation (review thread P2). The
+ *  delivery is enqueued only when the job is terminal, so no live job's
+ *  authority is dropped. */
+export function retireOwnedRegistrationForDeadLetter(
+	endpointId: string | undefined,
+	jobId: string,
+	jobGeneration: string,
+): void {
+	const tuple = lookupOwnedRegistration(jobId, jobGeneration, endpointId);
+	if (tuple) unregisterOwnedRegistration(tuple);
 }
 
 let attemptEpochCounter = 0;
@@ -454,13 +870,17 @@ export function createTurnContinuationSeam(options: {
 			// The tuple must be an EXACT registered five-tuple: an unregistered,
 			// forged, or mutated registration fails closed even when the outer
 			// lineage/epoch match the aborted turn (AC 25 — missing/copied/
-			// mismatched origin never authorizes an automatic call).
-			const registered = lookupOwnedRegistration(jobId, jobGeneration);
+			// mismatched origin never authorizes an automatic call). The lookup
+			// is ENDPOINT-scoped so concurrent sessions' same reusable job id
+			// never resolves to a foreign session's registration, which would
+			// deny a valid completion (review thread P1).
+			const registered = lookupOwnedRegistration(jobId, jobGeneration, origin.registration.endpointId);
 			if (!registered) return "deny";
 			if (
 				registered.lineageIdHash !== origin.lineageIdHash ||
 				registered.promptAttemptEpoch !== promptAttemptEpoch ||
-				registered.endpointGeneration !== endpointGeneration
+				registered.endpointGeneration !== endpointGeneration ||
+				(registered.endpointId ?? "") !== (origin.registration.endpointId ?? "")
 			)
 				return "deny";
 			return "allow-new-turn";
@@ -491,7 +911,7 @@ export function registerTerminalTurnScope(options: {
 	terminalScopeId?: string;
 	ownedCompletionPolicy?: OwnedCompletionPolicy;
 	blockedContinuationIds?: readonly string[];
-}): RegisteredTerminalScope {
+}): RegisteredTerminalScope | undefined {
 	const terminalScopeId = options.terminalScopeId ?? newTerminalScopeId();
 	const seam = createTurnContinuationSeam({
 		lineageIdHash: options.lineageIdHash,
@@ -501,17 +921,121 @@ export function registerTerminalTurnScope(options: {
 		blockedContinuationIds: options.blockedContinuationIds,
 	});
 	seam.gate.close("terminal-turn");
-	registerTerminalScope({
+	const admitted = registerTerminalScope({
 		scopeId: terminalScopeId,
 		lineageIdHash: options.lineageIdHash,
 		abortedAttemptEpoch: options.promptAttemptEpoch,
 		gate: seam.gate,
 		fence: seam.fence,
 	});
+	if (!admitted) return undefined;
 	return {
 		scopeId: terminalScopeId,
 		lineageIdHash: options.lineageIdHash,
 		promptAttemptEpoch: options.promptAttemptEpoch,
 		seam,
 	};
+}
+
+/**
+ * TEST-ONLY: clear the module-global terminal-abort registries so tests get
+ * isolated lineage/binding/scope state. Never call from production code —
+ * the registries are intentionally process-lifetime in the runtime.
+ */
+export function resetTerminalAbortRegistriesForTests(): void {
+	activeScopes.clear();
+	activeScopeByAttempt.clear();
+	ownedRegistrations.clear();
+	lineageByToolCall.clear();
+	retainedOwnershipTuples.clear();
+	retainedAttemptPolicies.clear();
+	incompleteOwnedAttempts.clear();
+	incompleteToolCallWindows.clear();
+	retentionBacklog.clear();
+	ownedRegistrySaturationEver = false;
+}
+
+/**
+ * Structural subset of a durable terminal-scope row needed for bounding
+ * retention (review thread P2). Only rows with a COMPLETED disposition are
+ * evictable; pending markers are never touched.
+ */
+export interface DurableScopeRetentionRow {
+	idempotencyKeyHash?: string;
+	idempotencyInputHash?: string;
+	turnDisposition: "pending" | "no_effect" | (string & {});
+	acceptedAt?: number;
+	ownedWorkDisposition?: "not_requested" | "left_running" | "stopped" | "uncertain";
+	responseState?: "pending" | "sent" | "delivered" | "failed";
+	responsePayloadHash?: string;
+	terminalPublished?: boolean;
+}
+
+/**
+ * Evict the OLDEST COMPLETED terminal-scope rows beyond `cap`, mirroring the
+ * bounded in-memory idempotency cache so a long-lived session cannot grow
+ * the durable reconciliation document indefinitely. Completed dispositions
+ * (stopped/uncertain/no_effect) are evicted oldest-first; pending markers
+ * (an in-flight abort) are never evicted. Returns a new array.
+ */
+export function boundCompletedTerminalScopeRows<T extends DurableScopeRetentionRow>(rows: T[], cap: number): T[] {
+	const completed = rows.filter(s => s.turnDisposition !== "pending");
+	if (completed.length <= cap) return rows;
+	const overflow = completed.length - cap;
+	const evict = new Set(
+		[...completed]
+			.sort((a, b) => (a.acceptedAt ?? 0) - (b.acceptedAt ?? 0))
+			.slice(0, overflow)
+			.map(s => `${s.idempotencyKeyHash ?? ""}\u0000${s.idempotencyInputHash ?? ""}`),
+	);
+	return rows.filter(
+		s =>
+			!(
+				s.turnDisposition !== "pending" &&
+				evict.has(`${s.idempotencyKeyHash ?? ""}\u0000${s.idempotencyInputHash ?? ""}`)
+			),
+	);
+}
+
+/**
+ * Compact key tombstones for completed rows evicted by the retention cap: the
+ * key+input hashes are retained durably so a same-key retry after dispatch
+ * cache expiry/restart still replays instead of aborting an unrelated later
+ * prompt (review thread P2).
+ */
+/** Compact key tombstone with enough disposition metadata to reconstruct the
+ *  original replay result (the retention cap can evict stopped/uncertain rows,
+ *  not only no-effect reservations — review thread P2). */
+export interface EvictedTerminalKey {
+	keyHash: string;
+	inputHash: string;
+	turnDisposition: "stopped" | "uncertain" | "no_effect";
+	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
+	responseState?: "pending" | "sent" | "delivered" | "failed";
+	responsePayloadHash?: string;
+	terminalPublished?: boolean;
+}
+
+export function collectEvictedTerminalKeys<T extends DurableScopeRetentionRow>(
+	before: T[],
+	after: T[],
+): EvictedTerminalKey[] {
+	const afterKeys = new Set(after.map(s => `${s.idempotencyKeyHash ?? ""}\u0000${s.idempotencyInputHash ?? ""}`));
+	const evicted: EvictedTerminalKey[] = [];
+	for (const row of before) {
+		if (row.turnDisposition === "pending") continue;
+		const key = `${row.idempotencyKeyHash ?? ""}\u0000${row.idempotencyInputHash ?? ""}`;
+		if (!afterKeys.has(key) && row.idempotencyKeyHash && row.idempotencyInputHash) {
+			evicted.push({
+				keyHash: row.idempotencyKeyHash,
+				inputHash: row.idempotencyInputHash,
+				turnDisposition: row.turnDisposition as "stopped" | "uncertain" | "no_effect",
+				ownedWorkDisposition: row.ownedWorkDisposition ?? "not_requested",
+				responseState: row.responseState,
+				responsePayloadHash: row.responsePayloadHash,
+				terminalPublished: row.terminalPublished,
+			});
+		}
+	}
+	return evicted;
 }

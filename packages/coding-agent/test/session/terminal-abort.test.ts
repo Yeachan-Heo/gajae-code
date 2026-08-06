@@ -1,11 +1,15 @@
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
+import { AsyncJobManager } from "../../src/async/job-manager";
 import { ownedCompletionResumeAction } from "../../src/session/agent-session";
 import {
 	bindToolLineage,
+	boundCompletedTerminalScopeRows,
 	classifyOwnedCompletion,
+	classifyOwnedEnvelope,
 	createTurnContinuationSeam,
 	type DeliveryOrigin,
 	findOwnedRegistrationsForTurn,
+	isOwnedAttemptRegistrationIncomplete,
 	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
 	lookupTerminalScope,
@@ -16,13 +20,62 @@ import {
 	registerOwnedRegistration,
 	registerTerminalScope,
 	registerTerminalTurnScope,
+	resetTerminalAbortRegistriesForTests,
 	resolveToolLineage,
+	retireOwnedRegistrationForDeadLetter,
+	retireOwnedRegistrationsForEndpoint,
 	settleOwnedWork,
 	type TurnRegistrationKey,
 	unbindToolLineage,
 	unregisterOwnedRegistration,
 	unregisterTerminalScope,
 } from "../../src/session/terminal-abort";
+
+test("retireOwnedRegistrationsForEndpoint removes the disposing endpoint's live and retained tuples only", () => {
+	// A disposing session's owned registrations can never reach a delivery
+	// settlement boundary, and other managers deliberately never classify
+	// foreign-endpoint tuples as terminal — retiring them at dispose prevents
+	// repeated session churn from saturating the 8192-entry registry and making
+	// all later owned aborts fail closed (review thread P2).
+	const jobOf = (n: number) => ({ ...registration, jobId: `retire-a-${n}`, jobGeneration: `gen-${n}` });
+	// Saturate the live map and force evictions: with isJobTerminal always true,
+	// each registration beyond the cap moves an older terminal tuple into the
+	// retained evidence (compact pending-authorization tuples).
+	for (let n = 1; n <= 8200; n++) {
+		registerOwnedRegistration({ ...jobOf(n), endpointId: "ep-a" }, { isJobTerminal: () => true });
+	}
+	// An early evicted tuple lives in the RETAINED evidence (still findable).
+	expect(lookupOwnedRegistration("retire-a-1", "gen-1", "ep-a")).toBeDefined();
+	// A recent tuple is still LIVE.
+	expect(lookupOwnedRegistration("retire-a-8200", "gen-8200", "ep-a")).toBeDefined();
+	// A foreign endpoint registers fine (its candidate eviction is terminal).
+	// A foreign endpoint registers fine (its candidate eviction is terminal).
+	registerOwnedRegistration(
+		{ ...registration, endpointId: "ep-b", jobId: "retire-b", jobGeneration: "gen-b" },
+		{ isJobTerminal: () => true },
+	);
+	expect(lookupOwnedRegistration("retire-b", "gen-b", "ep-b")).toBeDefined();
+	// Retire ONLY ep-a: live, retained, and backlogged ep-a tuples all go.
+	retireOwnedRegistrationsForEndpoint("ep-a");
+	for (const n of [1, 1024, 4096, 8192, 8200]) {
+		expect(lookupOwnedRegistration(`retire-a-${n}`, `gen-${n}`, "ep-a")).toBeUndefined();
+	}
+	// The foreign endpoint's registration is untouched.
+	expect(lookupOwnedRegistration("retire-b", "gen-b", "ep-b")).toBeDefined();
+	// And the registry is back under its live cap with only ep-b's tuple.
+	expect(
+		[1, 2, 3].map(n =>
+			lookupOwnedRegistration(`retire-a-${n}`, `gen-${n}`, "ep-a") === undefined ? "gone" : "present",
+		),
+	).toEqual(["gone", "gone", "gone"]);
+	unregisterOwnedRegistration({ ...registration, endpointId: "ep-b", jobId: "retire-b", jobGeneration: "gen-b" });
+});
+
+beforeEach(() => {
+	// Isolate the process-lifetime registries per test (job ids/generations
+	// collide across tests; bindings/scopes persist otherwise).
+	resetTerminalAbortRegistriesForTests();
+});
 
 const registration: TurnRegistrationKey = {
 	endpointGeneration: 1,
@@ -333,10 +386,12 @@ test("classifyOwnedCompletion fails closed when the scope is removed or epoch mi
 	unregisterOwnedRegistration(registration);
 });
 test("registerTerminalTurnScope registers a synchronously closed scope for the turn", () => {
-	const { scopeId, lineageIdHash, promptAttemptEpoch, seam } = registerTerminalTurnScope({
+	const registered = registerTerminalTurnScope({
 		lineageIdHash: "lineage-turn-1",
 		promptAttemptEpoch: 9,
 	});
+	expect(registered).toBeDefined();
+	const { scopeId, lineageIdHash, promptAttemptEpoch, seam } = registered!;
 	expect(seam.fence.state).toBe("closed");
 	expect(seam.fence.ownedCompletionPolicy).toBe("enabled");
 	expect(seam.fence.abortedAttemptEpoch).toBe(9);
@@ -356,7 +411,7 @@ test("registerTerminalTurnScope with owned policy disables owned-completion deli
 		lineageIdHash: "lineage-turn-2",
 		promptAttemptEpoch: 11,
 		ownedCompletionPolicy: "disabled",
-	});
+	})!;
 	expect(seam.fence.ownedCompletionPolicy).toBe("disabled");
 	expect(
 		seam.gate.authorizeOwnedCompletion(
@@ -536,15 +591,27 @@ test("ownedCompletionResumeAction drops denied owned deliveries at the injector 
 	// An ordinary async-result message (no envelope) delivers as before.
 	expect(ownedCompletionResumeAction({ role: "custom", customType: "async-result" } as never)).toBe("ordinary");
 	// A scope:"turn" envelope with the exact registered tuple resumes fresh.
-	const turnScope = registerTerminalTurnScope({ lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 });
-	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 });
+	const turnScope = registerTerminalTurnScope({ lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 })!;
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-drop",
+		jobGeneration: "gen-drop",
+		lineageIdHash: "lineage-drop",
+		promptAttemptEpoch: 21,
+	});
 	const freshMessage = {
 		details: {
 			ownedCompletions: [
 				{
 					lineageIdHash: "lineage-drop",
 					promptAttemptEpoch: 21,
-					registration: { ...registration, lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 },
+					registration: {
+						...registration,
+						jobId: "job-drop",
+						jobGeneration: "gen-drop",
+						lineageIdHash: "lineage-drop",
+						promptAttemptEpoch: 21,
+					},
 				},
 			],
 		},
@@ -556,15 +623,27 @@ test("ownedCompletionResumeAction drops denied owned deliveries at the injector 
 		lineageIdHash: "lineage-owned",
 		promptAttemptEpoch: 22,
 		ownedCompletionPolicy: "disabled",
+	})!;
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-owned",
+		jobGeneration: "gen-owned",
+		lineageIdHash: "lineage-owned",
+		promptAttemptEpoch: 22,
 	});
-	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-owned", promptAttemptEpoch: 22 });
 	const ownedMessage = {
 		details: {
 			ownedCompletions: [
 				{
 					lineageIdHash: "lineage-owned",
 					promptAttemptEpoch: 22,
-					registration: { ...registration, lineageIdHash: "lineage-owned", promptAttemptEpoch: 22 },
+					registration: {
+						...registration,
+						jobId: "job-owned",
+						jobGeneration: "gen-owned",
+						lineageIdHash: "lineage-owned",
+						promptAttemptEpoch: 22,
+					},
 				},
 			],
 		},
@@ -581,6 +660,7 @@ test("ownedCompletionResumeAction drops denied owned deliveries at the injector 
 						promptAttemptEpoch: 21,
 						registration: {
 							...registration,
+							jobId: "job-drop",
 							lineageIdHash: "lineage-drop",
 							promptAttemptEpoch: 21,
 							jobGeneration: "forged",
@@ -590,34 +670,73 @@ test("ownedCompletionResumeAction drops denied owned deliveries at the injector 
 			},
 		} as never),
 	).toBe("drop");
-	// An envelope whose scope no longer exists is dropped (fail closed).
+	// An envelope whose scope no longer exists is ORDINARY: ownership is kept
+	// on the entry regardless of scope (P1), and no active scope means normal
+	// delivery — the owned-drop applies only to an existing disabled scope.
 	unregisterTerminalScope(turnScope.scopeId);
-	expect(ownedCompletionResumeAction(freshMessage)).toBe("drop");
+	expect(ownedCompletionResumeAction(freshMessage)).toBe("ordinary");
 	unregisterTerminalScope(ownedScope.scopeId);
-	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-drop", promptAttemptEpoch: 21 });
-	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-owned", promptAttemptEpoch: 22 });
+	unregisterOwnedRegistration({
+		...registration,
+		jobId: "job-drop",
+		jobGeneration: "gen-drop",
+		lineageIdHash: "lineage-drop",
+		promptAttemptEpoch: 21,
+	});
+	unregisterOwnedRegistration({
+		...registration,
+		jobId: "job-owned",
+		jobGeneration: "gen-owned",
+		lineageIdHash: "lineage-owned",
+		promptAttemptEpoch: 22,
+	});
 });
 
 test("mixed owned-completion batches drop when ANY envelope is denied", async () => {
-	// Allowed turn-scope envelope.
-	const turnScope = registerTerminalTurnScope({ lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 });
-	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 });
+	// Allowed turn-scope envelope (distinct job key from the denied fixture:
+	// the registry overwrites reused (jobId, generation) tuples).
+	const turnScope = registerTerminalTurnScope({ lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 })!;
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-mix-a",
+		jobGeneration: "gen-mix-a",
+		lineageIdHash: "lineage-mix-a",
+		promptAttemptEpoch: 31,
+	});
 	const allowed = {
 		lineageIdHash: "lineage-mix-a",
 		promptAttemptEpoch: 31,
-		registration: { ...registration, lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 },
+		registration: {
+			...registration,
+			jobId: "job-mix-a",
+			jobGeneration: "gen-mix-a",
+			lineageIdHash: "lineage-mix-a",
+			promptAttemptEpoch: 31,
+		},
 	};
 	// Denied owned-scope envelope (policy disabled).
 	const ownedScope = registerTerminalTurnScope({
 		lineageIdHash: "lineage-mix-b",
 		promptAttemptEpoch: 32,
 		ownedCompletionPolicy: "disabled",
+	})!;
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-mix-b",
+		jobGeneration: "gen-mix-b",
+		lineageIdHash: "lineage-mix-b",
+		promptAttemptEpoch: 32,
 	});
-	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-b", promptAttemptEpoch: 32 });
 	const denied = {
 		lineageIdHash: "lineage-mix-b",
 		promptAttemptEpoch: 32,
-		registration: { ...registration, lineageIdHash: "lineage-mix-b", promptAttemptEpoch: 32 },
+		registration: {
+			...registration,
+			jobId: "job-mix-b",
+			jobGeneration: "gen-mix-b",
+			lineageIdHash: "lineage-mix-b",
+			promptAttemptEpoch: 32,
+		},
 	};
 	const message = (ownedCompletions: unknown[]) => ({ details: { ownedCompletions } }) as never;
 	// Allowed-then-denied and denied-then-allowed orderings both drop.
@@ -631,6 +750,395 @@ test("mixed owned-completion batches drop when ANY envelope is denied", async ()
 	expect(isOwnedCompletionEnvelopeAllowed(allowed)).toBe(true);
 	unregisterTerminalScope(turnScope.scopeId);
 	unregisterTerminalScope(ownedScope.scopeId);
-	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-a", promptAttemptEpoch: 31 });
-	unregisterOwnedRegistration({ ...registration, lineageIdHash: "lineage-mix-b", promptAttemptEpoch: 32 });
+	unregisterOwnedRegistration({
+		...registration,
+		jobId: "job-mix-a",
+		jobGeneration: "gen-mix-a",
+		lineageIdHash: "lineage-mix-a",
+		promptAttemptEpoch: 31,
+	});
+	unregisterOwnedRegistration({
+		...registration,
+		jobId: "job-mix-b",
+		jobGeneration: "gen-mix-b",
+		lineageIdHash: "lineage-mix-b",
+		promptAttemptEpoch: 32,
+	});
+});
+
+test("pre-abort completion keeps ownership and is dropped once an owned scope lands", async () => {
+	// A job completes BEFORE any terminal abort: registered but no scope yet.
+	registerOwnedRegistration({ ...registration, lineageIdHash: "lineage-p1", promptAttemptEpoch: 51 });
+	const envelope = {
+		lineageIdHash: "lineage-p1",
+		promptAttemptEpoch: 51,
+		registration: { ...registration, lineageIdHash: "lineage-p1", promptAttemptEpoch: 51 },
+	};
+	const message = { details: { ownedCompletions: [envelope] } } as never;
+	// No scope -> ordinary (normal delivery; ownership preserved on the entry).
+	expect(ownedCompletionResumeAction(message)).toBe("ordinary");
+	expect(isOwnedCompletionEnvelopeAllowed(envelope)).toBe(true);
+	// The owned scope lands AFTER the completion was queued: the same entry is
+	// now classified as owned-stopped work and must be dropped, so the queued
+	// async result can never resume the agent (review thread P1).
+	registerTerminalTurnScope({
+		lineageIdHash: "lineage-p1",
+		promptAttemptEpoch: 51,
+		ownedCompletionPolicy: "disabled",
+	});
+	expect(ownedCompletionResumeAction(message)).toBe("drop");
+	expect(isOwnedCompletionEnvelopeAllowed(envelope)).toBe(false);
+});
+
+test("registerOwnedRegistration overwrites a reused tuple from a different turn", () => {
+	registerOwnedRegistration(registration);
+	// Same tuple, same lineage -> idempotent no-op.
+	registerOwnedRegistration(registration);
+	expect(lookupOwnedRegistration("job-1", "gen-1")).toEqual(registration);
+	// Reused (jobId, generation) with a DIFFERENT lineage (fresh manager after
+	// session replacement restarts ids at bg_1/job:1) must OVERWRITE so the new
+	// job binds to its own turn (review thread P1).
+	const fresh = { ...registration, lineageIdHash: "lineage-new-session", promptAttemptEpoch: 99 };
+	registerOwnedRegistration(fresh);
+	expect(lookupOwnedRegistration("job-1", "gen-1")).toEqual(fresh);
+	unregisterOwnedRegistration(fresh);
+});
+
+test("boundCompletedTerminalScopeRows evicts the oldest completed rows but never pending markers", () => {
+	const rows: Array<{
+		idempotencyKeyHash: string;
+		idempotencyInputHash: string;
+		turnDisposition: string;
+		acceptedAt: number;
+	}> = [];
+	for (let i = 0; i < 300; i++) {
+		rows.push({
+			idempotencyKeyHash: `k${i}`,
+			idempotencyInputHash: `i${i}`,
+			turnDisposition: "no_effect",
+			acceptedAt: i,
+		});
+	}
+	rows.push({
+		idempotencyKeyHash: "stopped-key",
+		idempotencyInputHash: "i",
+		turnDisposition: "stopped",
+		acceptedAt: 0,
+	});
+	rows.push({
+		idempotencyKeyHash: "pending-key",
+		idempotencyInputHash: "i",
+		turnDisposition: "pending",
+		acceptedAt: 0,
+	});
+	const bounded = boundCompletedTerminalScopeRows(rows, 256);
+	// 300 completed + 1 stopped -> 256 completed kept (45 oldest evicted); the
+	// pending marker is NEVER evicted.
+	expect(bounded.filter((r: { turnDisposition: string }) => r.turnDisposition !== "pending")).toHaveLength(256);
+	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "k0")).toBe(false);
+	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "k43")).toBe(false);
+	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "k44")).toBe(true);
+	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "k299")).toBe(true);
+	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "stopped-key")).toBe(false);
+	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "pending-key")).toBe(true);
+});
+
+test("evicted terminal scopes retain their attempt policy via a compact tombstone", () => {
+	// Register a turn-scope attempt, then overflow the scope cap so it is evicted.
+	registerTerminalTurnScope({ lineageIdHash: "lineage-tomb", promptAttemptEpoch: 5001 });
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-tomb",
+		jobGeneration: "gen-tomb",
+		lineageIdHash: "lineage-tomb",
+		promptAttemptEpoch: 5001,
+	});
+	// The runnable cap check: register MAX_ACTIVE_TERMINAL_SCOPES more scopes to
+	// force eviction of the first (FIFO). The oldest scope is the tomb one.
+	for (let i = 0; i < 1024; i++) {
+		registerTerminalTurnScope({ lineageIdHash: `lineage-fill-${i}`, promptAttemptEpoch: 10000 + i });
+	}
+	expect(lookupTerminalScope("lineage-tomb", 5001)).toBeUndefined();
+	// A still-running turn-scope owned completion from the evicted attempt must
+	// STILL classify as fresh (resume), not degrade to ordinary.
+	const turnEnvelope = {
+		lineageIdHash: "lineage-tomb",
+		promptAttemptEpoch: 5001,
+		registration: {
+			...registration,
+			jobId: "job-tomb",
+			jobGeneration: "gen-tomb",
+			lineageIdHash: "lineage-tomb",
+			promptAttemptEpoch: 5001,
+		},
+	};
+	expect(classifyOwnedEnvelope(turnEnvelope)).toBe("fresh");
+	// An owned-scope evicted policy drops.
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-tomb-owned",
+		jobGeneration: "gen-tomb-owned",
+		lineageIdHash: "lineage-tomb-owned",
+		promptAttemptEpoch: 6001,
+	});
+	registerTerminalTurnScope({
+		lineageIdHash: "lineage-tomb-owned",
+		promptAttemptEpoch: 6001,
+		ownedCompletionPolicy: "disabled",
+	});
+	for (let i = 0; i < 1024; i++) {
+		registerTerminalTurnScope({ lineageIdHash: `lineage-fill2-${i}`, promptAttemptEpoch: 20000 + i });
+	}
+	expect(lookupTerminalScope("lineage-tomb-owned", 6001)).toBeUndefined();
+	expect(
+		classifyOwnedEnvelope({
+			lineageIdHash: "lineage-tomb-owned",
+			promptAttemptEpoch: 6001,
+			registration: {
+				...registration,
+				jobId: "job-tomb-owned",
+				jobGeneration: "gen-tomb-owned",
+				lineageIdHash: "lineage-tomb-owned",
+				promptAttemptEpoch: 6001,
+			},
+		}),
+	).toBe("drop");
+});
+
+test("registerOwnedRegistration evicts terminal registrations before a live one", () => {
+	// A long-lived live job is registered first; then the cap is overflowed with
+	// shorter FINISHED jobs. The live tuple must survive the FIFO eviction.
+	registerOwnedRegistration(
+		{ ...registration, jobId: "job-live", jobGeneration: "gen-live" },
+		{ isJobTerminal: candidate => (candidate.jobId === "job-live" ? undefined : true) },
+	);
+	for (let i = 0; i < 8192; i++) {
+		registerOwnedRegistration(
+			{ ...registration, jobId: `job-${i}`, jobGeneration: `gen-${i}`, lineageIdHash: `lineage-${i}` },
+			{ isJobTerminal: candidate => (candidate.jobId === "job-live" ? undefined : true) },
+		);
+	}
+	expect(lookupOwnedRegistration("job-live", "gen-live")).toBeDefined();
+	unregisterOwnedRegistration({ ...registration, jobId: "job-live", jobGeneration: "gen-live" });
+});
+
+test("retained-policy fallback validates the full tuple; a rebound registration classifies ordinary", () => {
+	registerTerminalTurnScope({ lineageIdHash: "lineage-rebind", promptAttemptEpoch: 7001 });
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-rebind",
+		jobGeneration: "gen-rebind",
+		lineageIdHash: "lineage-rebind",
+		promptAttemptEpoch: 7001,
+	});
+	for (let i = 0; i < 1024; i++) {
+		registerTerminalTurnScope({ lineageIdHash: `lineage-fill-${i}`, promptAttemptEpoch: 30000 + i });
+	}
+	expect(lookupTerminalScope("lineage-rebind", 7001)).toBeUndefined();
+	// The (jobId, jobGeneration) is REBOUND to another lineage/epoch.
+	registerOwnedRegistration({
+		...registration,
+		jobId: "job-rebind",
+		jobGeneration: "gen-rebind",
+		lineageIdHash: "lineage-new",
+		promptAttemptEpoch: 8001,
+	});
+	// A stale envelope for the OLD lineage must NOT classify fresh (the tuple no
+	// longer matches the authoritative registration).
+	expect(
+		classifyOwnedEnvelope({
+			lineageIdHash: "lineage-rebind",
+			promptAttemptEpoch: 7001,
+			registration: {
+				...registration,
+				jobId: "job-rebind",
+				jobGeneration: "gen-rebind",
+				lineageIdHash: "lineage-rebind",
+				promptAttemptEpoch: 7001,
+			},
+		}),
+	).toBe("ordinary");
+});
+
+test("rekeying the endpoint registration keeps owned registration resolvable after a session-identity transition", () => {
+	// Reproduction of the review-thread P1 scenario: the manager is registered
+	// under the construction-time endpoint, then newSession/switchSession
+	// commits a successor session id. Post-transition lineage bindings use the
+	// successor id, so AsyncJobManager.endpointIdOf() must follow — otherwise
+	// a queued subagent resume cannot resolve its lineage or register its
+	// owned tuple and a scope:"owned" abort misreports stopped_owned.
+	const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+	try {
+		AsyncJobManager.registerForEndpoint("session-a", manager);
+		expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-a");
+
+		// Pre-transition binding resolves under the predecessor endpoint.
+		bindToolLineage("call-pre", {
+			lineageIdHash: "lineage-pre",
+			promptAttemptEpoch: 7,
+			endpointGeneration: 4,
+			endpointId: "session-a",
+		});
+		registerOwnedIfLineaged({ getJob: () => ({ generation: "gen-1" }) }, "call-pre", "job-pre", "session-a");
+		expect(lookupOwnedRegistration("job-pre", "gen-1", "session-a")).toMatchObject({
+			lineageIdHash: "lineage-pre",
+			promptAttemptEpoch: 7,
+			jobId: "job-pre",
+		});
+		unregisterOwnedRegistration({
+			lineageIdHash: "lineage-pre",
+			promptAttemptEpoch: 7,
+			endpointGeneration: 4,
+			endpointId: "session-a",
+			jobId: "job-pre",
+			jobGeneration: "gen-1",
+		});
+		unbindToolLineage("call-pre", "session-a");
+
+		// Committed identity transition: the registry key follows the manager.
+		AsyncJobManager.rekeyForEndpoint("session-a", "session-b", AsyncJobManager.forEndpoint("session-a"));
+		expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+
+		// A queued subagent resume bound AFTER the transition registers its
+		// owned tuple through endpointIdOf(manager) — the exact seam the review
+		// thread identified as broken.
+		bindToolLineage("call-resume", {
+			lineageIdHash: "lineage-resume",
+			promptAttemptEpoch: 8,
+			endpointGeneration: 5,
+			endpointId: "session-b",
+		});
+		registerOwnedIfLineaged(
+			{ getJob: () => ({ generation: "gen-1" }) },
+			"call-resume",
+			"job-resume",
+			AsyncJobManager.endpointIdOf(manager),
+		);
+		expect(lookupOwnedRegistration("job-resume", "gen-1", "session-b")).toMatchObject({
+			lineageIdHash: "lineage-resume",
+			promptAttemptEpoch: 8,
+			jobId: "job-resume",
+		});
+		unregisterOwnedRegistration({
+			lineageIdHash: "lineage-resume",
+			promptAttemptEpoch: 8,
+			endpointGeneration: 5,
+			endpointId: "session-b",
+			jobId: "job-resume",
+			jobGeneration: "gen-1",
+		});
+		unbindToolLineage("call-resume", "session-b");
+
+		// Disposal drops the rekeyed registration regardless of the session id.
+		AsyncJobManager.unregisterManager(manager);
+		expect(AsyncJobManager.endpointIdOf(manager)).toBeUndefined();
+	} finally {
+		AsyncJobManager.unregisterManager(manager);
+	}
+});
+
+test("refuses the new registration when the eviction candidate must stay in the live backlog", () => {
+	// Reproduction of the review-thread P2 scenario: with retained evidence at
+	// cap, the eviction candidate (terminal but still awaiting delivery) must
+	// be restored to the LIVE map (backlogged). The new registration must
+	// FAIL CLOSED instead of inserting anyway and letting both the live map
+	// and the backlog grow without bound while deliveries stay stalled.
+	const terminal = { isJobTerminal: () => true };
+	// Registrations 1..8192 fill the live map; registrations 8193..10240 evict
+	// the oldest terminal tuples into retained evidence (2048 = cap).
+	for (let i = 0; i < 8192 + 2048; i++) {
+		registerOwnedRegistration(
+			{ ...registration, jobId: `job-${i}`, jobGeneration: `gen-${i}`, lineageIdHash: `lineage-${i}` },
+			terminal,
+		);
+	}
+	// The next candidate (job-2048) is restored to the live backlog; the new
+	// tuple is refused fail-closed and marked registration-incomplete.
+	registerOwnedRegistration(
+		{ ...registration, jobId: "job-refused", jobGeneration: "gen-refused", lineageIdHash: "lineage-refused" },
+		terminal,
+	);
+	expect(lookupOwnedRegistration("job-refused", "gen-refused")).toBeUndefined();
+	expect(isOwnedAttemptRegistrationIncomplete("lineage-refused", registration.promptAttemptEpoch)).toBe(true);
+	// The pending candidate is preserved (backlogged) and still findable, so
+	// authorizeOwnedCompletion keeps its authorization while queued.
+	expect(lookupOwnedRegistration("job-2048", "gen-2048")).toBeDefined();
+});
+
+test("rekeying retires the predecessor endpoint's owned registrations", () => {
+	// Reproduction of the review-thread P2 scenario: an identity transition
+	// rekeys the manager mapping but tuples registered before the transition
+	// stay keyed by the PREDECESSOR endpoint, where no delivery-settlement
+	// boundary ever fires; disposal retires only the successor. The rekey
+	// helper retires the predecessor's tuples as part of the transition.
+	const managerForRekey = new AsyncJobManager({ onJobComplete: async () => {} });
+	AsyncJobManager.registerForEndpoint("ep-old", managerForRekey);
+	AsyncJobManager.registerForEndpoint("ep-new", managerForRekey);
+	try {
+		// Pre-transition tuples under the predecessor endpoint.
+		registerOwnedRegistration(
+			{ ...registration, endpointId: "ep-old", jobId: "pre-1", jobGeneration: "gen-1" },
+			{ isJobTerminal: () => true },
+		);
+		// A successor-owned tuple is untouched by the retire.
+		registerOwnedRegistration(
+			{ ...registration, endpointId: "ep-new", jobId: "post-1", jobGeneration: "gen-1" },
+			{ isJobTerminal: () => true },
+		);
+		expect(lookupOwnedRegistration("pre-1", "gen-1", "ep-old")).toBeDefined();
+
+		// The rekey transition (helper semantics): move the manager mapping,
+		// then retire the predecessor endpoint's tuples.
+		AsyncJobManager.rekeyForEndpoint("ep-old", "ep-new", AsyncJobManager.forEndpoint("ep-old"));
+		retireOwnedRegistrationsForEndpoint("ep-old");
+
+		expect(AsyncJobManager.endpointIdOf(managerForRekey)).toBe("ep-new");
+		expect(lookupOwnedRegistration("pre-1", "gen-1", "ep-old")).toBeUndefined();
+		expect(lookupOwnedRegistration("post-1", "gen-1", "ep-new")).toBeDefined();
+	} finally {
+		AsyncJobManager.unregisterManager(managerForRekey);
+	}
+});
+test("lineage-binding eviction marks only the evicted attempt, never the whole process", () => {
+	// Reproduction of the review-thread P2 scenario: every tool call binds a
+	// lineage entry and production never unbinds it, so a healthy long-running
+	// daemon inevitably reaches the 8,192 cap and the first eviction is
+	// ordinary historical churn. The evicted ATTEMPT must fail closed (its
+	// per-attempt marker may be displaced before an in-flight job registers),
+	// but the process must NOT be permanently disabled — otherwise every
+	// subsequent scope:"owned" abort returns uncertainty even when all
+	// evicted calls and their jobs settled long ago.
+	for (let i = 0; i < 8192 + 10; i++) {
+		bindToolLineage(`call-evict-${i}`, {
+			lineageIdHash: `lineage-evict-${i}`,
+			promptAttemptEpoch: 1000 + i,
+			endpointGeneration: 0,
+		});
+	}
+	// The EVICTED attempt is provably-incomplete (per-attempt marker).
+	expect(isOwnedAttemptRegistrationIncomplete("lineage-evict-0", 1000)).toBe(true);
+	// An unrelated attempt stays provable: ordinary historical churn does not
+	// disable owned aborts process-wide (review thread P2).
+	expect(isOwnedAttemptRegistrationIncomplete("unrelated-attempt", 999_999)).toBe(false);
+});
+
+test("retireOwnedRegistrationForDeadLetter removes the exact tuple a dead-lettered delivery leaves behind", () => {
+	// Reproduction of the review-thread P2 scenario: a dead-lettered delivery
+	// (queue overflow or retry exhaustion) never injects a message and has no
+	// later consumption boundary, so the manager retires the exact tuple.
+	registerOwnedRegistration(
+		{ ...registration, endpointId: "ep-dl", jobId: "dl-1", jobGeneration: "gen-1" },
+		{ isJobTerminal: () => true },
+	);
+	expect(lookupOwnedRegistration("dl-1", "gen-1", "ep-dl")).toBeDefined();
+	retireOwnedRegistrationForDeadLetter("ep-dl", "dl-1", "gen-1");
+	expect(lookupOwnedRegistration("dl-1", "gen-1", "ep-dl")).toBeUndefined();
+	// A foreign tuple is untouched.
+	registerOwnedRegistration(
+		{ ...registration, endpointId: "ep-keep", jobId: "keep-1", jobGeneration: "gen-1" },
+		{ isJobTerminal: () => true },
+	);
+	retireOwnedRegistrationForDeadLetter("ep-dl", "keep-1", "gen-1");
+	expect(lookupOwnedRegistration("keep-1", "gen-1", "ep-keep")).toBeDefined();
+	unregisterOwnedRegistration({ ...registration, endpointId: "ep-keep", jobId: "keep-1", jobGeneration: "gen-1" });
 });

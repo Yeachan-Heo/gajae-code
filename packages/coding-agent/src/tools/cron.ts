@@ -589,8 +589,17 @@ export class CronTool implements AgentTool<typeof cronSchema, CronToolDetails> {
 		}
 	}
 
+	#resolveOwnedJobManager(): AsyncJobManager | undefined {
+		const endpointId = this.session.getSessionId?.() ?? undefined;
+		return this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
+	}
+
 	async #create(params: CronParams): Promise<AgentToolResult<CronToolDetails>> {
-		const manager = AsyncJobManager.instance();
+		// Cron cleanup is consumed by the owning AgentSession's lifecycle
+		// manager. A concurrent top-level session can be the process-global
+		// instance, so registering there would leave this session's timer
+		// running after new-session, switch, or disposal (review thread P1).
+		const manager = this.#resolveOwnedJobManager();
 		if (!manager) {
 			throw new ToolError("Async execution is disabled; cron is unavailable in this session.");
 		}

@@ -4,6 +4,12 @@ import {
 	type ResumeDescriptor,
 	type SubagentRecord,
 } from "@gajae-code/coding-agent/async/job-manager";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	resetTerminalAbortRegistriesForTests,
+	type TurnRegistrationKey,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 
 function subagentRecord(subagentId: string, currentJobId: string, status: SubagentRecord["status"]): SubagentRecord {
 	return {
@@ -193,5 +199,44 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		expect(manager.getResumeDescriptor("paused-sub")).toEqual(resumeDescriptor("paused-sub"));
 		expect(manager.getLiveHandle("paused-sub")).toBeUndefined();
 		expect(manager.getSubagentProgress("paused-sub")).toBeUndefined();
+	});
+	test("dead-lettered deliveries retire the exact owned registration", async () => {
+		resetTerminalAbortRegistriesForTests();
+		const manager = new AsyncJobManager({
+			onJobComplete: () => {
+				throw new Error("persistent delivery failure");
+			},
+			maxRunningJobs: 2,
+			retentionMs: 10_000,
+		});
+		try {
+			manager.register("task", "dead letter", async () => "done", { id: "dl-job" });
+			const generation = manager.getJob("dl-job")?.generation ?? "";
+			expect(generation).not.toBe("");
+			const registration: TurnRegistrationKey = {
+				endpointId: "ep-dl",
+				endpointGeneration: 0,
+				lineageIdHash: "dl-lineage",
+				promptAttemptEpoch: 7,
+				jobId: "dl-job",
+				jobGeneration: generation,
+			};
+			registerOwnedRegistration(registration, { isJobTerminal: () => true });
+			expect(lookupOwnedRegistration("dl-job", generation, "ep-dl")).toBeDefined();
+			// The delivery exhausts its retries and dead-letters; the exact
+			// tuple must be retired even though no message is ever injected and
+			// no consumption boundary runs (review thread P2).
+			const deadline = Date.now() + 10_000;
+			while (
+				manager.getDeliveryState().deadLettered === 0 ||
+				lookupOwnedRegistration("dl-job", generation, "ep-dl") !== undefined
+			) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for dead-letter retire");
+				await Bun.sleep(20);
+			}
+		} finally {
+			await manager.dispose({ timeoutMs: 100 });
+			resetTerminalAbortRegistriesForTests();
+		}
 	});
 });

@@ -1,6 +1,7 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { $env, logger } from "@gajae-code/utils";
+import type { AsyncJobManager } from "../async";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
@@ -217,6 +218,8 @@ export interface ToolSession {
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
 	/** Request that the active managed foreground bash call fold into a background job, if supported. */
 	requestForegroundBashBackground?: () => boolean;
+	/** Get the session-owned or inherited async job manager. */
+	getAsyncJobManager?: () => AsyncJobManager | undefined;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/** Scope-held MCP facade for mcp:// resolution. */

@@ -314,6 +314,37 @@ describe("reconciliation-store", () => {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
+	test.each([
+		["turn disposition", { turnDisposition: "bogus" }],
+		["owned-work disposition", { ownedWorkDisposition: "bogus" }],
+		["response state", { responseState: "bogus" }],
+		["empty response payload hash", { responsePayloadHash: "" }],
+		["publication state", { terminalPublished: "yes" }],
+	])("quarantines an evicted tombstone with invalid %s", async (_field, invalid) => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-evicted-bad-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const storePath = reconciliationStorePath(sessionFile, "s1");
+		await fs.mkdir(path.dirname(storePath), { recursive: true });
+		await fs.writeFile(
+			storePath,
+			JSON.stringify({
+				version: RECONCILIATION_STORE_VERSION,
+				sessionId: "s1",
+				records: [],
+				evictedTerminalKeys: [{ keyHash: "key", inputHash: "input", ...invalid }],
+			}),
+		);
+		try {
+			const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+			expect(await store.load()).toEqual([]);
+			expect(store.snapshotTerminalKeys()).toEqual([]);
+			expect((await fs.readdir(path.dirname(storePath))).some(name => name.includes("corrupt"))).toBe(true);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("settleTerminalScopeRestart maps pending to uncertain and never invents success", () => {
 		const now = 5_000;
 		const pending: DurableTerminalScopeRecord = {
@@ -442,5 +473,232 @@ test("initial pending marker CASes to stopped through the same owner", async () 
 	expect(settleTerminalScopeRestart(reloaded.snapshotTerminalScopes(), 9)[0]).toEqual(
 		reloaded.snapshotTerminalScopes()[0],
 	);
+	await fs.rm(root, { recursive: true, force: true });
+});
+
+test("response-state transition is guarded by the normalized input hash", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-inputhash-"));
+	const sessionFile = path.join(root, "s.jsonl");
+	await fs.writeFile(sessionFile, "");
+	const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	const base = {
+		selection: "turn" as const,
+		idempotencyKeyHash: "k1",
+		ownedWorkDisposition: "left_running" as const,
+		automaticDeliveryDisposition: "enabled" as const,
+		resumeOnOwnedCompletion: true,
+		turnContinuationFence: {
+			state: "retained" as const,
+			abortedAttemptEpoch: 3,
+			blockedContinuationIds: [],
+			predecessorTombstones: [],
+			ownedCompletionPolicy: "enabled" as const,
+		},
+		responseState: "pending" as const,
+		responsePayloadHash: "p",
+		acceptedAt: 1,
+	};
+	await store.transactTerminalScopes(() => [
+		{ ...base, idempotencyInputHash: "input-turn", turnDisposition: "stopped" as const },
+		{ ...base, idempotencyInputHash: "input-owned", turnDisposition: "stopped" as const },
+	]);
+	// A response for the TURN input (matching key + input) advances only the
+	// turn record; the owned record (same key, different input) stays pending
+	// — a conflict/invalid response for a different input must never advance
+	// the original marker (review thread P2).
+	await store.transactTerminalScopes(scopes =>
+		scopes.map(scope =>
+			scope.idempotencyKeyHash === "k1" &&
+			scope.idempotencyInputHash === "input-turn" &&
+			scope.responseState === "pending"
+				? { ...scope, responseState: "sent" as const }
+				: scope,
+		),
+	);
+	const after = store.snapshotTerminalScopes();
+	expect(after.find(s => s.idempotencyInputHash === "input-turn")?.responseState).toBe("sent");
+	expect(after.find(s => s.idempotencyInputHash === "input-owned")?.responseState).toBe("pending");
+	await fs.rm(root, { recursive: true, force: true });
+});
+
+test("no-effect terminal reservations persist and survive restart settlement", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-noeffect-"));
+	const sessionFile = path.join(root, "s.jsonl");
+	await fs.writeFile(sessionFile, "");
+	const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	await store.transactTerminalScopes(() => [
+		{
+			selection: "turn",
+			idempotencyKeyHash: "k1",
+			idempotencyInputHash: "i1",
+			turnDisposition: "no_effect",
+			ownedWorkDisposition: "not_requested",
+			automaticDeliveryDisposition: "enabled",
+			resumeOnOwnedCompletion: true,
+			turnContinuationFence: {
+				state: "retained",
+				abortedAttemptEpoch: 0,
+				blockedContinuationIds: [],
+				predecessorTombstones: [],
+				ownedCompletionPolicy: "enabled",
+			},
+			responseState: "pending",
+			responsePayloadHash: "i1",
+			acceptedAt: 1,
+		},
+	]);
+	// Validator accepts it and restart settlement leaves a no-effect row
+	// untouched (only pending rows settle to uncertainty).
+	const reloaded = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	await reloaded.load();
+	expect(reloaded.snapshotTerminalScopes()[0]!.turnDisposition).toBe("no_effect");
+	expect(settleTerminalScopeRestart(reloaded.snapshotTerminalScopes(), 9)[0]!.turnDisposition).toBe("no_effect");
+	await fs.rm(root, { recursive: true, force: true });
+});
+test("evicted pending tombstone advances to sent through the delivery transaction", async () => {
+	// A terminal response write lands while the row was already evicted by the
+	// 256-row retention cap: the delivery callback must update the matching
+	// COMPACT TOMBSTONE (evictedTerminalKeys), not only live scope rows — a
+	// same-key replay after cache expiry/restart would otherwise report a false
+	// durable delivery state (review thread P2).
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-evicted-delivery-"));
+	const sessionFile = path.join(root, "s.jsonl");
+	await fs.writeFile(sessionFile, "");
+	const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	const scope = {
+		selection: "turn" as const,
+		idempotencyKeyHash: "k-evicted",
+		idempotencyInputHash: "i-evicted",
+		turnDisposition: "stopped" as const,
+		ownedWorkDisposition: "left_running" as const,
+		automaticDeliveryDisposition: "enabled" as const,
+		resumeOnOwnedCompletion: true,
+		turnContinuationFence: {
+			state: "retained" as const,
+			abortedAttemptEpoch: 3,
+			blockedContinuationIds: [],
+			predecessorTombstones: [],
+			ownedCompletionPolicy: "enabled" as const,
+		},
+		responseState: "pending" as const,
+		responsePayloadHash: "p",
+		acceptedAt: 1,
+	};
+	await store.transactTerminalScopes(() => [scope]);
+	// The retention cap evicts the completed row; its compact tombstone keeps
+	// the pending response state so the replay reconstructs the original row.
+	await store.transactTerminalState(_state => ({
+		scopes: [],
+		keys: [
+			{
+				keyHash: "k-evicted",
+				inputHash: "i-evicted",
+				turnDisposition: "stopped",
+				ownedWorkDisposition: "left_running",
+				responseState: "pending",
+				responsePayloadHash: "p",
+			},
+		],
+	}));
+	expect(store.snapshotTerminalKeys()[0]!.responseState).toBe("pending");
+	// The delivery callback (onControlResponseDelivery) transaction: advance
+	// the matching live scope OR evicted tombstone from pending, atomically.
+	await store.transactTerminalState(state => ({
+		scopes: state.scopes.map(s =>
+			s.idempotencyKeyHash === "k-evicted" && s.idempotencyInputHash === "i-evicted" && s.responseState === "pending"
+				? { ...s, responseState: "sent" as const }
+				: s,
+		),
+		keys: state.keys.map(k =>
+			k.keyHash === "k-evicted" && k.inputHash === "i-evicted" && k.responseState === "pending"
+				? { ...k, responseState: "sent" }
+				: k,
+		),
+	}));
+	// The tombstone now reports the durable sent state; an unrelated pending
+	// tombstone is untouched.
+	expect(store.snapshotTerminalKeys()[0]!.responseState).toBe("sent");
+	await store.transactTerminalState(state => ({
+		scopes: state.scopes,
+		keys: [
+			...state.keys,
+			{
+				keyHash: "k-other",
+				inputHash: "i-other",
+				turnDisposition: "stopped",
+				ownedWorkDisposition: "left_running",
+				responseState: "pending",
+				responsePayloadHash: "q",
+			},
+		],
+	}));
+	await store.transactTerminalState(state => ({
+		scopes: state.scopes,
+		keys: state.keys.map(k =>
+			k.keyHash === "k-evicted" && k.inputHash === "i-evicted" && k.responseState === "pending"
+				? { ...k, responseState: "failed" }
+				: k,
+		),
+	}));
+	expect(store.snapshotTerminalKeys().find(k => k.keyHash === "k-evicted")?.responseState).toBe("sent");
+	expect(store.snapshotTerminalKeys().find(k => k.keyHash === "k-other")?.responseState).toBe("pending");
+	// Survives restart settlement (settlement only touches pending SCOPE rows).
+	const reloaded = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	await reloaded.load();
+	expect(reloaded.snapshotTerminalKeys().find(k => k.keyHash === "k-evicted")?.responseState).toBe("sent");
+});
+
+test("empty-store reload clears retained evicted-terminal keys on every empty-load path", async () => {
+	// Reproduction of the review-thread P2 scenario: a store instance that
+	// already loaded evicted-key tombstones must not keep replaying or
+	// conflicting on keys that no longer exist in the durable store — the
+	// ENOENT, no-path, and corrupt/quarantine branches all empty the store.
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-empty-reload-"));
+	const sessionFile = path.join(root, "s.jsonl");
+	await fs.writeFile(sessionFile, "");
+	const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+	await store.transactTerminalState(_state => ({
+		scopes: [],
+		keys: [
+			{
+				keyHash: "k-gone",
+				inputHash: "i-gone",
+				turnDisposition: "stopped",
+				ownedWorkDisposition: "left_running",
+				responseState: "pending",
+				responsePayloadHash: "p",
+			},
+		],
+	}));
+	expect(store.snapshotTerminalKeys()[0]!.keyHash).toBe("k-gone");
+
+	// ENOENT: the store's backing file deleted → load() clears
+	// records/scopes AND the retained terminal-key cache.
+	await fs.rm(reconciliationStorePath(sessionFile, "s1"), { force: true });
+	await store.load();
+	expect(store.snapshotTerminalKeys()).toEqual([]);
+
+	// Corrupt/quarantine: unparseable content → same cleared cache.
+	await store.transactTerminalState(_state => ({
+		scopes: [],
+		keys: [
+			{
+				keyHash: "k-quarantine",
+				inputHash: "i-q",
+				turnDisposition: "stopped",
+				ownedWorkDisposition: "left_running",
+				responseState: "pending",
+				responsePayloadHash: "p",
+			},
+		],
+	}));
+	await fs.writeFile(reconciliationStorePath(sessionFile, "s1"), "{ definitely not json");
+	await store.load();
+	expect(store.snapshotTerminalKeys()).toEqual([]);
+
+	// No-path: a store instance without a backing file starts empty.
+	const pathless = createReconciliationStore({ sessionFile: "", sessionId: "s2" });
+	await pathless.load();
+	expect(pathless.snapshotTerminalKeys()).toEqual([]);
 	await fs.rm(root, { recursive: true, force: true });
 });

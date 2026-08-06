@@ -173,3 +173,56 @@ describe("async result yield queue delivery", () => {
 		expect(asyncDetails(harness.prompts[0]![0]!).jobs.map(job => job.jobId)).toEqual([jobId]);
 	});
 });
+
+test("flush builds one message per groupKey origin so owned drops cannot suppress other origins", async () => {
+	const { queue, followUps } = createHarness(false);
+	// Two entries from DIFFERENT ownership origins plus one ordinary entry.
+	const g1 = { jobId: "j-1", result: "one", kind: "g1" };
+	const g2 = { jobId: "j-2", result: "two", kind: "g2" };
+	const ordinary = { jobId: "j-3", result: "three", kind: "ordinary" };
+	queue.register("test-grouped", {
+		groupKey: entry => entry.kind,
+		build: (survivors: Array<{ jobId: string; result: string; kind: string }>) => ({
+			role: "custom",
+			customType: "async-result",
+			content: survivors.map(s => s.result).join("+"),
+			display: true,
+			attribution: "agent",
+			details: { jobs: survivors.map(s => s.jobId) },
+			timestamp: 1,
+		}),
+	});
+	queue.enqueue("test-grouped", g1);
+	queue.enqueue("test-grouped", g2);
+	queue.enqueue("test-grouped", ordinary);
+	await queue.flush("streaming");
+	// One message per origin (3 groups), each carrying only its own entries.
+	const grouped = followUps as CustomMessage<{ jobs: string[] }>[];
+	expect(grouped).toHaveLength(3);
+	expect(grouped.map(m => m.content).sort()).toEqual(["one", "three", "two"]);
+	expect(grouped.find(m => m.content === "one")?.details?.jobs).toEqual(["j-1"]);
+	expect(grouped.find(m => m.content === "two")?.details?.jobs).toEqual(["j-2"]);
+	expect(grouped.find(m => m.content === "three")?.details?.jobs).toEqual(["j-3"]);
+	expect(grouped[0]?.details?.jobs).toBeDefined();
+});
+
+test("flush without a groupKey keeps the single-batch behavior", async () => {
+	const { queue, followUps } = createHarness(false);
+	queue.register("test-plain", {
+		build: (survivors: string[]) => ({
+			role: "custom",
+			customType: "async-result",
+			content: survivors.join("+"),
+			display: true,
+			attribution: "agent",
+			details: {},
+			timestamp: 1,
+		}),
+	});
+	queue.enqueue("test-plain", "a");
+	queue.enqueue("test-plain", "b");
+	await queue.flush("streaming");
+	const plain = followUps as CustomMessage<Record<string, never>>[];
+	expect(plain).toHaveLength(1);
+	expect(plain[0]?.content).toBe("a+b");
+});

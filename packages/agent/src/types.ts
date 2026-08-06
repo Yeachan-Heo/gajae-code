@@ -326,6 +326,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
 	/**
+	 * Invoked with the follow-up messages the loop dequeues for the next turn
+	 * (right after {@link getFollowUpMessages}). The consumer may use this to
+	 * attach per-turn state (e.g. a fresh owned-completion lineage) at actual
+	 * resume admission rather than when the message was merely queued.
+	 */
+	onFollowUpConsumed?: (messages: AgentMessage[]) => void;
+	/**
 	 * Supplies one bounded synthetic recovery instruction before the loop would
 	 * otherwise yield. Unlike a follow-up, it is sent only to the provider and
 	 * is not committed to durable agent message history.

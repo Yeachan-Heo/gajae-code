@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
-import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { Agent, type AgentTool, type RunSettlementProof } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
@@ -47,6 +47,7 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { getNotificationConfig } from "../src/sdk/bus/config";
+import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import * as telegramDaemon from "../src/sdk/bus/telegram-daemon";
 import { SessionSdkHost } from "../src/sdk/host";
@@ -169,7 +170,29 @@ function start(
 	createNotificationsExtension(
 		api,
 		effectiveSettings
-			? { settings: effectiveSettings, ensureTelegramDaemon, ensureProviderDaemon, controller }
+			? {
+					settings: effectiveSettings,
+					ensureTelegramDaemon,
+					ensureProviderDaemon,
+					controller,
+					terminalAbortSeams: {
+						getTerminalTurnEpoch: () =>
+							(ctx as { getTerminalTurnEpoch?: () => number | undefined }).getTerminalTurnEpoch?.(),
+						cancelPendingPreflightForTerminalAbort: () =>
+							(
+								ctx as { cancelPendingPreflightForTerminalAbort?: () => void }
+							).cancelPendingPreflightForTerminalAbort?.(),
+						abortPromptAndWaitWithTerminal: (handle, seamOptions) =>
+							(
+								ctx as {
+									abortPromptAndWait?: (
+										handle: string,
+										options: { graceMs: number; terminal?: { scope: string } },
+									) => Promise<unknown>;
+								}
+							).abortPromptAndWait?.(handle, seamOptions) as unknown as Promise<RunSettlementProof>,
+					},
+				}
 			: undefined,
 	);
 	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
@@ -2319,6 +2342,75 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
 
+test("terminal abort cancels a pending prompt preflight (never accepts)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-preflight-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-terminal-preflight-${Date.now()}`;
+	const live = { idle: true };
+	const neverPreflight = Promise.withResolvers<never>();
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		sessionManager: {
+			...(context(cwd, sessionId, "main", live).sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
+		},
+		getTerminalTurnEpoch: () => 1,
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			if (content === "never resolve") {
+				await neverPreflight.promise;
+			}
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("socket error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "term-prompt",
+			operation: "turn.prompt",
+			input: { text: "never resolve", images: [] },
+		}),
+	);
+	await waitFor(() => deliveries.length > 0, "prompt preflight started");
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "term-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "term-abort-key-1",
+		}),
+	);
+	await waitFor(
+		() =>
+			frames.some(frame => frame.type === "control_response" && frame.id === "term-abort") &&
+			frames.some(frame => frame.type === "control_response" && frame.id === "term-prompt"),
+		"terminal abort + cancelled preflight responses",
+	);
+	// The preflight is cancelled (never accepted), so the prompt never starts.
+	const promptResponse = frames.find(frame => frame.type === "control_response" && frame.id === "term-prompt");
+	expect(promptResponse).toMatchObject({ ok: false });
+	expect(frames.some(frame => frame.type === "agent_failed" || frame.type === "agent_start")).toBe(false);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
+});
+
 test("SDK host abort-and-prompt cancels a never-resolving preflight before replacement submission", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-never-preflight-"));
 	dirs.push(cwd);
@@ -2520,8 +2612,147 @@ test("SDK host turn.abort terminal mode returns no-effect with no active turn", 
 	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+test("terminal abort durable replay after restart never cancels a NEW unrelated pending preflight", async () => {
+	// A successful durable row replayed after the in-memory dispatch entry
+	// expires/restart returns stopped/stopped_owned/no_effect WITH `stored`; the
+	// admission predicate must treat EVERY stored-carrying replay as a
+	// non-admission — cancelling the requester's unrelated in-preflight prompt
+	// there would give an idempotency replay real effects (review thread P1).
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-replay-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-terminal-replay-${Date.now()}`;
+	const sessionFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`);
+	const makeContext = () => ({
+		...context(cwd, sessionId),
+		sessionManager: {
+			...(context(cwd, sessionId).sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		getTerminalTurnEpoch: () => 1,
+	});
+	// Host #1: file-backed store. The first abort (no active turn) durably
+	// reserves a no-effect row for the key.
+	const handlersA = start(makeContext(), undefined, () => {}, true);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint (host A)");
+	const endpointA = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const framesA: Record<string, unknown>[] = [];
+	const socketA = new WebSocket(`${endpointA.url}/?token=${encodeURIComponent(endpointA.token)}`);
+	socketA.addEventListener("message", event => framesA.push(JSON.parse(String(event.data))));
+	sockets.push(socketA);
+	await new Promise<void>((resolve, reject) => {
+		socketA.addEventListener("open", () => resolve(), { once: true });
+		socketA.addEventListener("error", () => reject(new Error("WS error (host A)")), { once: true });
+	});
+	socketA.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "replay-abort-1",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "mq-key-1",
+		}),
+	);
+	await waitFor(
+		() => framesA.some(frame => frame.type === "control_response" && frame.id === "replay-abort-1"),
+		"host A abort response",
+	);
+	expect(framesA.find(f => f.type === "control_response" && f.id === "replay-abort-1")).toMatchObject({
+		ok: true,
+		result: { selection: "turn", turn: "no_active_turn", terminal: "terminal_no_effect" },
+	});
+	// The durable no-effect reservation is written to the reconciliation store
+	// (a sibling of the transcript, derived path).
+	expect(fs.existsSync(reconciliationStorePath(sessionFile, sessionId))).toBe(true);
+	await handlersA.get("session_shutdown")?.({ type: "session_shutdown" }, makeContext());
+	await closeSocket(socketA);
+	// Shutdown may leave the endpoint file behind; remove it so host B's
+	// waitFor below observes a FRESH endpoint (token/port) instead of A's stale
+	// one — otherwise the reconnect would hang on a dead server.
+	fs.rmSync(endpointFile, { force: true });
+	await Bun.sleep(25);
 
-test("SDK host turn.abort terminal mode fails closed when the turn cannot be fenced", async () => {
+	// Host #2: FRESH in-memory dispatch (restart) over the SAME durable store.
+	let sessionPreflightCancelled = 0;
+	const ctxB = {
+		...makeContext(),
+		cancelPendingPreflightForTerminalAbort: () => {
+			sessionPreflightCancelled += 1;
+		},
+	};
+	const neverPreflight = Promise.withResolvers<never>();
+	const deliveries: unknown[][] = [];
+	const handlersB = start(
+		ctxB,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			if (content === "unrelated pending prompt") {
+				await neverPreflight.promise;
+			}
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint (host B)");
+	const endpointB = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const framesB: Record<string, unknown>[] = [];
+	const socketB = new WebSocket(`${endpointB.url}/?token=${encodeURIComponent(endpointB.token)}`);
+	socketB.addEventListener("message", event => framesB.push(JSON.parse(String(event.data))));
+	sockets.push(socketB);
+	await new Promise<void>((resolve, reject) => {
+		socketB.addEventListener("open", () => resolve(), { once: true });
+		socketB.addEventListener("error", () => reject(new Error("WS error (host B)")), { once: true });
+	});
+	await waitFor(() => framesB.some(frame => frame.type === "hello"), "host B hello");
+	// A NEW unrelated prompt enters PREFLIGHT (never resolves) on the SAME
+	// connection while the replay lands.
+	socketB.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "new-prompt",
+			operation: "turn.prompt",
+			input: { text: "unrelated pending prompt", images: [] },
+		}),
+	);
+	await waitFor(() => deliveries.length > 0, "new prompt preflight started");
+	socketB.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "replay-abort-2",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "mq-key-1",
+		}),
+	);
+	// Host B's store hydration (restart recovery) can stall on file I/O under
+	// load; give the replay response a longer observation window than the
+	// shared 15s waitFor before failing.
+	const replayDeadline = Date.now() + 30_000;
+	while (!framesB.some(frame => frame.type === "control_response" && frame.id === "replay-abort-2")) {
+		if (Date.now() > replayDeadline) throw new Error("Timed out waiting for replay abort response (host B)");
+		await Bun.sleep(20);
+	}
+	const replay = framesB.find(f => f.type === "control_response" && f.id === "replay-abort-2")!;
+	expect(replay).toMatchObject({ ok: true, result: { terminal: "terminal_no_effect", replay: expect.any(Object) } });
+	// The stored-carrying replay is a NON-admission: neither the connection-level
+	// waiter cancel nor the session preflight seam may fire, and the prompt stays
+	// pending (no response, no cancellation).
+	await Bun.sleep(100);
+	expect(sessionPreflightCancelled).toBe(0);
+	expect(framesB.some(f => f.type === "control_response" && f.id === "new-prompt")).toBe(false);
+	// Releasing the preflight completes the prompt normally — it was never
+	// cancelled by the replay.
+	neverPreflight.resolve();
+	await waitFor(
+		() => framesB.some(frame => frame.type === "control_response" && frame.id === "new-prompt"),
+		"new prompt response after preflight release",
+	);
+	expect(framesB.find(f => f.type === "control_response" && f.id === "new-prompt")).toMatchObject({ ok: true });
+	await handlersB.get("session_shutdown")?.({ type: "session_shutdown" }, ctxB);
+}, 20_000);
+
+test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started prompt as cancelled", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-fence-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-terminal-fence-${Date.now()}`;
@@ -2569,9 +2800,11 @@ test("SDK host turn.abort terminal mode fails closed when the turn cannot be fen
 	);
 	await waitFor(() => deliveries.length === 1, "terminal prompt accepted");
 	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	// The fixture harness has no exact run handle or abortPromptAndWait seam, so
-	// the fence cannot settle: terminal abort must fail closed with safe
-	// uncertainty instead of fabricating a stopped disposition.
+	// The fixture harness fires agent_start without binding an exact run handle,
+	// so the prompt is accepted-but-not-started: terminal abort must cancel the
+	// in-flight session preflight and FINALIZE the accepted prompt as a pre-run
+	// cancellation (no_active_turn / terminal_no_effect) instead of terminalizing
+	// with no run handle (which would wrongly fence the connection).
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -2589,11 +2822,8 @@ test("SDK host turn.abort terminal mode fails closed when the turn cannot be fen
 		ok: true,
 		result: {
 			selection: "turn",
-			turn: "uncertain",
-			ownedWork: "left_running",
-			automaticDelivery: "enabled",
-			resumeOnOwnedCompletion: true,
-			reason: "worker_unsettled",
+			turn: "no_active_turn",
+			terminal: "terminal_no_effect",
 		},
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);

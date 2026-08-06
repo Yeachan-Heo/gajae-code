@@ -533,6 +533,33 @@ describe("Cron tools", () => {
 		).rejects.toThrow(/Cron task limit reached/);
 	});
 
+	it("registers owner cleanup through the session endpoint manager, not the global manager", async () => {
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			// Session A's manager is endpoint-registered while concurrent session
+			// B is process-global. Cron cleanup must be consumed when A's
+			// lifecycle runs owner cleanups, not when B shuts down.
+			AsyncJobManager.setInstance(foreign);
+			expect(AsyncJobManager.registerForEndpoint("test-session", manager)).toBe(true);
+			const session = createSession(settings);
+			const create = CronTool.createIf(session)!;
+			const list = CronTool.createIf(session)!;
+			await create.execute("call", {
+				op: "create",
+				cron_expression: "*/5 * * * *",
+				prompt: "endpoint-owned cleanup",
+			});
+			expect(expectText(await list.execute("call", { op: "list" })).details.jobs).toHaveLength(1);
+			manager.runOwnerCleanups({ ownerId: "0-Test" });
+			expect(expectText(await list.execute("call", { op: "list" })).details.jobs).toHaveLength(0);
+		} finally {
+			AsyncJobManager.setInstance(manager);
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(foreign);
+			await foreign.dispose({ timeoutMs: 100 });
+		}
+	});
+
 	it("clears timers and schedules when owner cleanup fires", async () => {
 		const { create, list } = makeTools();
 		await create.execute("call", {

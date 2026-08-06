@@ -37,7 +37,10 @@ export interface SessionSdkTransport {
 	readonly sessionId: string;
 	readonly stateRoot: string;
 	readonly token: string;
-	sendFrame(connectionId: string, frame: SdkFrame): void | Promise<void>;
+	sendFrame(
+		connectionId: string,
+		frame: SdkFrame,
+	): void | "written" | "dropped" | Promise<void> | Promise<"written" | "dropped">;
 	onFrame(handler: (connectionId: string, frame: SdkFrame) => void): undefined | (() => void);
 	onMalformedFrame?(handler: (connectionId: string, message: string) => void): undefined | (() => void);
 	start(): Promise<{ url: string }>;
@@ -80,7 +83,11 @@ export class SessionSdkSessionRuntime {
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
-			sendFrame: options.transport.sendFrame,
+			sendFrame: (connectionId, frame) => {
+				const result = options.transport.sendFrame(connectionId, frame);
+				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
+				return result ?? "written";
+			},
 			onFrame: options.transport.onFrame,
 		});
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {

@@ -254,6 +254,15 @@ export interface ExecutorOptions {
 	 */
 	parentArtifactManager?: ArtifactManager;
 	managedPersistence?: ManagedTaskPersistence;
+	/**
+	 * The parent session's ENDPOINT-owned AsyncJobManager (resolved by the
+	 * TaskTool via forEndpoint(sessionId) ?? instance()). Model metadata and
+	 * live-handle state for THIS subagent are recorded in the SAME manager the
+	 * task job runs in — with concurrent top-level sessions the process-global
+	 * instance belongs to a different session and would surface this subagent
+	 * under the wrong session's record (review thread P1).
+	 */
+	asyncJobManager?: AsyncJobManager;
 	parentHindsightSessionState?: HindsightSessionState;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
@@ -1536,7 +1545,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Record which model the subagent actually runs on (and any auth fallback,
 			// see #985) so the subagent panel can surface it to the user.
 			if (model) {
-				AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
+				(options.asyncJobManager ?? AsyncJobManager.instance())?.updateSubagentModel?.(options.subagentId ?? id, {
 					requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
 					effectiveModel: resolvedModelString,
 					modelFellBack: authFallbackUsed === true,
@@ -1703,6 +1712,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentTaskPrefix: id,
+					inheritedAsyncJobManager: options.asyncJobManager,
 					inheritedMcpManager: options.parentMcpManager,
 					agentId: id,
 					agentDisplayName: agent.name,
@@ -1736,7 +1746,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				session.seedDefaultFallbackResolution(activeIndex, skips);
 			}
 			const liveSubagentId = options.subagentId ?? id;
-			const manager = AsyncJobManager.instance();
+			const manager = options.asyncJobManager ?? AsyncJobManager.instance();
 			if (manager) {
 				manager.registerLiveHandle(liveSubagentId, {
 					requestPause: () => {
@@ -1862,7 +1872,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						getActivePromptHandle: () => session.activePromptHandle,
 						abort: () => session.abort(),
 						abortPromptAndWait: (handle, options) => session.abortPromptAndWait(handle, options),
-						getTerminalTurnEpoch: () => session.getTerminalTurnEpoch(),
 						hasPendingMessages: () => session.queuedMessageCount > 0,
 						getPendingMessageCounts: () => session.pendingMessageCounts,
 						getTranscript: () => session.getTranscript(),
@@ -2075,7 +2084,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
-			AsyncJobManager.instance()?.removeLiveHandle(options.subagentId ?? id);
+			(options.asyncJobManager ?? AsyncJobManager.instance())?.removeLiveHandle(options.subagentId ?? id);
 			if (unsubscribe) {
 				try {
 					unsubscribe();

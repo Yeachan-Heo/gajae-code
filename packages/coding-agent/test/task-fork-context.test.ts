@@ -84,12 +84,14 @@ function createYieldingSession(): AgentSession {
 function createSession(
 	overrides: Partial<Record<string, unknown>> = {},
 	buildForkContextSeed?: ToolSession["buildForkContextSeed"],
+	sessionId?: string,
 ): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated({ "async.enabled": false, ...overrides }),
 		getSessionFile: () => null,
+		getSessionId: () => sessionId ?? null,
 		getSessionSpawns: () => "*",
 		model: { contextWindow: 1_000 } as Model,
 		buildForkContextSeed,
@@ -622,6 +624,40 @@ describe("fork context policy surface", () => {
 
 		expect(seedBuilder).toHaveBeenCalledTimes(1);
 		expect(getOptions()?.forkContextSeed).toBe(seedAtDispatch);
+	});
+
+	test("TaskTool registers task jobs on the session's endpoint-owned manager, never the process-global instance", async () => {
+		// Reproduction of the review-thread P1 scenario: the registration sites
+		// are endpoint-qualified, so TaskTool's manager selection must resolve
+		// the session's ENDPOINT manager — with concurrent top-level sessions
+		// and B as the process-global instance, recording A's task in B's
+		// manager would make an A scope:"owned" abort consult A's manager and
+		// return uncertainty while the task continues.
+		mockAgents([createAgent("executor")]);
+		mockCreateAgentSession();
+		const endpointManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			AsyncJobManager.setInstance(foreign);
+			// Mirror the production sdk/session.ts wiring: the session's
+			// manager is registered under its endpoint.
+			AsyncJobManager.registerForEndpoint("ep-task-route", endpointManager);
+			const tool = await TaskTool.create(
+				createSession({ "task.forkContext.enabled": true, "async.enabled": true }, undefined, "ep-task-route"),
+			);
+			await tool.execute("tool-call", {
+				agent: "executor",
+				tasks: [{ id: "Route", description: "r", assignment: "a" }],
+			} as TaskParams);
+			// The task job landed in the ENDPOINT manager; the process-global
+			// (foreign) manager never received it.
+			expect(endpointManager.getAllJobs().length).toBeGreaterThan(0);
+			expect(foreign.getAllJobs().length).toBe(0);
+		} finally {
+			AsyncJobManager.setInstance(undefined);
+			AsyncJobManager.unregisterManager(endpointManager);
+			AsyncJobManager.unregisterManager(foreign);
+		}
 	});
 
 	test("bundled executor and architect agents default to forkContext: allowed", () => {

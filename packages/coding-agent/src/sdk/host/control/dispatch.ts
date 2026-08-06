@@ -123,6 +123,23 @@ function inputHash(input: unknown): string {
 		.update(JSON.stringify(canonicalize(input)))
 		.digest("hex");
 }
+/**
+ * Normalize a WELL-FORMED terminal abort input for the idempotency hash:
+ * omitted scope defaults to "turn", so `{mode:"terminal"}` and
+ * `{mode:"terminal", scope:"turn"}` share one idempotency key (the durable
+ * terminal-scope replay hashes the same normalized payload). Malformed
+ * inputs (unknown fields, invalid mode/scope) are left raw so they are
+ * rejected downstream and never collide with a valid input's key.
+ */
+function normalizeTerminalAbortInputForHash(input: unknown): unknown {
+	if (typeof input !== "object" || input === null) return input;
+	const record = input as Record<string, unknown>;
+	if (record.mode !== "terminal") return input;
+	for (const key of Object.keys(record)) if (!TERMINAL_ABORT_FIELDS.has(key)) return input;
+	const scope = record.scope;
+	if (scope !== undefined && scope !== "turn" && scope !== "owned") return input;
+	return { mode: "terminal", scope: scope === undefined ? "turn" : scope };
+}
 
 function text(input: ControlInput, key = "text"): string {
 	return input[key] as string;
@@ -373,7 +390,11 @@ function idempotent(
 	const now = Date.now();
 	for (const [key, entry] of requests) if (entry.expiresAt <= now) requests.delete(key);
 	const key = `${row.sdkId}\u0000${request.idempotencyKey}`;
-	const hash = inputHash(request.input);
+	// Terminal abort normalizes the omitted scope BEFORE hashing so the
+	// defaulted and explicit shapes share one idempotency key (and reach the
+	// durable terminal-scope replay on eviction); malformed inputs stay raw.
+	const hashInput = row.sdkId === "turn.abort" ? normalizeTerminalAbortInputForHash(request.input) : request.input;
+	const hash = inputHash(hashInput);
 	const existing = requests.get(key);
 	if (existing) {
 		requests.delete(key);

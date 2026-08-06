@@ -46,7 +46,7 @@ export interface DurableTerminalScopeRecord {
 	idempotencyKeyHash?: string;
 	/** SHA-256 of the canonicalized normalized input; raw input is never persisted. */
 	idempotencyInputHash?: string;
-	turnDisposition: "pending" | "stopped" | "uncertain";
+	turnDisposition: "pending" | "stopped" | "uncertain" | "no_effect";
 	/** Whether the correlated agent_end event was published (AC 19). */
 	terminalPublished?: boolean;
 	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
@@ -71,11 +71,30 @@ export interface DurableTerminalScopeRecord {
 	terminalAt?: number;
 }
 
+/** Compact evicted-key tombstone with enough disposition metadata to
+ *  reconstruct the original terminal replay result (review thread P2). */
+export interface EvictedTerminalKeyEntry {
+	keyHash: string;
+	inputHash: string;
+	turnDisposition?: "stopped" | "uncertain" | "no_effect";
+	ownedWorkDisposition?: "not_requested" | "left_running" | "stopped" | "uncertain";
+	responseState?: "pending" | "sent" | "delivered" | "failed";
+	responsePayloadHash?: string;
+	terminalPublished?: boolean;
+}
+
 export interface ReconciliationStoreDocument {
 	version: typeof RECONCILIATION_STORE_VERSION;
 	sessionId: string;
 	records: DurableReconciliationRecord[];
 	terminalScopes?: DurableTerminalScopeRecord[];
+	/**
+	 * Compact key tombstones for completed terminal rows evicted by the
+	 * retention cap: the key hash is retained durably so a same-key retry
+	 * after dispatch-cache expiry/restart still replays instead of aborting an
+	 * unrelated later prompt (review thread P2).
+	 */
+	evictedTerminalKeys?: EvictedTerminalKeyEntry[];
 }
 
 export interface ReconciliationStoreFs {
@@ -182,9 +201,18 @@ function isValidTerminalScope(value: unknown): boolean {
 		responsePayloadHash,
 		acceptedAt,
 		terminalAt,
+		idempotencyKeyHash,
+		idempotencyInputHash,
+		terminalPublished,
 	} = value;
 	if (selection !== "turn" && selection !== "owned") return false;
-	if (turnDisposition !== "pending" && turnDisposition !== "stopped" && turnDisposition !== "uncertain") return false;
+	if (
+		turnDisposition !== "pending" &&
+		turnDisposition !== "stopped" &&
+		turnDisposition !== "uncertain" &&
+		turnDisposition !== "no_effect"
+	)
+		return false;
 	if (
 		ownedWorkDisposition !== "not_requested" &&
 		ownedWorkDisposition !== "left_running" &&
@@ -223,10 +251,51 @@ function isValidTerminalScope(value: unknown): boolean {
 	)
 		return false;
 	if (typeof responsePayloadHash !== "string" || !responsePayloadHash) return false;
+	if (typeof idempotencyKeyHash !== "string" || !idempotencyKeyHash) return false;
+	if (typeof idempotencyInputHash !== "string" || !idempotencyInputHash) return false;
+	if (terminalPublished !== undefined && typeof terminalPublished !== "boolean") return false;
 	if (typeof acceptedAt !== "number" || !Number.isFinite(acceptedAt)) return false;
 	if (terminalAt !== undefined && (typeof terminalAt !== "number" || !Number.isFinite(terminalAt))) return false;
 	// An incomplete (pending) scope cannot already be terminal.
 	if (turnDisposition === "pending" && terminalAt !== undefined) return false;
+	return true;
+}
+
+/** Evicted tombstones are replay authority, so every optional replay field
+ *  is validated before a durable document is trusted. */
+function isValidEvictedTerminalKeyEntry(value: unknown): value is EvictedTerminalKeyEntry {
+	if (!isRecord(value)) return false;
+	if (typeof value.keyHash !== "string" || !value.keyHash) return false;
+	if (typeof value.inputHash !== "string" || !value.inputHash) return false;
+	if (
+		value.turnDisposition !== undefined &&
+		value.turnDisposition !== "stopped" &&
+		value.turnDisposition !== "uncertain" &&
+		value.turnDisposition !== "no_effect"
+	)
+		return false;
+	if (
+		value.ownedWorkDisposition !== undefined &&
+		value.ownedWorkDisposition !== "not_requested" &&
+		value.ownedWorkDisposition !== "left_running" &&
+		value.ownedWorkDisposition !== "stopped" &&
+		value.ownedWorkDisposition !== "uncertain"
+	)
+		return false;
+	if (
+		value.responseState !== undefined &&
+		value.responseState !== "pending" &&
+		value.responseState !== "sent" &&
+		value.responseState !== "delivered" &&
+		value.responseState !== "failed"
+	)
+		return false;
+	if (
+		value.responsePayloadHash !== undefined &&
+		(typeof value.responsePayloadHash !== "string" || !value.responsePayloadHash)
+	)
+		return false;
+	if (value.terminalPublished !== undefined && typeof value.terminalPublished !== "boolean") return false;
 	return true;
 }
 
@@ -252,11 +321,21 @@ function parseDocument(raw: string, expectedSessionId: string): ReconciliationSt
 		if (!Array.isArray(terminalScopes)) throw new Error("invalid terminal scopes");
 		if (!terminalScopes.every(isValidTerminalScope)) throw new Error("invalid terminal scope");
 	}
+	const evictedTerminalKeys = value.evictedTerminalKeys;
+	if (
+		evictedTerminalKeys !== undefined &&
+		(!Array.isArray(evictedTerminalKeys) || !evictedTerminalKeys.every(isValidEvictedTerminalKeyEntry))
+	) {
+		throw new Error("invalid evicted terminal keys");
+	}
 	return {
 		version: RECONCILIATION_STORE_VERSION,
 		sessionId: expectedSessionId,
 		records: value.records as DurableReconciliationRecord[],
 		...(terminalScopes !== undefined ? { terminalScopes: terminalScopes as DurableTerminalScopeRecord[] } : {}),
+		...(evictedTerminalKeys !== undefined
+			? { evictedTerminalKeys: evictedTerminalKeys as EvictedTerminalKeyEntry[] }
+			: {}),
 	};
 }
 
@@ -327,6 +406,14 @@ export interface ReconciliationStore {
 	transactTerminalScopes(
 		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
 	): Promise<void>;
+	transactTerminalState(
+		mutator: (state: { scopes: DurableTerminalScopeRecord[]; keys: EvictedTerminalKeyEntry[] }) => {
+			scopes: DurableTerminalScopeRecord[];
+			keys: EvictedTerminalKeyEntry[];
+		},
+	): Promise<void>;
+	transactTerminalKeys(mutator: (keys: EvictedTerminalKeyEntry[]) => EvictedTerminalKeyEntry[]): Promise<void>;
+	snapshotTerminalKeys(): EvictedTerminalKeyEntry[];
 	loadTerminalScopes(): Promise<DurableTerminalScopeRecord[]>;
 	/** Snapshot of terminal scopes currently held in memory. */
 	snapshotTerminalScopes(): DurableTerminalScopeRecord[];
@@ -349,6 +436,7 @@ export function createReconciliationStore(options: {
 
 	let memory: DurableReconciliationRecord[] = [];
 	let terminalMemory: DurableTerminalScopeRecord[] = [];
+	let terminalKeyMemory: EvictedTerminalKeyEntry[] = [];
 	let chain: Promise<void> = Promise.resolve();
 
 	const writeAtomic = async (document: ReconciliationStoreDocument): Promise<void> => {
@@ -381,6 +469,10 @@ export function createReconciliationStore(options: {
 		if (!filePath) {
 			memory = [];
 			terminalMemory = [];
+			// No durable store means no evicted-key tombstones either: a store
+			// instance that already loaded tombstones must not keep replaying or
+			// conflicting on keys that no longer exist on disk (review thread P2).
+			terminalKeyMemory = [];
 			return memory;
 		}
 		let raw: string;
@@ -392,6 +484,7 @@ export function createReconciliationStore(options: {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			memory = [];
 			terminalMemory = [];
+			terminalKeyMemory = [];
 			return memory;
 		}
 		let document: ReconciliationStoreDocument;
@@ -406,6 +499,7 @@ export function createReconciliationStore(options: {
 			}
 			memory = [];
 			terminalMemory = [];
+			terminalKeyMemory = [];
 			return memory;
 		}
 		const settled = settleProcessRestart(document.records, now());
@@ -421,9 +515,13 @@ export function createReconciliationStore(options: {
 				sessionId,
 				records: settled,
 				...(document.terminalScopes !== undefined || terminalChanged ? { terminalScopes: settledTerminal } : {}),
+				...(document.evictedTerminalKeys !== undefined
+					? { evictedTerminalKeys: document.evictedTerminalKeys }
+					: {}),
 			});
 		memory = settled;
 		terminalMemory = settledTerminal;
+		terminalKeyMemory = document.evictedTerminalKeys ?? [];
 		return memory;
 	};
 
@@ -437,6 +535,7 @@ export function createReconciliationStore(options: {
 				sessionId,
 				records: next,
 				...(terminalMemory.length > 0 ? { terminalScopes: terminalMemory } : {}),
+				...(terminalKeyMemory.length > 0 ? { evictedTerminalKeys: terminalKeyMemory } : {}),
 			});
 			memory = next;
 		};
@@ -458,8 +557,60 @@ export function createReconciliationStore(options: {
 				sessionId,
 				records: memory,
 				...(next.length > 0 ? { terminalScopes: next } : {}),
+				...(terminalKeyMemory.length > 0 ? { evictedTerminalKeys: terminalKeyMemory } : {}),
 			});
 			terminalMemory = next;
+		};
+		const pending = chain.then(run, run);
+		chain = pending.then(
+			() => undefined,
+			() => undefined,
+		);
+		await pending;
+	};
+
+	const transactTerminalState = async (
+		mutator: (state: { scopes: DurableTerminalScopeRecord[]; keys: EvictedTerminalKeyEntry[] }) => {
+			scopes: DurableTerminalScopeRecord[];
+			keys: EvictedTerminalKeyEntry[];
+		},
+	): Promise<void> => {
+		const run = async () => {
+			const next = mutator({
+				scopes: terminalMemory.map(s => ({ ...s })),
+				keys: terminalKeyMemory.map(k => ({ ...k })),
+			});
+			await writeAtomic({
+				version: RECONCILIATION_STORE_VERSION,
+				sessionId,
+				records: memory,
+				...(next.scopes.length > 0 ? { terminalScopes: next.scopes } : {}),
+				...(next.keys.length > 0 ? { evictedTerminalKeys: next.keys } : {}),
+			});
+			terminalMemory = next.scopes;
+			terminalKeyMemory = next.keys;
+		};
+		const pending = chain.then(run, run);
+		chain = pending.then(
+			() => undefined,
+			() => undefined,
+		);
+		await pending;
+	};
+
+	const transactTerminalKeys = async (
+		mutator: (keys: EvictedTerminalKeyEntry[]) => EvictedTerminalKeyEntry[],
+	): Promise<void> => {
+		const run = async () => {
+			const next = mutator(terminalKeyMemory.map(k => ({ ...k })));
+			await writeAtomic({
+				version: RECONCILIATION_STORE_VERSION,
+				sessionId,
+				records: memory,
+				...(terminalMemory.length > 0 ? { terminalScopes: terminalMemory } : {}),
+				...(next.length > 0 ? { evictedTerminalKeys: next } : {}),
+			});
+			terminalKeyMemory = next;
 		};
 		const pending = chain.then(run, run);
 		chain = pending.then(
@@ -472,6 +623,7 @@ export function createReconciliationStore(options: {
 	const deleteStore = async (): Promise<void> => {
 		memory = [];
 		terminalMemory = [];
+		terminalKeyMemory = [];
 		if (!filePath) return;
 		await fileFs.unlink(filePath).catch(error => {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -485,11 +637,14 @@ export function createReconciliationStore(options: {
 		load,
 		snapshot: () => memory.map(r => ({ ...r })),
 		transactTerminalScopes,
+		transactTerminalState,
+		transactTerminalKeys,
 		loadTerminalScopes: async () => {
 			await load();
 			return terminalMemory.map(s => ({ ...s }));
 		},
 		snapshotTerminalScopes: () => terminalMemory.map(s => ({ ...s })),
+		snapshotTerminalKeys: () => terminalKeyMemory.map(k => ({ ...k })),
 		delete: deleteStore,
 	};
 }

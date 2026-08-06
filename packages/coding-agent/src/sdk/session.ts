@@ -122,9 +122,11 @@ import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../ses
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
 import {
-	classifyOwnedCompletion,
 	isOwnedCompletionEnvelopeAllowed,
+	lookupOwnedRegistration,
 	type OwnedCompletionEnvelope,
+	retireOwnedRegistrationsForEndpoint,
+	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
 import {
@@ -198,6 +200,31 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 	const survivors = entries.filter(
 		entry => entry.ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(entry.ownedCompletion),
 	);
+	// Denied entries never reach followUp/prompt (AC 36), so no later
+	// settlement boundary sees them — retire their terminal tuples HERE,
+	// otherwise an owned_unsettled abort's later completion keeps occupying
+	// the global registration and retained-policy capacities (review P2).
+	const denied = entries.filter(
+		(entry): entry is AsyncResultEntry & { ownedCompletion: OwnedCompletionEnvelope } =>
+			entry.ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(entry.ownedCompletion),
+	);
+	if (denied.length > 0) {
+		// Resolve the manager from the registration's OWN endpoint: the
+		// process-global instance is the last-created session, so when B's
+		// manager is global with the same local job id still running, the
+		// terminality check would observe B's running job and refuse to
+		// unregister A's already-terminal tuple (review thread P2).
+		const manager =
+			AsyncJobManager.forEndpoint(denied[0]?.ownedCompletion.registration.endpointId) ?? AsyncJobManager.instance();
+		for (const entry of denied) {
+			const registration = entry.ownedCompletion.registration;
+			const job = manager?.getJob(registration.jobId);
+			const status = job?.generation === registration.jobGeneration ? job?.status : undefined;
+			if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
+				unregisterOwnedRegistration(registration);
+			}
+		}
+	}
 	if (survivors.length === 0) return null;
 	const jobs = survivors.map(entry => ({
 		jobId: entry.jobId,
@@ -461,6 +488,8 @@ export interface CreateAgentSessionOptions {
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
 	parentTaskPrefix?: string;
+	/** Parent manager borrowed by a child session; never disposed by the child. */
+	inheritedAsyncJobManager?: AsyncJobManager;
 	/**
 	 * W6b: the parent's scope-held MCP facade, handed to a canonical sub-session so
 	 * it can inherit always-on MCP tools without owning the manager. Replaces the
@@ -1185,6 +1214,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	let asyncJobManager: AsyncJobManager | undefined;
+	let asyncJobManagerAdmitted = false;
+	let priorAsyncJobManager: AsyncJobManager | undefined;
 	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -1629,7 +1661,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// parent's manager via `AsyncJobManager.instance()` (set below), so creating
 		// a second instance here just to leave it orphaned wastes a constructor and
 		// risks accidental disposal of the parent's manager on subagent teardown.
-		const asyncJobManager =
+		asyncJobManager =
 			backgroundJobsEnabled && !options.parentTaskPrefix
 				? new AsyncJobManager({
 						maxRunningJobs: asyncMaxJobs,
@@ -1643,7 +1675,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// and receive a fresh turn attempt. Recover the immutable origin
 							// BEFORE formatting or artifact allocation; missing metadata
 							// fails closed to an ordinary delivery.
-							const ownedCompletion = job ? classifyOwnedCompletion(jobId, job.generation) : undefined;
+							// Preserve ownership on the queued entry REGARDLESS of whether a
+							// terminal scope exists yet: the registration is determined at
+							// job-registration time, and the scope is determined at abort
+							// time (or later, at flush). A completion finished before the
+							// abort must not become an ordinary entry that owned cleanup
+							// cannot identify/purge (review thread P1).
+							// Owned tuples are keyed by the LOGICAL endpoint, not a
+							// provider-facing session id. providerSessionId may differ
+							// from sessionManager.getSessionId(), so session.sessionId
+							// would miss the tuple and turn a left-running completion
+							// into an ordinary follow-up (review thread P1).
+							const endpointId = AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId();
+							const registration = job ? lookupOwnedRegistration(jobId, job.generation, endpointId) : undefined;
+							const ownedCompletion = registration
+								? {
+										lineageIdHash: registration.lineageIdHash,
+										promptAttemptEpoch: registration.promptAttemptEpoch,
+										registration,
+									}
+								: undefined;
 							const formattedResult = await formatAsyncResultForFollowUp(result);
 							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
 
@@ -1666,7 +1717,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							});
 						},
 					})
-				: undefined;
+				: options.inheritedAsyncJobManager;
 
 		let promptMetadataModel: Model | undefined;
 		const getActiveModelString = (): string | undefined => {
@@ -1702,6 +1753,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
+			getAsyncJobManager: () => asyncJobManager,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -1807,7 +1859,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
-			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
+			if (asyncJobManager) {
+				// Register under the session endpoint so concurrent sessions'
+				// owned work settles in the correct manager (review thread P1).
+				// `session` is not yet constructed here; the session manager id
+				// is the endpoint identity. ADMIT THE ENDPOINT FIRST: a second
+				// top-level session constructed or resumed under an endpoint id
+				// already held by another LIVE manager must fail construction
+				// BEFORE the global instance is replaced — otherwise the
+				// rejected construction leaves this orphan manager as the
+				// process-global instance, redirecting global-manager
+				// consumers away from the live session (review thread P1).
+				if (!AsyncJobManager.registerForEndpoint(sessionManager.getSessionId(), asyncJobManager)) {
+					throw new Error(
+						`Cannot construct session "${sessionManager.getSessionId()}": the endpoint id is already held by another live async job manager`,
+					);
+				}
+				asyncJobManagerAdmitted = true;
+				priorAsyncJobManager = AsyncJobManager.instance();
+				AsyncJobManager.setInstance(asyncJobManager);
+			}
 		}
 		await initializeLocalRoot(localProtocolOptions);
 		if (options.localProtocolOptions) {
@@ -2140,6 +2211,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							controller: notificationSessionController,
 							spawnedByGjc,
 							sdkHostModeSupported: options.sdkHostModeSupported,
+							// INTERNAL terminal-abort seams, threaded directly from the
+							// owning session (NOT on the public extension context).
+							terminalAbortSeams: {
+								getTerminalTurnEpoch: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.getTerminalTurnEpoch();
+								},
+								cancelPendingPreflightForTerminalAbort: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									session.cancelPendingPreflightForTerminalAbort();
+								},
+								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.abortPromptAndWait(handle, seamOptions);
+								},
+							},
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
 							runBtwTurn: async (question, signal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
@@ -3004,6 +3091,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// AsyncJobManager on teardown; subagents inherit the parent's and
 			// **MUST NOT** tear it down.
 			ownedAsyncJobManager: asyncJobManager,
+			disposeAsyncJobManager: !options.parentTaskPrefix,
 			// Only an MCP manager owned by this session is torn down on dispose;
 			// subagents and callers that merely observe a manager must not (see
 			// AgentSession.dispose).
@@ -3065,9 +3153,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		session.configWarnings.push(...contextFileWarnings);
 		hasSession = true;
-		if (asyncJobManager) {
+		const sessionAsyncJobManager = asyncJobManager;
+		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => asyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
+				isStale: entry => sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
+				// Build one message per ownership origin so an owned-scope drop of
+				// one turn's message never suppresses other turns'/ordinary
+				// completions batched in the same flush (review thread P2).
+				groupKey: entry =>
+					entry.ownedCompletion
+						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
+						: "ordinary",
 				build: buildAsyncResultBatchMessage,
 			});
 		}
@@ -3090,6 +3186,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
 					} finally {
+						// The endpoint is gone: its owned registrations can never
+						// reach a delivery settlement boundary, and foreign-endpoint
+						// tuples are deliberately never classified terminal by other
+						// managers — retire them before unregistering the manager so
+						// repeated session churn cannot saturate the registry
+						// (review thread P2). The endpoint is the manager's live
+						// registration key, which survives newSession/switchSession
+						// rekeying and may differ from the provider-facing session id.
+						if (!options.parentTaskPrefix) {
+							retireOwnedRegistrationsForEndpoint(
+								AsyncJobManager.endpointIdOf(asyncJobManager) ?? session.sessionId,
+							);
+							AsyncJobManager.unregisterManager(asyncJobManager);
+						}
 						closeOwnedAuthStorage();
 					}
 				}
@@ -3308,6 +3418,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session.dispose();
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
+				// Admission happens before session construction. Any later startup
+				// failure must remove THIS manager's endpoint mapping and restore
+				// the prior global only when this manager is still global: otherwise
+				// a retry under the same endpoint is falsely rejected and an orphan
+				// redirects global-manager consumers away from the live session
+				// (review thread P1).
+				if (asyncJobManagerAdmitted && asyncJobManager) {
+					AsyncJobManager.unregisterManager(asyncJobManager);
+					if (AsyncJobManager.instance() === asyncJobManager) {
+						AsyncJobManager.setInstance(priorAsyncJobManager);
+					}
+					await asyncJobManager.dispose({ timeoutMs: 100 });
+				}
 				await cleanupOwnedMcpManager?.();
 				const [{ disposeKernelSessionsByOwner }, { disposeVmContextsByOwner }] = await Promise.all([
 					import("../eval/py/executor"),

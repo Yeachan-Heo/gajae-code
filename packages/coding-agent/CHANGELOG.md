@@ -14,6 +14,7 @@
 - Added lease-backed MCP connection pooling with typed recovery, shared HTTP/SSE sessions, per-lease callback demultiplexing, and authorization binding scopes that keep credential secrets out of pool keys.
 - Added plugin registry v2 as the single execution authority for plugin tools, subskills, and prompt appendices, with digest verification at final use.
 - Added module-trace and process-tree RSS verification harnesses for startup-memory regressions.
+- `turn.abort` `mode:"terminal"` with `scope:"turn" | "owned"`: stops the root turn and blocks only its own continuation routes, while left-running owned work keeps running and its completions resume the agent as a fresh turn (`scope:"turn"`) or are settled/dropped (`scope:"owned"`). Durable idempotency via the reconciliation store, deterministic replay after restart/eviction, bounded reservations, and the private turn-continuation fence.
 
 ### Changed
 

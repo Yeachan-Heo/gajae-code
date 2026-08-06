@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { type ControlRequest, type ControlSurface, dispatchControl } from "../src/sdk/host/control";
+import { type ControlRequest, type ControlSurface, dispatchControl, TypedControlError } from "../src/sdk/host/control";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
 const methodByOperation: Record<string, string> = {
@@ -507,6 +507,44 @@ test("turn.abort terminal mode validates strictly and forwards normalized input"
 	expect(replay).toEqual({ id: "t", ok: true, result: "terminal" });
 	expect(calls).toHaveLength(2);
 });
+test("turn.abort terminal normalizes omitted scope before idempotency hashing", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	let calls = 0;
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: () => {
+			calls++;
+			return "terminal";
+		},
+	} as unknown as ControlSurface;
+	const terminal = (input: Record<string, unknown>, idempotencyKey: string) =>
+		dispatchControl(surface, abort, {
+			id: "t",
+			operation: abort.sdkId,
+			input,
+			idempotencyKey,
+		});
+
+	// The defaulted shape and the explicit `scope:"turn"` are the SAME input:
+	// the retry must replay (not idempotency_conflict), so it never re-runs the
+	// surface and stays eligible for the durable terminal-scope replay.
+	expect(await terminal({ mode: "terminal" }, "key-norm")).toEqual({ id: "t", ok: true, result: "terminal" });
+	expect(await terminal({ mode: "terminal", scope: "turn" }, "key-norm")).toEqual({
+		id: "t",
+		ok: true,
+		result: "terminal",
+	});
+	expect(calls).toBe(1);
+	// A genuinely different scope with the same key still conflicts.
+	const conflict = await terminal({ mode: "terminal", scope: "owned" }, "key-norm");
+	expect(conflict).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+	expect(calls).toBe(1);
+	// A malformed input (extra field) does NOT normalize: with a FRESH key it
+	// is rejected downstream (invalid_input), never replayed against a valid
+	// input's key.
+	const malformed = await terminal({ mode: "terminal", force: true }, "key-malformed");
+	expect(malformed).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+});
 
 test("turn.abort terminal mode rejects missing/oversized key, invalid mode/scope, and unknown fields", async () => {
 	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
@@ -571,4 +609,26 @@ test("turn.abort legacy mode keeps dropping input and calling the argument-less 
 		expect(response).toEqual({ id: "t", ok: true, result: "legacy" });
 	}
 	expect(calls).toEqual([[], [], []]);
+});
+
+test("turn.abort terminal conflict surfaces as a top-level control error", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	// A surface that throws a typed idempotency_conflict (the durable
+	// terminal-scope replay conflict path after in-memory eviction) must
+	// produce a TOP-LEVEL ok:false response — not a nested result inside a
+	// successful control_response.
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: () => {
+			throw new TypedControlError("idempotency_conflict", "Idempotency key was reused with different input.");
+		},
+	} as unknown as ControlSurface;
+	const response = await dispatchControl(surface, abort, {
+		id: "t-conflict",
+		operation: abort.sdkId,
+		input: { mode: "terminal", scope: "turn" },
+		idempotencyKey: "k",
+	});
+	expect(response.ok).toBe(false);
+	expect(response.error).toMatchObject({ code: "idempotency_conflict" });
 });

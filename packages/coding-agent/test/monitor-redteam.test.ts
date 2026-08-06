@@ -2,13 +2,19 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { Settings } from "../src/config/settings";
 import type { CustomMessage } from "../src/session/messages";
+import { bindToolLineage, resetTerminalAbortRegistriesForTests } from "../src/session/terminal-abort";
 import type { ToolSession } from "../src/tools/index";
 import { JobTool } from "../src/tools/job";
 import { MonitorTool } from "../src/tools/monitor";
 
 type QueuedMessage = { customType: string; content: string; details?: unknown };
 
-function detailsOf(entry: QueuedMessage): { taskId?: string; notificationId?: string; coalescedCount?: number } {
+function detailsOf(entry: QueuedMessage): {
+	taskId?: string;
+	notificationId?: string;
+	coalescedCount?: number;
+	jobGeneration?: string;
+} {
 	return (entry.details ?? {}) as { taskId?: string; notificationId?: string; coalescedCount?: number };
 }
 
@@ -160,8 +166,19 @@ describe("monitor backlog red-team public surfaces", () => {
 	});
 
 	it("non-persistent monitor delivers exactly one notification and terminal eviction does not purge it", async () => {
+		resetTerminalAbortRegistriesForTests();
 		const queue: QueuedMessage[] = [];
 		const session = makeSession("0-Owner", queue, settings);
+		// Bind the tool-call lineage so the monitor job registers as owned and
+		// its notification carries the owned-completion envelope.
+		bindToolLineage("call", {
+			lineageIdHash: "redteam-lineage",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 0,
+			// The monitor path resolves ownership with the SESSION endpoint, so
+			// the bind must carry the same endpoint.
+			endpointId: session.getSessionId?.() ?? undefined,
+		});
 		const result = await new MonitorTool(session).execute("call", {
 			command: "printf 'first\\nsecond\\n'",
 			kind: "log",
@@ -176,6 +193,18 @@ describe("monitor backlog red-team public surfaces", () => {
 		expect(entries).toHaveLength(1);
 		expect(entries[0]?.content).toContain("first");
 		expect(entries[0]?.content).not.toContain("second");
+		// The notification carries the owned-completion envelope (lineage +
+		// exact registration), so the admission filter attributes it via the
+		// shared async-result path — and the standalone generation is NOT
+		// persisted (INTERNAL_DETAILS_FIELDS strips ownedCompletions, P2).
+		const ownedCompletions = (
+			detailsOf(entries[0]!) as unknown as {
+				ownedCompletions?: Array<{ registration?: { jobId?: string; jobGeneration?: string } }>;
+			}
+		).ownedCompletions;
+		expect(ownedCompletions).toHaveLength(1);
+		expect(ownedCompletions?.[0]?.registration?.jobId).toBe(taskId);
+		expect(ownedCompletions?.[0]?.registration?.jobGeneration).toBe(manager.getJob(taskId)?.generation);
 		expect(manager.getJob(taskId)?.status).toBe("cancelled");
 		expect(queue.filter(entry => detailsOf(entry).taskId === taskId)).toHaveLength(1);
 	});

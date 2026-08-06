@@ -7,6 +7,7 @@ import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElaps
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import jobDescription from "../prompts/tools/job.md" with { type: "text" };
+import { lookupOwnedRegistration, unregisterOwnedRegistration } from "../session/terminal-abort";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
 import {
@@ -100,7 +101,10 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<JobToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<JobToolDetails>> {
-		const manager = AsyncJobManager.instance();
+		const manager =
+			this.session.getAsyncJobManager?.() ??
+			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.instance();
 		if (!manager) {
 			return {
 				content: [{ type: "text", text: "Async execution is disabled; no background jobs are available." }],
@@ -237,7 +241,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		const PROGRESS_INTERVAL_MS = 500;
 		const emitProgress = () => {
 			if (!onUpdate) return;
-			const snapshot = this.#snapshotJobs(allTrackedJobs);
+			const snapshot = this.#snapshotJobs(manager, allTrackedJobs);
 			onUpdate({
 				content: [{ type: "text", text: "" }],
 				details: {
@@ -318,6 +322,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	}
 
 	#snapshotJobs(
+		manager: AsyncJobManager,
 		jobs: {
 			id: string;
 			type: "bash" | "task";
@@ -331,7 +336,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	): JobSnapshot[] {
 		const now = Date.now();
 		return jobs.map(j => {
-			const current = AsyncJobManager.instance()?.getJob(j.id);
+			const current = manager.getJob(j.id);
 			const latest = current ?? j;
 			return {
 				id: latest.id,
@@ -366,9 +371,31 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			seen.add(j.id);
 			return true;
 		});
-		const jobResults = this.#snapshotJobs(uniqueJobs);
+		const jobResults = this.#snapshotJobs(manager, uniqueJobs);
 
-		manager.acknowledgeDeliveries(jobResults.filter(j => j.status !== "running").map(j => j.id));
+		// Only COMPLETED/FAILED/CANCELLED jobs are terminal for ownership
+		// retirement: a paused subagent is not quiescent (settleOwnedWork
+		// cancels paused jobs before it can claim stopped_owned), so its
+		// ownership tuple must stay registered until it is actually cancelled
+		// — otherwise a scope:"owned" abort could find an empty causal set and
+		// report stopped_owned while the job remains visibly paused (review
+		// thread P2).
+		const terminalJobs = jobResults.filter(
+			j => j.status === "completed" || j.status === "failed" || j.status === "cancelled",
+		);
+		manager.acknowledgeDeliveries(terminalJobs.map(j => j.id));
+		// A terminal job whose deliveries were just acknowledged is
+		// synchronously consumed: its owned registration is settled and must
+		// not occupy the registry, otherwise the retained-policy tombstone
+		// treats it as a live policy occupant forever and its FIFO fallback can
+		// evict a genuinely running job's policy (review thread P2).
+		for (const job of terminalJobs) {
+			const generation = manager.getJob?.(job.id)?.generation;
+			if (!generation) continue;
+			// The endpoint disambiguates concurrent sessions' same job ids (review P1).
+			const registration = lookupOwnedRegistration(job.id, generation, this.session.getSessionId?.() ?? "local");
+			if (registration) unregisterOwnedRegistration(registration);
+		}
 
 		const completed = jobResults.filter(j => j.status !== "running");
 		const running = jobResults.filter(j => j.status === "running");

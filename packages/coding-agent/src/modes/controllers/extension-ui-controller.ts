@@ -472,7 +472,13 @@ export class ExtensionUiController {
 			sendMessage: (message, options) => {
 				const wasStreaming = this.ctx.session.isStreaming;
 				this.ctx.session
-					.sendCustomMessage(message, options)
+					// The extension seam is the trusted runtime boundary: extension
+					// producers are external to the turn's model/tool runtime, so
+					// nextTurn messages are classified "external" here (survive a
+					// terminal abort) instead of letting the extension label its
+					// own origin — caller-controlled origin defeats source-based
+					// continuation fencing (review thread P2).
+					.sendCustomMessage(message, { ...options, origin: "external" })
 					.then(() => {
 						if (!this.#isStopped()) this.#applyCustomMessageDisplay(wasStreaming, message.display);
 					})
@@ -525,7 +531,6 @@ export class ExtensionUiController {
 			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
 			abort: () => this.ctx.session.abort(),
 			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
-			getTerminalTurnEpoch: () => this.ctx.session.getTerminalTurnEpoch(),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			getPendingMessageCounts: () => this.ctx.session.pendingMessageCounts,
 			getTranscript: () => this.ctx.session.getTranscript(),
@@ -792,7 +797,10 @@ export class ExtensionUiController {
 			sendMessage: (message, options) => {
 				const wasStreaming = this.ctx.session.isStreaming;
 				this.ctx.session
-					.sendCustomMessage(message, options)
+					// Trusted seam: extension producers are external to the turn
+					// runtime, so classify nextTurn messages "external" here
+					// instead of accepting a caller-supplied origin (review P2).
+					.sendCustomMessage(message, { ...options, origin: "external" })
 					.then(() => this.#applyCustomMessageDisplay(wasStreaming, message.display))
 					.catch((err: unknown) => {
 						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -845,7 +853,6 @@ export class ExtensionUiController {
 			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
 			abort: () => this.ctx.session.abort(),
 			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
-			getTerminalTurnEpoch: () => this.ctx.session.getTerminalTurnEpoch(),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			getPendingMessageCounts: () => this.ctx.session.pendingMessageCounts,
 			getTranscript: () => this.ctx.session.getTranscript(),

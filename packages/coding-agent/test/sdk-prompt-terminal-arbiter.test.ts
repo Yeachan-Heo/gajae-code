@@ -13,6 +13,7 @@ class MemoryStore implements ReconciliationStore {
 	readonly sessionId = "test-session";
 	#records: DurableReconciliationRecord[] = [];
 	#terminalScopes: DurableTerminalScopeRecord[] = [];
+	#terminalKeys: Array<{ keyHash: string; inputHash: string }> = [];
 	#failNext = false;
 	#holdNext?: Promise<void>;
 	#onHeld?: () => void;
@@ -45,6 +46,27 @@ class MemoryStore implements ReconciliationStore {
 		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
 	): Promise<void> {
 		this.#terminalScopes = mutator(this.snapshotTerminalScopes());
+	}
+
+	async transactTerminalState(
+		mutator: (state: {
+			scopes: DurableTerminalScopeRecord[];
+			keys: Array<{ keyHash: string; inputHash: string }>;
+		}) => { scopes: DurableTerminalScopeRecord[]; keys: Array<{ keyHash: string; inputHash: string }> },
+	): Promise<void> {
+		const next = mutator({ scopes: this.snapshotTerminalScopes(), keys: this.snapshotTerminalKeys() });
+		this.#terminalScopes = next.scopes;
+		this.#terminalKeys = next.keys;
+	}
+
+	async transactTerminalKeys(
+		mutator: (keys: Array<{ keyHash: string; inputHash: string }>) => Array<{ keyHash: string; inputHash: string }>,
+	): Promise<void> {
+		this.#terminalKeys = mutator(this.snapshotTerminalKeys());
+	}
+
+	snapshotTerminalKeys(): Array<{ keyHash: string; inputHash: string }> {
+		return this.#terminalKeys.map(k => ({ ...k }));
 	}
 
 	async loadTerminalScopes(): Promise<DurableTerminalScopeRecord[]> {

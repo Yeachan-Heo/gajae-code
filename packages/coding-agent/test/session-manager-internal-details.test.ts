@@ -124,6 +124,29 @@ describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence
 		});
 	});
 
+	it("F6: strips ownedCompletions (private terminal origin envelope) from persisted details", () => {
+		const details = {
+			jobs: [{ jobId: "bg_1" }],
+			ownedCompletions: [
+				{
+					lineageIdHash: "private-hash",
+					promptAttemptEpoch: 7,
+					registration: {
+						endpointGeneration: 0,
+						lineageIdHash: "private-hash",
+						promptAttemptEpoch: 7,
+						jobId: "bg_1",
+						jobGeneration: "job:1",
+					},
+				},
+			],
+		};
+		const result = stripInternalDetailsFields(details);
+		expect(result?.ownedCompletions).toBeUndefined();
+		// Public delivery fields survive the strip.
+		expect(result?.jobs).toEqual([{ jobId: "bg_1" }]);
+	});
+
 	it("F4: stripInternalDetailsFields treats undefined / null / non-object details as identity", () => {
 		expect(stripInternalDetailsFields(undefined)).toBeUndefined();
 		// `null as never` here only because the public signature is `T | undefined`,

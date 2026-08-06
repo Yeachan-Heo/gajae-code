@@ -645,4 +645,94 @@ describe("AsyncJobManager", () => {
 		await queuedManager.getJob(blocker)?.promise;
 		await queuedManager.dispose({ timeoutMs: 100 });
 	});
+
+	test("rekeyForEndpoint moves the registration across committed session-identity transitions", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			AsyncJobManager.registerForEndpoint("session-a", manager);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-a");
+
+			// newSession/switchSession/fork/handoff/branch commit a successor
+			// endpoint identity: the manager registration must follow so
+			// post-transition lineage bindings resolve (review thread P1).
+			expect(
+				AsyncJobManager.rekeyForEndpoint("session-a", "session-b", AsyncJobManager.forEndpoint("session-a")),
+			).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+			expect(AsyncJobManager.forEndpoint("session-a")).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint("session-b")).toBe(manager);
+
+			// A foreign registration under the successor is never clobbered; the
+			// rekey reports FAILURE (review thread P1) so the transitioning
+			// session aborts/rolls back before retiring predecessor state —
+			// leaving this manager under the predecessor while tools resolve
+			// the successor to the foreign manager would send jobs to the
+			// wrong session and strip owned aborts of their causal set.
+			AsyncJobManager.registerForEndpoint("session-c", foreign);
+			expect(AsyncJobManager.rekeyForEndpoint("session-b", "session-c", manager)).toBe(false);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+			expect(AsyncJobManager.forEndpoint("session-b")).toBe(manager);
+			expect(AsyncJobManager.forEndpoint("session-c")).toBe(foreign);
+
+			// Same-id and unknown-predecessor rekeys are successful no-ops.
+			expect(AsyncJobManager.rekeyForEndpoint("session-b", "session-b", manager)).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+			expect(AsyncJobManager.rekeyForEndpoint("unknown", "session-b", manager)).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+
+			// Disposal: unregisterManager drops every key owned by the manager,
+			// including rekeyed successor keys that no longer match the session id.
+			AsyncJobManager.unregisterManager(manager);
+			expect(AsyncJobManager.forEndpoint("session-b")).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint("session-c")).toBe(foreign);
+		} finally {
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(foreign);
+		}
+	});
+
+	test("registerForEndpoint rejects a foreign holder instead of silently replacing it", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			expect(AsyncJobManager.registerForEndpoint("session-a", manager)).toBe(true);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(manager);
+
+			// A second top-level session constructed or resumed under an
+			// endpoint id already held by a FOREIGN live manager must not
+			// clobber it: the first session's tools would resolve the second
+			// manager, letting same-id jobs be queried, registered, or
+			// cancelled across sessions and stripping an owned abort of its
+			// causal work set (review thread P1).
+			expect(AsyncJobManager.registerForEndpoint("session-a", foreign)).toBe(false);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(manager);
+			expect(AsyncJobManager.endpointIdOf(foreign)).toBeUndefined();
+
+			// Same-manager re-registration is a successful no-op.
+			expect(AsyncJobManager.registerForEndpoint("session-a", manager)).toBe(true);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(manager);
+
+			// After the holder is disposed, the endpoint id is free again.
+			AsyncJobManager.unregisterManager(manager);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBeUndefined();
+			expect(AsyncJobManager.registerForEndpoint("session-a", foreign)).toBe(true);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(foreign);
+		} finally {
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(foreign);
+		}
+	});
+
+	test("resetForTests clears endpoint registrations with the global instance", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		expect(AsyncJobManager.registerForEndpoint("test-session", manager)).toBe(true);
+		expect(AsyncJobManager.forEndpoint("test-session")).toBe(manager);
+
+		AsyncJobManager.resetForTests();
+
+		expect(AsyncJobManager.instance()).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint("test-session")).toBeUndefined();
+	});
 });

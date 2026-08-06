@@ -135,7 +135,16 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		onUpdate?: AgentToolUpdateCallback<SubagentToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SubagentToolDetails>> {
-		const manager = AsyncJobManager.instance();
+		// The session's ENDPOINT-owned manager first: concurrent top-level
+		// sessions register their manager under their endpoint (sdk/session.ts),
+		// so list/pause/resume/message/cancel/await must inspect THIS session's
+		// manager — the process-global instance belongs to the last-created
+		// session, where this session's subagent records and jobs are absent
+		// or belong to a same-id subagent of another session (review thread P1).
+		const manager =
+			this.session.getAsyncJobManager?.() ??
+			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.instance();
 		if (!manager) {
 			return {
 				content: [{ type: "text", text: "No subagent manager is available in this session." }],
@@ -241,7 +250,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				records.push(record);
 				terminalGuidanceIds.add(record.subagentId);
 			} else {
-				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message);
+				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message, _toolCallId);
 				if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 				if (!result.ok && result.reason === "not_found") {
 					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
@@ -293,7 +302,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 					steerStates.set(record.subagentId, "queued");
 				} else {
-					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message);
+					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message, _toolCallId);
 					if (!result.ok && result.reason === "not_found") {
 						missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					} else if (!result.ok) {

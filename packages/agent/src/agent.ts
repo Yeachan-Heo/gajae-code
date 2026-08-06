@@ -301,6 +301,8 @@ export interface AgentOptions {
 	 * message are emitted. See {@link AgentLoopConfig.afterToolCall} for full semantics.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+	/** Invoked with the follow-up messages dequeued for the next turn (reassignable). */
+	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation. Passing `{}` enables the loop's
@@ -467,6 +469,8 @@ export class Agent {
 	 * message emission. Reassign at any time to swap the implementation.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+	/** Invoked with the follow-up messages dequeued for the next turn. Reassign at any time. */
+	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
 
 	constructor(opts: AgentOptions = {}) {
 		this.#state = { ...this.#state, ...opts.initialState };
@@ -510,6 +514,7 @@ export class Agent {
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
+		this.onFollowUpConsumed = opts.onFollowUpConsumed;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
@@ -1191,6 +1196,17 @@ export class Agent {
 		return true;
 	}
 
+	/**
+	 * Remove ALL queued STEERING messages without touching the follow-up queue.
+	 * Used by the terminal-abort path to purge steering queued for the aborted
+	 * turn (the loop may exit on the abort signal without polling it); the
+	 * follow-up queue is preserved because it may carry owned-completion
+	 * resumes that must still deliver.
+	 */
+	clearSteeringMessages(): void {
+		this.#steeringQueue = [];
+	}
+
 	/** Remove queued steering+follow-up messages matching `predicate`, preserving order of the rest. */
 	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): {
 		steering: number;
@@ -1415,6 +1431,17 @@ export class Agent {
 
 			const queuedFollowUp = this.#dequeueFollowUpMessages();
 			if (queuedFollowUp.length > 0) {
+				// Route the DIRECT-dequeue batch through the same consumption hook
+				// the in-loop getFollowUpMessages path uses: denied owned-completion
+				// envelopes are filtered before they reach the loop, and delivered
+				// envelopes settle their registrations — the direct path otherwise
+				// bypasses onFollowUpConsumed entirely (review threads P1/P2).
+				await this.onFollowUpConsumed?.(queuedFollowUp);
+				// The hook can filter the WHOLE batch (every entry denied by a
+				// scope:"owned" abort): starting an empty provider run would
+				// violate the zero-final-call guarantee, so return without
+				// running the loop (review thread P1).
+				if (queuedFollowUp.length === 0) return;
 				await this.#runLoop(queuedFollowUp, options);
 				return;
 			}
@@ -1689,6 +1716,9 @@ export class Agent {
 				if (this.#activeRunId !== runId) {
 					this.#followUpQueue = [...queued, ...this.#followUpQueue];
 					return [];
+				}
+				if (queued.length > 0) {
+					await this.onFollowUpConsumed?.(queued);
 				}
 				return queued;
 			},
