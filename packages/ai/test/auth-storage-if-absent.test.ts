@@ -136,6 +136,28 @@ describe("if-absent auth credential writes", () => {
 			store.close();
 		}
 	});
+	test("SqliteAuthCredentialStore close releases WAL files for immediate directory removal", async () => {
+		const dbDir = path.join(tempDir, "close-releases-wal");
+		await fs.mkdir(dbDir);
+		const store = await SqliteAuthCredentialStore.open(path.join(dbDir, "agent.db"));
+
+		try {
+			const inserted = store.upsertAuthCredentialForProviderIfAbsent("anthropic", oauth("teardown"));
+			expect(inserted.inserted).toBe(true);
+			store.setCache("teardown-cache", "value", Math.floor(Date.now() / 1000) + 60);
+			expect(store.getCache("teardown-cache")).toBe("value");
+		} finally {
+			store.close();
+		}
+
+		await fs.rm(dbDir, { recursive: true });
+		expect(
+			await fs
+				.access(dbDir)
+				.then(() => true)
+				.catch(() => false),
+		).toBe(false);
+	});
 
 	test("SqliteAuthCredentialStore returns skipped-invalid without inserting", async () => {
 		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "invalid.db"));

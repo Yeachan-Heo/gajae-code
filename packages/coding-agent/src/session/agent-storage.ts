@@ -94,7 +94,13 @@ CREATE TABLE IF NOT EXISTS model_usage (
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
 `);
 
-		const settingsInfo = this.#db.prepare("PRAGMA table_info(settings)").all() as Array<{ name?: string }>;
+		const settingsInfoStmt = this.#db.prepare("PRAGMA table_info(settings)");
+		let settingsInfo: Array<{ name?: string }>;
+		try {
+			settingsInfo = settingsInfoStmt.all() as Array<{ name?: string }>;
+		} finally {
+			settingsInfoStmt.finalize();
+		}
 		const hasSettingsTable = settingsInfo.length > 0;
 		const hasKey = settingsInfo.some(column => column.name === "key");
 		const hasValue = settingsInfo.some(column => column.name === "value");
@@ -110,7 +116,13 @@ CREATE TABLE settings (
 		} else if (!hasKey || !hasValue) {
 			// Migrate v1 schema: single JSON blob in `data` column → per-key rows
 			let legacySettings: Record<string, unknown> | null = null;
-			const row = this.#db.prepare("SELECT data FROM settings WHERE id = 1").get() as { data?: string } | undefined;
+			const legacySettingsStmt = this.#db.prepare("SELECT data FROM settings WHERE id = 1");
+			let row: { data?: string } | undefined;
+			try {
+				row = legacySettingsStmt.get() as { data?: string } | undefined;
+			} finally {
+				legacySettingsStmt.finalize();
+			}
 			if (row?.data) {
 				try {
 					const parsed = JSON.parse(row.data);
@@ -137,11 +149,15 @@ CREATE TABLE settings (
 					const insert = this.#db.prepare(
 						`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ${SQLITE_NOW_EPOCH})`,
 					);
-					for (const [key, value] of Object.entries(settings)) {
-						if (value === undefined) continue;
-						const serialized = JSON.stringify(value);
-						if (serialized === undefined) continue;
-						insert.run(key, serialized);
+					try {
+						for (const [key, value] of Object.entries(settings)) {
+							if (value === undefined) continue;
+							const serialized = JSON.stringify(value);
+							if (serialized === undefined) continue;
+							insert.run(key, serialized);
+						}
+					} finally {
+						insert.finalize();
 					}
 				}
 			});
@@ -149,9 +165,13 @@ CREATE TABLE settings (
 			migrate(legacySettings);
 		}
 
-		const versionRow = this.#db.prepare("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").get() as
-			| { version?: number }
-			| undefined;
+		const versionStmt = this.#db.prepare("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1");
+		let versionRow: { version?: number } | undefined;
+		try {
+			versionRow = versionStmt.get() as { version?: number } | undefined;
+		} finally {
+			versionStmt.finalize();
+		}
 		const schemaVersion = typeof versionRow?.version === "number" ? versionRow.version : 0;
 		if (versionRow?.version !== undefined && versionRow.version !== SCHEMA_VERSION) {
 			logger.warn("AgentStorage schema version mismatch", {
@@ -162,7 +182,12 @@ CREATE TABLE settings (
 		if (schemaVersion < SCHEMA_VERSION) {
 			this.#migrateSchema(schemaVersion);
 		}
-		this.#db.prepare("INSERT OR REPLACE INTO schema_version(version) VALUES (?)").run(SCHEMA_VERSION);
+		const versionInsertStmt = this.#db.prepare("INSERT OR REPLACE INTO schema_version(version) VALUES (?)");
+		try {
+			versionInsertStmt.run(SCHEMA_VERSION);
+		} finally {
+			versionInsertStmt.finalize();
+		}
 	}
 
 	#migrateSchema(fromVersion: number): void {
@@ -342,13 +367,18 @@ FROM model_usage_legacy
 				? "SELECT id, provider, credential_type, data, disabled_cause FROM auth_credentials WHERE provider = ? ORDER BY id ASC"
 				: "SELECT id, provider, credential_type, data, disabled_cause FROM auth_credentials ORDER BY id ASC",
 		);
-		const rows = (provider ? stmt.all(provider) : stmt.all()) as Array<{
+		let rows: Array<{
 			id: number;
 			provider: string;
 			credential_type: string;
 			data: string;
 			disabled_cause: string | null;
 		}>;
+		try {
+			rows = (provider ? stmt.all(provider) : stmt.all()) as typeof rows;
+		} finally {
+			stmt.finalize();
+		}
 
 		const results: StoredAuthCredential[] = [];
 		for (const row of rows) {

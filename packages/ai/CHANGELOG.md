@@ -17,6 +17,8 @@
 
 - Anthropic cache-control resolution now falls back to `model.cacheRetention` at the provider boundary, preserving configured retention and request-over-model precedence through special dispatch wrappers such as GitLab Duo. A configured `cacheRetention: "none"` can no longer be dropped and replaced by the new automatic Claude-family cache marker.
 - Anthropic explicit prompt caching now advances its conversation breakpoint during tool-use loops by marking the latest completed assistant tool-use turn while leaving the newest tool result uncached. Previously it kept refreshing only the original human message until another human turn arrived, pinning proxy cache reads to the static tools/system prefix throughout long agentic runs.
+- SQLite-backed authentication storage now finalizes temporary and cached statements and closes its owned database connection, allowing settings directories and WAL files to be removed immediately on Windows.
+
 ## [0.12.12] - 2026-08-05
 
 ### Fixed

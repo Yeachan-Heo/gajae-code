@@ -211,10 +211,11 @@ describe("memory guard owner claims", () => {
 		}
 	});
 
-	it("proves claims released by fencing epochs and exact-releasing them", async () => {
+	it("proves claims released by fencing epochs, exact-releasing them, and closing database handles", async () => {
 		const stateDir = await tempStateDir();
 		const probeOwner = owner({ childToken: "probe-2681", pid: 3000, processStartTime: "444", ttyDevice: "555" });
 		const staleOwner = owner({ childToken: "stale-2681", pid: 4000, processStartTime: "666" });
+		let removed = false;
 		try {
 			await acquireMemoryGuardClaims(
 				stateDir,
@@ -246,8 +247,11 @@ describe("memory guard owner claims", () => {
 			const snapshot = await readMemoryGuardClaimsForTest(stateDir, probeOwner.sessionId);
 			expect(snapshot.epoch).toBe(4);
 			expect(snapshot.claims).toHaveLength(0);
+			await fs.rm(stateDir, { recursive: true });
+			removed = true;
+			await expect(fs.access(stateDir)).rejects.toThrow();
 		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
+			if (!removed) await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
 });

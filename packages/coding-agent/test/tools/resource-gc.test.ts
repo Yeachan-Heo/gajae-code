@@ -1267,5 +1267,9 @@ describe("resource GC settings precedence", () => {
 
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		expect(settings.get("browser.gc.idleMs")).toBe(222_222);
+
+		resetSettingsForTest();
+		expect(() => fs.rmSync(testDir, { recursive: true })).not.toThrow();
+		expect(fs.existsSync(testDir)).toBe(false);
 	});
 });

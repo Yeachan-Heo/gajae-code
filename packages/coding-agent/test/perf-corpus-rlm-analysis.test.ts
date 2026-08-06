@@ -1517,7 +1517,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 			"        handle.flush()",
 			"        os.fsync(handle.fileno())",
 			"    os.utime(report, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))",
-			"    if report.stat().st_ctime_ns == original_stat.st_ctime_ns:",
+			"    if os.name != 'nt' and report.stat().st_ctime_ns == original_stat.st_ctime_ns:",
 			"        raise RuntimeError('in-place mutation did not update ctime_ns')",
 			"    return captured",
 			"module._validate_sealed_inputs = capture_then_mutate_in_place",
