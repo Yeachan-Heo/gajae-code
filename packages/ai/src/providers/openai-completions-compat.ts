@@ -6,13 +6,19 @@ type ResolvedToolStrictMode = NonNullable<OpenAICompat["toolStrictMode"]> | "mix
 export type ResolvedOpenAICompat = Required<
 	Omit<
 		OpenAICompat,
-		"openRouterRouting" | "vercelGatewayRouting" | "extraBody" | "toolStrictMode" | "toolChoiceSupport"
+		| "openRouterRouting"
+		| "vercelGatewayRouting"
+		| "extraBody"
+		| "toolStrictMode"
+		| "toolChoiceSupport"
+		| "supportsResponsesSessionAffinity"
 	>
 > & {
 	openRouterRouting?: OpenAICompat["openRouterRouting"];
 	vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
 	extraBody?: OpenAICompat["extraBody"];
 	toolStrictMode: ResolvedToolStrictMode;
+	supportsResponsesSessionAffinity?: OpenAICompat["supportsResponsesSessionAffinity"];
 	/** Optional explicit capability override; resolved via deriveToolChoiceSupport. */
 	toolChoiceSupport?: OpenAICompat["toolChoiceSupport"];
 };
@@ -204,6 +210,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
 		sendSessionHeaders: false,
+		supportsResponsesSessionAffinity: false,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
 		supportsReasoningEffort: !isGrok && !isZai,
 		reasoningEffortMap,
@@ -270,6 +277,10 @@ export function resolveOpenAICompat(
 		supportsStore: model.compat.supportsStore ?? detected.supportsStore,
 		supportsDeveloperRole: model.compat.supportsDeveloperRole ?? detected.supportsDeveloperRole,
 		sendSessionHeaders: model.compat.sendSessionHeaders ?? detected.sendSessionHeaders,
+		supportsResponsesSessionAffinity:
+			("supportsResponsesSessionAffinity" in model.compat
+				? model.compat.supportsResponsesSessionAffinity
+				: undefined) ?? detected.supportsResponsesSessionAffinity,
 		supportsMultipleSystemMessages:
 			model.compat.supportsMultipleSystemMessages ?? detected.supportsMultipleSystemMessages,
 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,

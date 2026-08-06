@@ -113,64 +113,73 @@ export interface ThinkingConfig {
 	mode: ThinkingControlMode;
 }
 
-export type KnownProvider =
-	| "alibaba-token-plan"
-	| "amazon-bedrock"
-	| "azure-openai"
-	| "anthropic"
-	| "google"
-	| "google-gemini-cli"
-	| "google-antigravity"
-	| "google-vertex"
-	| "openai"
-	| "openai-codex"
-	| "opencodex"
-	| "kimi-code"
-	| "minimax-code"
-	| "minimax-code-cn"
-	| "github-copilot"
-	| "fireworks"
-	| "firepass"
-	| "fugu"
-	| "gitlab-duo"
-	| "cursor"
-	| "deepseek"
-	| "deepinfra"
-	| "xai"
-	| "groq"
-	| "cerebras"
-	| "openrouter"
-	| "kilo"
-	| "vercel-ai-gateway"
-	| "zai"
-	| "glm-zcode"
-	| "mistral"
-	| "minimax"
-	| "opencode-go"
-	| "opencode-zen"
-	| "opengateway"
-	| "bizrouter"
-	| "mara"
-	| "synthetic"
-	| "cloudflare-ai-gateway"
-	| "huggingface"
-	| "litellm"
-	| "moonshot"
-	| "nvidia"
-	| "nanogpt"
-	| "ollama"
-	| "ollama-cloud"
-	| "qianfan"
-	| "qwen-portal"
-	| "together"
-	| "venice"
-	| "vllm"
-	| "xiaomi"
-	| "xiaomi-token-plan-sgp"
-	| "xiaomi-token-plan-ams"
-	| "xiaomi-token-plan-cn"
-	| "zenmux"
-	| "lm-studio";
+export const KNOWN_PROVIDERS = [
+	"alibaba-token-plan",
+	"amazon-bedrock",
+	"azure-openai",
+	"anthropic",
+	"google",
+	"google-gemini-cli",
+	"google-antigravity",
+	"google-vertex",
+	"openai",
+	"openai-codex",
+	"opencodex",
+	"kimi-code",
+	"minimax-code",
+	"minimax-code-cn",
+	"github-copilot",
+	"fireworks",
+	"firepass",
+	"fugu",
+	"gitlab-duo",
+	"cursor",
+	"deepseek",
+	"deepinfra",
+	"xai",
+	"groq",
+	"cerebras",
+	"openrouter",
+	"kilo",
+	"vercel-ai-gateway",
+	"zai",
+	"glm-zcode",
+	"mistral",
+	"minimax",
+	"opencode-go",
+	"opencode-zen",
+	"opengateway",
+	"bizrouter",
+	"mara",
+	"synthetic",
+	"cloudflare-ai-gateway",
+	"huggingface",
+	"litellm",
+	"moonshot",
+	"nvidia",
+	"nanogpt",
+	"ollama",
+	"ollama-cloud",
+	"qianfan",
+	"qwen-portal",
+	"together",
+	"venice",
+	"vllm",
+	"xiaomi",
+	"xiaomi-token-plan-sgp",
+	"xiaomi-token-plan-ams",
+	"xiaomi-token-plan-cn",
+	"zenmux",
+	"lm-studio",
+] as const;
+
+export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];
+
+const KNOWN_PROVIDER_SET = new Set<string>(KNOWN_PROVIDERS);
+
+export function isKnownProvider(provider: string): provider is KnownProvider {
+	return KNOWN_PROVIDER_SET.has(provider);
+}
 export type Provider = KnownProvider | string;
 
 import type { Effort } from "./model-thinking";
@@ -852,6 +861,13 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 * caller already set via `headers`/`requestTransform`.
 	 */
 	sendSessionHeaders?: boolean;
+	/**
+	 * Whether an OpenAI Responses transport may forward the agent session id
+	 * as `session_id` and `x-client-request-id` affinity headers for an
+	 * explicitly configured custom relay. First-party OpenAI uses its canonical
+	 * HTTPS origin automatically; known non-OpenAI providers remain excluded.
+	 */
+	supportsResponsesSessionAffinity?: boolean;
 	/**
 	 * Whether the provider's chat-completions endpoint accepts multiple
 	 * leading `system`/`developer` messages. When false, ordered system

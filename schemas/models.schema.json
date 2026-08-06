@@ -62,6 +62,9 @@
 							"sendSessionHeaders": {
 								"type": "boolean"
 							},
+							"supportsResponsesSessionAffinity": {
+								"type": "boolean"
+							},
 							"supportsMultipleSystemMessages": {
 								"type": "boolean"
 							},
@@ -505,6 +508,9 @@
 										"sendSessionHeaders": {
 											"type": "boolean"
 										},
+										"supportsResponsesSessionAffinity": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -886,6 +892,9 @@
 											"type": "boolean"
 										},
 										"sendSessionHeaders": {
+											"type": "boolean"
+										},
+										"supportsResponsesSessionAffinity": {
 											"type": "boolean"
 										},
 										"supportsMultipleSystemMessages": {

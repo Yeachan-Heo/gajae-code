@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added opt-in `compat.supportsResponsesSessionAffinity` for OpenAI Responses custom relays. When enabled, supported `openai-responses` models may send `session_id` and `x-client-request-id` affinity headers to a custom endpoint; canonical OpenAI routing remains automatic and known non-OpenAI provider IDs remain excluded.
 
 ### Fixed
 

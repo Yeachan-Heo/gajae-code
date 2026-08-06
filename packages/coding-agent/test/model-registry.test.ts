@@ -1400,6 +1400,21 @@ describe("ModelRegistry", () => {
 				expect(getOpenAICompat(model)?.allowsSyntheticReasoningContentForToolCalls).toBe(false);
 			}
 		});
+		test("provider-level responses affinity applies to bundled OpenAI models", async () => {
+			writeRawModelsJson({
+				openai: {
+					baseUrl: "https://openai-relay.example.com/v1",
+					api: "openai-responses",
+					apiKey: "TEST_KEY",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(getOpenAICompat(registry.find("openai", "gpt-4o-mini"))?.supportsResponsesSessionAffinity).toBe(true);
+			await registry.refresh("offline");
+			expect(getOpenAICompat(registry.find("openai", "gpt-4o-mini"))?.supportsResponsesSessionAffinity).toBe(true);
+		});
 
 		test("provider-level compat applies to custom models", () => {
 			writeRawModelsJson({
@@ -1463,6 +1478,32 @@ describe("ModelRegistry", () => {
 			const compat = getOpenAICompat(model);
 			expect(compat?.supportsUsageInStreaming).toBe(true);
 			expect(compat?.maxTokensField).toBe("max_completion_tokens");
+		});
+		test("model-level false overrides provider-level responses affinity", async () => {
+			writeRawModelsJson({
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+					models: [
+						{
+							id: "relay-model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 8192,
+							compat: { supportsResponsesSessionAffinity: false },
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(getOpenAICompat(registry.find("relay", "relay-model"))?.supportsResponsesSessionAffinity).toBe(false);
+			await registry.refresh("offline");
+			expect(getOpenAICompat(registry.find("relay", "relay-model"))?.supportsResponsesSessionAffinity).toBe(false);
 		});
 	});
 
@@ -4465,6 +4506,53 @@ describe("ModelRegistry", () => {
 
 		expect(model?.wireModelId).toBe("proxy-gpt-4o-mini");
 		expect(model?.requestTransform).toEqual({ extraBody: { routed: true } });
+	});
+	test("rejects responses affinity on known non-target providers", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					baseUrl: "https://relay.example.com/v1",
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("only supported for the openai provider");
+	});
+
+	test("rejects responses affinity on non-Responses APIs", () => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("only supported with the openai-responses API");
+	});
+
+	test("rejects provider affinity inherited by a non-Responses model API", () => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					api: "openai-responses",
+					apiKey: "TEST_KEY",
+					compat: { supportsResponsesSessionAffinity: true },
+					models: [{ id: "chat-model", api: "openai-completions" }],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("only supported with the openai-responses API");
 	});
 	describe("generic local OpenAI-compatible provider config", () => {
 		test("does not add a generic local provider by default", () => {
