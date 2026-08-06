@@ -403,8 +403,8 @@ function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
 }
 
 const ACP_CONFIG_OPTIONS = [
-	{ id: MODEL_CONFIG_ID, name: "Model", options: [] },
-	{ id: THINKING_CONFIG_ID, name: "Thinking", options: [] },
+	{ id: MODEL_CONFIG_ID, name: "Model", category: "model", options: [] },
+	{ id: THINKING_CONFIG_ID, name: "Thinking", category: "thought_level", options: [] },
 	{
 		id: "steeringMode",
 		name: "Steering queue",
@@ -493,6 +493,7 @@ export function acpSessionStateFromConfig(query: unknown, modelCatalogQuery?: un
 			{
 				id: MODE_CONFIG_ID,
 				name: "Mode",
+				category: "mode" as const,
 				type: "select" as const,
 				currentValue: currentModeId,
 				options: [

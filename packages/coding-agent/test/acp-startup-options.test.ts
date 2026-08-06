@@ -191,17 +191,18 @@ test("ACP reports model presets when --mpreset is provided", () => {
 	expect(state.modes.currentModeId).toBe("plan");
 	expect(state.configOptions).toEqual(
 		expect.arrayContaining([
-			expect.objectContaining({ id: "mode", currentValue: "plan" }),
+			expect.objectContaining({ id: "mode", category: "mode", currentValue: "plan" }),
 			expect.objectContaining({
 				id: "model",
 				name: "Preset",
+				category: "model",
 				currentValue: "opus-codex",
 				options: [
 					{ value: "codex-medium", name: "Codex Medium" },
 					{ value: "opus-codex", name: "Opus Codex" },
 				],
 			}),
-			expect.objectContaining({ id: "thinking", currentValue: "high" }),
+			expect.objectContaining({ id: "thinking", category: "thought_level", currentValue: "high" }),
 			expect.objectContaining({ id: "steeringMode", currentValue: "one-at-a-time" }),
 		]),
 	);
