@@ -4522,6 +4522,24 @@ describe("ModelRegistry", () => {
 		expect(String(registry.getError()?.message)).toContain("only supported for the openai provider");
 	});
 
+	test.each([
+		"https://api.openai.com",
+		"https://api.openai.com/v1",
+		"https://api.openai.com/",
+	])("rejects unknown-provider responses affinity on a canonical OpenAI base URL %s", baseUrl => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					baseUrl,
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("requires a genuinely custom base URL");
+	});
 	test("rejects responses affinity on non-Responses APIs", () => {
 		writeRawModelsConfig({
 			providers: {

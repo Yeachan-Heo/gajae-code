@@ -137,7 +137,10 @@ const OPENAI_DEFAULT_BASE_URL_HOST = "api.openai.com";
 function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
 	try {
 		const url = new URL(baseUrl);
-		return url.hostname === OPENAI_DEFAULT_BASE_URL_HOST && (url.pathname === "" || url.pathname === "/v1");
+		return (
+			url.hostname === OPENAI_DEFAULT_BASE_URL_HOST &&
+			(url.pathname === "" || url.pathname === "/" || url.pathname === "/v1")
+		);
 	} catch {
 		return baseUrl === OPENAI_DEFAULT_BASE_URL;
 	}
@@ -151,7 +154,7 @@ function isCanonicalOpenAIAffinityOrigin(baseUrl: string | undefined): boolean {
 			url.origin === "https://api.openai.com" &&
 			url.username === "" &&
 			url.password === "" &&
-			(url.pathname === "" || url.pathname === "/v1") &&
+			(url.pathname === "" || url.pathname === "/" || url.pathname === "/v1") &&
 			url.search === "" &&
 			url.hash === ""
 		);
@@ -178,7 +181,7 @@ function shouldSendOpenAIResponsesSessionHeaders(
 	if (cacheRetention === "none" || isKnownProvider(model.provider)) {
 		return false;
 	}
-	return model.compat?.supportsResponsesSessionAffinity === true;
+	return model.compat?.supportsResponsesSessionAffinity === true && !isCanonicalOpenAIAffinityOrigin(baseUrl);
 }
 
 function isOpenAIHostBaseUrl(baseUrl: string): boolean {

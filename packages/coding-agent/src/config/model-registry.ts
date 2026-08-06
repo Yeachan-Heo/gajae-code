@@ -257,7 +257,29 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 		?.api as Api | undefined;
 }
 
-function assertResponsesSessionAffinitySupported(providerName: string, api: Api | undefined, source: string): void {
+function isCanonicalOpenAIAffinityBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return false;
+	try {
+		const url = new URL(baseUrl);
+		return (
+			url.origin === "https://api.openai.com" &&
+			url.username === "" &&
+			url.password === "" &&
+			(url.pathname === "/" || url.pathname === "/v1") &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
+}
+
+function assertResponsesSessionAffinitySupported(
+	providerName: string,
+	api: Api | undefined,
+	baseUrl: string | undefined,
+	source: string,
+): void {
 	if (isKnownProvider(providerName) && providerName !== "openai") {
 		throw new Error(
 			`Provider ${providerName}: ${source} is only supported for the openai provider or unknown user-defined provider IDs.`,
@@ -266,10 +288,16 @@ function assertResponsesSessionAffinitySupported(providerName: string, api: Api 
 	if (api !== "openai-responses") {
 		throw new Error(`Provider ${providerName}: ${source} is only supported with the openai-responses API.`);
 	}
+	if (!isKnownProvider(providerName) && isCanonicalOpenAIAffinityBaseUrl(baseUrl)) {
+		throw new Error(
+			`Provider ${providerName}: ${source} requires a genuinely custom base URL for unknown provider IDs.`,
+		);
+	}
 }
 
 interface ProviderValidationModel {
 	id: string;
+	baseUrl?: string;
 	api?: Api;
 	contextWindow?: number;
 	maxTokens?: number;
@@ -367,18 +395,19 @@ function validateProviderConfiguration(
 				assertResponsesSessionAffinitySupported(
 					providerName,
 					model.api ?? config.api ?? getKnownProviderModelApi(providerName, model.id),
+					model.baseUrl ?? config.baseUrl,
 					source,
 				);
 			}
 		} else if (config.api) {
-			assertResponsesSessionAffinitySupported(providerName, config.api, source);
+			assertResponsesSessionAffinitySupported(providerName, config.api, config.baseUrl, source);
 		} else {
 			const knownApis = getKnownProviderApis(providerName);
 			if (knownApis.size === 0) {
-				assertResponsesSessionAffinitySupported(providerName, undefined, source);
+				assertResponsesSessionAffinitySupported(providerName, undefined, config.baseUrl, source);
 			}
 			for (const api of knownApis) {
-				assertResponsesSessionAffinitySupported(providerName, api, source);
+				assertResponsesSessionAffinitySupported(providerName, api, config.baseUrl, source);
 			}
 		}
 	}
@@ -392,6 +421,7 @@ function validateProviderConfiguration(
 			assertResponsesSessionAffinitySupported(
 				providerName,
 				effectiveApi,
+				config.baseUrl,
 				`modelOverrides ${modelId} "compat.supportsResponsesSessionAffinity"`,
 			);
 		}
@@ -435,6 +465,7 @@ function validateProviderConfiguration(
 			assertResponsesSessionAffinitySupported(
 				providerName,
 				effectiveApi,
+				modelDef.baseUrl ?? config.baseUrl,
 				`model ${modelDef.id} "compat.supportsResponsesSessionAffinity"`,
 			);
 		}
