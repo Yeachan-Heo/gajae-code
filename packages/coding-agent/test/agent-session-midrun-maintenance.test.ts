@@ -15,6 +15,7 @@ import {
 	getLatestCompactionEntry,
 	loadEntriesFromFile,
 	SessionManager,
+	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
 
@@ -503,22 +504,32 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 	});
 
 	it("fails closed when tool-output artifact persistence is unavailable", async () => {
-		session = await buildSession({ settings: { "compaction.keepRecentTokens": 10 } });
-		const output = "unavailable-output-".repeat(35_000);
-		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
-		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
-		expect(outcome).toBe("failed");
-		const entry = session.sessionManager
-			.getBranch()
-			.find(
-				(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
-					candidate.type === "message" &&
-					candidate.message.role === "toolResult" &&
-					candidate.message.toolCallId === toolCallId,
-			);
-		expect(entry?.type).toBe("message");
-		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
-		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
+		// Non-persisted sessions fall back to an ephemeral artifact root (#3813). Force that
+		// install to fail so ensureArtifactManager() returns null — the true "unavailable" case.
+		const previousHook = SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall;
+		SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = async () => {
+			throw new Error("injected ephemeral artifact install failure");
+		};
+		try {
+			session = await buildSession({ settings: { "compaction.keepRecentTokens": 10 } });
+			const output = "unavailable-output-".repeat(35_000);
+			const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
+			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+			expect(outcome).toBe("failed");
+			const entry = session.sessionManager
+				.getBranch()
+				.find(
+					(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+						candidate.type === "message" &&
+						candidate.message.role === "toolResult" &&
+						candidate.message.toolCallId === toolCallId,
+				);
+			expect(entry?.type).toBe("message");
+			if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
+			expect(entry.message.content).toEqual([{ type: "text", text: output }]);
+		} finally {
+			SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = previousHook;
+		}
 	}, 15_000);
 
 	it("keeps canonical output when exact publication is incomplete", async () => {
