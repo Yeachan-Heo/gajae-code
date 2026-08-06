@@ -72,10 +72,15 @@ export const CURATED_TIER_LABELS = {
 	],
 } as const satisfies CuratedTierLabels;
 
-/** Generated from packages/ai/src/models.json at feature land: 3915 in-scope baseline skips. */
+/** Generated from packages/ai/src/models.json at feature land: 3917 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
+	"alibaba-token-plan/deepseek-v4-flash-0731": {
+		baseline: true,
+		rationale: "post-feature catalog addition; not yet curated",
+	},
 	"alibaba-token-plan/deepseek-v4-pro": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"alibaba-token-plan/glm-5.2": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
+	"alibaba-token-plan/qwen3.8-max": { baseline: true, rationale: "post-feature catalog addition; not yet curated" },
 	"alibaba-token-plan/qwen3.8-max-preview": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"amazon-bedrock/anthropic.claude-3-5-haiku-20241022-v1:0": {
 		baseline: true,

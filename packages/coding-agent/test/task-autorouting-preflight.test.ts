@@ -129,6 +129,7 @@ async function snapshotTree(root: string, skipStaging = false): Promise<string> 
 			return;
 		}
 		for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
+			if (/^\.gjc-(?:exact-(?:replace-destination|unlink-placeholder)|receipt-remove)-/.test(child.name)) continue;
 			if (skipStaging && child.isDirectory() && child.name === ".staging") continue;
 			const childPath = path.join(directory, child.name);
 			const childRelative = path.join(relative, child.name);

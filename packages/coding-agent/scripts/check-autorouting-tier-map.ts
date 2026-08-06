@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { RETIRED_MODEL_KEYS } from "../../ai/src/model-retirements";
+import { isValidAutoroutingSelector } from "../src/config/autorouting-contract";
 import {
 	CURATED_TIER_LABELS,
 	type CuratedTierLabels,
@@ -43,7 +44,12 @@ function isImageGenerationOnly(model: CommittedCatalogModel): boolean {
 
 export function isInAutoroutingGateScope(provider: string, id: string, model: CommittedCatalogModel): boolean {
 	const key = modelKey(provider, id);
-	return !RETIRED_KEYS.has(key) && !DISCOVERY_ONLY_PROVIDERS.has(provider) && !isImageGenerationOnly(model);
+	return (
+		isValidAutoroutingSelector(key) &&
+		!RETIRED_KEYS.has(key) &&
+		!DISCOVERY_ONLY_PROVIDERS.has(provider) &&
+		!isImageGenerationOnly(model)
+	);
 }
 
 export function committedCatalogKeys(catalog: CommittedCatalog): string[] {

@@ -1613,7 +1613,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 			publishedText.includes('"decimal":"0.5"') &&
 			publishedText.includes(`"id":"${first}"`) &&
 			rolledBack.final === null &&
-			JSON.stringify(rolledBack.parentTree) === JSON.stringify(["0.tool.log"]) &&
+			JSON.stringify(rolledBack.parentTree) === JSON.stringify([".artifact-id-0", "0.tool.log"]) &&
 			rolledBack.stagingTree.length === 0 &&
 			hookError === "before-publish-injected" &&
 			JSON.stringify(hookParentBefore) === JSON.stringify(hookAfter) &&
