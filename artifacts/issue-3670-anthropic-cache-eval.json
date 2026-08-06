@@ -1,20 +1,20 @@
 {
-	"schemaVersion": 3,
-	"issue": 2383,
+	"schemaVersion": 4,
+	"issue": 3670,
 	"status": "pass",
 	"evidenceType": "deterministic-sequential-three-request-provider-payload-simulation",
 	"source": {
 		"url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
 		"retrievedAt": "2026-07-18",
-		"providerSourceBlobOid": "a8f9134b09ceb66d273fd3e9190a3789cbdc15fd",
-		"providerSourceSha256": "e40dde0fe4fc7acdc98437a89c7d4232f10871207f1876fb837453bc59be98fe",
+		"providerSourceBlobOid": "5f9708abab7652c3ba56f214d2c92751bea1e2ed",
+		"providerSourceSha256": "fbf80b8d5c1f8ddc94197c7777053a6cd057c9db8b793dbfb201948f1f0d9334",
 		"inputFixtureSha256": "b1ca8d3183ca168140774f848ed414252178f7c5788d61243069862ae59c129b"
 	},
 	"derivationCommands": [
 		"git rev-parse HEAD:packages/ai/src/providers/anthropic.ts",
 		"git hash-object packages/ai/src/providers/anthropic.ts",
 		"sha256sum packages/ai/src/providers/anthropic.ts",
-		"WRITE_ARCHITECTURE_2383_EVAL=1 bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
+		"WRITE_ISSUE_3670_EVAL=1 bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
 		"bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
 	],
 	"perTurn": {
@@ -23,7 +23,7 @@
 				"anchors": [
 					{
 						"path": "messages[0].content[0]",
-						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
+						"sha256": "597af92751082858c0ea3162746259847bdedc2c85c9ee03d416fc5ba190dcdd"
 					}
 				],
 				"cacheableTokenEstimateAtLeast": 1948
@@ -32,7 +32,7 @@
 				"anchors": [
 					{
 						"path": "messages[0].content[0]",
-						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
+						"sha256": "597af92751082858c0ea3162746259847bdedc2c85c9ee03d416fc5ba190dcdd"
 					}
 				],
 				"cacheableTokenEstimateAtLeast": 1948
@@ -41,7 +41,7 @@
 				"anchors": [
 					{
 						"path": "messages[0].content[0]",
-						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
+						"sha256": "597af92751082858c0ea3162746259847bdedc2c85c9ee03d416fc5ba190dcdd"
 					}
 				],
 				"cacheableTokenEstimateAtLeast": 1948
@@ -52,11 +52,11 @@
 				"anchors": [
 					{
 						"path": "messages[0].content[0]",
-						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
+						"sha256": "597af92751082858c0ea3162746259847bdedc2c85c9ee03d416fc5ba190dcdd"
 					},
 					{
 						"path": "messages[1].content[0]",
-						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
+						"sha256": "87779cbbddebca3daa4306e18058178b59c7fd85ad54296dda2ab3e2aeda8633"
 					}
 				],
 				"cacheableTokenEstimateAtLeast": 1971
@@ -65,11 +65,11 @@
 				"anchors": [
 					{
 						"path": "messages[0].content[0]",
-						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
+						"sha256": "597af92751082858c0ea3162746259847bdedc2c85c9ee03d416fc5ba190dcdd"
 					},
 					{
 						"path": "messages[3].content[0]",
-						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+						"sha256": "277317060ae9683282759faa07ed317895a74f177f9a75a79deef92c3fc7bf86"
 					}
 				],
 				"cacheableTokenEstimateAtLeast": 2026
@@ -78,11 +78,11 @@
 				"anchors": [
 					{
 						"path": "messages[0].content[0]",
-						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
+						"sha256": "597af92751082858c0ea3162746259847bdedc2c85c9ee03d416fc5ba190dcdd"
 					},
 					{
 						"path": "messages[5].content[0]",
-						"sha256": "430ec7eb2f22ff6e14dbf58a21e450ed45f277712f30c0351d1325bd7216110a"
+						"sha256": "944c4147d31d99448e02147e8e8e7becceb3c37c54863c22850b0b91209185aa"
 					}
 				],
 				"cacheableTokenEstimateAtLeast": 2080
