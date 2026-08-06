@@ -106,8 +106,9 @@ function windowsProcessArguments(): string[] {
 		if (!argumentsPointer || argumentCount[0] === 0 || argumentCount[0] > 32_767) {
 			throw new Error("kernel process arguments unavailable");
 		}
+		const parsedArgumentsPointer = argumentsPointer;
 		return Array.from({ length: argumentCount[0] }, (_, index) =>
-			windowsWideString(read.ptr(argumentsPointer, index * 8)),
+			windowsWideString(read.ptr(parsedArgumentsPointer, index * 8) as Pointer),
 		);
 	} finally {
 		if (argumentsPointer) kernel32.symbols.LocalFree(argumentsPointer);
