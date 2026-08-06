@@ -379,8 +379,18 @@ export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boole
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {
 	if (model.api !== "anthropic-messages") return false;
 	const parsedModel = parseKnownModel(model.id);
-	if (parsedModel.family !== "anthropic" || parsedModel.kind !== "opus") return false;
-	return semverGte(parsedModel.version, "4.7");
+	if (parsedModel.family !== "anthropic") return false;
+	// Explicit capability predicate instead of a generic `kind === opus` gate:
+	// Sonnet 5 officially exposes Anthropic's real xhigh and max presets on
+	// the Messages API just like Opus 4.7+. Older Sonnet generations do not,
+	// so the predicate stays fail-closed for them.
+	if (parsedModel.kind === "opus") {
+		return semverGte(parsedModel.version, "4.7");
+	}
+	if (parsedModel.kind === "sonnet") {
+		return semverGte(parsedModel.version, "5.0");
+	}
+	return false;
 }
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
@@ -691,10 +701,16 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 			// Converse lacks it (same split as Opus 4.7+ below).
 			return model.api === "anthropic-messages" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
 		}
-		if (parsedModel.kind !== "opus") return DEFAULT_REASONING_EFFORTS;
-		return anthropicModelHasRealXHighEffort(model)
-			? DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX
-			: DEFAULT_REASONING_EFFORTS_WITH_MAX;
+		if (anthropicModelHasRealXHighEffort(model)) {
+			// Opus 4.7+ and Sonnet 5 expose both Anthropic's real xhigh and
+			// max presets on the Messages API.
+			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
+		}
+		if (parsedModel.kind === "opus") {
+			// Opus 4.6 exposes max but not the newer xhigh literal.
+			return DEFAULT_REASONING_EFFORTS_WITH_MAX;
+		}
+		return DEFAULT_REASONING_EFFORTS;
 	}
 	return inferFallbackEfforts(model);
 }
