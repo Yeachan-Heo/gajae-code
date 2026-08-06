@@ -2895,7 +2895,26 @@ async function executeToolCalls(
 		}
 	}
 
-	await Promise.allSettled(tasks);
+	const allTasks = Promise.allSettled(tasks);
+	if (!signal) {
+		await allTasks;
+	} else {
+		const abortPromise = Promise.withResolvers<boolean>();
+		const onAbort = () => abortPromise.resolve(true);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			const aborted = signal.aborted || (await Promise.race([allTasks.then(() => false), abortPromise.promise]));
+			if (aborted) {
+				for (const record of records) {
+					if (record.toolResultMessage) continue;
+					record.skipped = true;
+					emitToolResult(record, createAbortedToolExecutionResult(), true);
+				}
+			}
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
 
 	for (const record of records) {
 		if (!record.toolResultMessage) {
@@ -2967,6 +2986,12 @@ function createAbortedToolResult(
 function createSkippedToolResult(): AgentToolResult<any> {
 	return {
 		content: [{ type: "text", text: "Skipped due to queued user message." }],
+		details: {},
+	};
+}
+function createAbortedToolExecutionResult(): AgentToolResult<any> {
+	return {
+		content: [{ type: "text", text: "Tool execution was aborted." }],
 		details: {},
 	};
 }

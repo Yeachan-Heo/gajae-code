@@ -7,6 +7,7 @@
  */
 import { type AssistantMessage, type ImageContent, isContextOverflow } from "@gajae-code/ai";
 import { isKnownSinkPeerClosedError, logger, sanitizeText } from "@gajae-code/utils";
+import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { AgentSession } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
 import { initializeExtensions } from "./runtime-init";
@@ -206,6 +207,15 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			const header = session.sessionManager.getHeader();
 			if (header) stdout.write(`${JSON.stringify(header)}\n`);
 		}
+
+		// Bundled and file-based slash commands (`/init`, project `commands/*.md`, …) expand
+		// inside AgentSession#prompt from the list handed over by setSlashCommands. Interactive
+		// mode loads it while building its autocomplete; print mode has no autocomplete, so
+		// without this the list stays empty and a leading-slash prompt reaches the model as
+		// literal prose — no expansion, no error, and an answer that looks like the command ran.
+		await logger.time("print:slash-commands", async () => {
+			session.setSlashCommands(await loadSlashCommands({ cwd: session.sessionManager.getCwd() }));
+		});
 
 		// Set up extensions for print mode (no UI, no command context).
 		await initializeExtensions(session, {

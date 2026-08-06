@@ -309,33 +309,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "minimax-eco",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:low",
-			executor: "minimax-code/minimax-m3:minimal",
-			planner: "minimax-code/minimax-m3:low",
-			critic: "minimax-code/minimax-m3:medium",
-			architect: "minimax-code/minimax-m3:high",
+			default: "minimax-code/MiniMax-M3:low",
+			executor: "minimax-code/MiniMax-M3:minimal",
+			planner: "minimax-code/MiniMax-M3:low",
+			critic: "minimax-code/MiniMax-M3:medium",
+			architect: "minimax-code/MiniMax-M3:high",
 		},
 	},
 	{
 		name: "minimax-medium",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:medium",
-			executor: "minimax-code/minimax-m3:low",
-			planner: "minimax-code/minimax-m3:medium",
-			critic: "minimax-code/minimax-m3:high",
-			architect: "minimax-code/minimax-m3:xhigh",
+			default: "minimax-code/MiniMax-M3:medium",
+			executor: "minimax-code/MiniMax-M3:low",
+			planner: "minimax-code/MiniMax-M3:medium",
+			critic: "minimax-code/MiniMax-M3:high",
+			architect: "minimax-code/MiniMax-M3:xhigh",
 		},
 	},
 	{
 		name: "minimax-pro",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:xhigh",
-			executor: "minimax-code/minimax-m3:medium",
-			planner: "minimax-code/minimax-m3:high",
-			critic: "minimax-code/minimax-m3:xhigh",
-			architect: "minimax-code/minimax-m3:xhigh",
+			default: "minimax-code/MiniMax-M3:xhigh",
+			executor: "minimax-code/MiniMax-M3:medium",
+			planner: "minimax-code/MiniMax-M3:high",
+			critic: "minimax-code/MiniMax-M3:xhigh",
+			architect: "minimax-code/MiniMax-M3:xhigh",
 		},
 	},
 	{
@@ -601,7 +601,7 @@ describe("built-in model profile catalog", () => {
 		}
 		expect(missing).toEqual([]);
 		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.k3).toBeDefined();
-		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["MiniMax-M3"]).toBeDefined();
 		expect(
 			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-flash-0731"],
 		).toBeDefined();
@@ -709,7 +709,7 @@ describe("built-in model profile catalog", () => {
 		}
 	});
 
-	test("built-in minimax profiles resolve to minimax-m3 and never minimax-v3 (issue #656)", () => {
+	test("built-in minimax profiles resolve to the canonical MiniMax-M3 id (issue #3896)", () => {
 		const minimaxProfiles = BUILTIN_MODEL_PROFILES.filter(profile =>
 			profile.requiredProviders.includes("minimax-code"),
 		);
@@ -720,10 +720,11 @@ describe("built-in model profile catalog", () => {
 				expect(selector).toBeDefined();
 				const parsed = parseModelString(selectorHead(selector) ?? "");
 				expect(parsed?.provider).toBe("minimax-code");
-				expect(parsed?.id).toBe("minimax-m3");
+				expect(parsed?.id).toBe("MiniMax-M3");
 			}
 		}
 		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax-v3");
+		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax-m3");
 	});
 
 	test("Alibaba Token Plan profiles route their intended roles", () => {

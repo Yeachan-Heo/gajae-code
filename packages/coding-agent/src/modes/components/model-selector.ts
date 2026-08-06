@@ -1721,9 +1721,13 @@ export class ModelSelectorComponent extends Container {
 			: choice.role === null
 				? "temporary model"
 				: GJC_MODEL_ASSIGNMENT_TARGETS[choice.role].name;
+		// Show the highlighted reasoning level — never the model id (that mislabel
+		// made "Reasoning for Default: gpt-5.6-luna" look like a level).
+		const selectedLevel = choice.levels[this.#selectedThinkingIndex];
+		const selectedLevelLabel = selectedLevel ? getThinkingLevelMetadata(selectedLevel).label : "—";
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(
-			new Text(theme.fg("muted", `  Reasoning for ${targetLabel}: ${choice.item.model.id}`), 0, 0),
+			new Text(theme.fg("muted", `  Reasoning for ${targetLabel}: ${selectedLevelLabel}`), 0, 0),
 		);
 		this.#listContainer.addChild(new Spacer(1));
 		for (let i = 0; i < choice.levels.length; i++) {
@@ -2079,8 +2083,13 @@ export class ModelSelectorComponent extends Container {
 			this.#updateList();
 		}
 	}
-	#getInitialThinkingChoiceIndex(item: ModelItem | CanonicalModelItem, levels: ThinkingLevel[]): number {
-		const preferred = this.#getPreferredThinkingLevel(item);
+	#getInitialThinkingChoiceIndex(
+		item: ModelItem | CanonicalModelItem,
+		levels: ThinkingLevel[],
+		role: GjcModelAssignmentTargetId | null = null,
+		roles?: readonly GjcModelAssignmentTargetId[],
+	): number {
+		const preferred = this.#getPreferredThinkingLevel(item, role, roles);
 		if (preferred && preferred !== ThinkingLevel.Inherit) {
 			const index = levels.indexOf(preferred);
 			if (index !== -1) return index;
@@ -2088,11 +2097,49 @@ export class ModelSelectorComponent extends Container {
 		return 0;
 	}
 
-	#getPreferredThinkingLevel(item: ModelItem | CanonicalModelItem): ThinkingLevel | undefined {
+	/**
+	 * Prefer the role binding the user is editing when it already points at this
+	 * model so the reasoning menu opens on the level role badges already show
+	 * (e.g. EXECUTOR (xhigh) must not leave the cursor on "off").
+	 */
+	#getPreferredThinkingLevel(
+		item: ModelItem | CanonicalModelItem,
+		role: GjcModelAssignmentTargetId | null = null,
+		roles?: readonly GjcModelAssignmentTargetId[],
+	): ThinkingLevel | undefined {
+		const roleThinking = this.#getAssignedThinkingLevelForModel(item.model, role, roles);
+		if (roleThinking && roleThinking !== ThinkingLevel.Inherit) {
+			return roleThinking;
+		}
 		if (item.thinkingLevel && item.thinkingLevel !== ThinkingLevel.Inherit) {
 			return item.thinkingLevel;
 		}
 		return undefined;
+	}
+
+	#getAssignedThinkingLevelForModel(
+		model: Model,
+		role: GjcModelAssignmentTargetId | null,
+		roles?: readonly GjcModelAssignmentTargetId[],
+	): ThinkingLevel | undefined {
+		if (roles && roles.length > 0) {
+			const assignedLevels = roles
+				.map(targetRole => this.#roles[targetRole])
+				.filter(
+					(assigned): assigned is RoleAssignment =>
+						assigned !== undefined &&
+						modelsAreEqual(assigned.model, model) &&
+						assigned.thinkingLevel !== ThinkingLevel.Inherit,
+				)
+				.map(assigned => assigned.thinkingLevel);
+			if (assignedLevels.length === 0) return undefined;
+			const first = assignedLevels[0];
+			return assignedLevels.every(level => level === first) ? first : undefined;
+		}
+		if (role === null) return undefined;
+		const assigned = this.#roles[role];
+		if (!assigned || !modelsAreEqual(assigned.model, model)) return undefined;
+		return assigned.thinkingLevel;
 	}
 
 	#handleSelect(
@@ -2109,7 +2156,7 @@ export class ModelSelectorComponent extends Container {
 		if (!hasExplicitThinkingChoice && needsExplicitThinkingChoice) {
 			const levels = getSelectableThinkingLevels(item.model);
 			this.#pendingThinkingChoice = { item, role, roles, levels };
-			this.#selectedThinkingIndex = this.#getInitialThinkingChoiceIndex(item, levels);
+			this.#selectedThinkingIndex = this.#getInitialThinkingChoiceIndex(item, levels, role, roles);
 			this.#updateList();
 			return;
 		}

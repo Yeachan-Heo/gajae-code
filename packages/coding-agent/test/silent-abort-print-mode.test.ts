@@ -70,7 +70,9 @@ function createMockSession(
 		autoCompactionEnabled: opts?.autoCompactionEnabled ?? false,
 		sessionManager: {
 			getHeader: () => undefined,
+			getCwd: () => import.meta.dir,
 		},
+		setSlashCommands: () => {},
 		extensionRunner: undefined,
 		subscribe: () => () => {},
 		prompt: async () => {},
@@ -113,11 +115,16 @@ function createPrintModeTrackingSession(
 		for (const event of events) emit(event);
 		lifecycle.push("prompt:end");
 	});
+	// Print mode hands the loaded slash commands to the session before it prompts, so the
+	// fake models both seams. Ordering is pinned in its own test rather than in `lifecycle`,
+	// which the disposal/EPIPE cases assert byte-for-byte.
+	const setSlashCommands = vi.fn();
 	const session = {
 		configWarnings: [],
 		state: { messages },
-		sessionManager: { getHeader: () => header },
+		sessionManager: { getHeader: () => header, getCwd: () => import.meta.dir },
 		extensionRunner: undefined,
+		setSlashCommands,
 		subscribe: (listener: (event: unknown) => void) => {
 			lifecycle.push("subscribe");
 			onEvent = listener;
@@ -135,6 +142,7 @@ function createPrintModeTrackingSession(
 		session,
 		dispose,
 		prompt,
+		setSlashCommands,
 		lifecycle,
 		unsubscribeCount: () => unsubscribeCount,
 	};
@@ -525,5 +533,30 @@ describe("Print mode", () => {
 		} finally {
 			process.stdout.removeListener("error", externalListener);
 		}
+	});
+});
+
+describe("Print mode slash-command expansion", () => {
+	it("hands bundled slash commands to the session before the first prompt", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+		const tracking = createPrintModeTrackingSession();
+		installImmediateStdoutMock();
+
+		const order: string[] = [];
+		tracking.setSlashCommands.mockImplementation((commands: unknown) => {
+			order.push("setSlashCommands");
+			const names = (commands as Array<{ name: string }>).map(cmd => cmd.name);
+			// `/init` is embedded in the binary, so it is present regardless of cwd. Without the
+			// handover the session keeps an empty list and `/init` reaches the model as prose.
+			expect(names).toContain("init");
+		});
+		tracking.prompt.mockImplementation(async () => {
+			order.push("prompt");
+		});
+
+		await runPrintMode(tracking.session, { mode: "text", initialMessage: "/init" });
+
+		expect(tracking.setSlashCommands).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["setSlashCommands", "prompt"]);
 	});
 });

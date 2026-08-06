@@ -226,15 +226,17 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\n");
 		expect(selected).toBeUndefined();
 		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(thinkingRendered).toContain("Reasoning for Executor");
+		// Header must show the preselected reasoning level, not the model id.
+		expect(thinkingRendered).toContain("Reasoning for Executor: high");
 		expect(thinkingRendered).toContain("xhigh");
+		// Cursor is seeded from the role badge (high), so Enter keeps high.
 		selector.handleInput("\n");
 
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected role-agent selection");
 		expect(selectedAfterEnter.role).toBe("executor");
-		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
-		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:high`);
 	});
 
 	test("role assignment updates live runtime override for next selector render", async () => {
@@ -261,7 +263,9 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
-		selector.handleInput("\x1b[B");
+		// Reasoning cursor is seeded on the badge level (low); two downs → high.
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Planner: low");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
@@ -500,13 +504,17 @@ describe("ModelSelector canonical model selection", () => {
 
 		expect(selected).toBeUndefined();
 		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(thinkingRendered).toContain("Reasoning for Default");
+		// Header shows the highlighted level (starts at off), never the model id.
+		expect(thinkingRendered).toContain("Reasoning for Default: off");
+		expect(thinkingRendered).not.toContain(`Reasoning for Default: ${model.id}`);
 		expect(thinkingRendered).toContain("off");
 		expect(thinkingRendered).toContain("high");
 
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
+		const afterNav = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(afterNav).toContain("Reasoning for Default: high");
 		selector.handleInput("\n");
 
 		const selectedAfterThinking = selected;
@@ -716,6 +724,90 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterEnter.role).toBe("default");
 		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Inherit);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("seeds reasoning cursor from multi-effort role badge and keeps limited-effort catalog surface", async () => {
+		installTestTheme();
+		// Multi-effort Luna-class model (xhigh assigned on executor).
+		const multiEffort = createOpenAIModel("openai-codex", "gpt-5.6-luna");
+		multiEffort.thinking = {
+			minLevel: Effort.Low,
+			maxLevel: Effort.XHigh,
+			defaultLevel: Effort.Medium,
+			mode: "effort",
+		};
+		// Limited-effort Flash-class surface: only off + low.
+		const limitedEffort = createOpenAIModel("openai", "deepseek-v4-flash");
+		limitedEffort.thinking = {
+			minLevel: Effort.Low,
+			maxLevel: Effort.Low,
+			defaultLevel: Effort.Low,
+			mode: "effort",
+		};
+
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": {
+				executor: `${multiEffort.provider}/${multiEffort.id}:xhigh`,
+			},
+		});
+
+		const modelRegistry = {
+			getAll: () => [multiEffort, limitedEffort],
+			hasConfiguredProviderAuth: () => false,
+			getDiscoverableProviders: () => [],
+			getCanonicalModels: () => [],
+			resolveCanonicalModel: () => undefined,
+		} as unknown as ModelRegistry;
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			multiEffort,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ modelRegistry, thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const badgeRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(badgeRendered).toContain("EXECUTOR (xhigh)");
+
+		// Open action menu → Executor → reasoning menu.
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selected).toBeUndefined();
+
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Executor: xhigh");
+		expect(thinkingRendered).not.toContain(`Reasoning for Executor: ${multiEffort.id}`);
+		// Provider-neutral max label (must not leak Opus wording onto non-Opus models).
+		expect(thinkingRendered).not.toContain("Opus maximum");
+
+		// Enter keeps the badge-aligned level.
+		selector.handleInput("\n");
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected executor selection seeded from badge");
+		expect(selectedAfterEnter.role).toBe("executor");
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(selectedAfterEnter.selector).toBe(`${multiEffort.provider}/${multiEffort.id}:xhigh`);
+
+		// Limited-effort model only surfaces off + low (Flash-class completeness).
+		const limitedSelector = createSelector(limitedEffort, Settings.isolated({}), () => {}, {
+			thinkingLevel: null,
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+		limitedSelector.handleInput("\n");
+		limitedSelector.handleInput("\n");
+		const limitedRendered = normalizeRenderedText(limitedSelector.render(220).join("\n"));
+		expect(limitedRendered).toContain("Reasoning for Default: off");
+		expect(limitedRendered).toContain("low");
+		expect(limitedRendered).not.toContain("medium");
+		expect(limitedRendered).not.toContain("high");
+		expect(limitedRendered).not.toContain("xhigh");
 	});
 });
 

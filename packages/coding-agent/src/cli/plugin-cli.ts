@@ -155,6 +155,7 @@ export function parsePluginArgs(args: string[]): PluginCommandArgs | undefined {
 }
 
 import { classifyInstallTarget } from "./classify-install-target";
+import { findMarketplacesOffering, isBareInstallName } from "./marketplace-hint";
 
 export { classifyInstallTarget } from "./classify-install-target";
 
@@ -609,6 +610,15 @@ async function handleInstall(
 			// The spec can carry credentials, a query string, or an absolute home
 			// path, so report the failure without echoing it or the raw cause.
 			console.error(chalk.red(`${theme.status.error} Failed to install plugin (${describeInstallFailure(err)})`));
+			// A bare name (no `@scope`, no version, no path separator) is safe to
+			// echo, and it is exactly the shape a user copies out of
+			// `plugin discover`. Point at the qualified spec that would work.
+			if (isBareInstallName(spec)) {
+				const offering = await findMarketplacesOffering(mktMgr, spec).catch(() => []);
+				for (const marketplace of offering) {
+					console.error(chalk.dim(`  Try: ${APP_NAME} plugin install ${spec}@${marketplace}`));
+				}
+			}
 			process.exit(1);
 		}
 	}

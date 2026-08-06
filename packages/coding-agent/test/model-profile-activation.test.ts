@@ -100,8 +100,8 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			model("opencode-go", "deepseek-v4-pro"),
 			model("opencode-go", "kimi-k2.6"),
 			model("opencode-go", "mimo-v2.5-pro"),
-			model("minimax-code", "minimax-m3"),
-			model("minimax-code-cn", "minimax-m3"),
+			model("minimax-code", "MiniMax-M3"),
+			model("minimax-code-cn", "MiniMax-M3"),
 			model("kimi-code", "kimi-k2.5"),
 			model("zai", "glm-5.1"),
 			model("alibaba-token-plan", "qwen3.8-max-preview", {

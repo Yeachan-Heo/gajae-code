@@ -2,13 +2,15 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
+import { collectFileLocksForGc, fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
+import { collectGcReport, computeExitCode } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import { teamWorkersGcAdapter } from "@gajae-code/coding-agent/gjc-runtime/team-gc";
 import {
 	harnessLeasesGcAdapter,
 	registryEntriesGcAdapter,
 } from "@gajae-code/coding-agent/harness-control-plane/gc-adapter";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 
 const DEAD_PID = 4242;
 const ALIVE_PID = 4243;
@@ -149,18 +151,79 @@ describe("fileLocksGcAdapter", () => {
 			env: { ...process.env, GJC_RECEIPT_SPOOL_DIR: spoolDir },
 			cwd: base,
 		};
-		const { records } = await fileLocksGcAdapter.collect(ctx);
+		const { records, errors, warnings } = await fileLocksGcAdapter.collect(ctx);
 		const byPath = new Map(records.map(r => [path.resolve(r.path ?? r.id), r]));
 		expect(byPath.get(path.resolve(deadLock))?.removable).toBe(true);
 		expect(byPath.get(path.resolve(aliveLock))?.removable).toBe(false);
 		expect(byPath.get(path.resolve(oldLiveLock))?.removable).toBe(false);
 		expect(byPath.get(path.resolve(malformedLock))?.removable).toBe(false);
+		expect(errors).toEqual([]);
+		expect(warnings ?? []).toEqual([]);
 
 		// prune removes only the dead lock dir after re-probe.
 		const outcome = await fileLocksGcAdapter.prune(byPath.get(path.resolve(deadLock))!, ctx);
 		expect(outcome.removed).toBe(true);
 		expect(await fs.exists(deadLock)).toBe(false);
 		expect(await fs.exists(aliveLock)).toBe(true);
+	});
+
+	test("walk cap is a per-root warning and does not skip remaining roots (#3852)", async () => {
+		const base = await makeTemp();
+		const originalAgentDir = getAgentDir();
+		// Isolate agent dir under the temp tree so config-root + agent share base.
+		const agentDir = path.join(base, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		setAgentDir(agentDir);
+		try {
+			// Flood the agent root so a tiny budget truncates it; spool stays small.
+			const flooded = path.join(agentDir, "flood");
+			await fs.mkdir(flooded, { recursive: true });
+			for (let i = 0; i < 8; i++) {
+				await fs.writeFile(path.join(flooded, `f${i}`), "x", "utf8");
+			}
+
+			const spoolDir = path.join(base, "spool");
+			const spoolLock = path.join(spoolDir, "spool-dead.lock");
+			await writeJson(path.join(spoolLock, "info"), { pid: DEAD_PID, timestamp: Date.now() });
+
+			const ctx: GcContext = {
+				probe: splitProbe,
+				force: false,
+				env: { ...process.env, GJC_RECEIPT_SPOOL_DIR: spoolDir },
+				cwd: base,
+			};
+			// Budget of 3 is enough to start agent root but not exhaust its flood,
+			// while still fully scanning the small spool root (independent budget).
+			const result = await collectFileLocksForGc(ctx, { maxWalkEntries: 3 });
+			expect(result.errors).toEqual([]);
+			const warnings = result.warnings ?? [];
+			expect(warnings.length).toBeGreaterThan(0);
+			for (const warning of warnings) {
+				expect(warning.store).toBe("file_locks");
+				expect(warning.message).toContain("file lock discovery capped at 3 entries for root");
+				expect(warning.message).toContain("scanned");
+			}
+			// Spool lock must still be discovered after agent root truncation.
+			const spoolRec = result.records.find(r => path.resolve(r.path ?? r.id) === path.resolve(spoolLock));
+			expect(spoolRec?.removable).toBe(true);
+
+			const report = await collectGcReport(
+				[
+					{
+						store: "file_locks",
+						collect: async c => collectFileLocksForGc(c, { maxWalkEntries: 3 }),
+						prune: fileLocksGcAdapter.prune.bind(fileLocksGcAdapter),
+					},
+				],
+				ctx,
+				false,
+			);
+			expect(report.errors).toEqual([]);
+			expect(report.warnings.length).toBeGreaterThan(0);
+			expect(computeExitCode(report)).toBe(0);
+		} finally {
+			setAgentDir(originalAgentDir);
+		}
 	});
 });
 

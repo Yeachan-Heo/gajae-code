@@ -4410,12 +4410,6 @@ function extractTextFromContent(content: Message["content"]): string {
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
 const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
-// Hard cap on how many trailing bytes the listers may scan for header patches.
-// moveTo folds cwd patches into line 1 via a full atomic rewrite, so only a
-// recent title patch can live unfolded near EOF; anything buried deeper is
-// folded on the next natural full rewrite. Keeping this bounded preserves the
-// O(SESSION_LIST_PREFIX_BYTES) listing cost that SESSION_LIST_PREFIX_BYTES exists for.
-const SESSION_LIST_TRAILING_PATCH_SCAN_CAP = SESSION_LIST_TRAILING_PATCH_BYTES * 4;
 const SESSION_NAME_MAX_CHARS = 1_000;
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
@@ -4451,12 +4445,17 @@ async function readSessionListTrailingPatches(
 	if (size <= SESSION_LIST_PREFIX_BYTES) return [];
 	const latest: HeaderPatchRecord["patch"] = {};
 	let position = size;
-	const scanFloor = Math.max(0, size - SESSION_LIST_TRAILING_PATCH_SCAN_CAP);
+	// Reverse-scan from EOF in fixed chunks. Stop once both cwd and title
+	// resolve so recent patches stay cheap. Continue past the historical 16 KiB
+	// window when a field is still missing so a buried but canonically valid
+	// header_patch remains listable without a full sequential JSONL parse (#3633).
+	// Chunks that cannot contain a header_patch marker skip JSON parsing.
 	let trailingFragment = Buffer.alloc(0);
 	const chunkSize = Math.min(buffer.byteLength, SESSION_LIST_TRAILING_PATCH_BYTES);
+	const headerPatchMarker = Buffer.from("header_patch");
 	const handle = await fs.promises.open(file, "r");
 	try {
-		while (position > scanFloor && (latest.cwd === undefined || latest.title === undefined)) {
+		while (position > 0 && (latest.cwd === undefined || latest.title === undefined)) {
 			const start = Math.max(0, position - chunkSize);
 			const length = position - start;
 			const { bytesRead } = await handle.read(buffer, 0, length, start);
@@ -4472,18 +4471,26 @@ async function readSessionListTrailingPatches(
 				trailingFragment = combined.subarray(0, firstNewline);
 				complete = combined.subarray(firstNewline + 1);
 			}
-			const lines = complete.toString("utf8").split("\n");
-			for (let index = lines.length - 1; index >= 0; index--) {
-				const line = lines[index];
-				if (!line) continue;
-				try {
-					const record = JSON.parse(line) as SessionPatchRecord;
-					if (!isHeaderPatchRecord(record)) continue;
-					if (latest.cwd === undefined && typeof record.patch.cwd === "string") latest.cwd = record.patch.cwd;
-					if (latest.title === undefined && typeof record.patch.title === "string")
-						latest.title = record.patch.title;
-				} catch {
-					// Ignore malformed or partial records exactly as the canonical loader does.
+			// Marker may straddle the discarded partial first line; still parse when
+			// the raw chunk or carried fragment could hold a header_patch record.
+			const mayContainPatch =
+				complete.includes(headerPatchMarker) ||
+				buffer.subarray(0, bytesRead).includes(headerPatchMarker) ||
+				trailingFragment.includes(headerPatchMarker);
+			if (mayContainPatch) {
+				const lines = complete.toString("utf8").split("\n");
+				for (let index = lines.length - 1; index >= 0; index--) {
+					const line = lines[index];
+					if (!line?.includes("header_patch")) continue;
+					try {
+						const record = JSON.parse(line) as SessionPatchRecord;
+						if (!isHeaderPatchRecord(record)) continue;
+						if (latest.cwd === undefined && typeof record.patch.cwd === "string") latest.cwd = record.patch.cwd;
+						if (latest.title === undefined && typeof record.patch.title === "string")
+							latest.title = record.patch.title;
+					} catch {
+						// Ignore malformed or partial records exactly as the canonical loader does.
+					}
 				}
 			}
 			position = start;

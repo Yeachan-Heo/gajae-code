@@ -427,6 +427,23 @@ export function finalizeTelegramHtml(message?: string): string | undefined {
 	return truncateTelegramHtml(message);
 }
 
+/** Multi-select state marker a transport may prepend to an option label. */
+export const SELECTION_MARK_CHECKED = "☑";
+export const SELECTION_MARK_UNCHECKED = "☐";
+const SELECTION_MARK_PREFIX = new RegExp(`^\\s*([${SELECTION_MARK_CHECKED}${SELECTION_MARK_UNCHECKED}])\\s+`);
+
+/**
+ * Drop a leading `N.`/`N)` index already embedded in an option label (e.g.
+ * deep-interview options pre-numbered by the ask tool) so the canonical
+ * one-based index can be applied instead. A selection marker stays in front of
+ * the text: the label is renumbered, not un-marked.
+ */
+export function renumberableOptionText(label: string): string {
+	const marker = SELECTION_MARK_PREFIX.exec(label);
+	const rest = marker ? label.slice(marker[0].length) : label;
+	return `${marker ? `${marker[1]} ` : ""}${rest.replace(/^\s*\d+[.)]\s+/, "")}`;
+}
+
 /**
  * One-based, plain-text button label (Telegram does not parse HTML in labels).
  *
@@ -436,13 +453,12 @@ export function finalizeTelegramHtml(message?: string): string | undefined {
  * `1. 1. …` and keeps the displayed number aligned with the button's real index.
  */
 export function buttonLabel(label: string, index: number): string {
-	const stripped = label.replace(/^\s*\d+[.)]\s+/, "");
-	return `${index + 1}. ${stripped}`;
+	return `${index + 1}. ${renumberableOptionText(label)}`;
 }
 
 /** Numbered, escaped option list for the Telegram message body. */
 export function numberedOptionList(labels: string[]): string {
-	return labels.map((label, i) => `${i + 1}. ${escapeHtml(label.replace(/^\s*\d+[.)]\s+/, ""))}`).join("\n");
+	return labels.map((label, i) => `${i + 1}. ${escapeHtml(renumberableOptionText(label))}`).join("\n");
 }
 
 /** Compact numeric button label; full option text belongs in the message body. */

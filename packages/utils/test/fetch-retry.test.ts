@@ -1,7 +1,14 @@
-import { describe, expect, it, vi } from "bun:test";
-import { fetchWithRetry } from "../src/fetch-retry";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
+import { type FetchWithRetryOptions, fetchWithRetry } from "../src/fetch-retry";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe("fetchWithRetry", () => {
+	const maxTimerDelayMs = 2_147_483_647;
+
 	it("routes requests through the `fetch` override when provided", async () => {
 		const calls: Array<{ input: string | URL | Request; init: RequestInit | undefined }> = [];
 		const customFetch = async (input: string | URL | Request, init?: RequestInit) => {
@@ -178,5 +185,157 @@ describe("fetchWithRetry", () => {
 		expect(response).toBe(finalResponse);
 		expect(response.bodyUsed).toBe(false);
 		expect(await response.text()).toBe("Please retry in 2s");
+	});
+
+	it.each([
+		["negative numeric", -1, 0],
+		["NaN numeric", Number.NaN, 0],
+		["negative-infinite numeric", Number.NEGATIVE_INFINITY, 0],
+		["negative function result", () => -1, 0],
+		["NaN function result", () => Number.NaN, 0],
+		["negative-infinite function result", () => Number.NEGATIVE_INFINITY, 0],
+		["negative array entry", [-1], 0],
+		["NaN array entry", [Number.NaN], 0],
+		["negative-infinite array entry", [Number.NEGATIVE_INFINITY], 0],
+		["positive-infinite numeric capped to the maximum", Number.POSITIVE_INFINITY, 60_000],
+		["positive-infinite function result capped to the maximum", () => Number.POSITIVE_INFINITY, 60_000],
+		["positive-infinite array entry capped to the maximum", [Number.POSITIVE_INFINITY], 60_000],
+		["finite numeric", 7, 7],
+		["finite function result", () => 11, 11],
+		["finite array entry", [13], 13],
+	] satisfies Array<
+		[string, NonNullable<FetchWithRetryOptions["defaultDelayMs"]>, number]
+	>)("resolves %s before reaching the scheduler", async (_label, defaultDelayMs, expectedDelayMs) => {
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let attempt = 0;
+
+		const response = await fetchWithRetry("https://example.invalid/delay", {
+			fetch: async () => {
+				attempt += 1;
+				return new Response("", { status: attempt === 1 ? 503 : 200 });
+			},
+			defaultDelayMs,
+			maxAttempts: 2,
+		});
+
+		expect(response.status).toBe(200);
+		expect(waitSpy).toHaveBeenCalledTimes(1);
+		expect(waitSpy).toHaveBeenCalledWith(expectedDelayMs, { signal: undefined });
+	});
+
+	it.each([
+		["negative", -1, 0],
+		["NaN", Number.NaN, 0],
+		["negative-infinite", Number.NEGATIVE_INFINITY, 0],
+		["positive-infinite", Number.POSITIVE_INFINITY, 7],
+	] as const)("normalizes a %s response-path maximum at the scheduler boundary", async (_label, maxDelayMs, expected) => {
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let attempt = 0;
+
+		const response = await fetchWithRetry("https://example.invalid/response-cap", {
+			fetch: async () => {
+				attempt += 1;
+				return new Response("", { status: attempt === 1 ? 503 : 200 });
+			},
+			defaultDelayMs: 7,
+			maxAttempts: 2,
+			maxDelayMs,
+		});
+
+		expect(response.status).toBe(200);
+		expect(waitSpy).toHaveBeenCalledWith(expected, { signal: undefined });
+	});
+
+	it("normalizes a hinted response delay after applying an invalid maximum", async () => {
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let attempt = 0;
+
+		const response = await fetchWithRetry("https://example.invalid/hint-cap", {
+			fetch: async () => {
+				attempt += 1;
+				return attempt === 1
+					? new Response("", { status: 429, headers: { "retry-after": "1" } })
+					: new Response("done", { status: 200 });
+			},
+			maxAttempts: 2,
+			maxDelayMs: Number.NaN,
+		});
+
+		expect(response.status).toBe(200);
+		expect(waitSpy).toHaveBeenCalledWith(0, { signal: undefined });
+	});
+
+	it.each([
+		["negative", -1, 0],
+		["NaN", Number.NaN, 0],
+		["negative-infinite", Number.NEGATIVE_INFINITY, 0],
+		["positive-infinite", Number.POSITIVE_INFINITY, 7],
+	] as const)("normalizes a %s network-error maximum at the scheduler boundary", async (_label, maxDelayMs, expected) => {
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let attempt = 0;
+
+		const response = await fetchWithRetry("https://example.invalid/network-cap", {
+			fetch: async () => {
+				attempt += 1;
+				if (attempt === 1) throw new Error("temporary network failure");
+				return new Response("done", { status: 200 });
+			},
+			defaultDelayMs: 7,
+			maxAttempts: 2,
+			maxDelayMs,
+		});
+
+		expect(response.status).toBe(200);
+		expect(waitSpy).toHaveBeenCalledWith(expected, { signal: undefined });
+	});
+
+	it.each([
+		["response", maxTimerDelayMs, maxTimerDelayMs],
+		["response", maxTimerDelayMs + 1, maxTimerDelayMs],
+		["response", 3_000_000_000, maxTimerDelayMs],
+		["network", maxTimerDelayMs, maxTimerDelayMs],
+		["network", maxTimerDelayMs + 1, maxTimerDelayMs],
+		["network", 3_000_000_000, maxTimerDelayMs],
+	] as const)("keeps the %s retry delay within the timer ceiling for %d ms", async (path, configuredDelayMs, expectedDelayMs) => {
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let attempt = 0;
+
+		const response = await fetchWithRetry("https://example.invalid/timer-ceiling", {
+			fetch: async () => {
+				attempt += 1;
+				if (attempt === 1) {
+					if (path === "network") throw new Error("temporary network failure");
+					return new Response("", { status: 503 });
+				}
+				return new Response("done", { status: 200 });
+			},
+			defaultDelayMs: configuredDelayMs,
+			maxAttempts: 2,
+			maxDelayMs: configuredDelayMs,
+		});
+
+		expect(response.status).toBe(200);
+		expect(waitSpy).toHaveBeenCalledTimes(1);
+		expect(waitSpy).toHaveBeenCalledWith(expectedDelayMs, { signal: undefined });
+	});
+
+	it("clamps a server retry hint at the timer ceiling", async () => {
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let attempt = 0;
+
+		const response = await fetchWithRetry("https://example.invalid/hint-timer-ceiling", {
+			fetch: async () => {
+				attempt += 1;
+				return attempt === 1
+					? new Response("", { status: 429, headers: { "retry-after": "3000000" } })
+					: new Response("done", { status: 200 });
+			},
+			maxAttempts: 2,
+			maxDelayMs: 3_000_000_000,
+		});
+
+		expect(response.status).toBe(200);
+		expect(waitSpy).toHaveBeenCalledTimes(1);
+		expect(waitSpy).toHaveBeenCalledWith(maxTimerDelayMs, { signal: undefined });
 	});
 });
