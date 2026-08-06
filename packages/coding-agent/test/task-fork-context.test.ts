@@ -159,7 +159,6 @@ function createSeed(text = "seed"): ForkContextSeed {
 			maxTokens: 250,
 			skippedReasons: {},
 		},
-		cacheIdentity: "parent-cache-id",
 	};
 }
 

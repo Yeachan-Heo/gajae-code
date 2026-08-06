@@ -188,3 +188,10 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 		expect(skill).toMatch(/character-count/i);
 	});
 });
+
+describe("deep-interview invocation arguments contract", () => {
+	it("refers to the loader-appended user request without an unresolved placeholder", () => {
+		expect(skill).toContain("the appended `User:` request");
+		expect(skill).not.toContain("{{ARGUMENTS}}");
+	});
+});
