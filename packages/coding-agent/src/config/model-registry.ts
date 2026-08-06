@@ -257,11 +257,7 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 		?.api as Api | undefined;
 }
 
-function assertResponsesSessionAffinitySupported(
-	providerName: string,
-	api: Api | undefined,
-	source: string,
-): void {
+function assertResponsesSessionAffinitySupported(providerName: string, api: Api | undefined, source: string): void {
 	if (isKnownProvider(providerName) && providerName !== "openai") {
 		throw new Error(
 			`Provider ${providerName}: ${source} is only supported for the openai provider or unknown user-defined provider IDs.`,
@@ -360,7 +356,11 @@ function validateProviderConfiguration(
 		throw new Error(`Provider ${providerName}: "api" is required when discovery is enabled at provider level.`);
 	}
 	const configCompat = config.compat;
-	if (configCompat && "supportsResponsesSessionAffinity" in configCompat && configCompat.supportsResponsesSessionAffinity !== undefined) {
+	if (
+		configCompat &&
+		"supportsResponsesSessionAffinity" in configCompat &&
+		configCompat.supportsResponsesSessionAffinity !== undefined
+	) {
 		const source = '"compat.supportsResponsesSessionAffinity"';
 		if (models.length > 0) {
 			for (const model of models) {
@@ -3021,7 +3021,14 @@ export class ModelRegistry {
 		entry: T,
 		override: Pick<
 			ProviderOverride,
-			"baseUrl" | "headers" | "authHeader" | "apiKey" | "compat" | "transport" | "requestTransform" | "cacheRetention"
+			| "baseUrl"
+			| "headers"
+			| "authHeader"
+			| "apiKey"
+			| "compat"
+			| "transport"
+			| "requestTransform"
+			| "cacheRetention"
 		>,
 	): T {
 		const headers = mergeAuthHeader(

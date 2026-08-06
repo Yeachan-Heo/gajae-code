@@ -12,6 +12,7 @@ import {
 	type CacheRetention,
 	type Context,
 	type FetchImpl,
+	isKnownProvider,
 	type MessageAttribution,
 	type Model,
 	type OpenAICompat,
@@ -21,7 +22,6 @@ import {
 	type StreamOptions,
 	type Tool,
 	type ToolChoice,
-	isKnownProvider,
 } from "../types";
 import {
 	createOpenAIResponsesHistoryPayload,
@@ -570,11 +570,7 @@ function createClient(
 		headers.session_id ??= sessionId;
 		headers["x-client-request-id"] ??= sessionId;
 	}
-	headers = applyOpenAIRequestTransformHeaders(
-		headers,
-		model.requestTransform,
-		`Gajae-Code/${packageJson.version}`,
-	);
+	headers = applyOpenAIRequestTransformHeaders(headers, model.requestTransform, `Gajae-Code/${packageJson.version}`);
 	const { baseUrl: clientBaseUrl, query: endpointQuery } = splitBaseUrlQuery(baseUrl);
 	const baseFetch = fetchOverride ?? fetch;
 	const queryFetch = Object.assign(
