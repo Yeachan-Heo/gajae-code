@@ -72,6 +72,12 @@ export function buildGcReportText(report: GcReport): string {
 		lines.push("");
 	}
 
+	if (report.warnings.length > 0) {
+		lines.push(`Warnings (${report.warnings.length})`);
+		for (const warning of report.warnings) lines.push(`  [${warning.store}/${warning.scope}] ${warning.message}`);
+		lines.push("");
+	}
+
 	if (report.errors.length > 0) {
 		lines.push(`Errors (${report.errors.length})`);
 		for (const err of report.errors) lines.push(`  [${err.store}/${err.scope}] ${err.message}`);
@@ -82,7 +88,8 @@ export function buildGcReportText(report: GcReport): string {
 	lines.push(
 		`Summary: discovered=${c.discovered} stale=${c.stale} alive=${c.alive} eperm=${c.eperm} unknown=${c.unknown} ` +
 			`terminal_lifecycle=${c.terminal_lifecycle} unclassified=${c.unclassified} ` +
-			`${report.dry_run ? `would_remove=${c.would_remove}` : `removed=${c.removed} failed=${c.failed}`} errors=${c.errors}`,
+			`${report.dry_run ? `would_remove=${c.would_remove}` : `removed=${c.removed} failed=${c.failed}`} ` +
+			`errors=${c.errors} warnings=${report.warnings.length}`,
 	);
 	lines.push("");
 	return `${lines.join("\n")}`;

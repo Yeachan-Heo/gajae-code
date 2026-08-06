@@ -926,12 +926,24 @@ const customReferenceMap = buildCustomReferenceMap();
 
 function getCustomReferenceCandidateIds(modelId: string): string[] {
 	const candidates = new Set<string>();
-	const minimaxM = /^minimax-m(\d+(?:\.\d+)*)$/i.exec(modelId.trim());
-	const queue = minimaxM ? [`MiniMax-M${minimaxM[1]}`, modelId] : [modelId];
+	const trimmedId = modelId.trim();
+	const minimaxM = /^minimax-m(\d+(?:\.\d+)*)$/i.exec(trimmedId);
+	const queue = minimaxM ? [`MiniMax-M${minimaxM[1]}`, trimmedId] : [trimmedId];
 	if (minimaxM) {
 		// First-class MiniMax catalogs expose canonical `MiniMax-M*` ids only,
 		// but custom providers may still use lowercase wire ids. Normalize to
 		// the canonical display casing so metadata inheritance keeps working.
+	}
+	// Namespaced wire IDs (e.g. `cline-pass/deepseek-v4-flash`) keep the full id for
+	// the API request, but should still try the leaf segment against bundled
+	// references so capability metadata is not silently replaced by 128K/16K defaults.
+	// Only an exact leaf match in the reference map inherits; unknown leaves stay defaulted.
+	const slashIndex = trimmedId.lastIndexOf("/");
+	if (slashIndex >= 0 && slashIndex < trimmedId.length - 1) {
+		const leafId = trimmedId.slice(slashIndex + 1).trim();
+		if (leafId && leafId !== trimmedId) {
+			queue.push(leafId);
+		}
 	}
 	for (let index = 0; index < queue.length; index += 1) {
 		const candidate = queue[index]?.trim();
