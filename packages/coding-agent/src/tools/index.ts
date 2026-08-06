@@ -139,6 +139,13 @@ export interface AskAnswerRequest {
 	controls: readonly AskRemoteControl[];
 	/** Optional zero-based recommendation into the authoritative raw options. */
 	recommendedIndex?: number;
+	/** True while the question accepts several options before the navigation control commits. */
+	multi?: boolean;
+	/**
+	 * Options currently selected in the multi-select loop, as authoritative option
+	 * labels. Remote transports render the selection state so a toggle is visible.
+	 */
+	selectedOptions?: readonly string[];
 }
 
 export type AskRemoteInteraction =

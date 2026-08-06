@@ -1253,7 +1253,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
 		const logicalSessionId = sessionManager.getSessionId();
-		const providerSessionId = options.providerSessionId ?? options.forkContextSeed?.cacheIdentity ?? logicalSessionId;
+		// Fork-context seeds carry conversation content only, never provider identity:
+		// a shared continuity id would make concurrent subagents present the same
+		// session_id upstream, where session-owning transports reject the extra
+		// downstreams (owner_busy) and degrade those turns to uncached HTTP.
+		const providerSessionId = options.providerSessionId ?? logicalSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;

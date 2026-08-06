@@ -76,7 +76,7 @@ const comboOpencode: ModelProfileDefinition = {
 const minimax: ModelProfileDefinition = {
 	name: "minimax-medium",
 	requiredProviders: ["minimax-code"],
-	modelMapping: { default: "minimax-code/minimax-v3:medium" },
+	modelMapping: { default: "minimax-code/MiniMax-M3:medium" },
 	source: "builtin",
 };
 const noSuffixProfile: ModelProfileDefinition = {

@@ -763,6 +763,8 @@ interface AskSingleQuestionOptions {
 	onRemoteState?: (state: {
 		interaction: "selector" | "custom_editor" | "clarification_editor";
 		selectedCount: number;
+		/** Currently selected option labels, so a remote transport can render the selection. */
+		selectedOptions: readonly string[];
 		hasNonWhitespaceCustom: boolean;
 	}) => void;
 }
@@ -900,6 +902,7 @@ async function askSingleQuestion(
 			options.onRemoteState?.({
 				interaction: "custom_editor",
 				selectedCount: selectedOptions.length,
+				selectedOptions: [...selectedOptions],
 				hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
 			});
 			return ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
@@ -913,6 +916,7 @@ async function askSingleQuestion(
 			options.onRemoteState?.({
 				interaction: "clarification_editor",
 				selectedCount: selectedOptions.length,
+				selectedOptions: [...selectedOptions],
 				hasNonWhitespaceCustom: false,
 			});
 			return ui.editor("Ask a clarification question:", undefined, dialogOptions, { promptStyle: true });
@@ -949,6 +953,7 @@ async function askSingleQuestion(
 			options.onRemoteState?.({
 				interaction: "selector",
 				selectedCount: selected.size,
+				selectedOptions: [...selected],
 				hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
 			});
 			const prefix = selected.size > 0 ? `(${selected.size} selected) ` : "";
@@ -1054,6 +1059,7 @@ async function askSingleQuestion(
 		options.onRemoteState?.({
 			interaction: "selector",
 			selectedCount: selectedOptions.length,
+			selectedOptions: [...selectedOptions],
 			hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
 		});
 		const {
@@ -1591,6 +1597,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					options: remoteSelectorOptions,
 					interaction: "selector",
 					...(recommendedIndex === undefined ? {} : { recommendedIndex }),
+					multi: q.multi === true,
+					selectedOptions: [...(initialSelection?.selectedOptions ?? [])],
 					controls: askRemoteControls({
 						multi: q.multi === true,
 						questionIndex,
@@ -1625,6 +1633,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							...(state.interaction === "selector" && recommendedIndex !== undefined
 								? { recommendedIndex }
 								: {}),
+							multi: q.multi === true,
+							selectedOptions: [...state.selectedOptions],
 							controls:
 								state.interaction === "selector"
 									? askRemoteControls({

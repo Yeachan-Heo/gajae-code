@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import packageJson from "../package.json";
-import { interactiveBootstrapText, routeRootArgv } from "../src/cli";
+import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli";
 import { parseArgs } from "../src/cli/args";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -32,6 +32,18 @@ describe("GJC public CLI command surface", () => {
 			"0",
 			"invalid legacy --team-size",
 		]);
+	});
+
+	it("routes bare models to --list-models instead of a launch prompt (#3857)", () => {
+		expect(routeModelsAlias(["models"])).toEqual(["launch", "--list-models"]);
+		expect(routeModelsAlias(["models", "deepseek"])).toEqual(["launch", "--list-models", "deepseek"]);
+		expect(routeModelsAlias(["models", "claude", "sonnet"])).toEqual(["launch", "--list-models", "claude sonnet"]);
+		expect(routeModelsAlias(["models", "--json"])).toEqual(["launch", "--list-models", "--json"]);
+		expect(routeModelsAlias(["stats"])).toBeUndefined();
+		expect(routeRootArgv(["models"])).toEqual(["launch", "--list-models"]);
+		expect(routeRootArgv(["models", "opus"])).toEqual(["launch", "--list-models", "opus"]);
+		// Ordinary free-form prompts still launch; only the bare `models` token is remapped.
+		expect(routeRootArgv(["list available models"])).toEqual(["launch", "list available models"]);
 	});
 
 	it("renders an immediate keyboard-ready bootstrap only for interactive launch routes", () => {

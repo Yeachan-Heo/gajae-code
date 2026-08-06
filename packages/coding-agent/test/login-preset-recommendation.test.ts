@@ -18,7 +18,7 @@ const model = (provider: string, id: string): Model =>
 	}) as Model;
 
 const codexModel = model("openai-codex", "gpt-5.5");
-const minimaxModel = model("minimax-code", "minimax-v3");
+const minimaxModel = model("minimax-code", "MiniMax-M3");
 
 const profile = (name: string, provider: string, selector: string): ModelProfileDefinition => ({
 	name,
@@ -28,8 +28,8 @@ const profile = (name: string, provider: string, selector: string): ModelProfile
 });
 
 const codexProfile = profile("codex-medium", "openai-codex", "openai-codex/gpt-5.5:medium");
-const minimaxProfile = profile("minimax-medium", "minimax-code", "minimax-code/minimax-v3:medium");
-const plainMinimaxProfile = profile("minimax", "minimax-code", "minimax-code/minimax-v3:medium");
+const minimaxProfile = profile("minimax-medium", "minimax-code", "minimax-code/MiniMax-M3:medium");
+const plainMinimaxProfile = profile("minimax", "minimax-code", "minimax-code/MiniMax-M3:medium");
 let testTheme = await getThemeByName("red-claw");
 
 function installTestTheme(): void {
