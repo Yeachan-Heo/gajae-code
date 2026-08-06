@@ -127,35 +127,40 @@ describe("Anthropic prompt caching", () => {
 		compat: { promptCacheMode: "explicit" },
 	};
 
-	it("defaults canonical Anthropic and Claude-family models to automatic caching", async () => {
+	it("defaults canonical Anthropic to automatic caching and requires an explicit proxy opt-in", async () => {
 		const nonClaudeModel: Model<"anthropic-messages"> = {
 			...canonicalModel,
 			id: "custom-compatible-model",
 			name: "Custom compatible model",
 			baseUrl: "https://proxy.example.test/anthropic",
 		};
-		const [canonical, proxiedClaude, explicit, nonClaude] = await Promise.all([
+		const [canonical, proxiedClaude, proxiedAutomatic, explicit, nonClaude] = await Promise.all([
 			capturePayload(canonicalModel, context()),
 			capturePayload({ ...canonicalModel, baseUrl: "https://proxy.example.test/anthropic" }, context()),
+			capturePayload(
+				{
+					...canonicalModel,
+					baseUrl: "https://proxy.example.test/anthropic",
+					compat: { promptCacheMode: "automatic" },
+				},
+				context(),
+			),
 			capturePayload(explicitCompatibleModel, context()),
 			capturePayload(nonClaudeModel, context()),
 		]);
 
 		expect(canonical.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		// Claude-family models behind non-canonical Anthropic-compatible gateways
-		// get top-level automatic caching; without explicit long-retention support
-		// they fall back to the default ~5m breakpoint (no ttl).
-		expect(proxiedClaude.cache_control).toEqual({ type: "ephemeral" });
+		expect(proxiedClaude.cache_control).toBeUndefined();
+		expect(proxiedAutomatic.cache_control).toEqual({ type: "ephemeral" });
 		expect(explicit.cache_control).toBeUndefined();
 		expect(explicit.tools?.every(tool => !(tool as { cache_control?: CacheControl }).cache_control)).toBe(true);
 		expect(!Array.isArray(explicit.system) || explicit.system.every(block => !block.cache_control)).toBe(true);
 		expect((explicit.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control).toEqual({
 			type: "ephemeral",
 		});
-		// Non-Claude models on unknown compatible endpoints still get no generated caching.
 		expect(nonClaude.cache_control).toBeUndefined();
 	});
-	it("classifies the dispatched model id and honors every cache opt-out", async () => {
+	it("requires an explicit cache mode on non-canonical Anthropic-compatible endpoints and honors every cache opt-out", async () => {
 		const proxyUrl = "https://proxy.example.test/anthropic";
 		const cases: Array<{
 			name: string;
@@ -164,18 +169,22 @@ describe("Anthropic prompt caching", () => {
 			expected: CacheControl | undefined;
 		}> = [
 			{
-				name: "prefixed claude id on non-canonical gateway",
+				name: "prefixed Claude id on non-canonical gateway",
 				model: { ...canonicalModel, id: "anthropic/claude-sonnet-4-5", baseUrl: proxyUrl },
-				expected: { type: "ephemeral" },
+				expected: undefined,
 			},
 			{
-				name: "uppercase claude id on non-canonical gateway",
+				name: "uppercase Claude id on non-canonical gateway",
 				model: { ...canonicalModel, id: "CLAUDE-OPUS-5", baseUrl: proxyUrl },
-				expected: { type: "ephemeral" },
+				expected: undefined,
 			},
 			{
-				name: "non-canonical claude with explicit long retention opt-in",
-				model: { ...canonicalModel, baseUrl: proxyUrl, compat: { supportsLongCacheRetention: true } },
+				name: "non-canonical Claude with explicit automatic long-retention opt-in",
+				model: {
+					...canonicalModel,
+					baseUrl: proxyUrl,
+					compat: { promptCacheMode: "automatic", supportsLongCacheRetention: true },
+				},
 				expected: { type: "ephemeral", ttl: "1h" },
 			},
 			{
@@ -215,14 +224,14 @@ describe("Anthropic prompt caching", () => {
 				expected: undefined,
 			},
 			{
-				name: "wireModelId override to a non-claude wire id still follows dispatched id",
+				name: "wireModelId overrides do not enable non-canonical caching",
 				model: {
 					...canonicalModel,
 					id: "claude-sonnet-4-5",
 					wireModelId: "local-alias",
 					baseUrl: proxyUrl,
 				},
-				expected: { type: "ephemeral" },
+				expected: undefined,
 			},
 		];
 

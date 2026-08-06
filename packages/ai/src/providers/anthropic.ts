@@ -480,15 +480,6 @@ function dropAnthropicStrictTools(params: MessageCreateParamsStreaming): void {
 	}
 }
 
-function isClaudeFamilyModel(model: Model<"anthropic-messages">): boolean {
-	// Classify the same identifier the request body serializes (`params.model =
-	// model.id` in buildParams); a differing `wireModelId` is not dispatched by
-	// this transport, so it must not drive the cache decision either.
-	const id = model.id;
-	const shortId = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
-	return shortId.toLowerCase().startsWith("claude-");
-}
-
 function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
@@ -504,7 +495,7 @@ function getCacheControl(
 			? "none"
 			: promptCacheMode === "explicit"
 				? "explicit"
-				: promptCacheMode === "automatic" || isCanonicalApi || isClaudeFamilyModel(model)
+				: promptCacheMode === "automatic" || isCanonicalApi || cacheRetention !== undefined
 					? "automatic"
 					: "none";
 	if (mode === "none") return { mode };
