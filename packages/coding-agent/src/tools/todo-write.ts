@@ -73,14 +73,14 @@ function hasUnknownKeys(value: object, allowed: Set<string>): boolean {
 }
 
 function validateRawTodoArguments(arguments_: Record<string, unknown>): RawArgumentValidationResult {
-	if (hasUnknownKeys(arguments_, TODO_WRITE_KEYS)) return { outcome: "reject" };
+	if (hasUnknownKeys(arguments_, TODO_WRITE_KEYS)) return { outcome: "reject", code: "todo-write-unknown-root-key" };
 	if (!Array.isArray(arguments_.ops)) return { outcome: "passthrough" };
 	for (const entry of arguments_.ops) {
 		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
-		if (hasUnknownKeys(entry, TODO_OP_KEYS)) return { outcome: "reject" };
+		if (hasUnknownKeys(entry, TODO_OP_KEYS)) return { outcome: "reject", code: "todo-write-unknown-op-entry-key" };
 		const record = entry as Record<string, unknown>;
 		if ((record.op === "done" || record.op === "drop") && !record.task && !record.phase) {
-			return { outcome: "reject" };
+			return { outcome: "reject", code: "todo-write-done-drop-requires-target" };
 		}
 		const list = record.list;
 		if (!Array.isArray(list)) continue;
@@ -91,7 +91,7 @@ function validateRawTodoArguments(arguments_: Record<string, unknown>): RawArgum
 				!Array.isArray(item) &&
 				hasUnknownKeys(item, TODO_INIT_ENTRY_KEYS)
 			)
-				return { outcome: "reject" };
+				return { outcome: "reject", code: "todo-write-unknown-init-entry-key" };
 		}
 	}
 	return { outcome: "passthrough" };
