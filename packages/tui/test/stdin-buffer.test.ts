@@ -5,7 +5,7 @@
  * MIT License - Copyright (c) 2025 opentui
  */
 
-import { beforeEach, describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it, setSystemTime } from "bun:test";
 import { parseKey, setKittyProtocolActive } from "@gajae-code/tui/keys";
 import { StdinBuffer } from "@gajae-code/tui/stdin-buffer";
 
@@ -657,6 +657,97 @@ describe("StdinBuffer", () => {
 		it("keeps an OSC string terminator attached to its sequence", () => {
 			processInput("\x1b]11;rgb:0000/0000/0000\x1b\\");
 			expect(emittedSequences).toEqual(["\x1b]11;rgb:0000/0000/0000\x1b\\"]);
+		});
+	});
+	describe("Stranded Bracketed Paste", () => {
+		const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+		let emittedPaste: string[];
+
+		beforeEach(() => {
+			buffer = new StdinBuffer({ timeout: 10 });
+			emittedSequences = [];
+			buffer.on("data", (sequence: string) => {
+				emittedSequences.push(sequence);
+			});
+			emittedPaste = [];
+			buffer.on("paste", (data: string) => {
+				emittedPaste.push(data);
+			});
+		});
+
+		it("releases the latch when the end marker never arrives", async () => {
+			processInput("\x1b[200~hello");
+			expect(emittedPaste).toEqual([]);
+
+			await sleep(700);
+
+			expect(emittedPaste).toEqual(["hello"]);
+		});
+
+		it("delivers keys again after a stranded paste, including Escape and Ctrl+C", async () => {
+			processInput("\x1b[200~hello");
+			processInput("a");
+			expect(emittedSequences).toEqual([]); // latched: every byte is swallowed
+
+			await sleep(700);
+			emittedSequences = [];
+
+			processInput("b");
+			processInput("\x03");
+			await sleep(20);
+
+			expect(emittedSequences).toContain("b");
+			expect(emittedSequences).toContain("\x03");
+		});
+
+		it("keeps a slow paste intact while it is still streaming", async () => {
+			processInput("\x1b[200~part-one ");
+			await sleep(200);
+			processInput("part-two ");
+			await sleep(200);
+			processInput("part-three\x1b[201~");
+
+			expect(emittedPaste).toEqual(["part-one part-two part-three"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("releases the latch at the absolute cap when input keeps re-arming the idle timer", () => {
+			processInput("\x1b[200~");
+			processInput("k");
+			expect(emittedPaste).toEqual([]);
+
+			// A user typing during the stall refreshes the idle timer forever; only the
+			// absolute cap can end it.
+			setSystemTime(new Date(Date.now() + 11_000));
+			try {
+				processInput("k");
+				expect(emittedPaste).toEqual(["kk"]);
+			} finally {
+				setSystemTime();
+			}
+
+			processInput("\x03");
+			expect(emittedSequences).toEqual(["\x03"]);
+		});
+
+		it("cancels the pending watchdog on clear()", async () => {
+			processInput("\x1b[200~orphan");
+			buffer.clear();
+			processInput("z");
+
+			await sleep(700);
+
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual(["z"]);
+		});
+
+		it("arms no watchdog for a paste that completed normally", async () => {
+			processInput("\x1b[200~done\x1b[201~");
+			expect(emittedPaste).toEqual(["done"]);
+
+			await sleep(700);
+
+			expect(emittedPaste).toEqual(["done"]);
 		});
 	});
 });

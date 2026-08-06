@@ -33,6 +33,14 @@ const PROBE_FRAGMENT_MAX_BYTES = 256;
 const PROBE_ESCAPE_HOLD_MAX_MS = 150;
 const PROBE_REPLY_WINDOW_MS = 2500;
 
+// Bounds for a bracketed-paste
+// START whose END terminator never arrives. Without these the paste latch swallows
+// all input forever, including ESC and Ctrl+C. A real paste streams continuously so
+// the idle bound never trips on it; the absolute bound covers a user typing fast
+// enough to keep re-arming the idle timer.
+const PASTE_IDLE_MAX_MS = 500;
+const PASTE_HOLD_MAX_MS = 10000;
+
 /**
  * True when the buffer is an escape sequence that only a terminal reply can
  * complete: an OSC without its BEL/ST terminator (OSC 11 background color) or a
@@ -375,6 +383,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	readonly #timeoutMs: number;
 	#pasteMode: boolean = false;
 	#pasteBuffer: string = "";
+	// Bracketed-paste latch watchdog state.
+	#pasteIdleTimer?: NodeJS.Timeout;
+	#pasteStartedAt = 0;
 	#pendingKittyPrintableCodepoint: number | undefined;
 	// Persistent UTF-8 decoder. Holds an incomplete trailing multi-byte
 	// sequence between chunks so split reads (e.g. a 3-byte Korean syllable
@@ -484,8 +495,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				const pastedContent = this.#pasteBuffer.slice(0, endIndex);
 				const remaining = this.#pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
 
+				this.#clearPasteIdleWatchdog();
 				this.#pasteMode = false;
 				this.#pasteBuffer = "";
+				this.#pasteStartedAt = 0;
 				this.#pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
@@ -493,7 +506,18 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				if (remaining.length > 0) {
 					this.process(remaining);
 				}
+				return;
 			}
+			// The END terminator has
+			// not arrived. Bound the wait so a dropped/mangled terminator cannot swallow
+			// every following keystroke (ESC and Ctrl+C included) for the rest of the
+			// session. The absolute cap is checked here because a user typing during the
+			// stall keeps re-arming the idle timer.
+			if (this.#pasteStartedAt !== 0 && Date.now() - this.#pasteStartedAt >= PASTE_HOLD_MAX_MS) {
+				this.#releaseStrandedPaste();
+				return;
+			}
+			this.#armPasteIdleWatchdog();
 			return;
 		}
 
@@ -513,6 +537,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#pendingKittyPrintableCodepoint = undefined;
 			this.#buffer = this.#buffer.slice(startIndex + BRACKETED_PASTE_START.length);
 			this.#pasteMode = true;
+			this.#pasteStartedAt = Date.now();
 			this.#pasteBuffer = this.#buffer;
 			this.#buffer = "";
 
@@ -521,8 +546,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				const pastedContent = this.#pasteBuffer.slice(0, endIndex);
 				const remaining = this.#pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
 
+				this.#clearPasteIdleWatchdog();
 				this.#pasteMode = false;
 				this.#pasteBuffer = "";
+				this.#pasteStartedAt = 0;
 				this.#pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
@@ -530,7 +557,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				if (remaining.length > 0) {
 					this.process(remaining);
 				}
+				return;
 			}
+			// No terminator yet: bound the wait. See the in-paste-mode branch above.
+			this.#armPasteIdleWatchdog();
 			return;
 		}
 
@@ -626,6 +656,40 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#decoderHasPendingUtf8 = false;
 		return legacyMetaSequence(byte);
 	}
+	// Bracketed-paste latch watchdog.
+	// Uses its own timer rather than the shared #timeout, which the SGR-quarantine and
+	// pending-lead-byte paths own and which process() clears on every chunk.
+	#armPasteIdleWatchdog(): void {
+		this.#clearPasteIdleWatchdog();
+		this.#pasteIdleTimer = setTimeout(() => {
+			this.#pasteIdleTimer = undefined;
+			this.#releaseStrandedPaste();
+		}, PASTE_IDLE_MAX_MS);
+		this.#pasteIdleTimer.unref?.();
+	}
+
+	#clearPasteIdleWatchdog(): void {
+		if (this.#pasteIdleTimer) {
+			clearTimeout(this.#pasteIdleTimer);
+			this.#pasteIdleTimer = undefined;
+		}
+	}
+
+	// Leave the latch and hand back whatever accumulated. Emitting it as a paste keeps
+	// the user's pasted text intact and routes it through the editor's paste path;
+	// re-processing it as input would read newlines inside pasted text as Enter and
+	// submit the message.
+	#releaseStrandedPaste(): void {
+		this.#clearPasteIdleWatchdog();
+		if (!this.#pasteMode) return;
+		const stranded = this.#pasteBuffer;
+		this.#pasteMode = false;
+		this.#pasteBuffer = "";
+		this.#pasteStartedAt = 0;
+		this.#pendingKittyPrintableCodepoint = undefined;
+		if (stranded.length > 0) this.emit("paste", stranded);
+	}
+
 	#emitDataSequence(sequence: string): void {
 		const rawCodepoint = singleCodePoint(sequence);
 		if (rawCodepoint !== undefined && rawCodepoint === this.#pendingKittyPrintableCodepoint) {
@@ -717,8 +781,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#timeout = undefined;
 		}
 		this.#buffer = "";
+		this.#clearPasteIdleWatchdog();
 		this.#pasteMode = false;
 		this.#pasteBuffer = "";
+		this.#pasteStartedAt = 0;
 		this.#pendingKittyPrintableCodepoint = undefined;
 		this.#sgrQuarantine = false;
 		this.#sgrQuarantineBytes = 0;

@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- A bracketed paste whose end marker never arrives no longer freezes terminal input for the rest of the session. `StdinBuffer` latched `#pasteMode` on `ESC[200~` and cleared it only on the matching `ESC[201~`, with no timeout and no size bound, unlike the SGR quarantine (100ms / 256 bytes) and the probe-fragment hold (500ms / 256 bytes) in the same file. Every byte after a dropped, mangled, or spurious marker was appended to the paste buffer and never emitted, so the application stopped receiving input entirely - and because `Tui` dispatches input only to the focused component and raw mode delivers Ctrl+C as byte 0x03 rather than SIGINT, neither Escape nor Ctrl+C could recover the session. A 500ms idle watchdog now releases the latch once paste bytes stop arriving, and a 10s absolute cap releases it even while input keeps re-arming that timer; both emit what accumulated as a normal paste event, so pasted text is preserved rather than replayed as keystrokes. A paste that is still streaming re-arms the idle timer on every chunk and is never truncated.
 
 ## [0.12.12] - 2026-08-05
 ### Fixed
