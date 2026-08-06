@@ -10710,6 +10710,16 @@ export class SessionManager {
 					try {
 						store.moveExpectedNoReplace(stagingName, promotionName, stagedSnapshot);
 					} catch (error) {
+						const rollbackPublishedSuccessor = (relativePath: string, snapshot: ManagedFileSnapshot): void => {
+							try {
+								store.removeExpected(relativePath, snapshot);
+							} catch (cleanupError) {
+								logger.warn("Recovery successor rollback cleanup failed; original promotion error preserved", {
+									cleanupError: toError(cleanupError).message,
+									promotionError: toError(error).message,
+								});
+							}
+						};
 						const final = store.readExpected(promotionName);
 						if (
 							final &&
@@ -10719,16 +10729,18 @@ export class SessionManager {
 							final.identity.mtimeNs === stagedSnapshot.identity.mtimeNs &&
 							final.identity.sha256 === stagedSnapshot.identity.sha256
 						)
-							store.removeExpected(promotionName, final);
+							rollbackPublishedSuccessor(promotionName, final);
 						else {
 							const remaining = store.readExpected(stagingName);
 							if (
 								remaining &&
 								remaining.identity.dev === stagedSnapshot.identity.dev &&
 								remaining.identity.ino === stagedSnapshot.identity.ino &&
+								remaining.identity.size === stagedSnapshot.identity.size &&
+								remaining.identity.mtimeNs === stagedSnapshot.identity.mtimeNs &&
 								remaining.identity.sha256 === stagedSnapshot.identity.sha256
 							)
-								store.removeExpected(stagingName, stagedSnapshot);
+								rollbackPublishedSuccessor(stagingName, stagedSnapshot);
 						}
 						throw error;
 					}

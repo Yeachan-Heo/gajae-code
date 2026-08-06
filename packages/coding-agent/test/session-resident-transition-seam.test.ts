@@ -1147,7 +1147,7 @@ describe("resident-store transition seam", () => {
 		}
 	});
 
-	it("T6 disposes a prepared candidate and retains staging state when managed publication collides", async () => {
+	it("T6 preserves the publication error when managed rollback cleanup fails", async () => {
 		const root = makeTempDir("gjc-resident-transition-recovery-publish-");
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd, { recursive: true });
@@ -1171,8 +1171,13 @@ describe("resident-store transition seam", () => {
 				this.publishNoReplaceSync(destinationRelativePath, Buffer.from("pre-existing collision"));
 				originalMoveExpectedNoReplace.call(this, sourceRelativePath, destinationRelativePath, expected);
 			});
-		const adopted = vi.spyOn(EphemeralBlobStore, "adoptVerifiedDir");
-		const disposed = vi.spyOn(EphemeralBlobStore.prototype, "dispose");
+		const originalRemoveExpected = ManagedSessionDescendantStore.prototype.removeExpected;
+		const removeExpected = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "removeExpected")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relativePath, expected) {
+				if (relativePath.includes(".recovery-staging")) throw new Error("rollback_cleanup_failed");
+				return originalRemoveExpected.call(this, relativePath, expected);
+			});
 		try {
 			await expect(
 				staged.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(staged.hydrationContext, {
@@ -1180,8 +1185,7 @@ describe("resident-store transition seam", () => {
 				}),
 			).rejects.toThrow("destination_conflict");
 			expect(moveExpectedNoReplace).toHaveBeenCalledTimes(1);
-			expect(adopted).toHaveBeenCalledTimes(1);
-			expect(disposed).toHaveBeenCalledTimes(1);
+			expect(removeExpected).toHaveBeenCalledWith(expect.stringContaining(".recovery-staging"), expect.anything());
 			expect(collisionPath).toBeDefined();
 			expect(fs.existsSync(collisionPath!)).toBe(true);
 			expect(staged.manager.getSessionFile()).toBe(stagingFile);
@@ -1189,6 +1193,47 @@ describe("resident-store transition seam", () => {
 			expectReadable(staged.manager, text);
 			expect(fs.existsSync(stagingFile)).toBe(true);
 			expect(residentCacheDirs()).toEqual([]);
+		} finally {
+			await staged.cleanup();
+		}
+	});
+	it("T6 leaves metadata-drifted managed staging outside exact rollback authority", async () => {
+		const root = makeTempDir("gjc-resident-transition-recovery-drift-");
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, getAgentDir());
+		const staged = await stageMemoryGuardRecovery(
+			root,
+			destination,
+			`recovery drift predecessor ${"n".repeat(4096)}`,
+		);
+		let stagingPath: string | undefined;
+		const originalMoveExpectedNoReplace = ManagedSessionDescendantStore.prototype.moveExpectedNoReplace;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "moveExpectedNoReplace").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			sourceRelativePath,
+			destinationRelativePath,
+			expected,
+		) {
+			this.publishNoReplaceSync(destinationRelativePath, Buffer.from("pre-existing collision"));
+			try {
+				originalMoveExpectedNoReplace.call(this, sourceRelativePath, destinationRelativePath, expected);
+			} catch (error) {
+				stagingPath = path.join(this.dir, sourceRelativePath);
+				const drifted = new Date(Date.now() + 2_000);
+				fs.utimesSync(stagingPath, drifted, drifted);
+				throw error;
+			}
+		});
+		const removeExpected = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeExpected");
+		try {
+			await expect(
+				staged.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(staged.hydrationContext, {
+					ownershipReady: true,
+				}),
+			).rejects.toThrow("destination_conflict");
+			expect(stagingPath).toBeDefined();
+			expect(removeExpected).not.toHaveBeenCalled();
 		} finally {
 			await staged.cleanup();
 		}
