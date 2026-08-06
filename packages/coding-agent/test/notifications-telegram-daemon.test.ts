@@ -19568,8 +19568,15 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 
 		releaseSend.resolve({ ok: true, result: { message_id: 7 } });
 		await handlerPersistStarted.promise;
+		// `join` counts its deadline in wall-clock from the call, and the statements
+		// between the call and `releaseHandlerPersist` below (the held-state race and
+		// its assertion) run inside that window. A deadline as tight as the released
+		// work itself therefore expires on a loaded runner and reports `false` for a
+		// barrier that did hold. The held half is proven by the race below, not by
+		// the deadline, so bound it generously — the daemon's own shutdown join uses
+		// 1s.
 		const joinedSettled = Promise.withResolvers<boolean>();
-		const joinedEffect = effects.join(100).then(value => {
+		const joinedEffect = effects.join(5_000).then(value => {
 			joinedSettled.resolve(value);
 			return value;
 		});
