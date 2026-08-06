@@ -122,7 +122,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
    - Substitute `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` throughout the remaining instructions before continuing.
    - Include `threshold_source` in the first `gjc deep-interview write` payload and preserve it on later state updates; do not edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
    - Include both threshold and source in the final spec metadata.
-- Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, default to English unless `{{ARGUMENTS}}` makes another user/session language obvious or the user explicitly requests another language. Do not add language-specific special cases.
+- Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, default to English unless the appended `User:` request makes another user/session language obvious or the user explicitly requests another language. Do not add language-specific special cases.
 
 ## Phase 0.5: Suitability Gate
 
