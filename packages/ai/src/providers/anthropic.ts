@@ -447,6 +447,12 @@ function dropAnthropicStrictTools(params: MessageCreateParamsStreaming): void {
 	}
 }
 
+function isClaudeFamilyModel(model: Model<"anthropic-messages">): boolean {
+	const id = model.wireModelId ?? model.id;
+	const shortId = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+	return shortId.toLowerCase().startsWith("claude-");
+}
+
 function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
@@ -462,7 +468,7 @@ function getCacheControl(
 			? "none"
 			: promptCacheMode === "explicit"
 				? "explicit"
-				: isCanonicalApi
+				: isCanonicalApi || isClaudeFamilyModel(model)
 					? "automatic"
 					: "none";
 	if (mode === "none") return { mode };

@@ -98,21 +98,33 @@ describe("Anthropic prompt caching", () => {
 		compat: { promptCacheMode: "explicit" },
 	};
 
-	it("defaults canonical Anthropic to automatic and requires compatible endpoints to opt into explicit caching", async () => {
-		const [canonical, compatible, explicit] = await Promise.all([
+	it("defaults canonical Anthropic and Claude-family models to automatic caching", async () => {
+		const nonClaudeModel: Model<"anthropic-messages"> = {
+			...canonicalModel,
+			id: "custom-compatible-model",
+			name: "Custom compatible model",
+			baseUrl: "https://proxy.example.test/anthropic",
+		};
+		const [canonical, proxiedClaude, explicit, nonClaude] = await Promise.all([
 			capturePayload(canonicalModel, context()),
 			capturePayload({ ...canonicalModel, baseUrl: "https://proxy.example.test/anthropic" }, context()),
 			capturePayload(explicitCompatibleModel, context()),
+			capturePayload(nonClaudeModel, context()),
 		]);
 
 		expect(canonical.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		expect(compatible.cache_control).toBeUndefined();
+		// Claude-family models behind non-canonical Anthropic-compatible gateways
+		// get top-level automatic caching; without explicit long-retention support
+		// they fall back to the default ~5m breakpoint (no ttl).
+		expect(proxiedClaude.cache_control).toEqual({ type: "ephemeral" });
 		expect(explicit.cache_control).toBeUndefined();
 		expect(explicit.tools?.every(tool => !(tool as { cache_control?: CacheControl }).cache_control)).toBe(true);
 		expect(!Array.isArray(explicit.system) || explicit.system.every(block => !block.cache_control)).toBe(true);
 		expect((explicit.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control).toEqual({
 			type: "ephemeral",
 		});
+		// Non-Claude models on unknown compatible endpoints still get no generated caching.
+		expect(nonClaude.cache_control).toBeUndefined();
 	});
 
 	it("counts top-level automatic and caller controls together without mutating a callback replacement", async () => {

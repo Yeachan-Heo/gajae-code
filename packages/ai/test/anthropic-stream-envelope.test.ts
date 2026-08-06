@@ -1127,6 +1127,12 @@ describe("anthropic stream envelope handling", () => {
 			model,
 			{ ...model, compat: { supportsLongCacheRetention: false } },
 			{ ...model, baseUrl: "https://proxy.example.com/anthropic" },
+			{
+				...model,
+				id: "custom-compatible-model",
+				name: "Custom compatible model",
+				baseUrl: "https://proxy.example.com/anthropic",
+			},
 		]) {
 			const stream = streamAnthropic(testModel, context, {
 				apiKey: "sk-ant-test",
@@ -1143,7 +1149,11 @@ describe("anthropic stream envelope handling", () => {
 		);
 		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
 		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
-		expect(cacheControls[2]).toBeUndefined();
+		// Claude-family models through Anthropic-compatible gateways get automatic
+		// caching; without explicit long-retention support the default ~5m breakpoint applies.
+		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
+		// Non-Claude models on unknown compatible endpoints receive no generated caching.
+		expect(cacheControls[3]).toBeUndefined();
 	});
 
 	it("defaults to 1h cache TTL when the request omits cacheRetention, with safe fallback", async () => {
@@ -1163,6 +1173,12 @@ describe("anthropic stream envelope handling", () => {
 				model,
 				{ ...model, compat: { supportsLongCacheRetention: false } },
 				{ ...model, baseUrl: "https://proxy.example.com/anthropic" },
+				{
+					...model,
+					id: "custom-compatible-model",
+					name: "Custom compatible model",
+					baseUrl: "https://proxy.example.com/anthropic",
+				},
 			]) {
 				// No cacheRetention passed: the provider default should drive the TTL.
 				const stream = streamAnthropic(testModel, context, { apiKey: "sk-ant-test" });
@@ -1185,7 +1201,10 @@ describe("anthropic stream envelope handling", () => {
 		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
 		// Models without long-cache support fall back to the default ~5m breakpoint.
 		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
-		// Unknown compatible endpoints do not receive generated cache controls.
-		expect(cacheControls[2]).toBeUndefined();
+		// Claude-family models through Anthropic-compatible gateways get automatic
+		// caching; without explicit long-retention support the default ~5m breakpoint applies.
+		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
+		// Non-Claude models on unknown compatible endpoints receive no generated caching.
+		expect(cacheControls[3]).toBeUndefined();
 	});
 });
