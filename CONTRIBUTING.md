@@ -35,6 +35,14 @@ bun run check
 
 Use focused tests first for code changes, then broader checks when the change affects shared behavior or release-critical paths.
 
+## Rebasing onto `dev`
+
+`dev` moves often, so expect to rebase. Two files behave in ways worth knowing about up front.
+
+**`packages/*/CHANGELOG.md` conflicts are normal.** These files have no custom merge driver: if your branch and `dev` both added entries under `## [Unreleased]`, git reports a real conflict. Resolve it by keeping **both** entries under `## [Unreleased]`. Never move an entry into a released `## [X.Y.Z]` section, and never edit a released section — that version already shipped and its notes are historical record.
+
+**`packages/coding-agent/src/internal-urls/docs-index.generated.ts` is generated and untracked.** `bun install` rebuilds it through the root `prepare` hook, and `bun run generate-docs-index` rebuilds it on demand. Do not commit it. If you see it in `git status`, something forced it back into the index — `git rm --cached` it. A tracked copy inlines every doc onto a single line, which git cannot three-way merge, so it conflicts on every rebase.
+
 ## PR checklist
 
 - Target branch is `dev`, not `main`.

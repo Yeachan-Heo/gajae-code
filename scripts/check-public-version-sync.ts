@@ -2,7 +2,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Glob } from "bun";
+import { $, Glob } from "bun";
 import {
 	canonicalJsonBytes,
 	PUBLIC_PACKAGE_DEFINITIONS,
@@ -108,6 +108,23 @@ async function pathExists(candidate: string): Promise<boolean> {
 		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
 		throw error;
 	}
+}
+
+/**
+ * Whether git tracks `relativePath` inside `repoRoot`.
+ *
+ * A generated artifact that is both gitignored and tracked is the worst of both
+ * worlds: the ignore rule is inert (git only consults it for untracked paths),
+ * and every regeneration shows up as a spurious working-tree change. Returns
+ * false when `repoRoot` is not a git work tree, so the unit-test temp dirs and
+ * an extracted release tarball are both treated as "nothing to report" rather
+ * than failing on an absent git.
+ */
+export async function isTrackedByGit(repoRoot: string, relativePath: string): Promise<boolean> {
+	const insideWorkTree = await $`git -C ${repoRoot} rev-parse --is-inside-work-tree`.quiet().nothrow();
+	if (insideWorkTree.exitCode !== 0 || insideWorkTree.text().trim() !== "true") return false;
+	const tracked = await $`git -C ${repoRoot} ls-files --error-unmatch -- ${relativePath}`.quiet().nothrow();
+	return tracked.exitCode === 0;
 }
 
 async function readJson<T>(filePath: string): Promise<T> {
@@ -251,6 +268,19 @@ export async function checkPublicVersionSync(repoRoot = path.join(import.meta.di
 				});
 			}
 		}
+	}
+
+	if (await isTrackedByGit(repoRoot, GENERATED_DOCS_INDEX)) {
+		violations.push({
+			path: GENERATED_DOCS_INDEX,
+			message:
+				"Generated docs index is committed. It is listed in .gitignore and rebuilt by the root `prepare` hook, " +
+				"so a tracked copy only re-creates the merge conflict it was ignored to avoid: the generator emits one " +
+				"line per doc, and git cannot three-way merge two edits to the same multi-thousand-character line. " +
+				"Run `git rm --cached " +
+				GENERATED_DOCS_INDEX +
+				"`.",
+		});
 	}
 
 	return violations;
