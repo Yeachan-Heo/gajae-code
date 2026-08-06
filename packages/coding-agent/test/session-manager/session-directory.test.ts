@@ -30,12 +30,22 @@ import { FileSessionStorage } from "../../src/session/session-storage";
 
 const temporaryDirectories: string[] = [];
 
+async function removeTemporaryDirectory(directory: string): Promise<void> {
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		try {
+			await fs.rm(directory, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EFAULT" || attempt === 2) throw error;
+			await Bun.sleep(25);
+		}
+	}
+}
+
 afterEach(async () => {
 	ManagedSessionScopeTestHooks.beforeVerifiedDelete = undefined;
 	ManagedSessionScopeTestHooks.beforeManagedLockRelease = undefined;
-	await Promise.all(
-		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
-	);
+	await Promise.all(temporaryDirectories.splice(0).map(removeTemporaryDirectory));
 });
 
 function legacyDirectory(sessionsRoot: string, cwd: string): string {
