@@ -94,7 +94,8 @@ async function protectedTempDir(): Promise<string> {
 		["git", "commit", "--quiet", "--no-gpg-sign", "-m", "fixture base"],
 	]) {
 		const step = Bun.spawnSync(argv, { cwd: dir, stdout: "pipe", stderr: "pipe" });
-		if (step.exitCode !== 0) throw new Error(`Unable to prepare protected verifier fixture repository: ${argv.join(" ")}`);
+		if (step.exitCode !== 0)
+			throw new Error(`Unable to prepare protected verifier fixture repository: ${argv.join(" ")}`);
 	}
 	return dir;
 }
@@ -154,7 +155,6 @@ async function writePassingObligationFixture(root: string): Promise<void> {
 	);
 }
 
-let savedCiDevChangedPaths: { value: string | undefined } | undefined;
 /**
  * Root for validation-batch tests, hermetically OUTSIDE the enclosing git
  * repository. `computeCheckpointChangeSet` walks git from the checkpoint cwd,

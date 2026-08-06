@@ -31,7 +31,10 @@ test("beginInitialize: records capabilities, including experimentalApi and exact
 	const s = new ConnectionState();
 	s.beginInitialize({
 		clientInfo: { name: "test-client", version: "0.0.1" },
-		capabilities: { experimentalApi: true, optOutNotificationMethods: ["thread/started", "item/agentMessage/delta", "thread/started"] },
+		capabilities: {
+			experimentalApi: true,
+			optOutNotificationMethods: ["thread/started", "item/agentMessage/delta", "thread/started"],
+		},
 	});
 	s.completeInitialize();
 	expect(s.capabilities?.experimentalApi).toBe(true);
@@ -48,7 +51,9 @@ test("beginInitialize: records capabilities, including experimentalApi and exact
 test("optOut: unknown method names in the array are accepted and ignored (no validation error)", () => {
 	const s = new ConnectionState();
 	expect(() =>
-		s.beginInitialize({ capabilities: { optOutNotificationMethods: ["bogus/method", "", 123 as unknown as string] } }),
+		s.beginInitialize({
+			capabilities: { optOutNotificationMethods: ["bogus/method", "", 123 as unknown as string] },
+		}),
 	).not.toThrow();
 	// empty/non-string entries are filtered out
 	expect(s.capabilities?.optOutNotificationMethods.has("bogus/method")).toBe(true);

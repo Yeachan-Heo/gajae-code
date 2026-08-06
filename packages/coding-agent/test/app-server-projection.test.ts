@@ -23,7 +23,9 @@ function projectionStore(entries: Array<Record<string, unknown>>): AppServerProj
 test("app-server projection contract validates, persists ordinal cursors, and rejects conflicting idempotency keys", async () => {
 	const entries: Array<Record<string, unknown>> = [];
 	const store = projectionStore(entries);
-	await expect(appendAppServerProjection(store, { sourceKey: "missing" })).rejects.toMatchObject({ code: "invalid_input" });
+	await expect(appendAppServerProjection(store, { sourceKey: "missing" })).rejects.toMatchObject({
+		code: "invalid_input",
+	});
 	const first = await appendAppServerProjection(store, {
 		schemaVersion: 1,
 		recordKind: "turn",
@@ -68,7 +70,12 @@ test("app-server projection contract validates, persists ordinal cursors, and re
 		revision: 2,
 	});
 	expect(readAppServerProjections(projectionStore(entries), 1)).toEqual({
-		records: [{ entryId: second.entryId, envelope: { schemaVersion: 1, recordKind: "turn", sourceKey: "second", payload: { ordinal: 2 } } }],
+		records: [
+			{
+				entryId: second.entryId,
+				envelope: { schemaVersion: 1, recordKind: "turn", sourceKey: "second", payload: { ordinal: 2 } },
+			},
+		],
 		revision: 2,
 	});
 	expect(readAppServerProjections(store, 2).records).toEqual([]);
@@ -108,18 +115,30 @@ test("projection persistence fails closed for malformed, duplicate, and non-mono
 		{ schemaVersion: 1, recordKind: "turn", sourceKey: "descending", payload: {}, projectionOrdinal: 0 },
 	]) {
 		const entries: Array<Record<string, unknown>> = [
-			{ id: "first", type: "custom", customType: APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE, data: { schemaVersion: 1, recordKind: "turn", sourceKey: "first", payload: {}, projectionOrdinal: 1 } },
+			{
+				id: "first",
+				type: "custom",
+				customType: APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE,
+				data: { schemaVersion: 1, recordKind: "turn", sourceKey: "first", payload: {}, projectionOrdinal: 1 },
+			},
 			{ id: "corrupt", type: "custom", customType: APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE, data },
 		];
 		const store = projectionStore(entries);
 		expect(() => readAppServerProjections(store)).toThrow(/Persisted app-server projection/);
-		await expect(appendAppServerProjection(store, { schemaVersion: 1, recordKind: "turn", sourceKey: "new", payload: {} })).rejects.toMatchObject({ code: "projection_corrupt" });
+		await expect(
+			appendAppServerProjection(store, { schemaVersion: 1, recordKind: "turn", sourceKey: "new", payload: {} }),
+		).rejects.toMatchObject({ code: "projection_corrupt" });
 	}
 });
 
 test("reused projections flush before acknowledgement", async () => {
 	const entries: Array<Record<string, unknown>> = [
-		{ id: "entry-1", type: "custom", customType: APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE, data: { schemaVersion: 1, recordKind: "turn", sourceKey: "first", payload: {}, projectionOrdinal: 1 } },
+		{
+			id: "entry-1",
+			type: "custom",
+			customType: APP_SERVER_PROJECTION_CUSTOM_ENTRY_TYPE,
+			data: { schemaVersion: 1, recordKind: "turn", sourceKey: "first", payload: {}, projectionOrdinal: 1 },
+		},
 	];
 	let flushes = 0;
 	const store: AppServerProjectionStore = {
@@ -132,7 +151,11 @@ test("reused projections flush before acknowledgement", async () => {
 	};
 	const envelope = { schemaVersion: 1, recordKind: "turn", sourceKey: "first", payload: {} };
 	await expect(appendAppServerProjection(store, envelope)).rejects.toThrow("persistence failed");
-	await expect(appendAppServerProjection(store, envelope)).resolves.toEqual({ entryId: "entry-1", revision: 1, reused: true });
+	await expect(appendAppServerProjection(store, envelope)).resolves.toEqual({
+		entryId: "entry-1",
+		revision: 1,
+		reused: true,
+	});
 });
 
 test("generic custom entries cannot forge app-server projections", () => {

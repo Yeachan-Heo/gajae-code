@@ -22,7 +22,7 @@ export type HttpResponse = {
 /** Returns true if the request carries an Origin header (even empty). Per spec, ANY
  * request carrying an Origin header is rejected with 403 (CSRF layer). */
 function hasOrigin(req: HttpRequest): boolean {
-	const origin = req.headers["origin"] ?? req.headers["Origin"];
+	const origin = req.headers.origin ?? req.headers.Origin;
 	// The header's PRESENCE (even if empty) is what triggers 403.
 	return origin !== undefined;
 }

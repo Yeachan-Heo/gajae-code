@@ -2,11 +2,9 @@ import { describe, expect, it } from "bun:test";
 import {
 	Agent,
 	type AgentEvent,
+	type AgentPromptOptions,
 	type AgentTool,
 	getAgentTerminalOwnerContext,
-	type AgentPromptOptions,
-	type AttemptRunHandle,
-	type ManagedLogicalRunId,
 	type StreamFn,
 } from "@gajae-code/agent-core";
 import type { CursorExecHandlers, SimpleStreamOptions } from "@gajae-code/ai";

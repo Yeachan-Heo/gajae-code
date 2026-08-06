@@ -20,7 +20,7 @@ test("BoundedOutboundQueue: enqueues and flushes frames in order", async () => {
 	expect(q.queued).toBe(0);
 });
 
-	test("BoundedOutboundQueue: flush finalization starts a pump for a newly accepted frame", async () => {
+test("BoundedOutboundQueue: flush finalization starts a pump for a newly accepted frame", async () => {
 	const sent: string[] = [];
 	const firstStarted = Promise.withResolvers<void>();
 	const releaseFirst = Promise.withResolvers<void>();

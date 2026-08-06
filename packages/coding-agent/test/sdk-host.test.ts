@@ -98,7 +98,13 @@ describe("SessionSdkHost", () => {
 		host.emitEvent({ kind: "private", payload: "one", audience: { requesterRef: "requester-one" } });
 		host.emitEvent({ kind: "private", payload: "two", audience: { requesterRef: "requester-two" } });
 		const replay = (connectionId: string, id: string, requesterRef?: string, replayToken?: string) => {
-			receive(connectionId, { type: "event_replay", id, sinceSeq: 0, ...(requesterRef ? { requesterRef } : {}), ...(replayToken ? { replayToken } : {}) });
+			receive(connectionId, {
+				type: "event_replay",
+				id,
+				sinceSeq: 0,
+				...(requesterRef ? { requesterRef } : {}),
+				...(replayToken ? { replayToken } : {}),
+			});
 		};
 		replay("same-connection", "unscoped");
 		await new Promise(resolve => setTimeout(resolve, 0));
@@ -123,30 +129,38 @@ describe("SessionSdkHost", () => {
 		await host.stop();
 	});
 
-test("a guessed requester reference cannot replay another connection's correlated events", async () => {
-	let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
-	const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
-	const host = new SessionSdkHost({
-		sessionId: "replay-token",
-		stateRoot: "/tmp/replay-token",
-		token: "token",
-		sendFrame: (connectionId, frame) => void sent.push({ connectionId, frame }),
-		onFrame: handler => {
-			receive = handler;
-			return () => {};
-		},
-		control: () => ({ id: "submit", ok: true }),
+	test("a guessed requester reference cannot replay another connection's correlated events", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
+		const host = new SessionSdkHost({
+			sessionId: "replay-token",
+			stateRoot: "/tmp/replay-token",
+			token: "token",
+			sendFrame: (connectionId, frame) => void sent.push({ connectionId, frame }),
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+			control: () => ({ id: "submit", ok: true }),
+		});
+		await host.start();
+		receive("connection-a", {
+			type: "control_request",
+			id: "submit",
+			operation: "turn.prompt",
+			input: { clientRef: "a-ref" },
+		});
+		await new Promise(resolve => setTimeout(resolve, 0));
+		host.emitEvent({ kind: "private", payload: "A only", audience: { requesterRef: "a-ref" } });
+		receive("connection-b", { type: "event_replay", id: "guess", sinceSeq: 0, requesterRef: "a-ref" });
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(sent.at(-1)).toMatchObject({
+			connectionId: "connection-b",
+			frame: { ok: false, error: { code: "audience_forbidden" } },
+		});
+		expect(JSON.stringify(sent.at(-1))).not.toContain("A only");
+		await host.stop();
 	});
-	await host.start();
-	receive("connection-a", { type: "control_request", id: "submit", operation: "turn.prompt", input: { clientRef: "a-ref" } });
-	await new Promise(resolve => setTimeout(resolve, 0));
-	host.emitEvent({ kind: "private", payload: "A only", audience: { requesterRef: "a-ref" } });
-	receive("connection-b", { type: "event_replay", id: "guess", sinceSeq: 0, requesterRef: "a-ref" });
-	await new Promise(resolve => setTimeout(resolve, 0));
-	expect(sent.at(-1)).toMatchObject({ connectionId: "connection-b", frame: { ok: false, error: { code: "audience_forbidden" } } });
-	expect(JSON.stringify(sent.at(-1))).not.toContain("A only");
-	await host.stop();
-});
 	test("prompt audience claims bind token issuance to the successful requester acknowledgement", async () => {
 		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
 		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
@@ -194,9 +208,18 @@ test("a guessed requester reference cannot replay another connection's correlate
 			["missing", undefined],
 			["wrong", "wrong-token"],
 		] as const) {
-			receive("connection-b", { type: "event_replay", id, sinceSeq: 0, requesterRef: "a-ref", ...(token ? { replayToken: token } : {}) });
+			receive("connection-b", {
+				type: "event_replay",
+				id,
+				sinceSeq: 0,
+				requesterRef: "a-ref",
+				...(token ? { replayToken: token } : {}),
+			});
 			await new Promise(resolve => setTimeout(resolve, 0));
-			expect(sent.at(-1)).toMatchObject({ connectionId: "connection-b", frame: { id, ok: false, error: { code: "audience_forbidden" } } });
+			expect(sent.at(-1)).toMatchObject({
+				connectionId: "connection-b",
+				frame: { id, ok: false, error: { code: "audience_forbidden" } },
+			});
 			expect(JSON.stringify(sent.at(-1))).not.toContain("A only");
 		}
 		receive("connection-a-reconnected", {
@@ -285,7 +308,11 @@ test("a guessed requester reference cannot replay another connection's correlate
 		await new Promise(resolve => setTimeout(resolve, 0));
 		expect(sent.at(-1)).toMatchObject({
 			connectionId: "connection-a-reconnected",
-			frame: { id: "authenticated-replay", ok: true, events: expect.arrayContaining([expect.objectContaining({ payload: "A only" })]) },
+			frame: {
+				id: "authenticated-replay",
+				ok: true,
+				events: expect.arrayContaining([expect.objectContaining({ payload: "A only" })]),
+			},
 		});
 
 		receive("failed-claimant", {
@@ -380,7 +407,9 @@ test("a guessed requester reference cannot replay another connection's correlate
 			control: () => new Promise<void>(() => {}),
 		});
 		await host.start();
-		const tokens = Array.from({ length: PROMPT_REPLAY_TOKEN_CAPACITY }, (_, index) => host.issueReplayToken(`requester-${index}`));
+		const tokens = Array.from({ length: PROMPT_REPLAY_TOKEN_CAPACITY }, (_, index) =>
+			host.issueReplayToken(`requester-${index}`),
+		);
 		const savedToken = tokens[0];
 		for (let index = 0; index < PROMPT_REPLAY_TOKEN_CAPACITY; index++) {
 			receive(`connection-${index}`, {
@@ -409,7 +438,10 @@ test("a guessed requester reference cannot replay another connection's correlate
 		await new Promise(resolve => setTimeout(resolve, 0));
 		expect(sent.at(-1)).toMatchObject({
 			connectionId: "saved-connection",
-			frame: { ok: true, events: expect.arrayContaining([expect.objectContaining({ payload: "saved token survives" })]) },
+			frame: {
+				ok: true,
+				events: expect.arrayContaining([expect.objectContaining({ payload: "saved token survives" })]),
+			},
 		});
 		await host.stop();
 	});
@@ -428,7 +460,9 @@ test("a guessed requester reference cannot replay another connection's correlate
 			control: () => new Promise<void>(() => {}),
 		});
 		await host.start();
-		const tokens = Array.from({ length: PROMPT_REPLAY_TOKEN_CAPACITY }, (_, index) => host.issueReplayToken(`requester-${index}`));
+		const tokens = Array.from({ length: PROMPT_REPLAY_TOKEN_CAPACITY }, (_, index) =>
+			host.issueReplayToken(`requester-${index}`),
+		);
 		for (let index = 0; index < PROMPT_REPLAY_TOKEN_CAPACITY; index++) {
 			receive(`connection-${index}`, {
 				type: "control_request",
@@ -492,7 +526,13 @@ test("a guessed requester reference cannot replay another connection's correlate
 			["saved-one", firstSavedToken, "first saved audience"],
 			["saved-two", secondSavedToken, "second saved audience"],
 		] as const) {
-			receive(`${requesterRef}-connection`, { type: "event_replay", id: `${requesterRef}-replay`, sinceSeq: 0, requesterRef, replayToken });
+			receive(`${requesterRef}-connection`, {
+				type: "event_replay",
+				id: `${requesterRef}-replay`,
+				sinceSeq: 0,
+				requesterRef,
+				replayToken,
+			});
 			await new Promise(resolve => setTimeout(resolve, 0));
 			expect(sent.at(-1)).toMatchObject({
 				connectionId: `${requesterRef}-connection`,
@@ -528,12 +568,30 @@ test("a guessed requester reference cannot replay another connection's correlate
 			},
 		});
 		await host.start();
-		receive("claimant", { type: "control_request", id: "first", operation: "turn.prompt", input: { clientRef: "lost-ack" } });
+		receive("claimant", {
+			type: "control_request",
+			id: "first",
+			operation: "turn.prompt",
+			input: { clientRef: "lost-ack" },
+		});
 		await new Promise(resolve => setTimeout(resolve, 0));
-		receive("intruder", { type: "control_request", id: "intruder", operation: "turn.prompt", input: { clientRef: "lost-ack" } });
+		receive("intruder", {
+			type: "control_request",
+			id: "intruder",
+			operation: "turn.prompt",
+			input: { clientRef: "lost-ack" },
+		});
 		await new Promise(resolve => setTimeout(resolve, 0));
-		expect(sent.at(-1)).toMatchObject({ connectionId: "intruder", frame: { ok: false, error: { code: "audience_forbidden" } } });
-		receive("claimant", { type: "control_request", id: "recovered", operation: "turn.prompt", input: { clientRef: "lost-ack" } });
+		expect(sent.at(-1)).toMatchObject({
+			connectionId: "intruder",
+			frame: { ok: false, error: { code: "audience_forbidden" } },
+		});
+		receive("claimant", {
+			type: "control_request",
+			id: "recovered",
+			operation: "turn.prompt",
+			input: { clientRef: "lost-ack" },
+		});
 		await new Promise(resolve => setTimeout(resolve, 0));
 		const replayToken = (sent.at(-1)?.frame as { replayToken?: string }).replayToken;
 		expect(replayToken).toEqual(expect.any(String));
@@ -541,9 +599,21 @@ test("a guessed requester reference cannot replay another connection's correlate
 		const realNow = Date.now;
 		try {
 			Date.now = () => realNow() + 6 * 60_000;
-			receive("claimant", { type: "event_replay", id: "replay", sinceSeq: 0, requesterRef: "lost-ack", replayToken });
+			receive("claimant", {
+				type: "event_replay",
+				id: "replay",
+				sinceSeq: 0,
+				requesterRef: "lost-ack",
+				replayToken,
+			});
 			await new Promise(resolve => setTimeout(resolve, 0));
-			expect(sent.at(-1)).toMatchObject({ connectionId: "claimant", frame: { ok: true, events: expect.arrayContaining([expect.objectContaining({ payload: "recovered audience" })]) } });
+			expect(sent.at(-1)).toMatchObject({
+				connectionId: "claimant",
+				frame: {
+					ok: true,
+					events: expect.arrayContaining([expect.objectContaining({ payload: "recovered audience" })]),
+				},
+			});
 		} finally {
 			Date.now = realNow;
 		}

@@ -238,7 +238,8 @@ export class SessionSdkHost {
 		const existing = this.#replayTokens.get(requesterRef);
 		if (existing) return existing;
 		this.#evictExpiredAudienceClaims();
-		if (!this.#evictReplayTokens()) throw Object.assign(new Error("Replay token capacity is temporarily exhausted."), { code: "busy" });
+		if (!this.#evictReplayTokens())
+			throw Object.assign(new Error("Replay token capacity is temporarily exhausted."), { code: "busy" });
 		const token = randomBytes(32).toString("base64url");
 		this.#replayTokens.set(requesterRef, token);
 		return token;
@@ -272,7 +273,11 @@ export class SessionSdkHost {
 		});
 		return replayToken;
 	}
-	#authorizePromptAudience(connectionId: string, requesterRef: string, replayToken: string | undefined): string | undefined {
+	#authorizePromptAudience(
+		connectionId: string,
+		requesterRef: string,
+		replayToken: string | undefined,
+	): string | undefined {
 		this.#evictExpiredAudienceClaims();
 		const token = this.#replayTokens.get(requesterRef);
 		if (token) {
@@ -301,7 +306,9 @@ export class SessionSdkHost {
 				throw Object.assign(new Error("Replay token capacity is temporarily exhausted."), { code: "busy" });
 			this.#replayTokens.set(requesterRef, replayToken);
 		} else if (existingReplayToken !== replayToken) {
-			throw Object.assign(new Error("Replay token binding does not match the authorized token."), { code: "audience_forbidden" });
+			throw Object.assign(new Error("Replay token binding does not match the authorized token."), {
+				code: "audience_forbidden",
+			});
 		}
 		this.#replayTokenOwners.set(requesterRef, connectionId);
 		this.#releasePromptAudienceClaim(connectionId, requesterRef);
@@ -481,7 +488,10 @@ export class SessionSdkHost {
 							type: "control_response",
 							id: typeof frame.id === "string" ? frame.id : "",
 							ok: false,
-							error: { code: "audience_forbidden", message: "A matching replay token is required for this requesterRef." },
+							error: {
+								code: "audience_forbidden",
+								message: "A matching replay token is required for this requesterRef.",
+							},
 						});
 						break;
 					}
@@ -530,7 +540,8 @@ export class SessionSdkHost {
 							await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
 							await sendTerminal();
 						} catch (error) {
-							if (requesterRef && !successfulAcknowledgement) this.#releasePromptAudienceClaim(connectionId, requesterRef);
+							if (requesterRef && !successfulAcknowledgement)
+								this.#releasePromptAudienceClaim(connectionId, requesterRef);
 							throw error;
 						}
 						if (requesterRef && successfulAcknowledgement && issuedReplayToken)
@@ -597,12 +608,19 @@ export class SessionSdkHost {
 						pendingClaim.expiresAt > Date.now() &&
 						pendingClaim.connectionId === connectionId &&
 						pendingClaim.replayToken === replayToken;
-					if (requesterRef && (storedReplayToken === undefined || storedReplayToken !== replayToken) && !hasPendingRecovery) {
+					if (
+						requesterRef &&
+						(storedReplayToken === undefined || storedReplayToken !== replayToken) &&
+						!hasPendingRecovery
+					) {
 						await this.#send(connectionId, {
 							type: "event_replay_result",
 							id,
 							ok: false,
-							error: { code: "audience_forbidden", message: "A matching replay token is required for this requesterRef." },
+							error: {
+								code: "audience_forbidden",
+								message: "A matching replay token is required for this requesterRef.",
+							},
 							...rejectionCursor,
 						});
 						break;

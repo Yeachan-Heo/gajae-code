@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import {
 	APP_SERVER_FRAME_BYTES_DEFAULT,
-	GJC_STDIO_OVERSIZE_ENVELOPE,
 	decodeLine,
 	describeOversizeBehavior,
 	encodeMessage,
+	GJC_STDIO_OVERSIZE_ENVELOPE,
 } from "../../transport/framing";
 
 const enc = (s: string) => new TextEncoder().encode(s);

@@ -13,15 +13,9 @@ test("(a) child-session isolation remains keyed by independently sequenced event
 	expect(second.replay(0).events).toMatchObject([{ seq: 1, payload: { token: "two" } }]);
 });
 
-test.skip(
-	"(b) P2 ThreadRuntimeManager will prove attached detach preserves the runtime while spawned terminate closes it",
-	() => {},
-);
+test.skip("(b) P2 ThreadRuntimeManager will prove attached detach preserves the runtime while spawned terminate closes it", () => {});
 
-test.skip(
-	"(c) P2 ThreadRuntimeManager will prove lifecycle close remains a distinct destructive operation",
-	() => {},
-);
+test.skip("(c) P2 ThreadRuntimeManager will prove lifecycle close remains a distinct destructive operation", () => {});
 
 test("(e) SessionSdkHost installs a permission reverse lease, heartbeats it, and completes a reverse request", async () => {
 	let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
@@ -65,11 +59,20 @@ test("(e) SessionSdkHost installs a permission reverse lease, heartbeats it, and
 		if (!lease) throw new Error("Expected permission provider lease.");
 		expect(host.getProviderDefinitions("permission")).toEqual([{ name: "request" }]);
 		expect(installed).toEqual([[{ name: "request" }]]);
-		receive("permission-client", { type: "provider_heartbeat", connectionId: "permission-client", leaseId: lease.leaseId });
+		receive("permission-client", {
+			type: "provider_heartbeat",
+			connectionId: "permission-client",
+			leaseId: lease.leaseId,
+		});
 		await tick();
-		await expect(host.reverse.request("permission", "request", { tool: "shell" })).resolves.toEqual({ decision: "allow" });
+		await expect(host.reverse.request("permission", "request", { tool: "shell" })).resolves.toEqual({
+			decision: "allow",
+		});
 		expect(sent).toContainEqual(
-			expect.objectContaining({ connectionId: "permission-client", frame: expect.objectContaining({ type: "reverse_request" }) }),
+			expect.objectContaining({
+				connectionId: "permission-client",
+				frame: expect.objectContaining({ type: "reverse_request" }),
+			}),
 		);
 	} finally {
 		await host.stop();
@@ -117,18 +120,19 @@ test("(g) SessionSdkHost replays sequenced abandoned prompt events only to their
 			replayToken,
 		});
 		await tick();
-		expect((sent.at(-1)?.frame.events as Array<{ payload?: { promptId?: string; visibility?: string } }>).map(event => event.payload)).toEqual([
-			undefined,
-			{ visibility: "public" },
-			{ promptId: "abandoned-one" },
-		]);
+		expect(
+			(sent.at(-1)?.frame.events as Array<{ payload?: { promptId?: string; visibility?: string } }>).map(
+				event => event.payload,
+			),
+		).toEqual([undefined, { visibility: "public" }, { promptId: "abandoned-one" }]);
 
 		receive("unscoped-connection", { type: "event_replay", id: "unscoped-replay", sinceSeq: 0 });
 		await tick();
-		expect((sent.at(-1)?.frame.events as Array<{ payload?: { promptId?: string; visibility?: string } }>).map(event => event.payload)).toEqual([
-			undefined,
-			{ visibility: "public" },
-		]);
+		expect(
+			(sent.at(-1)?.frame.events as Array<{ payload?: { promptId?: string; visibility?: string } }>).map(
+				event => event.payload,
+			),
+		).toEqual([undefined, { visibility: "public" }]);
 	} finally {
 		await host.stop();
 	}

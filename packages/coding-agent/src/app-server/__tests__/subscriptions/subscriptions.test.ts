@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ThreadSubscriptionIndex, ConnectionRegistry } from "../../subscriptions";
+import { ConnectionRegistry, ThreadSubscriptionIndex } from "../../subscriptions";
 
 test("subscribe: adds a connection to a thread", () => {
 	const idx = new ThreadSubscriptionIndex();

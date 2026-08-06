@@ -7,10 +7,7 @@ export type EndpointIncarnationRecord = {
 };
 
 /** Derives endpoint authority only when immutable endpoint mtime evidence is present. */
-export function deriveEndpointIncarnation(
-	record: EndpointIncarnationRecord,
-	sessionId: string,
-): string | undefined {
+export function deriveEndpointIncarnation(record: EndpointIncarnationRecord, sessionId: string): string | undefined {
 	if (
 		!Number.isSafeInteger(record.endpointGeneration) ||
 		record.endpointGeneration <= 0 ||

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";

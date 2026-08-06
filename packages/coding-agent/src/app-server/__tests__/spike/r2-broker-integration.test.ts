@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,8 +7,8 @@ import { ModelRegistry } from "../../../config/model-registry";
 import { Settings } from "../../../config/settings";
 import { Broker } from "../../../sdk/broker/broker";
 import { createLifecycleAgentSession } from "../../../sdk/lifecycle-session";
-import { AuthStorage } from "../../../session/auth-storage";
 import { appendAppServerProjection, readAppServerProjections } from "../../../session/app-server-projection";
+import { AuthStorage } from "../../../session/auth-storage";
 import { SessionManager } from "../../../session/session-manager";
 import { api, models, providerName, streamSimple } from "../fixtures/stub-model-provider";
 
@@ -54,15 +54,15 @@ async function createInProcessLifecycleSession(root: string, name: string) {
 	return { session, authStorage };
 }
 
-async function disposeInProcessSession(session: { dispose: () => Promise<void> }, authStorage: AuthStorage): Promise<void> {
+async function disposeInProcessSession(
+	session: { dispose: () => Promise<void> },
+	authStorage: AuthStorage,
+): Promise<void> {
 	await session.dispose();
 	await authStorage.close();
 }
 
-test.skip(
-	"R2 real broker child-spawn is sandbox-blocked: spawn_failed No ready SDK endpoint remains available; GJC_SDK_SESSION_COMMAND then terminal_uncertain Lifecycle terminal evidence could not be verified after persistence (suspected pre-existing lifecycle persistence verification under bun test); approved in-process fallback below",
-	() => {},
-);
+test.skip("R2 real broker child-spawn is sandbox-blocked: spawn_failed No ready SDK endpoint remains available; GJC_SDK_SESSION_COMMAND then terminal_uncertain Lifecycle terminal evidence could not be verified after persistence (suspected pre-existing lifecycle persistence verification under bun test); approved in-process fallback below", () => {});
 
 test("R2 in-process lifecycle sessions stream isolated stub turns with usage and no network", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-r2-in-process-"));

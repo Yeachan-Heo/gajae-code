@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import type { ProviderConfigInput } from "../src/config/model-registry";
 import { registerTestModelProvider } from "../src/commands/sdk";
+import type { ProviderConfigInput } from "../src/config/model-registry";
 
 const fixtureUrl = new URL("../src/app-server/__tests__/fixtures/stub-model-provider.ts", import.meta.url).href;
 
@@ -64,8 +64,11 @@ test("authorized test model provider failures block startup", async () => {
 
 test("unauthorized broken test model provider is ignored", async () => {
 	await expect(
-		registerTestModelProvider({ modelRegistry: { registerProvider: () => {} } }, {
-			GJC_TEST_MODEL_PROVIDER: "file:///missing-gjc-test-provider.mjs",
-		}),
+		registerTestModelProvider(
+			{ modelRegistry: { registerProvider: () => {} } },
+			{
+				GJC_TEST_MODEL_PROVIDER: "file:///missing-gjc-test-provider.mjs",
+			},
+		),
 	).resolves.toBeUndefined();
 });

@@ -227,8 +227,17 @@ test("dispatch projection validation shares the persistence envelope contract", 
 		readProjection: (...args: unknown[]) => calls.push(args),
 	} as unknown as ControlSurface;
 	const validEnvelope = { schemaVersion: 1, recordKind: "turn", sourceKey: "source", payload: { value: 1 } };
-	expect((await dispatchControl(surface, append, { ...request(append), input: { envelope: validEnvelope } })).ok).toBe(true);
-	expect((await dispatchControl(surface, append, { ...request(append), input: { envelope: { ...validEnvelope, extra: true } } })).error?.code).toBe("invalid_input");
+	expect((await dispatchControl(surface, append, { ...request(append), input: { envelope: validEnvelope } })).ok).toBe(
+		true,
+	);
+	expect(
+		(
+			await dispatchControl(surface, append, {
+				...request(append),
+				input: { envelope: { ...validEnvelope, extra: true } },
+			})
+		).error?.code,
+	).toBe("invalid_input");
 	expect((await dispatchControl(surface, read, { ...request(read), input: { afterRevision: 2 } })).ok).toBe(true);
 	expect(calls).toEqual([[validEnvelope], [2]]);
 });
@@ -241,7 +250,10 @@ test("dispatch preserves projection corruption errors", async () => {
 		},
 	} as unknown as ControlSurface;
 	const response = await dispatchControl(surface, read, { ...request(read), input: {} });
-	expect(response.error).toEqual({ code: "projection_corrupt", message: "Persisted app-server projection is corrupt." });
+	expect(response.error).toEqual({
+		code: "projection_corrupt",
+		message: "Persisted app-server projection is corrupt.",
+	});
 });
 
 test("returns the current revision on an optimistic concurrency conflict", async () => {

@@ -3,12 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import {
-	loadEntriesFromFile,
-	SessionManager,
-	type SessionHeader,
-} from "../../../session/session-manager";
+import { loadEntriesFromFile, type SessionHeader, SessionManager } from "../../../session/session-manager";
 import { stableValidators } from "../../protocol-source/schema-validators.generated";
+import type { HandlerContext } from "../../suites/handlers";
 import {
 	threadDeleteHandler,
 	threadForkHandler,
@@ -17,7 +14,6 @@ import {
 	threadMutationHandlers,
 	threadNameSetHandler,
 } from "../../suites/thread-mutation-handlers";
-import type { HandlerContext } from "../../suites/handlers";
 
 const root = mkdtempSync(join(tmpdir(), "gjc-thread-mutation-suite-"));
 const sessionDir = join(root, "sessions");
@@ -52,7 +48,7 @@ function resultOf(value: { ok: true; result: unknown } | { ok: false; errorKey: 
 
 function header(entries: Awaited<ReturnType<typeof loadEntriesFromFile>>): SessionHeader {
 	const value = entries.find(entry => entry.type === "session");
-	if (!value || value.type !== "session") throw new Error("missing session header");
+	if (value?.type !== "session") throw new Error("missing session header");
 	return value;
 }
 
@@ -120,11 +116,14 @@ test("thread/metadata/update persists pinned and Git metadata through the native
 	const reread = await loadEntriesFromFile(source.file);
 	const metadata = reread
 		.filter(entry => entry.type === "custom" && entry.customType === threadMetadataCustomType)
-		.map(entry => entry.type === "custom" ? entry.data : undefined)
+		.map(entry => (entry.type === "custom" ? entry.data : undefined))
 		.at(-1) as Record<string, unknown> | undefined;
 	expect(metadata).toEqual({ isPinned: true, gitInfo: params.gitInfo });
 
-	const clearResult = await threadMetadataUpdateHandler({ threadId: source.id, isPinned: null, gitInfo: null }, context());
+	const clearResult = await threadMetadataUpdateHandler(
+		{ threadId: source.id, isPinned: null, gitInfo: null },
+		context(),
+	);
 	expect(clearResult.ok).toBe(true);
 	const clearedPayload = resultOf(clearResult) as { thread: Record<string, unknown> };
 	expect(clearedPayload.thread.isPinned).toBe(false);
@@ -134,11 +133,12 @@ test("thread/metadata/update persists pinned and Git metadata through the native
 test("mutation handlers return notFound for unknown thread ids without touching the temp store", async () => {
 	const before = [...(await SessionManager.list(cwd, sessionDir))].map(session => session.path).sort();
 	for (const handler of [threadDeleteHandler, threadForkHandler, threadNameSetHandler, threadMetadataUpdateHandler]) {
-		const params = handler === threadNameSetHandler
-			? { threadId: "missing-thread", name: "name" }
-			: handler === threadMetadataUpdateHandler
-				? { threadId: "missing-thread", isPinned: true }
-				: { threadId: "missing-thread" };
+		const params =
+			handler === threadNameSetHandler
+				? { threadId: "missing-thread", name: "name" }
+				: handler === threadMetadataUpdateHandler
+					? { threadId: "missing-thread", isPinned: true }
+					: { threadId: "missing-thread" };
 		expect(await handler(params, context())).toEqual({ ok: false, errorKey: "notFound" });
 	}
 	const after = [...(await SessionManager.list(cwd, sessionDir))].map(session => session.path).sort();
@@ -148,7 +148,10 @@ test("mutation handlers return notFound for unknown thread ids without touching 
 test("malformed mutation params return invalidParams before any session lookup", async () => {
 	expect(await threadDeleteHandler({}, context())).toEqual({ ok: false, errorKey: "invalidParams" });
 	expect(await threadForkHandler({ threadId: 42 }, context())).toEqual({ ok: false, errorKey: "invalidParams" });
-	expect(await threadNameSetHandler({ threadId: "x", name: 42 }, context())).toEqual({ ok: false, errorKey: "invalidParams" });
+	expect(await threadNameSetHandler({ threadId: "x", name: 42 }, context())).toEqual({
+		ok: false,
+		errorKey: "invalidParams",
+	});
 	expect(await threadMetadataUpdateHandler({ threadId: "x", isPinned: "yes" }, context())).toEqual({
 		ok: false,
 		errorKey: "invalidParams",
@@ -162,5 +165,6 @@ test("threadMutationHandlers exposes only the genuinely backed methods", () => {
 		"thread/name/set",
 		"thread/metadata/update",
 	]);
-	for (const method of Object.keys(threadMutationHandlers)) expect(typeof threadMutationHandlers[method]).toBe("function");
+	for (const method of Object.keys(threadMutationHandlers))
+		expect(typeof threadMutationHandlers[method]).toBe("function");
 });

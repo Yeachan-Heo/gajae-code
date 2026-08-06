@@ -9,8 +9,8 @@ import type {
 	SessionManager,
 } from "../../session/session-manager";
 import { SessionManager as ConcreteSessionManager, loadEntriesFromFile } from "../../session/session-manager";
-import type { HandlerContext, HandlerResult, MethodHandler } from "./handlers";
 import { FileSessionStorage } from "../../session/session-storage";
+import type { HandlerContext, HandlerResult, MethodHandler } from "./handlers";
 
 type RecordValue = Record<string, unknown>;
 type MutationContext = HandlerContext & {
@@ -93,7 +93,9 @@ function metadataFromEntries(entries: readonly FileEntry[]): PersistedMetadata {
 						sha: typeof patch.sha === "string" || patch.sha === null ? patch.sha : current.sha,
 						branch: typeof patch.branch === "string" || patch.branch === null ? patch.branch : current.branch,
 						originUrl:
-							typeof patch.originUrl === "string" || patch.originUrl === null ? patch.originUrl : current.originUrl,
+							typeof patch.originUrl === "string" || patch.originUrl === null
+								? patch.originUrl
+								: current.originUrl,
 					},
 				};
 			}
@@ -197,7 +199,10 @@ function latestModel(entries: readonly SessionEntry[]): { model: string; provide
 	return { model: "", provider: "unknown" };
 }
 
-async function threadFromManager(manager: SessionManager, metadata?: PersistedMetadata): Promise<Record<string, unknown>> {
+async function threadFromManager(
+	manager: SessionManager,
+	metadata?: PersistedMetadata,
+): Promise<Record<string, unknown>> {
 	const header = manager.getHeader();
 	if (!header) throw new Error("session_header_missing");
 	const entries = manager.getEntries();
@@ -248,7 +253,8 @@ function validateMetadataParams(p: RecordValue): HandlerResult | undefined {
 		const gitInfo = record(p.gitInfo);
 		if (!gitInfo) return invalidParams();
 		for (const key of ["sha", "branch", "originUrl"]) {
-			if (gitInfo[key] !== undefined && gitInfo[key] !== null && typeof gitInfo[key] !== "string") return invalidParams();
+			if (gitInfo[key] !== undefined && gitInfo[key] !== null && typeof gitInfo[key] !== "string")
+				return invalidParams();
 		}
 	}
 	if (p.isPinned !== undefined && p.isPinned !== null && typeof p.isPinned !== "boolean") return invalidParams();
@@ -286,7 +292,6 @@ export const threadDeleteHandler: MethodHandler = async (params, context) => {
 	if (!p || typeof p.threadId !== "string" || p.threadId.length === 0) return invalidParams();
 	const location = await locateSession(p.threadId, context);
 	if (!location) return notFound();
-	const ctx = contextRecord(context);
 	try {
 		const manager = ConcreteSessionManager.create(location.cwd, destinationFor(location, context));
 		try {
@@ -329,7 +334,8 @@ export const threadForkHandler: MethodHandler = async (params, context) => {
 			},
 		};
 	} catch (error) {
-		if (error instanceof Error && (error.message.includes("ENOENT") || error.message.includes("missing"))) return notFound();
+		if (error instanceof Error && (error.message.includes("ENOENT") || error.message.includes("missing")))
+			return notFound();
 		return internalError();
 	} finally {
 		if (manager) await manager.close().catch(() => {});
@@ -338,7 +344,8 @@ export const threadForkHandler: MethodHandler = async (params, context) => {
 
 export const threadNameSetHandler: MethodHandler = async (params, context) => {
 	const p = record(params);
-	if (!p || typeof p.threadId !== "string" || p.threadId.length === 0 || typeof p.name !== "string") return invalidParams();
+	if (!p || typeof p.threadId !== "string" || p.threadId.length === 0 || typeof p.name !== "string")
+		return invalidParams();
 	if (p.name.trim().length === 0) return invalidParams();
 	const location = await locateSession(p.threadId, context);
 	if (!location) return notFound();

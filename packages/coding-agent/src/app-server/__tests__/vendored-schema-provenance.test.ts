@@ -2,13 +2,13 @@ import { afterEach, beforeAll, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { materializeSchemaProfile } from "../../../../../scripts/codex-app-server-schema-materialize";
 import {
 	FROZEN_EXPERIMENTAL_SCHEMA_SUBTREE_OIDS,
 	FROZEN_STABLE_SCHEMA_SUBTREE_OIDS,
 	verifyVendoredSchemaProvenance,
 	verifyVendoredStableSchemaProvenance,
 } from "../vendored-schema-provenance";
-import { materializeSchemaProfile } from "../../../../../scripts/codex-app-server-schema-materialize";
 
 const repositoryRoot = path.resolve(import.meta.dir, "../../../../..");
 const vendorRoot = path.join(repositoryRoot, "packages/coding-agent/vendor/codex-app-server-schema");

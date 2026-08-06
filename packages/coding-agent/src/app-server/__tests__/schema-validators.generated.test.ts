@@ -155,8 +155,14 @@ test("generated validators distinguish required, optional, and absent params", (
 
 test("generated JSON guard rejects sparse arrays without rejecting dense arrays", () => {
 	const validator = stableValidators.clientRequestParams["thread/start"];
-	const sparseNested = [1, , 3];
-	const sparseTopLevel = [1, , 3];
+	const sparseNested: unknown[] = [];
+	sparseNested.length = 3;
+	sparseNested[0] = 1;
+	sparseNested[2] = 3;
+	const sparseTopLevel: unknown[] = [];
+	sparseTopLevel.length = 3;
+	sparseTopLevel[0] = 1;
+	sparseTopLevel[2] = 3;
 
 	expect(validator({ cwd: "/workspace", config: { values: sparseNested } })).toBe(false);
 	expect(isJson(sparseTopLevel)).toBe(false);

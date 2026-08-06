@@ -41,7 +41,7 @@ export class ThreadSubscriptionIndex {
 	unsubscribe(connectionId: string, threadId: string): boolean {
 		const conns = this.#subscriptions.get(threadId);
 		if (!conns?.delete(connectionId)) return false;
-	if (conns.size === 0) this.#subscriptions.delete(threadId);
+		if (conns.size === 0) this.#subscriptions.delete(threadId);
 		// Clean up the reverse index entry for this connection.
 		const connThreads = this.#connectionThreads.get(connectionId);
 		if (connThreads) {
