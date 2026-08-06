@@ -449,7 +449,7 @@ describe("Anthropic prompt caching", () => {
 		});
 	});
 
-	it("does not treat a tool-result-only wire user turn as the explicit human refresh", async () => {
+	it("advances explicit caching to the latest assistant tool-use turn without caching its result", async () => {
 		const payload = await capturePayload(
 			explicitCompatibleModel,
 			context([
@@ -479,12 +479,41 @@ describe("Anthropic prompt caching", () => {
 					isError: false,
 					timestamp: 3,
 				},
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call_2", name: "lookup", arguments: {} }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: canonicalModel.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 4,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_2",
+					toolName: "lookup",
+					content: [{ type: "text", text: "Second answer" }],
+					isError: false,
+					timestamp: 5,
+				},
 			]),
 		);
+		const firstAssistantContent = payload.messages[1]?.content as Array<{ cache_control?: CacheControl }>;
+		const latestAssistantContent = payload.messages[3]?.content as Array<{ cache_control?: CacheControl }>;
 		const firstUserContent = payload.messages[0]?.content as Array<{ cache_control?: CacheControl }>;
 		const toolResultContent = payload.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>;
 
 		expect(firstUserContent.at(-1)?.cache_control).toEqual({ type: "ephemeral" });
+		expect(firstAssistantContent.some(block => block.cache_control)).toBe(false);
+		expect(latestAssistantContent.at(-1)?.cache_control).toEqual({ type: "ephemeral" });
 		expect(toolResultContent.some(block => block.cache_control)).toBe(false);
 	});
 

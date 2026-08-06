@@ -16,6 +16,7 @@
 - Anthropic thinking-replay repair now also recovers when a proxy masks the rejection entirely (issue #3900). Live CLIProxyAPI captures replace the upstream 400 body with a generic `{"type":"api_error","message":"An error occurred while processing the request."}` SSE event on an HTTP 200 response, which names no cause and matches no transient phrase, so the turn died on the first attempt. Such a masked rejection now takes the same one-shot latest-then-full-history repair, but only before the first token and only while the request actually replays signed `thinking`/`redacted_thinking` blocks; masked failures on requests without replayed thinking still surface immediately. The classifier is exported as `isAnthropicMaskedProxyRejection`.
 
 - Anthropic cache-control resolution now falls back to `model.cacheRetention` at the provider boundary, preserving configured retention and request-over-model precedence through special dispatch wrappers such as GitLab Duo. A configured `cacheRetention: "none"` can no longer be dropped and replaced by the new automatic Claude-family cache marker.
+- Anthropic explicit prompt caching now advances its conversation breakpoint during tool-use loops by marking the latest completed assistant tool-use turn while leaving the newest tool result uncached. Previously it kept refreshing only the original human message until another human turn arrived, pinning proxy cache reads to the static tools/system prefix throughout long agentic runs.
 ## [0.12.12] - 2026-08-05
 
 ### Fixed

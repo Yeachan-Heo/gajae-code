@@ -2332,10 +2332,11 @@ function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: 
 	const currentUser = params.messages[currentUserIndex];
 	if (!currentUser) return;
 
-	// A tool result is encoded as role "user" on the wire, but belongs to the
-	// preceding assistant turn. Anchor that assistant turn, not the tool result,
-	// so changing tool output does not invalidate the reusable conversation prefix.
-	for (let index = currentUserIndex - 1; index >= 0; index--) {
+	// Tool results are encoded as role "user" on the wire but belong to the
+	// assistant tool-use turn immediately before them. Anchor the latest completed
+	// assistant turn so the reusable prefix advances during an agent tool loop,
+	// while keeping the newest tool output outside the cache boundary.
+	for (let index = params.messages.length - 1; index >= 0; index--) {
 		const message = params.messages[index];
 		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
 		if (
