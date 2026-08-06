@@ -80,19 +80,28 @@ export class BlobCorruptError extends Error {
 	}
 }
 
+/** Extra, human-readable evidence for why a resident-cache path was rejected. */
+export interface ResidentCacheTrustErrorOptions extends ErrorOptions {
+	detail?: string;
+}
+
 /**
  * A resident-cache path or blob failed the owner-only verification contract.
  * SessionManager catches this error to demote the entire resident store to
  * memory before retrying the triggering write.
  */
 export class ResidentCacheTrustError extends Error {
+	readonly detail: string | undefined;
+
 	constructor(
 		readonly reason: string,
 		readonly path: string,
-		options?: ErrorOptions,
+		options?: ResidentCacheTrustErrorOptions,
 	) {
-		super(`Resident cache trust validation failed (${reason}): ${path}`, options);
+		const detail = options?.detail;
+		super(`Resident cache trust validation failed (${reason}): ${path}${detail ? ` (${detail})` : ""}`, options);
 		this.name = "ResidentCacheTrustError";
+		this.detail = detail;
 	}
 }
 
@@ -132,6 +141,28 @@ function residentCacheDirectoryOpenFlags(pathname: string): number {
 	return fs.constants.O_RDONLY | directory | noFollow;
 }
 
+/**
+ * Classify why a resident-cache path is not the owner-only directory the cache
+ * requires. The conditions are indistinguishable in the aggregate check, and
+ * operators cannot repair the path without knowing which one tripped.
+ */
+function residentCacheDirectoryRejection(stat: fs.Stats, uid: number): { reason: string; detail: string } | null {
+	if (stat.isSymbolicLink())
+		return {
+			reason: "directory_symlink",
+			detail: "path is a symlink; the resident cache root must be a real directory",
+		};
+	if (!stat.isDirectory()) return { reason: "directory_not_a_directory", detail: "path is not a directory" };
+	if (stat.uid !== uid)
+		return { reason: "directory_foreign_owner", detail: `owned by uid ${stat.uid}, expected uid ${uid}` };
+	if (!hasOwnerOnlyMode(stat.mode))
+		return {
+			reason: "directory_group_or_world_accessible",
+			detail: `mode ${(stat.mode & 0o7777).toString(8).padStart(4, "0")} grants group or world access; expected owner-only (0700)`,
+		};
+	return null;
+}
+
 function hasSameFilesystemIdentity(a: fs.Stats, b: fs.Stats): boolean {
 	return a.dev === b.dev && a.ino === b.ino;
 }
@@ -143,8 +174,9 @@ function assertResidentCacheDirectory(pathname: string, uid: number): fs.Stats {
 	} catch (error) {
 		throw residentCacheTrustError("directory_unverifiable", pathname, error);
 	}
-	if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || !hasOwnerOnlyMode(stat.mode)) {
-		throw new ResidentCacheTrustError("directory_untrusted", pathname);
+	const rejection = residentCacheDirectoryRejection(stat, uid);
+	if (rejection) {
+		throw new ResidentCacheTrustError(rejection.reason, pathname, { detail: rejection.detail });
 	}
 	return stat;
 }

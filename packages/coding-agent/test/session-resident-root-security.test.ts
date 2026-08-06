@@ -89,6 +89,17 @@ function isDirectoryOpen(flags: fs.OpenMode | undefined): boolean {
 	return typeof flags === "number" && (flags & fs.constants.O_DIRECTORY) !== 0;
 }
 
+function rejectedResidentCacheRoot(cacheRoot: string): ResidentCacheTrustError {
+	let captured: unknown;
+	try {
+		openVerifiedResidentCacheInstanceDir(cacheRoot);
+	} catch (error) {
+		captured = error;
+	}
+	expect(captured).toBeInstanceOf(ResidentCacheTrustError);
+	return captured as ResidentCacheTrustError;
+}
+
 describe.skipIf(process.platform === "win32")("resident cache root trust boundary", () => {
 	it("rejects a pre-created symlinked cache root and installs a MemoryBlobStore fallback", async () => {
 		const root = makeTempDir();
@@ -98,7 +109,10 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 		fs.mkdirSync(attackerDirectory, { mode: 0o700 });
 		fs.symlinkSync(attackerDirectory, cacheRoot, "dir");
 
-		expect(() => openVerifiedResidentCacheInstanceDir(cacheRoot)).toThrow(ResidentCacheTrustError);
+		const rejection = rejectedResidentCacheRoot(cacheRoot);
+		expect(rejection.reason).toBe("directory_symlink");
+		expect(rejection.message).toContain(`(directory_symlink): ${cacheRoot}`);
+		expect(rejection.message).toContain("path is a symlink");
 		expect(fs.readdirSync(attackerDirectory)).toEqual([]);
 
 		const manager = createManager(root);
@@ -119,15 +133,17 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 	});
 
 	it.each([
-		["group-accessible", 0o770],
-		["other-accessible", 0o707],
-	] as const)("rejects a %s pre-existing cache root and falls back to memory", async (_access, mode) => {
+		["group-accessible", 0o770, "0770"],
+		["other-accessible", 0o707, "0707"],
+	] as const)("rejects a %s pre-existing cache root and falls back to memory", async (_access, mode, printedMode) => {
 		const root = makeTempDir();
 		const cacheRoot = residentCacheRoot();
 		fs.mkdirSync(cacheRoot, { recursive: true, mode });
 		fs.chmodSync(cacheRoot, mode);
 
-		expect(() => openVerifiedResidentCacheInstanceDir(cacheRoot)).toThrow(ResidentCacheTrustError);
+		const rejection = rejectedResidentCacheRoot(cacheRoot);
+		expect(rejection.reason).toBe("directory_group_or_world_accessible");
+		expect(rejection.message).toContain(`mode ${printedMode} grants group or world access`);
 		expect(residentInstanceDirs()).toEqual([]);
 
 		const manager = createManager(root);
@@ -161,7 +177,9 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 			return foreign;
 		}) as typeof fs.lstatSync);
 
-		expect(() => openVerifiedResidentCacheInstanceDir(cacheRoot)).toThrow(ResidentCacheTrustError);
+		const rejection = rejectedResidentCacheRoot(cacheRoot);
+		expect(rejection.reason).toBe("directory_foreign_owner");
+		expect(rejection.message).toContain(`expected uid ${process.getuid?.()}`);
 
 		const manager = createManager(root);
 		try {
@@ -177,6 +195,22 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 		} finally {
 			await manager.close().catch(() => {});
 		}
+	});
+
+	it("names a non-directory resident cache path instead of reporting it as untrusted", () => {
+		const notADirectory = path.join(makeTempDir(), "resident-cache-file");
+		fs.writeFileSync(notADirectory, "", { mode: 0o600 });
+
+		let captured: unknown;
+		try {
+			EphemeralBlobStore.adoptVerifiedDir(notADirectory);
+		} catch (error) {
+			captured = error;
+		}
+
+		expect(captured).toBeInstanceOf(ResidentCacheTrustError);
+		expect((captured as ResidentCacheTrustError).reason).toBe("directory_not_a_directory");
+		expect((captured as ResidentCacheTrustError).message).toContain("path is not a directory");
 	});
 
 	it("rejects a root replaced by a symlink between lstat and no-follow open", () => {
