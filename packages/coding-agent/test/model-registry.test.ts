@@ -1924,13 +1924,13 @@ describe("ModelRegistry", () => {
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
 
 			const registry = new ModelRegistry(authStorage, presetModelsPath);
-			const minimax = registry.find("minimax-code", "minimax-m3");
+			const minimax = registry.find("minimax-code", "MiniMax-M3");
 			const glm = registry.find("glm-proxy", "glm-4.6");
 
 			expect(minimax?.api).toBe("openai-completions");
 			// #614: preset-onboarded models inherit the bundled canonical display
-			// name (MiniMax-M3) while preserving the lowercase machine id.
-			expect(minimax?.id).toBe("minimax-m3");
+			// name (MiniMax-M3) while preserving the requested machine id.
+			expect(minimax?.id).toBe("MiniMax-M3");
 			expect(minimax?.name).toBe("MiniMax-M3");
 			expect(minimax?.baseUrl).toBe("https://api.minimax.io/v1");
 			expect(getOpenAICompat(minimax)?.supportsStore).toBe(false);

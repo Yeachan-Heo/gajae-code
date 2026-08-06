@@ -4302,6 +4302,51 @@ test("PresentationArbiter retires and republishes an active replay whose option 
 	});
 });
 
+test("PresentationArbiter publishes the ask tool's selection state and keeps its own navigation control", () => {
+	const publications: Array<Record<string, unknown>> = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as Record<string, unknown>;
+				publications.push(action);
+				return { actionId: action.id as string, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "retired" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	// The ask tool owns its multi-select loop: one presentation per toggle, with
+	// its own Next/Done control rather than the workflow gate's synthesized one.
+	const presentation = (selectedOptions: string[]) => ({
+		gateId: `interactive:${selectedOptions.length}`,
+		sessionId: "session",
+		question: "Pick",
+		options: ["one", "two"],
+		controls: [
+			{ id: "navigation_forward" as const, kind: "navigation" as const, label: "Next" as const, enabled: true },
+		],
+		multi: true,
+		allowEmpty: false,
+		selectedOptions,
+	});
+
+	arbiter.retain(presentation([]));
+	expect(publications[0]).toMatchObject({
+		question: "Pick",
+		selectedOptionIndices: [],
+		controls: [{ id: "navigation_forward", label: "Next", enabled: true }],
+	});
+
+	arbiter.complete("interactive:0");
+	arbiter.retain(presentation(["two"]));
+	expect(publications[1]).toMatchObject({
+		question: "(1 selected) Pick",
+		selectedOptionIndices: [1],
+		controls: [{ id: "navigation_forward", label: "Next", enabled: true }],
+	});
+});
+
 test("PresentationArbiter keeps the routed option snapshot when replay retirement lacks terminal proof", () => {
 	const publications: Array<Record<string, unknown>> = [];
 	const arbiter = new PresentationArbiter(

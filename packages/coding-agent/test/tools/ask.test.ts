@@ -1041,6 +1041,11 @@ describe("AskTool remote semantic settlements", () => {
 			{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: true },
 		]);
 		expect(requests.map(request => request.recommendedIndex)).toEqual([1, 1]);
+		// The toggle must be visible remotely: the second request carries the
+		// selection made by the first, not an identical repeated prompt.
+		expect(requests.map(request => request.multi)).toEqual([true, true]);
+		expect(requests[0]?.selectedOptions).toEqual([]);
+		expect(requests[1]?.selectedOptions).toEqual(["alpha"]);
 		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "toggle" }, { kind: "commit" }]);
 		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("alpha");
 	});

@@ -837,16 +837,22 @@ export class PresentationArbiter {
 							...(presentation.recommendedIndex === undefined
 								? {}
 								: { recommendedIndex: presentation.recommendedIndex }),
-							controls: presentation.multi
-								? [
-										{
-											id: "navigation_forward",
-											kind: "navigation",
-											label: presentation.navigationLabel ?? "Done",
-											enabled: presentation.allowEmpty || presentation.selectedOptions.length > 0,
-										},
-									]
-								: presentation.controls,
+							// A presentation that carries its own controls (the ask tool's
+							// Next/Done) keeps them; a durable workflow gate presents none,
+							// so its navigation control is synthesized here.
+							controls:
+								presentation.controls.length > 0
+									? presentation.controls
+									: presentation.multi
+										? [
+												{
+													id: "navigation_forward",
+													kind: "navigation",
+													label: presentation.navigationLabel ?? "Done",
+													enabled: presentation.allowEmpty || presentation.selectedOptions.length > 0,
+												},
+											]
+										: [],
 						},
 						{ redact: this.redact(), sessionTag: this.tag },
 					),
@@ -1824,9 +1830,12 @@ function registerInteractiveAnswerSource(
 					options: request.options,
 					controls: request.controls,
 					recommendedIndex: request.recommendedIndex,
-					multi: false,
+					// The ask tool owns the multi-select loop and re-issues one request per
+					// toggle; carrying its selection here is what makes the toggle visible
+					// on a remote transport instead of an identical repeated prompt.
+					multi: request.multi === true,
 					allowEmpty: false,
-					selectedOptions: [],
+					selectedOptions: [...(request.selectedOptions ?? [])],
 					onActivated: (actionId, lease) => {
 						if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
 							pendingInteractive.delete(pending.actionId);

@@ -930,9 +930,9 @@ function getCustomReferenceCandidateIds(modelId: string): string[] {
 	const minimaxM = /^minimax-m(\d+(?:\.\d+)*)$/i.exec(trimmedId);
 	const queue = minimaxM ? [`MiniMax-M${minimaxM[1]}`, trimmedId] : [trimmedId];
 	if (minimaxM) {
-		// MiniMax catalogs include lowercase wire ids plus display-cased aliases.
-		// Custom providers should keep the lowercase wire id while inheriting the
-		// canonical display casing when the alias exists.
+		// First-class MiniMax catalogs expose canonical `MiniMax-M*` ids only,
+		// but custom providers may still use lowercase wire ids. Normalize to
+		// the canonical display casing so metadata inheritance keeps working.
 	}
 	// Namespaced wire IDs (e.g. `cline-pass/deepseek-v4-flash`) keep the full id for
 	// the API request, but should still try the leaf segment against bundled

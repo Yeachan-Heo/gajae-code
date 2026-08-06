@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Canonicalized first-class MiniMax M3 catalog ids (issue #3896). The bundled catalog previously shipped stale lowercase `minimax-m3` duplicates (512K) next to the canonical `MiniMax-M3` (1M) on all four first-class MiniMax providers, plus a non-official `minimax-v3` entry under `minimax-code`. The lowercase `minimax-m3` entries and `minimax-v3` are removed; `MiniMax-M3` is the single canonical first-class id (the regen-safe 1M pin in `applyGeneratedModelPolicy` now keys on `MiniMax-M3` / `MiniMax-M3[1m]` instead of the removed lowercase id), `DEFAULT_MODEL_PER_PROVIDER` points at `MiniMax-M3`, and the official Anthropic Token Plan id `MiniMax-M3[1m]` is first-class on the `minimax` / `minimax-cn` Anthropic routes with 1M context semantics. Unrelated catalog providers keep their own `minimax-m3` contracts.
 ## [0.12.12] - 2026-08-05
 
 ### Fixed

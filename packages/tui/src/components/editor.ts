@@ -1,6 +1,7 @@
 import { getProjectDir, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
 import {
 	type AutocompleteProvider,
+	type AutocompleteSuggestionKind,
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	isInsideInlineCodeSpan,
@@ -2838,16 +2839,20 @@ export class Editor implements Component, Focusable {
 		);
 	}
 
-	#isSlashCommandNameAutocompleteSelection(): boolean {
-		if (this.#autocompleteState !== "regular") {
-			return false;
-		}
-
+	#isSlashCommandNameAutocompleteContext(): boolean {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol).trimStart();
 		return (
 			this.#isInSubmittedSlashCommandContext() && textBeforeCursor.startsWith("/") && !textBeforeCursor.includes(" ")
 		);
+	}
+
+	#isSlashCommandNameAutocompleteSelection(): boolean {
+		if (this.#autocompleteState !== "regular") {
+			return false;
+		}
+
+		return this.#isSlashCommandNameAutocompleteContext();
 	}
 
 	#isCompletedSlashCommandAtCursor(): boolean {
@@ -2890,7 +2895,7 @@ export class Editor implements Component, Focusable {
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
 			this.#autocompleteState = "regular";
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
@@ -2901,14 +2906,11 @@ export class Editor implements Component, Focusable {
 		}
 	}
 	#createAutocompleteList(
-		prefix: string,
 		items: Array<{ value: string; label: string; description?: string }>,
+		kind: AutocompleteSuggestionKind,
 	): SelectList {
-		// Layout options prepared for future SelectList enhancements (e.g., for slash commands)
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
-		// TODO: Pass layout to SelectList when constructor is updated to support it
-		void layout; // Use layout variable to avoid lint warnings
-		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList);
+		const layout = kind === "slash-command" ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
+		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
 	}
 
 	#handleTabCompletion(): void {
@@ -2985,7 +2987,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			}
 
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, "default");
 			this.#autocompleteState = "force";
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
@@ -3035,7 +3037,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
