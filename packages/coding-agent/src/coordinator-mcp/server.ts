@@ -65,6 +65,7 @@ import {
 	initializeCoordinatorNamespace,
 	recordDeletionIntent,
 	repairProjections,
+	transactionPath,
 	withAdmittedSessionTransaction,
 	withNamespaceRegistry,
 	withSessionTransaction,
@@ -3304,11 +3305,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 
 	async function readTurnPayload(turnId: unknown, sessionId: unknown): Promise<Record<string, unknown>> {
-		const turn = await readTurnRecord(namespaceDir, turnId);
+		let turn = await readTurnRecord(namespaceDir, turnId);
 		if (!turn) return { ok: false, reason: "unknown_turn" };
 		if (sessionId != null && turn.session_id !== safeExternalId("session", sessionId)) {
 			return { ok: false, reason: "turn_session_mismatch" };
 		}
+		if (await repairPendingCanonicalProjections(turn.session_id))
+			turn = (await readTurnRecord(namespaceDir, turn.turn_id)) ?? turn;
 		await reconcileQuestions(turn.session_id);
 		const session = asRecord(await readJsonFile(sessionFile(turn.session_id)));
 		let resolvedTurn = turn;
@@ -3725,6 +3728,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const committed = await commitTerminalTransition(turn, input);
 		await repairCanonicalProjections(turn.session_id);
 		return committed.committedTurn;
+	}
+	async function repairPendingCanonicalProjections(sessionId: string): Promise<boolean> {
+		const transaction = (await readJsonFile(
+			transactionPath(questionPaths, sessionId),
+		)) as CoordinatorSessionTransactionV1 | null;
+		if (!transaction) return false;
+		const projection = transaction.projection;
+		const appliedRevisions = [
+			projection.applied_turns_revision,
+			projection.applied_reports_revision,
+			projection.applied_session_revision,
+			projection.applied_active_revision,
+		];
+		if (
+			!Number.isSafeInteger(transaction.revision) ||
+			!appliedRevisions.every(revision => Number.isSafeInteger(revision) && revision >= 0)
+		)
+			throw new Error("state_corrupt");
+		const pending = appliedRevisions.some(revision => revision < transaction.revision - 1);
+		if (!pending) return false;
+		await repairCanonicalProjections(sessionId);
+		return true;
 	}
 
 	async function commitCanonicalTurn(
