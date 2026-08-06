@@ -1,6 +1,7 @@
 import { getProjectDir, logger } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../../debug/crash-diagnostics";
+import { registerResourceOwner } from "../../runtime/process-lifecycle";
 import { OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
@@ -14,7 +15,6 @@ import {
 } from "./kernel";
 import type { PythonRuntimeOptions } from "./runtime";
 import { ensurePyToolBridge, registerPyToolBridge } from "./tool-bridge";
-import { registerResourceOwner } from "../../runtime/process-lifecycle";
 
 export type PythonKernelMode = "session" | "per-call";
 

@@ -16,6 +16,7 @@ import {
 	mayCleanCurrentStaging,
 	type NativePublishOutcome,
 } from "./native-publish-outcome";
+
 type NativeManagedSessionStorage = Pick<
 	typeof import("@gajae-code/natives"),
 	| "applyOwnerOnlyFdSecurity"
@@ -34,7 +35,6 @@ type NativeManagedSessionStorage = Pick<
 >;
 
 let nativeManagedSessionStorage: NativeManagedSessionStorage | undefined;
-
 
 function nativeSessionStorage(): NativeManagedSessionStorage {
 	if (!nativeManagedSessionStorage) {
@@ -639,9 +639,17 @@ function securityError(pathname: string, result: NativeSecurity): Error {
 }
 
 function secure(pathname: string, kind: "directory" | "file"): void {
-	const applied = validateNativeSecurityResult(nativeSessionStorage().applyOwnerOnlyPathSecurity(pathname, kind), "apply", kind);
+	const applied = validateNativeSecurityResult(
+		nativeSessionStorage().applyOwnerOnlyPathSecurity(pathname, kind),
+		"apply",
+		kind,
+	);
 	if (!applied.ok) throw securityError(pathname, applied);
-	const verified = validateNativeSecurityResult(nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, kind), "verify", kind);
+	const verified = validateNativeSecurityResult(
+		nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, kind),
+		"verify",
+		kind,
+	);
 	if (!verified.ok) throw securityError(pathname, verified);
 }
 
@@ -1513,7 +1521,10 @@ export class ManagedSessionDescendantStore {
 					this.#relative(this.#resolve(destinationRelativePath)),
 					expected,
 				)
-			: nativeSessionStorage().renameNoReplacePath(this.#resolve(sourceRelativePath), this.#resolve(destinationRelativePath));
+			: nativeSessionStorage().renameNoReplacePath(
+					this.#resolve(sourceRelativePath),
+					this.#resolve(destinationRelativePath),
+				);
 		const outcome = classifyNativePublishOutcome(moved, this.#authority ? "retained_tree" : "direct_rename");
 		if (!outcome.ok)
 			throw new ManagedTreeMoveOutcomeError(publishFailure(outcome).message, mayCleanCurrentStaging(outcome));
@@ -1596,14 +1607,18 @@ function secureFileDescriptor(pathname: string, fd: number, operation: "apply" |
 	if (process.platform !== "linux") {
 		if (operation === "apply") secure(pathname, "file");
 		else {
-			const verified = validateNativeSecurityResult(nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"), "verify", "file");
+			const verified = validateNativeSecurityResult(
+				nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"),
+				"verify",
+				"file",
+			);
 			if (!verified.ok) throw securityError(pathname, verified);
 		}
 		return;
 	}
 	const result = validateNativeSecurityResult(
 		operation === "apply"
-		? nativeSessionStorage().applyOwnerOnlyFdSecurity(pathname, "file", fd)
+			? nativeSessionStorage().applyOwnerOnlyFdSecurity(pathname, "file", fd)
 			: nativeSessionStorage().verifyOwnerOnlyFdSecurity(pathname, "file", fd),
 		operation,
 		"file",
@@ -2025,7 +2040,9 @@ export function replaceManagedFileSync(
 				policy,
 			);
 			const receiptPath = replacementReceiptPath(parent, expectedDestination, publishedReceiptIdentity);
-			const receiptPublish = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(receiptStagingPath, receiptPath));
+			const receiptPublish = classifyNativePublishOutcome(
+				nativeSessionStorage().renameNoReplacePath(receiptStagingPath, receiptPath),
+			);
 			if (!receiptPublish.ok) throw publishFailure(receiptPublish);
 			const namedReceipt = captureManagedFileNoFollow(receiptPath);
 			if (

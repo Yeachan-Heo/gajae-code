@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -149,11 +149,11 @@ describe("Milestone 5 red-team appendix rendering", () => {
 				surfaces: surfaces({
 					systemAppendices: Array.from({ length: 5 }, (_, i) => ({
 						extensionId: `system-appendix:a${i}`,
-					name: `a${i}`,
-					relativePath: `a${i}.md`,
-					contentHash: sha256(`${i}:${body}`),
-					bytes: Buffer.byteLength(`${i}:${body}`),
-				})),
+						name: `a${i}`,
+						relativePath: `a${i}.md`,
+						contentHash: sha256(`${i}:${body}`),
+						bytes: Buffer.byteLength(`${i}:${body}`),
+					})),
 				}),
 			}),
 		]);

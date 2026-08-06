@@ -3,9 +3,9 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { logger } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
-import { logger } from "@gajae-code/utils";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -163,7 +163,8 @@ export class SessionSdkSessionRuntime {
 			}
 			this.host.reverse.dispose();
 			this.#transportStarted = false;
-			if (hostError !== undefined) throw new AggregateError([error, hostError], "SDK runtime startup cleanup failed.");
+			if (hostError !== undefined)
+				throw new AggregateError([error, hostError], "SDK runtime startup cleanup failed.");
 			throw error;
 		}
 	}
@@ -455,7 +456,8 @@ function createQuerySurface(
 		hostTools?: boolean | (() => boolean);
 	} = {},
 ): SessionSurface {
-	const policy = options.policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
+	const policy =
+		options.policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
 	const hasHostTools = (): boolean =>
 		typeof options.hostTools === "function" ? options.hostTools() : options.hostTools === true;
 	const getLiveState =
@@ -604,7 +606,8 @@ export function createSdkSurfaceFactory(
 	options: SdkSurfaceFactoryOptions & { reconciliation?: InvocationReconciliation },
 ): SdkSurfaceFactory {
 	const policy =
-		options.policy ?? createSdkSurfacePolicyForContext(options.ctx, hasSdkWorkflowGateCapability(options.ctx.workflowGate));
+		options.policy ??
+		createSdkSurfacePolicyForContext(options.ctx, hasSdkWorkflowGateCapability(options.ctx.workflowGate));
 	const reconciliation =
 		options.reconciliation ??
 		createInvocationReconciliation({
@@ -634,7 +637,8 @@ function createControlSurface(
 	onAccepted: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	policy?: SdkSurfacePolicy,
 ): ControlSurface {
-	const surfacePolicy = policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
+	const surfacePolicy =
+		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
 	const typed = (operation: string, input: Record<string, unknown> = {}) =>
 		ctx.sdkControl ? ctx.sdkControl(operation, input) : unavailable(operation)();
 	const resolveModel = (id: string) => {
@@ -914,7 +918,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
 	const errorCode = (error: unknown): string | undefined =>
-		typeof error === "object" && error !== null && "code" in error && typeof (error as { code?: unknown }).code === "string"
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		typeof (error as { code?: unknown }).code === "string"
 			? (error as { code: string }).code
 			: undefined;
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
@@ -937,9 +944,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
-		const controlSurface = createControlSurface(ctx, api, reconciliation, (kind, correlation) => {
-			pending.push({ kind, correlation });
-		}, surfaceFactory.policy);
+		const controlSurface = createControlSurface(
+			ctx,
+			api,
+			reconciliation,
+			(kind, correlation) => {
+				pending.push({ kind, correlation });
+			},
+			surfaceFactory.policy,
+		);
 		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
@@ -1054,7 +1067,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			try {
 				await runtime.stop();
 			} catch (cleanupError) {
-				logger.error("sdk runtime startup cleanup failed", { code: errorCode(cleanupError), error: String(cleanupError) });
+				logger.error("sdk runtime startup cleanup failed", {
+					code: errorCode(cleanupError),
+					error: String(cleanupError),
+				});
 				active = { runtime, revisions, cursors, reconciliation, pending, disposeGate };
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}

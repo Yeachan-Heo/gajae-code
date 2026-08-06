@@ -9,6 +9,7 @@ async function findNatives(): Promise<typeof import("@gajae-code/natives")> {
 	findNativesLoad ??= Promise.resolve(require("@gajae-code/natives") as typeof import("@gajae-code/natives"));
 	return await findNativesLoad;
 }
+
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { isEnoent, prompt, untilAborted } from "@gajae-code/utils";

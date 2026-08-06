@@ -200,7 +200,8 @@ function parseWindowsJobMemoryProbeResult(value: unknown): WindowsJobMemoryProbe
 export function runMemoryGuardNativeSmokeFastPath(
 	options: { loadNative?: MemoryGuardNativeSmokeLoad; writeStdout?: (text: string) => void } = {},
 ): void {
-	if (!options.loadNative) throw new Error("memory-guard-native-smoke: native loader is unavailable on the static CLI path");
+	if (!options.loadNative)
+		throw new Error("memory-guard-native-smoke: native loader is unavailable on the static CLI path");
 	const probe = options.loadNative().probeWindowsJobMemory;
 	if (typeof probe !== "function") {
 		throw new Error("memory-guard-native-smoke: probeWindowsJobMemory export missing from native addon");
@@ -454,7 +455,9 @@ export async function runCli(argv: string[]): Promise<void> {
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
-		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import("./gjc-runtime/managed-owner-admission");
+		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import(
+			"./gjc-runtime/managed-owner-admission"
+		);
 		const admission = await admitManagedOwnerBeforeCli();
 		if (admission.kind === "blocked") return;
 		if (admission.kind === "recovery") {

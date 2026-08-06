@@ -9,6 +9,7 @@ import computerDescription from "../prompts/tools/computer.md" with { type: "tex
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { markScreenshotFallbackDirCreatedForGc } from "./computer-gc";
 import { isComputerCallable } from "./computer-policy";
+
 export {
 	isComputerCallable,
 	isComputerEnabled,
@@ -17,6 +18,7 @@ export {
 	setComputerArchForTests,
 	setComputerPlatformForTests,
 } from "./computer-policy";
+
 import type { ToolSession } from "./index";
 import type { OutputMeta } from "./output-meta";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -230,7 +232,6 @@ const COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY = 70;
 export function setComputerControllerFactoryForTests(factory: ComputerControllerFactory | undefined): void {
 	controllerFactory = factory ? () => withLegacyBatchAdapterForTests(factory()) : createNativeComputerController;
 }
-
 
 export class ComputerTool implements AgentTool<typeof computerSchema, ComputerToolDetails> {
 	readonly name = "computer";
@@ -657,9 +658,7 @@ async function dispatchLegacyBatchStep(
 			break;
 		case "double_click":
 			if (!controller.doubleClick) missingNativeMethod("double_click", "doubleClick");
-			await settleLegacyStep(
-				controller.doubleClick(expectedEpoch, action.x!, action.y!, action.button ?? "left"),
-			);
+			await settleLegacyStep(controller.doubleClick(expectedEpoch, action.x!, action.y!, action.button ?? "left"));
 			results.push({ index, action: "double_click" });
 			break;
 		case "move":

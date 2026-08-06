@@ -248,10 +248,21 @@ function normalizeActiveSubskillEntry(raw: unknown): ActiveSubskillEntry | null 
 					return id && digest ? { extensionId: id, expectedDigest: digest } : null;
 				})
 				.filter((item): item is ActiveSubskillToolReference => item !== null)
-			: [];
-		// Path-only records are intentionally invalid: runtime must resolve through
-		// the migrated registry, never trust persisted executable paths.
-	if (!plugin || !subskillName || !parent || !bindsTo || !phase || !activationArg || !scope || !extensionId || !expectedDigest) return null;
+		: [];
+	// Path-only records are intentionally invalid: runtime must resolve through
+	// the migrated registry, never trust persisted executable paths.
+	if (
+		!plugin ||
+		!subskillName ||
+		!parent ||
+		!bindsTo ||
+		!phase ||
+		!activationArg ||
+		!scope ||
+		!extensionId ||
+		!expectedDigest
+	)
+		return null;
 	return { plugin, subskillName, parent, bindsTo, phase, activationArg, scope, extensionId, expectedDigest, toolRefs };
 }
 
@@ -264,7 +275,14 @@ function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | u
 }
 
 function activeSubskillEntryKey(entry: ActiveSubskillEntry): string {
-	return [entry.scope ?? "", entry.plugin, entry.extensionId ?? "", entry.parent, entry.phase, entry.activationArg].join("\0");
+	return [
+		entry.scope ?? "",
+		entry.plugin,
+		entry.extensionId ?? "",
+		entry.parent,
+		entry.phase,
+		entry.activationArg,
+	].join("\0");
 }
 
 function unionActiveSubskillEntries(...entrySets: Array<ActiveSubskillEntry[] | undefined>): ActiveSubskillEntry[] {

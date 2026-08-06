@@ -1,16 +1,16 @@
 import type { AgentTool } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult, TSchema } from "@gajae-code/ai/types";
-import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
 import type { ToolFactory, ToolSession } from ".";
+import { selectAskParameters } from "./ask-contract";
 import { isComputerCallable, isComputerLoadablePlatform } from "./computer-policy";
-import { ToolError } from "./tool-errors";
 import {
 	deferredAskParameters,
 	deferredIntentPolicies,
 	validateDeferredAskArguments,
 	validateDeferredTodoArguments,
 } from "./descriptor-validation";
-import { selectAskParameters } from "./ask-contract";
+import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
+import { ToolError } from "./tool-errors";
 
 export interface ToolDescriptorMetadata {
 	readonly name: string;
@@ -24,7 +24,10 @@ export interface ToolDescriptorMetadata {
 	readonly lenientArgValidation?: boolean;
 	readonly mergeCallAndResult?: boolean;
 	readonly inline?: boolean;
-	readonly rawArgumentValidation?: (arguments_: Record<string, unknown>, session?: ToolSession) => RawArgumentValidationResult;
+	readonly rawArgumentValidation?: (
+		arguments_: Record<string, unknown>,
+		session?: ToolSession,
+	) => RawArgumentValidationResult;
 	readonly intent?: AgentTool<any, any, any>["intent"];
 	readonly parametersForSession?: (session?: ToolSession) => TSchema;
 	readonly parameters?: TSchema;
@@ -131,7 +134,9 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		const validate = this.#tool?.rawArgumentValidation;
 		if (validate) return validate.bind(this.#tool);
 		const descriptorValidate = this.descriptor.metadata.rawArgumentValidation;
-		return descriptorValidate ? (arguments_: Record<string, unknown>) => descriptorValidate(arguments_, this.#session) : undefined;
+		return descriptorValidate
+			? (arguments_: Record<string, unknown>) => descriptorValidate(arguments_, this.#session)
+			: undefined;
 	}
 	get strict(): boolean | undefined {
 		return this.#tool?.strict ?? this.descriptor.metadata.strict;
@@ -285,7 +290,8 @@ const loaders: Record<string, Loader> = {
 	edit: session => cached("edit", () => import("../edit")).then(module => new module.EditTool(session)),
 	ast_grep: session => cached("ast_grep", () => import("./ast-grep")).then(module => new module.AstGrepTool(session)),
 	ast_edit: session => cached("ast_edit", () => import("./ast-edit")).then(module => new module.AstEditTool(session)),
-	render_mermaid: session => cached("render_mermaid", () => import("./render-mermaid")).then(module => new module.RenderMermaidTool(session)),
+	render_mermaid: session =>
+		cached("render_mermaid", () => import("./render-mermaid")).then(module => new module.RenderMermaidTool(session)),
 	ask: session => cached("ask", () => import("./ask")).then(module => module.AskTool.createIf(session)),
 	debug: session => cached("debug", () => import("./debug")).then(module => module.DebugTool.createIf(session)),
 	bisect: session => cached("bisect", () => import("./bisect")).then(module => new module.BisectTool(session)),
@@ -297,24 +303,40 @@ const loaders: Record<string, Loader> = {
 	search: session => cached("search", () => import("./search")).then(module => new module.SearchTool(session)),
 	lsp: session => cached("lsp", () => import("../lsp")).then(module => module.LspTool.createIf(session)),
 	browser: session => cached("browser", () => import("./browser")).then(module => new module.BrowserTool(session)),
-	computer: session => cached("computer", () => import("./computer")).then(module => module.ComputerTool.createIf(session)),
-	checkpoint: session => cached("checkpoint", () => import("./checkpoint")).then(module => module.CheckpointTool.createIf(session)),
-	rewind: session => cached("checkpoint", () => import("./checkpoint")).then(module => module.RewindTool.createIf(session)),
+	computer: session =>
+		cached("computer", () => import("./computer")).then(module => module.ComputerTool.createIf(session)),
+	checkpoint: session =>
+		cached("checkpoint", () => import("./checkpoint")).then(module => module.CheckpointTool.createIf(session)),
+	rewind: session =>
+		cached("checkpoint", () => import("./checkpoint")).then(module => module.RewindTool.createIf(session)),
 	task: session => cached("task", () => import("../task")).then(module => module.TaskTool.create(session)),
 	subagent: session => cached("subagent", () => import("./subagent")).then(module => new module.SubagentTool(session)),
 	job: session => cached("job", () => import("./job")).then(module => module.JobTool.createIf(session)),
-	monitor: session => cached("monitor", () => import("./monitor")).then(module => module.MonitorTool.createIf(session)),
+	monitor: session =>
+		cached("monitor", () => import("./monitor")).then(module => module.MonitorTool.createIf(session)),
 	cron: session => cached("cron", () => import("./cron")).then(module => module.CronTool.createIf(session)),
 	recipe: session => cached("recipe", () => import("./recipe")).then(module => module.RecipeTool.createIf(session)),
 	irc: session => cached("irc", () => import("./irc")).then(module => module.IrcTool.createIf(session)),
-	todo_write: session => cached("todo_write", () => import("./todo-write")).then(module => new module.TodoWriteTool(session)),
-	web_search: session => cached("web_search", () => import("../web/search")).then(module => new module.WebSearchTool(session)),
-	search_tool_bm25: session => cached("search_tool_bm25", () => import("./search-tool-bm25")).then(module => module.SearchToolBm25Tool.createIf(session)),
-	skill_discovery: session => cached("skill_discovery", () => import("./skill-discovery")).then(module => module.SkillDiscoveryTool.createIf(session)),
-	telegram_send: session => cached("telegram_send", () => import("./telegram-send")).then(module => module.TelegramSendTool.createIf(session)),
+	todo_write: session =>
+		cached("todo_write", () => import("./todo-write")).then(module => new module.TodoWriteTool(session)),
+	web_search: session =>
+		cached("web_search", () => import("../web/search")).then(module => new module.WebSearchTool(session)),
+	search_tool_bm25: session =>
+		cached("search_tool_bm25", () => import("./search-tool-bm25")).then(module =>
+			module.SearchToolBm25Tool.createIf(session),
+		),
+	skill_discovery: session =>
+		cached("skill_discovery", () => import("./skill-discovery")).then(module =>
+			module.SkillDiscoveryTool.createIf(session),
+		),
+	telegram_send: session =>
+		cached("telegram_send", () => import("./telegram-send")).then(module =>
+			module.TelegramSendTool.createIf(session),
+		),
 	write: session => cached("write", () => import("./write")).then(module => new module.WriteTool(session)),
 	skill: session => cached("skill", () => import("./skill")).then(module => module.SkillTool.createIf(session)),
-	goal: session => cached("goal", () => import("../goals/tools/goal-tool")).then(module => new module.GoalTool(session)),
+	goal: session =>
+		cached("goal", () => import("../goals/tools/goal-tool")).then(module => new module.GoalTool(session)),
 	yield: session => cached("yield", () => import("./yield")).then(module => new module.YieldTool(session)),
 	report_finding: _session => cached("review", () => import("./review")).then(module => module.reportFindingTool),
 	resolve: session => cached("resolve", () => import("./resolve")).then(module => new module.ResolveTool(session)),
@@ -351,48 +373,50 @@ function descriptor(spec: DescriptorSpec): ToolDescriptor {
 	return Object.freeze({
 		metadata,
 		presentation,
-		isAvailable: (session: ToolSession, context?: ToolAvailabilityContext) => availableFor(spec.name, session, context),
+		isAvailable: (session: ToolSession, context?: ToolAvailabilityContext) =>
+			availableFor(spec.name, session, context),
 		load: spec.loader,
 	});
 }
 
-const names: Array<[name: string, label: string, summary: string | undefined, loadMode: "essential" | "discoverable"]> = [
-	["read", "Read", undefined, "essential"],
-	["bash", "Bash", undefined, "essential"],
-	["edit", "Edit", undefined, "essential"],
-	["ast_grep", "AST Grep", "Search code with AST patterns (structural grep)", "discoverable"],
-	["ast_edit", "AST Edit", "Perform AST-aware code edits (structural refactoring)", "discoverable"],
-	["render_mermaid", "RenderMermaid", "Render a Mermaid diagram to an image", "discoverable"],
-	["ask", "Ask", "Ask the user a clarifying question", "discoverable"],
-	["debug", "Debug", "Debug a running process with DAP (debugger adapter protocol)", "discoverable"],
-	["bisect", "Bisect", "Find the commit that introduced a regression", "discoverable"],
-	["eval", "Eval", "Execute Python or JavaScript code in an in-process eval backend", "discoverable"],
-	["calc", "Calc", "Evaluate a mathematical expression", "discoverable"],
-	["ssh", "SSH", "Execute a command on a remote host over SSH", "discoverable"],
-	["github", "GitHub", "Interact with GitHub issues, pull requests, and repositories", "discoverable"],
-	["find", "Find", "Find files and directories matching a glob pattern", "discoverable"],
-	["search", "Search", "Search file contents using ripgrep (fast text search)", "discoverable"],
-	["lsp", "LSP", "Query LSP (language server) for diagnostics, hover info, and references", "discoverable"],
-	["browser", "Browser", "Control a headless browser to navigate and interact with web pages", "discoverable"],
-	["computer", "Computer", undefined, "discoverable"],
-	["checkpoint", "Checkpoint", "Create a git-based checkpoint to save and restore session state", "discoverable"],
-	["rewind", "Rewind", "Rewind to a previously created checkpoint", "discoverable"],
-	["task", "Task", "Spawn a subagent to complete a parallel task", "discoverable"],
-	["subagent", "Subagent", "Manage detached task subagents", "discoverable"],
-	["job", "Job", "Manage long-running background jobs", "discoverable"],
-	["monitor", "Monitor", "Start a background monitor", "discoverable"],
-	["cron", "Cron", "Schedule, list, and cancel cron-style prompts", "discoverable"],
-	["recipe", "Run", "Execute a saved bash recipe", "discoverable"],
-	["irc", "IRC", "Send and receive messages between agents", "discoverable"],
-	["todo_write", "Todo Write", "Write a structured todo list", "discoverable"],
-	["web_search", "Web Search", "Search the web for up-to-date information", "discoverable"],
-	["search_tool_bm25", "SearchTools", undefined, "essential"],
-	["skill_discovery", "SkillDiscovery", "Discover project and user runtime skills by thin metadata", "essential"],
-	["telegram_send", "TelegramSend", "Send a workspace file to Telegram", "discoverable"],
-	["write", "Write", "Write content to a file", "discoverable"],
-	["skill", "Skill", "Chain into another available skill", "essential"],
-	["goal", "Goal", undefined, "essential"],
-];
+const names: Array<[name: string, label: string, summary: string | undefined, loadMode: "essential" | "discoverable"]> =
+	[
+		["read", "Read", undefined, "essential"],
+		["bash", "Bash", undefined, "essential"],
+		["edit", "Edit", undefined, "essential"],
+		["ast_grep", "AST Grep", "Search code with AST patterns (structural grep)", "discoverable"],
+		["ast_edit", "AST Edit", "Perform AST-aware code edits (structural refactoring)", "discoverable"],
+		["render_mermaid", "RenderMermaid", "Render a Mermaid diagram to an image", "discoverable"],
+		["ask", "Ask", "Ask the user a clarifying question", "discoverable"],
+		["debug", "Debug", "Debug a running process with DAP (debugger adapter protocol)", "discoverable"],
+		["bisect", "Bisect", "Find the commit that introduced a regression", "discoverable"],
+		["eval", "Eval", "Execute Python or JavaScript code in an in-process eval backend", "discoverable"],
+		["calc", "Calc", "Evaluate a mathematical expression", "discoverable"],
+		["ssh", "SSH", "Execute a command on a remote host over SSH", "discoverable"],
+		["github", "GitHub", "Interact with GitHub issues, pull requests, and repositories", "discoverable"],
+		["find", "Find", "Find files and directories matching a glob pattern", "discoverable"],
+		["search", "Search", "Search file contents using ripgrep (fast text search)", "discoverable"],
+		["lsp", "LSP", "Query LSP (language server) for diagnostics, hover info, and references", "discoverable"],
+		["browser", "Browser", "Control a headless browser to navigate and interact with web pages", "discoverable"],
+		["computer", "Computer", undefined, "discoverable"],
+		["checkpoint", "Checkpoint", "Create a git-based checkpoint to save and restore session state", "discoverable"],
+		["rewind", "Rewind", "Rewind to a previously created checkpoint", "discoverable"],
+		["task", "Task", "Spawn a subagent to complete a parallel task", "discoverable"],
+		["subagent", "Subagent", "Manage detached task subagents", "discoverable"],
+		["job", "Job", "Manage long-running background jobs", "discoverable"],
+		["monitor", "Monitor", "Start a background monitor", "discoverable"],
+		["cron", "Cron", "Schedule, list, and cancel cron-style prompts", "discoverable"],
+		["recipe", "Run", "Execute a saved bash recipe", "discoverable"],
+		["irc", "IRC", "Send and receive messages between agents", "discoverable"],
+		["todo_write", "Todo Write", "Write a structured todo list", "discoverable"],
+		["web_search", "Web Search", "Search the web for up-to-date information", "discoverable"],
+		["search_tool_bm25", "SearchTools", undefined, "essential"],
+		["skill_discovery", "SkillDiscovery", "Discover project and user runtime skills by thin metadata", "essential"],
+		["telegram_send", "TelegramSend", "Send a workspace file to Telegram", "discoverable"],
+		["write", "Write", "Write content to a file", "discoverable"],
+		["skill", "Skill", "Chain into another available skill", "essential"],
+		["goal", "Goal", undefined, "essential"],
+	];
 
 const descriptorRawArgumentValidations: Readonly<Record<string, ToolDescriptorMetadata["rawArgumentValidation"]>> = {
 	ask: validateDeferredAskArguments,
@@ -412,19 +436,16 @@ const builtins = names
 			description: name === "write" ? undefined : summary,
 			platformExclusions:
 				name === "computer"
-					? [
-							{ platform: "linux" },
-							{ platform: "win32" },
-							{ platform: "darwin", arch: "x64" },
-						]
+					? [{ platform: "linux" }, { platform: "win32" }, { platform: "darwin", arch: "x64" }]
 					: undefined,
 			parameters: name === "ask" ? deferredAskParameters : undefined,
-			parametersForSession: name === "ask" ? session => selectAskParameters(session?.getDeepInterviewAskStage?.()) : undefined,
+			parametersForSession:
+				name === "ask" ? session => selectAskParameters(session?.getDeepInterviewAskStage?.()) : undefined,
 			rawArgumentValidation: descriptorRawArgumentValidations[name],
 			intent: deferredIntentPolicies[name],
 			loader: loaders[name],
 		}),
-		);
+	);
 
 export const PLATFORM_EXCLUDED_TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
 	computer: descriptor({
@@ -435,12 +456,9 @@ export const PLATFORM_EXCLUDED_TOOL_DESCRIPTORS: Record<string, ToolDescriptor> 
 		loadMode: "discoverable",
 		deferrable: true,
 		strict: true,
-		description: "Control the macOS desktop (Apple Silicon) with screenshot, pointer, keyboard, scroll, and wait actions.",
-		platformExclusions: [
-			{ platform: "linux" },
-			{ platform: "win32" },
-			{ platform: "darwin", arch: "x64" },
-		],
+		description:
+			"Control the macOS desktop (Apple Silicon) with screenshot, pointer, keyboard, scroll, and wait actions.",
+		platformExclusions: [{ platform: "linux" }, { platform: "win32" }, { platform: "darwin", arch: "x64" }],
 		loader: loaders.computer,
 	}),
 };
@@ -469,4 +487,3 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = Object.fromEntries(
 export const HIDDEN_TOOLS: Record<string, ToolFactory> = Object.fromEntries(
 	Object.entries(HIDDEN_TOOL_DESCRIPTORS).map(([name, descriptorValue]) => [name, descriptorValue.load]),
 );
-

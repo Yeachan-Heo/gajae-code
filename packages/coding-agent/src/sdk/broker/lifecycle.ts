@@ -3,17 +3,16 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
-import type * as native from "@gajae-code/natives";
 
 let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
 
-
 function nativeLifecycle(): typeof import("@gajae-code/natives") {
-	if (!nativeLifecycleBindings) nativeLifecycleBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	if (!nativeLifecycleBindings)
+		nativeLifecycleBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 	return nativeLifecycleBindings;
 }
+
 import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {

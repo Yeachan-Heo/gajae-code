@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import * as os from "node:os";
+import * as path from "node:path";
 
 describe("SDK session import graph", () => {
 	test("notifications-inactive session import does not load the notification bus graph", async () => {
@@ -25,7 +25,10 @@ describe("SDK session import graph", () => {
 		);
 		try {
 			expect(await processHandle.exited).toBe(0);
-			const records = JSON.parse(await fs.readFile(tracePath, "utf8")) as Array<{ resolved?: string; kind?: string }>;
+			const records = JSON.parse(await fs.readFile(tracePath, "utf8")) as Array<{
+				resolved?: string;
+				kind?: string;
+			}>;
 			// `source-scan` records are literal lazy dynamic-import mentions discovered by
 			// parsing loaded sources; they are catalog data, not loaded modules. The W1b
 			// contract is that the notification bus graph is never LOADED here.
@@ -42,7 +45,9 @@ describe("SDK session import graph", () => {
 		const firstUseEntry = path.join(os.tmpdir(), `sdk-session-first-use-${process.pid}-${randomUUID()}.ts`);
 		await fs.writeFile(
 			firstUseEntry,
-			'const { BUILTIN_TOOL_DESCRIPTORS } = await import("' + path.join(repositoryRoot, "packages/coding-agent/src/tools/descriptors.ts") + '");\nawait BUILTIN_TOOL_DESCRIPTORS.browser.load({});\n',
+			'const { BUILTIN_TOOL_DESCRIPTORS } = await import("' +
+				path.join(repositoryRoot, "packages/coding-agent/src/tools/descriptors.ts") +
+				'");\nawait BUILTIN_TOOL_DESCRIPTORS.browser.load({});\n',
 			"utf8",
 		);
 		const runTrace = async (tracePath: string, entry: string[]) => {
@@ -56,10 +61,23 @@ describe("SDK session import graph", () => {
 			return JSON.parse(await fs.readFile(tracePath, "utf8")) as Array<{ resolved?: string; kind?: string }>;
 		};
 		try {
-			const coldRecords = await runTrace(coldTracePath, ["-e", 'await import("./packages/coding-agent/src/sdk/session.ts")']);
+			const coldRecords = await runTrace(coldTracePath, [
+				"-e",
+				'await import("./packages/coding-agent/src/sdk/session.ts")',
+			]);
 			const coldLoaded = coldRecords.filter(record => record.kind !== "source-scan");
-			const forbidden = ["/src/tools/browser.", "/src/tools/computer.", "/src/tools/eval.", "/src/task/index.", "/src/web/search/index."];
-			expect(coldLoaded.filter(record => forbidden.some(fragment => record.resolved?.includes(fragment))).map(record => record.resolved)).toEqual([]);
+			const forbidden = [
+				"/src/tools/browser.",
+				"/src/tools/computer.",
+				"/src/tools/eval.",
+				"/src/task/index.",
+				"/src/web/search/index.",
+			];
+			expect(
+				coldLoaded
+					.filter(record => forbidden.some(fragment => record.resolved?.includes(fragment)))
+					.map(record => record.resolved),
+			).toEqual([]);
 
 			const firstUseRecords = await runTrace(useTracePath, [firstUseEntry]);
 			const firstUseLoaded = firstUseRecords.filter(record => record.kind !== "source-scan");
@@ -78,16 +96,15 @@ describe("SDK session import graph", () => {
 		const entryPath = path.join(tempRoot, "entry.ts");
 		const tracePath = path.join(tempRoot, "trace.json");
 		await fs.writeFile(moduleBPath, "export const value = 42;\n", "utf8");
-		await fs.writeFile(moduleAPath, 'const moduleB = await import("./module-b.ts");\nexport const value = moduleB.value;\n', "utf8");
+		await fs.writeFile(
+			moduleAPath,
+			'const moduleB = await import("./module-b.ts");\nexport const value = moduleB.value;\n',
+			"utf8",
+		);
 		await fs.writeFile(entryPath, 'await import("./module-a.ts");\n', "utf8");
 		try {
 			const processHandle = Bun.spawn(
-				[
-					"bun",
-					"--preload",
-					path.join(repositoryRoot, "scripts/trace-loader.ts"),
-					entryPath,
-				],
+				["bun", "--preload", path.join(repositoryRoot, "scripts/trace-loader.ts"), entryPath],
 				{
 					cwd: repositoryRoot,
 					env: { ...process.env, GJC_TRACE_OUT: tracePath },

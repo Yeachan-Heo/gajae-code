@@ -5,11 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
-	GjcPluginLoadError,
-	PluginImplementationHashMismatchError,
 	compileGjcPluginBundle,
+	GjcPluginLoadError,
 	getGjcPluginMigrationStatuses,
 	loadAlwaysOnPluginTools,
+	PluginImplementationHashMismatchError,
 	readRegistry,
 	serveGjcPluginSchemas,
 } from "../src/extensibility/gjc-plugins";
@@ -82,8 +82,17 @@ describe("GJC plugin registry v2 cutover", () => {
 			const registry = await readRegistry("project", cwd);
 			const tool = registry.plugins[0]?.surfaces.tools[0];
 			expect(registry.plugins[0]?.migration?.status).toBe("migrated");
-			expect(tool).toMatchObject({ metadataVersion: 2, schemaHash: expect.any(String), implementationHash: expect.any(String) });
-			expect(await fs.stat(sentinel).then(() => true).catch(() => false)).toBe(false);
+			expect(tool).toMatchObject({
+				metadataVersion: 2,
+				schemaHash: expect.any(String),
+				implementationHash: expect.any(String),
+			});
+			expect(
+				await fs
+					.stat(sentinel)
+					.then(() => true)
+					.catch(() => false),
+			).toBe(false);
 		} finally {
 			delete process.env.GJC_TEST_IMPORT_SENTINEL;
 		}
@@ -100,13 +109,13 @@ describe("GJC plugin registry v2 cutover", () => {
 		const manifestText = JSON.stringify(manifest);
 		await fs.writeFile(manifestPath, manifestText);
 		const bundle = await compileGjcPluginBundle(fixture);
-	for (const tool of bundle.surfaces.tools) {
-		delete tool.schema;
-		delete tool.schemaHash;
-		delete tool.implementationHash;
-		delete tool.metadataVersion;
-	}
-	for (const hook of bundle.surfaces.hooks) delete hook.implementationHash;
+		for (const tool of bundle.surfaces.tools) {
+			delete tool.schema;
+			delete tool.schemaHash;
+			delete tool.implementationHash;
+			delete tool.metadataVersion;
+		}
+		for (const hook of bundle.surfaces.hooks) delete hook.implementationHash;
 		const implementation = await fs.readFile(path.join(root, "tools/domain-note.ts"), "utf8");
 		const entry: GjcPluginRegistryEntry = {
 			name: "valid-six-surface-bundle",
@@ -121,7 +130,11 @@ describe("GJC plugin registry v2 cutover", () => {
 			updatedAt: new Date().toISOString(),
 			copiedFiles: [
 				{ relativePath: "gajae-plugin.json", sha256: sha256(manifestText), bytes: Buffer.byteLength(manifestText) },
-				{ relativePath: "tools/domain-note.ts", sha256: sha256(implementation), bytes: Buffer.byteLength(implementation) },
+				{
+					relativePath: "tools/domain-note.ts",
+					sha256: sha256(implementation),
+					bytes: Buffer.byteLength(implementation),
+				},
 			],
 			surfaces: bundle.surfaces,
 			disabledSurfaceIds: [],
@@ -129,9 +142,17 @@ describe("GJC plugin registry v2 cutover", () => {
 		await writeRegistry({ version: 1, scope: "project", plugins: [entry] }, cwd);
 		const loaded = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
 		expect(loaded.tools).toHaveLength(0);
-		expect(loaded.quarantine[0]).toMatchObject({ plugin: "valid-six-surface-bundle", surfaceId: expect.stringContaining("tool:"), code: "migration_required" });
+		expect(loaded.quarantine[0]).toMatchObject({
+			plugin: "valid-six-surface-bundle",
+			surfaceId: expect.stringContaining("tool:"),
+			code: "migration_required",
+		});
 		const status = (await getGjcPluginMigrationStatuses(cwd))[0];
-		expect(status).toMatchObject({ plugin: "valid-six-surface-bundle", status: "failed", failure: { surface: expect.stringContaining("tool:"), cause: expect.any(String) } });
+		expect(status).toMatchObject({
+			plugin: "valid-six-surface-bundle",
+			status: "failed",
+			failure: { surface: expect.stringContaining("tool:"), cause: expect.any(String) },
+		});
 	});
 
 	test("serves canonical schemas without importing implementations", async () => {
@@ -144,7 +165,12 @@ describe("GJC plugin registry v2 cutover", () => {
 		try {
 			const schemas = await serveGjcPluginSchemas(cwd);
 			expect(schemas["tool:domain_note"]).toMatchObject({ $schema: "https://json-schema.org/draft/2020-12/schema" });
-			expect(await fs.stat(sentinel).then(() => true).catch(() => false)).toBe(false);
+			expect(
+				await fs
+					.stat(sentinel)
+					.then(() => true)
+					.catch(() => false),
+			).toBe(false);
 		} finally {
 			delete process.env.GJC_TEST_IMPORT_SENTINEL;
 		}
@@ -157,7 +183,9 @@ describe("GJC plugin registry v2 cutover", () => {
 		await writeLegacyEntry(cwd, root);
 		await readRegistry("project", cwd);
 		const registryPath = path.join(cwd, ".gjc", "gjc-plugins", "registry.json");
-		const registry = JSON.parse(await fs.readFile(registryPath, "utf8")) as { plugins: Array<{ surfaces: { tools: Array<Record<string, unknown>> } }> };
+		const registry = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+			plugins: Array<{ surfaces: { tools: Array<Record<string, unknown>> } }>;
+		};
 		registry.plugins[0]!.surfaces.tools[0]!.implementationHash = "0".repeat(64);
 		await fs.writeFile(registryPath, JSON.stringify(registry));
 		const sentinel = path.join(cwd, "imported");
@@ -166,10 +194,17 @@ describe("GJC plugin registry v2 cutover", () => {
 			const loaded = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
 			expect(loaded.tools).toHaveLength(0);
 			expect(loaded.quarantine[0]?.code).toBe("runtime_mismatch");
-			expect(await fs.stat(sentinel).then(() => true).catch(() => false)).toBe(false);
+			expect(
+				await fs
+					.stat(sentinel)
+					.then(() => true)
+					.catch(() => false),
+			).toBe(false);
 		} finally {
 			delete process.env.GJC_TEST_IMPORT_SENTINEL;
 		}
-		await expect(Promise.reject(new PluginImplementationHashMismatchError("tool.ts", "a", "b"))).rejects.toBeInstanceOf(GjcPluginLoadError);
+		await expect(
+			Promise.reject(new PluginImplementationHashMismatchError("tool.ts", "a", "b")),
+		).rejects.toBeInstanceOf(GjcPluginLoadError);
 	});
 });

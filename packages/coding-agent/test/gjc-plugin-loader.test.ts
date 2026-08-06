@@ -2,13 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as gjcPluginBarrel from "../src/extensibility/gjc-plugins";
 import {
 	discoverGjcPluginRoots,
 	GjcPluginLoadError,
 	type GjcPluginLoadErrorCode,
 } from "../src/extensibility/gjc-plugins";
 import { loadGjcPlugin, loadGjcPlugins } from "../src/extensibility/gjc-plugins/loader";
-import * as gjcPluginBarrel from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const tempRoots: string[] = [];

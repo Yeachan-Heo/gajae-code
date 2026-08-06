@@ -1,9 +1,9 @@
+import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { describe, expect, test } from "bun:test";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { buildSkillPromptMessage } from "../extensibility/skills";
-import { scanSkillDescriptorsFromDir, SKILL_FRONTMATTER_SCAN_BYTES, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES } from "./index";
+import { SKILL_FRONTMATTER_SCAN_BYTES, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES, scanSkillDescriptorsFromDir } from "./index";
 
 function makeContext(): any {
 	return { cwd: process.cwd(), home: process.env.HOME ?? process.cwd(), repoRoot: null };
@@ -17,7 +17,10 @@ describe("skill descriptors", () => {
 			await fs.mkdir(skillDir, { recursive: true });
 			const bodyMarker = "BODY_MARKER_MUST_NOT_BE_SCANNED";
 			const body = "x".repeat(SKILL_FRONTMATTER_SCAN_BYTES) + bodyMarker;
-			await fs.writeFile(path.join(skillDir, "SKILL.md"), `---\nname: bounded\ndescription: bounded scan\n---\n${body}`);
+			await fs.writeFile(
+				path.join(skillDir, "SKILL.md"),
+				`---\nname: bounded\ndescription: bounded scan\n---\n${body}`,
+			);
 
 			const originalFile = Bun.file;
 			const sliceEnds: number[] = [];

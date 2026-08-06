@@ -2,7 +2,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { installGjcBundle, resolveSubskillActivationForSkillInvocation, toActiveSubskillEntry } from "../src/extensibility/gjc-plugins";
+import {
+	installGjcBundle,
+	resolveSubskillActivationForSkillInvocation,
+	toActiveSubskillEntry,
+} from "../src/extensibility/gjc-plugins";
 import { loadActiveSubskillTools } from "../src/extensibility/gjc-plugins/tools";
 import { syncSkillActiveState } from "../src/skill-state/active-state";
 
@@ -68,13 +72,17 @@ afterEach(async () => {
 	}
 });
 
-	describe("GJC plugin sub-skill tools", () => {
+describe("GJC plugin sub-skill tools", () => {
 	test("rechecks the subskill tool digest immediately before import", async () => {
 		const cwd = await makeTempRoot();
 		const fixture = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-skill-plugin");
 		const installed = await installGjcBundle({ cwd }, "project", fixture);
 		expect(installed.ok).toBe(true);
-		const activation = await resolveSubskillActivationForSkillInvocation({ cwd, skillName: "ralplan", args: "--design" });
+		const activation = await resolveSubskillActivationForSkillInvocation({
+			cwd,
+			skillName: "ralplan",
+			args: "--design",
+		});
 		expect(activation.activation).toBeDefined();
 		await syncSkillActiveState({
 			cwd,

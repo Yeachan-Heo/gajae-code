@@ -3,10 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionSdkSessionRuntime, type SessionSdkTransport } from "./session-runtime";
-import {
-	createSdkWebSocketTransport,
-	type SdkWebSocketTransportDependencies,
-} from "./websocket-transport";
+import { createSdkWebSocketTransport, type SdkWebSocketTransportDependencies } from "./websocket-transport";
 
 async function tempStateRoot(): Promise<string> {
 	return await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-transport-"));
@@ -133,7 +130,9 @@ describe("SDK WebSocket transport lifecycle", () => {
 			...dependencies,
 		});
 		await expect(transport.start()).rejects.toMatchObject({ code: "endpoint_chmod_failed" });
-		await expect(fs.stat(path.join(stateRoot, "sdk", "chmod-failure.json"))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.stat(path.join(stateRoot, "sdk", "chmod-failure.json"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 		await transport.stop();
 		await fs.rm(stateRoot, { recursive: true, force: true });
 	});

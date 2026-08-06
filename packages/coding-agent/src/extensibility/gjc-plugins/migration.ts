@@ -1,14 +1,14 @@
-import { canonicalizeJsonSchema, schemaHash } from "./metadata";
 import * as path from "node:path";
 import { compileGjcPluginBundle } from "./compiler";
+import { canonicalizeJsonSchema, schemaHash } from "./metadata";
 import {
-	GjcPluginLoadError,
-	PluginMigrationRequiredError,
 	type GjcPluginCopiedFile,
+	GjcPluginLoadError,
 	type GjcPluginMigrationFailure,
 	type GjcPluginMigrationState,
 	type GjcPluginRegistryEntry,
 	type NormalizedGjcPluginSurfaces,
+	PluginMigrationRequiredError,
 } from "./types";
 
 export interface GjcPluginMigrationStatus {
@@ -51,7 +51,10 @@ function migrationFailure(error: unknown, surface: string): GjcPluginMigrationFa
 	return { code: typed.code, surface, cause: typed.message };
 }
 
-function migrationState(status: GjcPluginMigrationState["status"], failure?: GjcPluginMigrationFailure): GjcPluginMigrationState {
+function migrationState(
+	status: GjcPluginMigrationState["status"],
+	failure?: GjcPluginMigrationFailure,
+): GjcPluginMigrationState {
 	return {
 		status,
 		metadataVersion: 2,
@@ -60,10 +63,22 @@ function migrationState(status: GjcPluginMigrationState["status"], failure?: Gjc
 	};
 }
 
-export function isV2Tool(surface: unknown): surface is { extensionId: string; name: string; schema: unknown; schemaHash: string; implementationHash: string; metadataVersion: 2 } {
+export function isV2Tool(surface: unknown): surface is {
+	extensionId: string;
+	name: string;
+	schema: unknown;
+	schemaHash: string;
+	implementationHash: string;
+	metadataVersion: 2;
+} {
 	if (!surface || typeof surface !== "object") return false;
 	const value = surface as Record<string, unknown>;
-	return value.metadataVersion === 2 && typeof value.schemaHash === "string" && typeof value.implementationHash === "string" && "schema" in value;
+	return (
+		value.metadataVersion === 2 &&
+		typeof value.schemaHash === "string" &&
+		typeof value.implementationHash === "string" &&
+		"schema" in value
+	);
 }
 
 export function entryNeedsMigration(entry: GjcPluginRegistryEntry): boolean {
@@ -78,18 +93,25 @@ async function verifyV2EntryMetadata(entry: GjcPluginRegistryEntry): Promise<voi
 	const bundle = await compileGjcPluginBundle(entry.pluginRoot);
 	const compiledTools = new Map(bundle.surfaces.tools.map(surface => [surface.extensionId, surface]));
 	for (const surface of entry.surfaces.tools) {
-		if (!isV2Tool(surface)) throw new GjcPluginLoadError("migration_required", `Tool ${surface.extensionId} is missing v2 metadata`);
+		if (!isV2Tool(surface))
+			throw new GjcPluginLoadError("migration_required", `Tool ${surface.extensionId} is missing v2 metadata`);
 		const schema = canonicalizeJsonSchema(surface.schema);
-		if (schemaHash(schema) !== surface.schemaHash) throw new GjcPluginLoadError("hash_mismatch", `Schema hash mismatch for ${surface.extensionId}`);
+		if (schemaHash(schema) !== surface.schemaHash)
+			throw new GjcPluginLoadError("hash_mismatch", `Schema hash mismatch for ${surface.extensionId}`);
 		const compiled = compiledTools.get(surface.extensionId);
-		if (!compiled || compiled.implementationHash !== surface.implementationHash || compiled.schemaHash !== surface.schemaHash) {
+		if (
+			!compiled ||
+			compiled.implementationHash !== surface.implementationHash ||
+			compiled.schemaHash !== surface.schemaHash
+		) {
 			throw new GjcPluginLoadError("hash_mismatch", `Compiled v2 metadata mismatch for ${surface.extensionId}`);
 		}
 	}
 	const compiledHooks = new Map(bundle.surfaces.hooks.map(surface => [surface.extensionId, surface]));
 	for (const surface of entry.surfaces.hooks) {
 		const compiled = compiledHooks.get(surface.extensionId);
-		if (!compiled || compiled.implementationHash !== surface.implementationHash) throw new GjcPluginLoadError("hash_mismatch", `Compiled v2 metadata mismatch for ${surface.extensionId}`);
+		if (!compiled || compiled.implementationHash !== surface.implementationHash)
+			throw new GjcPluginLoadError("hash_mismatch", `Compiled v2 metadata mismatch for ${surface.extensionId}`);
 	}
 }
 
@@ -97,19 +119,36 @@ async function verifyV2EntryMetadata(entry: GjcPluginRegistryEntry): Promise<voi
  * Convert one persisted v1 registry entry into v2 metadata. This function only
  * reads manifests and declared files through the non-executing compiler.
  */
-export async function migrateGjcPluginEntry(entry: GjcPluginRegistryEntry): Promise<{ entry: GjcPluginRegistryEntry; changed: boolean; status: GjcPluginMigrationStatus }> {
+export async function migrateGjcPluginEntry(
+	entry: GjcPluginRegistryEntry,
+): Promise<{ entry: GjcPluginRegistryEntry; changed: boolean; status: GjcPluginMigrationStatus }> {
 	if (!entryNeedsMigration(entry)) {
 		try {
 			await verifyV2EntryMetadata(entry);
 			return {
 				entry,
 				changed: false,
-				status: { plugin: entry.name, scope: entry.scope, status: "migrated", surfaces: surfaceIds(entry.surfaces) },
+				status: {
+					plugin: entry.name,
+					scope: entry.scope,
+					status: "migrated",
+					surfaces: surfaceIds(entry.surfaces),
+				},
 			};
 		} catch (error) {
 			const failure = migrationFailure(error, surfaceIds(entry.surfaces)[0] ?? `plugin:${entry.name}`);
 			const failed: GjcPluginRegistryEntry = { ...entry, migration: migrationState("failed", failure) };
-			return { entry: failed, changed: true, status: { plugin: entry.name, scope: entry.scope, status: "failed", surfaces: surfaceIds(entry.surfaces), failure } };
+			return {
+				entry: failed,
+				changed: true,
+				status: {
+					plugin: entry.name,
+					scope: entry.scope,
+					status: "failed",
+					surfaces: surfaceIds(entry.surfaces),
+					failure,
+				},
+			};
 		}
 	}
 
@@ -122,7 +161,11 @@ export async function migrateGjcPluginEntry(entry: GjcPluginRegistryEntry): Prom
 		const oldIds = new Set(surfaceIds(entry.surfaces));
 		const newIds = new Set(surfaceIds(bundle.surfaces));
 		for (const id of oldIds) {
-			if (!newIds.has(id)) throw new GjcPluginLoadError("missing_surface", `Declared surface ${id} is missing from the plugin manifest`);
+			if (!newIds.has(id))
+				throw new GjcPluginLoadError(
+					"missing_surface",
+					`Declared surface ${id} is missing from the plugin manifest`,
+				);
 		}
 		const migrated: GjcPluginRegistryEntry = {
 			...entry,
@@ -139,18 +182,29 @@ export async function migrateGjcPluginEntry(entry: GjcPluginRegistryEntry): Prom
 			status: { plugin: entry.name, scope: entry.scope, status: "migrated", surfaces: surfaceIds(bundle.surfaces) },
 		};
 	} catch (error) {
-		const failure = migrationFailure(error, entry.migration?.failure?.surface ?? surfaceIds(entry.surfaces)[0] ?? `plugin:${entry.name}`);
+		const failure = migrationFailure(
+			error,
+			entry.migration?.failure?.surface ?? surfaceIds(entry.surfaces)[0] ?? `plugin:${entry.name}`,
+		);
 		const failed: GjcPluginRegistryEntry = { ...entry, migration: migrationState("failed", failure) };
 		return {
 			entry: failed,
 			changed: true,
-			status: { plugin: entry.name, scope: entry.scope, status: "failed", surfaces: surfaceIds(entry.surfaces), failure },
+			status: {
+				plugin: entry.name,
+				scope: entry.scope,
+				status: "failed",
+				surfaces: surfaceIds(entry.surfaces),
+				failure,
+			},
 		};
 	}
 }
 
 /** Migrate entries from a parsed registry in memory; never imports implementations. */
-export async function migrateGjcPluginEntries(entries: readonly GjcPluginRegistryEntry[]): Promise<{ entries: GjcPluginRegistryEntry[]; changed: boolean; statuses: GjcPluginMigrationStatus[] }> {
+export async function migrateGjcPluginEntries(
+	entries: readonly GjcPluginRegistryEntry[],
+): Promise<{ entries: GjcPluginRegistryEntry[]; changed: boolean; statuses: GjcPluginMigrationStatus[] }> {
 	const results = await Promise.all(entries.map(entry => migrateGjcPluginEntry(entry)));
 	return {
 		entries: results.map(result => result.entry),
@@ -173,7 +227,10 @@ export async function migrationStatusForEntry(entry: GjcPluginRegistryEntry): Pr
 	return { plugin: entry.name, scope: entry.scope, status: "migrated", surfaces: surfaceIds(entry.surfaces) };
 }
 
-export async function getGjcPluginMigrationStatuses(cwd: string, options: { migrate?: boolean } = {}): Promise<GjcPluginMigrationStatus[]> {
+export async function getGjcPluginMigrationStatuses(
+	cwd: string,
+	options: { migrate?: boolean } = {},
+): Promise<GjcPluginMigrationStatus[]> {
 	const { readRegistry } = await import("./registry");
 	const [user, project] = await Promise.all([
 		readRegistry("user", cwd, { migrate: options.migrate !== false }),
@@ -201,12 +258,17 @@ export async function migratePluginRootForDoctor(pluginRoot: string): Promise<Gj
 }
 
 export function migrationDoctorCheckMessage(status: GjcPluginMigrationStatus): string {
-	if (status.status === "migrated") return `${status.plugin} (${status.scope}) migrated to registry v2; surfaces: ${status.surfaces.join(", ") || "none"}`;
+	if (status.status === "migrated")
+		return `${status.plugin} (${status.scope}) migrated to registry v2; surfaces: ${status.surfaces.join(", ") || "none"}`;
 	const failure = status.failure;
 	return `${status.plugin} (${status.scope}) migration failed for ${failure?.surface ?? "unknown surface"}: ${failure?.cause ?? "unknown cause"}`;
 }
 
 export function migrationRequiredError(entry: GjcPluginRegistryEntry): PluginMigrationRequiredError {
 	const failure = entry.migration?.failure;
-	return new PluginMigrationRequiredError(entry.name, failure?.surface ?? `plugin:${entry.name}`, failure?.cause ?? "v2 metadata is unavailable");
+	return new PluginMigrationRequiredError(
+		entry.name,
+		failure?.surface ?? `plugin:${entry.name}`,
+		failure?.cause ?? "v2 metadata is unavailable",
+	);
 }

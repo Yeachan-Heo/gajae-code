@@ -585,10 +585,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const stateRoot = path.join(runtime.cwd, ".gjc", "state");
 			switch (action) {
 				case "status": {
-					const {
-						buildNotificationStatusReport,
-						formatNotificationStatusReport,
-					} = await import("../sdk/bus/notification-service");
+					const { buildNotificationStatusReport, formatNotificationStatusReport } = await import(
+						"../sdk/bus/notification-service"
+					);
 					await runtime.output(formatNotificationStatusReport(buildNotificationStatusReport(runtime.settings)));
 					return commandConsumed();
 				}

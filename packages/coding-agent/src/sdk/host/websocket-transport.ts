@@ -30,7 +30,11 @@ export class SdkTransportLifecycleError extends Error {
 	}
 }
 
-function asLifecycleError(code: SdkTransportLifecycleErrorCode, message: string, error: unknown): SdkTransportLifecycleError {
+function asLifecycleError(
+	code: SdkTransportLifecycleErrorCode,
+	message: string,
+	error: unknown,
+): SdkTransportLifecycleError {
 	if (error instanceof SdkTransportLifecycleError) return error;
 	return new SdkTransportLifecycleError(code, message, error);
 }
@@ -165,7 +169,10 @@ export async function createSdkWebSocketTransport(
 										return;
 									}
 									if (typeof frame.type !== "string" || frame.type.length === 0) {
-										malformedHandler?.(socket.data.connectionId, "SDK frame type must be a non-empty string.");
+										malformedHandler?.(
+											socket.data.connectionId,
+											"SDK frame type must be a non-empty string.",
+										);
 										return;
 									}
 									if (frame.type === "event_replay" && Array.isArray(frame.capabilities)) {
@@ -220,7 +227,10 @@ export async function createSdkWebSocketTransport(
 					}
 					started = false;
 					server = undefined;
-					const combined = combineLifecycleErrors(failures, "SDK transport startup failed and cleanup was incomplete.");
+					const combined = combineLifecycleErrors(
+						failures,
+						"SDK transport startup failed and cleanup was incomplete.",
+					);
 					if (combined !== undefined) throw combined;
 					throw error;
 				}

@@ -7,8 +7,8 @@ import {
 	trimOpenAiCompactInput,
 } from "@gajae-code/agent-core/compaction/openai";
 import type { PruneConfig } from "@gajae-code/agent-core/compaction/pruning";
-import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 import type { AssistantMessage, Message, ToolResultMessage } from "@gajae-code/ai/types";
+import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 
 const timestamp = "2026-06-12T00:00:00.000Z";
 

@@ -32,7 +32,6 @@ import {
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-
 let astGrepLoad: Promise<typeof astGrepFn> | undefined;
 
 async function astGrepNative(): Promise<typeof astGrepFn> {

@@ -17,7 +17,9 @@ import type { LoadedSubskillActivation } from "./types";
 
 export function toActiveSubskillEntry(activation: LoadedSubskillActivation): ActiveSubskillEntry {
 	if (!activation.scope || !activation.extensionId || !activation.expectedDigest) {
-		throw new Error(`Cannot persist unvalidated GJC subskill activation for ${activation.plugin}/${activation.subskillName}`);
+		throw new Error(
+			`Cannot persist unvalidated GJC subskill activation for ${activation.plugin}/${activation.subskillName}`,
+		);
 	}
 	return {
 		plugin: activation.plugin,
@@ -29,7 +31,10 @@ export function toActiveSubskillEntry(activation: LoadedSubskillActivation): Act
 		scope: activation.scope,
 		extensionId: activation.extensionId,
 		expectedDigest: activation.expectedDigest,
-		toolRefs: (activation.toolRefs ?? []).map(ref => ({ extensionId: ref.extensionId, expectedDigest: ref.expectedDigest })),
+		toolRefs: (activation.toolRefs ?? []).map(ref => ({
+			extensionId: ref.extensionId,
+			expectedDigest: ref.expectedDigest,
+		})),
 	};
 }
 

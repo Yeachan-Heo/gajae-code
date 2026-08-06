@@ -1,7 +1,12 @@
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { GjcPluginSourceUnavailableError, type GjcBundleTransactionDecision, resolveGjcBundleCandidate, runGjcBundleTransaction } from "./installer";
+import {
+	type GjcBundleTransactionDecision,
+	GjcPluginSourceUnavailableError,
+	resolveGjcBundleCandidate,
+	runGjcBundleTransaction,
+} from "./installer";
 import {
 	activationFingerprint,
 	baselineFingerprint,
@@ -272,7 +277,11 @@ async function withSourceAvailability<T>(
 		if (error instanceof GjcPluginLoadError) {
 			return {
 				ok: false,
-				error: fail("invalid_target", `Stored source for GJC bundle "${identity.name}" is no longer a valid plugin target`, `gjc plugin install <source> --${identity.scope}`),
+				error: fail(
+					"invalid_target",
+					`Stored source for GJC bundle "${identity.name}" is no longer a valid plugin target`,
+					`gjc plugin install <source> --${identity.scope}`,
+				),
 			};
 		}
 		throw error;

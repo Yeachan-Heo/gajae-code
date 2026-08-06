@@ -22,6 +22,7 @@ function nativeScope(): NativeManagedScope {
 	if (!nativeManagedScope) nativeManagedScope = require("@gajae-code/natives") as NativeManagedScope;
 	return nativeManagedScope;
 }
+
 import { hasFsCode, logger, pathIsWithin } from "@gajae-code/utils";
 import type { ResumeSessionIdentity } from "../session-manager";
 import {
@@ -344,7 +345,12 @@ function verifyExistingManagedScopeDirectory(pathname: string) {
 	if (process.platform !== "win32") return nativeScope().verifyOwnerOnlyPathSecurity(pathname, "directory");
 	const expected = fs.lstatSync(pathname, { bigint: true });
 	if (!expected.isDirectory() || expected.isSymbolicLink()) throw new Error("reparse_point");
-	const verified = nativeScope().verifyOwnerOnlyPathSecurityExpected(pathname, "directory", expected.dev, expected.ino);
+	const verified = nativeScope().verifyOwnerOnlyPathSecurityExpected(
+		pathname,
+		"directory",
+		expected.dev,
+		expected.ino,
+	);
 	const current = fs.lstatSync(pathname, { bigint: true });
 	if (
 		!current.isDirectory() ||
@@ -2399,11 +2405,6 @@ function artifactIdentityForCleanup(target: RetiredTarget): SessionStorageFileId
 	}
 }
 
-type NativeDirectorySnapshotApi = {
-	snapshotDirectoryTree(
-		pathname: string,
-	): { ok: true; snapshot: NativeDirectoryTreeSnapshot } | { ok: false; code: string; snapshot?: undefined };
-};
 function snapshotArtifactTree(pathname: string): NativeDirectoryTreeSnapshot {
 	validateManagedArtifactTree(pathname);
 	const result = nativeScope().snapshotDirectoryTree(pathname);

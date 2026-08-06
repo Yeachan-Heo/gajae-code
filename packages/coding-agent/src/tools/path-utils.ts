@@ -686,7 +686,12 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		if (hasGlobPathChars(rawPath)) {
 			throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
 		}
-		const resource = await internalRouter.resolve(rawPath, { cwd, getArtifactsDir, getAuthorizedArtifactsDirs, mcpManager: opts.mcpManager });
+		const resource = await internalRouter.resolve(rawPath, {
+			cwd,
+			getArtifactsDir,
+			getAuthorizedArtifactsDirs,
+			mcpManager: opts.mcpManager,
+		});
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);
 		}

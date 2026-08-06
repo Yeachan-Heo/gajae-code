@@ -31,7 +31,7 @@ let discoveryNativeLoad: Promise<DiscoveryNativeModule> | undefined;
 async function discoveryNatives(): Promise<DiscoveryNativeModule> {
 	if (discoveryNativeModule) return discoveryNativeModule;
 	discoveryNativeLoad ??= Promise.resolve(
-		((require("@gajae-code/natives") as { FileType: typeof FileTypeEnum; glob: typeof globFn })),
+		require("@gajae-code/natives") as { FileType: typeof FileTypeEnum; glob: typeof globFn },
 	).then(mod => {
 		discoveryNativeModule = { FileType: mod.FileType, glob: mod.glob };
 		return discoveryNativeModule;
@@ -413,7 +413,9 @@ export async function scanSkillsFromDir(
 			const frontmatter = await readSkillFrontmatter(skillPath);
 			if (!frontmatter) {
 				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
-					warnings.push(`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`);
+					warnings.push(
+						`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`,
+					);
 				}
 				return;
 			}

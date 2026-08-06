@@ -8,8 +8,8 @@
  * and minimum-savings hysteresis semantics are unchanged.
  */
 
-import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
 import { createHash } from "node:crypto";
+import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
 import { sanitizeText } from "@gajae-code/utils";
 import type { AgentMessage } from "../types";
 import { estimateEntryTokens, estimateTextTokensHeuristic } from "./compaction";
@@ -186,7 +186,12 @@ function resultDigest(message: ToolResultMessage, call?: ToolCall): string | und
 	return summary ? `summary=${truncateField(summary, ERROR_DIGEST_MAX_CHARS)}` : undefined;
 }
 
-export function createPrunedNotice(tokens: number, message?: ToolResultMessage, call?: ToolCall, artifact?: string): string {
+export function createPrunedNotice(
+	tokens: number,
+	message?: ToolResultMessage,
+	call?: ToolCall,
+	artifact?: string,
+): string {
 	const generic = createGenericPrunedNotice(tokens);
 	const digest =
 		truncateField(message ? (resultDigest(message, call) ?? "") : "", DIGEST_TOTAL_MAX_CHARS) || undefined;
@@ -979,7 +984,8 @@ export function commitToolOutputPrune(
 			return { entryId: digest.entryId, outcome: "mismatch", diagnostic: "tool output changed before commit" };
 		}
 		const proposal = proposals.get(digest.entryId);
-		if (!proposal) return { entryId: digest.entryId, outcome: "unavailable", diagnostic: "replacement proposal missing" };
+		if (!proposal)
+			return { entryId: digest.entryId, outcome: "unavailable", diagnostic: "replacement proposal missing" };
 		const override = options.replacements?.get(digest.entryId);
 		const replacementText = override?.replacementText ?? proposal.replacementText;
 		message.content = [{ type: "text", text: replacementText }];
@@ -989,7 +995,8 @@ export function commitToolOutputPrune(
 				message.details && typeof message.details === "object" && !Array.isArray(message.details)
 					? (message.details as Record<string, unknown>)
 					: {};
-			const meta = details.meta && typeof details.meta === "object" && !Array.isArray(details.meta)
+			const meta =
+				details.meta && typeof details.meta === "object" && !Array.isArray(details.meta)
 					? (details.meta as Record<string, unknown>)
 					: {};
 			message.details = { ...details, meta: { ...meta, eviction: override.eviction } };

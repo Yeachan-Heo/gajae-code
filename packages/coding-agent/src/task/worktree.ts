@@ -7,11 +7,12 @@ import type * as natives from "@gajae-code/natives";
 
 import { getWorktreeDir, hashPath, logger, Snowflake } from "@gajae-code/utils";
 import * as git from "../utils/git";
+
 let nativeWorktreeBindings: typeof import("@gajae-code/natives") | undefined;
 
-
 function nativeWorktree(): typeof import("@gajae-code/natives") {
-	if (!nativeWorktreeBindings) nativeWorktreeBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	if (!nativeWorktreeBindings)
+		nativeWorktreeBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 	return nativeWorktreeBindings;
 }
 

@@ -31,7 +31,9 @@ import { clampTimeout } from "./tool-timeouts";
 let htmlToMarkdownLoad: Promise<typeof htmlToMarkdownFn> | undefined;
 
 async function htmlToMarkdownNative(): Promise<typeof htmlToMarkdownFn> {
-	htmlToMarkdownLoad ??= Promise.resolve((require("@gajae-code/natives") as { htmlToMarkdown: typeof htmlToMarkdownFn }).htmlToMarkdown);
+	htmlToMarkdownLoad ??= Promise.resolve(
+		(require("@gajae-code/natives") as { htmlToMarkdown: typeof htmlToMarkdownFn }).htmlToMarkdown,
+	);
 	return await htmlToMarkdownLoad;
 }
 

@@ -590,7 +590,8 @@ const DEFAULT_USAGE_PROVIDER_DESCRIPTORS: readonly UsageProviderDescriptor[] = [
 	},
 	{
 		id: "google-gemini-cli",
-		supports: (params: UsageFetchParams) => params.provider === "google-gemini-cli" && supportsGoogleGeminiCliUsage(params),
+		supports: (params: UsageFetchParams) =>
+			params.provider === "google-gemini-cli" && supportsGoogleGeminiCliUsage(params),
 		load: memoizeUsageProvider(() => {
 			const module = require("./usage/gemini") as { googleGeminiCliUsageProvider: UsageProvider };
 			return module.googleGeminiCliUsageProvider;
@@ -837,7 +838,6 @@ function getOpenAICodexPlanPriority(report: UsageReport | null): number {
 function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
 	return getUsagePlanType(report)?.includes("pro") === true;
 }
-
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
 	return DEFAULT_RANKING_STRATEGIES.get(provider);

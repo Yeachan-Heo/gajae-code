@@ -1,7 +1,7 @@
-import { GjcPluginLoadError } from "./types";
-import type { LoadedSubskillActivation } from "./types";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { resolveValidatedActiveSubskill } from "./subskill-authority";
+import type { LoadedSubskillActivation } from "./types";
+import { GjcPluginLoadError } from "./types";
 
 export interface SubskillActivationResult {
 	cleanedArgs: string;
@@ -41,10 +41,17 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 	const candidateActivations = candidates.filter(candidate => candidate.parent === input.skillName);
 	const activationsByArg = new Map<string, LoadedSubskillActivation>();
 	for (const candidate of candidateActivations) {
-		if (activationsByArg.has(candidate.activationArg)) throw new GjcPluginLoadError("duplicate_arg", `Duplicate GJC plugin activation argument: --${candidate.activationArg}`);
+		if (activationsByArg.has(candidate.activationArg))
+			throw new GjcPluginLoadError(
+				"duplicate_arg",
+				`Duplicate GJC plugin activation argument: --${candidate.activationArg}`,
+			);
 		activationsByArg.set(candidate.activationArg, candidate);
 	}
-	const tokens = input.args.trim().split(/\s+/).filter(token => token.length > 0);
+	const tokens = input.args
+		.trim()
+		.split(/\s+/)
+		.filter(token => token.length > 0);
 	let activation: LoadedSubskillActivation | undefined;
 	const cleanedTokens: string[] = [];
 	let consumed = false;
@@ -63,7 +70,10 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 		cleanedArgs: consumed ? cleanedTokens.join(" ") : input.args,
 		activation,
 		activeSubskillsToPersist: activation
-			? candidates.filter(candidate => candidate.plugin === activation!.plugin && candidate.activationArg === activation!.activationArg)
+			? candidates.filter(
+					candidate =>
+						candidate.plugin === activation!.plugin && candidate.activationArg === activation!.activationArg,
+				)
 			: [],
 	};
 }

@@ -11,9 +11,9 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
-import { resolveSubskillActivationForSkillInvocation, toActiveSubskillEntry } from "../src/extensibility/gjc-plugins";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { resolveSubskillActivationForSkillInvocation, toActiveSubskillEntry } from "../src/extensibility/gjc-plugins";
 
 let tempDir: TempDir;
 let authStorage: AuthStorage | undefined;
@@ -64,9 +64,19 @@ async function activateSubskill(toolPaths: string[], phase = "planner"): Promise
 	);
 	await fs.writeFile(
 		path.join(pluginRoot, "gajae-plugin.json"),
-		JSON.stringify({ kind: "gajae-code-plugin", name: "refresh-plugin", version: "1.0.0", subskills: ["subskills/design/SKILL.md"], tools: [] }),
+		JSON.stringify({
+			kind: "gajae-code-plugin",
+			name: "refresh-plugin",
+			version: "1.0.0",
+			subskills: ["subskills/design/SKILL.md"],
+			tools: [],
+		}),
 	);
-	const result = await resolveSubskillActivationForSkillInvocation({ cwd: tempDir.path(), skillName: "ralplan", args: "--design" });
+	const result = await resolveSubskillActivationForSkillInvocation({
+		cwd: tempDir.path(),
+		skillName: "ralplan",
+		args: "--design",
+	});
 	if (!result.activation) throw new Error("refresh fixture activation missing");
 	await syncSkillActiveState({
 		cwd: tempDir.path(),

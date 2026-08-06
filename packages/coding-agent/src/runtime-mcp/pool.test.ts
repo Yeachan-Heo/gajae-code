@@ -1,12 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import {
-	MCPConnectionPool,
-	MCPPoolAcquireAbortError,
-	MCPPoolLeaseInvalidatedError,
-} from "./pool";
+import { MCPConnectionPool, MCPPoolAcquireAbortError, MCPPoolLeaseInvalidatedError } from "./pool";
 import { MCPPoolConfigError } from "./pool-key";
-import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
 import type { MCPRequestOptions, MCPServerConfig, MCPServerConnection, MCPTransport } from "./types";
+import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
 
 class FakeTransport implements MCPTransport {
 	connected = true;
@@ -22,7 +18,11 @@ class FakeTransport implements MCPTransport {
 	onNotification?: (method: string, params: unknown) => void;
 	onRequest?: (method: string, params: unknown) => Promise<unknown>;
 
-	async request<T = unknown>(method: string, params?: Record<string, unknown>, _options?: MCPRequestOptions): Promise<T> {
+	async request<T = unknown>(
+		method: string,
+		params?: Record<string, unknown>,
+		_options?: MCPRequestOptions,
+	): Promise<T> {
 		this.requests.push(method);
 		const uri = typeof params?.uri === "string" ? params.uri : undefined;
 		if (method === "resources/subscribe") {
@@ -51,7 +51,11 @@ class DelayedSubscriptionTransport extends FakeTransport {
 	readonly subscribeStarted = Promise.withResolvers<void>();
 	readonly allowSubscribe = Promise.withResolvers<void>();
 
-	override async request<T = unknown>(method: string, params?: Record<string, unknown>, options?: MCPRequestOptions): Promise<T> {
+	override async request<T = unknown>(
+		method: string,
+		params?: Record<string, unknown>,
+		options?: MCPRequestOptions,
+	): Promise<T> {
 		if (method === "resources/subscribe") {
 			this.subscribeStarted.resolve();
 			await this.allowSubscribe.promise;
@@ -65,7 +69,11 @@ class CrashCallTransport extends FakeTransport {
 	readonly callStarted = Promise.withResolvers<void>();
 	#rejectCall?: (error: Error) => void;
 
-	override request<T = unknown>(method: string, params?: Record<string, unknown>, options?: MCPRequestOptions): Promise<T> {
+	override request<T = unknown>(
+		method: string,
+		params?: Record<string, unknown>,
+		options?: MCPRequestOptions,
+	): Promise<T> {
 		if (method !== "tools/call") return super.request<T>(method, params, options);
 		this.callCount += 1;
 		this.callStarted.resolve();
@@ -121,7 +129,9 @@ test("shared leases broadcast catalog notifications, union roots, and reject unk
 	transport.onNotification?.("notifications/unknown", {});
 	expect(firstEvents).toEqual([MCPNotificationMethods.TOOLS_LIST_CHANGED]);
 	expect(secondEvents).toEqual([MCPNotificationMethods.TOOLS_LIST_CHANGED]);
-	expect(pool.getHealth()[0]?.events.some(event => event.message?.includes("Unsupported MCP notification"))).toBe(true);
+	expect(pool.getHealth()[0]?.events.some(event => event.message?.includes("Unsupported MCP notification"))).toBe(
+		true,
+	);
 	await first.release();
 	expect(await transport.onRequest?.("roots/list", {})).toEqual({ roots: [{ uri: "file:///two", name: "two" }] });
 	await second.release();
@@ -150,7 +160,10 @@ test("a shared crash rejects only the in-flight calling lease with a typed error
 test("shared tools-only entries reject sampling and elicitation requests and gate restart ownership", async () => {
 	const transport = new FakeTransport();
 	const pool = new MCPConnectionPool({ connect: async (name, cfg) => connection(name, cfg, transport) });
-	const lease = await pool.acquire("server", config("shared"), { sharingMode: "shared", capabilityProfile: "tools-only" });
+	const lease = await pool.acquire("server", config("shared"), {
+		sharingMode: "shared",
+		capabilityProfile: "tools-only",
+	});
 	await expect(transport.onRequest?.("sampling/createMessage", {})).rejects.toMatchObject({ code: -32601 });
 	await expect(transport.onRequest?.("elicitation/create", {})).rejects.toMatchObject({ code: -32601 });
 	expect(pool.claimRestart(lease.key)).toBe(true);
@@ -159,7 +172,7 @@ test("shared tools-only entries reject sampling and elicitation requests and gat
 	expect(pool.claimRestart(lease.key)).toBe(true);
 	pool.releaseRestart(lease.key);
 	await lease.release();
-	});
+});
 test("shared SSE leases retain one physical callback transport until the last release", async () => {
 	let opens = 0;
 	const transport = new FakeTransport();
@@ -193,8 +206,6 @@ test("releasing subscribed leases after shared transport close detaches locally 
 	expect(transport.requests.filter(method => method === "resources/unsubscribe")).toHaveLength(0);
 	expect(pool.size).toBe(0);
 });
-
-
 
 test("repeated shared crash cleanup does not retain retired entries", async () => {
 	let opens = 0;
@@ -334,7 +345,7 @@ describe("MCPConnectionPool", () => {
 		let openSignal: AbortSignal | undefined;
 		const transport = new FakeTransport();
 		const pool = new MCPConnectionPool({
-			connect: async (name, cfg, options) => {
+			connect: async (_name, _cfg, options) => {
 				openSignal = options.signal;
 				return new Promise<MCPServerConnection>(resolve => {
 					resolveOpen = resolve;
@@ -358,7 +369,7 @@ describe("MCPConnectionPool", () => {
 		let openSignal: AbortSignal | undefined;
 		const transport = new FakeTransport();
 		const pool = new MCPConnectionPool({
-			connect: async (name, cfg, options) => {
+			connect: async (_name, _cfg, options) => {
 				openSignal = options.signal;
 				return new Promise<MCPServerConnection>(resolve => {
 					resolveOpen = resolve;
@@ -404,7 +415,9 @@ describe("MCPConnectionPool", () => {
 		await lease.request("ping");
 		transport?.onNotification?.("notifications/tools/list_changed", {});
 		expect(events).toEqual(["notifications/tools/list_changed"]);
-		expect(await transport?.onRequest?.("roots/list", {})).toEqual({ roots: [{ uri: "file:///workspace", name: "workspace" }] });
+		expect(await transport?.onRequest?.("roots/list", {})).toEqual({
+			roots: [{ uri: "file:///workspace", name: "workspace" }],
+		});
 		await lease.release();
 	});
 
@@ -412,7 +425,7 @@ describe("MCPConnectionPool", () => {
 		let resolveOpen: ((value: MCPServerConnection) => void) | undefined;
 		const transport = new FakeTransport();
 		const pool = new MCPConnectionPool({
-			connect: async (name, cfg) =>
+			connect: async (_name, _cfg) =>
 				new Promise<MCPServerConnection>(resolve => {
 					resolveOpen = resolve;
 				}),
@@ -437,7 +450,7 @@ describe("MCPConnectionPool", () => {
 		let resolveOpen: ((value: MCPServerConnection) => void) | undefined;
 		const transport = new FakeTransport();
 		const pool = new MCPConnectionPool({
-			connect: async (name, cfg) =>
+			connect: async (_name, _cfg) =>
 				new Promise<MCPServerConnection>(resolve => {
 					resolveOpen = resolve;
 				}),
@@ -571,11 +584,18 @@ describe("MCPConnectionPool", () => {
 				return connection(name, cfg, transport);
 			},
 		});
-		const lease = await pool.acquire("secret-server", { type: "http", url: "https://user:secret@example.test/mcp" }, { sessionId: "s" }).catch(() => undefined);
+		const lease = await pool
+			.acquire("secret-server", { type: "http", url: "https://user:secret@example.test/mcp" }, { sessionId: "s" })
+			.catch(() => undefined);
 		if (lease) await lease.release();
 		// Userinfo rejection happens before opening; use a valid endpoint for event health.
-		const validLease = await pool.acquire("secret-server", { type: "http", url: "https://example.test/mcp", headers: { Authorization: "Bearer top-secret" } }, { sessionId: "s" });
-		for (let index = 0; index < 30; index += 1) transport?.onError?.(new Error(`https://example.test/mcp?token=top-secret ${"x".repeat(600)}`));
+		const validLease = await pool.acquire(
+			"secret-server",
+			{ type: "http", url: "https://example.test/mcp", headers: { Authorization: "Bearer top-secret" } },
+			{ sessionId: "s" },
+		);
+		for (let index = 0; index < 30; index += 1)
+			transport?.onError?.(new Error(`https://example.test/mcp?token=top-secret ${"x".repeat(600)}`));
 		const health = pool.getHealth()[0];
 		expect(health?.events.length).toBeLessThanOrEqual(20);
 		expect(JSON.stringify(health)).not.toContain("top-secret");

@@ -3,7 +3,11 @@ import { logger } from "@gajae-code/utils";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
 import { readActiveSubskillsForParent } from "./state";
-import { resolveValidatedActiveSubskill, verifyValidatedActiveSubskill, verifyValidatedSubskillTool } from "./subskill-authority";
+import {
+	resolveValidatedActiveSubskill,
+	verifyValidatedActiveSubskill,
+	verifyValidatedSubskillTool,
+} from "./subskill-authority";
 
 export async function loadActiveSubskillTools(input: {
 	cwd: string;
@@ -20,7 +24,9 @@ export async function loadActiveSubskillTools(input: {
 			entries.map(entry => resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true })),
 		)
 	).filter((item): item is NonNullable<typeof item> => item !== null);
-	const toolRefs = validated.flatMap(item => (item.activation.toolRefs ?? []).map(reference => ({ validated: item, reference })));
+	const toolRefs = validated.flatMap(item =>
+		(item.activation.toolRefs ?? []).map(reference => ({ validated: item, reference })),
+	);
 	const toolPaths = [...new Set(toolRefs.map(({ reference }) => reference.relativePath))];
 	if (toolPaths.length === 0) return [];
 
@@ -43,7 +49,8 @@ export async function loadActiveSubskillTools(input: {
 			await verifyValidatedSubskillTool({ validated: pair.validated, reference: pair.reference });
 		},
 	);
-	for (const error of result.errors) logger.warn("Skipping GJC plugin sub-skill tool", { path: error.path, error: error.error });
+	for (const error of result.errors)
+		logger.warn("Skipping GJC plugin sub-skill tool", { path: error.path, error: error.error });
 
 	const tools: CustomTool[] = [];
 	const seenNames = new Set<string>();

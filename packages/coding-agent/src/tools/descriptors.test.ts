@@ -1,20 +1,20 @@
 import { describe, expect, test } from "bun:test";
+import type { AgentTool } from "@gajae-code/agent-core";
 import { normalizeTools } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/core";
 import { toolWireSchema } from "@gajae-code/ai/utils/schema";
-import type { AgentTool } from "@gajae-code/agent-core";
+import { isComputerLoadablePlatform } from "./computer";
 import {
 	BUILTIN_TOOL_DESCRIPTORS,
 	BUILTIN_TOOLS,
-	HIDDEN_TOOLS,
 	HIDDEN_TOOL_DESCRIPTORS,
+	HIDDEN_TOOLS,
 	LazyAgentTool,
-	TOOL_DESCRIPTORS,
 	resolveEffectiveDiscoveryMode,
+	TOOL_DESCRIPTORS,
 	type ToolAvailabilityContext,
 	type ToolDescriptor,
 } from "./descriptors";
-import { isComputerLoadablePlatform } from "./computer";
 import { computeEssentialBuiltinNames, createTools } from "./index";
 
 const schema = { type: "object", properties: {} } as never;
@@ -166,18 +166,49 @@ describe("tool descriptor compatibility gate", () => {
 			["mcp-only", false, true],
 			["all", false, true],
 		] as const) {
-			const discoverySession = makeSession({ "tools.discoveryMode": toolsDiscoveryMode, "mcp.discoveryMode": mcpDiscoveryMode });
-			expect(searchDescriptor.isAvailable(discoverySession, availabilityContext({ discoveryActive: expected }))).toBe(expected);
+			const discoverySession = makeSession({
+				"tools.discoveryMode": toolsDiscoveryMode,
+				"mcp.discoveryMode": mcpDiscoveryMode,
+			});
+			expect(
+				searchDescriptor.isAvailable(discoverySession, availabilityContext({ discoveryActive: expected })),
+			).toBe(expected);
 		}
-		expect(BUILTIN_TOOL_DESCRIPTORS.goal.isAvailable(session, availabilityContext({ goalEnabled: false }))).toBe(false);
+		expect(BUILTIN_TOOL_DESCRIPTORS.goal.isAvailable(session, availabilityContext({ goalEnabled: false }))).toBe(
+			false,
+		);
 		expect(BUILTIN_TOOL_DESCRIPTORS.goal.isAvailable(session, availabilityContext({ goalEnabled: true }))).toBe(true);
 		expect(HIDDEN_TOOL_DESCRIPTORS.resolve.isAvailable(session, availabilityContext())).toBe(true);
-		expect(BUILTIN_TOOL_DESCRIPTORS.task.isAvailable(makeSession({ "task.maxRecursionDepth": 0 }), availabilityContext())).toBe(false);
-		expect(BUILTIN_TOOL_DESCRIPTORS.task.isAvailable(makeSession({ "task.maxRecursionDepth": -1 }), availabilityContext())).toBe(true);
-		expect(BUILTIN_TOOL_DESCRIPTORS.task.isAvailable(makeSession({ "task.maxRecursionDepth": 1 }), availabilityContext())).toBe(true);
-		expect(BUILTIN_TOOL_DESCRIPTORS.task.isAvailable({ ...makeSession({ "task.maxRecursionDepth": 1 }), taskDepth: 1 }, availabilityContext())).toBe(false);
-		expect(computeEssentialBuiltinNames({ get: () => [] } as never)).toEqual(["read", "bash", "edit", "write", "search", "find"]);
-		expect(computeEssentialBuiltinNames({ get: () => ["read", "missing", "bash"] } as never)).toEqual(["read", "bash"]);
+		expect(
+			BUILTIN_TOOL_DESCRIPTORS.task.isAvailable(makeSession({ "task.maxRecursionDepth": 0 }), availabilityContext()),
+		).toBe(false);
+		expect(
+			BUILTIN_TOOL_DESCRIPTORS.task.isAvailable(
+				makeSession({ "task.maxRecursionDepth": -1 }),
+				availabilityContext(),
+			),
+		).toBe(true);
+		expect(
+			BUILTIN_TOOL_DESCRIPTORS.task.isAvailable(makeSession({ "task.maxRecursionDepth": 1 }), availabilityContext()),
+		).toBe(true);
+		expect(
+			BUILTIN_TOOL_DESCRIPTORS.task.isAvailable(
+				{ ...makeSession({ "task.maxRecursionDepth": 1 }), taskDepth: 1 },
+				availabilityContext(),
+			),
+		).toBe(false);
+		expect(computeEssentialBuiltinNames({ get: () => [] } as never)).toEqual([
+			"read",
+			"bash",
+			"edit",
+			"write",
+			"search",
+			"find",
+		]);
+		expect(computeEssentialBuiltinNames({ get: () => ["read", "missing", "bash"] } as never)).toEqual([
+			"read",
+			"bash",
+		]);
 	});
 
 	test("facade preserves advertised fields and delegates execution with the materialized this", async () => {
@@ -240,12 +271,7 @@ describe("tool descriptor compatibility gate", () => {
 	test("availability predicates retain every createTools settings branch", () => {
 		const session = makeSession();
 		const context = availabilityContext();
-		const unavailableByDefault = new Set([
-			"debug",
-			"github",
-			"search_tool_bm25",
-			"goal",
-		]);
+		const unavailableByDefault = new Set(["debug", "github", "search_tool_bm25", "goal"]);
 		for (const [name, descriptor] of Object.entries(BUILTIN_TOOL_DESCRIPTORS)) {
 			expect(descriptor.isAvailable(session, context)).toBe(!unavailableByDefault.has(name));
 		}
@@ -272,7 +298,24 @@ describe("tool descriptor compatibility gate", () => {
 			goalEnabled: true,
 			discoveryActive: true,
 		});
-		for (const name of ["lsp", "find", "search", "ast_grep", "ast_edit", "render_mermaid", "web_search", "calc", "skill", "skill_discovery", "browser", "checkpoint", "rewind", "irc", "recipe", "task"])
+		for (const name of [
+			"lsp",
+			"find",
+			"search",
+			"ast_grep",
+			"ast_edit",
+			"render_mermaid",
+			"web_search",
+			"calc",
+			"skill",
+			"skill_discovery",
+			"browser",
+			"checkpoint",
+			"rewind",
+			"irc",
+			"recipe",
+			"task",
+		])
 			expect(BUILTIN_TOOL_DESCRIPTORS[name].isAvailable(disabled, disabledContext)).toBe(false);
 		expect(BUILTIN_TOOL_DESCRIPTORS.goal.isAvailable(disabled, disabledContext)).toBe(true);
 		expect(BUILTIN_TOOL_DESCRIPTORS.search_tool_bm25.isAvailable(disabled, disabledContext)).toBe(true);
@@ -365,11 +408,16 @@ describe("tool descriptor compatibility gate", () => {
 		expect(typeof ask.rawArgumentValidation).toBe("function");
 		expect(typeof todo.rawArgumentValidation).toBe("function");
 		expect(() =>
-			validateToolArguments(todo, { id: "call-1", type: "toolCall", name: "todo_write", arguments: { unknown: true } }),
+			validateToolArguments(todo, {
+				id: "call-1",
+				type: "toolCall",
+				name: "todo_write",
+				arguments: { unknown: true },
+			}),
 		).toThrow("raw arguments rejected before coercion");
 		expect(() =>
 			validateToolArguments(ask, { id: "call-2", type: "toolCall", name: "ask", arguments: { unknown: true } }),
-		).toThrow("Validation failed for tool \"ask\"");
+		).toThrow('Validation failed for tool "ask"');
 	});
 
 	test("deferred ask validator recovers the canonical round-zero pair", async () => {
@@ -401,7 +449,12 @@ describe("tool descriptor compatibility gate", () => {
 				},
 			],
 		};
-		const recovered = validateToolArguments(ask, { id: "call-3", type: "toolCall", name: "ask", arguments: arguments_ });
+		const recovered = validateToolArguments(ask, {
+			id: "call-3",
+			type: "toolCall",
+			name: "ask",
+			arguments: arguments_,
+		});
 		expect(recovered.questions[0].deepInterview.intent_contract).toBeDefined();
 		expect(recovered.questions[0].deepInterview.intent_review).toBeUndefined();
 	});
@@ -419,7 +472,14 @@ describe("tool descriptor compatibility gate", () => {
 				questions: [{ id: "q", question: "q", options: [{ label: "yes" }], deepInterview: { arbitrary: true } }],
 			},
 			{
-				questions: [{ id: "q", question: "q", options: [{ label: "yes" }], workflowGate: { stage: "deep-interview", kind: "question", extra: true } }],
+				questions: [
+					{
+						id: "q",
+						question: "q",
+						options: [{ label: "yes" }],
+						workflowGate: { stage: "deep-interview", kind: "question", extra: true },
+					},
+				],
 			},
 			{
 				questions: [
@@ -438,7 +498,9 @@ describe("tool descriptor compatibility gate", () => {
 							},
 							intent_review: {
 								observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
-								supporting_substitutions: [{ removed_id: "artifact:report", replacement_ids: [], rationale: "bad" }],
+								supporting_substitutions: [
+									{ removed_id: "artifact:report", replacement_ids: [], rationale: "bad" },
+								],
 								approval_options: ["Approve"],
 							},
 						},

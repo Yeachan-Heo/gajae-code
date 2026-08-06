@@ -7,7 +7,6 @@ import type * as native from "@gajae-code/natives";
 
 let nativeSessionStorageBindings: typeof import("@gajae-code/natives") | undefined;
 
-
 function nativeSessionStorage(): typeof import("@gajae-code/natives") {
 	if (!nativeSessionStorageBindings) {
 		nativeSessionStorageBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");

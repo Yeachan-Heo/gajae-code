@@ -126,7 +126,13 @@ export class CustomToolLoader {
 
 	async load(pathsWithSources: ToolPathWithSource[], beforeImport?: CustomToolImportGuard): Promise<void> {
 		for (const { path: toolPath, source } of pathsWithSources) {
-			const { tools: loadedTools, error } = await loadTool(toolPath, this.#sharedApi.cwd, this.#sharedApi, source, beforeImport);
+			const { tools: loadedTools, error } = await loadTool(
+				toolPath,
+				this.#sharedApi.cwd,
+				this.#sharedApi,
+				source,
+				beforeImport,
+			);
 
 			if (error) {
 				this.errors.push(error);

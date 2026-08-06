@@ -1,5 +1,5 @@
 import type { AgentToolContext } from "@gajae-code/agent-core";
-import type { PtyRunResult, PtySession as NativePtySession } from "@gajae-code/natives";
+import type { PtySession as NativePtySession, PtyRunResult } from "@gajae-code/natives";
 import {
 	type Component,
 	extractPrintableText,
@@ -24,7 +24,9 @@ type PtySession = NativePtySession;
 let ptySessionLoad: Promise<typeof import("@gajae-code/natives")["PtySession"]> | undefined;
 
 async function ptySessionNative(): Promise<typeof import("@gajae-code/natives")["PtySession"]> {
-	ptySessionLoad ??= Promise.resolve((require("@gajae-code/natives") as { PtySession: typeof import("@gajae-code/natives")["PtySession"] }).PtySession);
+	ptySessionLoad ??= Promise.resolve(
+		(require("@gajae-code/natives") as { PtySession: typeof import("@gajae-code/natives")["PtySession"] }).PtySession,
+	);
 	return await ptySessionLoad;
 }
 

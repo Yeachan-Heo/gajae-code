@@ -9,7 +9,9 @@ import type { executeShell as executeShellFn } from "@gajae-code/natives";
 let executeShellLoad: Promise<typeof executeShellFn> | undefined;
 
 async function executeShellNative(): Promise<typeof executeShellFn> {
-	executeShellLoad ??= Promise.resolve((require("@gajae-code/natives") as { executeShell: typeof executeShellFn }).executeShell);
+	executeShellLoad ??= Promise.resolve(
+		(require("@gajae-code/natives") as { executeShell: typeof executeShellFn }).executeShell,
+	);
 	return await executeShellLoad;
 }
 

@@ -10,7 +10,9 @@ let nativeFuzzyFindLoad: Promise<NativeFuzzyFind> | undefined;
 
 async function fuzzyFindNative(): Promise<NativeFuzzyFind> {
 	if (nativeFuzzyFind) return nativeFuzzyFind;
-	nativeFuzzyFindLoad ??= Promise.resolve((require("@gajae-code/natives") as { fuzzyFind: NativeFuzzyFind }).fuzzyFind);
+	nativeFuzzyFindLoad ??= Promise.resolve(
+		(require("@gajae-code/natives") as { fuzzyFind: NativeFuzzyFind }).fuzzyFind,
+	);
 	return await nativeFuzzyFindLoad;
 }
 

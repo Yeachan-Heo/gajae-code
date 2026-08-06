@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { InternalUrlRouter } from "../../src/internal-urls";
 import { McpProtocolHandler } from "../../src/internal-urls/mcp-protocol";
+import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import type { MCPResource, MCPResourceReadResult, MCPResourceTemplate } from "../../src/runtime-mcp/types";
-import { parseInternalUrl } from "../../src/internal-urls/parse";
 
 let scopedManager: MCPManager | undefined;
 function scopedRouter(manager: MCPManager | undefined = scopedManager): Pick<InternalUrlRouter, "resolve"> {

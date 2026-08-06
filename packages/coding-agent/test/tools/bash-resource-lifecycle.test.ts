@@ -11,8 +11,8 @@ import {
 } from "@gajae-code/coding-agent/exec/bash-executor";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { DEFAULT_ARTIFACT_MAX_BYTES, OutputSink } from "@gajae-code/coding-agent/session/streaming-output";
-import { BashTool } from "@gajae-code/coding-agent/tools/implementations";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { BashTool } from "@gajae-code/coding-agent/tools/implementations";
 import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
 

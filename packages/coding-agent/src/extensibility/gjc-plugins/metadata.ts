@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
-import { PluginImplementationHashMismatchError } from "./types";
 import * as fs from "node:fs/promises";
-import { GjcPluginLoadError, type JsonSchema202012 } from "./types";
-import { resolveWithinRoot } from "./paths";
 import { upgradeJsonSchemaTo202012 } from "@gajae-code/ai/utils/schema";
+import { resolveWithinRoot } from "./paths";
+import { GjcPluginLoadError, type JsonSchema202012, PluginImplementationHashMismatchError } from "./types";
 
 export const JSON_SCHEMA_202012_URI = "https://json-schema.org/draft/2020-12/schema";
 
@@ -31,7 +30,8 @@ function sha256(value: Buffer | string): string {
 
 export async function verifyImplementationHash(filePath: string, expected: string): Promise<string> {
 	const actual = sha256(await fs.readFile(filePath));
-	if (actual.toLowerCase() !== expected.toLowerCase()) throw new PluginImplementationHashMismatchError(filePath, expected, actual);
+	if (actual.toLowerCase() !== expected.toLowerCase())
+		throw new PluginImplementationHashMismatchError(filePath, expected, actual);
 	return actual;
 }
 
@@ -64,40 +64,56 @@ function validateSchemaNode(value: unknown, at: string, depth: number): void {
 			throw new GjcPluginLoadError("invalid_schema", `JSON Schema type at ${at} is invalid`);
 		}
 	}
-	if (value.required !== undefined && (!Array.isArray(value.required) || value.required.some(item => typeof item !== "string"))) {
+	if (
+		value.required !== undefined &&
+		(!Array.isArray(value.required) || value.required.some(item => typeof item !== "string"))
+	) {
 		throw new GjcPluginLoadError("invalid_schema", `JSON Schema required at ${at} must be a string array`);
 	}
 	if (value.properties !== undefined) {
-		if (!isRecord(value.properties)) throw new GjcPluginLoadError("invalid_schema", `JSON Schema properties at ${at} must be an object`);
-		for (const [key, child] of Object.entries(value.properties)) validateSchemaNode(child, `${at}.properties.${key}`, depth + 1);
+		if (!isRecord(value.properties))
+			throw new GjcPluginLoadError("invalid_schema", `JSON Schema properties at ${at} must be an object`);
+		for (const [key, child] of Object.entries(value.properties))
+			validateSchemaNode(child, `${at}.properties.${key}`, depth + 1);
 	}
 	for (const key of ["items", "additionalProperties", "contains", "not", "if", "then", "else"] as const) {
 		if (value[key] !== undefined) validateSchemaNode(value[key], `${at}.${key}`, depth + 1);
 	}
 	for (const key of ["anyOf", "oneOf", "allOf", "prefixItems"] as const) {
 		if (value[key] === undefined) continue;
-		if (!Array.isArray(value[key])) throw new GjcPluginLoadError("invalid_schema", `JSON Schema ${key} at ${at} must be an array`);
+		if (!Array.isArray(value[key]))
+			throw new GjcPluginLoadError("invalid_schema", `JSON Schema ${key} at ${at} must be an array`);
 		for (const [index, child] of value[key].entries()) validateSchemaNode(child, `${at}.${key}[${index}]`, depth + 1);
 	}
-	if (value.enum !== undefined && !Array.isArray(value.enum)) throw new GjcPluginLoadError("invalid_schema", `JSON Schema enum at ${at} must be an array`);
+	if (value.enum !== undefined && !Array.isArray(value.enum))
+		throw new GjcPluginLoadError("invalid_schema", `JSON Schema enum at ${at} must be an array`);
 	for (const key of ["minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"] as const) {
-		if (value[key] !== undefined && (typeof value[key] !== "number" || !Number.isSafeInteger(value[key]) || value[key] < 0)) {
+		if (
+			value[key] !== undefined &&
+			(typeof value[key] !== "number" || !Number.isSafeInteger(value[key]) || value[key] < 0)
+		) {
 			throw new GjcPluginLoadError("invalid_schema", `JSON Schema ${key} at ${at} must be a non-negative integer`);
 		}
 	}
-	if (value.pattern !== undefined && typeof value.pattern !== "string") throw new GjcPluginLoadError("invalid_schema", `JSON Schema pattern at ${at} must be a string`);
-	if (value.$ref !== undefined && typeof value.$ref !== "string") throw new GjcPluginLoadError("invalid_schema", `JSON Schema $ref at ${at} must be a string`);
+	if (value.pattern !== undefined && typeof value.pattern !== "string")
+		throw new GjcPluginLoadError("invalid_schema", `JSON Schema pattern at ${at} must be a string`);
+	if (value.$ref !== undefined && typeof value.$ref !== "string")
+		throw new GjcPluginLoadError("invalid_schema", `JSON Schema $ref at ${at} must be a string`);
 }
 
 /** Validate and canonicalize a JSON Schema 2020-12 document without executing user code. */
 export function canonicalizeJsonSchema(value: unknown): JsonSchema202012 {
 	if (typeof value === "boolean") return value;
-	if (!isRecord(value)) throw new GjcPluginLoadError("invalid_schema", "Tool schema must be a JSON Schema object or boolean");
+	if (!isRecord(value))
+		throw new GjcPluginLoadError("invalid_schema", "Tool schema must be a JSON Schema object or boolean");
 	let upgraded: unknown;
 	try {
 		upgraded = upgradeJsonSchemaTo202012(value);
 	} catch (error) {
-		throw new GjcPluginLoadError("invalid_schema", `Unable to upgrade tool schema to JSON Schema 2020-12: ${error instanceof Error ? error.message : String(error)}`);
+		throw new GjcPluginLoadError(
+			"invalid_schema",
+			`Unable to upgrade tool schema to JSON Schema 2020-12: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 	if (!isRecord(upgraded)) throw new GjcPluginLoadError("invalid_schema", "Tool schema must be a JSON Schema object");
 	const copy = structuredClone(upgraded);
@@ -134,7 +150,7 @@ function readBalanced(source: string, start: number, open: string, close: string
 			else if (char === quote) quote = undefined;
 			continue;
 		}
-		if (char === "\"" || char === "'" || char === "`") {
+		if (char === '"' || char === "'" || char === "`") {
 			quote = char;
 			continue;
 		}
@@ -161,12 +177,12 @@ function splitTopLevel(source: string): string[] {
 			else if (char === quote) quote = undefined;
 			continue;
 		}
-		if (char === "\"" || char === "'" || char === "`") {
+		if (char === '"' || char === "'" || char === "`") {
 			quote = char;
 			continue;
 		}
 		if ("({[".includes(char)) depth += 1;
-		else if (")}\]".includes(char)) depth -= 1;
+		else if (")}]".includes(char)) depth -= 1;
 		else if (char === "," && depth === 0) {
 			parts.push(source.slice(start, index));
 			start = index + 1;
@@ -178,9 +194,10 @@ function splitTopLevel(source: string): string[] {
 
 function stringLiteral(value: string): string | undefined {
 	const trimmed = value.trim();
-	if (!((trimmed.startsWith("\"") && trimmed.endsWith("\"")) || (trimmed.startsWith("'") && trimmed.endsWith("'")))) return undefined;
+	if (!((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))))
+		return undefined;
 	try {
-		if (trimmed.startsWith("\"")) return JSON.parse(trimmed) as string;
+		if (trimmed.startsWith('"')) return JSON.parse(trimmed) as string;
 		return trimmed.slice(1, -1).replace(/\\(['\\])/g, "$1");
 	} catch {
 		return undefined;
@@ -205,7 +222,10 @@ function callName(expression: string): { name: string; args: string } | undefine
 }
 
 function staticSchemaExpression(expression: string): JsonSchema202012 | undefined {
-	let current = expression.trim().replace(/^(?:as\s+[^,]+|satisfies\s+[^,]+)$/, "").trim();
+	const current = expression
+		.trim()
+		.replace(/^(?:as\s+[^,]+|satisfies\s+[^,]+)$/, "")
+		.trim();
 	if (current.startsWith("{") && current.endsWith("}")) {
 		const body = current.slice(1, -1);
 		const out: Record<string, unknown> = {};
@@ -240,7 +260,12 @@ function staticSchemaExpression(expression: string): JsonSchema202012 | undefine
 			const schema = staticSchemaExpression(value);
 			if (schema === undefined) return undefined;
 			properties[key] = schema;
-			if (!/\.(?:optional|nullable)\s*\(\s*\)\s*$/.test(value) && !/\.Optional\s*\(\s*\)\s*$/.test(value) && !/(?:Type\.)?Optional\s*\(/.test(value)) required.push(key);
+			if (
+				!/\.(?:optional|nullable)\s*\(\s*\)\s*$/.test(value) &&
+				!/\.Optional\s*\(\s*\)\s*$/.test(value) &&
+				!/(?:Type\.)?Optional\s*\(/.test(value)
+			)
+				required.push(key);
 		}
 		return { type: "object", properties, ...(required.length > 0 ? { required } : {}), additionalProperties: true };
 	}
@@ -282,8 +307,7 @@ function staticSchemaExpression(expression: string): JsonSchema202012 | undefine
 
 function findParametersExpression(source: string): string | undefined {
 	const pattern = /\bparameters\s*:/g;
-	let match: RegExpExecArray | null;
-	while ((match = pattern.exec(source))) {
+	if (pattern.exec(source)) {
 		let start = skipSpace(source, pattern.lastIndex);
 		if (source.slice(start, start + 2) === "{\n") start = skipSpace(source, start);
 		let depth = 0;
@@ -297,19 +321,23 @@ function findParametersExpression(source: string): string | undefined {
 				else if (char === quote) quote = undefined;
 				continue;
 			}
-			if (char === "\"" || char === "'" || char === "`") {
+			if (char === '"' || char === "'" || char === "`") {
 				quote = char;
 				continue;
 			}
 			if ("([{".includes(char)) depth += 1;
 			else if (")]}".includes(char)) depth -= 1;
 			if ((char === "," || char === "\n") && depth === 0) return source.slice(start, index).trim();
-			if (depth === 0 && (")]}".includes(char))) {
+			if (depth === 0 && ")]}".includes(char)) {
 				const next = skipSpace(source, index + 1);
-				if (next >= source.length || ",;".includes(source[next] ?? "")) return source.slice(start, index + 1).trim();
+				if (next >= source.length || ",;".includes(source[next] ?? ""))
+					return source.slice(start, index + 1).trim();
 			}
 		}
-		return source.slice(start).replace(/[,;]\s*$/, "").trim();
+		return source
+			.slice(start)
+			.replace(/[,;]\s*$/, "")
+			.trim();
 	}
 	return undefined;
 }
@@ -317,37 +345,62 @@ function findParametersExpression(source: string): string | undefined {
 /** Extract a common TypeBox/Zod declaration from source text without loading it. */
 export function extractDeclaredToolSchema(source: string): JsonSchema202012 {
 	const expression = findParametersExpression(source);
-	if (!expression) throw new GjcPluginLoadError("missing_surface", "Tool implementation has no declared parameters schema");
+	if (!expression)
+		throw new GjcPluginLoadError("missing_surface", "Tool implementation has no declared parameters schema");
 	const direct = /(?:Type\.Object|zod\.object|\.Object|\.object)\s*\(\s*\{([\s\S]*)\}\s*\)\s*$/.exec(expression);
 	if (direct) {
 		const properties: Record<string, unknown> = {};
 		const required: string[] = [];
 		for (const part of splitTopLevel(direct[1]!)) {
 			const field = /^([A-Za-z_$][\w$-]*)\s*:\s*([\s\S]+)$/.exec(part);
-			if (!field) throw new GjcPluginLoadError("invalid_schema", "Tool parameters object contains an unreadable property");
+			if (!field)
+				throw new GjcPluginLoadError("invalid_schema", "Tool parameters object contains an unreadable property");
 			let child: JsonSchema202012 | undefined;
 			try {
 				child = staticSchemaExpression(field[2]!);
 			} catch (error) {
-				throw new GjcPluginLoadError("invalid_schema", `Tool parameters property ${field[1]} is unreadable: ${error instanceof Error ? error.message : String(error)}`);
+				throw new GjcPluginLoadError(
+					"invalid_schema",
+					`Tool parameters property ${field[1]} is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
-			if (child === undefined) throw new GjcPluginLoadError("invalid_schema", `Tool parameters property ${field[1]} is unreadable`);
+			if (child === undefined)
+				throw new GjcPluginLoadError("invalid_schema", `Tool parameters property ${field[1]} is unreadable`);
 			properties[field[1]!] = child;
-			if (!/\.(?:optional|nullable)\s*\(\s*\)\s*$/.test(field[2]!) && !/\.Optional\s*\(\s*\)\s*$/.test(field[2]!) && !/(?:Type\.)?Optional\s*\(/.test(field[2]!)) required.push(field[1]!);
+			if (
+				!/\.(?:optional|nullable)\s*\(\s*\)\s*$/.test(field[2]!) &&
+				!/\.Optional\s*\(\s*\)\s*$/.test(field[2]!) &&
+				!/(?:Type\.)?Optional\s*\(/.test(field[2]!)
+			)
+				required.push(field[1]!);
 		}
-		return canonicalizeJsonSchema({ type: "object", properties, ...(required.length > 0 ? { required } : {}), additionalProperties: true });
+		return canonicalizeJsonSchema({
+			type: "object",
+			properties,
+			...(required.length > 0 ? { required } : {}),
+			additionalProperties: true,
+		});
 	}
 	try {
 		const schema = staticSchemaExpression(expression);
-		if (schema === undefined) throw new GjcPluginLoadError("invalid_schema", "Tool parameters schema is not statically readable");
+		if (schema === undefined)
+			throw new GjcPluginLoadError("invalid_schema", "Tool parameters schema is not statically readable");
 		return canonicalizeJsonSchema(schema);
 	} catch (error) {
 		if (error instanceof GjcPluginLoadError) throw error;
-		throw new GjcPluginLoadError("invalid_schema", `Tool parameters schema is not statically readable: ${error instanceof Error ? error.message : String(error)}`);
+		throw new GjcPluginLoadError(
+			"invalid_schema",
+			`Tool parameters schema is not statically readable: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 }
 
-export async function readSchemaDeclaration(pluginRoot: string, sourcePath: string, declaration: unknown, schemaPath?: string): Promise<JsonSchema202012> {
+export async function readSchemaDeclaration(
+	pluginRoot: string,
+	sourcePath: string,
+	declaration: unknown,
+	schemaPath?: string,
+): Promise<JsonSchema202012> {
 	if (schemaPath !== undefined) {
 		const abs = resolveWithinRoot(pluginRoot, schemaPath);
 		const text = await fs.readFile(abs, "utf8");
@@ -355,7 +408,9 @@ export async function readSchemaDeclaration(pluginRoot: string, sourcePath: stri
 			return canonicalizeJsonSchema(JSON.parse(text) as unknown);
 		} catch (error) {
 			if (error instanceof GjcPluginLoadError) throw error;
-			throw new GjcPluginLoadError("invalid_schema", `Invalid JSON Schema declaration at ${schemaPath}`, { cause: error instanceof Error ? error : undefined });
+			throw new GjcPluginLoadError("invalid_schema", `Invalid JSON Schema declaration at ${schemaPath}`, {
+				cause: error instanceof Error ? error : undefined,
+			});
 		}
 	}
 	if (declaration !== undefined) return canonicalizeJsonSchema(declaration);
@@ -363,6 +418,9 @@ export async function readSchemaDeclaration(pluginRoot: string, sourcePath: stri
 		return canonicalizeJsonSchema(extractDeclaredToolSchema(await fs.readFile(sourcePath, "utf8")));
 	} catch (error) {
 		if (error instanceof GjcPluginLoadError) throw error;
-		throw new GjcPluginLoadError("invalid_schema", `Tool parameters schema is not statically readable: ${error instanceof Error ? error.message : String(error)}`);
+		throw new GjcPluginLoadError(
+			"invalid_schema",
+			`Tool parameters schema is not statically readable: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 }

@@ -164,7 +164,9 @@ export async function findReusableCdp(
 	exe: string,
 	signal?: AbortSignal,
 ): Promise<{ cdpUrl: string; pid: number } | null> {
-	const candidates = nativeProcessBindings().Process.fromPath(exe).filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
+	const candidates = nativeProcessBindings()
+		.Process.fromPath(exe)
+		.filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
 	for (const proc of candidates) {
 		let args: string[];
 		try {
@@ -194,7 +196,9 @@ export async function findRunningChromeProfile(
 	profile: { userDataDir: string; profileDirectory: string },
 	signal?: AbortSignal,
 ): Promise<RunningChromeProfile | null> {
-	const candidates = nativeProcessBindings().Process.fromPath(exe).filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
+	const candidates = nativeProcessBindings()
+		.Process.fromPath(exe)
+		.filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
 	for (const proc of candidates) {
 		let args: string[];
 		try {

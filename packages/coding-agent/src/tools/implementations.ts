@@ -1,6 +1,7 @@
 /** Opt-in implementation barrel. Import this module only when concrete tool classes are required. */
-export * from "../eval/py/env";
+
 export * from "../edit";
+export * from "../eval/py/env";
 export * from "../goals";
 export * from "../lsp";
 export * from "../session/streaming-output";

@@ -769,7 +769,10 @@ async function handleLink(manager: PluginManager, paths: string[], flags: { json
 	}
 }
 
-async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix?: boolean; migratePlugins?: boolean }): Promise<void> {
+async function handleDoctor(
+	manager: PluginManager,
+	flags: { json?: boolean; fix?: boolean; migratePlugins?: boolean },
+): Promise<void> {
 	const checks = await manager.doctor({ fix: flags.fix });
 	try {
 		const statuses = flags.migratePlugins

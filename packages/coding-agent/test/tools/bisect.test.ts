@@ -2,13 +2,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { BUILTIN_TOOLS, type ToolSession } from "@gajae-code/coding-agent/tools";
 import {
-	BUILTIN_TOOLS,
-	type ToolSession,
-} from "@gajae-code/coding-agent/tools";
-import {
-	BisectTool,
 	type BisectMarkResult,
+	BisectTool,
 	type BisectVerdict,
 	classifyExit,
 	parseFirstBadCommit,

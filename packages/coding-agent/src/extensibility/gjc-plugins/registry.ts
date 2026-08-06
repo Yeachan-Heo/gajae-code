@@ -1,10 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { compileGjcPluginBundle } from "./compiler";
+import { migrateGjcPluginEntries } from "./migration";
 import { gjcPluginProjectRoot, gjcPluginUserRoot } from "./paths";
 import { GjcPluginLoadError, type GjcPluginRegistry, type GjcPluginRegistryEntry, type GjcPluginScope } from "./types";
-import { migrateGjcPluginEntries } from "./migration";
-import { compileGjcPluginBundle } from "./compiler";
 
 const REGISTRY_FILENAME = "registry.json";
 const LOCK_FILENAME = "registry.lock";
@@ -62,22 +62,38 @@ async function readRegistryRaw(scope: GjcPluginScope, cwd: string): Promise<GjcP
 		throw new GjcPluginLoadError("invalid_manifest", `Unsupported GJC plugin registry shape at ${registryPath}`);
 	}
 	const registry = parsed as GjcPluginRegistry;
-	if (registry.scope !== scope) throw new GjcPluginLoadError("invalid_manifest", `GJC plugin registry scope mismatch at ${registryPath}: expected ${scope}`);
+	if (registry.scope !== scope)
+		throw new GjcPluginLoadError(
+			"invalid_manifest",
+			`GJC plugin registry scope mismatch at ${registryPath}: expected ${scope}`,
+		);
 	if (
 		!Array.isArray(registry.plugins) ||
 		registry.plugins.some(plugin => {
 			if (!plugin || typeof plugin !== "object") return true;
 			const entry = plugin as GjcPluginRegistryEntry;
-			return entry.scope !== scope || !entry.surfaces || !Array.isArray(entry.surfaces.tools) || !Array.isArray(entry.surfaces.hooks);
+			return (
+				entry.scope !== scope ||
+				!entry.surfaces ||
+				!Array.isArray(entry.surfaces.tools) ||
+				!Array.isArray(entry.surfaces.hooks)
+			);
 		})
 	) {
-		throw new GjcPluginLoadError("invalid_manifest", `Invalid GJC plugin registry entries or scope at ${registryPath}`);
+		throw new GjcPluginLoadError(
+			"invalid_manifest",
+			`Invalid GJC plugin registry entries or scope at ${registryPath}`,
+		);
 	}
 	registry.plugins = sortRegistryEntries(registry.plugins);
 	return registry;
 }
 
-async function discoverLegacyEntries(scope: GjcPluginScope, cwd: string, existing: readonly GjcPluginRegistryEntry[]): Promise<GjcPluginRegistryEntry[]> {
+async function discoverLegacyEntries(
+	scope: GjcPluginScope,
+	cwd: string,
+	existing: readonly GjcPluginRegistryEntry[],
+): Promise<GjcPluginRegistryEntry[]> {
 	const root = registryRootForScope(scope, cwd);
 	let dirents: import("node:fs").Dirent[];
 	try {
@@ -117,11 +133,15 @@ async function discoverLegacyEntries(scope: GjcPluginScope, cwd: string, existin
 			let version = "unknown";
 			let failureSurface = `plugin:${name}`;
 			try {
-				const manifest = JSON.parse(await fs.readFile(path.join(pluginRoot, "gajae-plugin.json"), "utf8")) as Record<string, unknown>;
+				const manifest = JSON.parse(
+					await fs.readFile(path.join(pluginRoot, "gajae-plugin.json"), "utf8"),
+				) as Record<string, unknown>;
 				if (typeof manifest.name === "string" && manifest.name.trim()) name = manifest.name;
 				if (typeof manifest.version === "string" && manifest.version.trim()) version = manifest.version;
 				if (Array.isArray(manifest.tools)) {
-					const firstTool = manifest.tools.find(item => item && typeof item === "object") as Record<string, unknown> | undefined;
+					const firstTool = manifest.tools.find(item => item && typeof item === "object") as
+						| Record<string, unknown>
+						| undefined;
 					if (typeof firstTool?.name === "string") failureSurface = `tool:${firstTool.name}`;
 				}
 			} catch {
@@ -146,7 +166,11 @@ async function discoverLegacyEntries(scope: GjcPluginScope, cwd: string, existin
 				migration: {
 					status: "failed",
 					metadataVersion: 2,
-					failure: { code, surface: failureSurface, cause: error instanceof Error ? error.message : String(error) },
+					failure: {
+						code,
+						surface: failureSurface,
+						cause: error instanceof Error ? error.message : String(error),
+					},
 				},
 			});
 			known.add(path.resolve(pluginRoot));
@@ -240,8 +264,13 @@ export async function writeRegistryUnlocked(
 	cwd: string,
 	ownerScope: GjcPluginScope = registry.scope,
 ): Promise<void> {
-	if (registry.scope !== ownerScope) throw new GjcPluginLoadError("invalid_manifest", `GJC plugin registry scope mismatch: caller owns ${ownerScope}, registry declares ${registry.scope}`);
-	if (registry.plugins.some(entry => entry.scope !== ownerScope)) throw new GjcPluginLoadError("invalid_manifest", `GJC plugin entry scope mismatch: caller owns ${ownerScope}`);
+	if (registry.scope !== ownerScope)
+		throw new GjcPluginLoadError(
+			"invalid_manifest",
+			`GJC plugin registry scope mismatch: caller owns ${ownerScope}, registry declares ${registry.scope}`,
+		);
+	if (registry.plugins.some(entry => entry.scope !== ownerScope))
+		throw new GjcPluginLoadError("invalid_manifest", `GJC plugin entry scope mismatch: caller owns ${ownerScope}`);
 	const registryPath = registryPathForScope(ownerScope, cwd);
 	await fs.mkdir(path.dirname(registryPath), { recursive: true });
 	const sorted: GjcPluginRegistry = { ...registry, scope: ownerScope, plugins: sortRegistryEntries(registry.plugins) };
@@ -261,7 +290,11 @@ export async function writeRegistryUnlocked(
  * Atomic registry write: write to a temp sibling, fsync, then rename. Guarded
  * by an interprocess lockfile so concurrent installs cannot clobber each other.
  */
-export async function writeRegistry(registry: GjcPluginRegistry, cwd: string, ownerScope: GjcPluginScope = registry.scope): Promise<void> {
+export async function writeRegistry(
+	registry: GjcPluginRegistry,
+	cwd: string,
+	ownerScope: GjcPluginScope = registry.scope,
+): Promise<void> {
 	await withRegistryLock(ownerScope, cwd, () => writeRegistryUnlocked(registry, cwd, ownerScope));
 }
 

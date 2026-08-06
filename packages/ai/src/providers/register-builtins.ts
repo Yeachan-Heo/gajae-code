@@ -65,7 +65,6 @@ export interface ProviderRuntimeDescriptor<TApi extends Api = Api, TModule = unk
 
 type ErasedProviderRuntimeDescriptor = ProviderRuntimeDescriptor<Api, any>;
 
-
 interface AnthropicProviderModule {
 	streamAnthropic: (
 		model: Model<"anthropic-messages">,
@@ -170,8 +169,6 @@ let ollamaProviderModulePromise: Promise<LazyProviderModule<"ollama-chat">> | un
 let cursorProviderModulePromise: Promise<LazyProviderModule<"cursor-agent">> | undefined;
 let bedrockProviderModuleOverride: LazyProviderModule<"bedrock-converse-stream"> | undefined;
 let bedrockProviderModulePromise: Promise<LazyProviderModule<"bedrock-converse-stream">> | undefined;
-
-
 
 export function setBedrockProviderModule(module: BedrockProviderModule): void {
 	bedrockProviderModuleOverride = {
@@ -475,9 +472,6 @@ export function getProviderRuntimeDescriptor<TApi extends Api>(
 ): ProviderRuntimeDescriptor<TApi, unknown> | undefined {
 	return providerRuntimeDescriptorMap.get(api) as ProviderRuntimeDescriptor<TApi, unknown> | undefined;
 }
-
-
-
 
 // ---------------------------------------------------------------------------
 // Lazy stream function exports

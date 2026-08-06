@@ -7,8 +7,8 @@
  * - Convenience helpers: captureText / execText, AbortSignal, timeouts.
  */
 
-import { nativeProcessBindings } from "./native-process";
 import type { Spawn, Subprocess } from "bun";
+import { nativeProcessBindings } from "./native-process";
 
 type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
 

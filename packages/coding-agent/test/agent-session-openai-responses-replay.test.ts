@@ -716,8 +716,17 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		child.agent.appendMessage(keptLocal);
 		childManager.appendMessage(oldLocal);
 		const firstKeptEntryId = childManager.appendMessage(keptLocal);
-		const compactionEntryId = childManager.appendCompaction("child summary", "child summary", firstKeptEntryId, 1_000);
-		const compactionLocal = { role: "user" as const, content: "child-before-compaction-rewrite", timestamp: Date.now() - 1_000 };
+		const compactionEntryId = childManager.appendCompaction(
+			"child summary",
+			"child summary",
+			firstKeptEntryId,
+			1_000,
+		);
+		const compactionLocal = {
+			role: "user" as const,
+			content: "child-before-compaction-rewrite",
+			timestamp: Date.now() - 1_000,
+		};
 		appendOnly.syncMessages([...seededPrefix, compactionLocal]);
 		expect(appendOnly.log.toMessages()).toHaveLength(seededPrefix.length + 1);
 		await child.applyCompactionPostAppendForTests(compactionEntryId, firstKeptEntryId);
@@ -760,7 +769,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			}),
 			usage: { ...createUsage(), totalTokens: (child.model!.contextWindow ?? 200_000) + 100_000 },
 		};
-		for (const message of [pruneAssistant, pruneResult, recentPruneResult, { role: "user" as const, content: "fork fence one", timestamp: Date.now() }, pruneFinalAssistant, { role: "user" as const, content: "fork fence two", timestamp: Date.now() }]) {
+		for (const message of [
+			pruneAssistant,
+			pruneResult,
+			recentPruneResult,
+			{ role: "user" as const, content: "fork fence one", timestamp: Date.now() },
+			pruneFinalAssistant,
+			{ role: "user" as const, content: "fork fence two", timestamp: Date.now() },
+		]) {
 			child.agent.appendMessage(message as never);
 			childManager.appendMessage(message as never);
 		}

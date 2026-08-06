@@ -401,7 +401,6 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 		ensureControlDir();
 		await validateKeyPermissions(host.keyPath);
 
-
 		const target = buildSshTarget(host.username, host.host);
 		if (!supportsSshControlMaster()) {
 			activeHosts.set(key, host);

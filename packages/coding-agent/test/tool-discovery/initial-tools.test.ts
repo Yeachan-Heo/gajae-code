@@ -86,7 +86,9 @@ const toolSession: ToolSession = {
 
 async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summary?: string }>> {
 	const tools = await createTools(toolSession, Object.keys(BUILTIN_TOOLS));
-	const { AskTool, ComputerTool, IrcTool, JobTool, RecipeTool, SshTool, TelegramSendTool } = await import("../../src/tools/implementations");
+	const { AskTool, ComputerTool, IrcTool, JobTool, RecipeTool, SshTool, TelegramSendTool } = await import(
+		"../../src/tools/implementations"
+	);
 	const metadata = new Map(tools.map(tool => [tool.name, { loadMode: tool.loadMode, summary: tool.summary }]));
 	for (const tool of [
 		new AskTool({ ...toolSession, hasUI: true }),

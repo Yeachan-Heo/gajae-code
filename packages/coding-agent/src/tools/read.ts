@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent } from "@gajae-code/ai/core";
-import type { glob as globFn, SummaryResult, summarizeCode as summarizeCodeFn } from "@gajae-code/natives";
+import type { SummaryResult } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { getRemoteDir, logger, prompt, readImageMetadata, untilAborted } from "@gajae-code/utils";

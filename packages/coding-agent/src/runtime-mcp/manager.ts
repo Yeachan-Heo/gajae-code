@@ -4,8 +4,9 @@
  * Discovers, connects to, and manages MCP servers.
  * Handles tool loading and lifecycle.
  */
-import * as path from "node:path";
+
 import { realpathSync } from "node:fs";
+import * as path from "node:path";
 import * as url from "node:url";
 import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
@@ -23,15 +24,15 @@ import {
 	serverSupportsPrompts,
 	serverSupportsResources,
 } from "./client";
+import { loadAllMCPConfigs, validateServerConfig } from "./config";
 import {
 	MCPConnectionPool,
 	MCPPoolAcquireAbortError,
-	MCPPoolLeaseObsoleteError,
-	MCPPoolLeaseReleaseError,
 	type MCPPoolEvent,
 	type MCPPoolLease,
+	MCPPoolLeaseObsoleteError,
+	MCPPoolLeaseReleaseError,
 } from "./pool";
-import { loadAllMCPConfigs, validateServerConfig } from "./config";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
@@ -391,9 +392,13 @@ export class MCPManager {
 		const sharedConfig = originalConfig.sharing === "shared";
 		const sharedEligible =
 			sharedConfig &&
-			(resolvedConfig.type === "http" || resolvedConfig.type === "sse" || (resolvedConfig.type === "stdio" && this.#toolsOnly));
+			(resolvedConfig.type === "http" ||
+				resolvedConfig.type === "sse" ||
+				(resolvedConfig.type === "stdio" && this.#toolsOnly));
 		if (sharedConfig && !sharedEligible) {
-			logger.debug("MCP shared pooling is limited to tools-only stdio and remote HTTP/SSE in W6", { path: `mcp:${name}` });
+			logger.debug("MCP shared pooling is limited to tools-only stdio and remote HTTP/SSE in W6", {
+				path: `mcp:${name}`,
+			});
 		}
 		const lease = await this.#pool.acquire(name, resolvedConfig, {
 			keyConfig: originalConfig,
@@ -401,7 +406,7 @@ export class MCPManager {
 			sessionId: sharedEligible ? undefined : this.#sessionId,
 			signal: connectionAbort.signal,
 			advertiseRoots: !this.#toolsOnly,
-			effectiveCwd: resolvedConfig.type === "stdio" ? resolvedConfig.cwd ?? this.cwd : this.cwd,
+			effectiveCwd: resolvedConfig.type === "stdio" ? (resolvedConfig.cwd ?? this.cwd) : this.cwd,
 			capabilityProfile: this.#toolsOnly ? "tools-only" : "roots",
 			effectiveHeaders:
 				resolvedConfig.type === "http" || resolvedConfig.type === "sse" ? resolvedConfig.headers : undefined,
@@ -450,7 +455,6 @@ export class MCPManager {
 			this.#scheduleSharedRebind(name, pending.lease);
 		}
 	}
-
 
 	#connectionForLease(connection: MCPServerConnection): MCPServerConnection {
 		return this.#leaseByConnection.get(connection)?.connectionForLease() ?? connection;
@@ -602,7 +606,12 @@ export class MCPManager {
 		for (const [index, result] of releases.entries()) {
 			if (result.status === "rejected") {
 				const operation = operations[index];
-				this.#logLeaseReleaseFailure(operation?.name ?? name, operation?.lease?.connection, result.reason, operation?.lease?.key);
+				this.#logLeaseReleaseFailure(
+					operation?.name ?? name,
+					operation?.lease?.connection,
+					result.reason,
+					operation?.lease?.key,
+				);
 			}
 		}
 	}
@@ -654,7 +663,6 @@ export class MCPManager {
 		return diagnostic;
 	}
 
-
 	#trackRetiredLeaseRelease(name: string, connection: MCPServerConnection, promise: Promise<void>): void {
 		const lease = this.#leaseByConnection.get(connection);
 		const retired: RetiredLeaseRelease = {
@@ -691,7 +699,12 @@ export class MCPManager {
 				failures.push(
 					result.reason instanceof MCPPoolLeaseReleaseError
 						? result.reason
-						: this.#logLeaseReleaseFailure(item?.name ?? "unknown", item?.connection, result.reason, item?.poolKey),
+						: this.#logLeaseReleaseFailure(
+								item?.name ?? "unknown",
+								item?.connection,
+								result.reason,
+								item?.poolKey,
+							),
 				);
 			}
 		}
@@ -779,7 +792,12 @@ export class MCPManager {
 		}
 	}
 
-	async #subscribeAndTrack(name: string, connection: MCPServerConnection, uris: string[], notificationEpoch: number): Promise<void> {
+	async #subscribeAndTrack(
+		name: string,
+		connection: MCPServerConnection,
+		uris: string[],
+		notificationEpoch: number,
+	): Promise<void> {
 		const lease = this.#leaseByConnection.get(connection);
 		if (!lease) return;
 		try {
@@ -1073,7 +1091,9 @@ export class MCPManager {
 						return;
 					this.#pendingToolLoads.delete(name);
 					const reconnect = () => this.reconnectServer(name);
-					const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, { noReplay: config.sharing === "shared" });
+					const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
+						noReplay: config.sharing === "shared",
+					});
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
 					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
@@ -1184,7 +1204,11 @@ export class MCPManager {
 					connectedServers.add(name);
 					const reconnect = () => this.reconnectServer(name);
 					try {
-						allTools.push(...MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, { noReplay: task.config.sharing === "shared" }));
+						allTools.push(
+							...MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
+								noReplay: task.config.sharing === "shared",
+							}),
+						);
 					} catch (error) {
 						await this.#cleanupConnectionTasks(connectionTasks);
 						throw error;
@@ -1459,9 +1483,7 @@ export class MCPManager {
 			void resolvedConfigPromise.catch(() => {});
 			const resolvedConfig = await Promise.race([resolvedConfigPromise, abortPromise]);
 			if (operation.lifecycleEpoch !== this.#scopedLifecycleEpoch || this.#scopedLifecycle !== "open") {
-				throw new MCPManagerLifecycleError(
-					this.#scopedLifecycle === "disconnecting" ? "disconnect" : "reconnect",
-				);
+				throw new MCPManagerLifecycleError(this.#scopedLifecycle === "disconnecting" ? "disconnect" : "reconnect");
 			}
 			lease = await this.#acquireLease(operation.name, resolvedConfig, config, operation.controller, false);
 			operation.lease = lease;
@@ -1491,12 +1513,7 @@ export class MCPManager {
 		try {
 			await this.#releaseScopedLease(operation);
 		} catch (cleanupError) {
-			const diagnostic = this.#logLeaseReleaseFailure(
-				operation.name,
-				lease?.connection,
-				cleanupError,
-				lease?.key,
-			);
+			const diagnostic = this.#logLeaseReleaseFailure(operation.name, lease?.connection, cleanupError, lease?.key);
 			if (!failed) throw diagnostic;
 		} finally {
 			callerSignal?.removeEventListener("abort", onAbort);
@@ -1508,7 +1525,6 @@ export class MCPManager {
 		if (failed) throw primaryError;
 		return result;
 	}
-
 
 	/** Read-only test seam for pending retired lease-release records. */
 	get retiredLeaseReleaseCountForTests(): number {
@@ -1717,18 +1733,23 @@ export class MCPManager {
 		} else {
 			attempt = this.#doReconnect(name);
 			if (sharedKey) {
-				attempt = attempt.then(
-					result => {
-						this.#pool.broadcastReplacement(sharedKey, result !== null);
-						this.#pool.finishRestart(sharedKey, result === null ? new Error(`MCP restart failed: ${name}`) : undefined);
-						return result;
-					},
-					error => {
-						this.#pool.broadcastReplacement(sharedKey, false);
-						this.#pool.finishRestart(sharedKey, error);
-						throw error;
-					},
-				).finally(() => this.#pool.releaseRestart(sharedKey));
+				attempt = attempt
+					.then(
+						result => {
+							this.#pool.broadcastReplacement(sharedKey, result !== null);
+							this.#pool.finishRestart(
+								sharedKey,
+								result === null ? new Error(`MCP restart failed: ${name}`) : undefined,
+							);
+							return result;
+						},
+						error => {
+							this.#pool.broadcastReplacement(sharedKey, false);
+							this.#pool.finishRestart(sharedKey, error);
+							throw error;
+						},
+					)
+					.finally(() => this.#pool.releaseRestart(sharedKey));
 			}
 		}
 		this.#pendingReconnections.set(name, attempt);
@@ -1822,7 +1843,8 @@ export class MCPManager {
 							error: msg,
 						});
 						await this.#sleep(delays[attempt]!, backoffAbort.signal).catch(error => {
-							if (!backoffAbort.signal.aborted) logger.error("MCP reconnect backoff failed", { path: `mcp:${name}`, error });
+							if (!backoffAbort.signal.aborted)
+								logger.error("MCP reconnect backoff failed", { path: `mcp:${name}`, error });
 						});
 					} else {
 						logger.error("MCP reconnect failed after retries", { path: `mcp:${name}`, error: msg });
@@ -1851,7 +1873,11 @@ export class MCPManager {
 		lifecycleEpoch?: number,
 	): Promise<MCPServerConnection> {
 		const assertLifecycle = (): void => {
-			if (lifecycleEpoch === undefined || (this.#scopedLifecycle === "open" && this.#scopedLifecycleEpoch === lifecycleEpoch)) return;
+			if (
+				lifecycleEpoch === undefined ||
+				(this.#scopedLifecycle === "open" && this.#scopedLifecycleEpoch === lifecycleEpoch)
+			)
+				return;
 			throw new MCPManagerLifecycleError(this.#scopedLifecycle === "disconnecting" ? "disconnect" : "reconnect");
 		};
 		assertLifecycle();
@@ -1885,7 +1911,8 @@ export class MCPManager {
 			!this.#serverConfigs.has(name) ||
 			this.#epoch !== globalEpoch ||
 			(this.#disconnectEpochs.get(name) ?? 0) !== disconnectEpoch ||
-			(lifecycleEpoch !== undefined && (this.#scopedLifecycle !== "open" || this.#scopedLifecycleEpoch !== lifecycleEpoch))
+			(lifecycleEpoch !== undefined &&
+				(this.#scopedLifecycle !== "open" || this.#scopedLifecycleEpoch !== lifecycleEpoch))
 		) {
 			const disconnectError = new Error(`Server "${name}" was disconnected during reconnection`);
 			await this.#releaseLeasePreservingPrimary(name, connection);
@@ -1918,7 +1945,9 @@ export class MCPManager {
 				throw disconnectError;
 			}
 			const reconnect = () => this.reconnectServer(name);
-			const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, { noReplay: config.sharing === "shared" });
+			const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
+				noReplay: config.sharing === "shared",
+			});
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
@@ -1981,7 +2010,9 @@ export class MCPManager {
 		const serverTools = await listTools(facade);
 		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		const reconnect = () => this.reconnectServer(name);
-		const customTools = MCPTool.fromTools(facade, serverTools, reconnect, { noReplay: connection.config.sharing === "shared" });
+		const customTools = MCPTool.fromTools(facade, serverTools, reconnect, {
+			noReplay: connection.config.sharing === "shared",
+		});
 		void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server

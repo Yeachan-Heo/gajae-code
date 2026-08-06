@@ -385,7 +385,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 			signal: AbortSignal;
 			awaitEventDrain: (invocationSignal: AbortSignal) => Promise<void>;
 		},
-	) => Promise<ContextMaintenanceResult | MidRunMaintenanceOutcome> | ContextMaintenanceResult | MidRunMaintenanceOutcome;
+	) =>
+		| Promise<ContextMaintenanceResult | MidRunMaintenanceOutcome>
+		| ContextMaintenanceResult
+		| MidRunMaintenanceOutcome;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.

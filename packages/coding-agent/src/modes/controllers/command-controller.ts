@@ -2,12 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import {
-	getEnvApiKey,
-	type ToolCall,
-	type UsageLimit,
-	type UsageReport,
-} from "@gajae-code/ai/core";
+import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";

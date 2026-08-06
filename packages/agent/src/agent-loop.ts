@@ -1522,7 +1522,8 @@ async function runLoopBody(
 						stream.waitForConsumerDrain(AbortSignal.any([loopSignal, invocationSignal])),
 				};
 				const maintenanceResult = await config.maintainContext(currentContext, lifecycle);
-				const maintenance = typeof maintenanceResult === "string" ? { outcome: maintenanceResult } : maintenanceResult;
+				const maintenance =
+					typeof maintenanceResult === "string" ? { outcome: maintenanceResult } : maintenanceResult;
 				// A callback can settle after its loop has been cancelled. Never let a
 				// stale "not-needed" fall through to streamAssistantResponse, which
 				// invokes the provider before it observes the aborted signal.

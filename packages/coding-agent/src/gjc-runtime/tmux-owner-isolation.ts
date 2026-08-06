@@ -16,11 +16,15 @@ import type { RecoveryFsRoot } from "@gajae-code/natives";
 
 let nativeRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] | undefined;
 
-
 function openRecoveryFsRootNative(): typeof import("@gajae-code/natives")["openRecoveryFsRoot"] {
-	nativeRecoveryFsRoot ??= (require("@gajae-code/natives") as { openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] }).openRecoveryFsRoot;
+	nativeRecoveryFsRoot ??= (
+		require("@gajae-code/natives") as {
+			openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"];
+		}
+	).openRecoveryFsRoot;
 	return nativeRecoveryFsRoot;
 }
+
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
 

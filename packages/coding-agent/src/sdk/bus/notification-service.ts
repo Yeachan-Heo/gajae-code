@@ -16,15 +16,14 @@ import * as fsSync from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
-import type * as native from "@gajae-code/natives";
-
 let nativeNotificationBindings: typeof import("@gajae-code/natives") | undefined;
 
-
 function nativeNotification(): typeof import("@gajae-code/natives") {
-	if (!nativeNotificationBindings) nativeNotificationBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	if (!nativeNotificationBindings)
+		nativeNotificationBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 	return nativeNotificationBindings;
 }
+
 import type { Settings } from "../../config/settings";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import {

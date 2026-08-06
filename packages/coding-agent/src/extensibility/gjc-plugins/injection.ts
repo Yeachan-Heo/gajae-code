@@ -14,10 +14,9 @@ async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promis
 import { readVisibleSkillActiveState } from "../../skill-state/active-state";
 import { initialPhaseForSkill } from "../../skill-state/initial-phase";
 import { sanitizePromptBody } from "./prompt-appendix";
-import { resolveValidatedActiveSubskill } from "./subskill-authority";
 import { readActiveSubskillsForParent } from "./state";
+import { resolveValidatedActiveSubskill } from "./subskill-authority";
 import { GJC_SUBSKILL_PARENT_AGENTS, type LoadedSubskillActivation } from "./types";
-
 
 function escapeAttribute(value: string): string {
 	return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -114,7 +113,9 @@ export async function buildAgentSubskillInjection(input: {
 		phase: "prompt",
 	});
 	const validated = (
-		await Promise.all(entries.map(entry => resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true })))
+		await Promise.all(
+			entries.map(entry => resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true })),
+		)
 	).filter((item): item is NonNullable<typeof item> => item !== null);
 	if (validated.length === 0) return "";
 	const blocks = await Promise.all(

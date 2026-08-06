@@ -185,7 +185,12 @@ export class HttpTransport implements MCPTransport {
 			return await this.#executeRequest<T>(method, params, options);
 		} catch (error) {
 			// Retry once on auth failure only for explicitly replay-safe requests.
-			if (this.onAuthError && !options?.noReplay && error instanceof Error && /^HTTP (401|403):/.test(error.message)) {
+			if (
+				this.onAuthError &&
+				!options?.noReplay &&
+				error instanceof Error &&
+				/^HTTP (401|403):/.test(error.message)
+			) {
 				const newHeaders = await this.onAuthError();
 				if (newHeaders) {
 					this.config = { ...this.config, headers: newHeaders };

@@ -31,12 +31,12 @@ import {
 	type AgentState,
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
+	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
 	getAgentTerminalOwnerContext,
 	type ManagedAttemptContinuationOwnership,
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
-	type ContextMaintenanceResult,
 	type MidRunMaintenanceOutcome,
 	type RunCancellationDomain,
 	type RunCancellationDomainBridge,
@@ -71,15 +71,15 @@ import {
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction";
 import {
-	DEFAULT_PRUNE_CONFIG,
-	type ToolOutputPruneEvictionHandle,
 	commitToolOutputPrune,
-	extractToolOutputText,
 	createPrunedNotice,
+	DEFAULT_PRUNE_CONFIG,
 	estimateToolOutputPruneSavings,
+	extractToolOutputText,
 	planToolOutputPrune,
 	pruneAssistantToolArguments,
 	shouldRunMaintenancePrune,
+	type ToolOutputPruneEvictionHandle,
 } from "@gajae-code/agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
@@ -2243,7 +2243,10 @@ export class AgentSession {
 		if (!idle && !system && !user && !display) return;
 		this.#powerAssertionLoad = Promise.resolve()
 			.then(() => {
-				const { MacOSPowerAssertion } = require("@gajae-code/natives") as Pick<typeof import("@gajae-code/natives"), "MacOSPowerAssertion">;
+				const { MacOSPowerAssertion } = require("@gajae-code/natives") as Pick<
+					typeof import("@gajae-code/natives"),
+					"MacOSPowerAssertion"
+				>;
 				if (this.#powerAssertion) return;
 				this.#powerAssertion = MacOSPowerAssertion.start({
 					reason: "Gajae Code agent session",
@@ -4924,7 +4927,9 @@ export class AgentSession {
 			lastMsg?.role === "assistant" &&
 			classifyContextOverflow(lastMsg as AssistantMessage, lastMsg.transportFailure, contextWindow)
 		) {
-			this.agent.replaceMessages(messages.slice(0, -1), { historyRewrite: { reason: "retry", preserveSeededPrefix: true } });
+			this.agent.replaceMessages(messages.slice(0, -1), {
+				historyRewrite: { reason: "retry", preserveSeededPrefix: true },
+			});
 		}
 	}
 
@@ -9893,7 +9898,9 @@ export class AgentSession {
 		const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
 		if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
-		this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "compaction", preserveSeededPrefix: true } });
+		this.agent.replaceMessages(sessionContext.messages, {
+			historyRewrite: { reason: "compaction", preserveSeededPrefix: true },
+		});
 		// Compaction can evict a previously injected goal/plan-mode-context copy from
 		// live context; clear the static-once signatures so the next prompt re-injects.
 		this.#resetInjectedContextSignatures();
@@ -9942,7 +9949,9 @@ export class AgentSession {
 			awaitEventDrain: async () => {},
 		},
 	): Promise<MidRunMaintenanceOutcome> {
-		return this.#trackMidRunMaintenance(this.#runMidRunMaintenance(context, lifecycle)).then(result => result.outcome);
+		return this.#trackMidRunMaintenance(this.#runMidRunMaintenance(context, lifecycle)).then(
+			result => result.outcome,
+		);
 	}
 
 	/** Test seam: estimate mid-run context tokens for a given context view. */
@@ -11734,8 +11743,10 @@ export class AgentSession {
 				if (signal?.aborted) break;
 				const proposal = plan.replacements.find(candidate => candidate.entryId === digest.entryId);
 				if (!proposal?.complete) continue;
-				const entry = branchEntries.find(candidate => candidate.type === "message" && candidate.id === digest.entryId);
-				if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") continue;
+				const entry = branchEntries.find(
+					candidate => candidate.type === "message" && candidate.id === digest.entryId,
+				);
+				if (entry?.type !== "message" || entry.message.role !== "toolResult") continue;
 				const captured = extractToolOutputText(entry.message as ToolResultMessage);
 				const outcome = await artifactManager.publishExactText(captured.text, { toolType: "evicted" });
 				if (outcome.outcome === "saved") {
@@ -11765,7 +11776,9 @@ export class AgentSession {
 		// live entry is mutated. This avoids retaining originals for rollback.
 		const estimateEntries = structuredClone(branchEntries) as typeof branchEntries;
 		const estimatedArgumentResult = pruneAssistantToolArguments(estimateEntries, DEFAULT_PRUNE_CONFIG);
-		const estimatedFileMentionResult = pruneStaleFileMentions(estimateEntries, p => resolveReadPath(p, this.sessionManager.getCwd()));
+		const estimatedFileMentionResult = pruneStaleFileMentions(estimateEntries, p =>
+			resolveReadPath(p, this.sessionManager.getCwd()),
+		);
 		const estimatedVolatileResult = pruneSupersededVolatileProjectContext(estimateEntries);
 		const estimatedReminderResult = pruneSupersededMaintenanceReminders(estimateEntries);
 		const estimatedToolEntries = [...published.keys()];
@@ -11774,8 +11787,13 @@ export class AgentSession {
 			const handle = published.get(entryId);
 			if (!proposal || !handle) return total;
 			const entry = branchEntries.find(candidate => candidate.type === "message" && candidate.id === entryId);
-			if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") return total;
-			const replacement = createPrunedNotice(proposal.tokens, entry.message as ToolResultMessage, undefined, handle.uri);
+			if (entry?.type !== "message" || entry.message.role !== "toolResult") return total;
+			const replacement = createPrunedNotice(
+				proposal.tokens,
+				entry.message as ToolResultMessage,
+				undefined,
+				handle.uri,
+			);
 			return total + Math.max(0, proposal.tokens - estimateTextTokensHeuristic(replacement));
 		}, 0);
 		const estimatedPrunedCount =
@@ -11787,13 +11805,21 @@ export class AgentSession {
 		const estimatedTokensSaved =
 			estimatedToolSavings +
 			estimatedArgumentResult.argumentTokensSaved +
-			Math.round((estimatedFileMentionResult.bytesSaved + estimatedVolatileResult.bytesSaved + estimatedReminderResult.bytesSaved) / 4);
+			Math.round(
+				(estimatedFileMentionResult.bytesSaved +
+					estimatedVolatileResult.bytesSaved +
+					estimatedReminderResult.bytesSaved) /
+					4,
+			);
 
 		if (estimatedPrunedCount === 0 || signal?.aborted) {
 			await removePublishedArtifacts();
 			return undefined;
 		}
-		if (options?.commitGate && !options.commitGate({ prunedCount: estimatedPrunedCount, tokensSaved: estimatedTokensSaved })) {
+		if (
+			options?.commitGate &&
+			!options.commitGate({ prunedCount: estimatedPrunedCount, tokensSaved: estimatedTokensSaved })
+		) {
 			await removePublishedArtifacts();
 			return { prunedCount: estimatedPrunedCount, tokensSaved: estimatedTokensSaved, committed: false };
 		}
@@ -11837,40 +11863,62 @@ export class AgentSession {
 				digests: plan.digests.filter(digest => published.has(digest.entryId)),
 				replacements: plan.replacements.filter(replacement => published.has(replacement.entryId)),
 			};
-			const replacementOverrides = new Map<string, { replacementText: string; eviction: ToolOutputPruneEvictionHandle }>();
+			const replacementOverrides = new Map<
+				string,
+				{ replacementText: string; eviction: ToolOutputPruneEvictionHandle }
+			>();
 			for (const digest of committedPlan.digests) {
 				const proposal = committedPlan.replacements.find(candidate => candidate.entryId === digest.entryId);
 				const handle = published.get(digest.entryId);
-				const entry = branchEntries.find(candidate => candidate.type === "message" && candidate.id === digest.entryId);
-				if (!proposal || !handle || !entry || entry.type !== "message" || entry.message.role !== "toolResult") continue;
+				const entry = branchEntries.find(
+					candidate => candidate.type === "message" && candidate.id === digest.entryId,
+				);
+				if (!proposal || !handle || !entry || entry.type !== "message" || entry.message.role !== "toolResult")
+					continue;
 				replacementOverrides.set(digest.entryId, {
-					replacementText: createPrunedNotice(proposal.tokens, entry.message as ToolResultMessage, undefined, handle.uri),
+					replacementText: createPrunedNotice(
+						proposal.tokens,
+						entry.message as ToolResultMessage,
+						undefined,
+						handle.uri,
+					),
 					eviction: handle,
 				});
 			}
-			const commitOutcomes = commitToolOutputPrune(branchEntries, committedPlan, { replacements: replacementOverrides });
-			const committedIds = new Set(commitOutcomes.filter(outcome => outcome.outcome === "committed").map(outcome => outcome.entryId));
+			const commitOutcomes = commitToolOutputPrune(branchEntries, committedPlan, {
+				replacements: replacementOverrides,
+			});
+			const committedIds = new Set(
+				commitOutcomes.filter(outcome => outcome.outcome === "committed").map(outcome => outcome.entryId),
+			);
 			for (const outcome of commitOutcomes) {
 				if (outcome.outcome !== "committed") {
 					const handle = published.get(outcome.entryId);
 					if (handle) {
 						const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
-						if (removed === false) logger.warn("Failed to remove rejected tool-output eviction artifact", { artifactId: handle.artifactId });
+						if (removed === false)
+							logger.warn("Failed to remove rejected tool-output eviction artifact", {
+								artifactId: handle.artifactId,
+							});
 					}
 					published.delete(outcome.entryId);
 				}
 			}
 			const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
-			const fileMentionResult = pruneStaleFileMentions(branchEntries, p => resolveReadPath(p, this.sessionManager.getCwd()));
+			const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
+				resolveReadPath(p, this.sessionManager.getCwd()),
+			);
 			const volatileContextResult = pruneSupersededVolatileProjectContext(branchEntries);
 			const reminderResult = pruneSupersededMaintenanceReminders(branchEntries);
 			const toolTokensSaved = [...committedIds].reduce((total, entryId) => {
 				const proposal = plan.replacements.find(candidate => candidate.entryId === entryId);
 				const handle = published.get(entryId);
 				const entry = branchEntries.find(candidate => candidate.type === "message" && candidate.id === entryId);
-				if (!proposal || !handle || !entry || entry.type !== "message" || entry.message.role !== "toolResult") return total;
+				if (!proposal || !handle || !entry || entry.type !== "message" || entry.message.role !== "toolResult")
+					return total;
 				const content = (entry.message as ToolResultMessage).content;
-				const replacement = typeof content === "string" ? content : content.find(part => part.type === "text")?.text ?? "";
+				const replacement =
+					typeof content === "string" ? content : (content.find(part => part.type === "text")?.text ?? "");
 				return total + Math.max(0, proposal.tokens - estimateTextTokensHeuristic(replacement));
 			}, 0);
 			const prunedCount =
@@ -11882,7 +11930,9 @@ export class AgentSession {
 			const tokensSaved =
 				toolTokensSaved +
 				argumentResult.argumentTokensSaved +
-				Math.round((fileMentionResult.bytesSaved + volatileContextResult.bytesSaved + reminderResult.bytesSaved) / 4);
+				Math.round(
+					(fileMentionResult.bytesSaved + volatileContextResult.bytesSaved + reminderResult.bytesSaved) / 4,
+				);
 			if (prunedCount === 0 || signal?.aborted) {
 				await removePublishedArtifacts();
 				return undefined;
@@ -11896,10 +11946,15 @@ export class AgentSession {
 			);
 			const combined = [...committedToolEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
 			this.sessionManager.applyEntryMessageUpdates(combined);
-			this.sessionManager.applyCustomMessageEntryUpdates([...volatileContextResult.changed, ...reminderResult.changed]);
+			this.sessionManager.applyCustomMessageEntryUpdates([
+				...volatileContextResult.changed,
+				...reminderResult.changed,
+			]);
 			await this.sessionManager.rewriteEntries();
 			const sessionContext = this.buildDisplaySessionContext();
-			this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "tool-output-prune", preserveSeededPrefix: true } });
+			this.agent.replaceMessages(sessionContext.messages, {
+				historyRewrite: { reason: "tool-output-prune", preserveSeededPrefix: true },
+			});
 			this.#contextUsageCache = undefined;
 			this.#providerReplaySourceCache = new WeakMap<AgentMessage, ProviderReplaySourceCacheEntry>();
 			// Pruning can evict a previously injected goal/plan-mode-context copy; clear
@@ -12512,7 +12567,9 @@ export class AgentSession {
 				this.sessionManager.restoreState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
-				this.agent.replaceMessages(rollbackAgentMessages, { historyRewrite: { reason: "handoff-rollback", preserveSeededPrefix: true } });
+				this.agent.replaceMessages(rollbackAgentMessages, {
+					historyRewrite: { reason: "handoff-rollback", preserveSeededPrefix: true },
+				});
 				this.agent.clearAllQueues();
 				this.agent.restoreSteering(rollbackAgentSteeringQueue);
 				this.agent.restoreFollowUp(rollbackAgentFollowUpQueue);
@@ -12626,7 +12683,9 @@ export class AgentSession {
 			const messages = this.agent.state.messages;
 			let removedOverflowAssistant = false;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-				this.agent.replaceMessages(messages.slice(0, -1), { historyRewrite: { reason: "overflow-retry", preserveSeededPrefix: true } });
+				this.agent.replaceMessages(messages.slice(0, -1), {
+					historyRewrite: { reason: "overflow-retry", preserveSeededPrefix: true },
+				});
 				removedOverflowAssistant = true;
 			}
 
@@ -13031,7 +13090,9 @@ export class AgentSession {
 			return;
 		}
 		const safeCount = Math.max(0, Math.min(checkpointState.checkpointMessageCount, this.agent.state.messages.length));
-		this.agent.replaceMessages(this.agent.state.messages.slice(0, safeCount), { historyRewrite: { reason: "rewind", preserveSeededPrefix: true } });
+		this.agent.replaceMessages(this.agent.state.messages.slice(0, safeCount), {
+			historyRewrite: { reason: "rewind", preserveSeededPrefix: true },
+		});
 		this.#resetInjectedContextSignatures();
 		try {
 			this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
@@ -15368,7 +15429,9 @@ export class AgentSession {
 					if (previous.stopReason !== "error" && previous.stopReason !== "aborted") break;
 					end--;
 				}
-				this.agent.replaceMessages(messages.slice(0, end), { historyRewrite: { reason: "retry", preserveSeededPrefix: true } });
+				this.agent.replaceMessages(messages.slice(0, end), {
+					historyRewrite: { reason: "retry", preserveSeededPrefix: true },
+				});
 			}
 			const retrySignal = ownership
 				? AbortSignal.any([retryAbortController.signal, ownership.lease.signal])
@@ -15610,7 +15673,9 @@ export class AgentSession {
 		if (!shouldDropAssistant) return false;
 
 		// Remove the failed/aborted/incomplete assistant message before re-attempting.
-		this.agent.replaceMessages(messages.slice(0, -1), { historyRewrite: { reason: "retry", preserveSeededPrefix: true } });
+		this.agent.replaceMessages(messages.slice(0, -1), {
+			historyRewrite: { reason: "retry", preserveSeededPrefix: true },
+		});
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
@@ -16700,7 +16765,9 @@ export class AgentSession {
 				this.agent.clearAllQueues();
 
 				if (historyRewriteReason) {
-					this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: historyRewriteReason } });
+					this.agent.replaceMessages(sessionContext.messages, {
+						historyRewrite: { reason: historyRewriteReason },
+					});
 				} else {
 					this.agent.replaceMessages(sessionContext.messages);
 				}
@@ -16979,7 +17046,9 @@ export class AgentSession {
 			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 			if (!skipConversationRestore) {
-				this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "session-branch", preserveSeededPrefix: true } });
+				this.agent.replaceMessages(sessionContext.messages, {
+					historyRewrite: { reason: "session-branch", preserveSeededPrefix: true },
+				});
 				this.#resetInjectedContextSignatures();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
 			}
@@ -17171,7 +17240,9 @@ export class AgentSession {
 			// request-scoped entries cannot re-enter live history after tree navigation.
 			const displayContext = this.buildDisplaySessionContext();
 			await this.#restoreMCPSelectionsForSessionContext(displayContext);
-			this.agent.replaceMessages(displayContext.messages, { historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: true } });
+			this.agent.replaceMessages(displayContext.messages, {
+				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: true },
+			});
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();

@@ -1,6 +1,6 @@
 import * as path from "node:path";
-import { TOOL_CATALOG } from "../src/tools/tool-catalog.generated";
 import { toolWireSchema } from "@gajae-code/ai/utils/schema";
+import { TOOL_CATALOG } from "../src/tools/tool-catalog.generated";
 
 export interface GeneratedToolCatalogEntry {
 	name: string;
@@ -21,7 +21,7 @@ export interface GeneratedToolCatalogEntry {
 	inline?: boolean;
 	intent?: "omit" | "optional" | "require";
 	platformExclusions?: readonly { platform: string; arch?: string }[];
-};
+}
 
 export interface ToolCatalogGenerationOptions {
 	platform?: NodeJS.Platform;
@@ -79,7 +79,7 @@ function makeSettings() {
 		"task.simpleMode": "off",
 		"task.simple": "default",
 		"task.parentSpawns": "*",
-		"disabledExtensions": [],
+		disabledExtensions: [],
 		"memory.backend": "off",
 		"edit.fuzzyMatch": true,
 		"edit.fuzzyThreshold": 0.8,
@@ -90,7 +90,8 @@ function makeSettings() {
 		get: (key: string) => values[key],
 		has: (key: string) => Object.hasOwn(values, key),
 		getGroup: (group: string) => {
-			if (group === "skills") return { enabled: true, enablePiUser: true, enablePiProject: true, customDirectories: [] };
+			if (group === "skills")
+				return { enabled: true, enablePiUser: true, enablePiProject: true, customDirectories: [] };
 			if (group === "task") return { disabledAgents: [] };
 			return {};
 		},
@@ -128,7 +129,17 @@ function makeSession(): any {
 		getCheckpointState: () => undefined,
 		setCheckpointState: () => undefined,
 		sendCustomMessage: async () => undefined,
-		skills: [{ name: "catalog", path: "embedded:catalog", filePath: "embedded:catalog", baseDir: "embedded:", description: "catalog", source: "bundled:default", content: "" }],
+		skills: [
+			{
+				name: "catalog",
+				path: "embedded:catalog",
+				filePath: "embedded:catalog",
+				baseDir: "embedded:",
+				description: "catalog",
+				source: "bundled:default",
+				content: "",
+			},
+		],
 		agentRegistry: {},
 		getArtifactsDir: () => null,
 		getAuthorizedArtifactsDirs: () => [],
@@ -174,7 +185,8 @@ function readToolProperty(toolName: string, tool: unknown, key: string): unknown
 
 function assertCatalogJsonValue(value: unknown, seen = new Set<object>()): void {
 	if (value === undefined) throw new Error("value contains undefined");
-	if (typeof value === "function" || typeof value === "symbol") throw new Error(`value has unsupported ${typeof value}`);
+	if (typeof value === "function" || typeof value === "symbol")
+		throw new Error(`value has unsupported ${typeof value}`);
 	if (value === null || typeof value !== "object") return;
 	if (seen.has(value)) return;
 	seen.add(value);
@@ -209,7 +221,10 @@ function excludedOnPlatform(
 	platform: NodeJS.Platform,
 	arch: NodeJS.Architecture,
 ): boolean {
-	return exclusions?.some(exclusion => exclusion.platform === platform && (!exclusion.arch || exclusion.arch === arch)) ?? false;
+	return (
+		exclusions?.some(exclusion => exclusion.platform === platform && (!exclusion.arch || exclusion.arch === arch)) ??
+		false
+	);
 }
 
 function fallbackMetadata(tool: Record<string, unknown>, parameters: unknown): AuditedFallback {
@@ -245,7 +260,10 @@ function fallbackMetadata(tool: Record<string, unknown>, parameters: unknown): A
 async function fallbackForPlatformExcludedTool(name: string): Promise<AuditedFallback> {
 	if (name === "computer") {
 		const { computerSchema, ComputerTool } = await import("../src/tools/computer");
-		const fallback = fallbackMetadata(new ComputerTool({} as any) as unknown as Record<string, unknown>, computerSchema);
+		const fallback = fallbackMetadata(
+			new ComputerTool({} as any) as unknown as Record<string, unknown>,
+			computerSchema,
+		);
 		fallback.deferrable = true;
 		return fallback;
 	}
@@ -255,13 +273,19 @@ async function fallbackForPlatformExcludedTool(name: string): Promise<AuditedFal
 async function fallbackForUnavailableTool(name: string): Promise<AuditedFallback> {
 	if (name === "ssh") {
 		const { sshSchema, SshTool, SSH_DESCRIPTION } = await import("../src/tools/ssh");
-		const fallback = fallbackMetadata(new SshTool({} as any, [], new Map(), SSH_DESCRIPTION) as unknown as Record<string, unknown>, sshSchema);
+		const fallback = fallbackMetadata(
+			new SshTool({} as any, [], new Map(), SSH_DESCRIPTION) as unknown as Record<string, unknown>,
+			sshSchema,
+		);
 		fallback.deferrable = true;
 		return fallback;
 	}
 	if (name === "telegram_send") {
 		const { telegramSendSchema, TelegramSendTool } = await import("../src/tools/telegram-send");
-		const fallback = fallbackMetadata(new TelegramSendTool({} as any) as unknown as Record<string, unknown>, telegramSendSchema);
+		const fallback = fallbackMetadata(
+			new TelegramSendTool({} as any) as unknown as Record<string, unknown>,
+			telegramSendSchema,
+		);
 		fallback.deferrable = true;
 		return fallback;
 	}
@@ -286,14 +310,22 @@ async function fallbackForUnavailableTool(name: string): Promise<AuditedFallback
 	throw new Error(`No independently derived catalog fallback is defined for unavailable tool "${name}"`);
 }
 
-export async function generateToolCatalogData(options: ToolCatalogGenerationOptions = {}): Promise<Record<string, GeneratedToolCatalogEntry>> {
+export async function generateToolCatalogData(
+	options: ToolCatalogGenerationOptions = {},
+): Promise<Record<string, GeneratedToolCatalogEntry>> {
 	const previousEditVariant = process.env.GJC_EDIT_VARIANT;
 	process.env.GJC_EDIT_VARIANT = "replace";
 	const platform = options.platform ?? process.platform;
 	const arch = options.arch ?? process.arch;
 	try {
-		const { BUILTIN_TOOL_DESCRIPTORS, HIDDEN_TOOL_DESCRIPTORS, PLATFORM_EXCLUDED_TOOL_DESCRIPTORS } = await import("../src/tools/descriptors");
-		const all = { ...BUILTIN_TOOL_DESCRIPTORS, ...HIDDEN_TOOL_DESCRIPTORS, ...PLATFORM_EXCLUDED_TOOL_DESCRIPTORS } as Record<string, any>;
+		const { BUILTIN_TOOL_DESCRIPTORS, HIDDEN_TOOL_DESCRIPTORS, PLATFORM_EXCLUDED_TOOL_DESCRIPTORS } = await import(
+			"../src/tools/descriptors"
+		);
+		const all = {
+			...BUILTIN_TOOL_DESCRIPTORS,
+			...HIDDEN_TOOL_DESCRIPTORS,
+			...PLATFORM_EXCLUDED_TOOL_DESCRIPTORS,
+		} as Record<string, any>;
 		const session = makeSession();
 		const output: Record<string, GeneratedToolCatalogEntry> = {};
 		for (const [name, descriptor] of Object.entries(all)) {
@@ -393,7 +425,8 @@ export async function generateToolCatalogData(options: ToolCatalogGenerationOpti
 					}
 				}
 			}
-			const read = (key: string): unknown => (fallback ? fallback[key as keyof AuditedFallback] : readToolProperty(name, tool, key));
+			const read = (key: string): unknown =>
+				fallback ? fallback[key as keyof AuditedFallback] : readToolProperty(name, tool, key);
 			const choose = <T>(key: string, descriptorValue: T | undefined): T | undefined =>
 				fallback ? (read(key) as T | undefined) : ((read(key) as T | undefined) ?? descriptorValue);
 			const intent = choose("intent", descriptor.metadata.intent);
@@ -411,7 +444,11 @@ export async function generateToolCatalogData(options: ToolCatalogGenerationOpti
 				concurrency: choose("concurrency", descriptor.metadata.concurrency),
 				lenientArgValidation: choose("lenientArgValidation", descriptor.metadata.lenientArgValidation),
 				customWireName: choose("customWireName", descriptor.metadata.customWireName),
-				customFormat: serializeCatalogValue(name, "customFormat", choose("customFormat", descriptor.metadata.customFormat)) as GeneratedToolCatalogEntry["customFormat"],
+				customFormat: serializeCatalogValue(
+					name,
+					"customFormat",
+					choose("customFormat", descriptor.metadata.customFormat),
+				) as GeneratedToolCatalogEntry["customFormat"],
 				mergeCallAndResult: choose("mergeCallAndResult", descriptor.metadata.mergeCallAndResult),
 				inline: choose("inline", descriptor.metadata.inline),
 				intent: typeof intent === "string" ? (intent as GeneratedToolCatalogEntry["intent"]) : undefined,

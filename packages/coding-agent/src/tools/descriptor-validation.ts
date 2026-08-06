@@ -1,11 +1,6 @@
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import type { ToolSession } from ".";
-import {
-	askSchema,
-	recoverRoundZeroIntentContract,
-	intentContract,
-	intentReview,
-} from "./ask-contract";
+import { askSchema, intentContract, intentReview, recoverRoundZeroIntentContract } from "./ask-contract";
 
 export const deferredAskParameters = askSchema;
 
@@ -46,7 +41,8 @@ export const validateDeferredAskArguments = (
 export type DeferredIntentPolicy = (arguments_: Record<string, unknown>) => string | undefined;
 
 export const deferredIntentPolicies: Readonly<Record<string, DeferredIntentPolicy>> = {
-	bisect: arguments_ => (typeof arguments_.run === "string" && arguments_.run ? `bisecting: ${arguments_.run}` : "bisecting regression"),
+	bisect: arguments_ =>
+		typeof arguments_.run === "string" && arguments_.run ? `bisecting: ${arguments_.run}` : "bisecting regression",
 	checkpoint: arguments_ =>
 		typeof arguments_.goal === "string" && arguments_.goal ? `checkpointing: ${arguments_.goal}` : "checkpointing",
 	rewind: () => "rewinding",

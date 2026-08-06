@@ -513,7 +513,7 @@ function startSpan(
 		readonly toolName?: string;
 	},
 ): Span | undefined {
-	if (!telemetry || !telemetry.spansEnabled) return undefined;
+	if (!telemetry?.spansEnabled) return undefined;
 	const attrCtx = buildTelemetryAttributeContext(telemetry, kind, options);
 	const attrs: Attributes = {};
 	const operation = kindToOperation(kind);
@@ -711,7 +711,7 @@ function safeOnSpanEnd(telemetry: AgentTelemetry | undefined, ctx: TelemetryHook
  * Returns `undefined` when telemetry is disabled.
  */
 export function startInvokeAgentSpan(telemetry: AgentTelemetry | undefined, model: Model): Span | undefined {
-	if (!telemetry || !telemetry.spansEnabled) return undefined;
+	if (!telemetry?.spansEnabled) return undefined;
 	const agentName = telemetry.agent ? normalizeAgentIdentity(telemetry, telemetry.agent).name : undefined;
 	const name = agentName ? `invoke_agent ${agentName}` : "invoke_agent";
 	return startSpan(telemetry, "invoke_agent", name, { spanKind: SpanKind.INTERNAL, model });
@@ -1904,7 +1904,8 @@ export function finishExecuteToolSpan(
 	if (status !== "ok") {
 		span.setAttribute(GenAIAttr.ErrorType, errorType ?? STATUS_ERROR_TYPE[status]);
 		span.setAttribute(EXECUTE_TOOL_STATUS_ATTR, status);
-		const msg = options.errorObject instanceof Error ? options.errorObject.message : (options.errorMessage ?? errorType);
+		const msg =
+			options.errorObject instanceof Error ? options.errorObject.message : (options.errorMessage ?? errorType);
 		span.setStatus({ code: SpanStatusCode.ERROR, message: msg });
 	} else {
 		span.setAttribute(EXECUTE_TOOL_STATUS_ATTR, status);
@@ -2104,7 +2105,7 @@ export function recordHandoff(
 		readonly attributes?: Attributes;
 	},
 ): void {
-	if (!telemetry || !telemetry.spansEnabled) return;
+	if (!telemetry?.spansEnabled) return;
 	const attrs: Attributes = {};
 	const fromAgent = options.fromAgent ? normalizeAgentIdentity(telemetry, options.fromAgent) : undefined;
 	const toAgent = normalizeAgentIdentity(telemetry, options.toAgent);

@@ -1,4 +1,3 @@
-
 /**
  * Lazy synchronous binding for @gajae-code/natives process control.
  *

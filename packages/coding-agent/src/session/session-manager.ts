@@ -19,13 +19,13 @@ import type * as native from "@gajae-code/natives";
 
 let nativeSessionManagerBindings: typeof import("@gajae-code/natives") | undefined;
 
-
 function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	if (!nativeSessionManagerBindings) {
 		nativeSessionManagerBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 	}
 	return nativeSessionManagerBindings;
 }
+
 import { getTerminalId } from "@gajae-code/tui";
 import {
 	getAgentDir,
@@ -4860,9 +4860,9 @@ class EvictedArtifactValidationError extends Error {
 	}
 }
 
-function validateEvictedToolOutputHandle(value: unknown):
-	| { ok: true; handle: EvictedToolOutputHandle }
-	| { ok: false; diagnostic: string; code: string } {
+function validateEvictedToolOutputHandle(
+	value: unknown,
+): { ok: true; handle: EvictedToolOutputHandle } | { ok: false; diagnostic: string; code: string } {
 	if (!value || typeof value !== "object" || Array.isArray(value))
 		return { ok: false, code: "invalid_shape", diagnostic: "eviction handle must be an object" };
 	const handle = value as Record<string, unknown>;
@@ -4873,7 +4873,8 @@ function validateEvictedToolOutputHandle(value: unknown):
 			diagnostic: `unsupported eviction handle version ${String(handle.v)}; only v1 is readable`,
 		};
 	}
-	if (handle.complete !== true) return { ok: false, code: "incomplete", diagnostic: "eviction artifact is not complete" };
+	if (handle.complete !== true)
+		return { ok: false, code: "incomplete", diagnostic: "eviction artifact is not complete" };
 	if (
 		typeof handle.artifactId !== "string" ||
 		!/^[0-9]+$/.test(handle.artifactId) ||
@@ -6476,7 +6477,9 @@ export class SessionManager {
 				if (!retainedTreeSnapshotEquals(adoptedSnapshot, forkArtifactPublication.snapshot))
 					throw new Error("artifact_destination_changed_during_transcript_publication");
 			} else if (forkArtifactPublication) {
-				const terminalArtifacts = nativeSessionManager().snapshotDirectoryTree(forkArtifactPublication.artifactsDir);
+				const terminalArtifacts = nativeSessionManager().snapshotDirectoryTree(
+					forkArtifactPublication.artifactsDir,
+				);
 				if (
 					!terminalArtifacts.ok ||
 					!terminalArtifacts.snapshot ||
@@ -6624,7 +6627,9 @@ export class SessionManager {
 					throw new Error("artifact_destination_terminal_mismatch");
 				// No-replace publication: a directory that appeared at the final name after the
 				// preflight is never replaced and never touched.
-				const outcome = classifyNativePublishOutcome(nativeSessionManager().renameNoReplacePath(stagingDir, finalDestinationDir));
+				const outcome = classifyNativePublishOutcome(
+					nativeSessionManager().renameNoReplacePath(stagingDir, finalDestinationDir),
+				);
 				if (!outcome.ok) {
 					if (outcome.reason === "destination_exists") throw new Error("destination_conflict");
 					throw new Error(outcome.code ?? "artifact_destination_publish_failed");
@@ -8223,10 +8228,7 @@ export class SessionManager {
 		return { manager, handle: validation.handle };
 	}
 
-	async #verifyEvictedToolOutputDigest(
-		manager: ArtifactManager,
-		handle: EvictedToolOutputHandle,
-	): Promise<void> {
+	async #verifyEvictedToolOutputDigest(manager: ArtifactManager, handle: EvictedToolOutputHandle): Promise<void> {
 		const stream = await manager.openReadStream(handle.artifactId);
 		const reader = stream.getReader();
 		const digest = crypto.createHash("sha256");
@@ -8236,7 +8238,10 @@ export class SessionManager {
 				const next = await reader.read();
 				if (next.done) break;
 				if (!(next.value instanceof Uint8Array))
-					throw new EvictedArtifactValidationError("invalid_artifact_stream", "eviction artifact stream is invalid");
+					throw new EvictedArtifactValidationError(
+						"invalid_artifact_stream",
+						"eviction artifact stream is invalid",
+					);
 				bytes += next.value.byteLength;
 				digest.update(next.value);
 			}
@@ -8279,7 +8284,8 @@ export class SessionManager {
 		if (
 			range &&
 			((range.start !== undefined && (!Number.isSafeInteger(range.start) || range.start < 0)) ||
-				(range.endExclusive !== undefined && (!Number.isSafeInteger(range.endExclusive) || range.endExclusive < 0)) ||
+				(range.endExclusive !== undefined &&
+					(!Number.isSafeInteger(range.endExclusive) || range.endExclusive < 0)) ||
 				(range.start !== undefined && range.endExclusive !== undefined && range.start > range.endExclusive))
 		) {
 			return { outcome: "unavailable", diagnostic: "invalid artifact byte range" };
@@ -10477,7 +10483,9 @@ export class SessionManager {
 						throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
 					privateStagingSnapshot = capturedStaging.snapshot;
 					fsyncManagedArtifactTree(privateStagingDir);
-					const outcome = classifyNativePublishOutcome(nativeSessionManager().renameNoReplacePath(privateStagingDir, dir));
+					const outcome = classifyNativePublishOutcome(
+						nativeSessionManager().renameNoReplacePath(privateStagingDir, dir),
+					);
 					if (!outcome.ok) throw new Error(outcome.code ?? "fork_destination_publish_failed");
 					privateStagingPublished = true;
 					const terminal = nativeSessionManager().snapshotDirectoryTree(dir);
@@ -10515,7 +10523,10 @@ export class SessionManager {
 					if (toError(cleanupError).message !== "cleanup_pending") cleanupErrors.push(toError(cleanupError));
 				}
 				if (!privateStagingPublished && privateStagingDir && privateStagingSnapshot) {
-					const removed = nativeSessionManager().exactRemoveDirectoryTree(privateStagingDir, privateStagingSnapshot);
+					const removed = nativeSessionManager().exactRemoveDirectoryTree(
+						privateStagingDir,
+						privateStagingSnapshot,
+					);
 					if (!removed.ok && removed.code !== "not_found" && removed.code !== "cleanup_pending")
 						cleanupErrors.push(new Error(removed.code ?? "fork_staging_cleanup_failed"));
 				}

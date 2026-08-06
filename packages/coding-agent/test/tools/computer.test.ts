@@ -3,11 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import {
-	BUILTIN_CAPABILITY_CATALOG,
-	createTools,
-	type ToolSession,
-} from "@gajae-code/coding-agent/tools";
+import { BUILTIN_CAPABILITY_CATALOG, createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
+import { summarizeComputerDetails } from "@gajae-code/coding-agent/tools/computer/render";
 import {
 	ComputerTool,
 	computerSchema,
@@ -17,7 +14,6 @@ import {
 	setComputerControllerFactoryForTests,
 	setComputerPlatformForTests,
 } from "@gajae-code/coding-agent/tools/implementations";
-import { summarizeComputerDetails } from "@gajae-code/coding-agent/tools/computer/render";
 import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
 import { zlibSync } from "fflate";
 

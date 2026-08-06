@@ -1,21 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import type {
-	AssistantMessage,
-	Message,
-	ToolResultMessage,
-} from "@gajae-code/ai";
+import type { AssistantMessage, Message, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Agent } from "./agent";
-import { AppendOnlyContextManager } from "./append-only-context";
 import { agentLoop } from "./agent-loop";
+import { AppendOnlyContextManager } from "./append-only-context";
+import type { SessionEntry, SessionMessageEntry } from "./compaction/entries";
 import {
 	commitToolOutputPrune,
-	planToolOutputPrune,
 	type PruneConfig,
+	planToolOutputPrune,
 	type ToolOutputPrunePlan,
 } from "./compaction/pruning";
-import type { SessionEntry, SessionMessageEntry } from "./compaction/entries";
 import type { AgentMessage, AgentTool, ContextMaintenanceResult } from "./types";
 
 const PRUNE_CONFIG: PruneConfig = {
@@ -65,7 +61,10 @@ function forceGc(): void {
 	if (typeof Bun.gc === "function") Bun.gc(true);
 }
 
-function assistantMessage(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage {
+function assistantMessage(
+	content: AssistantMessage["content"],
+	stopReason: AssistantMessage["stopReason"],
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content,
@@ -140,7 +139,15 @@ describe("W4 heap eviction acceptance: Agent retainers and rewrite boundaries", 
 		original = undefined as unknown as ToolResultMessage;
 		markerHolder = undefined;
 
-		const retainers = [agent.state, appendOnly.log.toMessages(), currentContext, newMessages, convertedContextCache, plan, commit];
+		const retainers = [
+			agent.state,
+			appendOnly.log.toMessages(),
+			currentContext,
+			newMessages,
+			convertedContextCache,
+			plan,
+			commit,
+		];
 		expect(retainers.some(value => containsText(value, marker))).toBe(false);
 		expect(agent.state.messages).toEqual([]);
 		expect(appendOnly.log.length).toBe(0);
@@ -193,9 +200,7 @@ describe("W4 heap eviction acceptance: Agent retainers and rewrite boundaries", 
 	});
 
 	test("seeded fork prefixes survive a child history rewrite", () => {
-		const prefix: Message[] = [
-			{ role: "user", content: "seeded-prefix", timestamp: Date.now() },
-		];
+		const prefix: Message[] = [{ role: "user", content: "seeded-prefix", timestamp: Date.now() }];
 		const manager = AppendOnlyContextManager.forkFromSeed({
 			messages: prefix,
 			options: { intentTracing: false },
@@ -207,19 +212,13 @@ describe("W4 heap eviction acceptance: Agent retainers and rewrite boundaries", 
 		const prefixBytes = jsonBytes(manager.log.toMessages()[0]);
 
 		agent.replaceMessages(
-			[
-				prefix[0] as AgentMessage,
-				{ role: "user", content: "child-before-rewrite", timestamp: Date.now() },
-			],
+			[prefix[0] as AgentMessage, { role: "user", content: "child-before-rewrite", timestamp: Date.now() }],
 			{ historyRewrite: { reason: "child-rewrite", preserveSeededPrefix: true } },
 		);
 		expect(jsonBytes(manager.log.toMessages()[0])).toBe(prefixBytes);
 		expect(manager.log.length).toBe(1);
 
-		manager.syncMessages([
-			prefix[0],
-			{ role: "user", content: "child-after-rewrite", timestamp: Date.now() },
-		]);
+		manager.syncMessages([prefix[0], { role: "user", content: "child-after-rewrite", timestamp: Date.now() }]);
 		expect(jsonBytes(manager.log.toMessages()[0])).toBe(prefixBytes);
 		expect(manager.log.toMessages().at(-1)).toMatchObject({ content: "child-after-rewrite" });
 	});
@@ -239,7 +238,10 @@ describe("W4 heap eviction acceptance: Agent retainers and rewrite boundaries", 
 		}
 		const outcomes = commitToolOutputPrune(commitEntries, plan);
 		expect(outcomes.find(outcome => outcome.entryId === "first")).toMatchObject({ outcome: "mismatch" });
-		expect(outcomes.find(outcome => outcome.entryId === "second")).toEqual({ entryId: "second", outcome: "committed" });
+		expect(outcomes.find(outcome => outcome.entryId === "second")).toEqual({
+			entryId: "second",
+			outcome: "committed",
+		});
 	});
 
 	test("ContextMaintenanceResult releaseCurrentContext clears loop context and newMessages", async () => {

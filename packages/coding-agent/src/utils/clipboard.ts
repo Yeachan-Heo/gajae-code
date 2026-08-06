@@ -1,6 +1,5 @@
 import { execSync } from "node:child_process";
 import type { ClipboardImage } from "@gajae-code/natives";
-import type * as native from "@gajae-code/natives";
 
 let nativeClipboardLoad: Promise<typeof import("@gajae-code/natives")> | undefined;
 
@@ -8,6 +7,7 @@ async function nativeClipboard(): Promise<typeof import("@gajae-code/natives")> 
 	nativeClipboardLoad ??= Promise.resolve(require("@gajae-code/natives") as typeof import("@gajae-code/natives"));
 	return await nativeClipboardLoad;
 }
+
 import { logger } from "@gajae-code/utils";
 
 function hasDisplay(): boolean {

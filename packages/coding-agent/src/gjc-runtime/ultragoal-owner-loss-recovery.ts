@@ -8,7 +8,13 @@ import { appendJsonlIdempotent, writeJsonAtomic } from "./state-writer";
 let recoveryFsRootLoad: Promise<typeof import("@gajae-code/natives")["openRecoveryFsRoot"]> | undefined;
 
 async function openRecoveryFsRootNative(): Promise<typeof import("@gajae-code/natives")["openRecoveryFsRoot"]> {
-	recoveryFsRootLoad ??= Promise.resolve((require("@gajae-code/natives") as { openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"] }).openRecoveryFsRoot);
+	recoveryFsRootLoad ??= Promise.resolve(
+		(
+			require("@gajae-code/natives") as {
+				openRecoveryFsRoot: typeof import("@gajae-code/natives")["openRecoveryFsRoot"];
+			}
+		).openRecoveryFsRoot,
+	);
 	return await recoveryFsRootLoad;
 }
 

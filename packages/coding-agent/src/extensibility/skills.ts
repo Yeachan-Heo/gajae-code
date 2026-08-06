@@ -422,7 +422,11 @@ export async function buildSkillPromptMessage(
 	args: string,
 	context?: BuildSkillPromptMessageContext,
 ): Promise<BuiltSkillPromptMessage> {
-	const content = skill.loadContent ? await skill.loadContent() : typeof skill.content === "string" ? skill.content : await Bun.file(skill.filePath).text();
+	const content = skill.loadContent
+		? await skill.loadContent()
+		: typeof skill.content === "string"
+			? skill.content
+			: await Bun.file(skill.filePath).text();
 	const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
 	const metaLines = [`Skill: ${skill.filePath}`];
 	const trimmedArgs = args.trim();

@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { resolveWithinRoot } from "./paths";
 import type { GjcPluginRegistryEntry, GjcSubskillParentAgent, NormalizedAppendixSurface } from "./types";
 import { GjcPluginLoadError } from "./types";
-import { resolveWithinRoot } from "./paths";
 
 /**
  * Renders plugin system/agent appendices as lower-authority, delimited blocks
@@ -39,7 +39,11 @@ function assertAppendixDigest(bytes: Buffer, surface: NormalizedAppendixSurface,
 	}
 }
 
-async function readAppendixBody(entry: GjcPluginRegistryEntry, surface: NormalizedAppendixSurface, options?: RenderPluginAppendixOptions): Promise<string> {
+async function readAppendixBody(
+	entry: GjcPluginRegistryEntry,
+	surface: NormalizedAppendixSurface,
+	options?: RenderPluginAppendixOptions,
+): Promise<string> {
 	// Inline and file-backed appendices carry the same persisted `contentHash`
 	// contract, so both verify their declared digest before the body can reach
 	// the prompt; otherwise contentHash would be unaudited metadata for inline
@@ -57,17 +61,24 @@ async function readAppendixBody(entry: GjcPluginRegistryEntry, surface: Normaliz
 	try {
 		[rootReal, fileReal] = await Promise.all([fs.realpath(entry.pluginRoot), fs.realpath(lexical)]);
 	} catch (error) {
-		throw new GjcPluginLoadError("runtime_mismatch", `Missing or unreadable appendix at ${surface.relativePath}`, { cause: error instanceof Error ? error : undefined });
+		throw new GjcPluginLoadError("runtime_mismatch", `Missing or unreadable appendix at ${surface.relativePath}`, {
+			cause: error instanceof Error ? error : undefined,
+		});
 	}
 	const relative = path.relative(rootReal, fileReal);
 	if (relative.startsWith("..") || path.isAbsolute(relative)) {
-		throw new GjcPluginLoadError("runtime_mismatch", `Appendix escapes the installed plugin root: ${surface.relativePath}`);
+		throw new GjcPluginLoadError(
+			"runtime_mismatch",
+			`Appendix escapes the installed plugin root: ${surface.relativePath}`,
+		);
 	}
 	let bytes: Buffer;
 	try {
 		bytes = await fs.readFile(fileReal);
 	} catch (error) {
-		throw new GjcPluginLoadError("runtime_mismatch", `Missing or unreadable appendix at ${surface.relativePath}`, { cause: error instanceof Error ? error : undefined });
+		throw new GjcPluginLoadError("runtime_mismatch", `Missing or unreadable appendix at ${surface.relativePath}`, {
+			cause: error instanceof Error ? error : undefined,
+		});
 	}
 	assertAppendixDigest(bytes, surface, surface.relativePath);
 	return bytes.toString("utf8");

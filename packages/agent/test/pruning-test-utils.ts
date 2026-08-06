@@ -1,12 +1,12 @@
 import type { ToolCall, ToolResultMessage } from "@gajae-code/ai/types";
-import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
 import { estimateEntryTokens } from "../src/compaction/compaction";
+import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
 import {
 	commitToolOutputPrune,
 	createPrunedNotice,
 	extractToolOutputText,
-	planToolOutputPrune,
 	type PruneConfig,
+	planToolOutputPrune,
 	type ToolOutputPrunePlan,
 } from "../src/compaction/pruning";
 
@@ -63,7 +63,7 @@ function replacementPlan(
 	const overrides = new Map<string, { replacementText: string }>();
 	for (const digest of plan.digests) {
 		const entry = entries.find(candidate => candidate.id === digest.entryId);
-		if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") continue;
+		if (entry?.type !== "message" || entry.message.role !== "toolResult") continue;
 		const message = entry.message as ToolResultMessage;
 		const captured = extractToolOutputText(message);
 		const proposal = plan.replacements.find(candidate => candidate.entryId === digest.entryId);
@@ -80,7 +80,11 @@ function replacementPlan(
 		const artifact = proposal.complete ? opts.artifactRef(original) : undefined;
 		if (artifact !== undefined && !/^artifact:\/\/\d+$/.test(artifact))
 			throw new Error("artifactRef must be a numeric artifact://<id> reference");
-		if (artifact !== undefined && opts.artifactRefMaxChars !== undefined && artifact.length > opts.artifactRefMaxChars)
+		if (
+			artifact !== undefined &&
+			opts.artifactRefMaxChars !== undefined &&
+			artifact.length > opts.artifactRefMaxChars
+		)
 			throw new Error("artifactRef exceeded artifactRefMaxChars");
 		const call = calls.get(message.toolCallId);
 		overrides.set(digest.entryId, {
@@ -105,9 +109,7 @@ export function applyToolOutputPrune(
 	});
 	if (plan.digests.length === 0) return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
 	const { overrides, originals } = replacementPlan(working, plan, opts);
-	const beforeTokens = new Map(
-		messageEntries(working).map(entry => [entry.id, estimateEntryTokens(entry)] as const),
-	);
+	const beforeTokens = new Map(messageEntries(working).map(entry => [entry.id, estimateEntryTokens(entry)] as const));
 	const outcomes = commitToolOutputPrune(working, plan, { replacements: overrides });
 	const committedIds = new Set(
 		outcomes.filter(outcome => outcome.outcome === "committed").map(outcome => outcome.entryId),

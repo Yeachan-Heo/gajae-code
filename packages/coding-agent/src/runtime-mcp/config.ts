@@ -10,8 +10,8 @@ import type { SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { loadMCPJsonFile } from "../discovery/mcp-json";
-import { canonicalizeMCPEndpoint } from "./pool-key";
 import { readDisabledServers } from "./config-writer";
+import { canonicalizeMCPEndpoint } from "./pool-key";
 import type { MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */

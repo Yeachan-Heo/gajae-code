@@ -591,12 +591,18 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	});
 	it("does not route canonical sub-sessions through the process-global MCP manager", async () => {
 		const callerMcpManager = new MCPManager(tempDir);
-		const getTools = vi.spyOn(callerMcpManager, "getTools").mockReturnValue([createMcpCustomTool("mcp__caller_lookup", "caller", "lookup")] as never);
+		const getTools = vi
+			.spyOn(callerMcpManager, "getTools")
+			.mockReturnValue([createMcpCustomTool("mcp__caller_lookup", "caller", "lookup")] as never);
 		const instanceSpy = vi.spyOn(MCPManager, "instance").mockImplementation(() => {
 			throw new Error("MCPManager.instance() must not route hosted sub-sessions");
 		});
 		try {
-			for (const subSessionOptions of [{ taskDepth: 1 }, { parentTaskPrefix: "0-Child" }, { currentAgentType: "executor" }]) {
+			for (const subSessionOptions of [
+				{ taskDepth: 1 },
+				{ parentTaskPrefix: "0-Child" },
+				{ currentAgentType: "executor" },
+			]) {
 				const { session, mcpManager } = await createAgentSession({
 					...createIsolatedSessionOptions(),
 					...subSessionOptions,
@@ -746,8 +752,13 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(installed.ok).toBe(true);
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
 		try {
-			const cleanupWarning = warning.mock.calls.find(([message]) => message === "Failed to wire GJC plugin MCP servers");
-			expect(cleanupWarning?.[1]).toMatchObject({ error: "plugin startup failed", cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" } });
+			const cleanupWarning = warning.mock.calls.find(
+				([message]) => message === "Failed to wire GJC plugin MCP servers",
+			);
+			expect(cleanupWarning?.[1]).toMatchObject({
+				error: "plugin startup failed",
+				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
+			});
 		} finally {
 			await session.dispose();
 		}
@@ -838,7 +849,9 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(installed.ok).toBe(true);
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
 		try {
-			const cleanupWarning = warning.mock.calls.find(([message]) => message === "Failed to wire GJC plugin MCP servers");
+			const cleanupWarning = warning.mock.calls.find(
+				([message]) => message === "Failed to wire GJC plugin MCP servers",
+			);
 			expect(cleanupWarning).toBeDefined();
 			expect(cleanupWarning?.[1]).toMatchObject({ error: "<unprintable error>" });
 			const serialized = JSON.stringify(cleanupWarning?.[1]);

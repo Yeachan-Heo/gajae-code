@@ -3,10 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import {
-	createTools,
-	type ToolSession,
-} from "@gajae-code/coding-agent/tools";
+import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 import {
 	buildPromptModel,
 	commandFromOp,

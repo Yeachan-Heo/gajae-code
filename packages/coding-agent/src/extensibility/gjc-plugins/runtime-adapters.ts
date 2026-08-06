@@ -6,12 +6,11 @@ import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
 import { bundleIdentity } from "./lifecycle-reconciliation";
 import { verifyImplementationHash } from "./metadata";
+import { isV2Tool } from "./migration";
 import { resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry, registryPathForScope } from "./registry";
 import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
-import type { GjcPluginRegistryEntry, GjcPluginScope } from "./types";
-import { isV2Tool } from "./migration";
-import type { NormalizedToolSurfaceV2, JsonSchema202012 } from "./types";
+import type { GjcPluginRegistryEntry, GjcPluginScope, JsonSchema202012, NormalizedToolSurfaceV2 } from "./types";
 
 export interface AlwaysOnPluginTools {
 	tools: CustomTool[];
@@ -23,7 +22,6 @@ export interface GjcPluginToolDeclaration extends NormalizedToolSurfaceV2 {
 	scope: GjcPluginScope;
 }
 
-
 function isWithin(root: string, target: string): boolean {
 	const rel = path.relative(root, target);
 	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
@@ -32,7 +30,8 @@ function isWithin(root: string, target: string): boolean {
 async function resolveRuntimeFile(root: string, relativePath: string): Promise<string> {
 	const lexical = resolveWithinRoot(root, relativePath);
 	const [rootReal, fileReal] = await Promise.all([fs.realpath(root), fs.realpath(lexical)]);
-	if (!isWithin(rootReal, fileReal)) throw new Error(`GJC plugin implementation escapes its installed root: ${relativePath}`);
+	if (!isWithin(rootReal, fileReal))
+		throw new Error(`GJC plugin implementation escapes its installed root: ${relativePath}`);
 	return fileReal;
 }
 /**
@@ -45,7 +44,8 @@ export async function getGjcPluginToolDeclarations(cwd: string): Promise<GjcPlug
 	for (const entry of entries) {
 		if (!entry.enabled || entry.migration?.status === "failed") continue;
 		for (const surface of entry.surfaces.tools) {
-			if (isV2Tool(surface)) declarations.push({ ...surface, plugin: entry.name, scope: entry.scope } as GjcPluginToolDeclaration);
+			if (isV2Tool(surface))
+				declarations.push({ ...surface, plugin: entry.name, scope: entry.scope } as GjcPluginToolDeclaration);
 		}
 	}
 	return declarations;
@@ -246,15 +246,20 @@ export async function loadAlwaysOnPluginTools(input: {
 	);
 
 	// Map declared (path -> name) for every active always-on tool surface.
-	const declaredMetadata = new Map((input.declarations ?? []).map(surface => [`${surface.scope}:${surface.plugin}:${surface.extensionId}`, surface]));
-	const declared = new Map<string, {
-		name: string;
-		plugin: string;
-		scope: GjcPluginScope;
-		pluginRoot: string;
-		relativePath: string;
-		implementationHash?: string;
-	}>();
+	const declaredMetadata = new Map(
+		(input.declarations ?? []).map(surface => [`${surface.scope}:${surface.plugin}:${surface.extensionId}`, surface]),
+	);
+	const declared = new Map<
+		string,
+		{
+			name: string;
+			plugin: string;
+			scope: GjcPluginScope;
+			pluginRoot: string;
+			relativePath: string;
+			implementationHash?: string;
+		}
+	>();
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const t of entry.surfaces.tools) {
@@ -263,7 +268,13 @@ export async function loadAlwaysOnPluginTools(input: {
 			try {
 				implementationPath = await resolveRuntimeFile(entry.pluginRoot, t.relativePath);
 			} catch (error) {
-				quarantine.push({ identity: bundleIdentity(entry.scope, entry.name), plugin: entry.name, surfaceId: t.extensionId, code: "runtime_mismatch", message: error instanceof Error ? error.message : String(error) });
+				quarantine.push({
+					identity: bundleIdentity(entry.scope, entry.name),
+					plugin: entry.name,
+					surfaceId: t.extensionId,
+					code: "runtime_mismatch",
+					message: error instanceof Error ? error.message : String(error),
+				});
 				continue;
 			}
 			const metadata = declaredMetadata.get(`${entry.scope}:${entry.name}:${t.extensionId}`);
@@ -273,7 +284,11 @@ export async function loadAlwaysOnPluginTools(input: {
 				scope: entry.scope,
 				pluginRoot: entry.pluginRoot,
 				relativePath: t.relativePath,
-				implementationHash: metadata?.implementationHash ?? ("implementationHash" in t && typeof t.implementationHash === "string" ? t.implementationHash : undefined),
+				implementationHash:
+					metadata?.implementationHash ??
+					("implementationHash" in t && typeof t.implementationHash === "string"
+						? t.implementationHash
+						: undefined),
 			});
 		}
 	}
@@ -290,7 +305,10 @@ export async function loadAlwaysOnPluginTools(input: {
 				identity: bundleIdentity(info.scope, info.plugin),
 				plugin: info.plugin,
 				surfaceId: `tool:${info.name}`,
-				code: error instanceof Error && "code" in error && (error as { code?: unknown }).code === "hash_mismatch" ? "runtime_mismatch" : "runtime_mismatch",
+				code:
+					error instanceof Error && "code" in error && (error as { code?: unknown }).code === "hash_mismatch"
+						? "runtime_mismatch"
+						: "runtime_mismatch",
 				message: error instanceof Error ? error.message : String(error),
 			});
 			declared.delete(declaredPath);
@@ -305,9 +323,10 @@ export async function loadAlwaysOnPluginTools(input: {
 		async resolvedPath => {
 			await input.beforeImport?.(resolvedPath);
 			const info = declared.get(path.resolve(resolvedPath));
-			if (!info || !info.implementationHash) throw new Error(`Unregistered or unhashed GJC tool import: ${resolvedPath}`);
+			if (!info?.implementationHash) throw new Error(`Unregistered or unhashed GJC tool import: ${resolvedPath}`);
 			const finalPath = await resolveRuntimeFile(info.pluginRoot, info.relativePath);
-			if (path.resolve(finalPath) !== path.resolve(resolvedPath)) throw new Error(`GJC tool path drifted before import: ${info.relativePath}`);
+			if (path.resolve(finalPath) !== path.resolve(resolvedPath))
+				throw new Error(`GJC tool path drifted before import: ${info.relativePath}`);
 			await verifyImplementationHash(finalPath, info.implementationHash);
 		},
 	);

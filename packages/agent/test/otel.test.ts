@@ -7,6 +7,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
+import type { AgentRunCoverage, AgentRunSummary } from "@gajae-code/agent-core/run-collector";
 import {
 	type AgentTelemetryConfig,
 	type ChatUsageEvent,
@@ -21,7 +22,6 @@ import {
 	resolveTelemetry,
 	type TelemetryHookContext,
 } from "@gajae-code/agent-core/telemetry";
-import type { AgentRunCoverage, AgentRunSummary } from "@gajae-code/agent-core/run-collector";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
 import type { Message } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";

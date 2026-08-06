@@ -6,11 +6,15 @@ import type { NativeRetainedBrokerPublication } from "@gajae-code/natives";
 
 let nativeRetainBrokerPublication: typeof import("@gajae-code/natives")["retainBrokerPublication"] | undefined;
 
-
 function retainBrokerPublicationNative(): typeof import("@gajae-code/natives")["retainBrokerPublication"] {
-	nativeRetainBrokerPublication ??= (require("@gajae-code/natives") as { retainBrokerPublication: typeof import("@gajae-code/natives")["retainBrokerPublication"] }).retainBrokerPublication;
+	nativeRetainBrokerPublication ??= (
+		require("@gajae-code/natives") as {
+			retainBrokerPublication: typeof import("@gajae-code/natives")["retainBrokerPublication"];
+		}
+	).retainBrokerPublication;
 	return nativeRetainBrokerPublication;
 }
+
 import { processIncarnation } from "./process-incarnation";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
 

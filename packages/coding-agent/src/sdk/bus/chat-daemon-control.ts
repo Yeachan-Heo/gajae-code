@@ -9,11 +9,11 @@ import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 type NativeChatDaemonBindings = Pick<typeof import("@gajae-code/natives"), "exactUnlink">;
 let nativeChatDaemonBindings: NativeChatDaemonBindings | undefined;
 
-
 function nativeChatDaemon(): NativeChatDaemonBindings {
 	if (!nativeChatDaemonBindings) nativeChatDaemonBindings = require("@gajae-code/natives") as NativeChatDaemonBindings;
 	return nativeChatDaemonBindings;
 }
+
 import type { Settings } from "../../config/settings";
 import type {
 	BuiltInDaemonController,

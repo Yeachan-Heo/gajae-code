@@ -105,12 +105,15 @@ const MINIMAL_ENV_KEYS = [
 
 function effectiveEnvironment(config: MCPServerConfig, options: MCPPoolKeyOptions): Record<string, string> {
 	if (options.effectiveEnv) return { ...options.effectiveEnv };
-	const inherited = config.type === "http" || config.type === "sse" || config.noInheritEnv !== true
-		? hostEnvironment()
-		: Object.fromEntries(MINIMAL_ENV_KEYS.flatMap(key => {
-			const value = hostEnvironment()[key];
-			return value === undefined ? [] : [[key, value] as const];
-		}));
+	const inherited =
+		config.type === "http" || config.type === "sse" || config.noInheritEnv !== true
+			? hostEnvironment()
+			: Object.fromEntries(
+					MINIMAL_ENV_KEYS.flatMap(key => {
+						const value = hostEnvironment()[key];
+						return value === undefined ? [] : [[key, value] as const];
+					}),
+				);
 	return config.type === "http" || config.type === "sse" ? inherited : { ...inherited, ...(config.env ?? {}) };
 }
 
@@ -136,7 +139,8 @@ function headerIdentity(
 	authBindingKind: string,
 	authScopeId: string,
 ): string[] {
-	const headers = options.effectiveHeaders ?? (config.type === "http" || config.type === "sse" ? config.headers : undefined) ?? {};
+	const headers =
+		options.effectiveHeaders ?? (config.type === "http" || config.type === "sse" ? config.headers : undefined) ?? {};
 	const names = Object.keys(headers);
 	const normalizedNames = new Set<string>();
 	for (const name of names) {
@@ -156,7 +160,10 @@ function headerIdentity(
 			const originalName = names.find(candidate => candidate.toLowerCase() === name) ?? name;
 			if (name === "authorization") {
 				const sharingMode = options.sharingMode ?? config.sharing ?? "per-session";
-				if (sharingMode === "shared" && (authBindingKind === "none" || authBindingKind.length === 0 || authScopeId.length === 0)) {
+				if (
+					sharingMode === "shared" &&
+					(authBindingKind === "none" || authBindingKind.length === 0 || authScopeId.length === 0)
+				) {
 					throw new MCPPoolConfigError(
 						"MCP_AUTH_BINDING_REQUIRED",
 						"Shared MCP Authorization entries require non-secret auth binding kind and scope",
@@ -179,7 +186,7 @@ export function canonicalizeMCPEndpoint(raw: string): MCPEndpointIdentity {
 		throw new MCPPoolConfigError("MCP_INVALID_ENDPOINT", "MCP endpoint must be an absolute URL");
 	}
 	const authorityStart = schemeSeparator + 3;
-	const authorityEndRelative = raw.slice(authorityStart).search(/[\/?#]/);
+	const authorityEndRelative = raw.slice(authorityStart).search(/[/?#]/);
 	const authorityEnd = authorityEndRelative < 0 ? raw.length : authorityStart + authorityEndRelative;
 	const authority = raw.slice(authorityStart, authorityEnd);
 	if (authority.includes("@")) {
@@ -231,10 +238,7 @@ function authIdentity(config: MCPServerConfig, options: MCPPoolKeyOptions): { ki
 function requireSessionId(sharingMode: MCPPoolSharingMode, sessionId: string | undefined): void {
 	if (sharingMode !== "per-session") return;
 	if (typeof sessionId !== "string" || sessionId.trim().length === 0) {
-		throw new MCPPoolConfigError(
-			"MCP_SESSION_ID_REQUIRED",
-			"MCP per-session pooling requires a non-empty sessionId",
-		);
+		throw new MCPPoolConfigError("MCP_SESSION_ID_REQUIRED", "MCP per-session pooling requires a non-empty sessionId");
 	}
 }
 
@@ -247,7 +251,7 @@ export function buildMCPPoolKeyIdentity(
 	const source = options.keyConfig ?? config;
 	const sharingMode = options.sharingMode ?? source.sharing ?? "per-session";
 	requireSessionId(sharingMode, options.sessionId);
-	const transport = options.transport ?? (config.type ?? "stdio");
+	const transport = options.transport ?? config.type ?? "stdio";
 	const auth = authIdentity(source, options);
 	const env = effectiveEnvironment(config, options);
 	const noInheritEnv = config.type === "stdio" && config.noInheritEnv === true;

@@ -26,26 +26,25 @@ import type { WorkspaceTree } from "../workspace-tree";
 import type { BashRestrictionProfile } from "./bash-allowed-prefixes";
 import type { CheckpointState } from "./checkpoint";
 import { isComputerLoadablePlatform } from "./computer-policy";
-import { wrapToolWithMetaNotice } from "./output-meta";
-import type { TodoPhase } from "./todo-write";
 import {
-	BUILTIN_TOOLS,
 	BUILTIN_TOOL_DESCRIPTORS,
-	HIDDEN_TOOLS,
+	BUILTIN_TOOLS,
 	HIDDEN_TOOL_DESCRIPTORS,
 	LazyAgentTool,
 	resolveEffectiveDiscoveryMode,
 	type ToolAvailabilityContext,
-	type ToolDescriptorLoadResult,
 } from "./descriptors";
-export * from "./descriptors";
-export { TOOL_CATALOG } from "./tool-catalog.generated";
+import { wrapToolWithMetaNotice } from "./output-meta";
+import type { TodoPhase } from "./todo-write";
+
+export type { LspStartupServerInfo } from "../lsp";
 export type { BashToolDetails, BashToolInput } from "./bash";
+export * from "./descriptors";
 export type { FindToolDetails, FindToolInput } from "./find";
 export type { ReadToolDetails, ReadToolInput } from "./read";
 export type { SearchToolDetails, SearchToolInput } from "./search";
+export { TOOL_CATALOG } from "./tool-catalog.generated";
 export type { WriteToolDetails, WriteToolInput } from "./write";
-export type { LspStartupServerInfo } from "../lsp";
 
 /** Tool type (AgentTool from pi-ai) */
 export type Tool = AgentTool<any, any, any>;
@@ -515,7 +514,6 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
 	return resolveEvalBackendsFromEnv($env) ?? readEvalBackendsAllowance(session);
 }
 
-
 /**
  * Create tools from the descriptor registry.
  */
@@ -634,13 +632,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 					...Object.entries(BUILTIN_TOOL_DESCRIPTORS)
 						.filter(([, descriptor]) => descriptor.isAvailable(session, availabilityContext))
 						.map(([name, descriptor]) => [name, descriptor] as const),
-					...(includeYield ? ([['yield', HIDDEN_TOOL_DESCRIPTORS.yield]] as const) : []),
+					...(includeYield ? ([["yield", HIDDEN_TOOL_DESCRIPTORS.yield]] as const) : []),
 				];
 
-	const selectedDiscoveredNames = new Set([
-		...(requestedTools ?? []),
-		...(session.getSelectedDiscoveredToolNames?.() ?? []),
-	].map(name => name.toLowerCase()));
+	const selectedDiscoveredNames = new Set(
+		[...(requestedTools ?? []), ...(session.getSelectedDiscoveredToolNames?.() ?? [])].map(name =>
+			name.toLowerCase(),
+		),
+	);
 	const materialize = async ([name, descriptor]: readonly [string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]]) => {
 		const defer =
 			effectiveDiscoveryMode !== "off" &&
@@ -652,7 +651,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			);
 		}
 		const materialized = await logger.time(`createTools:${name}`, descriptor.load, session);
-		return materialized ? wrapToolWithMetaNotice(new LazyAgentTool(descriptor, materialized, undefined, session)) : null;
+		return materialized
+			? wrapToolWithMetaNotice(new LazyAgentTool(descriptor, materialized, undefined, session))
+			: null;
 	};
 	const tools: LazyAgentTool[] = [];
 	for (const entry of baseEntries) {

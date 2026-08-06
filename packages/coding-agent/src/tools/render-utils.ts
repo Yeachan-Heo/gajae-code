@@ -8,16 +8,14 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolCallContext } from "@gajae-code/agent-core";
-import type { Ellipsis } from "@gajae-code/tui";
-import type { Component } from "@gajae-code/tui";
+import type { Component, Ellipsis } from "@gajae-code/tui";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
 import { pluralize } from "@gajae-code/utils";
 import { settings } from "../config/settings";
 import type { Theme } from "../modes/theme/theme";
 import { Hasher } from "../tui/utils";
 
-export { Ellipsis } from "@gajae-code/tui";
-export { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "@gajae-code/tui";
+export { Ellipsis, replaceTabs, truncateToWidth, wrapTextWithAnsi } from "@gajae-code/tui";
 export { formatScreenshot } from "./browser/screenshot-format";
 
 // =============================================================================

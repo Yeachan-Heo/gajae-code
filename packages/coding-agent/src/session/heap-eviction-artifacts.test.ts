@@ -6,15 +6,10 @@ import * as path from "node:path";
 import type { ToolResultMessage } from "@gajae-code/ai/core";
 import { ArtifactProtocolHandler } from "../internal-urls/artifact-protocol";
 import { parseInternalUrl } from "../internal-urls/parse";
-import { ArtifactManager } from "./artifacts";
-import {
-	CURRENT_SESSION_VERSION,
-	loadEntriesFromFile,
-	parseSessionEntries,
-	SessionManager,
-} from "./session-manager";
-import { DEFAULT_ARTIFACT_MAX_BYTES } from "./streaming-output";
 import type { EvictedToolOutputHandle } from "../tools/output-meta";
+import { ArtifactManager } from "./artifacts";
+import { CURRENT_SESSION_VERSION, loadEntriesFromFile, parseSessionEntries, SessionManager } from "./session-manager";
+import { DEFAULT_ARTIFACT_MAX_BYTES } from "./streaming-output";
 
 function toolResult(text: string, details?: unknown): ToolResultMessage {
 	return {
@@ -38,7 +33,11 @@ function sessionHeader(cwd: string, id = "w4-session"): Record<string, unknown> 
 	};
 }
 
-function sessionLine(message: ToolResultMessage, id = "w4-message", parentId: string | null = null): Record<string, unknown> {
+function sessionLine(
+	message: ToolResultMessage,
+	id = "w4-message",
+	parentId: string | null = null,
+): Record<string, unknown> {
 	return {
 		type: "message",
 		id,
@@ -351,8 +350,12 @@ describe("W4 session cache retainers and rewrite invalidation", () => {
 		expect(JSON.stringify(manager.getEntries())).not.toContain(marker);
 		expect(JSON.stringify(manager.buildSessionContext())).not.toContain(marker);
 		const statsAfter = manager.getObservabilityStatsForTests();
-		expect(statsAfter.materializedEntriesCachePopulateCount).toBeGreaterThan(statsBefore.materializedEntriesCachePopulateCount);
-		expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(statsBefore.materializedEntriesCachePopulateCount + marker.length + 1);
+		expect(statsAfter.materializedEntriesCachePopulateCount).toBeGreaterThan(
+			statsBefore.materializedEntriesCachePopulateCount,
+		);
+		expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(
+			statsBefore.materializedEntriesCachePopulateCount + marker.length + 1,
+		);
 	});
 });
 

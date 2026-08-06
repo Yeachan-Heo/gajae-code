@@ -1,6 +1,6 @@
+import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { describe, expect, test } from "bun:test";
 import { Settings } from "../config/settings";
 import {
 	ComputerTool,
@@ -31,7 +31,6 @@ function makeSession(settings: Settings): any {
 		getSessionFile: () => null,
 	};
 }
-
 
 function resultCode(result: any): string | undefined {
 	return result?.details?.code;
@@ -82,13 +81,21 @@ describe("computer enforcement red-team probes", () => {
 			};
 			const killBatch = await runTool(settings, killController, {
 				action: "batch",
-				actions: [{ action: "click", x: 1, y: 1 }, { action: "keypress", keys: ["A"] }],
+				actions: [
+					{ action: "click", x: 1, y: 1 },
+					{ action: "keypress", keys: ["A"] },
+				],
 			});
-			const killPassed = resultCode(killBatch) === "COMPUTER_SUPERVISOR_NOT_LIVE" && killCalls === 1 && killBatch.details?.steps?.length === 1;
+			const killPassed =
+				resultCode(killBatch) === "COMPUTER_SUPERVISOR_NOT_LIVE" &&
+				killCalls === 1 &&
+				killBatch.details?.steps?.length === 1;
 			reports.push({
 				caseId: "kill-switch-bypass",
-				scenario: "Native supervisor refuses the first batch step after kill-switch engagement; a follow-up keypress is queued in the same batch.",
-				expectedBehavior: "Typed COMPUTER_SUPERVISOR_NOT_LIVE refusal with kill-switch guidance; batch halts and follow-up does not dispatch.",
+				scenario:
+					"Native supervisor refuses the first batch step after kill-switch engagement; a follow-up keypress is queued in the same batch.",
+				expectedBehavior:
+					"Typed COMPUTER_SUPERVISOR_NOT_LIVE refusal with kill-switch guidance; batch halts and follow-up does not dispatch.",
 				observed: `code=${resultCode(killBatch)} message=${resultMessage(killBatch)} nativeCalls=${killCalls} steps=${killBatch.details?.steps?.length ?? 0}; hotkey=${settings.get("computer.killSwitchHotkey")}`,
 				verdict: killPassed ? "passed" : "failed",
 			});
@@ -107,32 +114,46 @@ describe("computer enforcement red-team probes", () => {
 			};
 			const suspendedBatch = await runTool(settings, suspendedController, {
 				action: "batch",
-				actions: [{ action: "keypress", keys: ["A"] }, { action: "click", x: 1, y: 1 }],
+				actions: [
+					{ action: "keypress", keys: ["A"] },
+					{ action: "click", x: 1, y: 1 },
+				],
 			});
 			reports.push({
 				caseId: "suspended-enforcement",
 				scenario: "Native supervisor reports COMPUTER_SUSPENDED on the first keypress in a two-step batch.",
-				expectedBehavior: "Typed COMPUTER_SUSPENDED refusal; failedStep terminates the batch with no later click dispatch.",
+				expectedBehavior:
+					"Typed COMPUTER_SUSPENDED refusal; failedStep terminates the batch with no later click dispatch.",
 				observed: `code=${resultCode(suspendedBatch)} message=${resultMessage(suspendedBatch)} nativeCalls=${suspendedCalls} steps=${suspendedBatch.details?.steps?.length ?? 0}`,
-				verdict: resultCode(suspendedBatch) === "COMPUTER_SUSPENDED" && suspendedCalls === 1 && suspendedBatch.details?.steps?.length === 1 ? "passed" : "failed",
+				verdict:
+					resultCode(suspendedBatch) === "COMPUTER_SUSPENDED" &&
+					suspendedCalls === 1 &&
+					suspendedBatch.details?.steps?.length === 1
+						? "passed"
+						: "failed",
 			});
-
 
 			// permission-revoked: native permission denial must map to typed guidance.
 			let permissionCalls = 0;
-			const permission = await runTool(settings, {
-				screenshot: () => {
-					permissionCalls += 1;
-					throw error("COMPUTER_PERMISSION_REQUIRED", "screen recording permission missing");
+			const permission = await runTool(
+				settings,
+				{
+					screenshot: () => {
+						permissionCalls += 1;
+						throw error("COMPUTER_PERMISSION_REQUIRED", "screen recording permission missing");
+					},
 				},
-			}, { action: "screenshot" });
+				{ action: "screenshot" },
+			);
 			reports.push({
 				caseId: "permission-revoked",
 				scenario: "Screenshot native seam denies screen-recording permission.",
-				expectedBehavior: "Action is refused with COMPUTER_PERMISSION_REQUIRED and user-facing permission guidance.",
+				expectedBehavior:
+					"Action is refused with COMPUTER_PERMISSION_REQUIRED and user-facing permission guidance.",
 				observed: `code=${resultCode(permission)} message=${resultMessage(permission)} nativeScreenshotCalls=${permissionCalls}`,
 				verdict:
-					resultCode(permission) === "COMPUTER_PERMISSION_REQUIRED" && resultMessage(permission).includes("screen-recording or accessibility permission")
+					resultCode(permission) === "COMPUTER_PERMISSION_REQUIRED" &&
+					resultMessage(permission).includes("screen-recording or accessibility permission")
 						? "passed"
 						: "failed",
 			});
@@ -155,7 +176,8 @@ describe("computer enforcement red-team probes", () => {
 				expectedBehavior: "Click is refused with COMPUTER_DISPLAY_STALE and fresh-screenshot guidance.",
 				observed: `code=${resultCode(stale)} message=${resultMessage(stale)} nativeClickCalls=${staleClicks}`,
 				verdict:
-					resultCode(stale) === "COMPUTER_DISPLAY_STALE" && resultMessage(stale).includes("Capture a fresh screenshot")
+					resultCode(stale) === "COMPUTER_DISPLAY_STALE" &&
+					resultMessage(stale).includes("Capture a fresh screenshot")
 						? "passed"
 						: "failed",
 			});
@@ -176,9 +198,11 @@ describe("computer enforcement red-team probes", () => {
 			reports.push({
 				caseId: "out-of-bounds-drift",
 				scenario: "After a bounded screenshot [10,20)..[110,100), probe x=max, x=max+1, and x=origin-1.",
-				expectedBehavior: "All edge/drift coordinates are refused with COMPUTER_COORD_INVALID before native dispatch.",
+				expectedBehavior:
+					"All edge/drift coordinates are refused with COMPUTER_COORD_INVALID before native dispatch.",
 				observed: `edge=${resultCode(edge)}; max+1=${resultCode(over)}; negative-origin=${resultCode(negative)}; nativeClickCalls=${boundsCalls}`,
-				verdict: boundCodes.every(code => code === "COMPUTER_COORD_INVALID") && boundsCalls === 0 ? "passed" : "failed",
+				verdict:
+					boundCodes.every(code => code === "COMPUTER_COORD_INVALID") && boundsCalls === 0 ? "passed" : "failed",
 			});
 
 			// runaway-loop-halt: deliberately large batch with no timeout. There is no
@@ -186,7 +210,9 @@ describe("computer enforcement red-team probes", () => {
 			// must be cancelled when the clamped timeout expires, and no later step runs.
 			let loopCalls = 0;
 			let releaseLoop!: () => void;
-			const loopGate = new Promise<void>(resolveGate => { releaseLoop = resolveGate; });
+			const loopGate = new Promise<void>(resolveGate => {
+				releaseLoop = resolveGate;
+			});
 			const loopController: NativeMock = {
 				click: () => {
 					loopCalls += 1;
@@ -196,12 +222,16 @@ describe("computer enforcement red-team probes", () => {
 					loopCalls += 1;
 				},
 			};
-			const actions = [{ action: "click", x: 10, y: 20 }, { action: "keypress", keys: ["A"] }];
+			const actions = [
+				{ action: "click", x: 10, y: 20 },
+				{ action: "keypress", keys: ["A"] },
+			];
 			const loop = await runTool(settings, loopController, { action: "batch", actions, timeout: 1 });
 			releaseLoop();
 			reports.push({
 				caseId: "runaway-loop-halt",
-				scenario: "First native action never resolves; one-second clamped deadline expires before queued follow-up.",
+				scenario:
+					"First native action never resolves; one-second clamped deadline expires before queued follow-up.",
 				expectedBehavior: "Typed COMPUTER_CANCELLED timeout refusal; no follow-up dispatch after deadline expiry.",
 				observed: `code=${resultCode(loop) ?? "none"} message=${resultMessage(loop)} nativeCalls=${loopCalls} steps=${loop.details?.steps?.length ?? 0}; clamp(300s)=300s`,
 				verdict: resultCode(loop) === "COMPUTER_CANCELLED" && loopCalls === 1 ? "passed" : "failed",
@@ -222,14 +252,24 @@ describe("computer enforcement red-team probes", () => {
 			};
 			const blast = await runTool(settings, blastController, {
 				action: "batch",
-				actions: [{ action: "type", text: "rm -rf /" }, { action: "keypress", keys: ["Control", "Alt", "Delete"] }],
+				actions: [
+					{ action: "type", text: "rm -rf /" },
+					{ action: "keypress", keys: ["Control", "Alt", "Delete"] },
+				],
 			});
 			reports.push({
 				caseId: "blast-radius",
-				scenario: "A refused first destructive/global action is followed by a queued keypress; batch confinement must prevent continuation.",
-				expectedBehavior: "Typed refusal at failedStep; no later action dispatch. Coordinate and timeout confinement are covered by dedicated probes.",
+				scenario:
+					"A refused first destructive/global action is followed by a queued keypress; batch confinement must prevent continuation.",
+				expectedBehavior:
+					"Typed refusal at failedStep; no later action dispatch. Coordinate and timeout confinement are covered by dedicated probes.",
 				observed: `code=${resultCode(blast) ?? "none"} status=${blast.details?.status} nativeCalls=${blastCalls} steps=${blast.details?.steps?.length ?? 0}; bounds=COMPUTER_COORD_INVALID; timeoutCeiling=300s`,
-				verdict: resultCode(blast) === "COMPUTER_PERMISSION_REQUIRED" && blastCalls === 1 && blast.details?.steps?.length === 1 ? "passed" : "failed",
+				verdict:
+					resultCode(blast) === "COMPUTER_PERMISSION_REQUIRED" &&
+					blastCalls === 1 &&
+					blast.details?.steps?.length === 1
+						? "passed"
+						: "failed",
 			});
 
 			const report = {

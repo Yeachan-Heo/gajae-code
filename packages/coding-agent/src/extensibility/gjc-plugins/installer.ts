@@ -407,7 +407,9 @@ export async function runGjcBundleTransaction(
 		if (preexisting) {
 			// The decision may compare a cross-scope fingerprint, so it must see the
 			// same complete universe the locked decision sees.
-			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd, { migrate: false });
+			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd, {
+				migrate: false,
+			});
 			const early = await options.decide({
 				targetRegistry: preflightTarget,
 				effective: sortRegistryEntries([...preflightTarget.plugins, ...preflightOther.plugins]),

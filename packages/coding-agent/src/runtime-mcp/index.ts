@@ -14,13 +14,13 @@ export * from "./config-writer";
 export { callMCP, parseSSE } from "./json-rpc";
 // Loader (for SDK integration)
 export * from "./loader";
+export * from "./manager";
+// OAuth Discovery
+export * from "./oauth-discovery";
 // Manager
 // Connection pool
 export * from "./pool";
 export * from "./pool-key";
-export * from "./manager";
-// OAuth Discovery
-export * from "./oauth-discovery";
 // Tool bridge
 export * from "./tool-bridge";
 // Tool cache

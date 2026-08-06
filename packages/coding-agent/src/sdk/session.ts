@@ -14,6 +14,7 @@ import {
 	type AttemptScopeRef,
 	type AuthCredentialSelector,
 	type CredentialDisabledEvent,
+	codexToolWireName,
 	type Message,
 	type Model,
 	type ProviderSessionState,
@@ -21,7 +22,6 @@ import {
 	streamSimple,
 	type ToolResultMessage,
 } from "@gajae-code/ai/core";
-import { codexToolWireName } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import {
 	$flag,
@@ -95,6 +95,7 @@ import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../e
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
+import type { LspStartupServerInfo } from "../lsp";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -132,8 +133,8 @@ import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
 import {
-	BUILTIN_TOOLS,
 	BUILTIN_TOOL_DESCRIPTORS,
+	BUILTIN_TOOLS,
 	computeEssentialBuiltinNames,
 	createTools,
 	HIDDEN_TOOLS,
@@ -141,7 +142,6 @@ import {
 	type Tool,
 	type ToolSession,
 } from "../tools";
-import type { LspStartupServerInfo } from "../lsp";
 import { ToolContextStore } from "../tools/context";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
@@ -523,12 +523,7 @@ export type { FileSlashCommand } from "../extensibility/slash-commands";
 export type { Tool } from "../tools";
 export { buildDirectoryTree, buildWorkspaceTree, type DirectoryTree, type WorkspaceTree } from "../workspace-tree";
 
-export {
-	BUILTIN_TOOLS,
-	createTools,
-	HIDDEN_TOOLS,
-	type ToolSession,
-};
+export { BUILTIN_TOOLS, createTools, HIDDEN_TOOLS, type ToolSession };
 
 export async function loadSshTool(session: ToolSession) {
 	return (await import("../tools/ssh")).loadSshTool(session);
@@ -716,7 +711,6 @@ function isCustomTool(tool: CustomTool | ToolDefinition): tool is CustomTool {
 }
 
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
-
 
 /*
  * Append-only context-mode resolution + manager construction live in
@@ -1022,9 +1016,9 @@ function safeErrorDescription(value: unknown): string {
 	}
 }
 
-function safeIsInstanceOf<T extends object>(value: unknown, constructor: abstract new (...args: any[]) => T): boolean {
+function safeIsInstanceOf<T extends object>(value: unknown, ctor: abstract new (...args: any[]) => T): boolean {
 	try {
-		return value instanceof constructor;
+		return value instanceof ctor;
 	} catch {
 		return false;
 	}
@@ -1145,7 +1139,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
 
-
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
@@ -1248,7 +1241,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				? Promise.resolve(emptyWorkspaceTree)
 				: logger.time("buildWorkspaceTree", () =>
 						runtimeServices.workspaceTree.get("legacy-startup").then(runtime => runtime.snapshot),
-				  );
+					);
 		workspaceTreePromise.catch(() => {});
 
 		// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
@@ -1266,11 +1259,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		slashCommandsPromise.catch(() => {});
 
 		// Initialize provider preferences from settings
-		const {
-			getConfiguredSearchProviderPreference,
-			setPreferredSearchProvider,
-			setSearchFallbackProviders,
-		} = await import("../web/search/provider");
+		const { getConfiguredSearchProviderPreference, setPreferredSearchProvider, setSearchFallbackProviders } =
+			await import("../web/search/provider");
 		const { isConfigurableSearchProviderId } = await import("../web/search/types");
 		const { applyConfiguredSearchTimeout } = await import("../web/search/providers/utils");
 		const webSearchProvider = getConfiguredSearchProviderPreference(settings);
@@ -1947,7 +1937,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// incomplete: its surfaces produced no evidence, so publishing
 							// would present a partial pass as a clear one.
 							gjcProducersComplete = false;
-							logger.warn("GJC plugin MCP connect failed", { path: `mcp:${server}`, error: safeErrorForLog(err) });
+							logger.warn("GJC plugin MCP connect failed", {
+								path: `mcp:${server}`,
+								error: safeErrorForLog(err),
+							});
 						}
 						if (result.connectedServers.length > 0) {
 							mcpManager = owned;
@@ -2324,7 +2317,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (settings.get("goal.enabled")) {
 			for (const name of goalStateToolNames) {
 				if (toolRegistry.has(name)) continue;
-				const goalStateTool = await logger.time(`createTools:${name}:session`, BUILTIN_TOOL_DESCRIPTORS[name].load, toolSession);
+				const goalStateTool = await logger.time(
+					`createTools:${name}:session`,
+					BUILTIN_TOOL_DESCRIPTORS[name].load,
+					toolSession,
+				);
 				if (goalStateTool) {
 					const wrappedGoalStateTool = wrapToolWithMetaNotice(goalStateTool);
 					builtinCandidateTools.push(wrappedGoalStateTool);
@@ -3058,10 +3055,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// branch. Statically-traceable require keeps it lazy AND bundled in
 			// compiled binaries (#1939 pattern).
 			const { getOpenAICodexTransportDetails, prewarmOpenAICodexResponses } =
-				// biome-ignore lint/style/noCommonJs: lazy compiled-safe provider load (W5d)
-				require("@gajae-code/ai/providers/openai-codex-responses") as typeof import(
-					"@gajae-code/ai/providers/openai-codex-responses"
-				);
+				require("@gajae-code/ai/providers/openai-codex-responses") as typeof import("@gajae-code/ai/providers/openai-codex-responses");
 			const codexTransport = getOpenAICodexTransportDetails(codexModel, {
 				sessionId: providerSessionId,
 				baseUrl: codexModel.baseUrl,
@@ -3112,7 +3106,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const memoryStatus = runtimeServices.memoryBackend.status();
 				if (memoryStatus.state !== "ready") {
 					if (memoryStatus.error !== undefined) throw memoryStatus.error;
-					throw new Error(`Memory backend did not become ready during legacy startup (state: ${memoryStatus.state}).`);
+					throw new Error(
+						`Memory backend did not become ready during legacy startup (state: ${memoryStatus.state}).`,
+					);
 				}
 				const memoryBackend = runtimeServices.memoryBackend.peek();
 				if (!memoryBackend) throw new Error("Memory backend became ready without a resident value.");

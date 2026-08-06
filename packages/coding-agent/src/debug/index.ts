@@ -10,11 +10,12 @@ import type { getWorkProfile as getWorkProfileFn } from "@gajae-code/natives";
 
 let nativeGetWorkProfile: typeof getWorkProfileFn | undefined;
 
-
 function getWorkProfileNative(...args: Parameters<typeof getWorkProfileFn>): ReturnType<typeof getWorkProfileFn> {
-	nativeGetWorkProfile ??= (require("@gajae-code/natives") as { getWorkProfile: typeof getWorkProfileFn }).getWorkProfile;
+	nativeGetWorkProfile ??= (require("@gajae-code/natives") as { getWorkProfile: typeof getWorkProfileFn })
+		.getWorkProfile;
 	return nativeGetWorkProfile(...args);
 }
+
 import { Container, Loader, type SelectItem, SelectList, Spacer, Text } from "@gajae-code/tui";
 import { getSessionsDir } from "@gajae-code/utils";
 import { DynamicBorder } from "../modes/components/dynamic-border";

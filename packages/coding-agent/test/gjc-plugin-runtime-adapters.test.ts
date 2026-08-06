@@ -79,7 +79,10 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 		);
 		const manifestPath = path.join(source, "gajae-plugin.json");
 		const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
-		manifest.tools = [...(manifest.tools as unknown[]), { name: "late_tool", path: "tools/late.ts", description: "late" }];
+		manifest.tools = [
+			...(manifest.tools as unknown[]),
+			{ name: "late_tool", path: "tools/late.ts", description: "late" },
+		];
 		await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 		const installed = await installGjcBundle({ cwd }, "project", source);
 		expect(installed.ok).toBe(true);
@@ -93,13 +96,23 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 				beforeImport: async resolvedPath => {
 					if (mutated || !resolvedPath.endsWith("domain-note.ts")) return;
 					mutated = true;
-					await fs.appendFile(path.join(path.dirname(resolvedPath), "late.ts"), "\n// changed after batch verification\n");
+					await fs.appendFile(
+						path.join(path.dirname(resolvedPath), "late.ts"),
+						"\n// changed after batch verification\n",
+					);
 				},
 			});
 			expect(result.tools.map(tool => tool.name)).toContain("domain_note");
 			expect(result.tools.map(tool => tool.name)).not.toContain("late_tool");
-			expect(result.quarantine.some(item => item.code === "runtime_mismatch" && item.surfaceId.includes("late_tool"))).toBe(true);
-			expect(await fs.stat(lateSentinel).then(() => true).catch(() => false)).toBe(false);
+			expect(
+				result.quarantine.some(item => item.code === "runtime_mismatch" && item.surfaceId.includes("late_tool")),
+			).toBe(true);
+			expect(
+				await fs
+					.stat(lateSentinel)
+					.then(() => true)
+					.catch(() => false),
+			).toBe(false);
 		} finally {
 			delete process.env.GJC_LATE_IMPORT_SENTINEL;
 		}

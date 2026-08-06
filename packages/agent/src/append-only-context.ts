@@ -341,7 +341,6 @@ export class AppendOnlyContextManager {
 		this.log.replaceTail(message);
 	}
 
-
 	/** Release provider-normalized retainers as one history-rewrite transaction. */
 	releaseAfterHistoryRewrite(options: { preserveSeededPrefix?: boolean } = {}): void {
 		const seeded = options.preserveSeededPrefix === true ? this.#seededPrefixCount : 0;

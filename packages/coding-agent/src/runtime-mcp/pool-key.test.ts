@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	MCPPoolConfigError,
-	buildMCPPoolKeyIdentity,
-	canonicalizeMCPEndpoint,
-	computeMCPPoolKey,
-} from "./pool-key";
+import { buildMCPPoolKeyIdentity, canonicalizeMCPEndpoint, computeMCPPoolKey, MCPPoolConfigError } from "./pool-key";
 import type { MCPHttpServerConfig, MCPServerConfig, MCPStdioServerConfig } from "./types";
 
 const stdio = (overrides: Partial<MCPStdioServerConfig> = {}): MCPServerConfig => ({
@@ -44,7 +39,9 @@ describe("MCP C5 pool identity", () => {
 			key(base, { capabilityProfile: "tools-only" }),
 		];
 		expect(new Set(keys).size).toBe(keys.length);
-		expect(key(base, { sharingMode: "shared", sessionId: "session-a" })).not.toBe(key(base, { sharingMode: "per-session", sessionId: "session-a" }));
+		expect(key(base, { sharingMode: "shared", sessionId: "session-a" })).not.toBe(
+			key(base, { sharingMode: "per-session", sessionId: "session-a" }),
+		);
 		expect(key(base, { sessionId: "session-b" })).not.toBe(key(base, { sessionId: "session-a" }));
 		expect(key(base, { pluginNetworkPolicyId: "restricted" })).not.toBe(key(base));
 		expect(key(base, { authBindingKind: "oauth", authScopeId: "scope-a" })).not.toBe(key(base));
@@ -61,7 +58,9 @@ describe("MCP C5 pool identity", () => {
 			key(base, { authBindingKind: "oauth", authScopeId: "scope-b" }),
 		);
 		expect(key(base, { capabilityProfile: "roots" })).not.toBe(key(base, { capabilityProfile: "tools-only" }));
-		expect(key(base, { pluginNetworkPolicyId: "default" })).not.toBe(key(base, { pluginNetworkPolicyId: "isolated" }));
+		expect(key(base, { pluginNetworkPolicyId: "default" })).not.toBe(
+			key(base, { pluginNetworkPolicyId: "isolated" }),
+		);
 		expect(key(base, { sharingMode: "per-session" })).not.toBe(key(base, { sharingMode: "shared" }));
 		expect(key(base, { sessionId: "session-a" })).not.toBe(key(base, { sessionId: "session-b" }));
 		expect(key(base)).not.toBe(key({ type: "sse", url: "https://h/mcp" }));
@@ -90,16 +89,16 @@ describe("MCP C5 pool identity", () => {
 		for (const [left, right] of distinct) expect(key(http(left))).not.toBe(key(http(right)));
 	});
 
-test("S7-style one-host endpoint partitions preserve path and query identity", () => {
-	const endpoints = [
-		"http://127.0.0.1:43123/mcp/alpha?tenant=one&cursor=1",
-		"http://127.0.0.1:43123/mcp/beta?tenant=one&cursor=1",
-		"http://127.0.0.1:43123/mcp/alpha?cursor=1&tenant=one",
-		"http://127.0.0.1:43123/mcp/alpha?tenant=one&tenant=one",
-	];
-	const keys = endpoints.map(endpoint => key(http(endpoint)));
-	expect(new Set(keys).size).toBe(endpoints.length);
-});
+	test("S7-style one-host endpoint partitions preserve path and query identity", () => {
+		const endpoints = [
+			"http://127.0.0.1:43123/mcp/alpha?tenant=one&cursor=1",
+			"http://127.0.0.1:43123/mcp/beta?tenant=one&cursor=1",
+			"http://127.0.0.1:43123/mcp/alpha?cursor=1&tenant=one",
+			"http://127.0.0.1:43123/mcp/alpha?tenant=one&tenant=one",
+		];
+		const keys = endpoints.map(endpoint => key(http(endpoint)));
+		expect(new Set(keys).size).toBe(endpoints.length);
+	});
 
 	test("normalizes only universally equivalent endpoint forms", () => {
 		const equivalent = [
@@ -134,9 +133,7 @@ test("S7-style one-host endpoint partitions preserve path and query identity", (
 
 	test("plain credential-free env/header rotation remains partitioning per C5", () => {
 		// This is contract-conformant behavior, not a defect: only Authorization rotates out of identity.
-		expect(key(stdio(), { effectiveEnv: { PATH: "one" } })).not.toBe(
-			key(stdio(), { effectiveEnv: { PATH: "two" } }),
-		);
+		expect(key(stdio(), { effectiveEnv: { PATH: "one" } })).not.toBe(key(stdio(), { effectiveEnv: { PATH: "two" } }));
 		expect(key(http("https://h/mcp"), { effectiveHeaders: { "X-Test": "one" } })).not.toBe(
 			key(http("https://h/mcp"), { effectiveHeaders: { "X-Test": "two" } }),
 		);
@@ -149,15 +146,15 @@ test("S7-style one-host endpoint partitions preserve path and query identity", (
 		expect(rotated).toBe(first);
 	});
 
-test("shared Authorization requires non-secret binding metadata", () => {
-	const config = http("https://h/mcp", { sharing: "shared", headers: { Authorization: "Bearer tenant-a" } });
-	expect(() => key(config, { sharingMode: "shared" })).toThrow(MCPPoolConfigError);
-	try {
-		key(config, { sharingMode: "shared" });
-	} catch (error) {
-		expect(error).toMatchObject({ code: "MCP_AUTH_BINDING_REQUIRED", name: "MCPPoolConfigError" });
-	}
-});
+	test("shared Authorization requires non-secret binding metadata", () => {
+		const config = http("https://h/mcp", { sharing: "shared", headers: { Authorization: "Bearer tenant-a" } });
+		expect(() => key(config, { sharingMode: "shared" })).toThrow(MCPPoolConfigError);
+		try {
+			key(config, { sharingMode: "shared" });
+		} catch (error) {
+			expect(error).toMatchObject({ code: "MCP_AUTH_BINDING_REQUIRED", name: "MCPPoolConfigError" });
+		}
+	});
 
 	test("rejects duplicate case-insensitive header names", () => {
 		expect(() => key(http("https://h/mcp", { headers: { Authorization: "one", authorization: "two" } }))).toThrow(

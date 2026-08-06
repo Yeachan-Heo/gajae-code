@@ -1888,7 +1888,9 @@ export async function main(args: string[]): Promise<void> {
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
-		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import("./gjc-runtime/managed-owner-admission");
+		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import(
+			"./gjc-runtime/managed-owner-admission"
+		);
 		const admission = await admitManagedOwnerBeforeCli();
 		if (admission.kind === "blocked") return;
 		if (admission.kind === "recovery") {

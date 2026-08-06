@@ -82,7 +82,6 @@ export class HistoryStorage {
 	#lastPromptCache: string | null = null;
 
 	private constructor(dbPath: string) {
-
 		this.#db = new Database(dbPath);
 
 		const hasFts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
@@ -257,11 +256,6 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 			merged.push(this.#toEntry(row));
 		}
 		return merged;
-	}
-
-	#ensureDir(dbPath: string): void {
-		const dir = path.dirname(dbPath);
-		fs.mkdirSync(dir, { recursive: true });
 	}
 
 	#historySchemaUsesUnixEpoch(): boolean {

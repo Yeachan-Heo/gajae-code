@@ -1,10 +1,7 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, isEnoent } from "@gajae-code/utils";
-import {
-	BUNDLED_GJC_SKILL_CATALOG,
-	type BundledGjcSkillCatalogEntry,
-} from "./gjc-skills.generated";
+import { BUNDLED_GJC_SKILL_CATALOG, type BundledGjcSkillCatalogEntry } from "./gjc-skills.generated";
 
 export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
 export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
@@ -78,9 +75,7 @@ export interface DefaultGjcDefinitionInstallResult {
 	files: DefaultGjcDefinitionInstallFile[];
 }
 function sourcePathForBundledEntry(entry: BundledGjcSkillCatalogEntry): string {
-	const relative = entry.kind === "skill"
-		? entry.relativePath
-		: entry.relativePath.replace(/^skill-fragments\//, "");
+	const relative = entry.kind === "skill" ? entry.relativePath : entry.relativePath.replace(/^skill-fragments\//, "");
 	return entry.kind === "skill"
 		? path.join(import.meta.dir, "gjc", relative)
 		: path.join(import.meta.dir, "gjc", "skills", relative);
@@ -104,11 +99,18 @@ export function readBundledContentSync(entry: BundledGjcSkillCatalogEntry): stri
 		return readFileSync(sourcePath, "utf8");
 	} catch (cause) {
 		const detail = cause instanceof Error ? cause.message : String(cause);
-		throw new BundledDefaultContentError(`Unable to read bundled GJC definition ${sourcePath}: ${detail}`, sourcePath, cause);
+		throw new BundledDefaultContentError(
+			`Unable to read bundled GJC definition ${sourcePath}: ${detail}`,
+			sourcePath,
+			cause,
+		);
 	}
 }
 
-function withLazyBundledContent<T extends object>(value: T, entry: BundledGjcSkillCatalogEntry): T & { content: string } {
+function withLazyBundledContent<T extends object>(
+	value: T,
+	entry: BundledGjcSkillCatalogEntry,
+): T & { content: string } {
 	Object.defineProperty(value, "content", {
 		enumerable: true,
 		configurable: false,
@@ -117,16 +119,21 @@ function withLazyBundledContent<T extends object>(value: T, entry: BundledGjcSki
 	return value as T & { content: string };
 }
 
-
 function asDefaultDefinition(entry: BundledGjcSkillCatalogEntry): DefaultGjcDefinition {
 	if (entry.kind === "skill") {
 		if (!entry.name) throw new Error(`Bundled skill catalog entry is missing name: ${entry.relativePath}`);
 		return withLazyBundledContent(
-			{ kind: "skill", name: entry.name as DefaultGjcDefinitionName, relativePath: entry.relativePath, loadContent: entry.loadContent },
+			{
+				kind: "skill",
+				name: entry.name as DefaultGjcDefinitionName,
+				relativePath: entry.relativePath,
+				loadContent: entry.loadContent,
+			},
 			entry,
 		);
 	}
-	if (!entry.parentSkillName) throw new Error(`Bundled skill fragment catalog entry is missing parent: ${entry.relativePath}`);
+	if (!entry.parentSkillName)
+		throw new Error(`Bundled skill fragment catalog entry is missing parent: ${entry.relativePath}`);
 	return withLazyBundledContent(
 		{
 			kind: "skill-fragment",

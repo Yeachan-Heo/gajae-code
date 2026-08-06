@@ -122,7 +122,9 @@ export function intentContract(
 	return metadata && "intent_contract" in metadata ? metadata.intent_contract : undefined;
 }
 
-export function intentReview(metadata: DeepInterviewMeta | undefined): z.infer<typeof DeepInterviewIntentReview> | undefined {
+export function intentReview(
+	metadata: DeepInterviewMeta | undefined,
+): z.infer<typeof DeepInterviewIntentReview> | undefined {
 	return metadata && "intent_review" in metadata ? metadata.intent_review : undefined;
 }
 

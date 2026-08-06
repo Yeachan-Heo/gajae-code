@@ -1,15 +1,14 @@
 import type { Skill as CapabilitySkill, SkillDescriptor as CapabilitySkillDescriptor } from "../capability/skill";
 import type { LoadContext, LoadResult } from "../capability/types";
-import {
-	scanSkillsFromDir,
+import { type ScanSkillsFromDirOptions, scanSkillsFromDir } from "../discovery/helpers";
+
+export type { SkillDescriptor, SkillFrontmatter } from "../capability/skill";
+export type { ScanSkillsFromDirOptions } from "../discovery/helpers";
+export {
 	SKILL_FRONTMATTER_SCAN_BYTES,
 	SKILL_FRONTMATTER_SCAN_TOTAL_BYTES,
-	type ScanSkillsFromDirOptions,
+	scanSkillsFromDir,
 } from "../discovery/helpers";
-
-export { SKILL_FRONTMATTER_SCAN_BYTES, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES, scanSkillsFromDir } from "../discovery/helpers";
-export type { ScanSkillsFromDirOptions } from "../discovery/helpers";
-export type { SkillFrontmatter, SkillDescriptor } from "../capability/skill";
 
 /** Convert a discovered skill into a metadata-only descriptor. */
 export function asSkillDescriptor(skill: CapabilitySkill): CapabilitySkillDescriptor {

@@ -11,10 +11,12 @@ import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
-type NativeLocalBindings = Pick<typeof import("@gajae-code/natives"), "exactRemoveDirectoryTree" | "snapshotDirectoryTree">;
+type NativeLocalBindings = Pick<
+	typeof import("@gajae-code/natives"),
+	"exactRemoveDirectoryTree" | "snapshotDirectoryTree"
+>;
 
 let nativeLocalBindings: NativeLocalBindings | undefined;
-
 
 function nativeLocal(): NativeLocalBindings {
 	if (!nativeLocalBindings) {

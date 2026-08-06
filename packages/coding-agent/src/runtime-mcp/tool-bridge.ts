@@ -17,13 +17,12 @@ import type {
 import type { Theme } from "../modes/theme/theme";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { callTool } from "./client";
-import { renderMCPCall, renderMCPResult } from "./render";
 import type { MCPPoolLease } from "./pool";
+import { renderMCPCall, renderMCPResult } from "./render";
 import type { MCPContent, MCPServerConnection, MCPToolCallParams, MCPToolCallResult, MCPToolDefinition } from "./types";
 
 /** Reconnect callback: tears down stale connection, returns new one or null. */
 export type MCPReconnect = () => Promise<MCPServerConnection | null>;
-
 
 type MCPToolTarget = MCPServerConnection | MCPPoolLease;
 
@@ -282,7 +281,8 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			if (this.reconnect && isRetriableConnectionError(error)) {
 				const newConn = await reconnectWithAbort(this.reconnect, signal);
 				if (newConn) {
-					if (this.#noReplay) return buildErrorResult(error, this.connection.name, this.tool.name, provider, providerName);
+					if (this.#noReplay)
+						return buildErrorResult(error, this.connection.name, this.tool.name, provider, providerName);
 					// Rebind so subsequent calls on this instance use the fresh connection
 					this.connection = newConn;
 					const retryProvider = newConn._source?.provider ?? provider;
@@ -391,7 +391,8 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				if (this.reconnect && isRetriableConnectionError(callError)) {
 					const newConn = await reconnectWithAbort(this.reconnect, signal);
 					if (newConn) {
-						if (this.#noReplay) return buildErrorResult(callError, this.serverName, this.tool.name, provider, providerName);
+						if (this.#noReplay)
+							return buildErrorResult(callError, this.serverName, this.tool.name, provider, providerName);
 						const retryProvider = newConn._source?.provider ?? provider;
 						const retryProviderName = newConn._source?.providerName ?? providerName;
 						try {

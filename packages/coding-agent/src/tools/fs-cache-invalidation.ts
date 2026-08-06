@@ -1,11 +1,11 @@
-
 import type { invalidateFsScanCache as invalidateFsScanCacheFn } from "@gajae-code/natives";
 
 let nativeInvalidateFsScanCache: typeof invalidateFsScanCacheFn | undefined;
 
-
 function invalidateFsScanCacheNative(path: string): void {
-	nativeInvalidateFsScanCache ??= (require("@gajae-code/natives") as { invalidateFsScanCache: typeof invalidateFsScanCacheFn }).invalidateFsScanCache;
+	nativeInvalidateFsScanCache ??= (
+		require("@gajae-code/natives") as { invalidateFsScanCache: typeof invalidateFsScanCacheFn }
+	).invalidateFsScanCache;
 	nativeInvalidateFsScanCache(path);
 }
 

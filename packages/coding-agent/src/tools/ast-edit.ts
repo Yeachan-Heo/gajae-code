@@ -34,7 +34,6 @@ import { queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-
 let astEditLoad: Promise<typeof astEditFn> | undefined;
 
 async function astEditNative(): Promise<typeof astEditFn> {

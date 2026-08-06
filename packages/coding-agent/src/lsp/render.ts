@@ -14,11 +14,11 @@ import type { HighlightColors } from "@gajae-code/natives";
 type NativeLspRenderBindings = Pick<typeof import("@gajae-code/natives"), "highlightCode" | "supportsLanguage">;
 let nativeLspRenderBindings: NativeLspRenderBindings | undefined;
 
-
 function nativeLspRender(): NativeLspRenderBindings {
 	if (!nativeLspRenderBindings) nativeLspRenderBindings = require("@gajae-code/natives") as NativeLspRenderBindings;
 	return nativeLspRenderBindings;
 }
+
 import { type Component, Text } from "@gajae-code/tui";
 import { getLanguageFromPath, type Theme } from "../modes/theme/theme";
 import {

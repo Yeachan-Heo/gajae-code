@@ -21,7 +21,10 @@ export const AGENTS_MD_LIMIT = 200;
 let nativeWorkspaceBindings: { FileType: typeof FileTypeEnum; listWorkspace: typeof listWorkspaceFn } | undefined;
 async function workspaceNatives(): Promise<{ FileType: typeof FileTypeEnum; listWorkspace: typeof listWorkspaceFn }> {
 	if (!nativeWorkspaceBindings) {
-		const mod = require("@gajae-code/natives") as { FileType: typeof FileTypeEnum; listWorkspace: typeof listWorkspaceFn };
+		const mod = require("@gajae-code/natives") as {
+			FileType: typeof FileTypeEnum;
+			listWorkspace: typeof listWorkspaceFn;
+		};
 		nativeWorkspaceBindings = { FileType: mod.FileType, listWorkspace: mod.listWorkspace };
 	}
 	return nativeWorkspaceBindings;

@@ -9,12 +9,17 @@ import { connectToServer, subscribeToResources, unsubscribeFromResources } from 
 import {
 	buildMCPPoolKeyIdentity,
 	computeMCPPoolKey,
-	type MCPPoolCapabilityProfile,
 	type MCPPoolKeyIdentity,
 	type MCPPoolKeyOptions,
 	type MCPPoolSharingMode,
 } from "./pool-key";
-import { MCPNotificationMethods, type MCPRequestOptions, type MCPServerConfig, type MCPServerConnection, type MCPTransport } from "./types";
+import {
+	MCPNotificationMethods,
+	type MCPRequestOptions,
+	type MCPServerConfig,
+	type MCPServerConnection,
+	type MCPTransport,
+} from "./types";
 
 export type { MCPPoolCapabilityProfile, MCPPoolKeyIdentity, MCPPoolKeyOptions, MCPPoolSharingMode } from "./pool-key";
 
@@ -391,10 +396,13 @@ export class MCPConnectionPool {
 
 	constructor(options: MCPConnectionPoolOptions = {}) {
 		this.#sharedPoolIdleMs =
-			typeof options.sharedPoolIdleMs === "number" && Number.isFinite(options.sharedPoolIdleMs) && options.sharedPoolIdleMs >= 0
+			typeof options.sharedPoolIdleMs === "number" &&
+			Number.isFinite(options.sharedPoolIdleMs) &&
+			options.sharedPoolIdleMs >= 0
 				? options.sharedPoolIdleMs
 				: 300_000;
-		this.#connect = options.connect ?? ((name, config, connectOptions) => connectToServer(name, config, connectOptions));
+		this.#connect =
+			options.connect ?? ((name, config, connectOptions) => connectToServer(name, config, connectOptions));
 	}
 
 	get size(): number {
@@ -514,7 +522,7 @@ export class MCPConnectionPool {
 				pending.settlement,
 			);
 			settle(() => reject(reason));
-			if (pending.waiters.size === 0 && !pending.settled) this.cancelPendingEntry(key, name, pending, reason);
+			if (pending.waiters.size === 0 && !pending.settled) this.cancelPendingEntry(key, pending, reason);
 		};
 		if (signal) {
 			if (signal.aborted) abortWaiter();
@@ -551,14 +559,18 @@ export class MCPConnectionPool {
 					this.#entries.get(key) === entry
 				) {
 					void this.closeEntry(entry).catch(error =>
-						logger.error("MCP zero-claim handoff cleanup failed", { path: `mcp:${entry.name}`, poolKey: key, error }),
+						logger.error("MCP zero-claim handoff cleanup failed", {
+							path: `mcp:${entry.name}`,
+							poolKey: key,
+							error,
+						}),
 					);
 				}
 			}),
 		);
 	}
 
-	private cancelPendingEntry(key: string, name: string, pending: PendingEntry, reason: unknown): void {
+	private cancelPendingEntry(key: string, pending: PendingEntry, reason: unknown): void {
 		if (pending.cancelled || pending.settled) return;
 		pending.cancelled = true;
 		pending.cancellationReason = reason;
@@ -666,7 +678,11 @@ export class MCPConnectionPool {
 				try {
 					await connection.transport.close();
 				} catch (closeError) {
-					logger.error("MCP late transport close failed", { path: `mcp:${name}`, poolKey: key, error: closeError });
+					logger.error("MCP late transport close failed", {
+						path: `mcp:${name}`,
+						poolKey: key,
+						error: closeError,
+					});
 				}
 				throw pending.cancellationReason ?? new Error(`MCP connection acquisition abandoned: ${name}`);
 			}
@@ -685,7 +701,11 @@ export class MCPConnectionPool {
 	private installTransportHandlers(entry: PoolEntry, options: MCPPoolAcquireOptions): void {
 		const transport = entry.connection.transport;
 		transport.onNotification = (method, params) => {
-			if (!Object.values(MCPNotificationMethods).includes(method as (typeof MCPNotificationMethods)[keyof typeof MCPNotificationMethods])) {
+			if (
+				!Object.values(MCPNotificationMethods).includes(
+					method as (typeof MCPNotificationMethods)[keyof typeof MCPNotificationMethods],
+				)
+			) {
 				this.record(entry, "error", new Error(`Unsupported MCP notification: ${method}`));
 				return;
 			}
@@ -728,28 +748,35 @@ export class MCPConnectionPool {
 		}
 	}
 	updateLeaseRoots(entry: PoolEntry, lease: MCPPoolLeaseImpl, roots: Array<{ uri: string; name: string }>): void {
-		entry.rootsByLease.set(lease, roots.map(root => ({ ...root })));
+		entry.rootsByLease.set(
+			lease,
+			roots.map(root => ({ ...root })),
+		);
 		this.#scheduleRootsNotification(entry);
 	}
 
 	#scheduleRootsNotification(entry: PoolEntry): void {
-		if (this.#shuttingDown || entry.rootsNotificationScheduled || entry.state === "closed" || entry.transportCloseStarted) return;
+		if (
+			this.#shuttingDown ||
+			entry.rootsNotificationScheduled ||
+			entry.state === "closed" ||
+			entry.transportCloseStarted
+		)
+			return;
 		entry.rootsNotificationScheduled = true;
 		queueMicrotask(() => {
 			entry.rootsNotificationScheduled = false;
 			if (this.#shuttingDown || entry.state === "closed" || entry.transportCloseStarted) return;
-			void entry.connection.transport.notify("notifications/roots/list_changed").catch(error =>
-				logger.debug("MCP roots/list_changed notification failed", { path: `mcp:${entry.name}`, error }),
-			);
+			void entry.connection.transport
+				.notify("notifications/roots/list_changed")
+				.catch(error =>
+					logger.debug("MCP roots/list_changed notification failed", { path: `mcp:${entry.name}`, error }),
+				);
 		});
 	}
 
 	/** @internal Lease-facing aggregate subscription refcount update; not public API. */
-	updateLeaseSubscriptions(
-		entry: PoolEntry,
-		previous: ReadonlySet<string>,
-		next: ReadonlySet<string>,
-	): Promise<void> {
+	updateLeaseSubscriptions(entry: PoolEntry, previous: ReadonlySet<string>, next: ReadonlySet<string>): Promise<void> {
 		const update = entry.resourceSubscriptionUpdate.then(async () => {
 			const removed = [...previous].filter(uri => !next.has(uri));
 			const added = [...next].filter(uri => !previous.has(uri));
@@ -764,7 +791,8 @@ export class MCPConnectionPool {
 					nextCounts.set(uri, count - 1);
 				}
 			}
-			if (unsubscribe.length > 0) await unsubscribeFromResources(entry.connection, unsubscribe, { throwOnError: true });
+			if (unsubscribe.length > 0)
+				await unsubscribeFromResources(entry.connection, unsubscribe, { throwOnError: true });
 
 			const subscribe: string[] = [];
 			for (const uri of added) {
@@ -780,7 +808,10 @@ export class MCPConnectionPool {
 						try {
 							await subscribeToResources(entry.connection, unsubscribe, { throwOnError: true });
 						} catch (restoreError) {
-							throw new AggregateError([error, restoreError], "MCP resource subscription transaction rollback failed");
+							throw new AggregateError(
+								[error, restoreError],
+								"MCP resource subscription transaction rollback failed",
+							);
 						}
 					}
 					throw error;

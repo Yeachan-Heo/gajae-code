@@ -2,12 +2,13 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
+import { readSchemaDeclaration, schemaHash } from "./metadata";
 import { resolveWithinRoot } from "./paths";
 import { parseManifest, parseSubskillFrontmatter } from "./schema";
 import {
 	GJC_PLUGIN_MANIFEST_FILENAME,
-	GjcPluginLoadError,
 	type GjcPluginAppendixManifestEntry,
+	GjcPluginLoadError,
 	type GjcPluginMcpManifestEntry,
 	type NormalizedAgentAppendixSurface,
 	type NormalizedAppendixSurface,
@@ -20,7 +21,6 @@ import {
 	type NormalizedToolSurface,
 } from "./types";
 import { validateBinding } from "./validation";
-import { readSchemaDeclaration, schemaHash } from "./metadata";
 
 function sha256(bytes: Buffer | string): string {
 	return createHash("sha256").update(bytes).digest("hex");
@@ -284,10 +284,16 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			}
 		}
 		if (hook.phase && hook.event !== "tool_call" && hook.event !== "tool_result") {
-			throw new GjcPluginLoadError("invalid_hook", `GJC plugin hook "${hook.name}": phase is only supported for tool_call/tool_result events`);
+			throw new GjcPluginLoadError(
+				"invalid_hook",
+				`GJC plugin hook "${hook.name}": phase is only supported for tool_call/tool_result events`,
+			);
 		}
 		if (hook.event === "tool_result" && hook.phase !== "after") {
-			throw new GjcPluginLoadError("invalid_hook", `GJC plugin hook "${hook.name}": tool_result requires the after phase`);
+			throw new GjcPluginLoadError(
+				"invalid_hook",
+				`GJC plugin hook "${hook.name}": tool_result requires the after phase`,
+			);
 		}
 		hooks.push({
 			extensionId: surfaceIds.hook(hook.event, hook.phase, hook.target, hook.name),

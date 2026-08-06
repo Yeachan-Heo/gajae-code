@@ -2,10 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SdkTransportLifecycleError } from "./websocket-transport";
-import { createSdkSessionRuntimeExtension, SessionSdkSessionRuntime, type SessionSdkTransport } from "./session-runtime";
+import {
+	createSdkSessionRuntimeExtension,
+	SessionSdkSessionRuntime,
+	type SessionSdkTransport,
+} from "./session-runtime";
 import { createSdkCapabilities, createSdkSurfacePolicy } from "./surface-policy";
 import type { SdkFrame } from "./types";
+import { SdkTransportLifecycleError } from "./websocket-transport";
 
 function memoryTransport(): SessionSdkTransport & {
 	feed(connectionId: string, frame: SdkFrame): void;
@@ -175,7 +179,10 @@ describe("SessionSdkSessionRuntime", () => {
 					stop: async () => {
 						stats.stops += 1;
 						if (failFirstStop && stats.stops === 1)
-							throw new SdkTransportLifecycleError("endpoint_remove_failed", "injected endpoint removal failure");
+							throw new SdkTransportLifecycleError(
+								"endpoint_remove_failed",
+								"injected endpoint removal failure",
+							);
 					},
 				};
 			},

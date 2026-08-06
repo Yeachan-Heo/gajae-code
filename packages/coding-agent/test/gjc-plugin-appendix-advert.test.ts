@@ -70,7 +70,10 @@ describe("plugin prompt appendices", () => {
 			renderPluginAppendices(effective, {
 				beforeRead: async (_entry, surface) => {
 					if (!surface.extensionId.includes("system-appendix")) return;
-					await fs.appendFile(path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "prompts", "system-appendix.md"), "\npost-validation replacement\n");
+					await fs.appendFile(
+						path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "prompts", "system-appendix.md"),
+						"\npost-validation replacement\n",
+					);
 				},
 			}),
 		).rejects.toMatchObject({ code: "runtime_mismatch" });
@@ -85,7 +88,10 @@ describe("plugin prompt appendices", () => {
 			renderPluginAppendices(effective, {
 				beforeRead: async (_entry, surface) => {
 					if (!surface.extensionId.includes("agent-appendix")) return;
-					await fs.appendFile(path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "prompts", "executor-appendix.md"), "\npost-validation replacement\n");
+					await fs.appendFile(
+						path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "prompts", "executor-appendix.md"),
+						"\npost-validation replacement\n",
+					);
 				},
 			}),
 		).rejects.toMatchObject({ code: "runtime_mismatch" });

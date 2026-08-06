@@ -10,8 +10,8 @@ export {
 	getShellConfig,
 	resetShellConfigCache,
 	resolveBasicShell,
-	scrubProcessEnv,
 	type ShellConfig,
+	scrubProcessEnv,
 } from "./shell-config";
 
 /**

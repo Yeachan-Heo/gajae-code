@@ -20,6 +20,7 @@ import type {
 	ResponseReasoningItem,
 } from "openai/resources/responses/responses";
 import packageJson from "../../package.json" with { type: "json" };
+import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
@@ -91,8 +92,8 @@ import {
 	mapOpenAIResponsesStopReason,
 	populateResponsesUsageFromResponse,
 } from "./openai-responses-shared";
-import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
 import { transformMessages } from "./transform-messages";
+
 export { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
 
 export interface OpenAICodexResponsesOptions extends StreamOptions {
@@ -139,7 +140,6 @@ const X_REASONING_INCLUDED_HEADER = "x-reasoning-included";
 const CODEX_WEBSOCKET_FATAL_PATTERNS = ["websocket error:", "websocket closed before open", "connection timeout"];
 /** Max total time to spend retrying 429s with server-provided delays (5 minutes). */
 const CODEX_RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
-
 
 const CODEX_PROGRESS_EVENT_TYPES = new Set([
 	"response.created",

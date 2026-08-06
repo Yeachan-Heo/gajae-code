@@ -2,11 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "@gajae-code/ai";
 import { estimateEntryTokens } from "../src/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
-import {
-	DEFAULT_PRUNE_CONFIG,
-	type PruneConfig,
-	pruneAssistantToolArguments,
-} from "../src/compaction/pruning";
+import { DEFAULT_PRUNE_CONFIG, type PruneConfig, pruneAssistantToolArguments } from "../src/compaction/pruning";
 import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 
 /**

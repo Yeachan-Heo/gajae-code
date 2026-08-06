@@ -424,7 +424,14 @@ describe("GJC bundle refusal purity", () => {
 				kind: "gajae-code-plugin",
 				name: "ordinary-bundle_1.0",
 				version: "1.0.0-beta.1",
-				tools: [{ name: "good_tool", path: "tools/t.ts", description: "Ordinary prose, punctuation: fine!", parameters: { type: "object", properties: {} } }],
+				tools: [
+					{
+						name: "good_tool",
+						path: "tools/t.ts",
+						description: "Ordinary prose, punctuation: fine!",
+						parameters: { type: "object", properties: {} },
+					},
+				],
 				hooks: [{ name: "audit-read", event: "tool_call", target: "read", phase: "before", path: "hooks/h.ts" }],
 			}),
 		);

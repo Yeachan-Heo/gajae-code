@@ -1,6 +1,6 @@
-import { loadNative as loadNativeBindings } from "../../../natives/native/loader-state.js";
-import { h01FindBestFuzzyMatch, h02ScoreSequenceFuzzy, h06FormatHashLines } from "@gajae-code/natives";
 import type { WindowsJobMemoryProbeResult } from "@gajae-code/natives";
+import { h01FindBestFuzzyMatch, h02ScoreSequenceFuzzy, h06FormatHashLines } from "@gajae-code/natives";
+import { loadNative as loadNativeBindings } from "../../../natives/native/loader-state.js";
 
 export type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
 

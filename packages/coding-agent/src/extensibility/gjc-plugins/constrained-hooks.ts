@@ -2,11 +2,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { bundleIdentity } from "./lifecycle-reconciliation";
+import { verifyImplementationHash } from "./metadata";
+import { resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { type SessionQuarantine, validateSessionBundles, verifyEntryHashes } from "./session-validation";
-import { resolveWithinRoot } from "./paths";
 import { GjcPluginLoadError, type GjcPluginRegistryEntry, type GjcPluginScope } from "./types";
-import { verifyImplementationHash } from "./metadata";
 
 /**
  * Constrained plugin-hook loader.
@@ -43,7 +43,8 @@ async function resolveConstrainedHookFile(root: string, relativePath: string): P
 	const lexical = resolveWithinRoot(root, relativePath);
 	const [rootReal, fileReal] = await Promise.all([fs.realpath(root), fs.realpath(lexical)]);
 	const rel = path.relative(rootReal, fileReal);
-	if (rel.startsWith("..") || path.isAbsolute(rel)) throw new GjcPluginLoadError("runtime_mismatch", `GJC plugin hook escapes its installed root: ${relativePath}`);
+	if (rel.startsWith("..") || path.isAbsolute(rel))
+		throw new GjcPluginLoadError("runtime_mismatch", `GJC plugin hook escapes its installed root: ${relativePath}`);
 	return fileReal;
 }
 
@@ -57,13 +58,17 @@ export interface DeclaredHook {
 	implementationHash?: string;
 }
 
-async function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[], invalidHookIds = new Set<string>()): Promise<DeclaredHook[]> {
+async function collectDeclaredHooks(
+	entries: readonly GjcPluginRegistryEntry[],
+	invalidHookIds = new Set<string>(),
+): Promise<DeclaredHook[]> {
 	const out: DeclaredHook[] = [];
 	for (const entry of entries) {
 		if (!entry.enabled) continue;
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const h of entry.surfaces.hooks) {
-			if (disabled.has(h.extensionId) || invalidHookIds.has(`${entry.scope}:${entry.name}:${h.extensionId}`)) continue;
+			if (disabled.has(h.extensionId) || invalidHookIds.has(`${entry.scope}:${entry.name}:${h.extensionId}`))
+				continue;
 			const implementationPath = await resolveConstrainedHookFile(entry.pluginRoot, h.relativePath);
 			out.push({
 				plugin: entry.name,
@@ -72,7 +77,8 @@ async function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[], 
 				target: h.target,
 				phase: h.phase,
 				relativePath: implementationPath,
-				implementationHash: "implementationHash" in h && typeof h.implementationHash === "string" ? h.implementationHash : undefined,
+				implementationHash:
+					"implementationHash" in h && typeof h.implementationHash === "string" ? h.implementationHash : undefined,
 			});
 		}
 	}
@@ -103,7 +109,10 @@ export class ConstrainedPluginHookDescriptor {
 		if (this.implementationHash) await verifyImplementationHash(this.relativePath, this.implementationHash);
 		const registered: { event: string; handler: (...a: any[]) => unknown }[] = [];
 		const deny = (method: string) => () => {
-			throw new GjcPluginLoadError("security_policy", `Plugin hook "${this.plugin}" attempted denied API: ${method}`);
+			throw new GjcPluginLoadError(
+				"security_policy",
+				`Plugin hook "${this.plugin}" attempted denied API: ${method}`,
+			);
 		};
 		const constrainedApi: Record<string, unknown> = {
 			on: (event: string, handler: (...a: any[]) => unknown) => registered.push({ event, handler }),
@@ -112,10 +121,14 @@ export class ConstrainedPluginHookDescriptor {
 		for (const method of DENIED_API_METHODS) constrainedApi[method] = deny(method);
 		const mod = await import(this.relativePath);
 		const factory = mod.default ?? mod;
-		if (typeof factory !== "function") throw new GjcPluginLoadError("invalid_hook", "Plugin hook must export a default function");
+		if (typeof factory !== "function")
+			throw new GjcPluginLoadError("invalid_hook", "Plugin hook must export a default function");
 		await (factory as (api: unknown) => unknown)(constrainedApi);
 		if (registered.length !== 1 || registered[0]?.event !== this.event) {
-			throw new GjcPluginLoadError("runtime_mismatch", `Plugin hook registered ${JSON.stringify(registered.map(r => r.event))}, expected exactly ["${this.event}"]`);
+			throw new GjcPluginLoadError(
+				"runtime_mismatch",
+				`Plugin hook registered ${JSON.stringify(registered.map(r => r.event))}, expected exactly ["${this.event}"]`,
+			);
 		}
 		return {
 			plugin: this.plugin,

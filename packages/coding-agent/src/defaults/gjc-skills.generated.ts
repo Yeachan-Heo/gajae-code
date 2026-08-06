@@ -17,20 +17,29 @@ export interface BundledGjcSkillCatalogEntry {
 
 const deepInterview = () =>
 	import("./gjc/skills/deep-interview/SKILL.md", { with: { type: "text" } }).then(module => module.default);
-const ralplan = () => import("./gjc/skills/ralplan/SKILL.md", { with: { type: "text" } }).then(module => module.default);
+const ralplan = () =>
+	import("./gjc/skills/ralplan/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const team = () => import("./gjc/skills/team/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const ultragoal = () =>
 	import("./gjc/skills/ultragoal/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const autoAnswerUncertain = () =>
-	import("./gjc/skills/deep-interview/auto-answer-uncertain.md", { with: { type: "text" } }).then(module => module.default);
+	import("./gjc/skills/deep-interview/auto-answer-uncertain.md", { with: { type: "text" } }).then(
+		module => module.default,
+	);
 const autoResearchGreenfield = () =>
-	import("./gjc/skills/deep-interview/auto-research-greenfield.md", { with: { type: "text" } }).then(module => module.default);
+	import("./gjc/skills/deep-interview/auto-research-greenfield.md", { with: { type: "text" } }).then(
+		module => module.default,
+	);
 const lateralReviewPanel = () =>
-	import("./gjc/skills/deep-interview/lateral-review-panel.md", { with: { type: "text" } }).then(module => module.default);
+	import("./gjc/skills/deep-interview/lateral-review-panel.md", { with: { type: "text" } }).then(
+		module => module.default,
+	);
 const aiSlopCleaner = () =>
 	import("./gjc/skills/ultragoal/ai-slop-cleaner.md", { with: { type: "text" } }).then(module => module.default);
 const validationBatchContracts = () =>
-	import("./gjc/skills/ultragoal/validation-batch-contracts.md", { with: { type: "text" } }).then(module => module.default);
+	import("./gjc/skills/ultragoal/validation-batch-contracts.md", { with: { type: "text" } }).then(
+		module => module.default,
+	);
 
 export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] = [
 	{

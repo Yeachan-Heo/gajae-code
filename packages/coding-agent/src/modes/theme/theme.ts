@@ -47,6 +47,7 @@ function loadNativeThemeBindings(): void {
 			nativeThemeBindingsLoad = undefined;
 		});
 }
+
 export { getLanguageFromPath } from "../../utils/lang-from-path";
 
 // ============================================================================

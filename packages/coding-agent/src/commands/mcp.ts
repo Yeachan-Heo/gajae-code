@@ -49,7 +49,11 @@ export default class MCP extends Command {
 		}),
 		cwd: Flags.string({ description: "Working directory for stdio server" }),
 		timeout: Flags.integer({ description: "Connection timeout in milliseconds" }),
-		sharing: Flags.string({ description: "MCP connection sharing mode", options: ["per-session", "shared"], default: "per-session" }),
+		sharing: Flags.string({
+			description: "MCP connection sharing mode",
+			options: ["per-session", "shared"],
+			default: "per-session",
+		}),
 	};
 
 	async run(): Promise<void> {

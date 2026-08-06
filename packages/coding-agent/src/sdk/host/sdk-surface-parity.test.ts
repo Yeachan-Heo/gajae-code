@@ -144,7 +144,8 @@ describe("SDK surface parity", () => {
 					return { id: frame.id, ok: true, result: { accepted: true } };
 				},
 				query: async (_connectionId, frame) => {
-					if (frame.query === "turn.prompt_status") return { id: frame.id, ok: true, result: { status: "unknown" } };
+					if (frame.query === "turn.prompt_status")
+						return { id: frame.id, ok: true, result: { status: "unknown" } };
 					return { id: frame.id, ok: true, result: { query: frame.query } };
 				},
 			});
@@ -198,7 +199,10 @@ describe("SDK surface parity", () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-native-parity-"));
 		const sessionId = `native-parity-${randomUUID()}`;
 		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
-		const callbacks = new WeakMap<object, (error: Error | null, frame: { connectionId: string; json: string }) => void>();
+		const callbacks = new WeakMap<
+			object,
+			(error: Error | null, frame: { connectionId: string; json: string }) => void
+		>();
 		const servers = new Set<object>();
 		const nativePrototype = NotificationServer.prototype as any;
 		const originalOnSdkFrame = nativePrototype.onSdkFrame;
