@@ -179,18 +179,19 @@ describe("VB001 gen-3 harness gates", () => {
 				loadRescopeReference(acceptedPath, policy, GIT_COMMIT, BINARY_SHA256, 115_064_832, 114_245_632),
 			).resolves.toMatchObject({ referenceId: "TEST-REF-001" });
 
-			const checkpointRoot = path.resolve(import.meta.dir, "../.gjc/rss-checkpoints");
+			const evidencePath = path.resolve(import.meta.dir, "fixtures/w1c-floor-evidence.json");
+			const reports = JSON.parse(await fs.readFile(evidencePath, "utf8")) as Array<{
+				metadata?: { gitCommit?: string; binarySha256?: string };
+				scenarios?: Array<{ id?: string; rssBytes?: { stableTree?: { median?: number } } }>;
+			}>;
 			const expectedMedians = [95_797_248, 103_309_312, 104_808_448];
-			for (const [index, expectedMedian] of expectedMedians.entries()) {
-				const report = JSON.parse(
-					await fs.readFile(path.join(checkpointRoot, `w1c-floor-met-run${index + 1}.json`), "utf8"),
-				) as {
-					metadata?: { gitCommit?: string; binarySha256?: string };
-					scenarios?: Array<{ id?: string; rssBytes?: { stableTree?: { median?: number } } }>;
-				};
+			expect(reports).toHaveLength(expectedMedians.length);
+			for (const [index, report] of reports.entries()) {
 				expect(report.metadata?.gitCommit).toBe(GIT_COMMIT);
 				expect(report.metadata?.binarySha256).toBe(BINARY_SHA256);
-				expect(report.scenarios?.find(scenario => scenario.id === "S3")?.rssBytes?.stableTree?.median).toBe(expectedMedian);
+				expect(report.scenarios?.find(scenario => scenario.id === "S3")?.rssBytes?.stableTree?.median).toBe(
+					expectedMedians[index],
+				);
 			}
 		} finally {
 			await fs.rm(tempRoot, { recursive: true, force: true });

@@ -3,7 +3,7 @@ import type { AgentTool } from "@gajae-code/agent-core";
 import { normalizeTools } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/core";
 import { toolWireSchema } from "@gajae-code/ai/utils/schema";
-import { isComputerLoadablePlatform } from "./computer";
+import { isComputerLoadablePlatform, isComputerSupportedPlatform } from "./computer";
 import {
 	BUILTIN_TOOL_DESCRIPTORS,
 	BUILTIN_TOOLS,
@@ -274,6 +274,8 @@ describe("tool descriptor compatibility gate", () => {
 		// `ask`, `irc` and `github` need session capabilities the bare fixture never provides:
 		// a UI or workflow gate, an agent registry, and an installed `gh`.
 		const unavailableByDefault = new Set(["ask", "debug", "github", "irc", "search_tool_bm25", "goal"]);
+		if (!isComputerSupportedPlatform()) unavailableByDefault.add("computer");
+		if (process.env.CLAUDE_CODE_DISABLE_CRON === "1") unavailableByDefault.add("cron");
 		for (const [name, descriptor] of Object.entries(BUILTIN_TOOL_DESCRIPTORS)) {
 			expect(descriptor.isAvailable(session, context)).toBe(!unavailableByDefault.has(name));
 		}
@@ -355,14 +357,15 @@ describe("tool descriptor compatibility gate", () => {
 
 		const cronSession = makeSession();
 		const previous = process.env.CLAUDE_CODE_DISABLE_CRON;
-		process.env.CLAUDE_CODE_DISABLE_CRON = "1";
 		try {
+			process.env.CLAUDE_CODE_DISABLE_CRON = "1";
 			expect(BUILTIN_TOOL_DESCRIPTORS.cron.isAvailable(cronSession, context)).toBe(false);
+			delete process.env.CLAUDE_CODE_DISABLE_CRON;
+			expect(BUILTIN_TOOL_DESCRIPTORS.cron.isAvailable(cronSession, context)).toBe(true);
 		} finally {
 			if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_CRON;
 			else process.env.CLAUDE_CODE_DISABLE_CRON = previous;
 		}
-		expect(BUILTIN_TOOL_DESCRIPTORS.cron.isAvailable(cronSession, context)).toBe(true);
 	});
 
 	test("descriptor creation is side-effect free; materialization registers cleanup exactly once", () => {

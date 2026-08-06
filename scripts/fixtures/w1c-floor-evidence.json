@@ -1,0 +1,38 @@
+[
+	{
+		"metadata": {
+			"gitCommit": "cc5873573ccebc955c5ba3bac7960df79e7b1bcd",
+			"binarySha256": "0abede40edcc6c79cea6e51d5bfcdcf9e6021bde8b998c13d540339f8035884c"
+		},
+		"scenarios": [
+			{
+				"id": "S3",
+				"rssBytes": { "stableTree": { "median": 95797248 } }
+			}
+		]
+	},
+	{
+		"metadata": {
+			"gitCommit": "cc5873573ccebc955c5ba3bac7960df79e7b1bcd",
+			"binarySha256": "0abede40edcc6c79cea6e51d5bfcdcf9e6021bde8b998c13d540339f8035884c"
+		},
+		"scenarios": [
+			{
+				"id": "S3",
+				"rssBytes": { "stableTree": { "median": 103309312 } }
+			}
+		]
+	},
+	{
+		"metadata": {
+			"gitCommit": "cc5873573ccebc955c5ba3bac7960df79e7b1bcd",
+			"binarySha256": "0abede40edcc6c79cea6e51d5bfcdcf9e6021bde8b998c13d540339f8035884c"
+		},
+		"scenarios": [
+			{
+				"id": "S3",
+				"rssBytes": { "stableTree": { "median": 104808448 } }
+			}
+		]
+	}
+]
