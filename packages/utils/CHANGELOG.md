@@ -3,12 +3,9 @@
 ## [Unreleased]
 
 ### Fixed
-## [0.12.12] - 2026-08-05
-### Fixed
-
-- Fatal-crash diagnostics now preserve the `.message` (and `.name`) of thrown non-Error objects instead of reducing them to `[object Object]`, so a crash that throws a structured plain object surfaces its real reason in the crash log and on stderr.
 
 - `fetchWithRetry` now clamps every scheduled retry delay to the platform timer ceiling so large backoffs and server hints cannot overflow into immediate retries.
+- Fatal-crash diagnostics now preserve the `.message` (and `.name`) of thrown non-Error objects instead of reducing them to `[object Object]`, so a crash that throws a structured plain object surfaces its real reason in the crash log and on stderr.
 
 ## [0.12.12] - 2026-08-05
 ## [0.12.11] - 2026-08-03
