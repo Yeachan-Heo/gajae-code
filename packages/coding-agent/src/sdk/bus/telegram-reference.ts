@@ -22,6 +22,7 @@ import {
 	buildCompactChoiceGrid,
 	escapeHtml,
 	numberedOptionList,
+	renumberableOptionText,
 	splitTelegramHtml,
 	TELEGRAM_PARSE_MODE,
 } from "./html-format";
@@ -293,7 +294,7 @@ export function buildActionMarkdown(action: {
 	const options = action.options ?? [];
 	const displayOptions = withRecommendedOptionLabel(options, action.recommendedIndex);
 	if (options.length === 0) return `${heading}\n\n(reply with text)`;
-	const list = displayOptions.map((label, i) => `${i + 1}. ${label.replace(/^\s*\d+[.)]\s+/, "")}`).join("\n");
+	const list = displayOptions.map((label, i) => `${i + 1}. ${renumberableOptionText(label)}`).join("\n");
 	return `${heading}\n\n${list}`;
 }
 

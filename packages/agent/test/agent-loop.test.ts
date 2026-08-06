@@ -1244,6 +1244,49 @@ describe("agentLoop with AgentMessage", () => {
 			expect(text).not.toContain("Tool execution was aborted.:");
 		}
 	});
+	it("does not wait forever for a non-cooperative tool after abort", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const abortController = new AbortController();
+		let toolStarted = false;
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "hang",
+			label: "Hang",
+			description: "Never settles",
+			parameters: toolSchema,
+			async execute() {
+				toolStarted = true;
+				abortController.abort();
+				return new Promise(() => {});
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "hang", arguments: { value: "x" } }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const stream = agentLoop([createUserMessage("start")], context, config, abortController.signal, mock.stream);
+
+		const completion = (async () => {
+			for await (const _event of stream) {
+				// drain
+			}
+			return stream.result();
+		})();
+		const messages = await Promise.race([
+			completion,
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("agent loop hung")), 1000)),
+		]);
+
+		expect(toolStarted).toBe(true);
+		const toolResult = messages.find(message => message.role === "toolResult");
+		expect(toolResult?.isError).toBe(true);
+		if (toolResult?.role === "toolResult") {
+			expect(toolResult.content).toEqual([{ type: "text", text: "Tool execution was aborted." }]);
+		}
+	});
 
 	it("should skip remaining tool calls when steering is queued", async () => {
 		const toolSchema = z.object({ value: z.string() });

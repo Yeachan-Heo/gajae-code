@@ -229,22 +229,26 @@ describe("generated model policies", () => {
 		});
 	});
 
-	it("maps only first-class MiniMax M3 routes to the official 1M context", () => {
+	it("maps only first-class MiniMax M3 routes to the official 1M context (issue #3896)", () => {
 		const models = [
-			createModel({ id: "minimax-m3", api: "anthropic-messages", provider: "minimax" }),
-			createModel({ id: "minimax-m3", api: "anthropic-messages", provider: "minimax-cn" }),
-			createModel({ id: "minimax-m3", api: "openai-completions", provider: "minimax-code" }),
-			createModel({ id: "minimax-m3", api: "openai-completions", provider: "minimax-code-cn" }),
+			createModel({ id: "MiniMax-M3", api: "anthropic-messages", provider: "minimax" }),
+			createModel({ id: "MiniMax-M3[1m]", api: "anthropic-messages", provider: "minimax" }),
+			createModel({ id: "MiniMax-M3[1m]", api: "anthropic-messages", provider: "minimax-cn" }),
+			createModel({ id: "MiniMax-M3", api: "openai-completions", provider: "minimax-code" }),
+			createModel({ id: "MiniMax-M3", api: "openai-completions", provider: "minimax-code-cn" }),
 			createModel({ id: "minimax-m3", api: "openai-completions", provider: "openai-codex" }),
-			createModel({ id: "minimax-m3", api: "openai-completions", provider: "opencode" }),
+			{
+				...createModel({ id: "minimax-m3", api: "openai-completions", provider: "opencode-zen" }),
+				contextWindow: 512_000,
+			},
 		];
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models.slice(0, 4).map(model => model.contextWindow)).toEqual([
-			1_000_000, 1_000_000, 1_000_000, 1_000_000,
+		expect(models.slice(0, 5).map(model => model.contextWindow)).toEqual([
+			1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000,
 		]);
-		expect(models.slice(4).map(model => model.contextWindow)).toEqual([200_000, 200_000]);
+		expect(models.slice(5).map(model => model.contextWindow)).toEqual([200_000, 512_000]);
 	});
 
 	it("refreshes thinking metadata and applies parsed catalog corrections", () => {

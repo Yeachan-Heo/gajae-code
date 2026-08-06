@@ -457,10 +457,11 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 		};
 	}
 	// MiniMax-M3's official Token Plan routes expose a 1M context window.
-	// Scope the correction to the four first-class regional MiniMax routes;
-	// unrelated catalog aliases and providers keep their own contracts.
+	// Scope the correction to the four first-class regional MiniMax routes
+	// (canonical id plus the Anthropic Token Plan `[1m]` id); unrelated
+	// catalog aliases and providers keep their own contracts.
 	if (
-		model.id === "minimax-m3" &&
+		(model.id === "MiniMax-M3" || model.id === "MiniMax-M3[1m]") &&
 		(model.provider === "minimax" ||
 			model.provider === "minimax-cn" ||
 			model.provider === "minimax-code" ||

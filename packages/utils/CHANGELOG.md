@@ -2,8 +2,11 @@
 
 ## [Unreleased]
 
-## [0.12.12] - 2026-08-05
+### Fixed
 
+- `fetchWithRetry` now clamps every scheduled retry delay to the platform timer ceiling so large backoffs and server hints cannot overflow into immediate retries.
+
+## [0.12.12] - 2026-08-05
 ## [0.12.11] - 2026-08-03
 
 ## [0.12.10] - 2026-08-03
@@ -14,7 +17,6 @@
 
 - macOS executable discovery now honors explicit `PATH` and `cwd` lookup overrides instead of silently searching the process environment.
 - Postmortem callbacks registered after a completed plain cleanup now run through the handled `Promise.try(...).catch(log)` path instead of a bare synchronous call that dropped the returned promise, so rejecting async late registrations are logged instead of surfacing as unhandled rejections that fail unrelated in-flight work.
-
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31

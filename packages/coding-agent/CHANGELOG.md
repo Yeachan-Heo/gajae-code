@@ -6,7 +6,11 @@
 
 - `gjc gc` file-lock discovery now budgets the walk **per lock root** and reports a hit entry cap as a **warning**, not a hard error. Truncating one root no longer skips the remaining roots, and a healthy run with only cap warnings exits `0` so scripts/cron/`&&` chains stay usable (#3852).
 
+- `gjc models` is no longer treated as a free-form agent prompt. The mistaken subcommand spelling now routes to the existing `--list-models` listing path so a nested bash-tool invocation cannot recursively spawn unbounded GJC agents (#3857).
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.
+- A Telegram notification daemon whose reconciliation pass fails no longer exits. The pass persists through the shared topic authority, and a momentarily unavailable authority (lock contention or a rejected compare-and-set) rejected out of both the scan timer and the run loop into the process-level fatal handler, killing the owner. Every session topic was then left behind as an unarchived shell that answers nothing — including for sessions that were still live and lost their notifications. The pass now reports the failure and the next scan interval retries it; the queue-flush timer is guarded the same way.
+- MiniMax M3 preset and profile ids canonicalized to `MiniMax-M3` (issue #3896): the `minimax` / `minimax-cn` onboarding presets and the `minimax-eco` / `minimax-medium` / `minimax-pro` builtin model profiles no longer reference the removed lowercase `minimax-m3` / `minimax-v3` first-class catalog ids.
+- A remote multi-select ask now shows what is already selected. The ask tool re-issues one remote request per toggle, but the request carried no selection state, so Telegram kept posting an identical prompt with no sign that option 1 had been picked — the checkbox rendering existed only for durable workflow gates. `AskAnswerRequest` now carries `multi` and the selected option labels, the notification bus publishes them as `selectedOptionIndices` with the `(N selected)` question prefix while keeping the ask tool's own Next/Done control, and pre-numbered options (deep interview) are renumbered once instead of rendering as `1. ☑ 1. …`.
 
 ## [0.12.12] - 2026-08-05
 
@@ -20,6 +24,8 @@
 - Added a verified, copy-installable `ooo` bridge example: `ooo interview` renders Ouroboros MCP questions in GJC, serializes startup and follow-up answers by session ID, cancellation-fences late settlement, disposes state on GJC session changes and `/clear`, drops queued predecessor-generation starts, releases dead transports and controls, honors `OUROBOROS_CLI`, and loads dependency-free in compiled binaries (#3803).
 
 ### Fixed
+
+- Fixed deep-interview prompts exposing the literal argument placeholder.
 
 - Automatic session retry now refuses to re-issue a request once the failed attempt carries observable assistant text, thinking, or tool-call content — including under explicit legacy `retry.*` settings. Content-free clean failures keep their existing bounded/unbounded policy; managed provisional discard, credential rotation, first-event timeout scope checks, and manual `/retry` are unchanged (#3791).
 - Resuming a session whose transcript file is at or above the ~64 MiB managed-storage per-file bound no longer OOMs, stalls the process, or fails with a bare unhandled rejection. Resume/open now fail closed with a structured `oversized` reason (`SessionTranscriptOversizedError`) and recovery guidance before the full read/decode/parse path, instead of loading the entire file into memory. The bound matches the existing managed-artifact per-file limit and is not raised; sub-limit sessions resume unchanged (#3851).
@@ -89,6 +95,8 @@
 - Windows automatic tmux resolution now selects `psmux` then `pmux` by canonical command order without rejecting distinct lower-priority aliases; it probes `tmux` only when neither named provider is available (#3725).
 - CI failure extraction now aggregates Bun failure and suite-error summaries across every test invocation in a job log instead of silently using only the first summary.
 - The GitHub status-line lookup now binds terminal links to positive PR numbers and canonical matching HTTP(S) pull-request URLs, rejecting ambiguous or control-bearing targets.
+- Fork-context subagents no longer inherit the parent's provider continuity identity. Each child session now presents its own `session_id`/`prompt_cache_key`, so concurrent subagent fleets stop colliding on session-owning upstream transports (`owner_busy` websocket-to-HTTP fallbacks) and keep per-worker cache affinity. Explicit `providerSessionId` overrides and serial same-session continuity are unchanged.
+- Fork-context subagents no longer inherit the parent's provider continuity identity. Each child session now presents its own `session_id`/`prompt_cache_key`, so concurrent subagent fleets stop colliding on session-owning upstream transports (`owner_busy` websocket-to-HTTP fallbacks) and keep per-worker cache affinity. Because `providerSessionId` scopes sticky credential selection as well as prompt-cache affinity, each child also selects its provider credential independently instead of following the parent's sticky choice. Explicit `providerSessionId` overrides and serial same-session continuity are unchanged.
 - Ordinary `ask` selectors now bound long question premises and page through every premise row without skipping rows hidden by overflow indicators (#3675).
 - First-event timeout retries now require a typed, content-free failure from the current clean attempt scope, preventing prior or stale extension activity from suppressing or admitting a later request (#3553).
 - The issue-1979 Korean prose wrap test now cleans up inherited multiplexer env vars (`TMUX`, `TMUX_PANE`, etc.) so it deterministically exercises the plain-terminal render path regardless of the CI runner's terminal session (#1979).
