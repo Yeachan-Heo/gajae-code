@@ -1158,18 +1158,18 @@ describe("resident-store transition seam", () => {
 		if (!stagingFile) throw new Error("Expected staged recovery transcript");
 		const entriesBefore = JSON.stringify(staged.manager.getEntries());
 		let collisionPath: string | undefined;
-		const originalPublishNoReplace = ManagedSessionDescendantStore.prototype.publishNoReplace;
-		const publishNoReplace = vi
-			.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplace")
-			.mockImplementation(async function (
+		const originalMoveExpectedNoReplace = ManagedSessionDescendantStore.prototype.moveExpectedNoReplace;
+		const moveExpectedNoReplace = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "moveExpectedNoReplace")
+			.mockImplementation(function (
 				this: ManagedSessionDescendantStore,
-				relativePath: string,
-				bytes: Uint8Array,
+				sourceRelativePath,
+				destinationRelativePath,
+				expected,
 			) {
-				if (relativePath.startsWith(".")) return await originalPublishNoReplace.call(this, relativePath, bytes);
-				collisionPath = path.join(this.dir, relativePath);
-				await originalPublishNoReplace.call(this, relativePath, Buffer.from("pre-existing collision"));
-				await originalPublishNoReplace.call(this, relativePath, bytes);
+				collisionPath = path.join(this.dir, destinationRelativePath);
+				this.publishNoReplaceSync(destinationRelativePath, Buffer.from("pre-existing collision"));
+				originalMoveExpectedNoReplace.call(this, sourceRelativePath, destinationRelativePath, expected);
 			});
 		const adopted = vi.spyOn(EphemeralBlobStore, "adoptVerifiedDir");
 		const disposed = vi.spyOn(EphemeralBlobStore.prototype, "dispose");
@@ -1179,7 +1179,7 @@ describe("resident-store transition seam", () => {
 					ownershipReady: true,
 				}),
 			).rejects.toThrow("destination_conflict");
-			expect(publishNoReplace).toHaveBeenCalledTimes(1);
+			expect(moveExpectedNoReplace).toHaveBeenCalledTimes(1);
 			expect(adopted).toHaveBeenCalledTimes(1);
 			expect(disposed).toHaveBeenCalledTimes(1);
 			expect(collisionPath).toBeDefined();
