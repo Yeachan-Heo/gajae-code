@@ -32,11 +32,17 @@ import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
 
 type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
-let nativeSdkBusBindingsLoad: Promise<NativeSdkBusBindings> | undefined;
+let nativeSdkBusBindings: NativeSdkBusBindings | undefined;
 
-async function sdkBusNatives(): Promise<NativeSdkBusBindings> {
-	nativeSdkBusBindingsLoad ??= Promise.resolve(require("@gajae-code/natives") as NativeSdkBusBindings);
-	return await nativeSdkBusBindingsLoad;
+/**
+ * Lazy native access for the SDK bus. `require` is synchronous on purpose:
+ * `startSession` must reach its `sessionStartPromises` registration without an
+ * intervening microtask yield, or two concurrent starts (two `/notify on`
+ * calls) each build a runtime and the loser observes a foreign registration.
+ */
+function sdkBusNatives(): NativeSdkBusBindings {
+	nativeSdkBusBindings ??= require("@gajae-code/natives") as NativeSdkBusBindings;
+	return nativeSdkBusBindings;
 }
 
 type NotificationServer = NativeNotificationServer;
@@ -3417,7 +3423,7 @@ export function createNotificationsExtension(
 		const token = resolveToken();
 		let server: NotificationServer;
 		try {
-			const { NotificationServer, nativeBuildInfo } = await sdkBusNatives();
+			const { NotificationServer, nativeBuildInfo } = sdkBusNatives();
 			assertNativeRuntimeCompatibility({
 				runtimeVersion: VERSION,
 				nativeVersion: nativeBuildInfo().version,
