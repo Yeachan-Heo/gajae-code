@@ -16,11 +16,8 @@ type NativeManagedScope = Pick<
 	| "verifyOwnerOnlyPathSecurityExpected"
 >;
 
-let nativeManagedScope: NativeManagedScope | undefined;
-
 function nativeScope(): NativeManagedScope {
-	if (!nativeManagedScope) nativeManagedScope = require("@gajae-code/natives") as NativeManagedScope;
-	return nativeManagedScope;
+	return require("@gajae-code/natives") as NativeManagedScope;
 }
 
 import { hasFsCode, logger, pathIsWithin } from "@gajae-code/utils";

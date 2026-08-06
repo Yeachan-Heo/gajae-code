@@ -17,13 +17,8 @@ import type {
 } from "@gajae-code/ai/core";
 import type * as native from "@gajae-code/natives";
 
-let nativeSessionManagerBindings: typeof import("@gajae-code/natives") | undefined;
-
 function nativeSessionManager(): typeof import("@gajae-code/natives") {
-	if (!nativeSessionManagerBindings) {
-		nativeSessionManagerBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
-	}
-	return nativeSessionManagerBindings;
+	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 
 import { getTerminalId } from "@gajae-code/tui";

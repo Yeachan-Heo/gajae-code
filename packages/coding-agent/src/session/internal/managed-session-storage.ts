@@ -34,13 +34,8 @@ type NativeManagedSessionStorage = Pick<
 	| "verifyOwnerOnlyPathSecurityExpected"
 >;
 
-let nativeManagedSessionStorage: NativeManagedSessionStorage | undefined;
-
 function nativeSessionStorage(): NativeManagedSessionStorage {
-	if (!nativeManagedSessionStorage) {
-		nativeManagedSessionStorage = require("@gajae-code/natives") as NativeManagedSessionStorage;
-	}
-	return nativeManagedSessionStorage;
+	return require("@gajae-code/natives") as NativeManagedSessionStorage;
 }
 
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
@@ -1603,7 +1598,12 @@ export class ManagedSessionDescendantStore {
 	}
 }
 
-function secureFileDescriptor(pathname: string, fd: number, operation: "apply" | "verify"): void {
+function secureFileDescriptor(
+	pathname: string,
+	fd: number,
+	operation: "apply" | "verify",
+	allowLinuxIdentityFallback = false,
+): void {
 	if (process.platform !== "linux") {
 		if (operation === "apply") secure(pathname, "file");
 		else {
@@ -1623,7 +1623,30 @@ function secureFileDescriptor(pathname: string, fd: number, operation: "apply" |
 		operation,
 		"file",
 	);
-	if (!result.ok) throw securityError(pathname, result);
+	if (result.ok || operation !== "verify" || !allowLinuxIdentityFallback || result.code !== "identity_mismatch") {
+		if (!result.ok) throw securityError(pathname, result);
+		return;
+	}
+
+	// Some Linux filesystems can report a transient descriptor/path identity mismatch
+	// after a long-lived descriptor has survived repeated metadata updates. Only the
+	// lock-release path opts into this recovery, and only after both the descriptor
+	// and pathname identities agree before and after a native pathname verification.
+	const identityFailure: NativeSecurity = { ok: false, code: "identity_mismatch" };
+	const before = fs.fstatSync(fd, { bigint: true });
+	const named = fs.lstatSync(pathname, { bigint: true });
+	if (!named.isFile() || named.isSymbolicLink() || !sameFileIdentity(before, named))
+		throw securityError(pathname, identityFailure);
+	const verified = validateNativeSecurityResult(
+		nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"),
+		"verify",
+		"file",
+	);
+	if (!verified.ok) throw securityError(pathname, verified);
+	const after = fs.fstatSync(fd, { bigint: true });
+	const current = fs.lstatSync(pathname, { bigint: true });
+	if (!current.isFile() || current.isSymbolicLink() || !sameFileIdentity(after, current))
+		throw securityError(pathname, identityFailure);
 }
 
 function assertSafeDirectory(pathname: string): void {
@@ -1739,8 +1762,13 @@ function ownerDefinitelyGone(record: LockRecord): boolean {
 
 function writeLockDescriptor(fd: number, record: LockRecord): void {
 	const encoded = Buffer.from(`${JSON.stringify(record)}\n`);
-	const written = fs.writeSync(fd, encoded, 0, encoded.byteLength, 0);
-	if (written !== encoded.byteLength) throw new Error("durability_failed");
+	let offset = 0;
+	while (offset < encoded.byteLength) {
+		const written = fs.writeSync(fd, encoded, offset, encoded.byteLength - offset, offset);
+		if (written <= 0) throw new Error("durability_failed");
+		offset += written;
+	}
+	fs.ftruncateSync(fd, encoded.byteLength);
 	fs.fsyncSync(fd);
 }
 
@@ -2203,8 +2231,7 @@ export async function acquireManagedLock(
 			);
 			try {
 				secureFileDescriptor(lockPath, fd, "apply");
-				fs.writeFileSync(fd, `${JSON.stringify(record)}\n`);
-				fs.fsyncSync(fd);
+				writeLockDescriptor(fd, record);
 				fsyncDirectory(locksDirectory);
 			} catch (error) {
 				fs.closeSync(fd);
@@ -2259,7 +2286,7 @@ export async function acquireManagedLock(
 					clearInterval(heartbeat);
 					try {
 						assertOwned();
-						secureFileDescriptor(lockPath, fd, "verify");
+						secureFileDescriptor(lockPath, fd, "verify", true);
 						const now = Date.now();
 						// A released record is the only live-process reclaim authority. Expiry alone
 						// never authorizes stealing from a holder whose process is still present.
