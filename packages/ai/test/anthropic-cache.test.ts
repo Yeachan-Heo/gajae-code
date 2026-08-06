@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
-import { normalizeCacheControlTtlOrdering, streamAnthropic } from "@gajae-code/ai/providers/anthropic";
+import {
+	isAnthropicCacheBreakpointOverflowError,
+	normalizeCacheControlTtlOrdering,
+	streamAnthropic,
+} from "@gajae-code/ai/providers/anthropic";
 import { clearGitLabDuoDirectAccessCache, streamGitLabDuo } from "@gajae-code/ai/providers/gitlab-duo";
 import type { CacheRetention, Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 
@@ -554,5 +558,62 @@ describe("Anthropic prompt caching", () => {
 		expect(payload.messages.at(-1)?.content).toEqual([
 			{ type: "text", text: "Continue.", cache_control: { type: "ephemeral" } },
 		]);
+	});
+});
+
+// The classifier gates a retry that silently turns generated caching off for the
+// rest of the session, so the exact set of payloads it claims is the contract.
+describe("Anthropic cache breakpoint overflow classifier", () => {
+	const overflowBody =
+		'{"type":"error","error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."}}';
+
+	function status400(message: string): Error {
+		return Object.assign(new Error(message), { status: 400 });
+	}
+
+	it("claims the passthrough 400 and the statusless proxy SSE form", () => {
+		expect(isAnthropicCacheBreakpointOverflowError(status400(`400 ${overflowBody}`))).toBe(true);
+		expect(isAnthropicCacheBreakpointOverflowError(new Error(overflowBody))).toBe(true);
+	});
+
+	it("tolerates phrasing drift in the limit and the reported total", () => {
+		const alternate =
+			'{"type":"error","error":{"type":"invalid_request_error","message":"At most 4 blocks with cache_control may be provided. Found 7."}}';
+		expect(isAnthropicCacheBreakpointOverflowError(status400(`400 ${alternate}`))).toBe(true);
+	});
+
+	it("does not claim other invalid_request_error bodies", () => {
+		const thinking = status400(
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.1: Invalid `signature` in `thinking` block"}}',
+		);
+		expect(isAnthropicCacheBreakpointOverflowError(thinking)).toBe(false);
+		const unrelated = status400(
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"Some other validation error."}}',
+		);
+		expect(isAnthropicCacheBreakpointOverflowError(unrelated)).toBe(false);
+	});
+
+	it("does not claim a cache_control error that is not a breakpoint overflow", () => {
+		const shapeError = status400(
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"cache_control: Input should be a valid dictionary"}}',
+		);
+		expect(isAnthropicCacheBreakpointOverflowError(shapeError)).toBe(false);
+	});
+
+	it("leaves our own pre-flight validation failure unclaimed", () => {
+		// `validateCacheControls` throws locally and names no wire error type, so a
+		// local bug must surface instead of being retried away.
+		const local = new Error(
+			"Invalid Anthropic cache_control at cache_control: at most four total breakpoints are allowed",
+		);
+		expect(isAnthropicCacheBreakpointOverflowError(local)).toBe(false);
+	});
+
+	it("does not claim non-400 statuses or non-Error inputs", () => {
+		expect(isAnthropicCacheBreakpointOverflowError(Object.assign(new Error(overflowBody), { status: 500 }))).toBe(
+			false,
+		);
+		expect(isAnthropicCacheBreakpointOverflowError(undefined)).toBe(false);
+		expect(isAnthropicCacheBreakpointOverflowError(null)).toBe(false);
 	});
 });

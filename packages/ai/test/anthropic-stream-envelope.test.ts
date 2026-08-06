@@ -118,6 +118,40 @@ function createOtherInvalidRequestError(): Error {
 	return error;
 }
 
+function createCacheBreakpointOverflowError(): Error {
+	const error = new Error(
+		'400 {"type":"error","error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."},"request_id":"req_test"}',
+	);
+	(error as Error & { status: number }).status = 400;
+	return error;
+}
+
+/** The same rejection as a proxy forwards it: in-stream SSE body, HTTP 200, no status on the error. */
+function createStatuslessCacheBreakpointOverflowError(): Error {
+	return new Error(
+		'{"type":"error","error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."}}',
+	);
+}
+
+function cacheControlCount(params: unknown): number {
+	const payload = params as {
+		cache_control?: unknown;
+		tools?: Array<{ cache_control?: unknown }>;
+		system?: Array<{ cache_control?: unknown }>;
+		messages?: Array<{ content?: unknown }>;
+	};
+	let total = payload.cache_control ? 1 : 0;
+	for (const tool of payload.tools ?? []) if (tool.cache_control) total++;
+	for (const block of payload.system ?? []) if (block.cache_control) total++;
+	for (const message of payload.messages ?? []) {
+		if (!Array.isArray(message.content)) continue;
+		for (const block of message.content as Array<{ cache_control?: unknown }>) {
+			if (block.cache_control) total++;
+		}
+	}
+	return total;
+}
+
 function getStrictFlags(params: unknown): boolean[] {
 	const tools = (params as { tools?: Array<{ strict?: unknown }> }).tools ?? [];
 	return tools.map(tool => tool.strict === true);
@@ -761,6 +795,109 @@ describe("anthropic stream envelope handling", () => {
 		expect(
 			(providerSessionState.get("anthropic-messages") as { strictToolsDisabled?: boolean } | undefined)
 				?.strictToolsDisabled,
+		).toBe(false);
+	});
+
+	it("retries once without generated caching after a cache breakpoint overflow and keeps it off", async () => {
+		// A gateway that injects its own block-level markers leaves no slot for ours.
+		const gatewayModel: Model<"anthropic-messages"> = {
+			...model,
+			baseUrl: "https://proxy.example.com/anthropic",
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const breakpointCounts: number[] = [];
+		let attempt = 0;
+		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
+			attempt += 1;
+			breakpointCounts.push(cacheControlCount(params));
+			if (attempt === 1) {
+				return createRejectedMockRequest(createCacheBreakpointOverflowError()) as never;
+			}
+			return createMockRequest(createTextSuccessEvents("recovered")) as never;
+		});
+
+		const stream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(2);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(countEvents(events, "error")).toBe(0);
+		// The rejected attempt carried a generated marker; the retry carries none.
+		expect(breakpointCounts[0]).toBeGreaterThan(0);
+		expect(breakpointCounts[1]).toBe(0);
+		expect(
+			(providerSessionState.get("anthropic-messages") as { generatedCachingDisabled?: boolean } | undefined)
+				?.generatedCachingDisabled,
+		).toBe(true);
+
+		// A later turn in the same session must not reintroduce the rejected marker.
+		const nextStream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
+		for await (const _ of nextStream) {
+			// drain stream
+		}
+		await nextStream.result();
+		expect(attempt).toBe(3);
+		expect(breakpointCounts[2]).toBe(0);
+	});
+
+	it("recovers from a cache breakpoint overflow forwarded as a statusless proxy SSE error", async () => {
+		const gatewayModel: Model<"anthropic-messages"> = {
+			...model,
+			baseUrl: "https://proxy.example.com/anthropic",
+		};
+		const breakpointCounts: number[] = [];
+		let attempt = 0;
+		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
+			attempt += 1;
+			breakpointCounts.push(cacheControlCount(params));
+			if (attempt === 1) {
+				return createRejectedMockRequest(createStatuslessCacheBreakpointOverflowError()) as never;
+			}
+			return createMockRequest(createTextSuccessEvents("recovered")) as never;
+		});
+
+		const stream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(2);
+		expect(result.stopReason).toBe("stop");
+		expect(breakpointCounts[1]).toBe(0);
+	});
+
+	it("does not suppress caching for unrelated invalid request errors", async () => {
+		const gatewayModel: Model<"anthropic-messages"> = {
+			...model,
+			baseUrl: "https://proxy.example.com/anthropic",
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		let attempt = 0;
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {
+			attempt += 1;
+			return createRejectedMockRequest(createOtherInvalidRequestError()) as never;
+		});
+
+		const stream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Some other validation error");
+		expect(countEvents(events, "error")).toBe(1);
+		expect(
+			(providerSessionState.get("anthropic-messages") as { generatedCachingDisabled?: boolean } | undefined)
+				?.generatedCachingDisabled,
 		).toBe(false);
 	});
 

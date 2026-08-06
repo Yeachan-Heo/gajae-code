@@ -319,15 +319,18 @@ const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
 	fastModeDisabled: boolean;
+	generatedCachingDisabled: boolean;
 };
 
 function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 	const state: AnthropicProviderSessionState = {
 		strictToolsDisabled: false,
 		fastModeDisabled: false,
+		generatedCachingDisabled: false,
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
+			state.generatedCachingDisabled = false;
 		},
 	};
 	return state;
@@ -456,6 +459,28 @@ export function isAnthropicMaskedProxyRejection(error: unknown): boolean {
 	return /"type"\s*:\s*"api_error"/.test(message) && /an error occurred while processing/i.test(message);
 }
 
+/**
+ * Anthropic rejects a request carrying more than four `cache_control`
+ * breakpoints. An Anthropic-compatible gateway may attach its own block-level
+ * markers before forwarding, and those never appear in the params we serialize,
+ * so no amount of local counting can predict the total. The rejection is the
+ * only evidence that our generated marker is one too many, and it is worth
+ * exactly one retry with generated caching suppressed.
+ *
+ * Our own pre-flight `validateCacheControls` failure is deliberately not
+ * matched: it carries no `invalid_request_error` wording, so a local bug stays
+ * loud instead of being silently retried.
+ */
+export function isAnthropicCacheBreakpointOverflowError(error: unknown): boolean {
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	if (!/invalid_request_error/i.test(message)) return false;
+	if (!/cache_control/i.test(message)) return false;
+	// Observed: "A maximum of 4 blocks with cache_control may be provided. Found 5."
+	// Stay tolerant of phrasing drift around the limit and the reported total.
+	return /maximum of \d+ blocks/i.test(message) || /at most \d+ blocks/i.test(message);
+}
+
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
 	const tools = params.tools as Array<{ strict?: unknown }> | undefined;
 	return tools?.some(tool => tool.strict === true) ?? false;
@@ -493,7 +518,12 @@ function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
+	suppressGeneratedCaching = false,
 ): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
+	// A gateway already at Anthropic's four-breakpoint limit rejected our
+	// generated marker on a previous attempt. The extra markers are invisible
+	// here, so the only safe retry is to add none of our own.
+	if (suppressGeneratedCaching) return { mode: "none" };
 	const retention = resolveCacheRetention(cacheRetention ?? model.cacheRetention, "long");
 	if (retention === "none") return { mode: "none" };
 
@@ -1415,16 +1445,23 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let droppedForcedToolChoice = false;
 			let repairLatestAssistantThinking = false;
 			let repairAllAssistantThinking = false;
+			let suppressGeneratedCaching = providerSessionState?.generatedCachingDisabled ?? false;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				// Degradation state is cumulative: every fallback rebuild must merge all
 				// repairs activated so far. Rebuilding from only the immediate call lets
 				// a later strict/forced-tool/fast-mode fallback reintroduce the rejected
 				// shape (e.g. invalid thinking signatures or forced tool_choice), and
 				// the one-shot thinking-repair guard then blocks recovery.
-				let nextParams = buildParams(model, baseUrl, context, isOAuthToken, options, disableStrictTools, {
-					repairLatestAssistantThinking,
-					repairAllAssistantThinking,
-				});
+				let nextParams = buildParams(
+					model,
+					baseUrl,
+					context,
+					isOAuthToken,
+					options,
+					disableStrictTools,
+					{ repairLatestAssistantThinking, repairAllAssistantThinking },
+					suppressGeneratedCaching,
+				);
 				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
 				}
@@ -1937,6 +1974,29 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						resetOutputForRetry();
 						continue;
 					}
+					if (
+						!options?.fallbackManaged &&
+						!suppressGeneratedCaching &&
+						firstTokenTime === undefined &&
+						isAnthropicCacheBreakpointOverflowError(streamFailure)
+					) {
+						// The gateway's own markers already fill Anthropic's four slots, so
+						// our generated breakpoint is the fifth. We cannot see the others,
+						// which makes the rejection itself the only usable signal; retry
+						// once with generated caching off and keep it off for the session.
+						logger.debug("anthropic: cache breakpoint limit exceeded, retrying without generated caching", {
+							model: model.id,
+							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+						});
+						if (providerSessionState) {
+							providerSessionState.generatedCachingDisabled = true;
+						}
+						suppressGeneratedCaching = true;
+						params = await prepareParams();
+						providerRetryAttempt = 0;
+						resetOutputForRetry();
+						continue;
+					}
 					const isTransientEnvelopeFailure =
 						isTransientStreamParseError(streamFailure) || isTransientStreamEnvelopeError(streamFailure);
 					const canRetryTransientEnvelopeFailure = isTransientEnvelopeFailure && !streamedReplayUnsafeContent;
@@ -2400,6 +2460,7 @@ function enforceCacheControlLimit(params: MessageCreateParamsStreaming, maxBreak
 	if (maxBreakpoints !== 4) throw new Error("Anthropic supports exactly four cache breakpoints");
 	validateCacheControls(params as AnthropicCacheParams);
 }
+
 function buildParams(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
@@ -2408,8 +2469,14 @@ function buildParams(
 	options?: AnthropicOptions,
 	disableStrictTools = false,
 	thinkingRepair?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
+	suppressGeneratedCaching = false,
 ): MessageCreateParamsStreaming {
-	const { mode: cacheMode, cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
+	const { mode: cacheMode, cacheControl } = getCacheControl(
+		model,
+		baseUrl,
+		options?.cacheRetention,
+		suppressGeneratedCaching,
+	);
 
 	const params: AnthropicSamplingParams = {
 		model: model.id,

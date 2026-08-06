@@ -813,6 +813,8 @@ Prompt-cache modes:
 
 Without an explicit mode, canonical Anthropic endpoints default to `automatic`, Claude-family model ids on non-canonical compatible endpoints default to `explicit`, and unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`. Set `promptCacheMode: automatic` only when a gateway is known to pass through Anthropic's top-level cache control without adding conflicting block markers.
 
+If a gateway attaches enough cache markers of its own that our generated breakpoint becomes the fifth, Anthropic rejects the request with `A maximum of 4 blocks with cache_control may be provided.` Those extra markers are not visible in the request GJC builds, so the rejection is handled at runtime rather than predicted: the turn retries once with generated caching suppressed and keeps it suppressed for the rest of the provider session. Set `promptCacheMode: none` on such a gateway to skip the wasted first attempt.
+
 ```yaml
 providers:
   corp-anthropic:
