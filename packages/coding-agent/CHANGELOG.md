@@ -5,6 +5,14 @@
 ### Added
 
 - Added first-class `cline-pass` and `commandcode-goat` provider presets with documented API endpoints, environment-variable credentials, non-hardcoded live model discovery from models.dev and the Command Code Provider API, and prefix-based Claude routing.
+- Added lease-backed MCP connection pooling with typed recovery, shared HTTP/SSE sessions, per-lease callback demultiplexing, and authorization binding scopes that keep credential secrets out of pool keys.
+- Added plugin registry v2 as the single execution authority for plugin tools, subskills, and prompt appendices, with digest verification at final use.
+- Added module-trace and process-tree RSS verification harnesses for startup-memory regressions.
+
+### Changed
+
+- Deferred notification adapters, native bindings, provider construction, tools, skills, eval, session artifacts, and history storage until their feature paths are used, reducing the CLI startup module graph without changing default behavior.
+- Split SDK session hosting into a transport-neutral runtime and lazy notification adapters.
 
 ### Fixed
 
@@ -22,6 +30,9 @@
 
 - `todo_write` now rejects malformed raw arguments with bounded, authority-controlled correction codes instead of a generic rejection: unknown root keys, unknown operation-entry keys, done/drop entries without a task or phase target, and unknown init list-entry keys each surface a fixed message naming the accepted shape without echoing the offending input, while recoverable payloads keep the passthrough/coercion path and the existing ask-tool codes are untouched (#3916).
 - The Alibaba Token Plan onboarding preset and `alibaba-token-plan-qwen-deepseek` profile now reference the provider-supported `qwen3.8-max` model id instead of `qwen-3.8-max`, preventing the built-in profile from selecting an HTTP 400 unsupported model (#3909).
+- Restored computer batch failure metadata, timeout handling, and coordinate bounds validation to match single-action dispatch.
+- Preserved idempotent deletion of unknown SDK sessions and fixed concurrent `/notify on` startup after native loading became lazy.
+- Kept deferred tool descriptors aligned with eager availability guards for headless asks, subagent checkpoints, IRC, GitHub, and cron.
 - `/model` reasoning menu header now shows the highlighted reasoning level (not the model id), seeds the cursor from the role badge when re-editing the same model, and uses a provider-neutral label for `max` instead of "Opus maximum reasoning" (#3847).
 - Resume listing now reverse-scans for buried but canonically valid `header_patch` titles, so a persisted manual title remains visible in the picker after later transcript growth instead of falling back to an empty/line-1 projection (#3633).
 - Custom OpenAI-compatible models whose wire id is namespaced (for example `cline-pass/deepseek-v4-flash`) now inherit capability metadata from the bundled leaf model when `contextWindow` / `maxTokens` are omitted, instead of silently falling back to the generic 128K / 16K defaults. True unknown leaf ids still default; explicit limits remain authoritative (#3856).
