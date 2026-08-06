@@ -8,7 +8,7 @@
 		"retrievedAt": "2026-07-18",
 		"providerSourceBlobOid": "5f9708abab7652c3ba56f214d2c92751bea1e2ed",
 		"providerSourceSha256": "fbf80b8d5c1f8ddc94197c7777053a6cd057c9db8b793dbfb201948f1f0d9334",
-		"inputFixtureSha256": "b1ca8d3183ca168140774f848ed414252178f7c5788d61243069862ae59c129b"
+		"inputFixtureSha256": "562926fba79f003eff4d45c0da2292ac66d84302e3960b2d7493441ade1f9e04"
 	},
 	"derivationCommands": [
 		"git rev-parse HEAD:packages/ai/src/providers/anthropic.ts",

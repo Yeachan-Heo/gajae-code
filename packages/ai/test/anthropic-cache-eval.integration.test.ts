@@ -126,6 +126,16 @@ function contextForTurn(turn: number): Context {
 		messages,
 	};
 }
+function evaluationInput(): { model: Model<"anthropic-messages">; contexts: Context[] } {
+	return {
+		model,
+		contexts: fixture.toolResultVariants.map((_, turn) => contextForTurn(turn)),
+	};
+}
+
+function inputFixtureSha256(): Promise<string> {
+	return sha256(JSON.stringify(evaluationInput()));
+}
 
 function capturePayload(turn: number): Promise<Payload> {
 	const controller = new AbortController();
@@ -270,7 +280,7 @@ async function deriveEvidence(): Promise<{
 
 async function buildArtifact(): Promise<EvalArtifact> {
 	const identity = await currentSourceIdentity();
-	const fixtureSha256 = await sha256(JSON.stringify(fixture));
+	const fixtureSha256 = await inputFixtureSha256();
 	const evidence = await deriveEvidence();
 	const perTurn = async (placement: Placement) =>
 		Promise.all(
@@ -334,7 +344,7 @@ describe("Anthropic cache placement eval (deterministic sequential three-request
 		const artifact = (await Bun.file(artifactPath).json()) as EvalArtifact;
 		expect(artifact).toEqual(derivedArtifact);
 		const identity = await currentSourceIdentity();
-		const fixtureSha256 = await sha256(JSON.stringify(fixture));
+		const fixtureSha256 = await inputFixtureSha256();
 		validateSource(artifact, identity, fixtureSha256);
 		expect(() =>
 			validateSource(
@@ -350,6 +360,13 @@ describe("Anthropic cache placement eval (deterministic sequential three-request
 				fixtureSha256,
 			),
 		).toThrow();
+		const tamperedInput = structuredClone(evaluationInput());
+		const tamperedMessage = tamperedInput.contexts[0]?.messages[0];
+		if (tamperedMessage?.role !== "user" || typeof tamperedMessage.content !== "string") {
+			throw new Error("Evaluation input lacks the expected first user message");
+		}
+		tamperedMessage.content += "!";
+		expect(await sha256(JSON.stringify(tamperedInput))).not.toBe(fixtureSha256);
 
 		const evidence = await deriveEvidence();
 		for (const placement of ["oldPlacement", "newPlacement"] as const) {
