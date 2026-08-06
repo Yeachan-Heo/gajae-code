@@ -2674,6 +2674,68 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(reviewResult.details?.selectedOptions).toEqual([]);
 		expect(recorder).not.toHaveBeenCalled();
 	});
+	it("does not auto-select a ralplan approval gate on ask timeout", async () => {
+		const tool = new AskTool(
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getSessionId: () => "session-ask",
+			}),
+		);
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				const timeout = dialogOptions?.timeout ?? 1;
+				await Bun.sleep(timeout + 5);
+				dialogOptions?.onTimeout?.();
+				return _options[0];
+			},
+		});
+		const approvalQuestion = {
+			id: "ralplan-approval-timeout",
+			question: "Approve the plan?",
+			options: [{ label: "Approve" }, { label: "Revise" }],
+			workflowGate: { stage: "ralplan", kind: "approval" } as const,
+		};
+		const result = await tool.execute(
+			"ralplan-approval-timeout",
+			{ questions: [approvalQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		// A timeout is not consent: the plan approval must stay unselected.
+		expect(result.details?.selectedOptions).toEqual([]);
+	});
+	it("does not auto-select an execution gate on ask timeout", async () => {
+		const tool = new AskTool(
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getSessionId: () => "session-ask",
+			}),
+		);
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				const timeout = dialogOptions?.timeout ?? 1;
+				await Bun.sleep(timeout + 5);
+				dialogOptions?.onTimeout?.();
+				return _options[0];
+			},
+		});
+		const executionQuestion = {
+			id: "ultragoal-execution-timeout",
+			question: "Approve execution?",
+			options: [{ label: "Approve" }, { label: "Hold" }],
+			workflowGate: { stage: "ultragoal", kind: "execution" } as const,
+		};
+		const result = await tool.execute(
+			"ultragoal-execution-timeout",
+			{ questions: [executionQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		// A timeout is not execution authorization.
+		expect(result.details?.selectedOptions).toEqual([]);
+	});
 
 	it("discards focused intent choices before multi-question timeout navigation", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({

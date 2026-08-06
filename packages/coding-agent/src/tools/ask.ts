@@ -573,10 +573,12 @@ export interface AskToolDetails {
 // Constants
 // =============================================================================
 
-const OTHER_OPTION = "Other (type your own)";
-const ASK_CLARIFICATION_OPTION = "Ask about these choices";
-const RECOMMENDED_SUFFIX = " (Recommended)";
+export const OTHER_OPTION = "Other (type your own)";
+export const ASK_CLARIFICATION_OPTION = "Ask about these choices";
+export const RECOMMENDED_SUFFIX = " (Recommended)";
 const REMOTE_NAVIGATION_FORWARD = "\u0000ask-navigation-forward";
+const HEADLESS_CHECKBOX_CHECKED = "[x]";
+const HEADLESS_CHECKBOX_UNCHECKED = "[ ]";
 const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
 
@@ -609,7 +611,8 @@ async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>,
 }
 
 function getDoneOptionLabel(): string {
-	return `${theme.status.success} Done selecting`;
+	const success = theme?.status?.success;
+	return success ? `${success} Done selecting` : "Done selecting";
 }
 
 function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
@@ -885,9 +888,28 @@ async function askSingleQuestion(
 				: undefined,
 		};
 		const startMs = Date.now();
-		const choice = signal
-			? await untilAborted(signal, () => ui.select(prompt, optionsToShow, dialogOptions))
-			: await ui.select(prompt, optionsToShow, dialogOptions);
+		let choice: string | undefined;
+		try {
+			choice = signal
+				? await untilAborted(signal, () => ui.select(prompt, optionsToShow, dialogOptions))
+				: await ui.select(prompt, optionsToShow, dialogOptions);
+		} catch (error) {
+			// A headless remote source that waits out the ask timeout surfaces as
+			// a remote-cancellation failure; classify only that cancellation as a
+			// timeout so the caller's auto-select-on-timeout policy stays
+			// authoritative and unrelated provider errors still surface.
+			if (
+				!signal?.aborted &&
+				error instanceof ToolAbortError &&
+				typeof timeout === "number" &&
+				Date.now() - startMs >= timeout
+			) {
+				timeoutTriggered = true;
+				choice = undefined;
+			} else {
+				throw error;
+			}
+		}
 		if (!timeoutTriggered && choice === undefined && typeof timeout === "number") {
 			timeoutTriggered = Date.now() - startMs >= timeout;
 		}
@@ -928,6 +950,8 @@ async function askSingleQuestion(
 	const promptWithProgress = navigation?.progressText ? `${question} (${navigation.progressText})` : question;
 	if (multi) {
 		const selected = new Set<string>(selectedOptions);
+		const checkedCheckbox = theme?.checkbox?.checked ?? HEADLESS_CHECKBOX_CHECKED;
+		const uncheckedCheckbox = theme?.checkbox?.unchecked ?? HEADLESS_CHECKBOX_UNCHECKED;
 		let cursorIndex = Math.min(Math.max(recommended ?? 0, 0), Math.max(optionLabels.length - 1, 0));
 		const firstSelected = selectedOptions[0];
 		if (firstSelected) {
@@ -938,7 +962,7 @@ async function askSingleQuestion(
 			const opts: string[] = [];
 
 			for (const opt of optionLabels) {
-				const checkbox = selected.has(opt) ? theme.checkbox.checked : theme.checkbox.unchecked;
+				const checkbox = selected.has(opt) ? checkedCheckbox : uncheckedCheckbox;
 				opts.push(`${checkbox} ${opt}`);
 			}
 
@@ -1011,13 +1035,17 @@ async function askSingleQuestion(
 				cursorIndex = selectedIdx;
 			}
 
-			const checkedPrefix = `${theme.checkbox.checked} `;
-			const uncheckedPrefix = `${theme.checkbox.unchecked} `;
+			const checkedPrefix = `${checkedCheckbox} `;
+			const uncheckedPrefix = `${uncheckedCheckbox} `;
 			let opt: string | undefined;
 			if (choice.startsWith(checkedPrefix)) {
 				opt = choice.slice(checkedPrefix.length);
 			} else if (choice.startsWith(uncheckedPrefix)) {
 				opt = choice.slice(uncheckedPrefix.length);
+			} else if (optionLabels.includes(choice)) {
+				// A headless remote source (e.g. the ACP permission bridge) returns
+				// the raw label without checkbox prefixes.
+				opt = choice;
 			}
 			if (opt) {
 				if (selected.has(opt)) {
@@ -1344,19 +1372,23 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						}
 						const remoteValue = receipt.interaction.kind === "value" ? receipt.interaction.value : undefined;
 						const value = remoteValue ?? REMOTE_NAVIGATION_FORWARD;
+						const checkboxPrefixes = theme?.checkbox
+							? [theme.checkbox.checked, theme.checkbox.unchecked].filter(
+									(prefix): prefix is string => typeof prefix === "string",
+								)
+							: [HEADLESS_CHECKBOX_CHECKED, HEADLESS_CHECKBOX_UNCHECKED];
 						const selectedValue =
 							remoteValue === undefined
 								? value
 								: (options.find(
 										option =>
 											option === remoteValue ||
-											option === `${theme.checkbox.checked} ${remoteValue}` ||
-											option === `${theme.checkbox.unchecked} ${remoteValue}`,
+											checkboxPrefixes.some(prefix => option === `${prefix} ${remoteValue}`),
 									) ?? value);
-						const normalizedRemoteValue = remoteValue?.startsWith(`${theme.checkbox.checked} `)
-							? remoteValue.slice(`${theme.checkbox.checked} `.length)
-							: remoteValue?.startsWith(`${theme.checkbox.unchecked} `)
-								? remoteValue.slice(`${theme.checkbox.unchecked} `.length)
+						const checkboxPrefix = checkboxPrefixes.find(prefix => remoteValue?.startsWith(`${prefix} `));
+						const normalizedRemoteValue =
+							remoteValue !== undefined && checkboxPrefix
+								? remoteValue.slice(checkboxPrefix.length + 1)
 								: remoteValue;
 						const semanticRemoteValue = normalizedRemoteValue?.replace(/^\s*\d+[.)]\s+/, "");
 						const transitionReason =
@@ -1597,6 +1629,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					options: remoteSelectorOptions,
 					interaction: "selector",
 					...(recommendedIndex === undefined ? {} : { recommendedIndex }),
+					...(timeout === undefined || timeout === null ? {} : { timeoutMs: timeout }),
+					...(clarificationOptionLabel ? { transitionCount: 2 } : { transitionCount: 1 }),
 					multi: q.multi === true,
 					selectedOptions: [...(initialSelection?.selectedOptions ?? [])],
 					controls: askRemoteControls({
@@ -1623,7 +1657,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					navigation: options?.navigation,
 					scrollTitleRows: DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
 					otherOptionLabel,
-					autoSelectOnTimeout: !intentContract(q.deepInterview) && !intentReview(q.deepInterview),
+					autoSelectOnTimeout:
+						!intentContract(q.deepInterview) &&
+						!intentReview(q.deepInterview) &&
+						(q.workflowGate === undefined || q.workflowGate.kind === "question"),
 					clarificationOptionLabel,
 					onRemoteState: state => {
 						activeRemoteRequest = {
@@ -1632,6 +1669,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							interaction: state.interaction,
 							...(state.interaction === "selector" && recommendedIndex !== undefined
 								? { recommendedIndex }
+								: {}),
+							...(state.interaction === "selector" && timeout !== undefined && timeout !== null
+								? { timeoutMs: timeout }
+								: {}),
+							...(state.interaction === "selector"
+								? clarificationOptionLabel
+									? { transitionCount: 2 }
+									: { transitionCount: 1 }
 								: {}),
 							multi: q.multi === true,
 							selectedOptions: [...state.selectedOptions],
