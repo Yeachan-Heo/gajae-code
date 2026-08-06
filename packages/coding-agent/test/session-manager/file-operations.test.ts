@@ -418,10 +418,10 @@ describe("getRecentSessions", () => {
 		expect(listed).toMatchObject({ id: "patched-oversized", title, cwd: "/patched-cwd" });
 	});
 
-	it("bounds the trailing patch scan to a constant tail budget", async () => {
-		// The lister must stay O(prefix + bounded tail) even when a transcript
-		// contains no header patches at all (the common case) or when the only
-		// patch is buried deeper than the scan cap (16KB tail budget).
+	it("recovers a title header_patch buried past the historical 16KiB tail window", async () => {
+		// Listing reverse-scans past the old 16 KiB preferred window so a
+		// canonically persisted title remains reachable without a full sequential
+		// JSONL parse of every message payload (#3633).
 		const mkRecords = (id: string, withBuriedPatch: boolean) => {
 			const records: unknown[] = [
 				{
@@ -447,19 +447,16 @@ describe("getRecentSessions", () => {
 		};
 
 		const buried = path.join(tempDir, "buried-patch.jsonl");
-		fs.writeFileSync(
-			buried,
-			`${mkRecords("buried-patch", true)
-				.map(record => JSON.stringify(record))
-				.join("\n")}\n`,
-		);
+		const lines = mkRecords("buried-patch", true).map(record => JSON.stringify(record));
+		fs.writeFileSync(buried, `${lines.join("\n")}\n`);
+		const trailingBytes = Buffer.byteLength(`${lines.slice(2).join("\n")}\n`);
+		expect(trailingBytes).toBeGreaterThan(16 * 1024);
 
 		const [session] = await getRecentSessions(tempDir);
+		const [listed] = await SessionManager.list("/tmp", tempDir);
 
-		// The buried patch sits more than 16KB before EOF, past the bounded tail
-		// budget: the lister must fall back to the line-1 header instead of
-		// scanning the whole transcript.
-		expect(session?.name).toBe("Original");
+		expect(session?.name).toBe("Buried title");
+		expect(listed).toMatchObject({ id: "buried-patch", title: "Buried title", cwd: "/tmp" });
 	});
 });
 
