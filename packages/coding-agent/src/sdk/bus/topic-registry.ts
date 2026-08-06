@@ -303,10 +303,16 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			value => value !== undefined,
 		).length;
 		if (leaseFieldCount !== 0 && leaseFieldCount !== 3) malformed();
+		// A `disconnect_grace` record without its deadline or orphan observation is
+		// genuinely ambiguous and stays fatal. The reverse — a grace deadline left
+		// behind in a settled authority state — is not ambiguous: the authority
+		// state is explicit and the stale deadline is inert. Releases before this
+		// fix persisted exactly that on every archive transition, so rejecting it
+		// permanently bricks the daemon on its own snapshot. Normalize it away in
+		// `load` instead.
 		if (
-			raw.authorityState === "disconnect_grace"
-				? raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined
-				: raw.disconnectGraceExpiresAt !== undefined
+			raw.authorityState === "disconnect_grace" &&
+			(raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined)
 		)
 			malformed();
 		const hasBinding = hasAnyBinding(raw);
@@ -583,6 +589,10 @@ export class TopicRegistry {
 					: {}),
 				...(bindingMalformed ? { bindingMalformed: true as const } : {}),
 			};
+			// Drop a grace deadline that a pre-fix release left behind on a settled
+			// authority state, so the normalized snapshot round-trips through
+			// `parseTopicRegistryState` instead of failing every later publish.
+			if (record.authorityState !== "disconnect_grace") delete record.disconnectGraceExpiresAt;
 			this.epochs.set(sessionId, Math.max(fenceEpoch, record.authorityEpoch ?? 0));
 			// Pre-generation-17 records have no endpoint authority. Retire them locally:
 			// their unknown remote topic must neither be rebound nor deleted cross-chat.
@@ -829,9 +839,8 @@ export class TopicRegistry {
 		record.endpointGeneration = binding.endpointGeneration;
 		if (!sameEndpoint) record.endpointIncarnation = (record.endpointIncarnation ?? 0) + 1;
 		if (record.authorityState === "disconnect_grace") {
-			record.authorityState = "active";
+			this.#setAuthorityState(record, "active");
 			delete record.orphanedAt;
-			delete record.disconnectGraceExpiresAt;
 			this.rebuildInboundRoutes();
 		}
 		return "bound";
@@ -945,7 +954,7 @@ export class TopicRegistry {
 			this.staged.delete(sessionId);
 			if ((this.epochs.get(sessionId) ?? 0) !== epoch) {
 				record.authorityEpoch = this.epochs.get(sessionId) ?? 0;
-				record.authorityState = "archive_pending";
+				this.#setAuthorityState(record, "archive_pending");
 				this.topics.set(sessionId, record);
 				throw new Error("topic authority was revoked during creation");
 			}
@@ -1017,9 +1026,8 @@ export class TopicRegistry {
 		record.leaseHeartbeatAt = now;
 		record.leaseExpiresAt = now + ttlMs;
 		if (record.authorityState === "disconnect_grace") {
-			record.authorityState = "active";
+			this.#setAuthorityState(record, "active");
 			delete record.orphanedAt;
-			delete record.disconnectGraceExpiresAt;
 			this.rebuildInboundRoutes();
 		}
 		return true;
@@ -1066,10 +1074,22 @@ export class TopicRegistry {
 	clearOrphaned(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
 		if (record?.authorityState !== "disconnect_grace" || record.orphanedAt === undefined) return false;
-		record.authorityState = "active";
-		delete record.disconnectGraceExpiresAt;
+		this.#setAuthorityState(record, "active");
 		delete record.orphanedAt;
 		return true;
+	}
+
+	/**
+	 * `disconnectGraceExpiresAt` is grace-state metadata, and
+	 * `parseTopicRegistryState` rejects a record that still carries it in any
+	 * other authority state. Every transition out of `disconnect_grace` must
+	 * therefore drop it, or the daemon persists a snapshot it can no longer read
+	 * back: the next load and every compare-and-set fail, and a shared-authority
+	 * daemon exits instead of archiving the topic.
+	 */
+	#setAuthorityState(record: TopicRecord, state: NonNullable<TopicRecord["authorityState"]>): void {
+		record.authorityState = state;
+		if (state !== "disconnect_grace") delete record.disconnectGraceExpiresAt;
 	}
 
 	/** Last durably consumed SDK event cursor for reconnect replay. */
@@ -1206,7 +1226,7 @@ export class TopicRegistry {
 			return false;
 		} else {
 			record.authorityEpoch = deleteEpoch;
-			record.authorityState = "archive_pending";
+			this.#setAuthorityState(record, "archive_pending");
 			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
 		}
 		this.epochs.set(snapshot.sessionId, deleteEpoch);
@@ -1229,7 +1249,7 @@ export class TopicRegistry {
 			this.epochs.set(sessionId, Number.MAX_SAFE_INTEGER);
 			if (record) {
 				record.authorityEpoch = Number.MAX_SAFE_INTEGER;
-				record.authorityState = "archive_exhausted";
+				this.#setAuthorityState(record, "archive_exhausted");
 				if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 			}
 			return undefined;
@@ -1238,7 +1258,7 @@ export class TopicRegistry {
 		this.epochs.set(sessionId, epoch);
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
-		record.authorityState = "archive_pending";
+		this.#setAuthorityState(record, "archive_pending");
 		if (hostId) record.archiveHostId = hostId;
 		record.archiveLeaseEpoch = epoch;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
@@ -1367,7 +1387,7 @@ export class TopicRegistry {
 			this.authorityEpoch(sessionId) !== dispatchedAuthorityEpoch
 		)
 			return false;
-		record.authorityState = "inactive";
+		this.#setAuthorityState(record, "inactive");
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		this.archiveJobs.delete(sessionId);
 		return true;
@@ -1382,7 +1402,7 @@ export class TopicRegistry {
 					const epoch = Math.min(currentEpoch + 1, Number.MAX_SAFE_INTEGER - 1);
 					record.authorityEpoch = epoch;
 					record.archiveLeaseEpoch = epoch;
-					record.authorityState = "archive_pending";
+					this.#setAuthorityState(record, "archive_pending");
 				}
 			}
 			return (record.authorityState === "archive_pending" || record.authorityState === "archive_exhausted") &&
@@ -1419,7 +1439,7 @@ export class TopicRegistry {
 			...(diagnostic ? { safeDiagnostic: diagnostic.slice(0, 256) } : {}),
 			...(exhausted ? { safeDiagnostic: "archive retry remains discoverable after retry budget" } : {}),
 		};
-		record.authorityState = "archive_pending";
+		this.#setAuthorityState(record, "archive_pending");
 		this.archiveJobs.set(sessionId, job);
 		return job;
 	}

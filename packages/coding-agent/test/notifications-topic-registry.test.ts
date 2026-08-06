@@ -818,3 +818,83 @@ test("retains inactive predecessor evidence when an authenticated successor rota
 	]);
 	expect(new TopicRegistry(serialized).serialize().retiredTopics).toEqual(serialized.retiredTopics);
 });
+
+test("archiving a disconnect-grace topic publishes a snapshot the daemon can read back", async () => {
+	// A grace deadline left on a settled authority state is rejected by
+	// parseTopicRegistryState, so persisting it makes every later load and
+	// compare-and-set fail and takes the shared-authority daemon down with it.
+	const registry = new TopicRegistry();
+	await registry.getOrCreateTopic("session", async () => "700");
+	expect(registry.acquireLease("session", "host-a", 100, 1_000, 60_000)).toBe(true);
+	expect(registry.releaseLeaseToGrace("session", "host-a", 200, 60_000)).toBe(true);
+	const grace = registry.serialize();
+	expect(grace.topics.session).toMatchObject({ authorityState: "disconnect_grace", disconnectGraceExpiresAt: 60_200 });
+	expect(parseTopicRegistryState(grace)).toBeDefined();
+
+	expect(registry.beginArchive("session", "host-a", 300_000)?.authorityState).toBe("archive_pending");
+	const archiving = registry.serialize();
+	expect(archiving.topics.session?.authorityState).toBe("archive_pending");
+	expect(archiving.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(parseTopicRegistryState(archiving)).toBeDefined();
+
+	expect(registry.settleArchive("session", "700", archiving.topics.session?.authorityEpoch ?? -1)).toBe(true);
+	const settled = registry.serialize();
+	expect(settled.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(parseTopicRegistryState(settled)).toBeDefined();
+});
+
+test("a grace deadline persisted by an older release loads instead of bricking the registry", () => {
+	// Reproduces a real on-disk snapshot: the archive transition kept the grace
+	// deadline, so the owning daemon could no longer parse its own registry.
+	const poisoned = {
+		version: 2 as const,
+		registryGeneration: 451,
+		topics: {
+			session: {
+				topicId: "14258",
+				topicOrigin: "daemon_created" as const,
+				sessionUuid: "1f5b3af9-5b97-4a78-b60e-1ef69700b36f",
+				identitySent: true,
+				createdAt: 1_785_971_484_922,
+				orphanedAt: 1_785_971_777_162,
+				authorityEpoch: 1,
+				authorityState: "archive_pending" as const,
+				chatId: "7731731210",
+				endpointKey: "ae6b6ed0e9f8e3d857f3d4d2c33f2b58f",
+				endpointDigest: "ae6b6ed0e9f8e3d857f3d4d2c33f2b58f",
+				endpointGeneration: 1,
+				endpointIncarnation: 0,
+				disconnectGraceExpiresAt: 1_785_971_807_162,
+				archiveHostId: "6080b838b93d01cd76fa4e12a9c2e67f7",
+				archiveLeaseEpoch: 1,
+			},
+		},
+	};
+	const parsed = parseTopicRegistryState(poisoned);
+	expect(parsed).toBeDefined();
+	const normalized = new TopicRegistry(parsed!).serialize();
+	expect(normalized.topics.session?.authorityState).toBe("archive_pending");
+	expect(normalized.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
+	// The normalized snapshot must republish, which is what a compare-and-set does.
+	expect(parseTopicRegistryState(normalized)).toBeDefined();
+});
+
+test("a disconnect-grace record without its own deadline stays fatal", () => {
+	expect(() =>
+		parseTopicRegistryState({
+			version: 2 as const,
+			registryGeneration: 1,
+			topics: {
+				session: {
+					topicId: "700",
+					topicOrigin: "daemon_created" as const,
+					sessionUuid: "s",
+					identitySent: true,
+					createdAt: 1,
+					orphanedAt: 2,
+					authorityState: "disconnect_grace" as const,
+				},
+			},
+		}),
+	).toThrow("malformed Telegram topic state");
+});
