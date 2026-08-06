@@ -61,17 +61,21 @@ export function releaseHeadings(text: string): string[] {
 /**
  * Compare one changelog across a range.
  *
- * A file that did not exist at the base cannot have lost history, and a file
- * deleted at the head is a different review conversation (and is visible in the
- * diff as a deletion), so both return no violation here.
+ * A file that did not exist at the base cannot have lost history. A file that
+ * existed at the base but is deleted at the head has lost every released
+ * section, so deletion fails closed through the same violation contract.
  */
 export function compareHistory(
 	file: string,
 	baseText: string | undefined,
 	headText: string | undefined,
 ): ChangelogHistoryViolation | undefined {
-	if (baseText === undefined || headText === undefined) return undefined;
+	if (baseText === undefined) return undefined;
 	const before = releaseHeadings(baseText);
+	if (headText === undefined) {
+		if (before.length === 0) return undefined;
+		return { file, removed: before, baseHeadingCount: before.length, headHeadingCount: 0 };
+	}
 	const after = new Set(releaseHeadings(headText));
 	const removed = before.filter(version => !after.has(version));
 	if (removed.length === 0) return undefined;
