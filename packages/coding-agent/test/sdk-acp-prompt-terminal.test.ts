@@ -139,13 +139,15 @@ async function createFixture(
 							? [{ mode: "default", model: "openai/gpt", thinking: "medium" }]
 							: frame.query === "models.list/current"
 								? [{ provider: "openai", id: "gpt", name: "GPT" }]
-								: [];
+								: frame.query === "providers.list/active"
+									? [{ provider: "openai", connectionKind: "credential" }]
+									: [];
 					const result =
 						frame.query === "runtime.capabilities"
 							? { promptTerminalOutcomeVersion: 1 }
 							: frame.query === "context.get"
 								? { usage: { tokens: 0, contextWindow: 200_000, percent: 0, source: "test" } }
-								: { page: { items } };
+								: { page: { items, complete: true } };
 					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, result }));
 					return;
 				}

@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Fixed
+- ACP session configuration now emits the spec-defined `category` field on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), so standards-compliant ACP clients such as Paseo discover models, modes, and thinking levels instead of an empty model picker (#3922).
+- The ACP session model catalog is now filtered to active providers via `providers.list/active`, falling back to the full catalog on older session hosts, so ACP clients no longer list models for providers without usable credentials (#3922).
 
 - `/model` reasoning menu header now shows the highlighted reasoning level (not the model id), seeds the cursor from the role badge when re-editing the same model, and uses a provider-neutral label for `max` instead of "Opus maximum reasoning" (#3847).
 - Resume listing now reverse-scans for buried but canonically valid `header_patch` titles, so a persisted manual title remains visible in the picker after later transcript growth instead of falling back to an empty/line-1 projection (#3633).
