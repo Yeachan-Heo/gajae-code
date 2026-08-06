@@ -22,113 +22,102 @@
 			{
 				"anchors": [
 					{
-						"path": "messages[2].content[0]",
-						"sha256": "0866acbb6c3c82b40c6e6df39231ff991b3ac203a91ac0282c3ae007660c8732"
-					},
-					{
-						"path": "messages[3].content[0]",
-						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+						"path": "messages[0].content[0]",
+						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
 					}
 				],
-				"cacheableTokenEstimateAtLeast": 1024
+				"cacheableTokenEstimateAtLeast": 1948
 			},
 			{
 				"anchors": [
 					{
-						"path": "messages[2].content[0]",
-						"sha256": "0866acbb6c3c82b40c6e6df39231ff991b3ac203a91ac0282c3ae007660c8732"
-					},
-					{
-						"path": "messages[3].content[0]",
-						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+						"path": "messages[0].content[0]",
+						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
 					}
 				],
-				"cacheableTokenEstimateAtLeast": 1024
+				"cacheableTokenEstimateAtLeast": 1948
 			},
 			{
 				"anchors": [
 					{
-						"path": "messages[2].content[0]",
-						"sha256": "0866acbb6c3c82b40c6e6df39231ff991b3ac203a91ac0282c3ae007660c8732"
-					},
-					{
-						"path": "messages[3].content[0]",
-						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+						"path": "messages[0].content[0]",
+						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
 					}
 				],
-				"cacheableTokenEstimateAtLeast": 1024
+				"cacheableTokenEstimateAtLeast": 1948
 			}
 		],
 		"newPlacement": [
 			{
 				"anchors": [
 					{
-						"path": "messages[1].content[0]",
-						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
+						"path": "messages[0].content[0]",
+						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
 					},
 					{
-						"path": "messages[3].content[0]",
-						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+						"path": "messages[1].content[0]",
+						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
 					}
 				],
-				"cacheableTokenEstimateAtLeast": 1024
+				"cacheableTokenEstimateAtLeast": 1971
 			},
 			{
 				"anchors": [
 					{
-						"path": "messages[1].content[0]",
-						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
+						"path": "messages[0].content[0]",
+						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
 					},
 					{
 						"path": "messages[3].content[0]",
 						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
 					}
 				],
-				"cacheableTokenEstimateAtLeast": 1024
+				"cacheableTokenEstimateAtLeast": 2026
 			},
 			{
 				"anchors": [
 					{
-						"path": "messages[1].content[0]",
-						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
+						"path": "messages[0].content[0]",
+						"sha256": "475819010875142560f35cf3364e5b9241dc7a766bfe697ae5a477368527071d"
 					},
 					{
-						"path": "messages[3].content[0]",
-						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+						"path": "messages[5].content[0]",
+						"sha256": "430ec7eb2f22ff6e14dbf58a21e450ed45f277712f30c0351d1325bd7216110a"
 					}
 				],
-				"cacheableTokenEstimateAtLeast": 1024
+				"cacheableTokenEstimateAtLeast": 2080
 			}
 		]
 	},
 	"simulatedExplicitBreakpointWriteTokensAtLeast": {
 		"oldPlacement": [
-			1024,
-			1024,
-			1024
+			1948,
+			1948,
+			1948
 		],
 		"newPlacement": [
-			1024,
-			1024,
-			1024
+			1971,
+			2026,
+			2080
 		]
 	},
 	"simulatedExplicitBreakpointReadTokensAtLeast": {
 		"oldPlacement": [
 			0,
-			0,
-			0
+			1948,
+			1948
 		],
 		"newPlacement": [
 			0,
-			1024,
-			1024
+			1971,
+			2026
 		]
 	},
-	"method": "The test sequentially builds three real explicit-mode streamAnthropic onPayload requests over the same agentic turn shape, with a distinct newest tool result on each request and a stable prefix above the documented 1,024-token minimum. It models documented explicit cache writes at each provider-built cache_control breakpoint and reads using inclusive structural prefix lookback over the actual built tools, system, and message sequence. Cache-control metadata is excluded from prefix identity because it designates the breakpoint rather than prompt content. The old comparator places the assistant breakpoint on the volatile tool-result wire message plus the current human message; the provider payload is the new comparator, with the stable previous assistant boundary plus current human message. All token quantities are structural simulated estimates, not billed or provider-reported usage.",
+	"method": "The test sequentially builds three real explicit-mode streamAnthropic onPayload requests over a growing agent tool loop with a stable prefix above the documented 1,024-token minimum. The old comparator reproduces the previous provider algorithm: it selects the last human user message and searches only before it for an assistant breakpoint, so a tool-result-only continuation remains pinned to the original human turn. The provider payload is the new comparator: it retains that human marker and advances the second marker to the latest completed assistant tool-use turn while leaving the newest tool result uncached. It models explicit cache writes and reads using inclusive structural prefix lookback over the actual built tools, system, and message sequence. Cache-control metadata is excluded from prefix identity because it designates the breakpoint rather than prompt content. All token quantities are structural simulated estimates, not billed or provider-reported usage.",
 	"limitations": [
 		"This is deterministic local simulation over provider-built payloads; it does not send Anthropic API requests.",
-		"Structural simulated token estimates use floor(UTF-8 bytes / 4), not provider tokenization or billing telemetry.",
+		"Structural token estimates use floor(UTF-8 bytes / 4), not provider tokenization or billing telemetry.",
+		"The live CLIProxyAPI probe is reported separately in the pull request and is not encoded as immutable artifact evidence.",
 		"The cited prompt-caching documentation was retrieved on 2026-07-18; cache retention, pricing, and provider usage are not asserted."
 	],
 	"testCommand": "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
