@@ -19,7 +19,7 @@ const outputPath = path.join(
 );
 
 async function formatSource(source: string): Promise<string> {
-	const process = Bun.spawn(["bunx", "biome", "check", "--write", `--stdin-file-path=${outputPath}`], {
+	const process = Bun.spawn(["bunx", "biome", "check", "--write", `--stdin-file-path=${import.meta.filename}`], {
 		cwd: repositoryRoot,
 		stdin: new TextEncoder().encode(source),
 		stdout: "pipe",
