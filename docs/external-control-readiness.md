@@ -67,6 +67,28 @@ Air-created Git worktrees are supported because each ACP request's absolute `cwd
 Session title and update metadata are advisory state for the active ACP process. Text, thought, tool-call, and tool-result history is replayed on load, but historical binary image bytes are not replayed.
 
 See [Environment Variables](./environment-variables.md#11-acp-permission-handling) for supported values and precedence.
+## Paseo custom agent
+
+[Paseo](https://github.com/getpaseo/paseo) registers GJC as a generic ACP provider through its custom provider configuration. Add this entry to `$PASEO_HOME/config.json` (default `~/.paseo/config.json`); Paseo then lists **Gajae Code** in its provider picker with GJC's model catalog and Default/Plan modes:
+
+```json
+{
+  "version": 1,
+  "agents": {
+    "providers": {
+      "gjc": {
+        "extends": "acp",
+        "label": "Gajae Code",
+        "command": ["gjc", "acp"]
+      }
+    }
+  }
+}
+```
+
+GJC's ACP session configuration carries the spec-defined `category` on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), which lets ACP clients such as Paseo discover models and thinking levels without provider-specific metadata. The model catalog is filtered to providers with usable stored credentials (`providers.list/active`), falling back to the full catalog on session hosts that do not expose that query.
+
+Sessions launched through an ACP client (e.g. `paseo run --provider gjc/...`) are broker-managed and appear in ACP `session/list`, so Paseo's import flow can attach them. Interactive `gjc` sessions host their own SDK endpoint and are not broker-registered, so they are not listed by ACP clients; use the GJC SDK/notifications surface to control those sessions.
 
 ## ACP conformance and Air release gates
 

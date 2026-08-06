@@ -24,8 +24,8 @@
 | --- | --- | --- | --- |
 | `init` | `list` | None of the other fields are used | Replaces the entire list with `list`; every new task starts `pending` before normalization. |
 | `start` | `task` | None | Marks one task `in_progress`; any other `in_progress` task is demoted to `pending`. |
-| `done` | `task` or `phase` or neither | None | Marks the target task, phase, or all tasks `completed`. |
-| `drop` | `task` or `phase` or neither | None | Marks the target task, phase, or all tasks `abandoned`. |
+| `done` | `task` or `phase` | None | Marks the target task or phase `completed`. |
+| `drop` | `task` or `phase` | None | Marks the target task or phase `abandoned`. |
 | `rm` | `task` or `phase` or neither | None | Removes the target task, clears the phase's task list, or clears all task lists. |
 | `append` | `phase`, `items` | None | Appends new `pending` tasks to a phase; creates the phase if missing. |
 | `note` | `task`, `text` | None | Appends one trimmed note string to the task's `notes` array. |
@@ -37,7 +37,7 @@
 | `op` | `"init" | "start" | "done" | "rm" | "drop" | "append" | "note"` | Yes | Operation discriminator. |
 | `list` | `{ phase: string; items: string[] }[]` | For `init` | Full replacement payload. Each `items` array has `minItems: 1`. |
 | `task` | `string` | For `start`; for task-targeted `done`/`drop`/`rm`/`note` | Exact task content match. |
-| `phase` | `string` | For `append`; for phase-targeted `done`/`drop`/`rm` | Exact phase name match, except `append` lazily creates a missing phase. |
+| `phase` | `string` | For `append`; for phase-targeted `done`/`drop`/`rm`; required when `done`/`drop` omit `task` | Exact phase name match, except `append` lazily creates a missing phase. |
 | `items` | `string[]` | For `append` | Tasks to append. `minItems: 1`. |
 | `text` | `string` | For `note` | Note text; trailing whitespace is stripped before storing. Empty-after-trim is rejected. |
 
@@ -66,7 +66,7 @@ The TUI renderer (`todoWriteToolRenderer`) merges call and result into one trans
 3. Each op mutates the working phase array:
    - `initPhases(...)` rebuilds the list from scratch.
    - `start` resolves a task by exact `content`, demotes every other `in_progress` task to `pending`, then marks the target `in_progress`.
-   - `done` / `drop` use `getTaskTargets(...)` to target one task, one phase, or every task.
+   - `done` / `drop` use `getTaskTargets(...)` to target one task or one phase; raw validation rejects either operation when both targets are absent.
    - `rm` removes one task, clears one phase's `tasks`, or clears all phases' task arrays.
    - `appendItems(...)` resolves or creates the target phase and pushes new `pending` tasks unless the same task content already exists anywhere.
    - `note` trims trailing whitespace, rejects empty text, and appends the note to `task.notes`.
@@ -91,10 +91,13 @@ The TUI renderer (`todoWriteToolRenderer`) merges call and result into one trans
 Normalization then re-applies the single-active-task rule after the full op batch.
 
 ### Op targeting rules
-- `done`, `drop`, `rm`:
+- `done`, `drop`:
   - `task` set: affect one exact-content task.
-  - else `phase` set: affect every task in that exact-name phase.
-  - else: affect every task in every phase.
+  - else `phase` must be set: affect every task in that exact-name phase.
+- `rm`:
+  - `task` set: remove one exact-content task.
+  - else `phase` set: clear every task in that exact-name phase.
+  - else: clear every task in every phase.
 - `append` is the only op that creates a missing phase.
 - `note` only targets a single task.
 - `init` discards previous phases entirely.

@@ -385,6 +385,47 @@ describe("system Handlebars prompt templates", () => {
 		});
 	});
 
+	// Regression for #3859: default prompt path (no customPrompt) must inject
+	// always-apply bodies and rulebook listings. They lived only in
+	// custom-system-prompt.md and were silently dropped for normal sessions.
+	test("buildSystemPrompt injects alwaysApplyRules and rulebook on the default path", async () => {
+		const alwaysBody = "MAGICPROBE7F3A is the passphrase.";
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: os.tmpdir(),
+			contextFiles: [],
+			skills: [],
+			rules: [
+				{
+					name: "probe-rulebook",
+					description: "rulebook probe description",
+					path: "/tmp/probe-rulebook.md",
+					globs: ["**/*.ts"],
+				},
+			],
+			alwaysApplyRules: [{ name: "probe", content: alwaysBody, path: "/tmp/probe.md" }],
+			toolNames: ["read"],
+			workspaceTree: {
+				rootPath: os.tmpdir(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+
+		// Default path is [system-prompt, project-prompt]; rules land in project.
+		const projectPrompt = systemPrompt[1] ?? "";
+		const full = systemPrompt.join("\n\n");
+
+		expect(full).toContain(alwaysBody);
+		expect(projectPrompt).toContain(alwaysBody);
+		expect(projectPrompt).toContain("Rules are local constraints");
+		expect(projectPrompt).toContain('rule name="probe-rulebook"');
+		expect(projectPrompt).toContain("rulebook probe description");
+		expect(projectPrompt).toContain("<glob>**/*.ts</glob>");
+		expect(projectPrompt).toContain("rule://");
+	});
+
 	test("buildSystemPrompt deduplicates always-apply rules already present in SYSTEM.md", async () => {
 		const duplicateRule = ["Use static imports.", "", "Do not use dynamic loading."].join("\n");
 		const distinctRule = "Validate inputs at boundaries.";

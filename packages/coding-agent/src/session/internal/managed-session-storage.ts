@@ -944,6 +944,13 @@ export class ManagedSessionDescendantStore {
 			quarantineName,
 		});
 		if (
+			!detached.ok &&
+			detached.code === "not_found" &&
+			detached.retainedSuccessorPath === undefined &&
+			detached.retainedUnknownPath === undefined
+		)
+			return;
+		if (
 			(!detached.ok && detached.code !== "cleanup_pending") ||
 			detached.detachedPath !== path.join(this.#baseDir, quarantineName) ||
 			detached.retainedSuccessorPath ||
@@ -956,7 +963,13 @@ export class ManagedSessionDescendantStore {
 	#reconcileLegacyReplacementCleanupReceipt(receiptPath: string, name: string): void {
 		const binding = legacyReplacementCleanupReceiptBinding(name);
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
-		const receipt = captureManagedFileNoFollow(receiptPath);
+		let receipt: ManagedFileSnapshot;
+		try {
+			receipt = captureManagedFileNoFollow(receiptPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
 		const parsed = parseLegacyReplacementCleanupReceipt(receipt.bytes);
 		const expectedPredecessor = path.join(
 			this.#baseDir,
@@ -985,7 +998,16 @@ export class ManagedSessionDescendantStore {
 		if (!exactUnlinkCompleted(retired) && retired.code !== "not_found")
 			throw new Error(`managed_replace_cleanup_pending:${retired.code ?? "unknown"}`);
 
-		const currentReceipt = captureManagedFileNoFollow(receiptPath);
+		let currentReceipt: ManagedFileSnapshot;
+		try {
+			currentReceipt = captureManagedFileNoFollow(receiptPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				fsyncDirectory(this.#baseDir);
+				return;
+			}
+			throw error;
+		}
 		if (
 			!sameIdentity(currentReceipt.identity, receipt.identity) ||
 			currentReceipt.identity.sha256 !== receipt.identity.sha256
