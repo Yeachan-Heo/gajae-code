@@ -986,14 +986,45 @@ describe("Coordinator MCP canonical SDK controls", () => {
 
 		await fs.rm(sessionStatesPath);
 		await fs.rename(sessionStatesBackup, sessionStatesPath);
-		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+		const repaired = await server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id });
+		expect(repaired).toMatchObject({
 			ok: true,
 			turn: { status: "completed", completed_at: "2026-08-06T09:04:29.000Z" },
+			session_state: { state: "completed", current_turn_id: null },
 		});
 		await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
 			ok: true,
 			summary: { active_turns: 0 },
 		});
+		const namespaceIds = await fs.readdir(path.join(root, ".gjc", "coordinator-state", "v1"));
+		expect(namespaceIds).toHaveLength(1);
+		const transaction = JSON.parse(
+			await fs.readFile(
+				path.join(
+					root,
+					".gjc",
+					"coordinator-state",
+					"v1",
+					namespaceIds[0]!,
+					"sessions",
+					"visible-session",
+					"transaction.v1.json",
+				),
+				"utf8",
+			),
+		) as {
+			revision: number;
+			projection: {
+				applied_turns_revision: number;
+				applied_reports_revision: number;
+				applied_session_revision: number;
+				applied_active_revision: number;
+			};
+		};
+		expect(transaction.projection.applied_turns_revision).toBe(transaction.revision - 1);
+		expect(transaction.projection.applied_reports_revision).toBe(transaction.revision - 1);
+		expect(transaction.projection.applied_session_revision).toBe(transaction.revision - 1);
+		expect(transaction.projection.applied_active_revision).toBe(transaction.revision - 1);
 	});
 	it("fences concurrent terminal reconciliation to one queued-turn promotion", async () => {
 		const root = await tempRoot();
