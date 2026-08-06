@@ -14994,7 +14994,7 @@ export class AgentSession {
 	 * Marks the credential that just failed and reports whether the session
 	 * actually moved to a DIFFERENT stored credential.
 	 *
-	 * Three invariants this enforces, in order:
+	 * Four invariants this enforces, in order:
 	 *
 	 * 1. **Pin guard, first and for every trigger class.** A pinned credential
 	 *    (`--api-key` or `--credential`) must never be mutated or rotated away
@@ -15009,6 +15009,14 @@ export class AgentSession {
 	 *    session now uses a different credential" — with a single-row pool it is
 	 *    true while nothing rotated. Both branches therefore re-resolve and
 	 *    require the active key to have actually changed.
+	 * 4. **Usable-auth proof after auth invalidation.** Quota already fails closed
+	 *    via `markUsageLimitReached` (false when no unblocked alternate remains).
+	 *    Auth cannot: `invalidateCredentialMatching` only reports match-and-block,
+	 *    and when every stored row is blocked `AuthStorage.#selectCredentialByType`
+	 *    wraparound-returns a blocked fallback whose key string differs from the
+	 *    one just failed. Without this check a multi-row all-401 outage overshoots
+	 *    to pool+1 attempts. `hasUsableAuth` is false when no unblocked stored row
+	 *    remains (env/fallback-only paths are not mid-session rotation targets).
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
@@ -15047,6 +15055,11 @@ export class AgentSession {
 
 		// (3) Distinct-row proof.
 		if ((await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) === activeApiKey) {
+			return false;
+		}
+		// (4) Auth-only usable-auth proof — see method doc. Quota already closed
+		// this at (mutated) via markUsageLimitReached's remaining-unblocked check.
+		if (trigger.class === "auth" && !authStorage.hasUsableAuth(provider)) {
 			return false;
 		}
 		const toRowId = authStorage.getSessionCredentialRowId(provider, providerAffinitySessionId);

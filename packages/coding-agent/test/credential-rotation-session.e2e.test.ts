@@ -467,4 +467,81 @@ describe("AgentSession credential rotation — observability and 401 parity (#37
 		expect(attempts).toBe(1);
 		expect(switches).toHaveLength(0);
 	});
+
+	it("walks a multi-row pool to exhaustion on 401 without overshooting", async () => {
+		// Production outage shape: every stored row for the provider returns 401.
+		// Rotation must try each distinct row exactly once (pool size), announce
+		// only the accepted intermediate switches (pool size - 1), and surface
+		// exactly one terminal error — never pool+1 and never unbounded.
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary) throw new Error("Expected bundled test model");
+
+		const poolSize = rowIds().length;
+		expect(poolSize).toBeGreaterThanOrEqual(3);
+
+		let attempts = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, _options) => {
+				attempts += 1;
+				return auth401Stream(model);
+			}) satisfies AgentOptions["streamFn"],
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			// Single-entry chain so only credential rotation can produce more attempts.
+			modelRoles: { default: selector(primary) },
+			"retry.enabled": true,
+			// Deliberately low: credential rotation must override maxRetries so the
+			// walk still covers the full pool rather than stopping after one retry.
+			"retry.maxRetries": 1,
+			"retry.baseDelayMs": 1,
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const switches: Array<Extract<AgentSessionEvent, { type: "credential_switched" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "credential_switched") switches.push(event);
+		});
+
+		await session.prompt("multi-row 401 must exhaust the pool once");
+		await session.waitForIdle();
+
+		expect(attempts).toBe(poolSize);
+		// Each accepted rotation (all but the terminal attempt) announces once.
+		expect(switches).toHaveLength(poolSize - 1);
+		for (const event of switches) {
+			expect(event).toEqual(
+				expect.objectContaining({
+					type: "credential_switched",
+					provider: "anthropic",
+					reason: "auth",
+				}),
+			);
+			expect(typeof event.from).toBe("number");
+			expect(typeof event.to).toBe("number");
+			expect(event.from).not.toBe(event.to);
+		}
+		// From/to chain: every intermediate "to" is the next attempt's "from".
+		for (let i = 1; i < switches.length; i++) {
+			expect(switches[i]!.from).toBe(switches[i - 1]!.to);
+		}
+		// Opacity: no key material on the wire for any announced switch.
+		expect(JSON.stringify(switches)).not.toContain("anthropic-key-");
+
+		const terminalErrors = session.messages.filter(
+			(message): message is AssistantMessage => message.role === "assistant" && message.stopReason === "error",
+		);
+		expect(terminalErrors).toHaveLength(1);
+		expect(terminalErrors[0]!.errorStatus).toBe(401);
+		expect(terminalErrors[0]!.errorMessage).toContain("Unauthorized");
+	});
 });
