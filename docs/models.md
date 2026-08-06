@@ -162,15 +162,16 @@ providers:
       - id: anthropic.claude-3-5-sonnet-20241022-v2:0
 ```
 
-### MiniMax and GLM custom provider examples
+### Provider presets
 
-For common MiniMax and GLM/zAI setup, prefer the provider presets so the OpenAI-compatible API, base URL, env var, model id, and compatibility flags are written together:
+For common OpenAI-compatible providers, prefer a provider preset so the API, base URL, env var, model id, and compatibility flags are written together:
 
 ```sh
 gjc setup provider --preset minimax
 gjc setup provider --preset minimax-cn
 gjc setup provider --preset glm
 gjc setup provider --preset alibaba-token-plan
+gjc setup provider --preset atlas-cloud
 ```
 
 The same presets are available inside the TUI:
@@ -180,9 +181,10 @@ The same presets are available inside the TUI:
 /provider add --preset glm
 /provider add zai
 /provider add --preset alibaba-token-plan
+/provider add --preset atlas-cloud
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, or `ALIBABA_TOKEN_PLAN_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: alibaba, token-plan) writes an OpenAI-compatible custom provider named alibaba-token-plan with per-model API routing (qwen3.8-max-preview uses openai-responses; glm-5.2, deepseek-v4-pro, and deepseek-v4-flash-0731 use openai-completions).
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, or `ATLASCLOUD_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: alibaba, token-plan) writes an OpenAI-compatible custom provider named alibaba-token-plan with per-model API routing (qwen3.8-max-preview uses openai-responses; glm-5.2, deepseek-v4-pro, and deepseek-v4-flash-0731 use openai-completions). The Atlas Cloud preset (aliases: atlas, atlascloud) writes an OpenAI-compatible custom provider named `atlas-cloud` that defaults to `deepseek-ai/deepseek-v4-pro` at `https://api.atlascloud.ai/v1`.
 
 ## Model profiles (`--mpreset`)
 

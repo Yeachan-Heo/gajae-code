@@ -189,6 +189,41 @@ describe("provider onboarding setup core", () => {
 		).rejects.toThrow("fixed model ids");
 	});
 
+	it("adds Atlas Cloud through the provider preset with OpenAI-compatible config", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "atlas", modelsPath });
+
+		expect(result.providerId).toBe("atlas-cloud");
+		expect(result.api).toBe("openai-completions");
+		expect(result.compatibility).toBe("openai");
+		expect(result.preset).toBe("atlas-cloud");
+		expect(result.presetName).toBe("Atlas Cloud");
+		expect(result.modelIds).toEqual(["deepseek-ai/deepseek-v4-pro"]);
+		expect(result.credentialSource).toBe("env");
+
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as { providers?: Record<string, unknown> };
+		expect(parsed.providers?.["atlas-cloud"]).toEqual({
+			baseUrl: "https://api.atlascloud.ai/v1",
+			api: "openai-completions",
+			auth: "apiKey",
+			apiKeyEnv: "ATLASCLOUD_API_KEY",
+			compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens" },
+			models: [{ id: "deepseek-ai/deepseek-v4-pro" }],
+			modelOverrides: {
+				"deepseek-ai/deepseek-v4-pro": {
+					name: "DeepSeek V4 Pro",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 1.68, output: 3.38, cacheRead: 0.13, cacheWrite: 0 },
+					contextWindow: 1_048_576,
+					maxTokens: 393_216,
+				},
+			},
+		});
+		expect(findProviderPreset("atlascloud")?.id).toBe("atlas-cloud");
+		expect(formatProviderPresetList()).toContain("atlas-cloud");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });

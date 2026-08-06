@@ -1922,10 +1922,12 @@ describe("ModelRegistry", () => {
 			const presetModelsPath = path.join(tempDir, "preset-models.yml");
 			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({ preset: "atlas-cloud", modelsPath: presetModelsPath });
 
 			const registry = new ModelRegistry(authStorage, presetModelsPath);
 			const minimax = registry.find("minimax-code", "MiniMax-M3");
 			const glm = registry.find("glm-proxy", "glm-4.6");
+			const atlas = registry.find("atlas-cloud", "deepseek-ai/deepseek-v4-pro");
 
 			expect(minimax?.api).toBe("openai-completions");
 			// #614: preset-onboarded models inherit the bundled canonical display
@@ -1939,6 +1941,51 @@ describe("ModelRegistry", () => {
 			expect(glm?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
 			expect(getOpenAICompat(glm)?.thinkingFormat).toBe("zai");
 			expect(getOpenAICompat(glm)?.supportsReasoningEffort).toBe(false);
+			expect(atlas?.api).toBe("openai-completions");
+			expect(atlas?.baseUrl).toBe("https://api.atlascloud.ai/v1");
+			expect(atlas?.name).toBe("DeepSeek V4 Pro");
+			expect(atlas?.reasoning).toBe(false);
+			expect(atlas?.thinking).toBeUndefined();
+			expect(atlas?.input).toEqual(["text"]);
+			expect(atlas?.cost).toEqual({ input: 1.68, output: 3.38, cacheRead: 0.13, cacheWrite: 0 });
+			expect(atlas?.contextWindow).toBe(1_048_576);
+			expect(atlas?.maxTokens).toBe(393_216);
+			expect(getOpenAICompat(atlas)?.supportsStore).toBe(false);
+			expect(getOpenAICompat(atlas)?.supportsDeveloperRole).toBe(false);
+			expect(getOpenAICompat(atlas)?.maxTokensField).toBe("max_tokens");
+
+			let requestBody: Record<string, unknown> | undefined;
+			using _hook = hookFetch((input, init) => {
+				expect(String(input)).toBe("https://api.atlascloud.ai/v1/chat/completions");
+				requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+				const body = [
+					`data: ${JSON.stringify({
+						id: "chatcmpl-atlas",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: "deepseek-ai/deepseek-v4-pro",
+						choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+					})}`,
+					`data: ${JSON.stringify({
+						id: "chatcmpl-atlas",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: "deepseek-ai/deepseek-v4-pro",
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+						usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+					})}`,
+					"data: [DONE]",
+					"",
+				].join("\n\n");
+				return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+			});
+			await streamOpenAICompletions(
+				atlas as Model<"openai-completions">,
+				{ messages: [{ role: "user", content: "hello", timestamp: Date.now() }] } satisfies Context,
+				{ apiKey: "ATLAS_TEST_KEY", maxTokens: 8192 },
+			).result();
+			expect(requestBody?.max_tokens).toBe(8192);
+			expect(requestBody?.max_completion_tokens).toBeUndefined();
 		});
 
 		test("#614: custom provider referencing a bundled model id inherits canonical display name", () => {

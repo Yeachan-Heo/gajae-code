@@ -38,6 +38,7 @@ export interface ProviderSetupResult {
 
 type ProviderConfig = NonNullable<NonNullable<ModelsConfig["providers"]>[string]>;
 type ProviderCompatConfig = NonNullable<ProviderConfig["compat"]>;
+type ProviderModelOverridesConfig = NonNullable<ProviderConfig["modelOverrides"]>;
 
 interface ProviderPreset {
 	id: string;
@@ -51,6 +52,7 @@ interface ProviderPreset {
 	apiKeyEnv: string;
 	models: readonly string[];
 	modelApi?: Readonly<Record<string, ProviderSetupApi>>;
+	modelOverrides?: ProviderModelOverridesConfig;
 	compat?: ProviderCompatConfig;
 }
 
@@ -130,6 +132,7 @@ function resolvePresetInput(input: ProviderSetupInput): {
 	apiKeyEnv?: string;
 	models: readonly string[];
 	modelApi?: Readonly<Record<string, ProviderSetupApi>>;
+	modelOverrides?: ProviderModelOverridesConfig;
 	api: ProviderSetupApi;
 	compat?: ProviderCompatConfig;
 } {
@@ -170,6 +173,7 @@ function resolvePresetInput(input: ProviderSetupInput): {
 		apiKeyEnv: input.apiKeyEnv ?? preset?.apiKeyEnv,
 		models: input.models && input.models.length > 0 ? input.models : (preset?.models ?? []),
 		modelApi: preset?.modelApi,
+		modelOverrides: preset?.modelOverrides,
 		api: preset?.api ?? apiForCompatibility(compatibility),
 		compat: preset?.compat,
 	};
@@ -205,6 +209,7 @@ function validateSetupInput(input: ProviderSetupInput): {
 	api: ProviderSetupApi;
 	compat?: ProviderCompatConfig;
 	modelApi?: Readonly<Record<string, ProviderSetupApi>>;
+	modelOverrides?: ProviderModelOverridesConfig;
 	preset?: ProviderPreset;
 } {
 	const resolved = resolvePresetInput(input);
@@ -251,6 +256,7 @@ function validateSetupInput(input: ProviderSetupInput): {
 		compatibility: resolved.compatibility,
 		api: resolved.api,
 		modelApi: resolved.modelApi,
+		modelOverrides: resolved.modelOverrides,
 		compat: resolved.compat,
 		preset: resolved.preset,
 	};
@@ -322,6 +328,7 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		}),
 	};
 	if (validated.compat) provider.compat = validated.compat;
+	if (validated.modelOverrides) provider.modelOverrides = validated.modelOverrides;
 	if (validated.credentialSource === "env") {
 		provider.apiKeyEnv = validated.apiKey;
 	} else {

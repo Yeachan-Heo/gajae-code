@@ -2,7 +2,7 @@ import { formatProviderCredentialHint } from "@gajae-code/ai/stream";
 
 export const MODEL_ONBOARDING_API_PROVIDER_COMMAND =
 	"/provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model>";
-export const MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND = "/provider add --preset <minimax|minimax-cn|glm>";
+export const MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND = "/provider add --preset <atlas-cloud|minimax|minimax-cn|glm>";
 
 export const MODEL_ONBOARDING_SETUP_COMMAND = "gjc setup provider";
 export const MODEL_ONBOARDING_OAUTH_COMMAND = "/provider login [provider-id] or /login [provider-id]";
@@ -20,7 +20,7 @@ export function formatModelOnboardingGuidance(): string {
 }
 
 export function formatModelOnboardingInlineHint(): string {
-	return `Add MiniMax/GLM presets with ${MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND}; custom API providers with ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} (or ${MODEL_ONBOARDING_SETUP_COMMAND}); OAuth/subscription with ${MODEL_ONBOARDING_OAUTH_COMMAND}; then run /model for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, and CRITIC.`;
+	return `Add a provider preset with ${MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND}; custom API providers with ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} (or ${MODEL_ONBOARDING_SETUP_COMMAND}); OAuth/subscription with ${MODEL_ONBOARDING_OAUTH_COMMAND}; then run /model for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, and CRITIC.`;
 }
 
 export function formatNoModelOnboardingError(): string {
@@ -31,7 +31,7 @@ export function formatNoCredentialOnboardingError(providerId: string): string {
 	const lines = [
 		`No credentials found for ${providerId}.`,
 		"",
-		`For MiniMax/GLM presets, configure credentials with ${MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND} (or ${MODEL_ONBOARDING_SETUP_COMMAND} --preset <preset>).`,
+		`For provider presets, configure credentials with ${MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND} (or ${MODEL_ONBOARDING_SETUP_COMMAND} --preset <preset>).`,
 		`For custom API-compatible providers, use ${MODEL_ONBOARDING_API_PROVIDER_COMMAND}.`,
 		`For OAuth/subscription providers, use ${MODEL_ONBOARDING_OAUTH_COMMAND} (interactive; not available in headless/print mode).`,
 	];

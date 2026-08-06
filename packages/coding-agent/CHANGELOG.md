@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Added an `atlas-cloud` provider preset for Atlas Cloud's OpenAI-compatible API, using `ATLASCLOUD_API_KEY`, `https://api.atlascloud.ai/v1`, and `deepseek-ai/deepseek-v4-pro` without storing credentials in `models.yml`.
+
 ### Fixed
 - ACP session configuration now emits the spec-defined `category` field on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), so standards-compliant ACP clients such as Paseo discover models, modes, and thinking levels instead of an empty model picker (#3922).
 - The ACP session model catalog is now filtered to active providers via `providers.list/active`, falling back to the full catalog on older session hosts, so ACP clients no longer list models for providers without usable credentials (#3922).
