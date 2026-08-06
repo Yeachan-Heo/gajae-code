@@ -355,6 +355,33 @@ describe("Anthropic thinking replay 400 classification", () => {
 		expect(isAnthropicThinkingSignatureInvalidError(error)).toBe(false);
 	});
 
+	// Issue #3900: CLIProxyAPI delivers the upstream 400 body as an in-stream SSE
+	// `error` event on an HTTP 200 response, so the thrown error carries no HTTP
+	// status. Both matchers must still classify the invalid_request_error payload.
+	it("classifies the statusless SSE error-event mutation variant", () => {
+		const sseError = new Error(
+			'{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}',
+		);
+		expect(isAnthropicThinkingBlockMutationError(sseError)).toBe(true);
+		expect(isAnthropicThinkingSignatureInvalidError(sseError)).toBe(false);
+	});
+
+	it("classifies the statusless SSE error-event signature variant", () => {
+		const sseError = new Error(
+			'{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.24: Invalid `signature` in `thinking` block"}}',
+		);
+		expect(isAnthropicThinkingSignatureInvalidError(sseError)).toBe(true);
+		expect(isAnthropicThinkingBlockMutationError(sseError)).toBe(false);
+	});
+
+	it("rejects statusless masked proxy errors without thinking attribution", () => {
+		const masked = new Error(
+			'{"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}',
+		);
+		expect(isAnthropicThinkingBlockMutationError(masked)).toBe(false);
+		expect(isAnthropicThinkingSignatureInvalidError(masked)).toBe(false);
+	});
+
 	it("rejects non-Error inputs and unrelated thinking-config 400s", () => {
 		expect(isAnthropicThinkingSignatureInvalidError(undefined)).toBe(false);
 		expect(isAnthropicThinkingSignatureInvalidError("Invalid `signature` in `thinking` block")).toBe(false);

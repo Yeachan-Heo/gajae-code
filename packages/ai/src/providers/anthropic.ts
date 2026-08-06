@@ -395,8 +395,20 @@ export function isAnthropicFastModeUnsupportedError(error: unknown): boolean {
 	return false;
 }
 
+/**
+ * Proxies (e.g. CLIProxyAPI) can deliver Anthropic's 400 body as an in-stream
+ * SSE `error` event on an HTTP 200 response; the thrown error then carries no
+ * HTTP status at all (issue #3900). Accept both the direct 400 and the
+ * statusless SSE shape — the strict `invalid_request_error` message checks in
+ * each matcher keep the statusless branch from claiming unrelated failures.
+ */
+function isAnthropicInvalidRequestStatus(error: unknown): boolean {
+	const status = extractHttpStatusFromError(error);
+	return status === 400 || status === undefined;
+}
+
 export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
-	if (extractHttpStatusFromError(error) !== 400) return false;
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	return (
 		/invalid_request_error/i.test(message) &&
@@ -414,7 +426,7 @@ export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
  * than only the latest one.
  */
 export function isAnthropicThinkingSignatureInvalidError(error: unknown): boolean {
-	if (extractHttpStatusFromError(error) !== 400) return false;
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	return (
 		/invalid_request_error/i.test(message) &&

@@ -102,6 +102,19 @@ function createAnthropicSignatureInvalid400(): MockAnthropicRequest {
 	};
 }
 
+// Issue #3900: proxies like CLIProxyAPI forward the upstream 400 body as an
+// in-stream SSE `error` event on an HTTP 200 response. The provider throws
+// `new Error(sse.data)` with no HTTP status attached.
+function createStatuslessSseThinkingMutationError(): MockAnthropicRequest {
+	return {
+		async withResponse() {
+			throw new Error(
+				'{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}',
+			);
+		},
+	};
+}
+
 function makeSignedAssistant(suffix: string, text: string): AssistantMessage {
 	return {
 		role: "assistant",
@@ -174,6 +187,40 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(JSON.stringify(requestBodies[1])).not.toContain("synthetic_sig");
 		expect(JSON.stringify(requestBodies[1])).not.toContain("redacted_thinking");
 		expect(JSON.stringify(requestBodies[1])).toContain("visible answer");
+	});
+
+	// Issue #3900: behind CLIProxyAPI the same mutation rejection arrives as a
+	// statusless SSE error event, and the repair path used to reject it because
+	// the classifier required an HTTP 400 status.
+	it("repairs thinking replay when the mutation error arrives statusless via a proxy SSE error event", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("proxied", "proxied answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 1 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt === 1 ? createStatuslessSseThinkingMutationError() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(requestBodies).toHaveLength(2);
+		expect(JSON.stringify(requestBodies[0])).toContain("sig_proxied");
+		expect(JSON.stringify(requestBodies[1])).not.toContain("sig_proxied");
 	});
 
 	// Real captured session failure (2026-07-29): the mutation 400 says "latest
