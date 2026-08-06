@@ -7,8 +7,12 @@
 import { streamAnthropic } from "../packages/ai/src/providers/anthropic";
 import type { AssistantMessage, Context, Model, UserMessage } from "../packages/ai/src/types";
 
+// `masked` reproduces the live 2026-08-06 CPA capture: the proxy replaces the
+// upstream body entirely, so the client only sees a generic `api_error`.
 const capturedError =
-	'{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}';
+	process.argv[2] === "masked"
+		? '{"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}'
+		: '{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}';
 
 const successFrames = [
 	['message_start', '{"type":"message_start","message":{"id":"msg_sim","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'],
