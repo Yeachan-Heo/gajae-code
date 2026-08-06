@@ -461,7 +461,7 @@ function getCacheControl(
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
 ): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
-	const retention = resolveCacheRetention(cacheRetention, "long");
+	const retention = resolveCacheRetention(cacheRetention ?? model.cacheRetention, "long");
 	if (retention === "none") return { mode: "none" };
 
 	const isCanonicalApi = isAnthropicApiBaseUrl(baseUrl);

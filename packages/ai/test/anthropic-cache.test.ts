@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
 import { normalizeCacheControlTtlOrdering, streamAnthropic } from "@gajae-code/ai/providers/anthropic";
-import type { Context, Model, TJsonSchema } from "@gajae-code/ai/types";
+import { clearGitLabDuoDirectAccessCache, streamGitLabDuo } from "@gajae-code/ai/providers/gitlab-duo";
+import type { CacheRetention, Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 
 const canonicalModel: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -43,7 +44,7 @@ function capturePayload(
 	model: Model<"anthropic-messages">,
 	input: Context,
 	onPayload?: (payload: Payload) => Payload | undefined,
-	cacheRetention?: "none" | "short" | "long",
+	cacheRetention?: CacheRetention,
 ): Promise<Payload> {
 	const { promise, resolve } = Promise.withResolvers<Payload>();
 	streamAnthropic(model, input, {
@@ -55,6 +56,32 @@ function capturePayload(
 			const replacement = onPayload?.(payload as Payload);
 			resolve((replacement ?? payload) as Payload);
 			return replacement;
+		},
+	});
+	return promise;
+}
+function captureGitLabPayload(model: Model<"anthropic-messages">, cacheRetention?: CacheRetention): Promise<Payload> {
+	clearGitLabDuoDirectAccessCache();
+	const { promise, resolve } = Promise.withResolvers<Payload>();
+	streamGitLabDuo(model, context(), {
+		apiKey: "glpat-test",
+		signal: abortedSignal(),
+		cacheRetention,
+		fetch: async input => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url === "https://gitlab.com/api/v4/ai/third_party_agents/direct_access") {
+				return new Response(
+					JSON.stringify({ token: "direct-token", headers: { "x-gitlab-instance-id": "test" } }),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+			throw new Error(`Unexpected GitLab Duo fetch: ${url}`);
+		},
+		onPayload: payload => {
+			resolve(payload as Payload);
 		},
 	});
 	return promise;
@@ -204,6 +231,24 @@ describe("Anthropic prompt caching", () => {
 			expect(payload.model, name).toBe(model.id);
 			expect(cacheControls(payload), name).toEqual(expected ? [expected] : []);
 		}
+	});
+	it("preserves configured cache retention through GitLab Duo and lets request options win", async () => {
+		const gitlabModel: Model<"anthropic-messages"> = {
+			...canonicalModel,
+			id: "duo-chat-sonnet-4-6",
+			name: "Duo Chat Sonnet 4.6",
+			provider: "gitlab-duo",
+			baseUrl: "https://cloud.gitlab.com/ai/v1/proxy/anthropic/",
+			cacheRetention: "none",
+		};
+
+		const configuredNone = await captureGitLabPayload(gitlabModel);
+		const requestOverride = await captureGitLabPayload(gitlabModel, "short");
+
+		expect(configuredNone.model).toBe("claude-sonnet-4-6");
+		expect(cacheControls(configuredNone)).toEqual([]);
+		expect(requestOverride.model).toBe("claude-sonnet-4-6");
+		expect(cacheControls(requestOverride)).toEqual([{ type: "ephemeral" }]);
 	});
 
 	it("counts top-level automatic and caller controls together without mutating a callback replacement", async () => {

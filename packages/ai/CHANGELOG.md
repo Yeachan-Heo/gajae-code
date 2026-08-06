@@ -4,11 +4,12 @@
 
 ### Changed
 
-- Anthropic prompt caching now defaults to top-level automatic caching (`cache_control: { type: "ephemeral" }`) for every Claude-family model, including through non-canonical Anthropic-compatible gateways (Cloudflare AI Gateway, GitHub Copilot, GitLab Duo, Vercel AI Gateway, zenmux, etc.), instead of only `api.anthropic.com`. Non-Claude models on unknown compatible endpoints keep the previous no-cache default; `compat.promptCacheMode: "none"`, `compat.promptCacheMode: "explicit"`, and per-request `cacheRetention: "none"` still opt out. Non-canonical Claude models get the default ~5m cache lifetime unless the endpoint sets `compat.supportsLongCacheRetention: true`.
+- Anthropic prompt caching now defaults to top-level automatic caching (`cache_control: { type: "ephemeral" }`) for every Claude-family model, including through non-canonical Anthropic-compatible gateways (Cloudflare AI Gateway, GitHub Copilot, GitLab Duo, Vercel AI Gateway, zenmux, etc.), instead of only `api.anthropic.com`. Non-Claude models on unknown compatible endpoints keep the previous no-cache default; `compat.promptCacheMode: "none"`, `compat.promptCacheMode: "explicit"`, and configured or per-request `cacheRetention: "none"` still opt out. Non-canonical Claude models get the default ~5m cache lifetime unless the endpoint sets `compat.supportsLongCacheRetention: true`.
 
 ### Fixed
 
 - Canonicalized first-class MiniMax M3 catalog ids (issue #3896). The bundled catalog previously shipped stale lowercase `minimax-m3` duplicates (512K) next to the canonical `MiniMax-M3` (1M) on all four first-class MiniMax providers, plus a non-official `minimax-v3` entry under `minimax-code`. The lowercase `minimax-m3` entries and `minimax-v3` are removed; `MiniMax-M3` is the single canonical first-class id (the regen-safe 1M pin in `applyGeneratedModelPolicy` now keys on `MiniMax-M3` / `MiniMax-M3[1m]` instead of the removed lowercase id), `DEFAULT_MODEL_PER_PROVIDER` points at `MiniMax-M3`, and the official Anthropic Token Plan id `MiniMax-M3[1m]` is first-class on the `minimax` / `minimax-cn` Anthropic routes with 1M context semantics. Unrelated catalog providers keep their own `minimax-m3` contracts.
+- Anthropic cache-control resolution now falls back to `model.cacheRetention` at the provider boundary, preserving configured retention and request-over-model precedence through special dispatch wrappers such as GitLab Duo. A configured `cacheRetention: "none"` can no longer be dropped and replaced by the new automatic Claude-family cache marker.
 ## [0.12.12] - 2026-08-05
 
 ### Fixed
