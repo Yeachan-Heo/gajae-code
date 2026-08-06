@@ -1095,10 +1095,14 @@ export class AcpAgent implements Agent {
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		if (params.modeId !== ACP_DEFAULT_MODE_ID && params.modeId !== ACP_PLAN_MODE_ID)
 			throw new Error(`Unsupported ACP mode: ${params.modeId}`);
-		await this.#adapter(params.sessionId).control("mode.plan.set", { on: params.modeId === ACP_PLAN_MODE_ID });
+		if (params.modeId === ACP_PLAN_MODE_ID)
+			throw new AcpSdkAdapterError(
+				"unsupported",
+				"ACP plan mode is not available because this ACP session has no host plan-mode lifecycle.",
+			);
 		await this.#publishSessionUpdate(params.sessionId, {
 			sessionId: params.sessionId,
-			update: { sessionUpdate: "current_mode_update", currentModeId: params.modeId },
+			update: { sessionUpdate: "current_mode_update", currentModeId: ACP_DEFAULT_MODE_ID },
 		});
 		return {};
 	}
