@@ -64,11 +64,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * generation 26 / slack generation 25 add the in-place operator command channel:
  * an owner serves per-request commands inside its own serving loop and answers
  * them against an exact owner tuple, so an owner at an earlier generation may
- * not serve or answer a request captured against this contract.
+ * not serve or answer a request captured against this contract. Discord
+ * generation 27 / slack generation 26 move shared exact unlink and process-
+ * incarnation authority behind lazy native bindings.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 26,
-	slack: 25,
+	discord: 27,
+	slack: 26,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
