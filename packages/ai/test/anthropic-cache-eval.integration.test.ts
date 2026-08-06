@@ -83,18 +83,10 @@ async function currentSourceIdentity(
 }
 
 function contextForTurn(turn: number): Context {
-	const callId = "call_1";
-	return {
-		systemPrompt: [fixture.stablePrefix],
-		tools: [
-			{
-				name: "lookup",
-				description: "Looks up an answer.",
-				parameters: { type: "object", properties: {} } as TJsonSchema,
-			},
-		],
-		messages: [
-			{ role: "user", content: "Find the answer", timestamp: 1 },
+	const messages: Context["messages"] = [{ role: "user", content: "Find the answer", timestamp: 1 }];
+	for (let index = 0; index <= turn; index++) {
+		const callId = `call_${index + 1}`;
+		messages.push(
 			{
 				role: "assistant",
 				content: [{ type: "toolCall", id: callId, name: "lookup", arguments: {} }],
@@ -110,18 +102,28 @@ function contextForTurn(turn: number): Context {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 				stopReason: "toolUse",
-				timestamp: 2,
+				timestamp: index * 2 + 2,
 			},
 			{
 				role: "toolResult",
 				toolCallId: callId,
 				toolName: "lookup",
-				content: [{ type: "text", text: fixture.toolResultVariants[turn]! }],
+				content: [{ type: "text", text: fixture.toolResultVariants[index]! }],
 				isError: false,
-				timestamp: 3,
+				timestamp: index * 2 + 3,
 			},
-			{ role: "user", content: "Use the newest lookup result in the answer.", timestamp: 4 },
+		);
+	}
+	return {
+		systemPrompt: [fixture.stablePrefix],
+		tools: [
+			{
+				name: "lookup",
+				description: "Looks up an answer.",
+				parameters: { type: "object", properties: {} } as TJsonSchema,
+			},
 		],
+		messages,
 	};
 }
 
@@ -168,11 +170,16 @@ function oldPlacement(payload: Payload): Payload {
 	if (!control) throw new Error("Provider payload lacks an explicit cache-control breakpoint");
 	const cacheControl = (payload.messages[Number(control[1])]!.content as ContentBlock[])[Number(control[2])]!
 		.cache_control;
-	const toolIndex = old.messages.findLastIndex(isToolResultMessage);
 	const humanIndex = old.messages.findLastIndex(message => message.role === "user" && !isToolResultMessage(message));
-	if (!cacheControl || toolIndex < 0 || humanIndex < 0)
-		throw new Error("Provider payload lacks expected tool-result/current-human blocks");
-	(old.messages[toolIndex]!.content as ContentBlock[])[0]!.cache_control = cacheControl;
+	if (!cacheControl || humanIndex < 0) throw new Error("Provider payload lacks a current-human cache candidate");
+
+	for (let index = humanIndex - 1; index >= 0; index--) {
+		const message = old.messages[index];
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		const block = message.content.findLast(candidate => candidate.type !== "thinking");
+		if (block) block.cache_control = cacheControl;
+		break;
+	}
 	const humanBlocks = old.messages[humanIndex]!.content;
 	if (!Array.isArray(humanBlocks) || !humanBlocks[0]) throw new Error("Current human message is not cacheable");
 	humanBlocks[0].cache_control = cacheControl;
@@ -274,11 +281,11 @@ async function buildArtifact(): Promise<EvalArtifact> {
 					anchors: await Promise.all(
 						turn.map(async anchor => ({ path: anchor.path, sha256: await sha256(anchor.path) })),
 					),
-					cacheableTokenEstimateAtLeast: 1024,
+					cacheableTokenEstimateAtLeast: estimate,
 				};
 			}),
 		);
-	const lowerBounds = (values: number[]) => values.map(value => (value === 0 ? 0 : Math.min(value, 1024)));
+	const lowerBounds = (values: number[]) => values;
 	return {
 		schemaVersion: 3,
 		issue: 2383,
@@ -307,10 +314,11 @@ async function buildArtifact(): Promise<EvalArtifact> {
 			newPlacement: lowerBounds(evidence.retention.newPlacement.reads),
 		},
 		method:
-			"The test sequentially builds three real explicit-mode streamAnthropic onPayload requests over the same agentic turn shape, with a distinct newest tool result on each request and a stable prefix above the documented 1,024-token minimum. It models documented explicit cache writes at each provider-built cache_control breakpoint and reads using inclusive structural prefix lookback over the actual built tools, system, and message sequence. Cache-control metadata is excluded from prefix identity because it designates the breakpoint rather than prompt content. The old comparator places the assistant breakpoint on the volatile tool-result wire message plus the current human message; the provider payload is the new comparator, with the stable previous assistant boundary plus current human message. All token quantities are structural simulated estimates, not billed or provider-reported usage.",
+			"The test sequentially builds three real explicit-mode streamAnthropic onPayload requests over a growing agent tool loop with a stable prefix above the documented 1,024-token minimum. The old comparator reproduces the previous provider algorithm: it selects the last human user message and searches only before it for an assistant breakpoint, so a tool-result-only continuation remains pinned to the original human turn. The provider payload is the new comparator: it retains that human marker and advances the second marker to the latest completed assistant tool-use turn while leaving the newest tool result uncached. It models explicit cache writes and reads using inclusive structural prefix lookback over the actual built tools, system, and message sequence. Cache-control metadata is excluded from prefix identity because it designates the breakpoint rather than prompt content. All token quantities are structural simulated estimates, not billed or provider-reported usage.",
 		limitations: [
 			"This is deterministic local simulation over provider-built payloads; it does not send Anthropic API requests.",
-			"Structural simulated token estimates use floor(UTF-8 bytes / 4), not provider tokenization or billing telemetry.",
+			"Structural token estimates use floor(UTF-8 bytes / 4), not provider tokenization or billing telemetry.",
+			"The live CLIProxyAPI probe is reported separately in the pull request and is not encoded as immutable artifact evidence.",
 			"The cited prompt-caching documentation was retrieved on 2026-07-18; cache retention, pricing, and provider usage are not asserted.",
 		],
 		testCommand: "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
@@ -364,7 +372,8 @@ describe("Anthropic cache placement eval (deterministic sequential three-request
 			artifact.perTurn.newPlacement[0]!.anchors[0]!.sha256,
 		);
 		for (const [turn, oldRead] of evidence.retention.oldPlacement.reads.entries()) {
-			expect(evidence.retention.newPlacement.reads[turn]).toBeGreaterThanOrEqual(oldRead);
+			if (turn > 0) expect(evidence.retention.newPlacement.reads[turn]).toBeGreaterThan(oldRead);
+			else expect(evidence.retention.newPlacement.reads[turn]).toBe(oldRead);
 			for (const placement of ["oldPlacement", "newPlacement"] as const) {
 				expect(evidence.retention[placement].writes[turn]).toBeGreaterThanOrEqual(
 					artifact.simulatedExplicitBreakpointWriteTokensAtLeast[placement][turn]!,
