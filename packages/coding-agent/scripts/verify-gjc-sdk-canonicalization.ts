@@ -1504,11 +1504,15 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 	const continuation = /async\s+function\s+continueStalledGjcTeamWorkers\s*\([^)]*\)\s*:\s*Promise<void>\s*\{/.exec(
 		contents,
 	);
-	if (!executor || !continuation) return [];
+	const monitor = /(?:export\s+)?async\s+function\s+monitorGjcTeam\s*\([\s\S]*?\)\s*:\s*Promise<[^>]+>\s*\{/.exec(
+		contents,
+	);
+	if (!executor || !continuation || !monitor) return [];
 
 	const executorRange = braceBlockRange(contents, (executor.index ?? 0) + executor[0].lastIndexOf("{"));
 	const continuationRange = braceBlockRange(contents, (continuation.index ?? 0) + continuation[0].lastIndexOf("{"));
-	if (!executorRange || !continuationRange) return [];
+	const monitorRange = braceBlockRange(contents, (monitor.index ?? 0) + monitor[0].lastIndexOf("{"));
+	if (!executorRange || !continuationRange || !monitorRange) return [];
 
 	const executorBody = contents.slice(executorRange.start, executorRange.end);
 	const literalSend =
@@ -1531,6 +1535,15 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 		return [];
 
 	const continuationBody = contents.slice(continuationRange.start, continuationRange.end);
+	const monitorBody = contents.slice(monitorRange.start, monitorRange.end);
+	const continuationCalls = [...monitorBody.matchAll(/await\s+continueStalledGjcTeamWorkers\s*\([^;]*\)\s*;/g)];
+	const reconcileCalls = [...monitorBody.matchAll(/await\s+reconcileGjcTeamStaleClaimsUnlocked\s*\([^;]*\)\s*;/g)];
+	if (
+		continuationCalls.length !== 1 ||
+		reconcileCalls.length !== 1 ||
+		(continuationCalls[0].index ?? 0) >= (reconcileCalls[0].index ?? 0)
+	)
+		return [];
 	// The frozen argv may address the pane either through `worker.pane_id` directly or
 	// through a local binding that was proven non-empty first (the optional field does
 	// not narrow for the type checker). Either way both send operations must name the
@@ -3350,8 +3363,8 @@ async function monitorGjcTeam(): Promise<void> {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				": (() => {",
-				": Bun.spawnSync([config.tmux_command, ...args])",
+				/\t\t: \(\(\) => \{[\s\S]*?\n\t\t\t\}\)\(\);/,
+				"\t\t: Bun.spawnSync([config.tmux_command, ...args]);",
 			),
 		},
 		1,
