@@ -2264,6 +2264,13 @@ export class Settings implements NotificationSettingsReader {
 					);
 					return;
 				}
+				const targetIdentityBeforePatch = await this.#workflowMigrationTargetIdentity(target);
+				if (targetIdentityBeforePatch === null) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration cannot verify target directory ${path.dirname(target)} before patch; leaving source and marker pending`,
+					);
+					return;
+				}
 				const prePatchTargetSnapshot = structuredClone(tx.current);
 				// Apply the nested patches AND the flat-form cleanup in a single
 				// atomic write: two separate writes would let an external editor's
@@ -2368,10 +2375,10 @@ export class Settings implements NotificationSettingsReader {
 					return;
 				}
 
-				const targetIdentity = await this.#workflowMigrationTargetIdentity(target);
+				const targetIdentity = await this.#workflowMigrationTargetIdentity(target, targetIdentityBeforePatch);
 				if (targetIdentity === null) {
 					this.#warnLegacyFallbackMigration(
-						`Settings: config-root workflow migration cannot publish completion because the target directory identity is unavailable; leaving source, backup, and marker pending`,
+						`Settings: config-root workflow migration target directory changed after patch; leaving source, backup, and marker pending`,
 					);
 					return;
 				}
@@ -2792,12 +2799,20 @@ export class Settings implements NotificationSettingsReader {
 
 	async #workflowMigrationTargetIdentity(
 		target: string,
+		expected?: { canonicalTargetDir: string; canonicalTargetIdentity: string },
 	): Promise<{ canonicalTargetDir: string; canonicalTargetIdentity: string } | null> {
 		const targetDir = path.dirname(target);
 		const canonicalTargetDir = await fs.promises.realpath(targetDir).catch(() => null);
 		if (canonicalTargetDir === null) return null;
 		const canonicalTargetIdentity = await this.#statIdentity(targetDir);
 		if (canonicalTargetIdentity === undefined) return null;
+		if (
+			expected &&
+			(canonicalTargetDir !== expected.canonicalTargetDir ||
+				canonicalTargetIdentity !== expected.canonicalTargetIdentity)
+		) {
+			return null;
+		}
 		return { canonicalTargetDir, canonicalTargetIdentity };
 	}
 
