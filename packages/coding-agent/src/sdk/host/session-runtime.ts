@@ -20,6 +20,8 @@ import {
 	type SdkSurfacePolicy,
 } from "./surface-policy";
 
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "../bus/kind-aware-reconciliation";
+import { createReconciliationStore } from "../bus/reconciliation-store";
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -641,6 +643,7 @@ function createControlSurface(
 	reconciliation: InvocationReconciliation,
 	onAccepted: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	policy?: SdkSurfacePolicy,
+	steerReconciliation?: KindAwareReconciliation,
 ): ControlSurface {
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -750,17 +753,22 @@ function createControlSurface(
 					options,
 				),
 			),
-		steer: async (text, clientRef) =>
-			submit(
-				"steer",
-				clientRef,
-				async options => {
-					await options.onPreflightAcceptCommit();
-					await api.sendUserMessage(text, { deliverAs: "steer" });
-				},
-				undefined,
-				true,
-			),
+		steer: async (text, clientRef) => {
+			const retainedClientRef = normalizeClientRef(clientRef);
+			if (retainedClientRef === undefined) {
+				await api.sendUserMessage(text, { deliverAs: "steer" });
+				return { accepted: true, commandId: crypto.randomUUID() };
+			}
+			const durable = steerReconciliation ?? (reconciliation as unknown as KindAwareReconciliation);
+			const reservation = await durable.reserveSteer(retainedClientRef, text);
+			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
+			try {
+				await api.sendUserMessage(text, { deliverAs: "steer" });
+				return { accepted: true, ...(await durable.settleSteer(retainedClientRef, "accepted")) };
+			} catch (error) {
+				return { accepted: false, ...(await durable.settleSteer(retainedClientRef, "rejected", error)) };
+			}
+		},
 		followUp: async text =>
 			submit("prompt", undefined, options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" })),
 		abort: () => {
@@ -905,6 +913,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				revisions: RevisionStore;
 				cursors: CursorRegistry;
 				reconciliation: InvocationReconciliation;
+				steerReconciliation: KindAwareReconciliation;
 				pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
 				disposeGate?: () => void;
@@ -947,6 +956,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const cursors = new CursorRegistry(token, revisions);
 		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
 		await reconciliation.hydrate();
+		const steerReconciliation = createKindAwareReconciliation({
+			store: createReconciliationStore({ sessionFile: ctx.sessionManager.getSessionFile(), sessionId }),
+		});
+		await steerReconciliation.hydrateFromStore();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
@@ -955,7 +968,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			promptStatusLookup: selector => reconciliation.lookup("prompt", selector),
 			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
-			steerStatusLookup: selector => reconciliation.lookup("steer", selector),
+			steerStatusLookup: selector => steerReconciliation.lookupSteer(selector),
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const controlSurface = createControlSurface(
@@ -966,6 +979,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				pending.push({ kind, correlation });
 			},
 			surfaceFactory.policy,
+			steerReconciliation,
 		);
 		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
@@ -1072,7 +1086,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);
-		active = { runtime, revisions, cursors, reconciliation, pending, disposeGate };
+		active = { runtime, revisions, cursors, reconciliation, steerReconciliation, pending, disposeGate };
 		try {
 			await runtime.start();
 		} catch (error) {
@@ -1085,7 +1099,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					code: errorCode(cleanupError),
 					error: String(cleanupError),
 				});
-				active = { runtime, revisions, cursors, reconciliation, pending, disposeGate };
+				active = { runtime, revisions, cursors, reconciliation, steerReconciliation, pending, disposeGate };
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}
 			cursors.close();
