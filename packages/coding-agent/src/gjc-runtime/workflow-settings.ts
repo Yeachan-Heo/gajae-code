@@ -259,15 +259,17 @@ async function getStaleMigrationOwnedKeys(sourcePath: string): Promise<ReadonlyS
 		throw error;
 	}
 	try {
-		let marker: Record<string, unknown>;
+		let parsedMarker: unknown;
 		try {
-			marker = JSON.parse(raw) as Record<string, unknown>;
+			parsedMarker = JSON.parse(raw);
 		} catch {
 			// Malformed marker contents are invalid ownership evidence (direct
 			// commands do not run the Settings quarantine path); treat as no
 			// marker - only actual read failures propagate (above).
 			return null;
 		}
+		if (!parsedMarker || typeof parsedMarker !== "object" || Array.isArray(parsedMarker)) return null;
+		const marker = parsedMarker as Record<string, unknown>;
 		if (
 			marker.version !== WORKFLOW_MIGRATION_MARKER_VERSION ||
 			(marker.status !== "complete" && marker.status !== "pending") ||

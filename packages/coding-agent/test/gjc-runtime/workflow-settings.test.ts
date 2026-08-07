@@ -374,6 +374,20 @@ describe("workflow-settings resolver", () => {
 			resolveWorkflowSetting(cwd, KEY, { defaultValue: "default", parse: stringParse, invalidPolicy: "throw" }),
 		).rejects.toThrow();
 	});
+	test("a null migration marker does not crash or suppress the legacy source", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const configRoot = path.join(home, ".myconfig");
+		await fs.mkdir(configRoot, { recursive: true });
+		const source = path.join(configRoot, "settings.json");
+		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
+		await fs.writeFile(`${source}.migrated`, "null");
+
+		const result = await resolveIn(cwd, { HOME: home, GJC_CONFIG_DIR: ".myconfig" });
+		expect(result.value).toBe(7);
+		expect(result.source).toBe(source);
+	});
+
 	test("an edited legacy source outranks its stale migration-owned agent value", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();
