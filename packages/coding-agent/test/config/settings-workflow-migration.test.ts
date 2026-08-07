@@ -1381,6 +1381,46 @@ describe("config-root workflow settings migration", () => {
 		}
 	});
 
+	test("a complete marker for a replaced agent directory never recovers into the new profile", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source, agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		const target = path.join(agentDir, "config.yml");
+		const oldRaw = '{"gjc.ralplan.maxIterations":7}';
+		// The replacement profile holds the old migration-copied value.
+		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
+		await fs.writeFile(`${source}.bak`, oldRaw);
+		// The user EDITED the legacy source after the migration.
+		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":12}');
+		// The completed marker records an identity that no longer matches the
+		// current agent directory (deleted/recreated or repointed).
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "complete",
+				sourcePath: source,
+				backupPath: `${source}.bak`,
+				targetPath: target,
+				canonicalTargetDir: agentDir,
+				canonicalTargetIdentity: "replaced:0",
+				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+				completedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		// The stale marker's claims are refused: the replacement profile's value
+		// is a genuine override that the fresh re-run must NOT overwrite (the
+		// edited source value 12 never clobbers the present valid target 7).
+		expect(result.markerStatus).toBe("complete");
+		expect(result.targetValue).toBe(7);
+		expect(result.backupExists).toBe(true);
+	});
+
 	test("a pre-apply repair marker does not reclaim a matching user override after source deletion", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();

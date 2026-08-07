@@ -344,7 +344,11 @@ async function getStaleMigrationOwnedKeys(sourcePath: string): Promise<ReadonlyS
 			// Parse the SAME bytes that were verified (a second read could observe
 			// a different revision if the file changed between the two reads).
 			backupRaw = Buffer.from(backupBytes).toString("utf8");
-		} catch {
+		} catch (error) {
+			// A MISSING backup (ENOENT) means no ownership evidence; a transient
+			// EACCES/EIO read failure must propagate so the migration-owned agent
+			// value is never treated as a genuine override over the strict error.
+			if (!isEnoent(error)) throw error;
 			return null;
 		}
 		const backupDoc = JSON.parse(backupRaw) as unknown;

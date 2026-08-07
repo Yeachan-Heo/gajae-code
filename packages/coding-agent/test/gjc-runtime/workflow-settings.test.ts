@@ -505,6 +505,44 @@ describe("workflow-settings resolver", () => {
 		expect(result.source).toBe(path.join(agentDir, "config.yml"));
 	});
 
+	test("a missing backup leaves the agent value a genuine override", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		await fs.mkdir(path.join(home, ".myconfig"), { recursive: true });
+		await fs.mkdir(path.join(home, ".myconfig", "agent"), { recursive: true });
+		const agentDir = path.join(home, ".myconfig", "agent");
+		const source = path.join(home, ".myconfig", "settings.json");
+		const oldRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": 9 })); // edited legacy source
+		const targetIdentity = await fs.stat(agentDir);
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "complete",
+				sourcePath: source,
+				backupPath: `${source}.bak`, // intentionally missing
+				targetPath: path.join(agentDir, "config.yml"),
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${targetIdentity.dev}:${targetIdentity.ino}`,
+				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+				completedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await resolveIn(cwd, { HOME: home, GJC_CONFIG_DIR: ".myconfig" });
+		// ENOENT backup = no ownership evidence: the agent value wins as a
+		// genuine override instead of crashing or being classified as owned.
+		expect(result.value).toBe(7);
+		expect(result.source).toBe(path.join(agentDir, "config.yml"));
+	});
+
 	test("a malformed agent config.yml during stale-key inspection does not crash resolution", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();

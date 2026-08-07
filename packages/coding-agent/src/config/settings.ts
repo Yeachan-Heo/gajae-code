@@ -1583,17 +1583,20 @@ export class Settings implements NotificationSettingsReader {
 					);
 					marker = null;
 				}
-				// A pending marker records the identity of the directory that received
-				// (or would receive) the migration write. If that directory was
+				// The marker records the identity of the directory that received (or
+				// would receive) the migration write. If that directory was
 				// deleted/recreated or a symlink was repointed, recovery must not
-				// apply the marker's ownership claims to the replacement profile.
+				// apply the marker's ownership claims to the replacement profile -
+				// for a PENDING marker (claims never completed) and for a COMPLETE
+				// marker (deletion recovery or reconcile would otherwise overwrite
+				// or unset a genuine value in the new profile).
 				if (
-					marker?.status === "pending" &&
+					(marker?.status === "pending" || marker?.status === "complete") &&
 					typeof marker.canonicalTargetIdentity === "string" &&
 					(await this.#statIdentity(path.dirname(target))) !== marker.canonicalTargetIdentity
 				) {
 					this.#warnLegacyFallbackMigration(
-						`Settings: config-root workflow migration pending marker at ${markerPath} targets a replaced agent directory; treating it as invalid so the migration re-runs into the current profile`,
+						`Settings: config-root workflow migration ${marker?.status} marker at ${markerPath} targets a replaced agent directory; treating it as invalid so the migration re-runs into the current profile`,
 					);
 					marker = null;
 				}
