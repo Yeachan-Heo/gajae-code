@@ -1602,15 +1602,18 @@ export class Settings implements NotificationSettingsReader {
 						);
 						marker = null;
 					}
-				} else if (
-					marker?.status === "complete" &&
-					typeof marker.canonicalTargetIdentity === "string" &&
-					(await this.#statIdentity(path.dirname(target))) !== marker.canonicalTargetIdentity
-				) {
-					this.#warnLegacyFallbackMigration(
-						`Settings: config-root workflow migration complete marker at ${markerPath} targets a replaced agent directory; treating it as invalid so the migration re-runs into the current profile`,
-					);
-					marker = null;
+				} else if (marker?.status === "complete") {
+					const completeMarkerIdentity = marker.canonicalTargetIdentity;
+					if (
+						typeof completeMarkerIdentity !== "string" ||
+						completeMarkerIdentity.length === 0 ||
+						(await this.#statIdentity(path.dirname(target))) !== completeMarkerIdentity
+					) {
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration complete marker at ${markerPath} lacks or mismatches the target directory identity; treating it as invalid so recovery never applies its claims to the current profile`,
+						);
+						marker = null;
+					}
 				}
 				if (marker?.status === "complete") {
 					// The migration is complete only while the source still matches
@@ -2105,8 +2108,45 @@ export class Settings implements NotificationSettingsReader {
 						// blindly - leave it and warn.
 						if (staleMarkerKey && extractWorkflowSetting(targetDoc, key, { flat: false }).present) {
 							if (backupExists) {
-								patches.push({ path: key, op: "unset" });
-								if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
+								// Only unset a target that STILL matches the migration's
+								// write (the hash-verified backup copy or committed repair
+								// evidence): a target the user edited after the crash is a
+								// genuine override and must not be removed merely because
+								// the backup exists.
+								const removedKeyTarget = extractWorkflowSetting(targetDoc, key, { flat: false });
+								let removedKeyBackupDoc: Record<string, unknown> | null = null;
+								try {
+									const removedKeyRead = await this.#readBackupBytes(backup);
+									const removedKeyHash = createHash("sha256")
+										.update(Buffer.from(removedKeyRead.bytes))
+										.digest("hex");
+									if (
+										removedKeyHash === marker?.sourceSha256 ||
+										removedKeyHash === marker?.priorSourceSha256
+									) {
+										removedKeyBackupDoc = JSON.parse(removedKeyRead.text) as Record<string, unknown>;
+									}
+								} catch {
+									// Unreadable or hash-mismatched backup: cannot verify
+									// ownership; keep the target value.
+								}
+								const removedKeyBackupValue = removedKeyBackupDoc
+									? extractWorkflowSetting(removedKeyBackupDoc, key)
+									: { present: false, value: undefined };
+								const removedKeyTargetHash = createHash("sha256")
+									.update(JSON.stringify(removedKeyTarget.value))
+									.digest("hex");
+								const removedKeyVerifiable =
+									(removedKeyBackupValue.present &&
+										this.#coerceWorkflowScalar(key, removedKeyBackupValue.value) ===
+											removedKeyTarget.value) ||
+									(marker?.repairsApplied === true &&
+										marker?.repairValueHashes?.[key] !== undefined &&
+										removedKeyTargetHash === marker?.repairValueHashes[key]);
+								if (removedKeyVerifiable) {
+									patches.push({ path: key, op: "unset" });
+									if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
+								}
 							} else {
 								// Ownership is unverifiable: abort the recovery (the
 								// source stays active) instead of completing with the
@@ -2153,14 +2193,11 @@ export class Settings implements NotificationSettingsReader {
 							// the key in the rebuilt migratedKeys so ownership
 							// survives the marker rewrite.
 							if (marker?.migratedKeys.includes(key)) {
-								// A pending marker WITHOUT a backup cannot prove its write ever
-								// applied (the backup is created only after the target patch
-								// commits). The present value may be an editor's genuine
-								// override from a pre-apply CAS rejection or a crash after
-								// the pending write; never re-record it as migration-owned
-								// or touch its flat form, so a later source edit cannot
-								// unset the editor's value.
-								if (marker.status === "pending" && !backupExists) continue;
+								// Retain ownership scope across the pre-backup crash window
+								// (the target patch committed but the backup move did not):
+								// the retry's own move creates the durable backup, and every
+								// later unset verifies the target value against that backup,
+								// so an editor's DIFFERENT value is never reclaimed.
 								if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
 								if (!migratedKeys.includes(key)) migratedKeys.push(key);
 							}
