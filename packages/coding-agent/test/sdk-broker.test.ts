@@ -1844,8 +1844,7 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: {
 					code: "terminal_uncertain",
-					message:
-						"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
+					message: "Prior cleanup authority for this session is corrupt or incomplete.",
 				},
 			});
 			expect(calls).toBe(1);
