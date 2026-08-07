@@ -156,6 +156,63 @@ describe("atomic YAML patches", () => {
 		const directoryEntries = await fs.readdir(path.dirname(configPath));
 		expect(directoryEntries.filter(entry => entry.endsWith(".tmp"))).toEqual([]);
 	});
+
+	test("rejects and removes listeners when the native worker closes or exits before responding", async () => {
+		const configPath = await configPathForTest();
+		const originalWorker = globalThis.Worker;
+		type TerminalEvent = "close" | "exit";
+		class TerminalWorker {
+			#handlers = new Map<string, Set<EventListener>>();
+
+			constructor(private readonly terminalEvent: TerminalEvent) {}
+
+			postMessage(): void {
+				queueMicrotask(() => {
+					for (const handler of this.#handlers.get(this.terminalEvent) ?? [])
+						handler(new Event(this.terminalEvent));
+				});
+			}
+
+			addEventListener(type: string, listener: EventListener): void {
+				let handlers = this.#handlers.get(type);
+				if (!handlers) {
+					handlers = new Set();
+					this.#handlers.set(type, handlers);
+				}
+				handlers.add(listener);
+			}
+
+			removeEventListener(type: string, listener: EventListener): void {
+				this.#handlers.get(type)?.delete(listener);
+			}
+
+			terminate(): void {}
+
+			listenerCount(): number {
+				return [...this.#handlers.values()].reduce((count, handlers) => count + handlers.size, 0);
+			}
+		}
+
+		try {
+			for (const terminalEvent of ["close", "exit"] as const) {
+				const worker = new TerminalWorker(terminalEvent);
+				(globalThis as unknown as { Worker: typeof Worker }).Worker = class {
+					constructor() {
+						return worker as unknown as Worker;
+					}
+				} as unknown as typeof Worker;
+
+				await expect(
+					withAtomicYamlConfigTransaction(configPath, async tx => {
+						await tx.applyPatches([{ path: "feature.enabled", op: "set", value: true }]);
+					}),
+				).rejects.toBeInstanceOf(AtomicYamlReplaceError);
+				expect(worker.listenerCount()).toBe(0);
+			}
+		} finally {
+			(globalThis as unknown as { Worker: typeof Worker }).Worker = originalWorker;
+		}
+	});
 	test("transaction exposes root/current and applies patches under the lock", async () => {
 		const configPath = await configPathForTest();
 		await fs.writeFile(configPath, YAML.stringify({ external: { keep: true } }, null, 2));

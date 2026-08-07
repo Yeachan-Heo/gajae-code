@@ -298,32 +298,55 @@ async function runNativeAtomicYamlWorker(
 		? new Worker("./packages/coding-agent/src/config/atomic-yaml-patch-worker.ts", { type: "module" })
 		: new Worker(new URL("./atomic-yaml-patch-worker.ts", import.meta.url).href, { type: "module" });
 	const { promise, resolve, reject } = Promise.withResolvers<NativeExactUnlinkResult | NativeNoReplaceResult>();
+	let settled = false;
+	let cleanedUp = false;
+	const cleanup = (): void => {
+		if (cleanedUp) return;
+		cleanedUp = true;
+		worker.removeEventListener("message", onMessage);
+		worker.removeEventListener("error", onError);
+		worker.removeEventListener("messageerror", onMessageError);
+		worker.removeEventListener("close", onClose);
+		worker.removeEventListener("exit", onExit);
+	};
+	const succeed = (result: NativeExactUnlinkResult | NativeNoReplaceResult): void => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		resolve(result);
+	};
+	const fail = (error: Error): void => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		reject(error);
+	};
 	const onMessage: EventListener = event => {
 		const response = (event as MessageEvent<AtomicYamlNativeWorkerResponse>).data;
 		if (response?.type === "result") {
-			resolve(response.result);
+			succeed(response.result);
 			return;
 		}
 		if (response?.type === "error") {
 			const failure = new Error(response.message);
 			if (response.name) failure.name = response.name;
 			if (response.stack) failure.stack = response.stack;
-			reject(failure);
+			fail(failure);
 			return;
 		}
-		reject(new Error("Atomic YAML native worker returned an invalid response."));
+		fail(new Error("Atomic YAML native worker returned an invalid response."));
 	};
-	const onError: EventListener = () => reject(new Error("Atomic YAML native worker failed."));
-	const onMessageError: EventListener = () => reject(new Error("Atomic YAML native worker message failed."));
-	const cleanup = (): void => {
-		worker.removeEventListener("message", onMessage);
-		worker.removeEventListener("error", onError);
-		worker.removeEventListener("messageerror", onMessageError);
-	};
+	const onError: EventListener = () => fail(new Error("Atomic YAML native worker failed."));
+	const onMessageError: EventListener = () => fail(new Error("Atomic YAML native worker message failed."));
+	// Bun emits `close`; Node-compatible worker hosts may emit `exit` instead.
+	const onClose: EventListener = () => fail(new Error("Atomic YAML native worker closed before responding."));
+	const onExit: EventListener = () => fail(new Error("Atomic YAML native worker exited before responding."));
 	try {
 		worker.addEventListener("message", onMessage);
 		worker.addEventListener("error", onError);
 		worker.addEventListener("messageerror", onMessageError);
+		worker.addEventListener("close", onClose);
+		worker.addEventListener("exit", onExit);
 		worker.postMessage(request);
 		return await promise;
 	} catch (error) {
