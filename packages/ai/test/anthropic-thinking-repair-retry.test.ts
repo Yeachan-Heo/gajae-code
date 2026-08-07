@@ -354,9 +354,10 @@ describe("Anthropic thinking replay repair retry", () => {
 	});
 
 	// Real captured session failure (2026-07-29): the mutation 400 says "latest
-	// assistant message" but cites `messages.1.content.1` — a HISTORICAL turn — so the
-	// latest-only repair is rejected identically and the turn used to die.
-	it("escalates to a full-history repair when the mutation 400 survives the latest-only repair", async () => {
+	// assistant message" but cites `messages.1.content.1` — a HISTORICAL turn. The
+	// provider demands those blocks be replayed verbatim, so a latest-only edit is
+	// just another mutation; the only recovery is to stop replaying native thinking.
+	it("drops thinking from EVERY assistant turn on the first mutation 400", async () => {
 		const user: UserMessage = {
 			role: "user",
 			content: "first",
@@ -376,26 +377,26 @@ describe("Anthropic thinking replay repair retry", () => {
 		const create = ((body: unknown) => {
 			requestBodies.push(body);
 			attempt += 1;
-			return (attempt <= 2 ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
+			return (attempt === 1 ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
 
 		const result = await streamAnthropic(model, context, { client }).result();
 
 		expect(result.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(3);
-		// Attempt 2: latest-only repair keeps the historical signature.
+		expect(requestBodies).toHaveLength(2);
+		const firstBody = JSON.stringify(requestBodies[0]);
+		expect(firstBody).toContain("sig_early");
+		expect(firstBody).toContain("sig_late");
+		// The single repair drops every replayed signature rather than re-editing the
+		// turn the provider just refused.
 		const secondBody = JSON.stringify(requestBodies[1]);
-		expect(secondBody).toContain("sig_early");
+		expect(secondBody).not.toContain("sig_early");
 		expect(secondBody).not.toContain("sig_late");
-		// Attempt 3: escalated full-history repair drops every replayed signature.
-		const thirdBody = JSON.stringify(requestBodies[2]);
-		expect(thirdBody).not.toContain("sig_early");
-		expect(thirdBody).not.toContain("sig_late");
-		expect(thirdBody).toContain("early answer");
+		expect(secondBody).toContain("early answer");
 	});
 
-	it("stops after exactly three requests when the mutation 400 persists through both repair scopes", async () => {
+	it("stops after exactly two requests when the mutation 400 persists", async () => {
 		const user: UserMessage = {
 			role: "user",
 			content: "first",
@@ -415,7 +416,7 @@ describe("Anthropic thinking replay repair retry", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorStatus).toBe(400);
-		expect(requestBodies).toHaveLength(3);
+		expect(requestBodies).toHaveLength(2);
 	});
 
 	it("retries once with thinking dropped from EVERY assistant turn after the invalid-signature 400", async () => {
