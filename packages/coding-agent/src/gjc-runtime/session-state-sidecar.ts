@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { AssistantMessage } from "@gajae-code/ai/core";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import type { ExecutionState, ReceiptState } from "../sdk/receipt-state";
+import { receiptStateForTerminal } from "../sdk/receipt-state";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
@@ -102,6 +104,8 @@ interface RuntimeStateSidecarPayload {
 	cwd?: unknown;
 	workdir?: unknown;
 	session_file?: unknown;
+	execution_state?: unknown;
+	receipt_state?: unknown;
 	final_response?: { source?: unknown };
 }
 
@@ -341,6 +345,39 @@ function assistantText(assistant: AssistantMessage | undefined): string | null {
 	return text.length > 0 ? text : null;
 }
 
+interface TerminalEventTruth {
+	state: Extract<RuntimeState, "completed" | "errored">;
+	executionState: Extract<ExecutionState, "terminal_ok" | "failed">;
+	receiptState: Extract<ReceiptState, "present" | "missing">;
+	finalResponse: ReturnType<typeof finalResponseForEvent>;
+	error?: { code: string; message: string; recoverable: true };
+}
+
+export function terminalTruthForEvent(event: RuntimeStateEvent): TerminalEventTruth | null {
+	if (event.type !== "agent_end") return null;
+	const assistant = lastAssistant(event.messages);
+	const text = assistantText(assistant);
+	const receiptState = receiptStateForTerminal({ text, artifactPath: null });
+	const failed = assistant?.stopReason === "error" || assistant?.stopReason === "aborted";
+	return {
+		state: failed ? "errored" : "completed",
+		executionState: failed ? "failed" : "terminal_ok",
+		receiptState,
+		finalResponse: finalResponseForEvent(event),
+		...(failed
+			? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true as const } }
+			: receiptState === "missing"
+				? {
+						error: {
+							code: "receipt_missing",
+							message: "GJC agent completed without a reportable receipt",
+							recoverable: true as const,
+						},
+					}
+				: {}),
+	};
+}
+
 function finalResponseForEvent(event: RuntimeStateEvent): {
 	text: string | null;
 	format: "markdown";
@@ -360,10 +397,7 @@ function finalResponseForEvent(event: RuntimeStateEvent): {
 
 export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 	if (event.type === "agent_start" || event.type === "turn_start") return "running";
-	if (event.type === "agent_end") {
-		const assistant = lastAssistant(event.messages);
-		return assistant?.stopReason === "error" ? "errored" : "completed";
-	}
+	if (event.type === "agent_end") return terminalTruthForEvent(event)?.state ?? null;
 	if (event.type === "notice") return null;
 	return null;
 }
@@ -406,18 +440,13 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 			payload.state !== "unknown")
 	)
 		return false;
-	// Coordinator-seeded payloads (#2549) carry session_id and state but not the
-	// runtime identity fields cwd/workdir/session_file. Accept their absence; when
-	// present, validate them as before.
-	if (typeof payload.cwd !== "undefined") {
-		if (typeof payload.cwd !== "string" || payload.cwd.trim().length === 0) return false;
-	}
-	if (typeof payload.workdir !== "undefined") {
-		if (typeof payload.workdir !== "string" || payload.workdir.trim().length === 0) return false;
-	}
-	if (Object.hasOwn(payload, "session_file")) {
-		if (payload.session_file !== null && typeof payload.session_file !== "string") return false;
-	}
+	if (typeof payload.cwd !== "string" || payload.cwd.trim().length === 0) return false;
+	if (typeof payload.workdir !== "string" || payload.workdir.trim().length === 0) return false;
+	if (
+		!Object.hasOwn(payload, "session_file") ||
+		(payload.session_file !== null && typeof payload.session_file !== "string")
+	)
+		return false;
 	if (payload.ready_for_input !== undefined && typeof payload.ready_for_input !== "boolean") return false;
 	if (payload.live !== undefined && payload.live !== null && typeof payload.live !== "boolean") return false;
 	if (payload.reason !== undefined && payload.reason !== null && typeof payload.reason !== "string") return false;
@@ -524,26 +553,20 @@ function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload, inp
 
 function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, input: RuntimeStateIdentity): void {
 	if (Object.keys(previous).length === 0) return;
-	// A coordinator-seeded payload (#2549) carries session_id and current_turn_id
-	// but not cwd/workdir/session_file (those are runtime identity fields). When
-	// the runtime writes to the coordinator-shared file, the seed is from the
-	// same session — the session_id match plus the broker-scoped file path is
-	// sufficient identity. Only refuse a genuinely foreign session_id.
-	if (previous.session_id !== input.sessionId) throw new PreviousRuntimeStateReadError();
-	// If the previous payload has runtime identity fields, verify them fully.
-	if (typeof previous.cwd === "string" && typeof previous.workdir === "string") {
-		if (
-			!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
-			!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
-			(previous.session_file !== input.sessionFile &&
-				!(
-					typeof previous.session_file === "string" &&
-					typeof input.sessionFile === "string" &&
-					sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
-				))
-		)
-			throw new PreviousRuntimeStateReadError();
-	}
+	if (
+		previous.session_id !== input.sessionId ||
+		typeof previous.cwd !== "string" ||
+		typeof previous.workdir !== "string" ||
+		!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
+		!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
+		(previous.session_file !== input.sessionFile &&
+			!(
+				typeof previous.session_file === "string" &&
+				typeof input.sessionFile === "string" &&
+				sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
+			))
+	)
+		throw new PreviousRuntimeStateReadError();
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
@@ -799,6 +822,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
+						const terminal = terminalTruthForEvent(event);
 						const payload = {
 							...basePayload({
 								context,
@@ -811,10 +835,11 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 								sessionId: identity.sessionId,
 							}),
 							...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
-							...(finalResponseForEvent(event) ? { final_response: finalResponseForEvent(event) } : {}),
-							...(state === "errored"
-								? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true } }
-								: {}),
+							...(terminal
+								? { execution_state: terminal.executionState, receipt_state: terminal.receiptState }
+								: { execution_state: state === "running" ? "in_flight" : "unknown", receipt_state: "absent" }),
+							...(terminal?.finalResponse ? { final_response: terminal.finalResponse } : {}),
+							...(terminal?.error ? { error: terminal.error } : {}),
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);

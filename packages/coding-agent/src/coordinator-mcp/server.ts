@@ -12,38 +12,13 @@ import {
 	type CoordinatorToolName,
 } from "../coordinator/contract";
 import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
-import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
-import {
-	type ActivatedPreparedSession,
-	requestPreparedSessionActivation,
-	SessionActivationError,
-} from "../sdk/session-activation";
-import {
-	ackCodexWakeEvent,
-	bindDelegateCodexHandoff,
-	type CodexHandoffRegistrationV1,
-	type CodexWakeEventV1,
-	codexWakeLifecycle,
-	isCodexWakeEventKind,
-	listCodexHandoffs,
-	listCodexWakeEvents,
-	listPendingCodexWakeEvents,
-	readCodexHandoff,
-	recordCodexWakeEvent,
-	registerCodexHandoff,
-	updateCodexWakeEvent,
-} from "./codex-handoff";
-import {
-	type CodexTransportFactory,
-	createDefaultCodexTransportFactory,
-	publishCodexWake,
-} from "./codex-wake-publisher";
+import { type ExecutionState, type ReceiptState, reportableReceipt } from "../sdk/receipt-state";
 import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
@@ -89,6 +64,7 @@ import {
 	withNamespaceRegistry,
 	withSessionTransaction,
 } from "./question-state";
+
 import { createSessionReaper, type ReapableSession, type SessionReaper } from "./session-reaper";
 
 export type { CoordinatorToolName };
@@ -163,14 +139,13 @@ interface CoordinatorFinalResponse {
 }
 
 function reportableFinalResponse(response: CoordinatorFinalResponse): boolean {
-	return (
-		(typeof response.text === "string" && response.text.trim().length > 0) ||
-		(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)
-	);
+	return reportableReceipt({ text: response.text, artifactPath: response.artifact_path });
 }
 
 interface RuntimeSessionStatePayload extends CoordinatorSessionState {
 	final_response?: CoordinatorFinalResponse;
+	execution_state?: ExecutionState;
+	receipt_state?: ReceiptState;
 	error?: { code: string; message: string; recoverable: boolean } | null;
 }
 
@@ -181,7 +156,6 @@ interface CoordinatorServices {
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
 	canonicalizePath?: (value: string) => Promise<string>;
-	codexTransportFactory?: CodexTransportFactory;
 }
 
 interface CoordinatorMcpServerOptions {
@@ -201,6 +175,7 @@ type TurnStatus =
 	| "waiting_for_answer"
 	| "completing"
 	| "completed"
+	| "receipt_missing"
 	| "failed"
 	| "cancelled"
 	| "superseded";
@@ -211,6 +186,8 @@ interface TurnRecord {
 	session_id: string;
 	namespace: { profile: string | null; repo: string | null };
 	status: TurnStatus;
+	execution_state?: ExecutionState;
+	receipt_state?: ReceiptState;
 	prompt: { text: string; created_at: string; source: "mcp" | "question_answer" };
 	delivery: {
 		delivered: boolean;
@@ -248,8 +225,6 @@ interface TurnRecord {
 
 type CoordinatorSessionStateValue =
 	| "booting"
-	/** Live and endpoint-addressable, but withholding readiness until activation. */
-	| "prepared"
 	| "ready_for_input"
 	| "running"
 	| "needs_user_input"
@@ -318,14 +293,18 @@ interface CoordinatorEventInput {
 	metadata?: Record<string, string | number | boolean | null>;
 }
 
-const UNOBSERVED_COMPENSATION_CODE = "broker_compensation_unobserved";
-
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
-const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
+const TERMINAL_TURN_STATUSES = new Set<TurnStatus>([
+	"completed",
+	"receipt_missing",
+	"failed",
+	"cancelled",
+	"superseded",
+]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_EXTERNAL_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/;
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -394,39 +373,17 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_start_session") {
 		return {
 			name,
-			description:
-				"Start a broker-managed GJC session through canonical SDK lifecycle control. Set prepare_existing_thread to hold the session at prepared (endpoint-addressable, readiness withheld) so an existing chat thread can be bound before activation.",
+			description: "Start a broker-managed GJC session through canonical SDK lifecycle control.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					cwd,
 					prompt: { type: "string" },
-					prepare_existing_thread: {
-						type: "boolean",
-						description:
-							"Create the session prepared instead of ready: no readiness is published and no initial prompt is accepted until gjc_coordinator_activate_session proves activation.",
-					},
 					mpreset,
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
 				},
 				required: ["cwd", "idempotency_key", "allow_mutation"],
-			},
-		};
-	}
-	if (name === "gjc_coordinator_activate_session") {
-		return {
-			name,
-			description:
-				"Activate a prepared session so it publishes the readiness it withheld. Requires the session's own proof at the exact endpoint generation, so it fails closed while no existing-thread binding has been applied.",
-			inputSchema: {
-				type: "object",
-				properties: {
-					session_id: sessionId,
-					idempotency_key: idempotencyKey,
-					allow_mutation: allowMutation,
-				},
-				required: ["session_id", "idempotency_key", "allow_mutation"],
 			},
 		};
 	}
@@ -608,53 +565,6 @@ function toolSchema(name: CoordinatorToolName): {
 			},
 		};
 	}
-	if (name === "gjc_coordinator_register_codex_handoff") {
-		return {
-			name,
-			description: "Register a Codex app-server resume handoff using only unix or loopback TCP endpoints.",
-			inputSchema: {
-				type: "object",
-				properties: {
-					session_id: sessionId,
-					thread_id: { type: "string" },
-					endpoint: {
-						type: "object",
-						description: "Codex app-server unix socket path or loopback TCP endpoint only.",
-					},
-					token_file: {
-						type: "string",
-						description: "Token FILE PATH reference only; raw tokens are rejected and never persisted.",
-					},
-					allow_mutation: allowMutation,
-					idempotency_key: idempotencyKey,
-				},
-				required: ["session_id", "thread_id", "endpoint", "idempotency_key", "allow_mutation"],
-			},
-		};
-	}
-	if (name === "gjc_coordinator_read_codex_handoff") {
-		return {
-			name,
-			description: "Read a Codex app-server resume handoff and durable wake events.",
-			inputSchema: { type: "object", properties: { session_id: sessionId }, required: ["session_id"] },
-		};
-	}
-	if (name === "gjc_coordinator_ack_codex_handoff") {
-		return {
-			name,
-			description: "Acknowledge a durable Codex app-server resume wake event.",
-			inputSchema: {
-				type: "object",
-				properties: {
-					session_id: sessionId,
-					wake_key: { type: "string" },
-					allow_mutation: allowMutation,
-					idempotency_key: idempotencyKey,
-				},
-				required: ["session_id", "wake_key", "idempotency_key", "allow_mutation"],
-			},
-		};
-	}
 	const delegateWorkflow = workflowForDelegateTool(name);
 	if (delegateWorkflow) {
 		return {
@@ -675,11 +585,6 @@ function toolSchema(name: CoordinatorToolName): {
 						type: "string",
 						description:
 							"Optional existing GJC coordinator bridge session id to reuse; omitted starts a fresh session.",
-					},
-					codex_host_session_id: {
-						type: "string",
-						description:
-							"Optional Codex resume-bridge correlation: the session_id previously passed to gjc_coordinator_register_codex_handoff. When set, the new delegate session auto-binds to that registration's Codex thread; ambient host-context inference is skipped.",
 					},
 					queue: {
 						type: "boolean",
@@ -956,108 +861,6 @@ function boundedPublicResponse(response: Record<string, unknown>): Record<string
 	const value = boundedPublicValue(response, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP });
 	return asRecord(value) ?? { ok: false, error: { code: "unavailable", message: "Invalid coordinator response." } };
 }
-const CODEX_HANDOFF_RESPONSE_STRING_CAP = 4096;
-
-function boundedCodexHandoffString(value: unknown): string | null {
-	return typeof value === "string" ? value.slice(0, CODEX_HANDOFF_RESPONSE_STRING_CAP) : null;
-}
-
-function boundedCodexHandoff(response: unknown): Record<string, unknown> | null {
-	const handoff = asRecord(response);
-	if (!handoff) return null;
-	const workUnit = boundedCodexHandoffString(handoff.work_unit);
-	const threadId = boundedCodexHandoffString(handoff.thread_id);
-	const tokenFile = handoff.token_file === null ? null : boundedCodexHandoffString(handoff.token_file);
-	const registeredAt = boundedCodexHandoffString(handoff.registered_at);
-	const updatedAt = boundedCodexHandoffString(handoff.updated_at);
-	const endpoint = asRecord(handoff.endpoint);
-	if (
-		handoff.schema_version !== 1 ||
-		workUnit === null ||
-		threadId === null ||
-		(tokenFile === null && handoff.token_file !== null) ||
-		registeredAt === null ||
-		updatedAt === null ||
-		!endpoint
-	)
-		return null;
-	let boundedEndpoint: Record<string, unknown> | null = null;
-	if (endpoint.kind === "unix") {
-		const socketPath = boundedCodexHandoffString(endpoint.path);
-		if (socketPath !== null) boundedEndpoint = { kind: "unix", path: socketPath };
-	} else if (endpoint.kind === "tcp") {
-		const host = boundedCodexHandoffString(endpoint.host);
-		if (host !== null && typeof endpoint.port === "number")
-			boundedEndpoint = { kind: "tcp", host, port: endpoint.port };
-	}
-	if (!boundedEndpoint) return null;
-	return {
-		schema_version: 1,
-		work_unit: workUnit,
-		thread_id: threadId,
-		endpoint: boundedEndpoint,
-		token_file: tokenFile,
-		registered_at: registeredAt,
-		updated_at: updatedAt,
-	};
-}
-
-function boundedCodexHandoffResponse(response: Record<string, unknown>): Record<string, unknown> {
-	const output: Record<string, unknown> = {};
-	if (typeof response.ok === "boolean") output.ok = response.ok;
-	const error = asRecord(response.error);
-	if (error) {
-		const boundedError: Record<string, unknown> = {};
-		const code = boundedCodexHandoffString(error.code);
-		const message = boundedCodexHandoffString(error.message);
-		if (code !== null) boundedError.code = code;
-		if (message !== null) boundedError.message = message;
-		if (Object.keys(boundedError).length > 0) output.error = boundedError;
-	}
-	const handoff = boundedCodexHandoff(response.handoff);
-	if (handoff) output.handoff = handoff;
-	const heartbeat = asRecord(response.heartbeat);
-	if (heartbeat?.supported === false && heartbeat.reason === "automation_update_unavailable")
-		output.heartbeat = { supported: false, reason: "automation_update_unavailable" };
-	return output;
-}
-
-function boundedToolResponse(tool: string, response: Record<string, unknown>): Record<string, unknown> {
-	if (tool === "gjc_coordinator_register_codex_handoff") return boundedCodexHandoffResponse(response);
-	return boundedPublicResponse(response);
-}
-
-/**
- * `activation_outcome_unknown` states only that the activation's outcome could
- * not be observed: the session may already have published the readiness the
- * request asked for. It is the one activation answer that proves nothing, so it
- * is returned to the caller without being sealed as a settled receipt.
- */
-function isUnknownActivationOutcome(response: Record<string, unknown>): boolean {
-	if (response.ok !== false) return false;
-	return asRecord(response.error)?.code === "activation_outcome_unknown";
-}
-
-/**
- * Which durable states may reach the activation proof, and which of them is
- * already settled.
- *
- * Durable state is a record of what was proved, never a proof on its own. Only
- * a `prepared` session (readiness still withheld) and a `ready_for_input` one
- * (readiness already proved once) are activatable, and both are answered by the
- * live session at the exact endpoint, generation, incarnation, and binding.
- * Every other observed state — stale, booting, running, needs_user_input,
- * completed, errored, unknown, or a missing state file — is not activatable and
- * fails closed before any frame is sent.
- */
-function classifyCoordinatorActivation(
-	state: CoordinatorSessionState | null,
-): { activatable: true; settled: boolean; observed: string } | { activatable: false; observed: string } {
-	const observed = state?.state ?? "unknown";
-	if (observed === "prepared") return { activatable: true, settled: false, observed };
-	if (observed === "ready_for_input") return { activatable: true, settled: true, observed };
-	return { activatable: false, observed };
-}
 
 interface RuntimePromptAcknowledgement {
 	accepted: true;
@@ -1315,268 +1118,6 @@ async function readLatestEventSeq(namespaceDir: string): Promise<number> {
 }
 
 const eventAppendQueues = new Map<string, Promise<unknown>>();
-const codexWakeTransportFactories = new Map<string, CodexTransportFactory>();
-const codexWakePublishTails = new Map<string, Promise<void>>();
-
-const CODEX_WAKE_ERROR_CAP = 240;
-const CODEX_WAKE_DIAGNOSTIC_CAP = 512;
-const CODEX_HANDOFF_FRESHNESS_MS = 24 * 60 * 60 * 1000;
-
-function codexWakeErrorCode(error: unknown): string {
-	if (error instanceof Error && /^[a-z0-9_]+$/.test(error.message))
-		return error.message.slice(0, CODEX_WAKE_ERROR_CAP);
-	return "codex_wake_publish_failed";
-}
-
-async function appendCodexWakeDiagnostic(
-	namespaceDir: string,
-	event: Pick<CoordinatorEvent, "id">,
-	error: unknown,
-): Promise<void> {
-	const line = `${new Date().toISOString()} event=${event.id} error=${codexWakeErrorCode(error)}\n`;
-	try {
-		await fs.appendFile(path.join(namespaceDir, "codex-wake-errors.log"), line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP), {
-			mode: 0o600,
-		});
-	} catch {
-		try {
-			process.stderr.write("codex-wake-diagnostic-unwritable\n");
-		} catch {}
-	}
-}
-
-async function appendCodexWakePublishDiagnostic(
-	namespaceDir: string,
-	event: CodexWakeEventV1,
-	error: unknown,
-): Promise<void> {
-	const line = `${new Date().toISOString()} wake=${event.key} error=${codexWakeErrorCode(error)}\n`;
-	try {
-		await fs.appendFile(path.join(namespaceDir, "codex-wake-errors.log"), line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP), {
-			mode: 0o600,
-		});
-	} catch {
-		try {
-			process.stderr.write("codex-wake-diagnostic-unwritable\n");
-		} catch {}
-	}
-}
-
-async function autoBindDelegateCodexHandoff(
-	namespaceDir: string,
-	cwd: string,
-	workUnit: string,
-	delegationId: string,
-	workflow: string,
-	explicitHostWorkUnit: string | null,
-): Promise<{ auto_bound: boolean; thread_id?: string }> {
-	const diagnosticEvent = { id: `delegate-handoff-${delegationId}` };
-	if (explicitHostWorkUnit !== null) {
-		if (!SAFE_EXTERNAL_ID_PATTERN.test(explicitHostWorkUnit)) {
-			await appendCodexWakeDiagnostic(
-				namespaceDir,
-				diagnosticEvent,
-				new Error("codex_handoff_explicit_source_missing"),
-			);
-			return { auto_bound: false };
-		}
-		let source: CodexHandoffRegistrationV1 | null;
-		try {
-			source = await readCodexHandoff(namespaceDir, explicitHostWorkUnit);
-		} catch {
-			await appendCodexWakeDiagnostic(
-				namespaceDir,
-				diagnosticEvent,
-				new Error("codex_handoff_explicit_source_missing"),
-			);
-			return { auto_bound: false };
-		}
-		if (!source) {
-			await appendCodexWakeDiagnostic(
-				namespaceDir,
-				diagnosticEvent,
-				new Error("codex_handoff_explicit_source_missing"),
-			);
-			return { auto_bound: false };
-		}
-		try {
-			const binding = await bindDelegateCodexHandoff(namespaceDir, {
-				work_unit: workUnit,
-				source,
-				origin: {
-					gjc_session_id: workUnit,
-					gjc_turn_id: delegationId,
-					codex_thread_id: source.thread_id,
-					codex_turn_id: null,
-					codex_host_session_id: explicitHostWorkUnit,
-					delegation_id: delegationId,
-					workflow,
-					bound_at: new Date().toISOString(),
-				},
-			});
-			return { auto_bound: true, thread_id: binding.handoff.thread_id };
-		} catch (error) {
-			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, error);
-			return { auto_bound: false };
-		}
-	}
-	try {
-		const hostContexts = await listMcpDelegateHostContexts(cwd);
-		if (hostContexts.failures > 0)
-			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, new Error("codex_handoff_context_unreadable"));
-		if (hostContexts.contexts.length === 0) return { auto_bound: false };
-		const handoffs = await listCodexHandoffs(namespaceDir);
-		const freshHostHandoffs = handoffs
-			.filter(handoff => {
-				if (handoff.origin !== undefined) return false;
-				const updatedAt = Date.parse(handoff.updated_at);
-				return Number.isFinite(updatedAt) && updatedAt >= Date.now() - CODEX_HANDOFF_FRESHNESS_MS;
-			})
-			.sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
-		const freshThreads = new Set(freshHostHandoffs.map(handoff => handoff.thread_id));
-		const fallbackSource = freshThreads.size === 1 ? freshHostHandoffs[0] : undefined;
-		const resolved = hostContexts.contexts.flatMap(context => {
-			const source = handoffs.find(handoff => handoff.work_unit === context.session_id) ?? fallbackSource;
-			return source ? [{ context, source }] : [];
-		});
-		if (resolved.length === 0) {
-			const hasHostHandoffs = handoffs.some(handoff => handoff.origin === undefined);
-			await appendCodexWakeDiagnostic(
-				namespaceDir,
-				diagnosticEvent,
-				new Error(
-					hasHostHandoffs && freshHostHandoffs.length === 0
-						? "codex_handoff_source_stale"
-						: "codex_handoff_source_ambiguous",
-				),
-			);
-			return { auto_bound: false };
-		}
-		if (new Set(resolved.map(({ source }) => source.thread_id)).size !== 1) {
-			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, new Error("codex_handoff_context_ambiguous"));
-			return { auto_bound: false };
-		}
-		const { context, source } = resolved[0]!;
-		const binding = await bindDelegateCodexHandoff(namespaceDir, {
-			work_unit: workUnit,
-			source,
-			origin: {
-				gjc_session_id: workUnit,
-				gjc_turn_id: delegationId,
-				codex_thread_id: source.thread_id,
-				codex_turn_id: context.turn_id,
-				codex_host_session_id: context.session_id,
-				delegation_id: delegationId,
-				workflow,
-				bound_at: new Date().toISOString(),
-			},
-		});
-		return { auto_bound: true, thread_id: binding.handoff.thread_id };
-	} catch (error) {
-		await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, error);
-		return { auto_bound: false };
-	}
-}
-
-async function maybeRecordCodexWake(
-	namespaceDir: string,
-	event: CoordinatorEvent,
-): Promise<{ handoff: CodexHandoffRegistrationV1; event: CodexWakeEventV1 | null } | null> {
-	if (!event.session_id || !isCodexWakeEventKind(event.kind)) return null;
-	const handoff = await readCodexHandoff(namespaceDir, event.session_id);
-	if (!handoff) return null;
-	const recorded = await recordCodexWakeEvent(namespaceDir, {
-		work_unit: event.session_id,
-		event_seq: event.seq,
-		event_kind: event.kind,
-		turn_id: event.turn_id ?? null,
-		question_id: event.question_id ?? null,
-		summary: event.summary,
-	});
-	return {
-		handoff,
-		event: recorded.event.status === "pending" || recorded.event.status === "failed" ? recorded.event : null,
-	};
-}
-
-type CodexWakePublishOutcome = "published" | "thread_active_pending" | "failed" | "skipped";
-
-async function publishRecordedCodexWake(
-	namespaceDir: string,
-	handoff: CodexHandoffRegistrationV1,
-	event: CodexWakeEventV1,
-): Promise<CodexWakePublishOutcome> {
-	if (event.status !== "pending" && event.status !== "failed") return "skipped";
-	const transportFactory = codexWakeTransportFactories.get(namespaceDir);
-	if (!transportFactory) return "skipped";
-	try {
-		const published = await publishCodexWake({ handoff, event, transportFactory });
-		await updateCodexWakeEvent(namespaceDir, event.key, {
-			...(published.published ? { status: "published" as const } : {}),
-			attempts_delta: 1,
-			last_error: null,
-		});
-		return published.published ? "published" : "thread_active_pending";
-	} catch (error) {
-		await appendCodexWakePublishDiagnostic(namespaceDir, event, error);
-		try {
-			await updateCodexWakeEvent(namespaceDir, event.key, {
-				status: "failed",
-				attempts_delta: 1,
-				last_error: codexWakeErrorCode(error),
-			});
-		} catch (updateError) {
-			await appendCodexWakePublishDiagnostic(namespaceDir, event, updateError);
-		}
-		return "failed";
-	}
-}
-
-async function publishPendingCodexWakes(namespaceDir: string, threadId: string): Promise<void> {
-	const handoffs = (await listCodexHandoffs(namespaceDir)).filter(handoff => handoff.thread_id === threadId);
-	if (handoffs.length === 0) return;
-	const byWorkUnit = new Map(handoffs.map(handoff => [handoff.work_unit, handoff]));
-	const pending: CodexWakeEventV1[] = [];
-	for (const handoff of handoffs) pending.push(...(await listPendingCodexWakeEvents(namespaceDir, handoff.work_unit)));
-	pending.sort((left, right) => left.event_seq - right.event_seq);
-	for (const event of pending) {
-		const handoff = byWorkUnit.get(event.work_unit);
-		if (!handoff) continue;
-		const outcome = await publishRecordedCodexWake(namespaceDir, handoff, event);
-		if (outcome === "thread_active_pending" || outcome === "failed") return;
-	}
-}
-
-function codexWakeTailKey(namespaceDir: string, threadId: string): string {
-	return `${namespaceDir}\0${threadId}`;
-}
-
-function enqueueCodexWakePublish(namespaceDir: string, handoff: CodexHandoffRegistrationV1): void {
-	const tailKey = codexWakeTailKey(namespaceDir, handoff.thread_id);
-	const previous = codexWakePublishTails.get(tailKey) ?? Promise.resolve();
-	const next = previous
-		.then(() => publishPendingCodexWakes(namespaceDir, handoff.thread_id))
-		.catch(async error => {
-			await appendCodexWakeDiagnostic(
-				namespaceDir,
-				{ id: `wake-queue:${handoff.thread_id}` } as CoordinatorEvent,
-				error,
-			);
-		});
-	codexWakePublishTails.set(tailKey, next);
-	void next.finally(() => {
-		if (codexWakePublishTails.get(tailKey) === next) codexWakePublishTails.delete(tailKey);
-	});
-}
-
-/** Test-only helper that waits for queued Codex wake publishes in a namespace. */
-export async function awaitCodexWakePublishesForTest(namespaceDir: string): Promise<void> {
-	await Promise.all(
-		[...codexWakePublishTails.entries()]
-			.filter(([key]) => key.startsWith(`${namespaceDir}\0`))
-			.map(([, tail]) => tail),
-	);
-}
 
 async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEventInput): Promise<CoordinatorEvent> {
 	const previous = eventAppendQueues.get(namespaceDir) ?? Promise.resolve();
@@ -1612,23 +1153,11 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 		await ensureDir(eventsDir(namespaceDir));
 		await fs.appendFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
 		await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
-		const codexWake = await maybeRecordCodexWake(namespaceDir, event).catch(async error => {
-			await appendCodexWakeDiagnostic(namespaceDir, event, error);
-			return null;
-		});
-		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff);
 		return event;
 	} finally {
 		release();
 		if (eventAppendQueues.get(namespaceDir) === queued) eventAppendQueues.delete(namespaceDir);
 	}
-}
-/** Test-only event injection for coordinator wake-pipeline coverage. */
-export async function appendCoordinatorEventForTest(
-	namespaceDir: string,
-	input: CoordinatorEventInput,
-): Promise<CoordinatorEvent> {
-	return appendCoordinatorEvent(namespaceDir, input);
 }
 
 function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
@@ -2021,7 +1550,6 @@ async function markTurnTerminalFromSessionState(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState,
 ): Promise<TurnRecord> {
-	const terminalStatus: TurnStatus = sessionState.state === "errored" ? "failed" : "completed";
 	const runtimeState = sessionState as RuntimeSessionStatePayload;
 	const finalResponse = runtimeState.final_response ?? {
 		text: null,
@@ -2030,6 +1558,16 @@ async function markTurnTerminalFromSessionState(
 		artifact_path: null,
 		truncated: false,
 	};
+	const hasReceipt = reportableFinalResponse(finalResponse);
+	const executionState: ExecutionState =
+		runtimeState.execution_state ?? (sessionState.state === "errored" ? "failed" : "unknown");
+	const receiptState: ReceiptState = runtimeState.receipt_state ?? (hasReceipt ? "present" : "missing");
+	const terminalStatus: TurnStatus =
+		executionState === "failed" || sessionState.state === "errored"
+			? "failed"
+			: hasReceipt && receiptState === "present"
+				? "completed"
+				: "receipt_missing";
 	const timestamp = new Date().toISOString();
 	const resolved: TurnRecord = {
 		...turn,
@@ -2040,6 +1578,8 @@ async function markTurnTerminalFromSessionState(
 			state: "acknowledged",
 		},
 		final_response: finalResponse,
+		execution_state: executionState,
+		receipt_state: receiptState,
 		evidence: reportableFinalResponse(finalResponse)
 			? turn.evidence
 			: [
@@ -2057,7 +1597,13 @@ async function markTurnTerminalFromSessionState(
 						message: sessionState.reason ?? "runtime_errored",
 						recoverable: true,
 					})
-				: null,
+				: terminalStatus === "receipt_missing"
+					? {
+							code: "receipt_missing",
+							message: "Runtime completed without a reportable receipt.",
+							recoverable: true,
+						}
+					: null,
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};
@@ -2399,17 +1945,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		config.namespace.repo ?? "unscoped-repo",
 	);
 	const questionPaths = coordinatorStatePaths(config.stateRoot, config.namespace.identity);
-	codexWakeTransportFactories.set(
-		namespaceDir,
-		services.codexTransportFactory ?? createDefaultCodexTransportFactory(),
-	);
-	void (async () => {
-		try {
-			for (const handoff of await listCodexHandoffs(namespaceDir)) enqueueCodexWakePublish(namespaceDir, handoff);
-		} catch (error) {
-			await appendCodexWakeDiagnostic(namespaceDir, { id: "startup-drain" }, error);
-		}
-	})();
 	let questionStateReady: Promise<void> | null = null;
 
 	function ensureQuestionStateReady(): Promise<void> {
@@ -2613,7 +2148,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 			}
 			const projectedTurnQuestions = new Map<string, string[]>();
-			const openedQuestions: Array<{ turnId: string; questionId: string }> = [];
 			await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 				const seen = new Set<string>();
 				const byRuntimeTurn = new Map<string, Array<(typeof transaction.canonical.turns)[string]>>();
@@ -2776,7 +2310,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 						turn.question_ids = [...new Set([...turn.question_ids, questionId])];
 						projectedTurnQuestions.set(turn.turn_id, turn.question_ids);
-						openedQuestions.push({ turnId: turn.turn_id, questionId });
 					}
 				}
 				if (complete)
@@ -2803,14 +2336,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				legacyTurn.question_ids = questionIds;
 				await writeTurnRecord(namespaceDir, legacyTurn);
 			}
-			for (const question of openedQuestions)
-				await appendCoordinatorEvent(namespaceDir, {
-					kind: "question.opened",
-					sessionId,
-					turnId: question.turnId,
-					questionId: question.questionId,
-					summary: "A coordinator question is awaiting an answer.",
-				});
 			return {
 				ok: true,
 				schema_version: 1,
@@ -3010,16 +2535,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return normalizeRuntimePromptAcknowledgement(result);
 	}
 
-	/**
-	 * The outcome of a failed compensating close is unobserved, not decided: the
-	 * session may still be running. Sealing it under the idempotency key would
-	 * answer that uncertainty forever, so the key stays open for a real retry.
-	 */
-	function isUnobservedCompensation(response: Record<string, unknown>): boolean {
-		const error = asRecord(response.error);
-		return error?.code === UNOBSERVED_COMPENSATION_CODE;
-	}
-
 	function sdkError(error: unknown): Record<string, unknown> {
 		if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
 		return {
@@ -3039,26 +2554,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 	}
 
-	/**
-	 * Run one mutation under its idempotency key, then seal its response as the
-	 * key's terminal replay.
-	 *
-	 * `isNonterminal` is the one exception. Sealing is correct for a decided
-	 * outcome, and wrong for a response that states only that the outcome could
-	 * not be observed: the key would answer that uncertainty forever, even once
-	 * the remote effect settled. A tool may declare such a response nonterminal,
-	 * which returns it to this caller while the receipt stays `in_progress`, so
-	 * an exact same-key retry re-runs the observation under the same request
-	 * digest. The default declares nothing nonterminal, so every other tool keeps
-	 * its existing caching, conflict, and replay behaviour unchanged.
-	 */
 	async function withToolIdempotency(
 		tool: string,
 		idempotencyKey: string,
 		canonicalArgs: Record<string, unknown>,
 		operation: () => Promise<Record<string, unknown>>,
 		recoverInProgress = false,
-		isNonterminal: (response: Record<string, unknown>) => boolean = () => false,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
@@ -3108,10 +2609,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 					};
 				if (existing.state === "in_progress") {
-					const response = boundedToolResponse(tool, await operation().catch(error => sdkError(error)));
-					// The receipt keeps its original key and request digests, so a
-					// reused key still conflicts and a later settled answer still seals.
-					if (isNonterminal(response)) return response;
+					const response = boundedPublicResponse(await operation().catch(error => sdkError(error)));
 					await writeCoordinatorIdempotencyFile(file, {
 						...existing,
 						state: "completed",
@@ -3137,8 +2635,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				created_at: new Date().toISOString(),
 			};
 			await writeCoordinatorIdempotencyFile(file, started);
-			const response = boundedToolResponse(tool, await operation().catch(error => sdkError(error)));
-			if (isNonterminal(response)) return response;
+			const response = boundedPublicResponse(await operation().catch(error => sdkError(error)));
 			await writeCoordinatorIdempotencyFile(file, {
 				...started,
 				state: "completed",
@@ -3330,75 +2827,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
 			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
 		return binding.endpoint;
-	}
-
-	/**
-	 * The same incarnation-bound authority `resolveSessionEndpoint` requires,
-	 * plus the exact endpoint generation the activation frame has to name. A
-	 * session whose endpoint rolled or whose workspace binding drifted is refused
-	 * here, before any activation is attempted.
-	 */
-	async function resolveSessionActivationTarget(
-		session: Record<string, unknown>,
-		idempotencyKey?: string,
-	): Promise<{ endpoint: { url: string; token: string }; endpointGeneration: number }> {
-		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
-		const cwd = optionalString(session.cwd);
-		const persistedWorkspace = optionalString(session.broker_workspace);
-		const persistedGeneration =
-			typeof session.endpoint_generation === "number" &&
-			Number.isSafeInteger(session.endpoint_generation) &&
-			session.endpoint_generation > 0
-				? session.endpoint_generation
-				: null;
-		const persistedIncarnation = optionalString(session.endpoint_incarnation);
-		if (!sessionId || !cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
-			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
-		const workspace = await canonicalBrokerWorkspace(cwd);
-		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
-			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
-		const binding = await exactBrokerSessionBinding(sessionId, workspace, idempotencyKey);
-		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
-			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
-		return { endpoint: binding.endpoint, endpointGeneration: binding.endpointGeneration };
-	}
-
-	/**
-	 * Ask a prepared session to publish its withheld readiness.
-	 *
-	 * The Coordinator never writes a chat mapping and never fakes a readiness
-	 * signal: it proves exact endpoint authority, then delegates to the same
-	 * activation exchange the `gjc notify activate-thread` CLI uses. The session's
-	 * own activation gate remains the authority on whether a binding exists.
-	 */
-	async function activatePreparedCoordinatorSession(
-		session: Record<string, unknown>,
-		sessionId: string,
-		idempotencyKey: string,
-	): Promise<ActivatedPreparedSession> {
-		const target = await resolveSessionActivationTarget(session, idempotencyKey);
-		let client: SdkClient;
-		try {
-			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
-				target.endpoint.url,
-				target.endpoint.token,
-			);
-		} catch {
-			// Nothing was sent, so no activation can have been applied.
-			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
-		}
-		try {
-			return await requestPreparedSessionActivation(
-				{
-					request: async frame => (await client.request(frame)) as Record<string, unknown>,
-					close: async () => await client.close(),
-				},
-				sessionId,
-				target.endpointGeneration,
-			);
-		} finally {
-			await client.close().catch(() => undefined);
-		}
 	}
 
 	async function listSessions(cwd?: string): Promise<Array<Record<string, unknown>>> {
@@ -4204,119 +3632,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return response;
 					},
 					true,
-					isUnobservedCompensation,
-				);
-			}
-			if (name === "gjc_coordinator_register_codex_handoff") {
-				requireCoordinatorMutation(config, "sessions", args);
-				const idempotencyKey = requiredIdempotencyKey(args);
-				const sessionId = safeExternalId("session", args.session_id);
-				if (!(await readJsonFile(sessionFile(sessionId))))
-					return {
-						ok: false,
-						error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
-					};
-				if (Object.hasOwn(args, "token")) return { ok: false, error: { code: "token_material_not_allowed" } };
-				return await withToolIdempotency(
-					name,
-					idempotencyKey,
-					{
-						session_id: sessionId,
-						thread_id: args.thread_id,
-						endpoint: args.endpoint,
-						token_file: args.token_file ?? null,
-						allow_mutation: true,
-					},
-					async () => {
-						try {
-							const handoff = await registerCodexHandoff(namespaceDir, {
-								work_unit: sessionId,
-								thread_id: typeof args.thread_id === "string" ? args.thread_id : "",
-								endpoint: args.endpoint as
-									| { kind: "unix"; path: string }
-									| { kind: "tcp"; host: string; port: number },
-								token_file: args.token_file as string | null | undefined,
-							});
-							return {
-								ok: true,
-								handoff,
-								heartbeat: { supported: false, reason: "automation_update_unavailable" },
-							};
-						} catch (error) {
-							const code = error instanceof Error ? error.message : "invalid_codex_endpoint";
-							if (
-								code === "invalid_codex_endpoint" ||
-								code === "codex_endpoint_not_loopback" ||
-								code === "token_material_not_allowed" ||
-								code === "invalid_thread_id"
-							)
-								return { ok: false, error: { code } };
-							throw error;
-						}
-					},
-				);
-			}
-			if (name === "gjc_coordinator_read_codex_handoff") {
-				const sessionId = safeExternalId("session", args.session_id);
-				const wakeEvents = (await listCodexWakeEvents(namespaceDir, sessionId))
-					.slice(-100)
-					.map(event => ({ ...event, lifecycle: codexWakeLifecycle(event.status) }));
-				const pendingWakeEvents = (await listPendingCodexWakeEvents(namespaceDir, sessionId))
-					.slice(-100)
-					.map(event => ({ ...event, lifecycle: codexWakeLifecycle(event.status) }));
-				return {
-					ok: true,
-					handoff: await readCodexHandoff(namespaceDir, sessionId),
-					heartbeat: { supported: false, reason: "automation_update_unavailable" },
-					lifecycle_schema: {
-						version: 1,
-						mapping: {
-							pending: "requested",
-							published: "delivered",
-							acked: "acknowledged",
-							failed: "failed",
-						},
-					},
-					wake_events: wakeEvents,
-					pending_wake_events: pendingWakeEvents,
-				};
-			}
-			if (name === "gjc_coordinator_ack_codex_handoff") {
-				requireCoordinatorMutation(config, "sessions", args);
-				const idempotencyKey = requiredIdempotencyKey(args);
-				const sessionId = safeExternalId("session", args.session_id);
-				const wakeKey = typeof args.wake_key === "string" ? args.wake_key : "";
-				return await withToolIdempotency(
-					name,
-					idempotencyKey,
-					{ session_id: sessionId, wake_key: wakeKey, allow_mutation: true },
-					async () => {
-						const wakeEvent = (await listCodexWakeEvents(namespaceDir, sessionId)).find(
-							event => event.key === wakeKey,
-						);
-						if (!wakeEvent)
-							return {
-								ok: false,
-								error: { code: "not_found", message: `Codex wake event not found: ${wakeKey}` },
-							};
-						try {
-							const acknowledgedWakeEvent = await ackCodexWakeEvent(namespaceDir, wakeKey);
-							return {
-								ok: true,
-								wake_event: {
-									...acknowledgedWakeEvent,
-									lifecycle: codexWakeLifecycle(acknowledgedWakeEvent.status),
-								},
-							};
-						} catch (error) {
-							if (error instanceof Error && error.message === "resource_gone")
-								return {
-									ok: false,
-									error: { code: "not_found", message: `Codex wake event not found: ${wakeKey}` },
-								};
-							throw error;
-						}
-					},
 				);
 			}
 			if (name === "gjc_coordinator_read_status") {
@@ -4479,13 +3794,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					model: typeof args.model === "string" ? args.model : null,
 				});
 				const reusedSessionId = args.session_id == null ? undefined : safeExternalId("session", args.session_id);
-				const explicitHostWorkUnit =
-					args.codex_host_session_id === undefined
-						? null
-						: typeof args.codex_host_session_id === "string" &&
-								SAFE_EXTERNAL_ID_PATTERN.test(args.codex_host_session_id)
-							? args.codex_host_session_id
-							: "";
 				const canonicalArgs = {
 					cwd: canonicalCwd,
 					task,
@@ -4499,7 +3807,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						? { timeout_ms: args.timeout_ms, poll_interval_ms: args.poll_interval_ms }
 						: {}),
 					prompt_alias_ignored: hasTask && hasPrompt,
-					...(explicitHostWorkUnit !== null ? { codex_host_session_id: explicitHostWorkUnit } : {}),
 					allow_mutation: true,
 				};
 				return await withToolIdempotency(
@@ -4595,9 +3902,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 												cwd: canonicalCwd,
 												target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
 												...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-												// Thread the coordinator state dir so the broker-spawned runtime
-												// writes terminal state to the coordinator-shared file (#2549).
-												coordinatorStateDir: namespaceDir,
 											},
 											idempotencyKey,
 										),
@@ -4662,14 +3966,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								acknowledgement,
 								promptKey,
 							);
-							const codexHandoff = await autoBindDelegateCodexHandoff(
-								namespaceDir,
-								canonicalCwd,
-								sessionId,
-								turn.turn_id,
-								delegateWorkflow,
-								explicitHostWorkUnit,
-							);
 							await appendCoordinatorEvent(namespaceDir, {
 								kind: "delegation.started",
 								sessionId,
@@ -4697,7 +3993,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
 								result: publicSdkAcknowledgement(acknowledgement),
-								codex_handoff: codexHandoff,
 								...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
 							};
 							if (creationKey) {
@@ -4757,41 +4052,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					};
 				}
 				const prompt = typeof args.prompt === "string" && args.prompt.length > 0 ? args.prompt : null;
-				/**
-				 * A prepared session is deliberately not ready for input: its readiness
-				 * is withheld until an operator-supplied thread is bound and activation
-				 * is proven. Accepting an initial prompt here would either be silently
-				 * dropped or delivered to a session no consumer has been told is live,
-				 * so it is refused before any broker mutation or idempotency record.
-				 */
-				// Runtime dispatch hands `params.arguments` through unvalidated, so a
-				// client sending the string "true" would coerce to false here and start
-				// an ordinary ready session that accepts the prompt — the opposite of
-				// what the schema promises. Reject a non-boolean before any mutation.
-				const requestedPrepare = (args as Record<string, unknown>).prepare_existing_thread;
-				if (requestedPrepare !== undefined && typeof requestedPrepare !== "boolean")
-					return {
-						ok: false,
-						error: {
-							code: "invalid_input",
-							message: `prepare_existing_thread must be a boolean; received ${typeof requestedPrepare}.`,
-						},
-					};
-				const preparesExistingThread = requestedPrepare === true;
-				if (preparesExistingThread && prompt)
-					return {
-						ok: false,
-						error: {
-							code: "invalid_input",
-							message:
-								"prepare_existing_thread cannot carry an initial prompt; activate the session first, then send_prompt.",
-						},
-					};
 				const canonicalArgs = {
 					cwd,
 					mpreset: mpresetResolution.mpreset,
 					...(prompt ? { prompt } : {}),
-					...(preparesExistingThread ? { prepare_existing_thread: true } : {}),
 					allow_mutation: true,
 				};
 				return await withToolIdempotency(
@@ -4818,48 +4082,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										cwd,
 										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
 										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-										...(preparesExistingThread ? { readiness: "deferred" } : {}),
-										// Thread the coordinator state dir so the broker-spawned runtime
-										// writes terminal state to the coordinator-shared file (#2549).
-										coordinatorStateDir: namespaceDir,
 									},
 									idempotencyKey,
 								),
 							);
-							/**
-							 * Preparation is only real when the broker proves it. A create that
-							 * silently published readiness would leave a live session whose root
-							 * is already claimed, so the session is closed rather than reported
-							 * as prepared.
-							 */
-							if (preparesExistingThread && created.readiness !== "prepared") {
-								const unpreparedId = optionalString(created.sessionId ?? created.session_id);
-								let compensated = true;
-								if (unpreparedId) {
-									compensated = await brokerSession(
-										cwd,
-										"session.close",
-										{ sessionId: unpreparedId },
-										`${idempotencyKey}:unprepared-close`,
-									).then(
-										() => true,
-										() => false,
-									);
-								}
-								// A swallowed compensation leaves a live, untracked session while
-								// idempotency seals the failure, so exact retries only replay the
-								// cached error and never reach the session again. Name the session
-								// and mark the outcome unobserved so the key is not sealed.
-								if (!compensated)
-									throw new SdkClientError(
-										UNOBSERVED_COMPENSATION_CODE,
-										`SDK broker did not prepare the requested session, and closing the unprepared session ${unpreparedId} failed; it may still be running.`,
-									);
-								throw new SdkClientError(
-									"broker_request_unavailable",
-									"SDK broker did not prepare the requested session.",
-								);
-							}
 							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
 							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
 							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd, idempotencyKey);
@@ -4876,7 +4102,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							kind: "start",
 							session: canonicalCreationSnapshot(session),
 							remote_create_key: creation.request.remote_create_key,
-							initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
+							initial_state: prompt ? "running" : "ready_for_input",
 							initial_prompt: prompt
 								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
 								: null,
@@ -4917,18 +4143,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 							return response;
 						}
-						const sessionState = await writeSessionState(
-							namespaceDir,
-							sessionId,
-							preparesExistingThread ? "prepared" : "ready_for_input",
-							{ live: null, reason: null },
-						);
+						const sessionState = await writeSessionState(namespaceDir, sessionId, "ready_for_input", {
+							live: null,
+							reason: null,
+						});
 						await appendCoordinatorEvent(namespaceDir, {
 							kind: "session.started",
 							sessionId,
-							summary: preparesExistingThread
-								? `Session ${sessionId} prepared through SDK lifecycle control`
-								: `Session ${sessionId} started through SDK lifecycle control`,
+							summary: `Session ${sessionId} started through SDK lifecycle control`,
 							payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
 						});
 						const response = {
@@ -4936,113 +4158,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							session: publicCoordinatorSession(session),
 							session_state: publicCoordinatorSessionState(sessionState),
 							lifecycle,
-							...(preparesExistingThread ? { session_id: sessionId, state: "prepared" as const } : {}),
 						};
 						await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
 						await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 						return response;
 					},
 					true,
-					isUnobservedCompensation,
-				);
-			}
-			if (name === "gjc_coordinator_activate_session") {
-				requireCoordinatorMutation(config, "sessions", args);
-				const idempotencyKey = requiredIdempotencyKey(args);
-				const sessionId = safeExternalId("session", args.session_id);
-				return await withToolIdempotency(
-					name,
-					idempotencyKey,
-					{ session_id: sessionId, allow_mutation: true },
-					async () =>
-						await withSessionTransition(sessionId, async () => {
-							const currentSession = asRecord(await readJsonFile(sessionFile(sessionId)));
-							if (!currentSession)
-								return {
-									ok: false,
-									error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
-								};
-							const before = await readSessionState(namespaceDir, sessionId);
-							/**
-							 * A settled activation is not reported from durable state alone: a
-							 * session that went stale, errored, completed, or never recorded a
-							 * state cannot be answered `already`, and even a recorded
-							 * `ready_for_input` has to be re-proved against the live session
-							 * below before it may be.
-							 */
-							const eligibility = classifyCoordinatorActivation(before);
-							if (!eligibility.activatable)
-								return {
-									ok: false,
-									session_id: sessionId,
-									state: eligibility.observed,
-									session_state: publicCoordinatorSessionState(before),
-									error: {
-										code: "session_not_activatable",
-										message: `Coordinator session is not activatable in state ${eligibility.observed}.`,
-									},
-								};
-							let activated: ActivatedPreparedSession;
-							try {
-								activated = await activatePreparedCoordinatorSession(currentSession, sessionId, idempotencyKey);
-							} catch (error) {
-								if (!(error instanceof SessionActivationError)) throw error;
-								return {
-									ok: false,
-									session_id: sessionId,
-									state: before?.state ?? "unknown",
-									session_state: publicCoordinatorSessionState(before),
-									error: { code: error.code, message: error.message },
-								};
-							}
-							/**
-							 * An already-ready session transitions nothing: the answer above is
-							 * the live session's own, proved at the exact endpoint generation
-							 * this call resolved, so durable state is neither rewritten nor
-							 * given a second readiness event.
-							 */
-							if (eligibility.settled)
-								return {
-									ok: true,
-									session_id: sessionId,
-									status: activated.status,
-									state: "ready_for_input" as const,
-									endpoint_generation: activated.endpointGeneration,
-									session_state: publicCoordinatorSessionState(before),
-								};
-							// Only a proven `activated`/`already` moves durable state to ready.
-							const sessionState = await writeSessionState(namespaceDir, sessionId, "ready_for_input", {
-								live: true,
-								reason: null,
-							});
-							await appendCoordinatorEvent(namespaceDir, {
-								kind: "session.started",
-								sessionId,
-								summary: `Session ${sessionId} activated its withheld readiness`,
-								payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
-								metadata: {
-									status: activated.status,
-									endpoint_generation: activated.endpointGeneration,
-								},
-							});
-							return {
-								ok: true,
-								session_id: sessionId,
-								status: activated.status,
-								state: "ready_for_input" as const,
-								endpoint_generation: activated.endpointGeneration,
-								session_state: publicCoordinatorSessionState(sessionState),
-							};
-						}),
-					/**
-					 * A crash between writing the receipt and settling it leaves an
-					 * in-progress activation. Recovering it is safe because every retry
-					 * re-proves the workspace, generation, and incarnation before it
-					 * sends anything, and the session answers a repeated activation
-					 * `already` rather than publishing readiness twice.
-					 */
-					true,
-					isUnknownActivationOutcome,
 				);
 			}
 			if (name === "gjc_coordinator_send_prompt") {
@@ -5069,25 +4190,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								return {
 									ok: false,
 									error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
-								};
-							}
-							/**
-							 * A prepared session is not ready for input. Its readiness is still
-							 * withheld, so a prompt here would be delivered to a session no
-							 * consumer has been told is live, and (for an existing-thread
-							 * preparation) before its root binding could be applied.
-							 */
-							const preparedState = await readSessionState(namespaceDir, sessionId);
-							if (preparedState?.state === "prepared") {
-								return {
-									ok: false,
-									session_id: sessionId,
-									state: "prepared" as const,
-									error: {
-										code: "session_not_activated",
-										message: `Session ${sessionId} is prepared; activate it before sending a prompt.`,
-									},
-									session_state: publicCoordinatorSessionState(preparedState),
 								};
 							}
 							const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);

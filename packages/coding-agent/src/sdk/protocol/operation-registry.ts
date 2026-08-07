@@ -165,6 +165,7 @@ const queries = [
 		"Read the authoritative reconciliation status of a skill.invoke by command/turn IDs or clientRef.",
 	],
 	["providers.list/active", "List active providers."],
+	["turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
 ] as const;
 
 const reverse = [
@@ -244,7 +245,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29", "Q30"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }

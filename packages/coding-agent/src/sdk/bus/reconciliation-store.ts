@@ -12,6 +12,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
+import type { ReceiptState } from "../receipt-state";
 import type { PromptCorrelation } from "./prompt-reconciliation";
 
 export const RECONCILIATION_STORE_VERSION = 1;
@@ -20,7 +21,7 @@ export const RECONCILIATION_DIR_NAME = ".sdk-reconciliation";
 
 export type ReconciliationKind = "prompt" | "skill";
 
-export interface DurableReconciliationRecord extends PromptCorrelation {
+export interface DurableExecutionReconciliationRecord extends PromptCorrelation {
 	kind: ReconciliationKind;
 	clientRef?: string;
 	status: PromptReconciliationStatus;
@@ -29,10 +30,34 @@ export interface DurableReconciliationRecord extends PromptCorrelation {
 	startedAt?: number;
 	terminalAt?: number;
 	outcome?: SdkPromptTerminalOutcome;
+	receiptState?: Exclude<ReceiptState, "absent">;
 	pendingOutcome?: SdkPromptTerminalOutcome;
+	pendingReceiptState?: Extract<ReceiptState, "present" | "missing">;
 	/** Skill-only safe token; never skill args bodies. */
 	skillName?: string;
 }
+
+export interface DurableSteerReconciliationRecord {
+	kind: "steer";
+	clientRef: string;
+	textDigest: string;
+	createdAt: number;
+	status: "dispatching" | "accepted" | "rejected" | "uncertain";
+	settledAt?: number;
+	error?: { code: string; message: string };
+	commandId?: never;
+	turnId?: never;
+	acceptedAt?: never;
+	startedAt?: never;
+	terminalAt?: never;
+	outcome?: never;
+	receiptState?: never;
+	pendingOutcome?: never;
+	pendingReceiptState?: never;
+	skillName?: never;
+}
+
+export type DurableReconciliationRecord = DurableExecutionReconciliationRecord | DurableSteerReconciliationRecord;
 
 export interface ReconciliationStoreDocument {
 	version: typeof RECONCILIATION_STORE_VERSION;
@@ -85,18 +110,56 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Record-level validation: JSON-valid but malformed entries must be quarantined too. */
 function isValidRecord(value: unknown): boolean {
 	if (!isRecord(value)) return false;
-	const { kind, commandId, turnId, status, acceptedAt, terminalAt, outcome, pendingOutcome } = value;
+	const { kind } = value;
+	if (kind === "steer") {
+		if (typeof value.clientRef !== "string" || !value.clientRef) return false;
+		if (typeof value.textDigest !== "string" || !/^[0-9a-f]{64}$/.test(value.textDigest)) return false;
+		if (typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt)) return false;
+		if (!["dispatching", "accepted", "rejected", "uncertain"].includes(value.status as string)) return false;
+		const settled = value.status !== "dispatching";
+		if (settled !== (typeof value.settledAt === "number" && Number.isFinite(value.settledAt))) return false;
+		if ((value.status === "rejected" || value.status === "uncertain") !== (value.error !== undefined)) return false;
+		if (
+			value.error !== undefined &&
+			(!isRecord(value.error) || typeof value.error.code !== "string" || typeof value.error.message !== "string")
+		)
+			return false;
+		return (
+			value.commandId === undefined &&
+			value.turnId === undefined &&
+			value.receiptState === undefined &&
+			value.outcome === undefined
+		);
+	}
 	if (kind !== "prompt" && kind !== "skill") return false;
+	const {
+		commandId,
+		turnId,
+		status,
+		acceptedAt,
+		terminalAt,
+		outcome,
+		pendingOutcome,
+		receiptState,
+		pendingReceiptState,
+	} = value;
 	if (typeof commandId !== "string" || !commandId || typeof turnId !== "string" || !turnId) return false;
 	if (status !== "accepted" && status !== "in_flight" && status !== "terminal_ok" && status !== "failed") return false;
 	if (typeof acceptedAt !== "number" || !Number.isFinite(acceptedAt)) return false;
 	if (terminalAt !== undefined && (typeof terminalAt !== "number" || !Number.isFinite(terminalAt))) return false;
+	if (receiptState !== undefined && !["present", "missing", "unknown"].includes(receiptState as string)) return false;
+	if (pendingReceiptState !== undefined && pendingReceiptState !== "present" && pendingReceiptState !== "missing")
+		return false;
 	// Durable invariants: only prompts carry a pending claim, a finalized record has no
 	// pending claim left, and terminal/active status must agree with `terminalAt`.
 	if (pendingOutcome !== undefined && kind !== "prompt") return false;
+	if (pendingReceiptState !== undefined && kind !== "prompt") return false;
+	if (pendingReceiptState !== undefined && pendingOutcome === undefined) return false;
 	if (pendingOutcome !== undefined && terminalAt !== undefined) return false;
 	const isTerminalStatus = status === "terminal_ok" || status === "failed";
 	if (isTerminalStatus !== (terminalAt !== undefined)) return false;
+	if (!isTerminalStatus && receiptState !== undefined) return false;
+	if (isTerminalStatus && pendingReceiptState !== undefined) return false;
 	if (outcome !== undefined && !isTerminalStatus) return false;
 	if (
 		outcome !== undefined &&
@@ -150,6 +213,15 @@ export function settleProcessRestart(
 	now: number,
 ): DurableReconciliationRecord[] {
 	return records.map(record => {
+		if (record.kind === "steer") {
+			if (record.status !== "dispatching") return record;
+			return {
+				...record,
+				status: "uncertain",
+				settledAt: now,
+				error: { code: "process_restart_uncertain", message: "Steer delivery is uncertain after process restart." },
+			};
+		}
 		if (record.terminalAt !== undefined) return record;
 		if (record.kind === "prompt") {
 			const outcome: SdkPromptTerminalOutcome = record.pendingOutcome ?? {
@@ -163,7 +235,9 @@ export function settleProcessRestart(
 				status: outcome.kind === "stopped" ? "terminal_ok" : "failed",
 				terminalAt: now,
 				outcome,
+				receiptState: record.pendingReceiptState ?? (outcome.kind === "stopped" ? "missing" : "unknown"),
 				pendingOutcome: undefined,
+				pendingReceiptState: undefined,
 				...(outcome.kind === "failed" ? { error: { code: outcome.code, message: outcome.message } } : {}),
 			};
 		}
@@ -172,6 +246,7 @@ export function settleProcessRestart(
 			status: "failed",
 			terminalAt: now,
 			error: { code: "process_restart", message: "Reconciliation incomplete after process restart." },
+			receiptState: "unknown",
 		};
 	});
 }

@@ -7,7 +7,7 @@ export type ControlInput = Record<string, unknown>;
  */
 export interface ControlSurface {
 	prompt(text: string, images?: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
-	steer(text: string): Promise<ControlValue> | ControlValue;
+	steer(text: string, clientRef?: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
 	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
