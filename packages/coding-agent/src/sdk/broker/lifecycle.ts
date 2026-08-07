@@ -13,7 +13,7 @@ function nativeLifecycle(): typeof import("@gajae-code/natives") {
 	return nativeLifecycleBindings;
 }
 
-import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, logger, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
 	isModelProfileError,
@@ -4381,4 +4381,122 @@ export async function executeLifecycle(
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
 	};
+}
+
+/**
+ * The live client/socket subscription count of the SDK session endpoint this
+ * process serves, or `undefined` while this process serves no endpoint.
+ *
+ * Only the SDK session runtime owns the real socket table, so it publishes a
+ * reader here instead of every consumer re-deriving attachment from the OS.
+ * Consumers must treat `undefined` as "no evidence" and never as "detached".
+ */
+export type SessionHostAttachmentReader = () => number;
+
+let sessionHostAttachmentReader: SessionHostAttachmentReader | undefined;
+
+/**
+ * Publishes (or, with `undefined`, retracts) this process's SDK client-count
+ * reader. Called by the SDK session runtime around its transport lifetime.
+ */
+export function publishSessionHostAttachmentReader(reader: SessionHostAttachmentReader | undefined): void {
+	sessionHostAttachmentReader = reader;
+}
+
+/**
+ * This process's currently attached SDK client count, or `undefined` when no
+ * SDK endpoint is serving (before startup, after teardown, or when the reader
+ * itself fails). Never guesses: absence of a reader is absence of evidence.
+ */
+export function sessionHostAttachedClients(): number | undefined {
+	const reader = sessionHostAttachmentReader;
+	if (!reader) return undefined;
+	try {
+		const count = reader();
+		return Number.isSafeInteger(count) && count >= 0 ? count : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * How often a live broker re-checks its own session registrations against OS
+ * process liveness.
+ *
+ * This sweep can never disturb healthy work: a registration is only dropped
+ * when `process.kill(pid, 0)` proves the exact published pid is gone, and a
+ * working host answers that probe for its entire life no matter how long a turn
+ * runs. One minute keeps `gjc_sessions`/`session.get_endpoint` from advertising
+ * a corpse for longer than a single poll while costing one index refresh per
+ * minute on an otherwise idle broker.
+ */
+export const BROKER_DEAD_REGISTRATION_SWEEP_MS = 60_000;
+
+/** One reaped registration, as recorded by {@link reapDeadSessionRegistrations}. */
+export interface ReapedSessionRegistration {
+	sessionId: string;
+	pid: number;
+	endpointGeneration: number;
+}
+
+/**
+ * Drops every indexed session registration whose host process is provably gone.
+ *
+ * Liveness is the session index's own `alive(pid)` probe (`listSessions().live`),
+ * which reports live for both a running pid and an EPERM pid, so an alien or
+ * unreadable process is never mistaken for a dead one. Registrations already
+ * marked `terminalUncertain` are left alone: their disposition belongs to the
+ * terminal-uncertainty reconciliation path, and silently dropping them would
+ * turn a fail-closed `session.close`/`session.delete` refusal into `not_found`.
+ */
+export async function reapDeadSessionRegistrations(
+	broker: Pick<Broker, "index">,
+): Promise<ReapedSessionRegistration[]> {
+	await broker.index.refresh();
+	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
+	const reaped: ReapedSessionRegistration[] = [];
+	for (const session of dead) {
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId: session.sessionId,
+			locator: session.locator,
+			endpointGeneration: session.endpointGeneration,
+			pid: session.pid,
+			...(session.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: session.endpointMtimeMs }),
+			...(session.lifecycleRequestId ? { lifecycleRequestId: session.lifecycleRequestId } : {}),
+		});
+		const record = {
+			sessionId: session.sessionId,
+			pid: session.pid,
+			endpointGeneration: session.endpointGeneration,
+		};
+		reaped.push(record);
+		logger.warn("sdk broker reaped a session registration whose host process is gone", record);
+	}
+	return reaped;
+}
+
+/**
+ * Runs {@link reapDeadSessionRegistrations} on {@link BROKER_DEAD_REGISTRATION_SWEEP_MS}.
+ * The timer is unref'd, so it never keeps an otherwise idle broker process alive.
+ * Returns a disposer.
+ */
+export function startBrokerDeadRegistrationSweep(
+	broker: Pick<Broker, "index">,
+	intervalMs = BROKER_DEAD_REGISTRATION_SWEEP_MS,
+): () => void {
+	let running = false;
+	const timer = setInterval(() => {
+		if (running) return;
+		running = true;
+		void reapDeadSessionRegistrations(broker)
+			.catch(error => {
+				logger.warn("sdk broker dead-registration sweep failed", { error: String(error) });
+			})
+			.finally(() => {
+				running = false;
+			});
+	}, intervalMs);
+	timer.unref();
+	return () => clearInterval(timer);
 }

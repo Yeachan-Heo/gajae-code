@@ -80,6 +80,7 @@ import {
 } from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
+import { publishSessionHostAttachmentReader } from "../broker/lifecycle";
 import { SessionIndex } from "../broker/session-index";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
@@ -3749,6 +3750,9 @@ export function createNotificationsExtension(
 				await rt.server.stopAndWait();
 				serverStopped = true;
 				rt.serverStopped = true;
+				// This process no longer serves an SDK endpoint, so it publishes no
+				// attachment evidence either (absence of a reader is not detachment).
+				publishSessionHostAttachmentReader(undefined);
 			} catch (e) {
 				ownerReleaseFailures.push(e);
 				logger.warn(`notifications: stop failed: ${String(e)}`);
@@ -5503,6 +5507,10 @@ export function createNotificationsExtension(
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await sdkRuntime.startTransport();
+			// The native server owns the only authoritative view of this host's live
+			// SDK client sockets; publish it so a detached session host can bound its
+			// own lifetime without probing the OS (#4010).
+			publishSessionHostAttachmentReader(() => server.clientCount());
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
 				endpointDigest: endpointAuthorityDigest(endpoint.url, token),

@@ -16,6 +16,8 @@ import {
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
+	sessionHostAttachedClients,
+	startBrokerDeadRegistrationSweep,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
@@ -102,6 +104,81 @@ export async function watchSessionHostBrokerLiveness(deps: {
 		} else {
 			absentSince ??= now();
 			if (now() - absentSince >= graceMs) return;
+		}
+		await sleep(pollMs);
+	}
+}
+
+/**
+ * How long a session host that has served at least one client tolerates having
+ * no client attached before treating itself as abandoned.
+ *
+ * This cannot fire during healthy work. "Attached" is the host's own live
+ * socket-subscription count, so a client that is merely idle — an editor
+ * sitting on an open ACP session, a long agent turn with nobody typing — still
+ * holds a socket and resets the window on every poll. Only a client that is
+ * actually gone opens it, and 30 minutes is far longer than any client
+ * reconnect budget (ACP's is seconds), so a crashed-and-restarted client
+ * reattaches long before the window closes.
+ */
+export const SESSION_HOST_DETACHED_IDLE_GRACE_MS = 30 * 60_000;
+
+/**
+ * How long a freshly spawned session host waits for its very first client
+ * before treating itself as abandoned.
+ *
+ * A host is ready before its client has finished dialing, so a host that has
+ * never seen an attachment must not be judged by the detached window above. One
+ * hour is orders of magnitude beyond the slowest observed cold start (worktree
+ * preparation, MCP server launch, model-profile application) and beyond any
+ * lifecycle readiness deadline the broker will wait on, so it can only elapse
+ * for a host nobody ever came for.
+ */
+export const SESSION_HOST_FIRST_ATTACH_GRACE_MS = 60 * 60_000;
+
+const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
+
+/**
+ * Resolves once this host is provably abandoned: either it has been detached
+ * from every client for the full idle grace, or it was never attached at all
+ * for the full first-attach grace.
+ *
+ * `readAttachedClients` reports the host's own live client/socket subscription
+ * count; `undefined` means the SDK endpoint publishes no such evidence yet and
+ * is deliberately *not* treated as detachment, so a host can never be reaped on
+ * missing evidence — only on observed absence of clients.
+ */
+export async function watchSessionHostClientAttachment(deps: {
+	readAttachedClients: () => number | undefined;
+	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+	idleGraceMs?: number;
+	firstAttachGraceMs?: number;
+	pollMs?: number;
+}): Promise<void> {
+	const now = deps.now ?? Date.now;
+	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
+	const idleGraceMs = deps.idleGraceMs ?? SESSION_HOST_DETACHED_IDLE_GRACE_MS;
+	const firstAttachGraceMs = deps.firstAttachGraceMs ?? SESSION_HOST_FIRST_ATTACH_GRACE_MS;
+	const pollMs = deps.pollMs ?? SESSION_HOST_ATTACHMENT_POLL_MS;
+	const startedAt = now();
+	let everAttached = false;
+	let detachedSince: number | null = null;
+	for (;;) {
+		const attached = deps.readAttachedClients();
+		if (attached === undefined) {
+			// No endpoint evidence at all is ambiguity, not abandonment; it still
+			// accrues against the first-attach bound so a host whose SDK runtime
+			// never came up cannot outlive that bound either.
+			if (!everAttached && now() - startedAt >= firstAttachGraceMs) return;
+		} else if (attached > 0) {
+			everAttached = true;
+			detachedSince = null;
+		} else if (everAttached) {
+			detachedSince ??= now();
+			if (now() - detachedSince >= idleGraceMs) return;
+		} else if (now() - startedAt >= firstAttachGraceMs) {
+			return;
 		}
 		await sleep(pollMs);
 	}
@@ -555,10 +632,15 @@ export async function runSessionHost(
 	}
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
-	// A detached host whose broker is gone for good would otherwise live (and
-	// hold its session's memory) forever; reap it through the same graceful
-	// teardown a SIGTERM would take once the bounded absence grace elapses.
-	await watchSessionHostBrokerLiveness({ agentDir });
+	// Two independent bounds, either of which reaps this detached host through
+	// the same graceful teardown a SIGTERM would take. The first covers a broker
+	// that is gone for good; the second covers the opposite case, a perfectly
+	// healthy broker whose host nobody is attached to any more and for which no
+	// `session.close` will ever arrive.
+	await Promise.race([
+		watchSessionHostBrokerLiveness({ agentDir }),
+		watchSessionHostClientAttachment({ readAttachedClients: sessionHostAttachedClients }),
+	]);
 	stop();
 	await new Promise<void>(() => {});
 }
@@ -617,9 +699,19 @@ export default class Sdk extends Command {
 		});
 		await broker.start();
 		if (!broker.ownsDiscovery) return;
-		const stop = () => void broker.stop();
+		// A live broker must not keep advertising sessions whose host process is
+		// gone; the sweep is the broker-side half of the host reaping bound.
+		const stopSweep = startBrokerDeadRegistrationSweep(broker);
+		const stop = () => {
+			stopSweep();
+			void broker.stop();
+		};
 		process.once("SIGTERM", stop);
 		process.once("SIGINT", stop);
-		await completeBrokerProcess(broker);
+		try {
+			await completeBrokerProcess(broker);
+		} finally {
+			stopSweep();
+		}
 	}
 }
