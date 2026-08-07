@@ -2254,6 +2254,46 @@
 			},
 			"additionalProperties": false
 		},
+		"gc": {
+			"type": "object",
+			"properties": {
+				"sessions": {
+					"type": "object",
+					"properties": {
+						"maxAgeDays": {
+							"type": "number",
+							"default": 60
+						},
+						"maxTotalBytes": {
+							"type": "number",
+							"default": 0
+						}
+					},
+					"additionalProperties": false
+				},
+				"natives": {
+					"type": "object",
+					"properties": {
+						"keepVersions": {
+							"type": "number",
+							"default": 2
+						}
+					},
+					"additionalProperties": false
+				},
+				"backups": {
+					"type": "object",
+					"properties": {
+						"maxAgeDays": {
+							"type": "number",
+							"default": 30
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"resourceGc": {
 			"type": "object",
 			"properties": {

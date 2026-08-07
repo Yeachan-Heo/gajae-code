@@ -2810,6 +2810,29 @@ export const SETTINGS_SCHEMA = {
 			description: "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
 		},
 	},
+	// `gjc gc --disk` retention policy. Report-only unless `--prune` is also passed;
+	// these knobs never run implicitly and never affect the PID-liveness axis.
+	"gc.sessions.maxAgeDays": {
+		type: "number",
+		default: 60,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	// 0 disables the size axis; only the age axis retires transcripts then.
+	"gc.sessions.maxTotalBytes": {
+		type: "number",
+		default: 0,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"gc.natives.keepVersions": {
+		type: "number",
+		default: 2,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
+	},
+	"gc.backups.maxAgeDays": {
+		type: "number",
+		default: 30,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
 	"resourceGc.sweepIntervalMs": {
 		type: "number",
 		default: 30_000,

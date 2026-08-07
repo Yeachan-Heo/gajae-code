@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -1816,5 +1816,78 @@ export class MemorySessionStorage implements SessionStorage {
 
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
 		return new MemorySessionStorageWriter(this, path, options);
+	}
+}
+
+/**
+ * Outcome of a disk-retention retirement attempt. `kept` carries the exact
+ * reason the transcript survived so `gjc gc --disk` can report it.
+ */
+export type SessionRetirementOutcome = { kind: "retired" } | { kind: "kept"; reason: string };
+
+/**
+ * Retire one managed session transcript through the verified hard-delete
+ * authority.
+ *
+ * This is the only supported way for a retention pass to remove a transcript:
+ * identity, containment, header id/cwd, artifact tree and parent directory are
+ * all re-verified inside {@link FileSessionStorage.deleteSessionVerified}, and
+ * anything ambiguous fails closed as `kept` rather than deleting bytes. The
+ * caller owns the retention policy; this function owns nothing but the delete
+ * authority.
+ */
+export async function retireSessionTranscript(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+): Promise<SessionRetirementOutcome> {
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(transcriptPath);
+	} catch (err) {
+		return { kind: "kept", reason: `transcript_unreadable: ${toError(err).message}` };
+	}
+
+	const header = parseFirstJsonlLine(snapshot.bytes);
+	if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") {
+		return { kind: "kept", reason: "transcript_header_unusable" };
+	}
+
+	const directory = path.dirname(transcriptPath);
+	const target: VerifiedSessionDeleteTarget = {
+		sessionsRoot,
+		transcriptPath,
+		sessionId: header.id,
+		cwd: header.cwd,
+		transcriptIdentity: {
+			dev: snapshot.stat.dev,
+			ino: snapshot.stat.ino,
+			nlink: snapshot.stat.nlink,
+			size: snapshot.stat.size,
+			mtimeNs: snapshot.stat.mtimeNs,
+			sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+		},
+		plannedArtifactsPath: path.join(directory, `.gjc-delete-gc-${randomUUID()}-artifacts`),
+		plannedTranscriptPath: path.join(directory, `.gjc-delete-gc-${randomUUID()}-transcript`),
+	};
+
+	try {
+		// Phase 1 removes the sibling artifact directory (or proves it absent);
+		// phase 2 unlinks the transcript only against the same bound identity.
+		const artifacts = await storage.deleteSessionVerified(target);
+		if (artifacts.kind === "deleted") return { kind: "retired" };
+		if (artifacts.kind === "cleanup_pending") {
+			return { kind: "kept", reason: `cleanup_pending_${artifacts.phase}: ${artifacts.error.message}` };
+		}
+		const deletion = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
+		if (deletion.kind === "deleted") return { kind: "retired" };
+		if (deletion.kind === "cleanup_pending") {
+			return { kind: "kept", reason: `cleanup_pending_${deletion.phase}: ${deletion.error.message}` };
+		}
+		return { kind: "kept", reason: "transcript_not_deleted" };
+	} catch (err) {
+		const error = toError(err);
+		const kind = err instanceof SessionDeleteVerificationError ? err.kind : "error";
+		return { kind: "kept", reason: `verified_delete_rejected(${kind}): ${error.message}` };
 	}
 }
