@@ -289,9 +289,35 @@ describe("atomic YAML patches", () => {
 						await fs.rename(predecessorPath, sourcePath);
 						return {
 							ok: false,
-							code: "durability_failed",
-							retainedSuccessorPath: destinationPath,
+							code: "identity_mismatch",
 							detachedPath: sourcePath,
+							retainedUnknownPath: destinationPath,
+						};
+					},
+				});
+			}),
+		).rejects.toBeInstanceOf(AtomicYamlReplaceError);
+
+		expect(await readYaml(configPath)).toEqual({ durable: { value: "new" } });
+		expect((await fs.readdir(path.dirname(configPath))).filter(entry => entry.endsWith(".tmp"))).toHaveLength(1);
+	});
+
+	test("retains staging after an ambiguous no-replace publication", async () => {
+		const configPath = await configPathForTest();
+
+		await expect(
+			withAtomicYamlConfigTransaction(configPath, async tx => {
+				await tx.applyPatches([{ path: "durable.value", op: "set", value: "new" }], {
+					noReplace: async (_sourcePath, destinationPath) => {
+						await fs.writeFile(destinationPath, YAML.stringify({ durable: { value: "new" } }, null, 2));
+						return {
+							ok: false,
+							mutationState: "unknown",
+							durabilityState: "unknown",
+							reason: "native failure",
+							primitive: "renameat2",
+							phase: "publish",
+							diagnostic: { schemaVersion: 1, collectionState: "unknown" },
 						};
 					},
 				});

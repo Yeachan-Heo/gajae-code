@@ -81,6 +81,8 @@ export interface AtomicYamlPatchOptions {
 		expectedSource: NativeExactFileIdentity,
 		expectedDestination: NativeExactFileIdentity,
 	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
+	/** Test seam for an atomic no-replace publication. */
+	noReplace?: (sourcePath: string, destinationPath: string) => NativeNoReplaceResult | Promise<NativeNoReplaceResult>;
 	/** Test seam for bounded retry timing. */
 	sleep?: (ms: number) => Promise<void>;
 	/** Test seam for Windows rename retry behavior. */
@@ -346,11 +348,13 @@ async function replaceWithExpectedIdentity(
 	if (!destination) {
 		if (expectedRaw !== "")
 			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
-		const published = (await runNativeAtomicYamlWorker({
-			operation: "no-replace",
-			sourcePath: tempPath,
-			destinationPath: configPath,
-		})) as NativeNoReplaceResult;
+		const published = options.noReplace
+			? await options.noReplace(tempPath, configPath)
+			: ((await runNativeAtomicYamlWorker({
+					operation: "no-replace",
+					sourcePath: tempPath,
+					destinationPath: configPath,
+				})) as NativeNoReplaceResult);
 		if (published.ok) return;
 		if (published.reason === "destination_exists") {
 			const actual = await currentRawOrEmpty(configPath);
@@ -360,6 +364,7 @@ async function replaceWithExpectedIdentity(
 			configPath,
 			1,
 			new Error(`native no-replace publish failed: ${published.code ?? "unknown"}`),
+			published.mutationState === "unknown",
 		);
 	}
 	if (destination.sha256 !== expectedHash) {
@@ -382,7 +387,12 @@ async function replaceWithExpectedIdentity(
 	// document. It may still report a post-exchange verification or durability
 	// failure, so this is not a CAS rejection and the detached temp-path object
 	// must be retained for native recovery rather than unlinked by the caller.
-	if (replaced.retainedSuccessorPath) {
+	if (
+		replaced.detachedPath ||
+		replaced.retainedSuccessorPath ||
+		replaced.retainedPlaceholderPath ||
+		replaced.retainedUnknownPath
+	) {
 		throw new AtomicYamlReplaceError(
 			configPath,
 			1,
