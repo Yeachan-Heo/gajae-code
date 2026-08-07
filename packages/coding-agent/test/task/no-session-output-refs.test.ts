@@ -657,9 +657,14 @@ describe("task no-session output refs", () => {
 				getSessionId: () => targetSessionId,
 			});
 			await target.close();
+			// Plant a managed legacy-local tree with *non*-owner-only modes (default
+			// umask). Production must resecure mode drift once during captureTree
+			// rather than aborting switchSession with bare mode_mismatch.
 			const legacyLocalDir = path.join(targetFile.slice(0, -6), "local");
-			await fs.mkdir(legacyLocalDir, { recursive: true });
-			await Bun.write(path.join(legacyLocalDir, "legacy.txt"), "managed legacy payload");
+			await fs.mkdir(legacyLocalDir, { recursive: true, mode: 0o755 });
+			await fs.writeFile(path.join(legacyLocalDir, "legacy.txt"), "managed legacy payload", {
+				mode: 0o644,
+			});
 
 			const owner = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			const currentFile = owner.getSessionFile();

@@ -910,6 +910,11 @@ export async function ensureManagedScope(
  * uncaught exception. Re-securing the tree in place lets a drifted scope
  * recover on the next launch instead of trapping the user behind a fatal error.
  */
+/** Re-secure owner-only modes under a managed directory (exported for legacy-local migration). */
+export function resecureOwnerOnlyManagedTree(directory: string): void {
+	reapplyOwnerOnlyManagedTree(directory);
+}
+
 function reapplyOwnerOnlyManagedTree(directory: string): void {
 	let entries: fs.Dirent[];
 	try {
@@ -953,7 +958,7 @@ function reapplyOwnerOnlyManagedTree(directory: string): void {
  * (group/other permission bits) rather than an ownership or identity change.
  * Only mode drift can be self-healed by re-applying owner-only permissions.
  */
-function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
+export function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : "";
 	return message === "mode_mismatch" || message.endsWith(": mode_mismatch");
 }

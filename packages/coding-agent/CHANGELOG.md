@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Managed legacy-local resume no longer aborts `switchSession` with bare `mode_mismatch` when `artifacts/<id>/local` was written with group/other-readable modes: capture re-secures owner-only permissions once (same recovery class as managed-scope prepare) before failing closed.
 - ACP `session/request_permission` responses are now normalized from the spec-shaped `RequestPermissionResponse` (`{ outcome: { outcome, optionId } }`) into the SDK's flat permission-decision contract before reaching the permission provider. Standards-compliant ACP clients such as Paseo can now authorize permission-gated shell/eval and destructive file operations (`bash`, `monitor`, `eval`, `delete`, `move`, and `edit` only for delete/move operations) without an invalid-response failure; `write` and ordinary edits remain ungated. Nested and flat selected/cancelled responses are accepted by reconstructing the canonical SDK decision fields, while malformed or unknown decisions fail closed.
 
 ### Added
