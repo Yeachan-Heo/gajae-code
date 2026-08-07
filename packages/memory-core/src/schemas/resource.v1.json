@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.resource.v1",
+  "title": "Gajae memory resource envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "uri", "relPath", "contentType"],
+  "properties": {
+    "schemaVersion": { "const": "gajae.memory.resource.v1" },
+    "uri": { "type": "string", "minLength": 1 },
+    "relPath": { "type": "string", "minLength": 1 },
+    "contentType": { "enum": ["text/markdown", "text/plain", "application/json"] },
+    "content": { "type": "string" },
+    "size": { "type": "integer", "minimum": 0 },
+    "digest": { "type": "string", "minLength": 1 },
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "scope", "relPath", "heading", "startLine", "endLine", "authority", "volatility", "updatedAt", "digest"],
+      "properties": {
+        "uri": { "type": "string", "minLength": 1 },
+        "scope": { "enum": ["global", "project", "session"] },
+        "relPath": { "type": "string", "minLength": 1 },
+        "heading": { "type": "string" },
+        "startLine": { "type": "integer", "minimum": 1 },
+        "endLine": { "type": "integer", "minimum": 1 },
+        "authority": { "type": "string" },
+        "volatility": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "digest": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "anyOf": [
+    { "required": ["content"] },
+    { "required": ["uri", "relPath", "contentType"] }
+  ]
+}

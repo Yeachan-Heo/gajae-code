@@ -388,8 +388,8 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
-// planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
-// smoke flag. Downstream jobs reuse the planner's exact diff via
+// planner outputs: `matrix`, `has_tasks`, `has_native`, the canonical Darwin smoke,
+// and memory determinism flags. Downstream jobs reuse the planner's exact diff via
 // CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
 // Paths that affect the compiled tab-worker smoke graph. Keep this authoritative
 // predicate in the planner: dev-ci consumes its emitted flag rather than copying
@@ -435,6 +435,33 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 
 export function needsWindowsSessionPathRegression(paths: readonly string[]): boolean {
 	return paths.some(isWindowsSessionPathRegressionPath);
+}
+
+// Paths whose M2 retrieval inputs and memory adapters can affect the deterministic M2 contracts. Keep
+// this predicate limited to the memory-core implementation and its test/golden/fixture data plus
+// coding-agent memory command/CLI/protocol/hyperlink adapters and related tests. The three-OS
+// lane consumes the emitted flag so Linux, macOS, and Windows run the same contract only when
+// one of these paths changes.
+export function isMemoryDeterminismPath(changedPath: string): boolean {
+	return changedPath.startsWith("packages/memory-core/src/") ||
+		changedPath.startsWith("packages/memory-core/test/") ||
+		changedPath.startsWith("packages/memory-core/tests/") ||
+		changedPath.startsWith("packages/memory-core/golden/") ||
+		changedPath.startsWith("packages/memory-core/fixtures/") ||
+		changedPath === "packages/utils/src/dirs.ts" ||
+		changedPath === "packages/utils/test/dirs-memory-root.test.ts" ||
+		changedPath.startsWith("packages/coding-agent/src/cli/memory/") ||
+		changedPath === "packages/coding-agent/src/commands/memory.ts" ||
+		changedPath === "packages/coding-agent/src/internal-urls/memory-protocol.ts" ||
+		changedPath === "packages/coding-agent/src/tui/hyperlink.ts" ||
+		changedPath.startsWith("packages/coding-agent/test/cli/memory/") ||
+		changedPath === "packages/coding-agent/test/commands/memory-command.test.ts" ||
+		changedPath === "packages/coding-agent/test/internal-urls/memory-protocol.test.ts" ||
+		changedPath === "packages/coding-agent/test/tui/hyperlink.test.ts";
+}
+
+export function needsMemoryDeterminism(paths: readonly string[]): boolean {
+	return paths.some(isMemoryDeterminismPath);
 }
 
 // Main CI full mode: emit a lean matrix from the deterministic full plan. It
@@ -496,6 +523,7 @@ async function emitMatrix(): Promise<void> {
 	const hasRiskCanaries = selectCanaryTests(paths).length > 0;
 	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
 	const hasWindowsSessionPath = needsWindowsSessionPathRegression(paths);
+	const hasMemoryDeterminism = needsMemoryDeterminism(paths);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
@@ -504,6 +532,7 @@ async function emitMatrix(): Promise<void> {
 		`has_risk_canaries=${hasRiskCanaries}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`has_windows_session_path=${hasWindowsSessionPath}`,
+		`has_memory_determinism=${hasMemoryDeterminism}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -1575,6 +1604,12 @@ export interface AffectedAggregateResults {
 	hasPython: string;
 	darwinArm64TabWorkerSmoke: string;
 	darwinArm64TabWorkerSmokeRequired: string;
+	memoryDeterminismLinux: string;
+	memoryDeterminismLinuxRequired: string;
+	memoryDeterminismMacos: string;
+	memoryDeterminismMacosRequired: string;
+	memoryDeterminismWindows: string;
+	memoryDeterminismWindowsRequired: string;
 }
 
 export function validateAffectedAggregate(results: AffectedAggregateResults): void {
@@ -1591,6 +1626,12 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.windowsNativeToolchain !== (results.windowsNativeToolchainRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsNativeToolchainRequired === "true" ? "required Windows native build toolchain check did not succeed" : "unplanned Windows native build toolchain check was not skipped");
 	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
 	if (results.darwinArm64TabWorkerSmoke !== (results.darwinArm64TabWorkerSmokeRequired === "true" ? "success" : "skipped")) throw new Error(results.darwinArm64TabWorkerSmokeRequired === "true" ? "required Darwin arm64 tab-worker smoke did not succeed" : "unplanned Darwin arm64 tab-worker smoke was not skipped");
+	if (results.memoryDeterminismLinuxRequired !== "true" && results.memoryDeterminismLinuxRequired !== "false") throw new Error(`planner emitted invalid memory_determinism_linux_required=${results.memoryDeterminismLinuxRequired}`);
+	if (results.memoryDeterminismLinux !== (results.memoryDeterminismLinuxRequired === "true" ? "success" : "skipped")) throw new Error(results.memoryDeterminismLinuxRequired === "true" ? "required Linux memory determinism contract did not succeed" : "unplanned Linux memory determinism contract was not skipped");
+	if (results.memoryDeterminismMacosRequired !== "true" && results.memoryDeterminismMacosRequired !== "false") throw new Error(`planner emitted invalid memory_determinism_macos_required=${results.memoryDeterminismMacosRequired}`);
+	if (results.memoryDeterminismMacos !== (results.memoryDeterminismMacosRequired === "true" ? "success" : "skipped")) throw new Error(results.memoryDeterminismMacosRequired === "true" ? "required macOS memory determinism contract did not succeed" : "unplanned macOS memory determinism contract was not skipped");
+	if (results.memoryDeterminismWindowsRequired !== "true" && results.memoryDeterminismWindowsRequired !== "false") throw new Error(`planner emitted invalid memory_determinism_windows_required=${results.memoryDeterminismWindowsRequired}`);
+	if (results.memoryDeterminismWindows !== (results.memoryDeterminismWindowsRequired === "true" ? "success" : "skipped")) throw new Error(results.memoryDeterminismWindowsRequired === "true" ? "required Windows memory determinism contract did not succeed" : "unplanned Windows memory determinism contract was not skipped");
 	if (results.telegramGuardRequired !== "true" && results.telegramGuardRequired !== "false") throw new Error(`planner emitted invalid telegram_guard_required=${results.telegramGuardRequired}`);
 	if (results.telegramGuard !== (results.telegramGuardRequired === "true" ? "success" : "skipped")) throw new Error(results.telegramGuardRequired === "true" ? "required Telegram daemon generation guard did not succeed" : "unplanned Telegram daemon generation guard was not skipped");
 	if (results.telegramWindowsRequired !== "true" && results.telegramWindowsRequired !== "false") throw new Error(`planner emitted invalid telegram_windows_required=${results.telegramWindowsRequired}`);
@@ -1616,6 +1657,12 @@ async function validateAggregate(): Promise<void> {
 		hasPython: Bun.env.CI_DEV_HAS_PYTHON?.trim() || "",
 		darwinArm64TabWorkerSmoke: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT?.trim() || "",
 		darwinArm64TabWorkerSmokeRequired: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED?.trim() || "",
+		memoryDeterminismLinux: Bun.env.CI_DEV_MEMORY_DETERMINISM_LINUX_RESULT?.trim() || "",
+		memoryDeterminismLinuxRequired: Bun.env.CI_DEV_MEMORY_DETERMINISM_LINUX_REQUIRED?.trim() || "",
+		memoryDeterminismMacos: Bun.env.CI_DEV_MEMORY_DETERMINISM_MACOS_RESULT?.trim() || "",
+		memoryDeterminismMacosRequired: Bun.env.CI_DEV_MEMORY_DETERMINISM_MACOS_REQUIRED?.trim() || "",
+		memoryDeterminismWindows: Bun.env.CI_DEV_MEMORY_DETERMINISM_WINDOWS_RESULT?.trim() || "",
+		memoryDeterminismWindowsRequired: Bun.env.CI_DEV_MEMORY_DETERMINISM_WINDOWS_REQUIRED?.trim() || "",
 	};
 
 
@@ -1632,6 +1679,12 @@ async function validateAggregate(): Promise<void> {
 	console.log(`planned Windows native build toolchain: ${results.windowsNativeToolchainRequired}`);
 	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
 	console.log(`planned Darwin arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmokeRequired}`);
+	console.log(`memory determinism Linux: ${results.memoryDeterminismLinux}`);
+	console.log(`planned memory determinism Linux: ${results.memoryDeterminismLinuxRequired}`);
+	console.log(`memory determinism macOS: ${results.memoryDeterminismMacos}`);
+	console.log(`planned memory determinism macOS: ${results.memoryDeterminismMacosRequired}`);
+	console.log(`memory determinism Windows: ${results.memoryDeterminismWindows}`);
+	console.log(`planned memory determinism Windows: ${results.memoryDeterminismWindowsRequired}`);
 	console.log(`telegram-daemon-generation: ${results.telegramGuard}`);
 	console.log(`planned Telegram daemon generation: ${results.telegramGuardRequired}`);
 	console.log(`windows-telegram-daemon-safety: ${results.telegramWindows}`);
@@ -1733,6 +1786,12 @@ function aggregateFromEnv(): AffectedAggregateResults {
 		hasPython: requiredEnv("CI_DEV_HAS_PYTHON"),
 		darwinArm64TabWorkerSmoke: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT"),
 		darwinArm64TabWorkerSmokeRequired: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED"),
+		memoryDeterminismLinux: requiredEnv("CI_DEV_MEMORY_DETERMINISM_LINUX_RESULT"),
+		memoryDeterminismLinuxRequired: requiredEnv("CI_DEV_MEMORY_DETERMINISM_LINUX_REQUIRED"),
+		memoryDeterminismMacos: requiredEnv("CI_DEV_MEMORY_DETERMINISM_MACOS_RESULT"),
+		memoryDeterminismMacosRequired: requiredEnv("CI_DEV_MEMORY_DETERMINISM_MACOS_REQUIRED"),
+		memoryDeterminismWindows: requiredEnv("CI_DEV_MEMORY_DETERMINISM_WINDOWS_RESULT"),
+		memoryDeterminismWindowsRequired: requiredEnv("CI_DEV_MEMORY_DETERMINISM_WINDOWS_REQUIRED"),
 	};
 }
 function parseAggregate(value: unknown): AffectedAggregateResults {
@@ -1757,6 +1816,12 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 			"hasPython",
 			"darwinArm64TabWorkerSmoke",
 			"darwinArm64TabWorkerSmokeRequired",
+			"memoryDeterminismLinux",
+			"memoryDeterminismLinuxRequired",
+			"memoryDeterminismMacos",
+			"memoryDeterminismMacosRequired",
+			"memoryDeterminismWindows",
+			"memoryDeterminismWindowsRequired",
 		],
 		"unexpected aggregate results field",
 	);
@@ -1779,6 +1844,12 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 		hasPython: value.hasPython as string,
 		darwinArm64TabWorkerSmoke: value.darwinArm64TabWorkerSmoke as string,
 		darwinArm64TabWorkerSmokeRequired: value.darwinArm64TabWorkerSmokeRequired as string,
+		memoryDeterminismLinux: value.memoryDeterminismLinux as string,
+		memoryDeterminismLinuxRequired: value.memoryDeterminismLinuxRequired as string,
+		memoryDeterminismMacos: value.memoryDeterminismMacos as string,
+		memoryDeterminismMacosRequired: value.memoryDeterminismMacosRequired as string,
+		memoryDeterminismWindows: value.memoryDeterminismWindows as string,
+		memoryDeterminismWindowsRequired: value.memoryDeterminismWindowsRequired as string,
 	};
 }
 function parseReplayScope(value: unknown): ReplayScope {

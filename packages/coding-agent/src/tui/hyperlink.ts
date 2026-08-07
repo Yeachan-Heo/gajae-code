@@ -7,13 +7,7 @@
  */
 import { TERMINAL } from "@gajae-code/tui";
 import { settings } from "../config/settings";
-import {
-	LocalProtocolHandler,
-	memoryRootsFromRegistry,
-	parseInternalUrl,
-	resolveLocalUrlToPath,
-	resolveMemoryUrlToPath,
-} from "../internal-urls";
+import { LocalProtocolHandler, resolveLocalUrlToPath, resolveMemoryUrlToPathSync } from "../internal-urls";
 
 const OSC = "\x1b]";
 const ST = "\x1b\\";
@@ -88,9 +82,9 @@ export function fileHyperlink(absPath: string, displayText: string, opts?: { lin
 
 /**
  * Synchronously resolve a filesystem-backed internal URL (e.g. `local://foo.md`,
- * `memory://root/notes.md`) to its absolute filesystem path. Returns `undefined`
- * for inputs that aren't fs-backed, aren't resolvable in the current session
- * registry, or fail to parse.
+ * `memory://global/notes.md`) to its absolute filesystem path. Returns `undefined`
+ * for inputs that aren't fs-backed, aren't resolvable in the owning session, or
+ * fail policy validation.
  *
  * Used by renderers to wrap fs-backed internal URLs in OSC 8 hyperlinks even
  * when the resolved path isn't yet available from tool result details (e.g.
@@ -108,16 +102,7 @@ export function tryResolveInternalUrlSync(input: string): string | undefined {
 			return resolveLocalUrlToPath(input, opts);
 		}
 		if (input.startsWith("memory://")) {
-			const url = parseInternalUrl(input);
-			const roots = memoryRootsFromRegistry();
-			for (const root of roots) {
-				try {
-					return resolveMemoryUrlToPath(url, root);
-				} catch {
-					// Try the next root; some sessions may not have this namespace mounted.
-				}
-			}
-			return undefined;
+			return resolveMemoryUrlToPathSync(input);
 		}
 	} catch {
 		return undefined;

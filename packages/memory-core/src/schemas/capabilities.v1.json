@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.capabilities.v1",
+  "title": "Gajae memory capabilities",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "packageVersion",
+    "milestone",
+    "commands",
+    "agentTools",
+    "schemaVersions",
+    "features",
+    "absentOptionalFeatures"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.capabilities.v1"
+    },
+    "packageVersion": {
+      "const": "0.12.0"
+    },
+    "milestone": {
+      "const": "M6"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "init",
+          "capabilities",
+          "scopes",
+          "resolve",
+          "get",
+          "search",
+          "recall",
+          "checkpoint",
+          "resume",
+          "doctor",
+          "propose",
+          "apply",
+          "forget"
+        ]
+      },
+      "minItems": 13,
+      "maxItems": 13,
+      "uniqueItems": true
+    },
+    "agentTools": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "memory_recall",
+          "memory_checkpoint",
+          "memory_propose_write",
+          "memory_forget"
+        ]
+      },
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true
+    },
+    "schemaVersions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capabilities",
+        "initReceipt",
+        "scopeResolution",
+        "searchResult",
+        "recall",
+        "retrievalLedgerEntry",
+        "error",
+        "checkpoint",
+        "handoff",
+        "audit",
+        "writeProposal",
+        "applyReceipt",
+        "forgetReceipt",
+        "resource"
+      ],
+      "properties": {
+        "capabilities": {
+          "const": "gajae.memory.capabilities.v1"
+        },
+        "initReceipt": {
+          "const": "gajae.memory.init-receipt.v1"
+        },
+        "scopeResolution": {
+          "const": "gajae.memory.scope-resolution.v1"
+        },
+        "searchResult": {
+          "const": "gajae.memory.search-result.v1"
+        },
+        "recall": {
+          "const": "gajae.memory.recall.v1"
+        },
+        "retrievalLedgerEntry": {
+          "const": "gajae.memory.retrieval-ledger-entry.v1"
+        },
+        "error": {
+          "const": "gajae.memory.error.v1"
+        },
+        "checkpoint": {
+          "const": "gajae.memory.checkpoint.v1"
+        },
+        "handoff": {
+          "const": "gajae.memory.handoff.v1"
+        },
+        "audit": {
+          "const": "gajae.memory.audit.v1"
+        },
+        "writeProposal": {
+          "const": "gajae.memory.write-proposal.v1"
+        },
+        "applyReceipt": {
+          "const": "gajae.memory.apply-receipt.v1"
+        },
+        "forgetReceipt": {
+          "const": "gajae.memory.forget-receipt.v1"
+        },
+        "resource": {
+          "const": "gajae.memory.resource.v1"
+        }
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deterministicRetrieval",
+        "writes",
+        "checkpointResume"
+      ],
+      "properties": {
+        "deterministicRetrieval": {
+          "const": true
+        },
+        "writes": {
+          "const": true
+        },
+        "checkpointResume": {
+          "const": true
+        }
+      }
+    },
+    "absentOptionalFeatures": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "answer",
+          "mcp",
+          "embeddings",
+          "graphrag",
+          "legacy-data-migration",
+          "remote-service"
+        ]
+      },
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true
+    }
+  }
+}

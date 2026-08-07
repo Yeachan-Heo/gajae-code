@@ -11,7 +11,7 @@
  *   3. Publish only those retained `.tgz` files. Existing same-version packages
  *      are resumed only after registry tarball, raw package/package.json bytes,
  *      SRI, and resolved internal dependencies match expected evidence.
- *   4. Write final closed evidence only after all 14 packages verify.
+ *   4. Write final closed evidence only after all 15 packages verify.
  *
  * Use `--prepare-evidence` first, upload expected evidence to the draft release,
  * then use `--publish-from-evidence --release-serialization-key <shared-cross-version-key>`
@@ -207,6 +207,7 @@ export const packages: PublishPackage[] = [
 	},
 	{ dir: "packages/agent", kind: "typescript" },
 	{ dir: "packages/bridge-client", kind: "typescript" },
+	{ dir: "packages/memory-core", kind: "typescript" },
 	{ dir: "packages/coding-agent", kind: "typescript" },
 	{ dir: "packages/gajae-code", kind: "manifest" },
 ];

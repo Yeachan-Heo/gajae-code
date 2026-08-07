@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.scope-resolution.v1",
+  "title": "Gajae memory scope resolution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "memoryRoot",
+    "projectKey",
+    "sessionId",
+    "scopes"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.scope-resolution.v1"
+    },
+    "memoryRoot": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?:/|[A-Za-z]:[\\\\/]|\\\\\\\\)"
+    },
+    "projectKey": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "sessionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "scopes": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/scope"
+      }
+    }
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "relPath",
+        "root",
+        "writable",
+        "available",
+        "unavailableReason"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "global",
+            "project",
+            "session"
+          ]
+        },
+        "relPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$)).+$"
+        },
+        "root": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "pattern": "^(?:/|[A-Za-z]:[\\\\/]|\\\\\\\\)"
+        },
+        "writable": {
+          "type": "boolean"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "unavailableReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "available": {
+                "const": true
+              }
+            },
+            "required": [
+              "available"
+            ]
+          },
+          "then": {
+            "properties": {
+              "relPath": {
+                "type": "string"
+              },
+              "root": {
+                "type": "string"
+              },
+              "writable": {
+                "const": true
+              },
+              "unavailableReason": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "available": {
+                "const": false
+              }
+            },
+            "required": [
+              "available"
+            ]
+          },
+          "then": {
+            "properties": {
+              "relPath": {
+                "const": null
+              },
+              "writable": {
+                "const": false
+              },
+              "root": {
+                "const": null
+              },
+              "unavailableReason": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

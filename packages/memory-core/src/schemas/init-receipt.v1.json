@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.init-receipt.v1",
+  "title": "Gajae memory initialization receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "memoryRoot",
+    "created",
+    "alreadyPresent"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.init-receipt.v1"
+    },
+    "memoryRoot": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/relativePath"
+      },
+      "uniqueItems": true
+    },
+    "alreadyPresent": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/relativePath"
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?:[^/\\u0000]+/)*[^/\\u0000]+$"
+    }
+  }
+}

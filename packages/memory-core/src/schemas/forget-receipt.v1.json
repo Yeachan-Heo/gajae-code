@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.forget-receipt.v1",
+  "title": "Gajae memory forget receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "uri",
+    "forgotten",
+    "superseded",
+    "marker"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.forget-receipt.v1"
+    },
+    "uri": {
+      "type": "string",
+      "minLength": 1
+    },
+    "forgotten": {
+      "type": "boolean"
+    },
+    "superseded": {
+      "type": "boolean"
+    },
+    "marker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

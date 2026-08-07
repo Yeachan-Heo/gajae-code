@@ -1,0 +1,367 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.error.v1",
+  "title": "Gajae memory error envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "code",
+    "exitCode"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.error.v1"
+    },
+    "code": {
+      "enum": [
+        "not-initialized",
+        "invalid-input",
+        "scope-unresolved",
+        "not-found",
+        "policy-denied",
+        "conflict-requires-confirmation",
+        "malformed-document",
+        "stale-source",
+        "truncated",
+        "sensitivity-violation",
+        "lock-conflict"
+      ]
+    },
+    "exitCode": {
+      "enum": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ]
+    },
+    "memoryRoot": {
+      "type": "string",
+      "minLength": 1
+    },
+    "remedy": {
+      "type": "string",
+      "minLength": 1
+    },
+    "detail": {
+      "type": "string",
+      "minLength": 1
+    },
+    "uri": {
+      "type": "string",
+      "minLength": 1
+    },
+    "destination": {
+      "enum": [
+        "global-canonical",
+        "project-canonical",
+        "session",
+        "proposal",
+        "checkpoint",
+        "ledger",
+        "redact-output",
+        "export-output",
+        "explain-output",
+        "doctor-report"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "relPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$)).+$"
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/conflict"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    }
+  },
+  "$defs": {
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimKey",
+        "conflict",
+        "resolution",
+        "rejected",
+        "requiresUserConfirmation",
+        "dimensions"
+      ],
+      "properties": {
+        "claimKey": {
+          "type": "string"
+        },
+        "conflict": {
+          "type": "boolean"
+        },
+        "resolution": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "rejected": {
+          "type": "array"
+        },
+        "requiresUserConfirmation": {
+          "type": "boolean"
+        },
+        "dimensions": {
+          "type": "object"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "patternId",
+        "sensitivity",
+        "line",
+        "excerptRedacted"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "secret-pattern",
+            "sensitivity-label"
+          ]
+        },
+        "patternId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sensitivity": {
+          "enum": [
+            "public-safe",
+            "private",
+            "restricted"
+          ]
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excerptRedacted": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "not-initialized"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "memoryRoot",
+          "remedy"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "invalid-input"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "detail"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "scope-unresolved"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "detail"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "not-found"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "uri"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "policy-denied"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "destination",
+          "reason"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "conflict-requires-confirmation"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "conflicts"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "malformed-document"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "relPath",
+          "detail"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "stale-source"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "uri"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "truncated"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "detail"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "sensitivity-violation"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "destination",
+          "findings"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "lock-conflict"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "relPath"
+        ]
+      }
+    }
+  ]
+}

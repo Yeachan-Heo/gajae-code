@@ -1,0 +1,47 @@
+{
+  "schemaVersion": "gajae.memory.recall.v1",
+  "queryId": "memq_663ffd0bae4989464a0e2f6c545a261e7f844e2810cecdb9231f79cf8d90724f",
+  "query": "deterministic needle",
+  "intent": "generic-recall",
+  "projectKey": "global-only",
+  "status": "matched",
+  "sources": [
+    {
+      "uri": "global://body-only.md",
+      "scope": "global",
+      "relPath": "body-only.md",
+      "heading": "Unrelated heading",
+      "startLine": 15,
+      "endLine": 17,
+      "authority": "user-confirmed",
+      "volatility": "stable",
+      "updatedAt": "2026-07-29T00:00:00.000Z",
+      "digest": "387015c895dd677b51eade07be749d1ce4706e022f7c521352a4c72598b4d2f7",
+      "score": 197500,
+      "stage": "lexical"
+    }
+  ],
+  "resolutions": [],
+  "conflicts": [],
+  "volatileClaims": [],
+  "truncated": false,
+  "partial": false,
+  "ledgerId": null,
+  "budget": {
+    "limits": {
+      "maxMaps": 4,
+      "maxFiles": 20,
+      "maxSections": 8,
+      "maxChars": 24000
+    },
+    "usage": {
+      "maps": 1,
+      "files": 1,
+      "sections": 1,
+      "chars": 70
+    },
+    "droppedCandidates": [],
+    "drops": [],
+    "truncated": false
+  }
+}

@@ -1,0 +1,505 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.retrieval-ledger-entry.v1",
+  "title": "Gajae memory retrieval ledger entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "ledgerId",
+    "queryId",
+    "queryDigest",
+    "asOf",
+    "intent",
+    "scopes",
+    "mapsRead",
+    "selectedSources",
+    "rejections",
+    "conflicts",
+    "volatileClaims",
+    "budget",
+    "truncated"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.retrieval-ledger-entry.v1"
+    },
+    "ledgerId": {
+      "type": "string",
+      "pattern": "^memledger_[0-9a-f]{64}$"
+    },
+    "queryId": {
+      "type": "string",
+      "pattern": "^memq_[0-9a-f]{64}$"
+    },
+    "queryDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "asOf": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$"
+    },
+    "intent": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/scope"
+      }
+    },
+    "mapsRead": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/map"
+      }
+    },
+    "selectedSources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "rejections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rejection"
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/conflict"
+      }
+    },
+    "volatileClaims": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/volatileClaim"
+      }
+    },
+    "budget": {
+      "$ref": "#/$defs/budget"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "memoryUri": {
+      "type": "string",
+      "pattern": "^(?:global|project|session):\\/\\/[^?#]+(?:#[^?]*)?$"
+    },
+    "line": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "digest",
+        "startLine",
+        "endLine"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$)).+$"
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "startLine": {
+          "$ref": "#/$defs/line"
+        },
+        "endLine": {
+          "$ref": "#/$defs/line"
+        }
+      }
+    },
+    "map": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uri",
+        "digest",
+        "startLine",
+        "endLine"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/memoryUri"
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "startLine": {
+          "$ref": "#/$defs/line"
+        },
+        "endLine": {
+          "$ref": "#/$defs/line"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uri",
+        "digest",
+        "startLine",
+        "endLine",
+        "stage",
+        "authority",
+        "volatility"
+      ],
+      "properties": {
+        "uri": {
+          "$ref": "#/$defs/memoryUri"
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "startLine": {
+          "$ref": "#/$defs/line"
+        },
+        "endLine": {
+          "$ref": "#/$defs/line"
+        },
+        "stage": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "volatility": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    },
+    "rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uri",
+        "digest",
+        "stage",
+        "reason"
+      ],
+      "properties": {
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(?:global|project|session):\\/\\/[^?#]+(?:#[^?]*)?$"
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "stage": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimKey",
+        "conflict",
+        "requiresUserConfirmation",
+        "dimensions"
+      ],
+      "properties": {
+        "claimKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "conflict": {
+          "type": "boolean"
+        },
+        "requiresUserConfirmation": {
+          "type": "boolean"
+        },
+        "dimensions": {
+          "$ref": "#/$defs/conflictDimensions"
+        }
+      }
+    },
+    "conflictDimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "specificity",
+        "freshness",
+        "volatility"
+      ],
+      "properties": {
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "specificity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "freshness": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "volatility": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    },
+    "volatileClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimDigest",
+        "verificationRequired",
+        "verificationHint"
+      ],
+      "properties": {
+        "claimDigest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "verificationRequired": {
+          "type": "boolean"
+        },
+        "verificationHint": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/verificationHint"
+            }
+          ]
+        }
+      }
+    },
+    "verificationHint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "resource",
+        "id"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resource": {
+          "type": "string",
+          "minLength": 1
+        },
+        "id": {
+          "type": [
+            "string",
+            "integer"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "limits",
+        "usage",
+        "droppedCandidates",
+        "drops"
+      ],
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/budgetLimits"
+        },
+        "usage": {
+          "$ref": "#/$defs/budgetUsage"
+        },
+        "droppedCandidates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "drops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/budgetDrop"
+          }
+        }
+      }
+    },
+    "budgetLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxMaps",
+        "maxFiles",
+        "maxSections",
+        "maxChars"
+      ],
+      "properties": {
+        "maxMaps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxFiles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxSections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxChars": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "budgetUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maps",
+        "files",
+        "sections",
+        "chars"
+      ],
+      "properties": {
+        "maps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chars": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "budgetDrop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateDigest",
+        "dimension",
+        "amount",
+        "reason"
+      ],
+      "properties": {
+        "candidateDigest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "dimension": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "maps",
+            "files",
+            "sections",
+            "chars",
+            null
+          ]
+        },
+        "amount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

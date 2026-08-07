@@ -222,6 +222,7 @@ type XdgCategory = "data" | "state" | "cache";
 class DirResolver {
 	readonly configRoot: string;
 	readonly agentDir: string;
+	readonly #isDefaultProfile: boolean;
 
 	// Per-category base dirs. Without XDG, all three equal configRoot / agentDir.
 	// With XDG on Linux, they point to $XDG_*_HOME/gjc/.
@@ -236,14 +237,14 @@ class DirResolver {
 
 		const defaultAgent = path.join(this.configRoot, "agent");
 		this.agentDir = agentDirOverride ? path.resolve(agentDirOverride) : defaultAgent;
-		const isDefault = this.agentDir === defaultAgent;
+		this.#isDefaultProfile = this.agentDir === defaultAgent;
 
 		// XDG is a Linux convention. On other platforms, or for non-default
 		// profiles, all categories resolve to the legacy paths.
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
 		let xdgCache: string | undefined;
-		if ((process.platform === "linux" || process.platform === "darwin") && isDefault) {
+		if ((process.platform === "linux" || process.platform === "darwin") && this.#isDefaultProfile) {
 			const resolveIf = (envVar: string) => {
 				const value = process.env[envVar];
 				if (value) {
@@ -282,6 +283,16 @@ class DirResolver {
 		const result = path.join(base, subdir);
 		this.#rootCache.set(subdir, result);
 		return result;
+	}
+
+	/** Profile-root subdirectory, with optional XDG override for the default profile. */
+	profileRootSubdir(agentDir: string | undefined, subdir: string, xdg?: XdgCategory): string {
+		const target = agentDir === undefined ? this.agentDir : path.resolve(agentDir);
+		if (target === this.agentDir && this.#isDefaultProfile) {
+			const base = xdg ? this.#rootDirs[xdg] : this.configRoot;
+			return path.join(base, subdir);
+		}
+		return path.join(target, subdir);
 	}
 
 	/** Agent subdirectory, with optional XDG override. */
@@ -579,6 +590,11 @@ export function getAgentModulesDir(agentDir?: string): string {
 /** Get the memories directory (~/.gjc/agent/memories). */
 export function getMemoriesDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "memories", "state");
+}
+
+/** Get the memory state root (~/.gjc/memory or its profile-specific equivalent). */
+export function getMemoryRootDir(agentDir?: string): string {
+	return dirs.profileRootSubdir(agentDir, "memory", "state");
 }
 
 /** Get the terminal sessions directory (~/.gjc/agent/terminal-sessions). */

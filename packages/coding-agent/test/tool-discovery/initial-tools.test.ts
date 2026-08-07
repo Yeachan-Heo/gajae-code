@@ -110,14 +110,23 @@ async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summa
 	}
 	return metadata;
 }
+const GATED_MEMORY_TOOL_NAMES = new Set([
+	"memory_recall",
+	"memory_checkpoint",
+	"memory_propose_write",
+	"memory_forget",
+]);
+
 describe("BUILTIN_TOOLS public factory map", () => {
 	it("sets loading fields on tool definitions without wrapping factories", async () => {
 		const metadata = await getToolMetadata();
-		const missing = Object.keys(BUILTIN_TOOLS).filter(name => metadata.get(name)?.loadMode === undefined);
+		const missing = Object.keys(BUILTIN_TOOLS).filter(
+			name => !GATED_MEMORY_TOOL_NAMES.has(name) && metadata.get(name)?.loadMode === undefined,
+		);
 		expect(missing).toEqual([]);
 	});
 
-	it("does not expose memory helpers as public built-in tools", async () => {
+	it("does not expose legacy Hindsight helpers as public built-in tools", async () => {
 		expect(Object.keys(BUILTIN_TOOLS)).not.toEqual(expect.arrayContaining(["memory", "recall", "retain", "reflect"]));
 
 		const tools = await createTools(

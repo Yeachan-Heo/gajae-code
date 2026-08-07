@@ -28,6 +28,7 @@ export const PUBLIC_PACKAGE_DEFINITIONS: readonly PublicPackageDefinition[] = [
 	{ dir: "packages/ai", name: "@gajae-code/ai" },
 	{ dir: "packages/bridge-client", name: "@gajae-code/bridge-client" },
 	{ dir: "packages/coding-agent", name: "@gajae-code/coding-agent" },
+	{ dir: "packages/memory-core", name: "@gajae-code/memory-core" },
 	{ dir: "packages/natives", name: "@gajae-code/natives" },
 	{ dir: "packages/natives-darwin-arm64", name: "@gajae-code/natives-darwin-arm64" },
 	{ dir: "packages/natives-darwin-x64", name: "@gajae-code/natives-darwin-x64" },

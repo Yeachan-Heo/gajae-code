@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.write-proposal.v1",
+  "title": "Gajae Memory Write Proposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "proposalId",
+    "type",
+    "recommendedScope",
+    "recommendedUri",
+    "recommendedRelPath",
+    "requiresApproval",
+    "sourceSession",
+    "diff",
+    "expectedDigest",
+    "supersedes",
+    "sensitivityFindings",
+    "conflicts",
+    "mapUpdates"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.write-proposal.v1"
+    },
+    "proposalId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "preference",
+        "constraint",
+        "policy",
+        "convention",
+        "decision",
+        "fact",
+        "observation",
+        "hypothesis",
+        "task-state",
+        "handoff",
+        "checkpoint",
+        "note"
+      ]
+    },
+    "recommendedScope": {
+      "type": "string",
+      "enum": ["global", "project", "session"]
+    },
+    "recommendedUri": {
+      "type": "string",
+      "minLength": 1
+    },
+    "recommendedRelPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?:global|projects|sessions)/[^\\\\\\u0000]+$"
+    },
+    "requiresApproval": {
+      "type": "boolean"
+    },
+    "sourceSession": {
+      "type": ["string", "null"]
+    },
+    "diff": {
+      "type": "string",
+      "minLength": 1
+    },
+    "expectedDigest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "supersedes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "sensitivityFindings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sensitivityFinding"
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/conflict"
+      }
+    },
+    "mapUpdates": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "sensitivityFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "patternId", "sensitivity", "line", "excerptRedacted"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["secret-pattern", "sensitivity-label"]
+        },
+        "patternId": {
+          "type": ["string", "null"]
+        },
+        "sensitivity": {
+          "type": "string",
+          "enum": ["public-safe", "private", "restricted"]
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excerptRedacted": {
+          "type": "string"
+        }
+      }
+    },
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimKey",
+        "conflict",
+        "resolution",
+        "rejected",
+        "requiresUserConfirmation",
+        "dimensions"
+      ],
+      "properties": {
+        "claimKey": {
+          "type": "string",
+          "minLength": 1
+        },
+        "conflict": {
+          "type": "boolean"
+        },
+        "resolution": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["value", "source", "reason"],
+              "properties": {
+                "value": { "type": "string" },
+                "source": { "type": "string" },
+                "reason": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "rejected": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "source", "reason"],
+            "properties": {
+              "value": { "type": "string" },
+              "source": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        },
+        "requiresUserConfirmation": {
+          "type": "boolean"
+        },
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authority", "specificity", "freshness", "volatility"],
+          "properties": {
+            "authority": { "type": "string" },
+            "specificity": { "type": "string" },
+            "freshness": { "type": "string" },
+            "volatility": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

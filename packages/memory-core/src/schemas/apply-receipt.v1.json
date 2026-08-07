@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.apply-receipt.v1",
+  "title": "Gajae memory apply receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "proposalId",
+    "mutationId",
+    "applied",
+    "changed",
+    "superseded"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.apply-receipt.v1"
+    },
+    "proposalId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mutationId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "applied": {
+      "type": "boolean"
+    },
+    "changed": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "superseded": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

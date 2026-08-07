@@ -58,6 +58,7 @@
 		"@gajae-code/agent-core": "catalog:",
 		"@gajae-code/ai": "catalog:",
 		"@gajae-code/bridge-client": "catalog:",
+		"@gajae-code/memory-core": "catalog:",
 		"@gajae-code/natives": "catalog:",
 		"@gajae-code/tui": "catalog:",
 		"@gajae-code/utils": "catalog:",

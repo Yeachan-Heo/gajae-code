@@ -1,0 +1,478 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.search-result.v1",
+  "title": "Gajae memory search result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "queryId",
+    "query",
+    "sources",
+    "truncated",
+    "partial",
+    "ledgerId"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.search-result.v1"
+    },
+    "queryId": {
+      "type": "string",
+      "pattern": "^memq_[0-9a-f]{64}$"
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "budget": {
+      "$ref": "#/$defs/budget"
+    },
+    "explain": {
+      "$ref": "#/$defs/explain"
+    },
+    "partial": {
+      "type": "boolean"
+    },
+    "ledgerId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^memledger_[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "stage": {
+      "enum": [
+        "map-route",
+        "metadata",
+        "heading",
+        "lexical",
+        "fuzzy"
+      ]
+    },
+    "intent": {
+      "enum": [
+        "user-preference",
+        "project-convention",
+        "architecture-rationale",
+        "decision-history",
+        "current-task-status",
+        "resume-session",
+        "person-identity",
+        "environment",
+        "debugging-history",
+        "workflow-policy",
+        "generic-recall"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uri",
+        "scope",
+        "relPath",
+        "heading",
+        "startLine",
+        "endLine",
+        "authority",
+        "volatility",
+        "updatedAt",
+        "digest",
+        "score",
+        "stage"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "pattern": "^(?:global|project|session):\\/\\/[^?#]+(?:#[^?]*)?$"
+        },
+        "scope": {
+          "enum": [
+            "global",
+            "project",
+            "session"
+          ]
+        },
+        "relPath": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$)).+$"
+        },
+        "heading": {
+          "type": "string"
+        },
+        "startLine": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "endLine": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "authority": {
+          "enum": [
+            "user-confirmed",
+            "repository-reviewed",
+            "project-config",
+            "tool-verified",
+            "session-observed",
+            "model-inferred",
+            "unverified"
+          ]
+        },
+        "volatility": {
+          "enum": [
+            "stable",
+            "volatile",
+            "historical"
+          ]
+        },
+        "updatedAt": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "stage": {
+          "enum": [
+            "map-route",
+            "metadata",
+            "heading",
+            "lexical",
+            "fuzzy"
+          ]
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "limits",
+        "usage",
+        "droppedCandidates",
+        "drops",
+        "truncated"
+      ],
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/budgetLimits"
+        },
+        "usage": {
+          "$ref": "#/$defs/budgetUsage"
+        },
+        "droppedCandidates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "drops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/budgetDrop"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "budgetLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxMaps",
+        "maxFiles",
+        "maxSections",
+        "maxChars"
+      ],
+      "properties": {
+        "maxMaps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxFiles": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxSections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxChars": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "budgetUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maps",
+        "files",
+        "sections",
+        "chars"
+      ],
+      "properties": {
+        "maps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "chars": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "budgetDrop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateId",
+        "dimension",
+        "amount",
+        "reason"
+      ],
+      "properties": {
+        "candidateId": {
+          "type": "string"
+        },
+        "dimension": {
+          "enum": [
+            "maps",
+            "files",
+            "sections",
+            "chars"
+          ]
+        },
+        "amount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "enum": [
+            "limit",
+            "invalid-amount"
+          ]
+        }
+      }
+    },
+    "explain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scopes",
+        "intent",
+        "routesConsidered",
+        "stageCounts",
+        "rankingFactors",
+        "exclusionReasons",
+        "mapsRead",
+        "candidateCount",
+        "selectedCount",
+        "sourcesSelected",
+        "rejectedCount",
+        "budget",
+        "conflicts",
+        "hints",
+        "truncated"
+      ],
+      "properties": {
+        "scopes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "global",
+              "project",
+              "session"
+            ]
+          }
+        },
+        "intent": {
+          "$ref": "#/$defs/intent"
+        },
+        "routesConsidered": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rankingFactors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "uri",
+              "score",
+              "stage"
+            ],
+            "properties": {
+              "uri": {
+                "type": "string",
+                "minLength": 1
+              },
+              "score": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "stage": {
+                "$ref": "#/$defs/stage"
+              }
+            }
+          }
+        },
+        "exclusionReasons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "uri",
+              "reason",
+              "stage"
+            ],
+            "properties": {
+              "uri": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "stage": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/stage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "sourcesSelected": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/source"
+          }
+        },
+        "conflicts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "hints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "totalMs"
+          ],
+          "properties": {
+            "totalMs": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "stageCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "map-route",
+            "metadata",
+            "heading",
+            "lexical",
+            "fuzzy"
+          ],
+          "properties": {
+            "map-route": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "metadata": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "heading": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lexical": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "fuzzy": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "mapsRead": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "candidateCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "selectedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rejectedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "budget": {
+          "$ref": "#/$defs/budget"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

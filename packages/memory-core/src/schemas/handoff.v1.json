@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gajae.memory.handoff.v1",
+  "title": "Gajae memory handoff result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "sessionId",
+    "goal",
+    "task",
+    "nextSteps"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "gajae.memory.handoff.v1"
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!\\.\\.?$)(?!.*[\\\\/\\u0000:#?])(?!.+[. ]$).+$"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nextSteps": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

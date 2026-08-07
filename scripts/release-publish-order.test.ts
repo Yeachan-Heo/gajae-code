@@ -105,12 +105,16 @@ describe("unscoped gajae-code package publication", () => {
 		const releaseScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
 		const bridgeClientIndex = releaseScript.indexOf('dir: "packages/bridge-client"');
 		const codingAgentIndex = releaseScript.indexOf('dir: "packages/coding-agent"');
+		const memoryCoreIndex = releaseScript.indexOf('dir: "packages/memory-core"');
 		const aliasIndex = releaseScript.indexOf('dir: "packages/gajae-code"');
 
 		expect(codingAgentIndex).toBeGreaterThan(-1);
+		expect(memoryCoreIndex).toBeGreaterThan(-1);
 		expect(aliasIndex).toBeGreaterThan(codingAgentIndex);
 		expect(bridgeClientIndex).toBeGreaterThan(-1);
 		expect(bridgeClientIndex).toBeLessThan(codingAgentIndex);
+		expect(memoryCoreIndex).toBeGreaterThan(bridgeClientIndex);
+		expect(memoryCoreIndex).toBeLessThan(codingAgentIndex);
 	});
 
 	test("native platform packages publish before the stable loader package", () => {
@@ -300,12 +304,12 @@ describe("release bump set equals publish set", () => {
 	});
 });
 describe("immutable stable release contracts", () => {
-	test("publisher configuration equals the closed 14-package evidence definition", () => {
+	test("publisher configuration equals the closed 15-package evidence definition", () => {
 		const publishedDirs = publishPackages.map(pkg => pkg.dir).sort();
 		const evidencedDirs = PUBLIC_PACKAGE_DEFINITIONS.map(definition => definition.dir).sort();
 
-		expect(PUBLIC_PACKAGE_DEFINITIONS).toHaveLength(14);
-		expect(publishPackages).toHaveLength(14);
+		expect(PUBLIC_PACKAGE_DEFINITIONS).toHaveLength(15);
+		expect(publishPackages).toHaveLength(15);
 		expect(publishedDirs).toEqual(evidencedDirs);
 	});
 
