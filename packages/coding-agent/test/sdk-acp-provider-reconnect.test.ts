@@ -72,6 +72,11 @@ test("ACP provider reconnects after a server-side heartbeat disconnect, awaits h
 	}
 });
 
+// The ACP reconnect budget deliberately outlives the host heartbeat TTL (#4012),
+// so exhausting the production budget against a dead endpoint burns tens of
+// seconds of real backoff. Inject a one-shot client so this stays an assertion
+// about the typed rejection; the budget itself is asserted from its constants in
+// acp-session-reconnect.test.ts.
 test("ACP reconnect exhaustion is observable as a typed rejection", async () => {
 	// The ACP session reconnect budget (ACP_SESSION_RECONNECT) deliberately
 	// outlives the host heartbeat TTL — 23 attempts with backoff up to 2s, ~40s
