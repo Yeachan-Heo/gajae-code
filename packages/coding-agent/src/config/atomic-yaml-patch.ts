@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
+import { isCompiledBinary } from "@gajae-code/utils/env";
 import { YAML } from "bun";
+import type { AtomicYamlNativeWorkerRequest, AtomicYamlNativeWorkerResponse } from "./atomic-yaml-patch-worker";
 import { withFileLock } from "./file-lock";
 
 export interface AtomicYamlExpectedPrecondition {
@@ -67,23 +69,6 @@ export interface AtomicYamlUpdate<T> {
 	apply(current: Record<string, unknown>): T | Promise<T>;
 	shouldWrite?(result: T): boolean;
 	committed?(current: Record<string, unknown>, result: T): void | Promise<void>;
-}
-
-type NativeAtomicYamlBindings = {
-	exactReplacePath: (
-		sourcePath: string,
-		destinationPath: string,
-		expectedSource: NativeExactFileIdentity,
-		expectedDestination: NativeExactFileIdentity,
-	) => NativeExactUnlinkResult;
-	renameNoReplacePath: (sourcePath: string, destinationPath: string) => NativeNoReplaceResult;
-};
-
-let nativeAtomicYamlBindings: NativeAtomicYamlBindings | undefined;
-
-function nativeAtomicYaml(): NativeAtomicYamlBindings {
-	nativeAtomicYamlBindings ??= require("@gajae-code/natives") as NativeAtomicYamlBindings;
-	return nativeAtomicYamlBindings;
 }
 
 export interface AtomicYamlPatchOptions {
@@ -301,6 +286,49 @@ async function currentRawOrEmpty(configPath: string): Promise<string> {
 		});
 }
 
+async function runNativeAtomicYamlWorker(
+	request: AtomicYamlNativeWorkerRequest,
+): Promise<NativeExactUnlinkResult | NativeNoReplaceResult> {
+	const worker = isCompiledBinary()
+		? new Worker("./packages/coding-agent/src/config/atomic-yaml-patch-worker.ts", { type: "module" })
+		: new Worker(new URL("./atomic-yaml-patch-worker.ts", import.meta.url).href, { type: "module" });
+	const { promise, resolve, reject } = Promise.withResolvers<NativeExactUnlinkResult | NativeNoReplaceResult>();
+	const onMessage: EventListener = event => {
+		const response = (event as MessageEvent<AtomicYamlNativeWorkerResponse>).data;
+		if (response?.type === "result") {
+			resolve(response.result);
+			return;
+		}
+		if (response?.type === "error") {
+			const failure = new Error(response.message);
+			if (response.name) failure.name = response.name;
+			if (response.stack) failure.stack = response.stack;
+			reject(failure);
+			return;
+		}
+		reject(new Error("Atomic YAML native worker returned an invalid response."));
+	};
+	const onError: EventListener = () => reject(new Error("Atomic YAML native worker failed."));
+	const onMessageError: EventListener = () => reject(new Error("Atomic YAML native worker message failed."));
+	const cleanup = (): void => {
+		worker.removeEventListener("message", onMessage);
+		worker.removeEventListener("error", onError);
+		worker.removeEventListener("messageerror", onMessageError);
+	};
+	try {
+		worker.addEventListener("message", onMessage);
+		worker.addEventListener("error", onError);
+		worker.addEventListener("messageerror", onMessageError);
+		worker.postMessage(request);
+		return await promise;
+	} catch (error) {
+		throw new AtomicYamlReplaceError(request.destinationPath, 1, error);
+	} finally {
+		cleanup();
+		worker.terminate();
+	}
+}
+
 async function replaceWithExpectedIdentity(
 	tempPath: string,
 	configPath: string,
@@ -317,7 +345,11 @@ async function replaceWithExpectedIdentity(
 	if (!destination) {
 		if (expectedRaw !== "")
 			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
-		const published = nativeAtomicYaml().renameNoReplacePath(tempPath, configPath);
+		const published = (await runNativeAtomicYamlWorker({
+			operation: "no-replace",
+			sourcePath: tempPath,
+			destinationPath: configPath,
+		})) as NativeNoReplaceResult;
 		if (published.ok) return;
 		if (published.reason === "destination_exists") {
 			const actual = await currentRawOrEmpty(configPath);
@@ -335,12 +367,15 @@ async function replaceWithExpectedIdentity(
 	// `exactReplacePath` validates both identities inside one native atomic
 	// namespace exchange. A save after the snapshots therefore rejects the
 	// exchange without replacing the editor's newer destination.
-	const replaced = await (options.exactReplace ?? nativeAtomicYaml().exactReplacePath)(
-		tempPath,
-		configPath,
-		source,
-		destination,
-	);
+	const replaced = options.exactReplace
+		? await options.exactReplace(tempPath, configPath, source, destination)
+		: await runNativeAtomicYamlWorker({
+				operation: "exact-replace",
+				sourcePath: tempPath,
+				destinationPath: configPath,
+				expectedSource: source,
+				expectedDestination: destination,
+			});
 	if (replaced.ok) return;
 	if (replaced.code === "identity_mismatch") {
 		const actual = await currentRawOrEmpty(configPath);
