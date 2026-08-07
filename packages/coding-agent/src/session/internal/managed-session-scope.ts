@@ -933,23 +933,31 @@ function reapplyOwnerOnlyManagedTree(directory: string): void {
 		if (stat.isSymbolicLink()) continue;
 		if (stat.isDirectory()) {
 			reapplyOwnerOnlyManagedTree(child);
-			try {
-				native.applyOwnerOnlyPathSecurity(child, "directory");
-			} catch {
-				// Best-effort: the managed-tree snapshot re-verifies and reports genuine failures.
-			}
+			assertOwnerOnlyApplied(child, "directory");
 		} else if (stat.isFile()) {
-			try {
-				native.applyOwnerOnlyPathSecurity(child, "file");
-			} catch {
-				// Best-effort, as above.
-			}
+			assertOwnerOnlyApplied(child, "file");
 		}
 	}
-	try {
-		native.applyOwnerOnlyPathSecurity(directory, "directory");
-	} catch {
-		// Best-effort, as above.
+	assertOwnerOnlyApplied(directory, "directory");
+}
+
+/** Apply and verify owner-only mode/ACL; throw mode_mismatch (or native code) on failure. */
+function assertOwnerOnlyApplied(pathname: string, kind: "directory" | "file"): void {
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, kind);
+	if (!applied || typeof applied !== "object" || (applied as { ok?: unknown }).ok !== true) {
+		const code =
+			applied && typeof applied === "object" && typeof (applied as { code?: unknown }).code === "string"
+				? (applied as { code: string }).code
+				: "mode_mismatch";
+		throw new Error(code);
+	}
+	const verified = verifyOwnerOnlyPathSecurity(pathname, kind);
+	if (!verified || typeof verified !== "object" || (verified as { ok?: unknown }).ok !== true) {
+		const code =
+			verified && typeof verified === "object" && typeof (verified as { code?: unknown }).code === "string"
+				? (verified as { code: string }).code
+				: "mode_mismatch";
+		throw new Error(code);
 	}
 }
 
@@ -1019,8 +1027,20 @@ export function prepareManagedSessionScopeForWriteSync(
 			);
 		stage = "store";
 		let store: ManagedSessionDescendantStore;
+		const openManagedStore = (): ManagedSessionDescendantStore => {
+			const next = buildStore();
+			// #3951 root-store identity binding no longer walks the full managed tree
+			// on construct. Explicitly snapshot so group/other-readable descendants
+			// still surface mode_mismatch and trigger self-heal instead of reporting
+			// resolved while modes like 0o036 remain on disk.
+			if (retainedAuthority) {
+				const tree = retainedAuthority.snapshotManagedTree("");
+				if (!tree.ok) throw new Error(tree.code ?? "unsafe_artifacts");
+			}
+			return next;
+		};
 		try {
-			store = buildStore();
+			store = openManagedStore();
 		} catch (error) {
 			if (process.platform === "win32" && policy === "windows-existing-verify-first") throw error;
 			if (!isRecoverableOwnerOnlyModeDrift(error)) throw error;
@@ -1028,7 +1048,7 @@ export function prepareManagedSessionScopeForWriteSync(
 			// (e.g. resident-cache blobs written on the explicit session path).
 			// Re-secure the tree in place and retry once before failing closed.
 			reapplyOwnerOnlyManagedTree(scope.directoryPath);
-			store = buildStore();
+			store = openManagedStore();
 		}
 		const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
 		stage = "binding_publish";
