@@ -13,6 +13,7 @@ import {
 } from "../coordinator/contract";
 import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
+import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
@@ -2021,7 +2022,11 @@ async function markTurnTerminalFromSessionState(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState,
 ): Promise<TurnRecord> {
-	const terminalStatus: TurnStatus = sessionState.state === "errored" ? "failed" : "completed";
+	const receiptState = reduceTerminalReceiptState({
+		execution: sessionState.state === "errored" ? "failed" : "completed",
+		reportable: reportableFinalResponse((sessionState as RuntimeSessionStatePayload).final_response),
+	});
+	const terminalStatus: TurnStatus = receiptState.receipt === "missing" ? "failed" : receiptState.execution;
 	const runtimeState = sessionState as RuntimeSessionStatePayload;
 	const finalResponse = runtimeState.final_response ?? {
 		text: null,
@@ -2040,24 +2045,21 @@ async function markTurnTerminalFromSessionState(
 			state: "acknowledged",
 		},
 		final_response: finalResponse,
-		evidence: reportableFinalResponse(finalResponse)
-			? turn.evidence
-			: [
-					...turn.evidence,
-					{
-						type: MISSING_FINAL_RESPONSE_ADVISORY,
-						message: "Runtime completed without reportable final_response text or artifact_path.",
-						created_at: timestamp,
-					},
-				],
+		evidence: turn.evidence,
 		error:
-			terminalStatus === "failed"
-				? (runtimeState.error ?? {
-						code: "runtime_errored",
-						message: sessionState.reason ?? "runtime_errored",
+			receiptState.receipt === "missing"
+				? {
+						code: "receipt_missing",
+						message: "Runtime completed without reportable final_response text or artifact_path.",
 						recoverable: true,
-					})
-				: null,
+					}
+				: terminalStatus === "failed"
+					? (runtimeState.error ?? {
+							code: "runtime_errored",
+							message: sessionState.reason ?? "runtime_errored",
+							recoverable: true,
+						})
+					: null,
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};
