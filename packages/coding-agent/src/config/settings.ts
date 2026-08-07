@@ -1579,6 +1579,20 @@ export class Settings implements NotificationSettingsReader {
 					);
 					marker = null;
 				}
+				// A pending marker records the identity of the directory that received
+				// (or would receive) the migration write. If that directory was
+				// deleted/recreated or a symlink was repointed, recovery must not
+				// apply the marker's ownership claims to the replacement profile.
+				if (
+					marker?.status === "pending" &&
+					typeof marker.canonicalTargetIdentity === "string" &&
+					(await this.#statIdentity(path.dirname(target))) !== marker.canonicalTargetIdentity
+				) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration pending marker at ${markerPath} targets a replaced agent directory; treating it as invalid so the migration re-runs into the current profile`,
+					);
+					marker = null;
+				}
 				if (marker?.status === "complete") {
 					// The migration is complete only while the source still matches
 					// the marker hash. If the user edited/recreated the legacy
@@ -2247,12 +2261,24 @@ export class Settings implements NotificationSettingsReader {
 					marker?.status === "pending" && typeof marker.startedAt === "string"
 						? marker.startedAt
 						: new Date().toISOString();
+				// The pending marker is the ownership record if this run crashes
+				// after the target patch; bind it to the directory that will
+				// receive the write so a later replacement profile can never
+				// inherit its ownership claims.
+				const pendingTargetIdentity = await this.#workflowMigrationTargetIdentity(target);
+				if (pendingTargetIdentity === null) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration cannot verify target directory ${path.dirname(target)} before the pending write; leaving source and marker untouched`,
+					);
+					return;
+				}
 				await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
 					version: WORKFLOW_MIGRATION_MARKER_VERSION,
 					status: "pending",
 					sourcePath: source,
 					backupPath: backup,
 					targetPath: target,
+					...pendingTargetIdentity,
 					sourceSha256,
 					migratedKeys,
 					startedAt,
@@ -2693,6 +2719,17 @@ export class Settings implements NotificationSettingsReader {
 			migratedKeys: [...new Set([...retainedOwnedKeys, ...newlyPropagatedKeys])],
 		};
 		await this.#writeWorkflowMigrationMarkerAtomic(markerPath, pendingRepairMarker);
+		// Capture the target identity BEFORE applying the repairs: the completion
+		// marker below must describe the directory that actually received the
+		// reconcile write, never a repointed successor (the native CAS protects
+		// only the write itself).
+		const reconcileTargetIdentityBeforeRepair = await this.#workflowMigrationTargetIdentity(target);
+		if (reconcileTargetIdentityBeforeRepair === null) {
+			this.#warnLegacyFallbackMigration(
+				`Settings: config-root workflow migration cannot verify target directory ${path.dirname(target)} before reconcile repairs; leaving source/backup/marker pending`,
+			);
+			return;
+		}
 		// Snapshot the target before the repairs so they can be rolled
 		// back if the source changes again before publication.
 		const preRepairTargetSnapshot = structuredClone(tx.current);
@@ -2788,10 +2825,10 @@ export class Settings implements NotificationSettingsReader {
 		} finally {
 			await fs.promises.rm(backupTemp, { force: true }).catch(() => undefined);
 		}
-		const targetIdentity = await this.#workflowMigrationTargetIdentity(target);
+		const targetIdentity = await this.#workflowMigrationTargetIdentity(target, reconcileTargetIdentityBeforeRepair);
 		if (targetIdentity === null) {
 			this.#warnLegacyFallbackMigration(
-				`Settings: config-root workflow migration cannot publish completion because the target directory identity is unavailable; leaving source, backup, and marker pending`,
+				`Settings: config-root workflow migration target directory changed during reconciliation; leaving source, backup, and marker pending`,
 			);
 			return;
 		}
