@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
-import { ImageProtocol, TERMINAL, Text } from "@gajae-code/tui";
+import { getKeybindings, ImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
@@ -32,7 +32,8 @@ import {
 } from "../session/streaming-output";
 
 import { renderStatusLine } from "../tui";
-import { CachedOutputBlock } from "../tui/output-block";
+import { CachedOutputBlock, getOutputBlockContentWidth } from "../tui/output-block";
+import { truncateToWidth } from "../tui/utils";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
 import { checkBashAllowedPrefixes, normalizeReadOnlyBashCommand } from "./bash-allowed-prefixes";
@@ -1635,6 +1636,7 @@ export interface ShellRendererConfig<TArgs> {
 	resolveCommand?: (args: TArgs | undefined) => string | undefined;
 	resolveCwd?: (args: TArgs | undefined) => string | undefined;
 	resolveEnv?: (args: TArgs | undefined) => Record<string, string> | undefined;
+	compactCommand?: boolean;
 }
 
 function getPartialJson<TArgs>(args: TArgs | undefined): string | undefined {
@@ -1682,6 +1684,85 @@ export function formatBashCommandLines(args: BashRenderArgs, uiTheme: Theme): st
 	return highlightedLines.map((line, i) => (i === 0 ? `${prefix}${line}` : line));
 }
 
+const BASH_COLLAPSED_COMMAND_MAX_VISUAL_ROWS = 5;
+const BASH_COMMAND_SENTINEL_MAX_VISUAL_ROWS = 3;
+
+interface BashCommandProjection {
+	lines: string[];
+}
+
+function resolveBashExpandKeyLabel(): string | undefined {
+	return getKeybindings().getKeys("app.tools.expand")[0];
+}
+
+function formatBashExpandActionHint(maxWidth?: number): string {
+	const keyLabel = resolveBashExpandKeyLabel();
+	const actionHint = keyLabel ? `${keyLabel} to expand` : "expand tools";
+	return maxWidth !== undefined && visibleWidth(actionHint) > Math.max(1, maxWidth) ? "expand tools" : actionHint;
+}
+
+function renderBashCommandProjection(
+	commandLines: string[],
+	width: number,
+	expanded: boolean,
+	actionHint: string,
+	uiTheme: Theme,
+): BashCommandProjection {
+	const renderWidth = Math.max(1, width);
+	const visualLines = new Text(commandLines.join("\n"), 0, 0).render(renderWidth);
+	if (expanded || visualLines.length <= BASH_COLLAPSED_COMMAND_MAX_VISUAL_ROWS) {
+		return { lines: visualLines };
+	}
+
+	const retained = visualLines.slice(0, BASH_COLLAPSED_COMMAND_MAX_VISUAL_ROWS);
+	const omittedVisualRows = visualLines.length - retained.length;
+	let sentinel = new Text(
+		uiTheme.fg("dim", `… ${omittedVisualRows} command rows omitted\n${actionHint}`),
+		0,
+		0,
+	).render(renderWidth);
+
+	if (sentinel.length > BASH_COMMAND_SENTINEL_MAX_VISUAL_ROWS) {
+		sentinel = new Text(uiTheme.fg("dim", `… ${omittedVisualRows} rows omitted\nexpand tools`), 0, 0).render(
+			renderWidth,
+		);
+	}
+	if (sentinel.length > BASH_COMMAND_SENTINEL_MAX_VISUAL_ROWS) {
+		sentinel = [
+			uiTheme.fg("dim", truncateToWidth(`… +${omittedVisualRows}`, renderWidth)),
+			uiTheme.fg("dim", truncateToWidth("expand tools", renderWidth)),
+		];
+	}
+
+	return { lines: [...retained, ...sentinel] };
+}
+
+function createBashCommandProjector(commandLines: string[], uiTheme: Theme) {
+	let cached:
+		| {
+				width: number;
+				expanded: boolean;
+				actionHint: string;
+				projection: BashCommandProjection;
+		  }
+		| undefined;
+
+	return {
+		render(width: number, expanded: boolean): BashCommandProjection {
+			const actionHint = formatBashExpandActionHint(width);
+			if (cached?.width === width && cached.expanded === expanded && cached.actionHint === actionHint) {
+				return cached.projection;
+			}
+			const projection = renderBashCommandProjection(commandLines, width, expanded, actionHint, uiTheme);
+			cached = { width, expanded, actionHint, projection };
+			return projection;
+		},
+		invalidate(): void {
+			cached = undefined;
+		},
+	};
+}
+
 function toBashRenderArgs<TArgs>(args: TArgs | undefined, config: ShellRendererConfig<TArgs>): BashRenderArgs {
 	return {
 		command: config.resolveCommand?.(args),
@@ -1695,10 +1776,23 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 	return {
 		renderCall(args: TArgs, options: RenderResultOptions, uiTheme: Theme): Component {
 			const renderArgs = toBashRenderArgs(args, config);
-			const cmdText = formatBashCommand(renderArgs);
 			const title = config.resolveTitle(args, options);
-			const text = renderStatusLine({ icon: "pending", title, description: cmdText }, uiTheme);
-			return new Text(text, 0, 0);
+			if (!config.compactCommand) {
+				const cmdText = formatBashCommand(renderArgs);
+				const text = renderStatusLine({ icon: "pending", title, description: cmdText }, uiTheme);
+				return new Text(text, 0, 0);
+			}
+
+			const header = renderStatusLine({ icon: "pending", title }, uiTheme);
+			const projectCommand = createBashCommandProjector(formatBashCommandLines(renderArgs, uiTheme), uiTheme);
+			const renderOptions = options as RenderResultOptions & { renderContext?: BashRenderContext };
+			return {
+				render: (width: number): string[] => {
+					const expanded = renderOptions.renderContext?.expanded ?? renderOptions.expanded;
+					return [header, ...projectCommand.render(width, expanded).lines];
+				},
+				invalidate: () => projectCommand.invalidate(),
+			};
 		},
 
 		renderResult(
@@ -1713,6 +1807,8 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 		): Component {
 			const renderArgs = toBashRenderArgs(args, config);
 			const cmdLines = args ? formatBashCommandLines(renderArgs, uiTheme) : undefined;
+			const projectCommand =
+				config.compactCommand && cmdLines ? createBashCommandProjector(cmdLines, uiTheme) : undefined;
 			const isError = result.isError === true;
 			const icon = options.isPartial ? "pending" : isError ? "error" : "success";
 			const title = config.resolveTitle(args, options);
@@ -1726,6 +1822,10 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 					const { renderContext } = options;
 					const expanded = renderContext?.expanded ?? options.expanded;
 					const previewLines = renderContext?.previewLines ?? BASH_DEFAULT_PREVIEW_LINES;
+					const commandLines =
+						cmdLines && projectCommand
+							? projectCommand.render(getOutputBlockContentWidth(width, uiTheme), expanded).lines
+							: (cmdLines ?? []);
 
 					// Get output from context (preferred) or fall back to result content.
 					// Strip the LLM-facing notice appended by wrappedExecute so we don't
@@ -1778,7 +1878,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 								outputLines.push(
 									uiTheme.fg(
 										"dim",
-										`… (${result.skippedCount} earlier lines, showing ${result.visualLines.length} of ${result.skippedCount + result.visualLines.length}) (ctrl+o to expand)`,
+										`… (${result.skippedCount} earlier lines, showing ${result.visualLines.length} of ${result.skippedCount + result.visualLines.length}) (${formatBashExpandActionHint(getOutputBlockContentWidth(width, uiTheme))})`,
 									),
 								);
 							}
@@ -1793,7 +1893,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 							header,
 							state: options.isPartial ? "pending" : isError ? "error" : "success",
 							sections: [
-								{ lines: cmdLines ?? [] },
+								{ lines: commandLines },
 								{ label: uiTheme.fg("toolTitle", "Output"), lines: outputLines },
 							],
 							width,
@@ -1803,6 +1903,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 				},
 				invalidate: () => {
 					outputBlock.invalidate();
+					projectCommand?.invalidate();
 				},
 			};
 		},
@@ -1816,4 +1917,5 @@ export const bashToolRenderer = createShellRenderer<BashRenderArgs>({
 	resolveCommand: args => args?.command,
 	resolveCwd: args => args?.cwd,
 	resolveEnv: args => args?.env,
+	compactCommand: true,
 });
