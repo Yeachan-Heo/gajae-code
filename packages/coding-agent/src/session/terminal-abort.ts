@@ -303,16 +303,13 @@ export function registerOwnedRegistration(
 		if (evictKey === undefined) {
 			// ALL retained registrations are live: evicting any of them would lose
 			// a still-running job's ownership authority. FAIL CLOSED instead —
-			// do not evict, skip the new registration, and record the new
-			// attempt as registration-incomplete so a later scope:"owned" abort
-			// of it returns uncertainty rather than stopped_owned over an
-			// incomplete set (review thread P2).
+			// do not evict, skip the new registration. The coarse saturation flag
+			// keeps every owned abort uncertain, so no per-attempt marker is
+			// added here: saturation-path markers have no registration window to
+			// settle them and would grow without bound while adding nothing that
+			// ownedRegistrySaturationEver does not already cover (review thread
+			// P2).
 			ownedRegistrySaturationEver = true;
-			markAttemptRegistrationIncomplete(key.lineageIdHash, key.promptAttemptEpoch);
-			// Retiring an oldest marker is safe for fail-closed correctness only
-			// because ownedRegistrySaturationEver above keeps every owned abort
-			// uncertain — no marker deletion can lose the last evidence that a
-			// skipped job is still live (review thread P2).
 			return;
 		}
 		const evictedTuple = ownedRegistrations.get(evictKey);
@@ -332,7 +329,6 @@ export function registerOwnedRegistration(
 				// inserting it and letting both the live map and the backlog grow
 				// without bound while deliveries stay stalled (review thread P2).
 				ownedRegistrySaturationEver = true;
-				markAttemptRegistrationIncomplete(key.lineageIdHash, key.promptAttemptEpoch);
 				return;
 			}
 			retainedOwnershipTuples.set(evictKey, evictedTuple);
@@ -342,9 +338,12 @@ export function registerOwnedRegistration(
 }
 
 /** Record an attempt whose owned-registration set is KNOWN incomplete — the
- *  shared bounded fail-closed authority (saturation skip or evicted in-flight
- *  lineage binding). FIFO-capped so a long-running daemon never grows the set
- *  without bound (review thread P2). */
+ *  fail-closed authority for an EVICTED in-flight lineage binding whose tool
+ *  may still launch unregistered work. Every marker is paired with a
+ *  registration window that settles it at afterToolCall, so the set is bounded
+ *  by the open-window map; registry-saturation skips set the coarse
+ *  ownedRegistrySaturationEver flag instead and never add per-attempt markers
+ *  (review thread P2). */
 function markAttemptRegistrationIncomplete(lineageIdHash: string, attemptEpoch: number): void {
 	const incompleteKey = `${lineageIdHash}\u0000${attemptEpoch}`;
 	// A marker can be cleared only once its affected call is known unable to
