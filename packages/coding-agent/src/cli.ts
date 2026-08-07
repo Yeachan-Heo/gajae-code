@@ -272,6 +272,13 @@ export class RootHelpCommand extends Command {
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
 		"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
+		"clipboard-transport": Flags.string({
+			description: "Clipboard transport: auto (default), native, osc52, or ssh",
+			options: ["auto", "native", "osc52", "ssh"],
+		}),
+		"clipboard-ssh-host": Flags.string({
+			description: "SSH host alias for --clipboard-transport ssh (from ~/.ssh/config)",
+		}),
 		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
 		mode: Flags.string({
 			description: "Output mode: text (default), json, or acp",
