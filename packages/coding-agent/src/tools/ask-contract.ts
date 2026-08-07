@@ -3,6 +3,7 @@
  * Kept dependency-light so both eager AskTool and the cold descriptor registry
  * validate the same payloads without importing the AskTool implementation.
  */
+import { INTENT_FIELD } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
 import { deepInterviewCharacterCount } from "../gjc-runtime/deep-interview-state";
@@ -275,9 +276,20 @@ function isOnlyPlainData(value: unknown): boolean {
 	return isPlainRecord(value) && Object.values(value).every(isOnlyPlainData);
 }
 
-function hasExactOwnKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+/**
+ * Exact-key check. `required` defaults to `allowed`, so callers that tolerate an
+ * optional key still demand every mandatory one.
+ */
+function hasExactOwnKeys(
+	value: Record<string, unknown>,
+	allowed: readonly string[],
+	required: readonly string[] = allowed,
+): boolean {
 	const keys = Reflect.ownKeys(value);
-	return keys.length === allowed.length && keys.every(key => typeof key === "string" && allowed.includes(key));
+	return (
+		keys.every(key => typeof key === "string" && allowed.includes(key)) &&
+		required.every(key => Object.hasOwn(value, key))
+	);
 }
 
 function hasOnlyAllowedOwnKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
@@ -396,8 +408,12 @@ export function recoverRoundZeroIntentContract(
 	const knownRejection = knownIntentRejection(normalizedArguments);
 	if (knownRejection) return knownRejection;
 	if (!isOnlyPlainData(normalizedArguments) || !isPlainRecord(normalizedArguments)) return { outcome: "reject" };
+	// `_i` is the intent field the agent loop injects into every tool schema. The
+	// loop strips it before validation, but replayed and directly validated calls
+	// can still carry it, and rejecting an otherwise canonical payload for the
+	// harness's own field fails a call the model cannot correct.
 	if (
-		!hasExactOwnKeys(normalizedArguments, ["questions"]) ||
+		!hasExactOwnKeys(normalizedArguments, ["questions", INTENT_FIELD], ["questions"]) ||
 		!Array.isArray(normalizedArguments.questions) ||
 		normalizedArguments.questions.length !== 1
 	)

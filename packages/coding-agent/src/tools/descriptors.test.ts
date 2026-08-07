@@ -463,6 +463,51 @@ describe("tool descriptor compatibility gate", () => {
 		).toThrow('Validation failed for tool "ask"');
 	});
 
+	test("deferred todo_write validator matches the loaded tool on every payload", async () => {
+		const session = makeSession({ "tools.discoveryMode": "all" });
+		session.hasUI = true;
+		const lazy = (await createTools(session)).find(tool => tool.name === "todo_write");
+		const eager = await BUILTIN_TOOL_DESCRIPTORS.todo_write.load(session);
+		if (!lazy?.rawArgumentValidation || !eager?.rawArgumentValidation)
+			throw new Error("expected deferred and loaded todo_write validators");
+		// A deferred rejection fires before the tool can load, so any divergence
+		// fails a call the loaded tool would have accepted.
+		const payloads: Array<Record<string, unknown>> = [
+			{ ops: [{ op: "done", content: "ship it" }] },
+			{ ops: [{ op: "complete", task: "ship it" }] },
+			{ ops: [{ op: "completed", task: "ship it" }] },
+			{ ops: [{ op: "complete" }] },
+			{ ops: [{ op: "done" }] },
+			{ ops: [{ op: "drop" }] },
+			{ ops: [{ op: "done", task: "x", bogus: 1 }] },
+			{ ops: [{ op: "init", list: [{ phase: "P", items: ["a"], bogus: 1 }] }] },
+			{ ops: [{ op: "init", list: [{ phase: "P", items: ["a"] }] }] },
+			{ ops: "not-an-array" },
+			{ ops: [{ op: "done", task: "x" }], stray: true },
+			{ _i: "Tracking progress", ops: [{ op: "done", task: "x" }] },
+		];
+		for (const payload of payloads) {
+			expect(lazy.rawArgumentValidation(payload)).toEqual(eager.rawArgumentValidation(payload));
+		}
+	});
+
+	test("deferred todo_write rejections carry the correction code", async () => {
+		const session = makeSession({ "tools.discoveryMode": "all" });
+		session.hasUI = true;
+		const todo = (await createTools(session)).find(tool => tool.name === "todo_write");
+		if (!todo) throw new Error("expected deferred todo_write tool");
+		// Without a code the thrown message is a bare "rejected before coercion",
+		// which gives the model nothing to correct and it retries the same shape.
+		expect(() =>
+			validateToolArguments(todo, {
+				id: "call-code",
+				type: "toolCall",
+				name: "todo_write",
+				arguments: { ops: [{ op: "done" }] },
+			}),
+		).toThrow("todo_write done and drop entries require a task or phase target");
+	});
+
 	test("deferred ask validator recovers the canonical round-zero pair", async () => {
 		const session = makeSession({ "tools.discoveryMode": "all" });
 		session.hasUI = true;
@@ -501,6 +546,54 @@ describe("tool descriptor compatibility gate", () => {
 		});
 		expect(recovered.questions[0].deepInterview.intent_contract).toBeDefined();
 		expect(recovered.questions[0].deepInterview.intent_review).toBeUndefined();
+	});
+
+	test("deferred ask recovery tolerates the injected intent field at the root", async () => {
+		const session = makeSession({ "tools.discoveryMode": "all" });
+		session.hasUI = true;
+		session.getDeepInterviewAskStage = () => "topology";
+		const [ask] = (await createTools(session)).filter(tool => tool.name === "ask");
+		if (!ask) throw new Error("expected deferred ask tool");
+		const question = {
+			id: "round-0",
+			question: "Confirm",
+			options: [{ label: "Looks right" }, { label: "Approve" }],
+			deepInterview: {
+				round: 0,
+				component: "review-topology",
+				dimension: "topology",
+				ambiguity: 1,
+				intent_contract: {
+					items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+					confirmation_options: ["Looks right"],
+				},
+				intent_review: {
+					observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+					supporting_substitutions: [],
+					approval_options: ["Approve"],
+				},
+			},
+		};
+		// `_i` is the harness's own injected intent field; rejecting it fails an
+		// otherwise canonical payload the model has no way to repair.
+		const recovered = validateToolArguments(ask, {
+			id: "call-intent",
+			type: "toolCall",
+			name: "ask",
+			arguments: { _i: "Confirming topology", questions: [question] },
+		});
+		expect(recovered.questions[0].deepInterview.intent_contract).toBeDefined();
+		expect(recovered.questions[0].deepInterview.intent_review).toBeUndefined();
+
+		// A genuinely unknown root key must still be rejected.
+		expect(() =>
+			validateToolArguments(ask, {
+				id: "call-intent-stray",
+				type: "toolCall",
+				name: "ask",
+				arguments: { _i: "Confirming topology", stray: 1, questions: [question] },
+			}),
+		).toThrow('Validation failed for tool "ask"');
 	});
 	test("deferred ask validation matches eager AskTool on adversarial contracts", async () => {
 		const session = makeSession({ "tools.discoveryMode": "all" });

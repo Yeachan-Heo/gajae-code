@@ -1,12 +1,9 @@
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import type { ToolSession } from ".";
 import { askSchema, intentContract, intentReview, recoverRoundZeroIntentContract } from "./ask-contract";
+import { validateRawTodoArguments } from "./todo-contract";
 
 export const deferredAskParameters = askSchema;
-
-const TODO_WRITE_KEYS = new Set(["ops"]);
-const TODO_OP_KEYS = new Set(["op", "list", "task", "phase", "items", "text"]);
-const TODO_INIT_ENTRY_KEYS = new Set(["phase", "items"]);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -14,24 +11,12 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return prototype === Object.prototype || prototype === null;
 }
 
-function hasUnknownKeys(value: object, allowed: Set<string>): boolean {
-	return Object.keys(value).some(key => !allowed.has(key));
-}
-
-export function validateDeferredTodoArguments(arguments_: Record<string, unknown>): RawArgumentValidationResult {
-	if (hasUnknownKeys(arguments_, TODO_WRITE_KEYS)) return { outcome: "reject" };
-	if (!Array.isArray(arguments_.ops)) return { outcome: "passthrough" };
-	for (const entry of arguments_.ops) {
-		if (!isPlainRecord(entry)) continue;
-		if (hasUnknownKeys(entry, TODO_OP_KEYS)) return { outcome: "reject" };
-		if ((entry.op === "done" || entry.op === "drop") && !entry.task && !entry.phase) return { outcome: "reject" };
-		if (!Array.isArray(entry.list)) continue;
-		for (const item of entry.list) {
-			if (isPlainRecord(item) && hasUnknownKeys(item, TODO_INIT_ENTRY_KEYS)) return { outcome: "reject" };
-		}
-	}
-	return { outcome: "passthrough" };
-}
+/**
+ * The deferred registry and the loaded TodoWriteTool must reject and accept the
+ * same payloads: a divergence here fails the call before the tool can load, and
+ * the model has no way to see which rule it broke.
+ */
+export const validateDeferredTodoArguments = validateRawTodoArguments;
 
 export const validateDeferredAskArguments = (
 	arguments_: Record<string, unknown>,

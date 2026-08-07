@@ -1,5 +1,4 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
@@ -12,6 +11,7 @@ import type { ToolSession } from "../sdk";
 import type { SessionEntry } from "../session/session-manager";
 import { renderStatusLine, renderTreeList } from "../tui";
 import { PREVIEW_LIMITS } from "./render-utils";
+import { isDoneAlias, validateRawTodoArguments } from "./todo-contract";
 
 // =============================================================================
 // Types
@@ -45,15 +45,6 @@ export interface TodoWriteToolDetails {
 // =============================================================================
 // Schema
 // =============================================================================
-
-// Models reliably reach for `complete`/`completed` because the status this op sets is
-// spelled `completed` (see TodoStatus). Accepting them as exact aliases for `done`
-// removes a repeated hard tool failure without widening the operation vocabulary.
-const TODO_DONE_ALIASES = ["complete", "completed"] as const;
-
-function isDoneAlias(value: string): boolean {
-	return (TODO_DONE_ALIASES as readonly string[]).includes(value);
-}
 
 const TodoOp = z
 	.preprocess(
@@ -91,46 +82,6 @@ const TodoOpEntry = z.preprocess(
 		text: z.string().optional().describe("note text"),
 	}),
 );
-
-const TODO_WRITE_KEYS = new Set(["ops"]);
-const TODO_OP_KEYS = new Set(["op", "list", "task", "phase", "items", "text"]);
-const TODO_INIT_ENTRY_KEYS = new Set(["phase", "items"]);
-/** `content` is accepted only as a synonym the schema rewrites to `task`. */
-const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
-
-function hasUnknownKeys(value: object, allowed: Set<string>): boolean {
-	return Object.keys(value).some(key => !allowed.has(key));
-}
-
-function validateRawTodoArguments(arguments_: Record<string, unknown>): RawArgumentValidationResult {
-	if (hasUnknownKeys(arguments_, TODO_WRITE_KEYS)) return { outcome: "reject", code: "todo-write-unknown-root-key" };
-	if (!Array.isArray(arguments_.ops)) return { outcome: "passthrough" };
-	for (const entry of arguments_.ops) {
-		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
-		// `content` is normalized to `task` by the schema preprocessor, so it must not be
-		// rejected here as an unknown key first.
-		if (hasUnknownKeys(entry, TODO_OP_KEYS_WITH_ALIASES))
-			return { outcome: "reject", code: "todo-write-unknown-op-entry-key" };
-		const record = entry as Record<string, unknown>;
-		const op = typeof record.op === "string" && isDoneAlias(record.op) ? "done" : record.op;
-		const target = record.task ?? record.content;
-		if ((op === "done" || op === "drop") && !target && !record.phase) {
-			return { outcome: "reject", code: "todo-write-done-drop-requires-target" };
-		}
-		const list = record.list;
-		if (!Array.isArray(list)) continue;
-		for (const item of list) {
-			if (
-				typeof item === "object" &&
-				item !== null &&
-				!Array.isArray(item) &&
-				hasUnknownKeys(item, TODO_INIT_ENTRY_KEYS)
-			)
-				return { outcome: "reject", code: "todo-write-unknown-init-entry-key" };
-		}
-	}
-	return { outcome: "passthrough" };
-}
 
 const todoWriteSchema = z
 	.object({

@@ -319,6 +319,20 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		expect(message).toContain('Validation failed for tool "todo_write"');
 		expect(message).not.toContain("raw arguments rejected before coercion");
 	});
+
+	it("accepts the injected intent field alongside ops", () => {
+		const parsed = validateToolArguments(
+			tool,
+			call({ _i: "Tracking progress", ops: [{ op: "done", task: "status" }] }),
+		) as { ops: Array<{ op: string; task?: string }> };
+		expect(parsed.ops[0]).toEqual({ op: "done", task: "status" });
+	});
+
+	it("still rejects an unknown root key when the intent field is present", () => {
+		expect(() =>
+			validateToolArguments(tool, call({ _i: "Tracking progress", ops: [{ op: "done", task: "x" }], stray: 1 })),
+		).toThrow("todo_write root accepts only an ops array of operation entries");
+	});
 });
 
 describe("TodoWriteTool renderer", () => {
