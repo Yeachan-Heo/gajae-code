@@ -99,6 +99,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	"vercel-ai-gateway": "AI_GATEWAY_API_KEY",
 	zai: "ZAI_API_KEY",
 	"glm-zcode": "GLM_ZCODE_API_KEY",
+	"jetbrains-junie": "JUNIE_API_KEY",
 	mistral: "MISTRAL_API_KEY",
 	minimax: "MINIMAX_API_KEY",
 	"minimax-code": "MINIMAX_CODE_API_KEY",
@@ -221,6 +222,11 @@ export function formatProviderCredentialHint(provider: string): string {
 	if (isOpenCodeSubscription) {
 		parts.push(
 			"OpenCode subscriptions authenticate with an API key (created at https://opencode.ai/auth), not a separate session/OAuth token.",
+		);
+	}
+	if (provider === "jetbrains-junie") {
+		parts.push(
+			"JetBrains AI (Junie) authenticates with an access token generated at https://junie.jetbrains.com/cli; there is no OAuth login for this provider.",
 		);
 	}
 	if (envVar) {

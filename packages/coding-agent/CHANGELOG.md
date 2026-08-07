@@ -11,6 +11,7 @@
 ### Added
 
 - Added first-class `cline-pass` and `commandcode-goat` provider presets with documented API endpoints, environment-variable credentials, non-hardcoded live model discovery from models.dev and the Command Code Provider API, and prefix-based Claude routing.
+- Registered the `jetbrains-junie` provider in the famous-provider ordering and the `JUNIE_API_KEY` credential help so JetBrains AI (Junie) Claude models surface in `/model`, `--list-models` and `gjc --help` alongside the other first-class providers (#3626).
 - Added lease-backed MCP connection pooling with typed recovery, shared HTTP/SSE sessions, per-lease callback demultiplexing, and authorization binding scopes that keep credential secrets out of pool keys.
 - Added plugin registry v2 as the single execution authority for plugin tools, subskills, and prompt appendices, with digest verification at final use.
 - Added module-trace and process-tree RSS verification harnesses for startup-memory regressions.

@@ -283,6 +283,35 @@ providers:
     models:
       - id: glm-4.6
 ```
+
+### JetBrains AI (Junie)
+
+`jetbrains-junie` is a first-class provider serving JetBrains-hosted models through the documented
+Ingrazzio gateway (`https://ingrazzio-cloud-prod.labs.jb.gg`).
+
+Authenticate with an access token generated at [junie.jetbrains.com/cli](https://junie.jetbrains.com/cli):
+
+```sh
+export JUNIE_API_KEY=...
+```
+
+The token is sent as `Authorization: Bearer` — JetBrains AI rejects requests that also carry `x-api-key`, so
+this provider never lets the Anthropic SDK attach one. Usage is billed against your JetBrains AI
+subscription, so bundled per-token costs are zero. There is no OAuth login flow; the environment variable is
+the only supported credential source.
+
+The gateway multiplexes transports by model family:
+
+| Family | Models | Transport | Prompt limit |
+| --- | --- | --- | --- |
+| Claude | `claude-sonnet-4-6` (default), `claude-sonnet-5`, `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, `claude-fable-5` | `anthropic-messages` | 1M |
+| GPT | `gpt-5-2025-08-07`, `gpt-5.2-2025-12-11`, `gpt-5.4`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` | `openai-completions` | 922K |
+| GPT (Responses-only) | `gpt-5.3-codex` | `openai-responses` | 272K |
+
+All models cap output at 128K. Junie also exposes Gemini and Grok, but those ride a proprietary Grazie
+translation protocol that GJC does not implement, so they are deliberately not bundled. The bare
+`opus`/`sonnet`/`gpt`/`grok` aliases are Junie CLI shorthands the gateway itself rejects.
+
 ### Allowed auth/discovery values
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement

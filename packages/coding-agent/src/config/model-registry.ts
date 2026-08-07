@@ -3109,7 +3109,10 @@ export class ModelRegistry {
 	}
 	#applyHardcodedModelPolicies(models: Model<Api>[]): Model<Api>[] {
 		return models.map(model => {
-			if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
+			// `github-copilot` and `jetbrains-junie` both serve GPT-5.4 through their own
+			// gateway, which enforces a smaller prompt budget than the first-party 1M
+			// figure (Junie's is a probed 922K). Their bundled values are measured.
+			if (model.id !== "gpt-5.4" || model.provider === "github-copilot" || model.provider === "jetbrains-junie") {
 				return model;
 			}
 			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
