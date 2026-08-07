@@ -1327,6 +1327,60 @@ describe("config-root workflow settings migration", () => {
 		expect(result.backupExists).toBe(true);
 	});
 
+	test("an externally created backup survives an aborted migration", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source, agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":7}');
+		const backup = `${source}.bak`;
+		const sentinel = "external-backup-content";
+		// Simulate another process: as soon as this run publishes its pending
+		// marker, delete the legacy source and (if no backup exists yet) create
+		// one of its own. A backup this migration did not create must never be
+		// removed by an abort path.
+		const interceptor = Bun.spawn(
+			[
+				process.execPath,
+				"-e",
+				`
+				import * as fs from "node:fs";
+				const marker = ${JSON.stringify(`${source}.migrated`)};
+				const source = ${JSON.stringify(source)};
+				const backup = ${JSON.stringify(backup)};
+				const sentinel = ${JSON.stringify(sentinel)};
+				const timer = setInterval(() => {
+					if (!fs.existsSync(marker)) return;
+					clearInterval(timer);
+					fs.rmSync(source, { force: true });
+					try {
+						fs.writeFileSync(backup, sentinel, { flag: "wx" });
+					} catch { /* a migration-owned backup already exists */ }
+				}, 1);
+			`,
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		try {
+			const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+			expect(result.sourceExists).toBe(false);
+			// The patch never commits (the source vanishes before the move), so
+			// the target holds no migrated value.
+			expect(result.targetValue).toBeNull();
+			if (result.backupExists) {
+				// If a backup is present at the end, it must be the EXTERNAL sentinel
+				// (this run never created a backup it could later remove).
+				expect(await fs.readFile(backup, "utf8")).toBe(sentinel);
+			} else {
+				// The migration's own no-replace move already ran before the source
+				// deletion landed; its owned backup was removed by the post-move abort.
+				expect(result.markerStatus).toBeNull();
+			}
+		} finally {
+			interceptor.kill();
+		}
+	});
+
 	test("a pre-apply repair marker does not reclaim a matching user override after source deletion", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();

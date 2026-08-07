@@ -1555,6 +1555,10 @@ export class Settings implements NotificationSettingsReader {
 		// marker is retained as the only evidence its values are migration-written.
 		let pendingMarkerWritten = false;
 		let targetPatchCommitted = false;
+		// A `.bak` created by ANOTHER process after the initial backupExists check
+		// must never be removed by this migration: abort paths may delete a backup
+		// only when this run created it (after a successful no-replace move).
+		let backupCreatedByThisRun = false;
 		try {
 			await withAtomicYamlConfigTransaction(target, async tx => {
 				// A config.yml written by a NEWER schema version is intentionally
@@ -2332,19 +2336,19 @@ export class Settings implements NotificationSettingsReader {
 					// clear the now-obsolete marker so the deletion is honored (the
 					// later post-copy deletion path does the same).
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
 					await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 					this.#warnLegacyFallbackMigration(
-						`Settings: config-root workflow migration aborted: ${source} was deleted during migration; target reverted, backup removed, marker cleared`,
+						`Settings: config-root workflow migration aborted: ${source} was deleted during migration; target reverted, ${backupCreatedByThisRun ? "backup removed" : "external backup preserved"}, marker cleared`,
 					);
 					return;
 				}
 				if (preMoveSourceHash !== sourceSha256) {
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
 					await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 					this.#warnLegacyFallbackMigration(
-						`Settings: config-root workflow migration aborted: ${source} changed during migration; target reverted, backup removed, marker cleared`,
+						`Settings: config-root workflow migration aborted: ${source} changed during migration; target reverted, ${backupCreatedByThisRun ? "backup removed" : "external backup preserved"}, marker cleared`,
 					);
 					return;
 				}
@@ -2359,6 +2363,7 @@ export class Settings implements NotificationSettingsReader {
 					);
 					return;
 				}
+				backupCreatedByThisRun = true;
 
 				// The source may have been edited in the narrow window after the
 				// pre-move check but before/during the move; verify the bytes we
@@ -2369,7 +2374,7 @@ export class Settings implements NotificationSettingsReader {
 				// file (never completing behind a stale hash).
 				if ((await this.#sha256File(backup)) !== sourceSha256) {
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
 					this.#warnLegacyFallbackMigration(
 						`Settings: config-root workflow migration aborted: ${source} changed during migration; target reverted, backup removed, source left active for the next load`,
 					);
@@ -2393,7 +2398,7 @@ export class Settings implements NotificationSettingsReader {
 					// values and silently undoing the deletion.
 					if (isEnoent(error)) {
 						await tx.replaceCurrent(prePatchTargetSnapshot);
-						await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+						if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
 						await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 						this.#warnLegacyFallbackMigration(
 							`Settings: config-root workflow migration aborted: ${source} was deleted during migration; target reverted, backup removed, marker cleared`,
@@ -2411,7 +2416,7 @@ export class Settings implements NotificationSettingsReader {
 				}
 				if (sourceHashAfterMove !== null && sourceHashAfterMove !== sourceSha256) {
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
 					this.#warnLegacyFallbackMigration(
 						`Settings: config-root workflow migration aborted: ${source} edited after the copy; target reverted, backup removed, source left active for the next load`,
 					);
