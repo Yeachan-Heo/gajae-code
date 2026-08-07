@@ -2546,6 +2546,14 @@ const OPENCODE_GO_OFFICIAL_MODELS: Readonly<Record<string, OpenCodeGoOfficialMod
 		reasoning: true,
 		cost: { input: 0.95, output: 4, cacheRead: 0.19, cacheWrite: 0 },
 	},
+	"kimi-k3": {
+		name: "Kimi K3 (2x usage)",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
+	},
 	"minimax-m2.5": {
 		name: "MiniMax M2.5",
 		contextWindow: 204_800,

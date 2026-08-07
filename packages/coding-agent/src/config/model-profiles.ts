@@ -100,9 +100,9 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "openai-codex/gpt-5.6-luna:max",
 	}),
 	profile("opencodego", ["opencode-go"], {
-		default: "opencode-go/kimi-k2.6",
+		default: "opencode-go/kimi-k3",
 		executor: "opencode-go/deepseek-v4-flash",
-		planner: "opencode-go/qwen3.7-max",
+		planner: "opencode-go/kimi-k3",
 		critic: "opencode-go/mimo-v2.5-pro",
 		architect: "opencode-go/deepseek-v4-pro",
 	}),
@@ -329,7 +329,7 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	profile("codex-opencodego", ["openai-codex", "opencode-go"], {
 		default: "openai-codex/gpt-5.6-sol:low",
 		executor: "opencode-go/deepseek-v4-pro",
-		planner: "opencode-go/kimi-k2.6",
+		planner: "opencode-go/kimi-k3",
 		critic: "opencode-go/mimo-v2.5-pro",
 		architect: "openai-codex/gpt-5.6-sol:high",
 	}),

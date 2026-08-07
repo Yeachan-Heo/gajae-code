@@ -98,7 +98,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			}),
 			model("anthropic", "claude-sonnet-5"),
 			model("opencode-go", "deepseek-v4-pro"),
-			model("opencode-go", "kimi-k2.6"),
+			model("opencode-go", "kimi-k3"),
 			model("opencode-go", "mimo-v2.5-pro"),
 			model("minimax-code", "MiniMax-M3"),
 			model("minimax-code-cn", "MiniMax-M3"),
@@ -591,7 +591,7 @@ describe("model profile activation", () => {
 			{
 				default: "openai-codex/gpt-5.6-sol:low",
 				executor: "opencode-go/deepseek-v4-pro",
-				planner: "opencode-go/kimi-k2.6",
+				planner: "opencode-go/kimi-k3",
 				critic: "opencode-go/mimo-v2.5-pro",
 				architect: "openai-codex/gpt-5.6-sol:high",
 			},

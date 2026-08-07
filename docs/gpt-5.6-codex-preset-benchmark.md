@@ -120,7 +120,7 @@ The selected-task data show that Luna xhigh used more reported tokens than Luna 
 | `codex-medium` | `openai-codex/gpt-5.6-sol:low` | `openai-codex/gpt-5.6-terra:low` | `openai-codex/gpt-5.6-terra:high` | `openai-codex/gpt-5.6-sol:xhigh` | `openai-codex/gpt-5.6-sol:high` |
 | `codex-pro` | `openai-codex/gpt-5.6-sol:medium` | `openai-codex/gpt-5.6-terra:medium` | `openai-codex/gpt-5.6-sol:high` | `openai-codex/gpt-5.6-sol:max` | `openai-codex/gpt-5.6-sol:xhigh` |
 | `opus-codex` | `anthropic/claude-opus-5:xhigh` | `openai-codex/gpt-5.6-terra:low` | `anthropic/claude-sonnet-5` | `openai-codex/gpt-5.6-sol:xhigh` | `openai-codex/gpt-5.6-sol:high` |
-| `codex-opencodego` | `openai-codex/gpt-5.6-sol:low` | `opencode-go/deepseek-v4-pro` | `opencode-go/kimi-k2.6` | `opencode-go/mimo-v2.5-pro` | `openai-codex/gpt-5.6-sol:high` |
+| `codex-opencodego` | `openai-codex/gpt-5.6-sol:low` | `opencode-go/deepseek-v4-pro` | `opencode-go/kimi-k3` | `opencode-go/mimo-v2.5-pro` | `openai-codex/gpt-5.6-sol:high` |
 | `fable-opus-codex` | `anthropic/claude-fable-5:high` | `openai-codex/gpt-5.6-terra:medium` | `anthropic/claude-opus-5:medium` | `anthropic/claude-opus-5:high` | `openai-codex/gpt-5.6-sol:xhigh` |
 
 ## Limitations

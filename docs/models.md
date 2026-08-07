@@ -234,7 +234,7 @@ Cancellation discards provisional output and emits exactly one cancelled `agent_
 Built-in profiles are grouped by provider mix and tier:
 
 - `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort; `lunamaxxing` — OpenAI Codex Luna-only profile with maximum reasoning on delegated roles
-- `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
+- `opencodego` — single OpenCode Go preset (Kimi K3 default and planner, DeepSeek executor/architect, MiMo critic)
 - `claude-opus` — Anthropic OAuth preset centered on `claude-opus-5`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
 - Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model

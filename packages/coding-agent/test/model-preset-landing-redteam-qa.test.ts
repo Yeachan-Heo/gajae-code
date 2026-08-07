@@ -42,7 +42,7 @@ const builtinComboModels = [
 	model("anthropic", "claude-fable-5", Effort.Low),
 	model("anthropic", "claude-sonnet-5"),
 	model("opencode-go", "deepseek-v4-pro"),
-	model("opencode-go", "kimi-k2.6"),
+	model("opencode-go", "kimi-k3"),
 	model("opencode-go", "mimo-v2.5-pro"),
 ];
 
@@ -70,7 +70,7 @@ const combo: ModelProfileDefinition = {
 const comboOpencode: ModelProfileDefinition = {
 	name: "codex-opencodego",
 	requiredProviders: ["openai-codex", "opencode-go"],
-	modelMapping: { default: "opencode-go/kimi-k2.6", executor: "openai-codex/gpt-5.5:low" },
+	modelMapping: { default: "opencode-go/kimi-k3", executor: "openai-codex/gpt-5.5:low" },
 	source: "builtin",
 };
 const minimax: ModelProfileDefinition = {
@@ -349,7 +349,7 @@ describe("preset landing adversarial QA", () => {
 		const text = await rendered(selector);
 		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-sol");
 		expect(text).toContain("EXECUTOR: opencode-go/deepseek-v4-pro");
-		expect(text).toContain("PLANNER: opencode-go/kimi-k2.6");
+		expect(text).toContain("PLANNER: opencode-go/kimi-k3");
 		expect(text).toContain("CRITIC: opencode-go/mimo-v2.5-pro");
 		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-sol");
 	});
