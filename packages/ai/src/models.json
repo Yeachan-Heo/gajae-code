@@ -13317,8 +13317,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
-			"maxTokens": 64000,
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
 			"headers": {
 				"X-LLM-Model": "anthropic",
 				"X-Keep-Path": "true"
@@ -13346,8 +13346,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
-			"maxTokens": 64000,
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
 			"headers": {
 				"X-LLM-Model": "anthropic",
 				"X-Keep-Path": "true"
@@ -13375,8 +13375,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
-			"maxTokens": 64000,
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
 			"headers": {
 				"X-LLM-Model": "anthropic",
 				"X-Keep-Path": "true"
@@ -13404,8 +13404,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
-			"maxTokens": 64000,
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
 			"headers": {
 				"X-LLM-Model": "anthropic",
 				"X-Keep-Path": "true"

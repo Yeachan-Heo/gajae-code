@@ -224,6 +224,11 @@ export function formatProviderCredentialHint(provider: string): string {
 			"OpenCode subscriptions authenticate with an API key (created at https://opencode.ai/auth), not a separate session/OAuth token.",
 		);
 	}
+	if (provider === "jetbrains-junie") {
+		parts.push(
+			"JetBrains AI (Junie) authenticates with an access token generated at https://junie.jetbrains.com/cli; there is no OAuth login for this provider.",
+		);
+	}
 	if (envVar) {
 		parts.push(
 			`Headless GJC reads this provider's key from ${envVar} (exported in your shell or set in ~/.gjc/.env).`,

@@ -3,7 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { getBundledModel, getBundledModels } from "../src/models";
 import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { buildAnthropicClientOptions, buildAnthropicHeaders } from "../src/providers/anthropic";
-import { complete, getEnvApiKey } from "../src/stream";
+import { complete, formatMissingApiKeyError, getEnvApiKey } from "../src/stream";
 import { KNOWN_PROVIDERS } from "../src/types";
 import { getOAuthProviders } from "../src/utils/oauth";
 import { withEnv } from "./helpers";
@@ -40,6 +40,11 @@ describe("JetBrains Junie provider", () => {
 			expect(model.baseUrl).toBe(JUNIE_BASE_URL);
 			expect(model.headers?.["X-LLM-Model"]).toBe("anthropic");
 			expect(model.headers?.["X-Keep-Path"]).toBe("true");
+			// Gateway-enforced ceilings, probed live. Junie CLI sends far smaller
+			// per-model budgets (20k-60k), but those are its own policy, not the
+			// endpoint limit -- do not copy them back in.
+			expect(model.contextWindow).toBe(1_000_000);
+			expect(model.maxTokens).toBe(128_000);
 		}
 	});
 
@@ -95,6 +100,14 @@ describe("JetBrains Junie provider", () => {
 		expect(requestUrl).toBe(`${JUNIE_BASE_URL}/v1/messages`);
 		expect(authorization).toBe(`Bearer ${API_KEY}`);
 		expect(hasApiKeyHeader).toBe(false);
+	});
+
+	it("tells the user where to get a key, and does not offer a login flow", () => {
+		const message = formatMissingApiKeyError("jetbrains-junie");
+		expect(message).toContain("JUNIE_API_KEY");
+		expect(message).toContain("https://junie.jetbrains.com/cli");
+		// There is no OAuth for this provider; suggesting /login would dead-end the user.
+		expect(message).not.toContain("/login");
 	});
 
 	it("exposes no OAuth login surface", () => {

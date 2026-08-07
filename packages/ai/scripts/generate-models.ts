@@ -165,6 +165,13 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
  * Messages transport, adaptive thinking and the `x-llm-model: anthropic` routing
  * header were captured from Junie CLI 2470.4 traffic against the documented
  * Ingrazzio gateway.
+ *
+ * `contextWindow` and `maxTokens` are the gateway's own enforced ceilings, probed
+ * directly rather than copied from Junie CLI's request values (the CLI sends much
+ * smaller per-model budgets, which are its own policy, not the endpoint limit).
+ * Over-limit requests are rejected with `prompt is too long: N tokens > 1000000
+ * maximum` and `max_tokens: N > 128000, which is the maximum allowed number of
+ * output tokens`; all four models report identical ceilings.
  */
 export const JETBRAINS_JUNIE_BASE_URL = "https://ingrazzio-cloud-prod.labs.jb.gg";
 
@@ -173,13 +180,18 @@ const JETBRAINS_JUNIE_HEADERS: Record<string, string> = {
 	"X-Keep-Path": "true",
 };
 
+/** Gateway-enforced prompt ceiling, probed against the live endpoint. */
+const JETBRAINS_JUNIE_CONTEXT_WINDOW = 1_000_000;
+/** Gateway-enforced output ceiling, probed against the live endpoint. */
+const JETBRAINS_JUNIE_MAX_TOKENS = 128_000;
+
 export function injectJetBrainsJunieModels(models: Model[]): void {
 	const junieModels: Model<"anthropic-messages">[] = [
-		{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
-		{ id: "claude-sonnet-5", name: "Claude Sonnet 5 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
-		{ id: "claude-opus-4-8", name: "Claude Opus 4.8 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
-		{ id: "claude-opus-5", name: "Claude Opus 5 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
-	].map(({ id, name, contextWindow, maxTokens }) => ({
+		{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (Junie)" },
+		{ id: "claude-sonnet-5", name: "Claude Sonnet 5 (Junie)" },
+		{ id: "claude-opus-4-8", name: "Claude Opus 4.8 (Junie)" },
+		{ id: "claude-opus-5", name: "Claude Opus 5 (Junie)" },
+	].map(({ id, name }) => ({
 		id,
 		name,
 		api: "anthropic-messages",
@@ -189,8 +201,8 @@ export function injectJetBrainsJunieModels(models: Model[]): void {
 		input: ["text", "image"],
 		// JetBrains bills these through a JetBrains AI subscription, not per token.
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow,
-		maxTokens,
+		contextWindow: JETBRAINS_JUNIE_CONTEXT_WINDOW,
+		maxTokens: JETBRAINS_JUNIE_MAX_TOKENS,
 		// `applyGeneratedModelPolicies` derives the adaptive thinking config from the model id.
 		headers: JETBRAINS_JUNIE_HEADERS,
 	}));
