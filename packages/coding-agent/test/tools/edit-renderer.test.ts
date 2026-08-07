@@ -173,7 +173,6 @@ describe("editToolRenderer", () => {
 		expect(Bun.stripANSI(partial.render(160).join("\n"))).not.toContain("*** End Patch");
 		expect(Bun.stripANSI(complete.render(160).join("\n"))).toContain("*** End Patch");
 	});
-
 	it("hides hashline envelope input while the live card is collapsed", async () => {
 		await getUiTheme();
 		const uiStub = { requestRender() {} } as unknown as TUI;
