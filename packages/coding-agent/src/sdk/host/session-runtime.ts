@@ -1246,9 +1246,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
 		await reconciliation.hydrate();
 		const sessionFile =
-			typeof ctx.sessionManager.getSessionFile === "function"
-				? ctx.sessionManager.getSessionFile()
-				: path.join(stateRoot, `${sessionId}.jsonl`);
+			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
+			path.join(stateRoot, `${sessionId}.jsonl`);
 		const steerReconciliation = createKindAwareReconciliation({
 			store: createReconciliationStore({ sessionFile, sessionId }),
 		});

@@ -13,7 +13,7 @@ interface Harness {
 	persistedAtDispatch?: string;
 }
 
-function createHarness(cwd: string, sessionId: string, sessionFile: string): Harness {
+function createHarness(cwd: string, sessionId: string, sessionFile: string | undefined): Harness {
 	const handlers = new Map<string, (event: unknown, context: ExtensionContext) => unknown>();
 	let receive: ((connectionId: string, frame: never) => void) | undefined;
 	let response: Record<string, unknown> | undefined;
@@ -42,7 +42,11 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string): Har
 		sendUserMessage: async () => {
 			dispatches++;
 			persistedAtDispatch = await fs.readFile(
-				path.join(path.dirname(sessionFile), ".sdk-reconciliation", `${sessionId}.json`),
+				path.join(
+					path.dirname(sessionFile ?? path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`)),
+					".sdk-reconciliation",
+					`${sessionId}.json`,
+				),
 				"utf8",
 			);
 		},
@@ -151,6 +155,33 @@ test("production SDK host correlates durable steer replay and restart without re
 			result: { accepted: false, status: "uncertain" },
 		});
 		expect(restarted.dispatches).toBe(0);
+		await restarted.stop();
+	} finally {
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("production SDK host persists steer reconciliation under state root when session file is undefined", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-state-root-"));
+	try {
+		const sessionId = "in-memory-host-steer";
+		const harness = createHarness(cwd, sessionId, undefined);
+		await harness.start();
+		const accepted = await control(harness, "accept", "private steer text", "state-root-ref");
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "state-root-ref" } });
+		const persisted = await fs.readFile(
+			path.join(cwd, ".gjc", "state", ".sdk-reconciliation", `${sessionId}.json`),
+			"utf8",
+		);
+		expect(persisted).toContain('"status":"accepted"');
+		expect(persisted).not.toContain("private steer text");
+		await harness.stop();
+		const restarted = createHarness(cwd, sessionId, undefined);
+		await restarted.start();
+		expect(await query(restarted, "restart", { clientRef: "state-root-ref" })).toMatchObject({
+			ok: true,
+			result: { status: "uncertain", error: { code: "process_restart_uncertain" } },
+		});
 		await restarted.stop();
 	} finally {
 		await fs.rm(cwd, { recursive: true, force: true });
