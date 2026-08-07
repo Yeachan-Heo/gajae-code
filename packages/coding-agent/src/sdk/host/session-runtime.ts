@@ -627,6 +627,7 @@ export function createSdkSurfaceFactory(
 		configOverrides: options.configOverrides,
 		promptStatusLookup: options.promptStatusLookup,
 		skillStatusLookup: options.skillStatusLookup,
+		steerStatusLookup: options.steerStatusLookup,
 		hostTools: options.hostTools,
 	});
 	return {

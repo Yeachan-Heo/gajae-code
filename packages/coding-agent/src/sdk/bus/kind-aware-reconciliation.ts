@@ -420,13 +420,24 @@ export function createKindAwareReconciliation(
 		const run = async () => {
 			const loaded = await store.load();
 			const candidate = new Map(
-				loaded.map(
-					record =>
-						[
-							record.kind === "steer" ? steerKey(record.clientRef) : keyOf(record.kind, record),
-							{ ...record },
-						] as const,
-				),
+				loaded.map(record => {
+					const hydrated =
+						record.kind === "steer" && record.status === "accepted"
+							? {
+									...record,
+									status: "uncertain" as const,
+									settledAt: now(),
+									error: {
+										code: "process_restart_uncertain",
+										message: "Steer delivery cannot be proven after process restart.",
+									},
+								}
+							: { ...record };
+					return [
+						record.kind === "steer" ? steerKey(record.clientRef) : keyOf(record.kind, record),
+						hydrated,
+					] as const;
+				}),
 			);
 			const candidateIndex = indexRecords(candidate);
 			await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
