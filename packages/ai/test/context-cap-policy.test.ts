@@ -28,6 +28,11 @@ describe("Codex GPT-5.6 context cap policy", () => {
 		expect(resolveCodexGpt56DiscoveryContext(identity, undefined)).toBe(372_000);
 		expect(resolveCodexGpt56DiscoveryContext(identity, 373_000)).toBe(372_000);
 		expect(resolveCodexGpt56DiscoveryContext(identity, 200_000)).toBe(200_000);
+		// Non-5.6 Codex rows keep the generic 272K fallback — the 372K authority
+		// never leaks into unrelated discovery rows with absent metadata.
+		expect(resolveCodexGpt56DiscoveryContext(model({ id: "gpt-5.5" }), undefined)).toBe(272_000);
+		expect(resolveCodexGpt56DiscoveryContext(model({ id: "gpt-5.6-codex" }), undefined)).toBe(272_000);
+		expect(resolveCodexGpt56DiscoveryContext(model({ id: "gpt-5.5" }), 373_000)).toBe(373_000);
 	});
 
 	it("scopes the ceiling to exact tiers and Codex product transports", () => {

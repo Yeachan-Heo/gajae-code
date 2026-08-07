@@ -27,6 +27,7 @@ describe("OpenAI Codex defaults", () => {
 			const model = getBundledModel("openai-codex", id);
 			expect(model.contextWindow).toBe(372_000);
 			expect(model.maxTokens).toBe(128_000);
+			expect(model.longContextPricing?.threshold).toBe(272_000);
 		}
 	});
 });
