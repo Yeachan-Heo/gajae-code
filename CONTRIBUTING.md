@@ -54,7 +54,7 @@ If it is already lost, recover with `git checkout origin/dev -- packages/<pkg>/C
 
 ## Nightly release operations
 
-The `CI` workflow publishes a nightly prerelease from `main` at 04:23 UTC. Maintainers can run the same cycle with **Run workflow → nightly-release**. The run must pass the complete main check/test graph before publication, then publishes all public packages under the npm `nightly` dist-tag and creates a matching immutable GitHub prerelease with binaries and package-evidence assets. Do not create or move nightly tags manually, and do not edit package versions or `[Unreleased]` changelog sections for a nightly run; version staging is ephemeral inside CI.
+The `CI` workflow publishes a scheduled nightly prerelease from `main` at 04:23 UTC. Maintainers can run the same cycle with **Run workflow → nightly-release**, but manual dispatches must select the `dev` branch: the workflow's `release_metadata` gate rejects manual nightlies from `main` or any other ref. The run must pass the complete dev check/test graph before publication, then publishes all public packages under the npm `nightly` dist-tag and creates a matching immutable GitHub prerelease with binaries and package-evidence assets. Do not create or move nightly tags manually, and do not edit package versions or `[Unreleased]` changelog sections for a nightly run; version staging is ephemeral inside CI.
 
 ## PR checklist
 
