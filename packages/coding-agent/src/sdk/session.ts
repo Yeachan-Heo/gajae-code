@@ -112,6 +112,7 @@ import {
 	SPAWN_PROVENANCE_ENV,
 	shouldRegisterGenericNotificationsExtension,
 } from "../sdk/bus/config";
+import { createReconciliationStore } from "../sdk/bus/reconciliation-store";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
@@ -2240,9 +2241,45 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						});
 					} else if (sdkHostEligible) {
 						registerSdkOnlyNotificationCommand(api);
+						let sdkOnlyReconciliationStore:
+							| { sessionId: string; store: ReturnType<typeof createReconciliationStore> }
+							| undefined;
 						const { createSdkWebSocketTransport } = await import("../sdk/host/websocket-transport");
 						createSdkSessionRuntimeExtension(api, {
 							createTransport: input => createSdkWebSocketTransport(input),
+							// INTERNAL terminal-abort seams, threaded directly from the
+							// owning session (NOT on the public extension context).
+							terminalAbortSeams: {
+								getReconciliationStore: () => {
+									const sessionId = sessionManager.getSessionId();
+									if (!sdkOnlyReconciliationStore || sdkOnlyReconciliationStore.sessionId !== sessionId) {
+										sdkOnlyReconciliationStore = {
+											sessionId,
+											store: createReconciliationStore({
+												sessionFile: sessionManager.getSessionFile(),
+												sessionId,
+											}),
+										};
+									}
+									return sdkOnlyReconciliationStore.store;
+								},
+								getTerminalTurnEpoch: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.getTerminalTurnEpoch();
+								},
+								getActivePromptHandle: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.activePromptHandle;
+								},
+								cancelPendingPreflightForTerminalAbort: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									session.cancelPendingPreflightForTerminalAbort();
+								},
+								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.abortPromptAndWait(handle, seamOptions);
+								},
+							},
 						});
 					}
 				} catch (error) {

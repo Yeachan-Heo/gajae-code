@@ -8,6 +8,7 @@ import {
 	type SessionSdkTransport,
 } from "./session-runtime";
 import { createSdkCapabilities, createSdkSurfacePolicy } from "./surface-policy";
+import { createReconciliationStore } from "../bus/reconciliation-store";
 import type { SdkFrame } from "./types";
 import { SdkTransportLifecycleError } from "./websocket-transport";
 
@@ -59,6 +60,7 @@ function extensionContext(sessionId: string, cwd: string): any {
 		sdkBindings: () => [],
 		sessionManager: {
 			getSessionId: () => sessionId,
+			getSessionFile: () => path.join(cwd, `${sessionId}.json`),
 			getSessionName: () => undefined,
 		},
 	};
@@ -105,6 +107,117 @@ describe("SessionSdkSessionRuntime", () => {
 		);
 		await runtime.stop();
 	});
+	test("SDK-only host admits, replays, and conflicts terminal abort requests durably", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-abort-"));
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const seamCalls: Array<{ handle: string; scope: string }> = [];
+		let activeHandle: string | undefined = "exact-run-handle";
+		let activeEpoch: number | undefined = 7;
+		createSdkSessionRuntimeExtension(api, {
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => activeEpoch,
+				getActivePromptHandle: () => activeHandle,
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async (handle, options) => {
+					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = extensionContext(transport.sessionId, cwd);
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			const request = {
+				type: "control_request",
+				id: "terminal-abort-1",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "terminal-key-1",
+			} as SdkFrame;
+			transport.feed("client", request);
+			await Bun.sleep(25);
+			expect(seamCalls).toEqual([{ handle: "exact-run-handle", scope: "turn" }]);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-1",
+						ok: true,
+						result: expect.objectContaining({ turn: "stopped" }),
+					}),
+				]),
+			);
+
+			transport.feed("client", { ...request, id: "terminal-abort-replay" });
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-replay",
+						ok: true,
+					}),
+				]),
+			);
+
+			transport.feed("client", {
+				...request,
+				id: "terminal-abort-conflict",
+				input: { mode: "terminal", scope: "owned" },
+			});
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-conflict",
+						ok: false,
+						error: expect.objectContaining({ code: "idempotency_conflict" }),
+					}),
+				]),
+			);
+
+			activeHandle = undefined;
+			activeEpoch = undefined;
+			const idleRequest = { ...request, id: "terminal-abort-idle", idempotencyKey: "terminal-idle-key" };
+			transport.feed("client", idleRequest);
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			activeHandle = "later-run-handle";
+			activeEpoch = 8;
+			transport.feed("client", { ...idleRequest, id: "terminal-abort-idle-replay" });
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-idle-replay",
+						ok: true,
+						result: expect.objectContaining({ turn: "no_active_turn" }),
+					}),
+				]),
+			);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("native-like and loopback transports share the same SDK contract matrix", async () => {
 		const nativePolicy = createSdkSurfacePolicy({
 			bindings: ["sdkControl", "cycleModel", "getSkillState"],
