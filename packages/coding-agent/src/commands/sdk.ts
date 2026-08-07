@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
@@ -246,6 +247,22 @@ export async function openLifecycleSessionManager(
 	return { parsed, sessionManager };
 }
 
+/**
+ * Starts the memory backend a lifecycle session deferred past its readiness
+ * window.
+ *
+ * Deliberately not awaited: the local backend summarises every queued rollout
+ * through the model, so its duration scales with the backlog and would eat the
+ * broker's readiness budget. The session is already published as ready here, so
+ * a failure is a degraded-memory condition, not a startup failure — it is
+ * logged and swallowed instead of surfacing as an unhandled rejection.
+ */
+export function startMemoryBackendAfterReadiness(start: () => Promise<void>): void {
+	void start().catch(error => {
+		logger.warn("Deferred memory backend startup failed after readiness", { error: String(error) });
+	});
+}
+
 /** Runs the same persisted AgentSession bootstrap used by the production CLI. */
 export async function runSessionHost(
 	timing: {
@@ -438,7 +455,7 @@ export async function runSessionHost(
 
 		throw created.failure;
 	}
-	const { session, capability, rollback } = created;
+	const { session, capability, rollback, startDeferredMemoryBackend } = created;
 	let sessionDisposal: Promise<void> | undefined;
 	const disposeSession = (): Promise<void> => {
 		sessionDisposal ??= session.dispose().catch(() => {});
@@ -553,6 +570,10 @@ export async function runSessionHost(
 		await failAfterRollback(durableFailure);
 		throw error;
 	}
+	// Readiness is published; the session is live. Memory startup issues one LLM
+	// request per queued rollout, so it must run outside the readiness window and
+	// its failure must never take the session down.
+	startMemoryBackendAfterReadiness(startDeferredMemoryBackend);
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
 	// A detached host whose broker is gone for good would otherwise live (and

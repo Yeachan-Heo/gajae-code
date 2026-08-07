@@ -1632,8 +1632,11 @@ export async function runRootCommand(
 		sessionOptions.deferMcpConfigStartup = true;
 	}
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
-	const deferMemoryBackendStartup =
-		hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive) && mode !== "acp";
+	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
+	// session here, and the broker-launched lifecycle child defers memory startup
+	// unconditionally (createLifecycleAgentSession) so readiness never waits on
+	// the memory pipeline's LLM work.
+	const deferMemoryBackendStartup = hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive);
 	sessionOptions.deferMemoryBackendStartup = deferMemoryBackendStartup;
 
 	// Research-mode (RLM) preset: augment session options before session creation.

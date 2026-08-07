@@ -53,6 +53,33 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("Request was aborted");
 	});
 
+	it("keeps the payload of a non-Error object throwable", () => {
+		// SDK lifecycle startup failures are thrown as plain records, not Errors;
+		// String(record) used to reduce the whole crash to "[object Object]".
+		const target = tempCrashLog();
+		const written = recordFatalCrash(
+			"Uncaught Exception",
+			{ phase: "startup", reason: "pending", message: "SDK startup did not complete before readiness cutoff." },
+			{ path: target },
+		);
+		expect(written).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).not.toContain("[object Object]");
+		expect(contents).toContain('"phase":"startup"');
+		expect(contents).toContain('"reason":"pending"');
+		expect(contents).toContain("SDK startup did not complete before readiness cutoff.");
+	});
+
+	it("still records a throwable that cannot be serialized", () => {
+		const target = tempCrashLog();
+		const cyclic: { self?: unknown; marker: string } = { marker: "cyclic-throwable" };
+		cyclic.self = cyclic;
+		const written = recordFatalCrash("Unhandled Rejection", cyclic, { path: target });
+		expect(written).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("[Unhandled Rejection]");
+	});
+
 	it("appends successive crashes rather than overwriting", () => {
 		const target = tempCrashLog();
 		recordFatalCrash("Uncaught Exception", new Error("first"), { path: target });

@@ -190,8 +190,33 @@ function installProcessStdoutWriteClassifier(): void {
 	process.stdout.write = markedWrite as typeof process.stdout.write;
 }
 
+/**
+ * Render a non-`Error` throwable so the crash record keeps its payload.
+ *
+ * `String(value)` collapses every plain object to `[object Object]`, which is
+ * exactly how SDK lifecycle startup failures (`{ phase, reason, message }` are
+ * thrown as records, not `Error`s) used to reach the log with no diagnostic
+ * left. Serialize own properties instead, and stay defensive: a throwing
+ * `toString`/`toJSON` or a cycle must never mask the original fatal.
+ */
+function describeThrowable(reason: unknown): string {
+	if (typeof reason === "object" && reason !== null) {
+		try {
+			const serialized = JSON.stringify(reason);
+			if (typeof serialized === "string") return serialized;
+		} catch {
+			// Cyclic or non-serializable payload; fall through to String().
+		}
+	}
+	try {
+		return String(reason);
+	} catch {
+		return "[unserializable throwable]";
+	}
+}
+
 function errorForDiagnostic(reason: unknown): Error {
-	return reason instanceof Error ? reason : new Error(String(reason));
+	return reason instanceof Error ? reason : new Error(describeThrowable(reason));
 }
 
 // Register signal and error event handlers to trigger cleanup before exit.
