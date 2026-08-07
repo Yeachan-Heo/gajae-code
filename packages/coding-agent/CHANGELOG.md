@@ -10,6 +10,7 @@
 
 ### Added
 
+- The SDK `models.list/current` (Q10) catalog now lists model profiles as synthetic `gajae-code/<profile>` entries (e.g. `gajae-code/codex-eco`), and selecting one through `model.set` (or the ACP Model picker) activates the profile for the live session only; global persistence remains the explicit `gjc --mpreset <name> --default` or TUI default-selection path. ACP/SDK clients such as Paseo can therefore offer presets like ordinary models; only availability-filtered profiles are advertised, the reserved `gajae-code` namespace fails closed on collision, and `config.patch` serializes with profile activation through the session admission boundary.
 - Added first-class `cline-pass` and `commandcode-goat` provider presets with documented API endpoints, environment-variable credentials, non-hardcoded live model discovery from models.dev and the Command Code Provider API, and prefix-based Claude routing.
 - Added lease-backed MCP connection pooling with typed recovery, shared HTTP/SSE sessions, per-lease callback demultiplexing, and authorization binding scopes that keep credential secrets out of pool keys.
 - Added plugin registry v2 as the single execution authority for plugin tools, subskills, and prompt appendices, with digest verification at final use.

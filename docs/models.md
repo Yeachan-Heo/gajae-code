@@ -251,6 +251,12 @@ gjc --mpreset opencodego --default
 ```
 
 The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically.
+External SDK/ACP clients (e.g. the Paseo TUI) can select profiles like ordinary
+models: the SDK `models.list/current` (Q10) catalog exposes every usable profile
+as a synthetic `gajae-code/<profile>` entry (e.g. `gajae-code/codex-eco`), and
+selecting one through `model.set` (or the ACP Model picker) activates the
+profile for the live session only. Persisting a profile remains an explicit TUI
+choice, mirroring `gjc --mpreset <name> --default`. See [SDK model profiles](./sdk.md#model-profiles-as-synthetic-models-gajae-codeprofile).
 
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 

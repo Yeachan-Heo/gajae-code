@@ -147,3 +147,150 @@ describe("Q10 model projection", () => {
 		).toThrow(`Invalid thinking metadata for test/reasoning: ${reason}`);
 	});
 });
+describe("Q10 synthetic profile facade", () => {
+	const profile = (
+		overrides: Record<string, unknown> = {},
+	): {
+		name: string;
+		requiredProviders: string[];
+		modelMapping: Record<string, string>;
+		source: "builtin";
+		displayName?: string;
+	} => ({
+		name: "codex-eco",
+		requiredProviders: ["openai-codex"],
+		modelMapping: { default: "openai-codex/gpt-5.6-terra:low" },
+		source: "builtin",
+		...overrides,
+	});
+
+	const profiles = new Map<
+		string,
+		{
+			name: string;
+			requiredProviders: string[];
+			modelMapping: Record<string, string>;
+			source: "builtin";
+			displayName?: string;
+		}
+	>([
+		["codex-eco", profile({ displayName: "Codex Eco" })],
+		["codex-medium", profile({ name: "codex-medium" })],
+		["opencodego", profile({ name: "opencodego", requiredProviders: ["opencode-go"] })],
+	]);
+
+	const plain = model({
+		id: "plain",
+		name: "Plain model",
+		reasoning: false,
+		thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+	});
+
+	it("appends deterministic, availability-filtered synthetic rows after real rows", () => {
+		const rows = projectQ10Models({
+			models: [plain],
+			profiles: profiles as unknown as Map<string, never>,
+			availableProfileIds: new Set(["codex-eco", "codex-medium"]),
+		});
+		expect(rows.map(row => `${row.provider}/${row.id}`)).toEqual([
+			"test/plain",
+			"gajae-code/codex-eco",
+			"gajae-code/codex-medium",
+		]);
+		expect(rows[1]).toMatchObject({
+			provider: "gajae-code",
+			id: "codex-eco",
+			name: "Codex Eco",
+			reasoning: false,
+			thinking: { validLevels: [ThinkingLevel.Off] },
+			current: false,
+		});
+	});
+
+	it("uses the profile default model metadata with unknown constants as fallback", () => {
+		const rows = projectQ10Models({
+			models: [plain],
+			profiles: profiles as unknown as Map<string, never>,
+			availableProfileIds: new Set(["codex-eco", "opencodego"]),
+			resolveProfileDefaultModel: () =>
+				model({ provider: "openai-codex", id: "gpt-5.6-terra", contextWindow: 300_000, maxTokens: 64_000 }),
+		});
+		expect(rows[1].contextWindow).toBe(300_000);
+		expect(rows[1].maxTokens).toBe(64_000);
+		// Unresolvable default falls back to the shared unknown constants.
+		const fallback = projectQ10Models({
+			models: [plain],
+			profiles: profiles as unknown as Map<string, never>,
+			availableProfileIds: new Set(["opencodego"]),
+		});
+		expect(fallback[1].contextWindow).toBeGreaterThan(0);
+		expect(fallback[1].maxTokens).toBeGreaterThan(0);
+	});
+
+	it("marks the active profile row current with inherit and suppresses the concrete current", () => {
+		const currentModel = model({ id: "plain" });
+		const rows = projectQ10Models({
+			models: [plain],
+			currentModel,
+			currentThinkingLevel: ThinkingLevel.Off,
+			profiles: profiles as unknown as Map<string, never>,
+			availableProfileIds: new Set(["codex-eco"]),
+			activeProfile: "codex-eco",
+		});
+		const currentRows = rows.filter(row => row.current);
+		expect(currentRows).toHaveLength(1);
+		expect(currentRows[0]).toMatchObject({
+			provider: "gajae-code",
+			id: "codex-eco",
+			current: true,
+			currentThinkingLevel: ThinkingLevel.Inherit,
+		});
+	});
+
+	it("keeps the active profile visible as the current readback even when unavailable", () => {
+		const rows = projectQ10Models({
+			models: [plain],
+			profiles: profiles as unknown as Map<string, never>,
+			availableProfileIds: new Set([]),
+			activeProfile: "codex-eco",
+		});
+		expect(rows.map(row => `${row.provider}/${row.id}`)).toEqual(["test/plain", "gajae-code/codex-eco"]);
+		expect(rows[1].current).toBe(true);
+	});
+	it("emits a bounded current fallback row when the active marker is absent from the profile map", () => {
+		const rows = projectQ10Models({
+			models: [plain],
+			currentModel: { provider: "test", id: "plain" } as never,
+			currentThinkingLevel: ThinkingLevel.Off,
+			profiles: new Map(),
+			availableProfileIds: new Set(),
+			activeProfile: "codex-eco",
+		});
+		const currentRows = rows.filter(row => row.current);
+		expect(currentRows).toHaveLength(1);
+		expect(currentRows[0]).toMatchObject({
+			provider: "gajae-code",
+			id: "codex-eco",
+			name: "codex-eco",
+			reasoning: false,
+			thinking: { validLevels: [ThinkingLevel.Off] },
+			current: true,
+			currentThinkingLevel: ThinkingLevel.Inherit,
+		});
+	});
+
+	it("fails closed on an unknown availability join: never advertises non-current profiles", () => {
+		const rows = projectQ10Models({
+			models: [plain],
+			profiles: profiles as unknown as Map<string, never>,
+			// availableProfileIds intentionally absent: the join outcome is unknown.
+		});
+		expect(rows.map(row => `${row.provider}/${row.id}`)).toEqual(["test/plain"]);
+	});
+
+	it("omits the facade entirely without profile inputs", () => {
+		const rows = projectQ10Models({ models: [plain] });
+		expect(rows).toHaveLength(1);
+		expect(rows[0].provider).toBe("test");
+	});
+});

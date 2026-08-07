@@ -465,3 +465,41 @@ test("replays matching idempotency requests, rejects conflicts, and evicts LRU e
 	});
 	expect(calls).toBe(258);
 });
+test("forwards synthetic gajae-code selections with an off thinking level and pins typed result values", async () => {
+	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		setModel: (...args: unknown[]) => {
+			calls.push(args);
+			return { provider: "gajae-code", modelId: "codex-eco", thinkingLevel: "off" };
+		},
+	} as unknown as ControlSurface;
+
+	const response = await dispatchControl(surface, model, {
+		...request(model),
+		input: { id: "gajae-code/codex-eco", thinkingLevel: "off" },
+	});
+
+	expect(calls).toEqual([["gajae-code/codex-eco", "off"]]);
+	expect(response.ok).toBe(true);
+	expect(response.result).toEqual({ provider: "gajae-code", modelId: "codex-eco", thinkingLevel: "off" });
+});
+
+test("forwards a synthetic selection without a thinking level as undefined", async () => {
+	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		setModel: (...args: unknown[]) => {
+			calls.push(args);
+			return { changed: true };
+		},
+	} as unknown as ControlSurface;
+
+	const response = await dispatchControl(surface, model, {
+		...request(model),
+		input: { id: "gajae-code/codex-eco" },
+	});
+
+	expect(calls).toEqual([["gajae-code/codex-eco", undefined]]);
+	expect(response.result).toEqual({ changed: true });
+});

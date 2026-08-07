@@ -35,6 +35,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:materializeActiveDefaultModelProfileAssignment":
+		"internal extension selection materialization seam, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionCleanup":
 		"internal tool lifecycle cleanup registration, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionTransitionCleanup":
@@ -129,12 +131,24 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal owner-recovery staged restore builder after durable claims/fencing, never a user-facing SDK operation",
 	"agent_session:setActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:clearSessionOnlyModelProfileState":
+		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:noteProfileInstalledOverrides":
+		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:clearProfileInstalledOverrides":
+		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:getProfileInstalledOverrideKeys":
+		"internal session-scoped profile lifecycle accessor behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:getSessionDefaultModelSelector": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:recordResumeDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:resolveConfiguredDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporaryForControl":
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:setDefaultModelProfileForControl":
+		"internal control wrapper behind the reviewed model.set seam (session-scoped synthetic gajae-code selection), not an independent public SDK operation",
+	"agent_session:withSdkControlMutation":
+		"internal session admission wrapper for the reviewed config.patch seam, not an independent public SDK operation",
 	"agent_session:setThinkingLevelForControl":
 		"internal Telegram control wrapper over the reviewed thinking.set seam, not an independent public SDK operation",
 	"agent_session:getThinkingScopeForControl":

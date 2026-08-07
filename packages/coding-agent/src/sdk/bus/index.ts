@@ -48,7 +48,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 type NotificationServer = NativeNotificationServer;
 
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
-import { Settings } from "../../config/settings";
+import { Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -85,6 +85,13 @@ import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime,
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
+import {
+	parseSyntheticModelId,
+	resolveSyntheticModelSelection,
+	SYNTHETIC_PROVIDER_ID,
+	syntheticModelInputError,
+	syntheticNamespaceCollision,
+} from "../model-profile-model";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -2243,6 +2250,7 @@ function sdkQuerySurface(
 		followupQueueDepth: 0,
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
+	settings: Settings | undefined = undefined,
 	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
@@ -2257,6 +2265,7 @@ function sdkQuerySurface(
 		getInstalledDefinitions,
 		getLiveState,
 		configOverrides,
+		settings,
 		promptStatusLookup,
 		skillStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
@@ -2272,6 +2281,49 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 		([key, nested]) =>
 			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
 			containsSecretConfigKey(nested, seen),
+	);
+}
+
+function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
+	const before = new Map<string, unknown>();
+	for (const key of configOverrides.keys()) {
+		try {
+			before.set(key, settings.get(key as never));
+		} catch {
+			before.set(key, undefined);
+		}
+	}
+	return before;
+}
+
+function reconcileConfigOverridesShadow(
+	settings: Settings,
+	configOverrides: Map<string, unknown>,
+	before: ReadonlyMap<string, unknown>,
+): void {
+	for (const [key, prior] of before) {
+		let current: unknown;
+		try {
+			current = settings.get(key as never);
+		} catch {
+			current = undefined;
+		}
+		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
+	}
+}
+
+function deepStructuralEqual(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (Array.isArray(left) && Array.isArray(right))
+		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
+	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+	const leftRecord = left as Record<string, unknown>;
+	const rightRecord = right as Record<string, unknown>;
+	const leftKeys = Object.keys(leftRecord);
+	const rightKeys = Object.keys(rightRecord);
+	return (
+		leftKeys.length === rightKeys.length &&
+		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
 	);
 }
 
@@ -2374,6 +2426,55 @@ function sdkControlSurface(
 				: ctx.modelRegistry.getAll().find(candidate => candidate.id === id);
 		if (!model) throw Object.assign(new Error(`Model ${id} was not found.`), { code: "invalid_input" });
 		return model;
+	};
+	/**
+	 * `config.patch` records patched values in `configOverrides` so query
+	 * readback shows them, but a serialized activation that rewrites the same
+	 * setting (e.g. `modelRoles` cleared by persist-default activation) does not
+	 * touch the shadow — leaving `config.list/get` reporting a stale patch as
+	 * authoritative. After the admitted mutation completes, drop any shadowed
+	 * key whose live settings value changed so the durable value wins.
+	 */
+
+	/**
+	 * Route a synthetic `gajae-code/<profile>` model selection into the
+	 * session-scoped activation transaction. ACP model selection never writes a
+	 * global profile default; persistence remains an explicit TUI choice. Only
+	 * an absent or `off` thinking level is forwarded (synthetic rows advertise
+	 * `validLevels: ["off"]`); any other level is rejected before admission.
+	 * A user-defined provider under the reserved namespace fails closed rather
+	 * than being shadowed. With a thinking level, the typed host surface returns
+	 * the pinned `DefaultModelSelectionResult`-shaped result.
+	 */
+	const setSyntheticModel = async (id: string, requestedThinkingLevel: unknown) => {
+		const hasLevel = requestedThinkingLevel !== undefined;
+		const thinkingLevel =
+			typeof requestedThinkingLevel === "string" ? parseThinkingLevel(requestedThinkingLevel) : undefined;
+		if (
+			hasLevel &&
+			(!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit || thinkingLevel !== ThinkingLevel.Off)
+		)
+			throw syntheticModelInputError('model.set thinkingLevel for a synthetic profile must be "off".');
+		const profiles = ctx.modelRegistry.getModelProfiles();
+		const resolved = resolveSyntheticModelSelection(id, profiles, ctx.modelRegistry.getError?.());
+		if (syntheticNamespaceCollision(ctx.modelRegistry.getAll(), ctx.modelRegistry.getConfiguredProviderIds?.() ?? []))
+			throw syntheticModelInputError(
+				`The ${SYNTHETIC_PROVIDER_ID} namespace is reserved; synthetic preset selection is disabled while a provider of the same name is configured.`,
+			);
+		const setDefaultModelProfile = ctx.setDefaultModelProfile;
+		if (!bindings.has("setDefaultModelProfile") || !setDefaultModelProfile)
+			return unavailable("model.set", "no default model-profile seam is installed")();
+		await setDefaultModelProfile(resolved.canonicalName, {
+			persistDefault: false,
+			...(hasLevel ? { thinkingLevelOverride: ThinkingLevel.Off } : {}),
+		});
+		return hasLevel
+			? {
+					provider: SYNTHETIC_PROVIDER_ID,
+					modelId: resolved.canonicalName,
+					thinkingLevel: ThinkingLevel.Off,
+				}
+			: { changed: true };
 	};
 	const unavailablePerSession = (operation: string) =>
 		unavailable(operation, "the registry classifies it outside the per-session extension host");
@@ -2835,8 +2936,22 @@ function sdkControlSurface(
 		},
 		replaceTodo: items => typed("todo.replace", { items }),
 		setModel: async (id, requestedThinkingLevel) => {
+			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);
-			if (requestedThinkingLevel === undefined) return { changed: await api.setModel(model) };
+			if (requestedThinkingLevel === undefined) {
+				// The extension seam is not admission-bound, so serialize it (and the
+				// Q13 shadow capture/reconcile) against config.patch through the
+				// session admission boundary.
+				const run = async () => {
+					const shadowBefore = settings ? captureConfigOverridesShadow(settings, configOverrides) : undefined;
+					const changed = await api.setModel(model);
+					if (settings && shadowBefore) reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+					return { changed };
+				};
+				return typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function"
+					? ctx.withSdkControlMutation!(run)
+					: run();
+			}
 			const thinkingLevel =
 				typeof requestedThinkingLevel === "string" ? parseThinkingLevel(requestedThinkingLevel) : undefined;
 			if (!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
@@ -2844,7 +2959,21 @@ function sdkControlSurface(
 					new Error("model.set thinkingLevel must be off, minimal, low, medium, high, xhigh, or max."),
 					{ code: "invalid_input" },
 				);
-			return typed("model.set", { id: `${model.provider}/${model.id}`, thinkingLevel });
+			// The typed concrete selection already admits internally; run the Q13
+			// shadow capture/reconcile inside that same admission via internal
+			// hooks so a concurrent config.patch cannot race the snapshot.
+			let shadowBefore: Map<string, unknown> | undefined;
+			const capture = () =>
+				(shadowBefore = settings ? captureConfigOverridesShadow(settings, configOverrides) : undefined);
+			const reconcile = () => {
+				if (settings && shadowBefore) reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+			};
+			const result = await typed("model.set", {
+				id: `${model.provider}/${model.id}`,
+				thinkingLevel,
+				...(settings ? { onBeforeMutation: capture, onAfterMutation: reconcile } : {}),
+			});
+			return result;
 		},
 		setModelProfile: async id => {
 			if (!bindings.has("setModelProfile") || !ctx.setModelProfile)
@@ -2908,12 +3037,28 @@ function sdkControlSurface(
 				throw Object.assign(new Error("config.patch rejects secret fields at the SDK host."), {
 					code: "invalid_input",
 				});
+			const patchIssues = validateSettingPatch(patch as Record<string, unknown>);
+			if (patchIssues.length > 0) {
+				const detail = patchIssues.map(issue => `${issue.path} (${issue.detail})`).join("; ");
+				throw Object.assign(new Error(`config.patch rejects invalid settings: ${detail}`), {
+					code: "invalid_input",
+				});
+			}
 			if (!settings) return unavailable("config.patch", "configuration settings are unavailable for this session")();
-			const entries = Object.entries(patch as Record<string, unknown>);
-			for (const [key, value] of entries) settings.set(key as never, value as never);
-			for (const [key, value] of entries) configOverrides.set(key, value);
-			configRevision.current += 1;
-			return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
+			const applyPatch = async () => {
+				const entries = Object.entries(patch as Record<string, unknown>);
+				for (const [key, value] of entries) settings.set(key as never, value as never);
+				for (const [key, value] of entries) configOverrides.set(key, value);
+				configRevision.current += 1;
+				return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
+			};
+			// Serialize config mutations against synthetic profile activation and
+			// default-model selection so an interleaved patch can never be lost or
+			// clobbered by an activation rollback (plan criterion 8).
+			if (typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function") {
+				return ctx.withSdkControlMutation!(applyPatch);
+			}
+			return applyPatch();
 		},
 
 		reloadRuntime: components => typed("runtime.reload", { components }),
@@ -4355,6 +4500,7 @@ export function createNotificationsExtension(
 					};
 				},
 				configOverrides,
+				settings,
 				lookupPromptStatus,
 				selector => kindReconciliation.lookup("skill", selector),
 			),
@@ -4528,6 +4674,8 @@ export function createNotificationsExtension(
 			},
 			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
 			...(activationGate ? { activationGate } : {}),
+			...(settings ? { settings } : {}),
+			...(configOverrides ? { configOverrides } : {}),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,

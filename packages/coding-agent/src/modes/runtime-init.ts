@@ -11,6 +11,12 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
+import {
+	parseSyntheticModelId,
+	resolveSyntheticModelSelection,
+	SYNTHETIC_PROVIDER_ID,
+	syntheticNamespaceCollision,
+} from "../sdk/model-profile-model";
 import type { AgentSession } from "../session/agent-session";
 
 import { parseThinkingLevel } from "../thinking";
@@ -81,8 +87,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setThinkingLevelForControl: (level, persist) => session.setThinkingLevelForControl(level, persist),
 			setThinkingVisibilityForControl: (visibility, persist) =>
 				session.setThinkingVisibilityForControl(visibility, persist),
-			setModelTemporaryForControl: (model, expectedSessionId) =>
-				session.setModelTemporaryForControl(model, expectedSessionId),
+			setModelTemporaryForControl: (model, expectedSessionId, thinkingLevel) =>
+				session.setModelTemporaryForControl(model, expectedSessionId, thinkingLevel),
 			fetchUsageReportsForControl: () => session.fetchUsageReportsForControl(),
 			getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 			getSessionName: () => session.sessionManager.getSessionName(),
@@ -118,6 +124,9 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			clearContext: () => session.clearContext(),
 			cycleModel: () => session.cycleModel(),
 			setModelProfile: name => session.activateModelProfileForControl(name),
+			setDefaultModelProfile: (name, options) => session.setDefaultModelProfileForControl(name, options),
+			getActiveModelProfile: () => session.getActiveModelProfile(),
+			withSdkControlMutation: body => session.withSdkControlMutation(body),
 			cycleThinkingLevel: () => session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {
@@ -175,18 +184,72 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				switch (operation) {
 					case "model.set": {
 						const selector = typeof input.id === "string" ? input.id : "";
+						const rawThinkingLevel = typeof input.thinkingLevel === "string" ? input.thinkingLevel : undefined;
+						const hasThinkingLevel = rawThinkingLevel !== undefined;
+						const thinkingLevel =
+							rawThinkingLevel === undefined ? undefined : parseThinkingLevel(rawThinkingLevel);
+						if (parseSyntheticModelId(selector) !== undefined) {
+							if (
+								syntheticNamespaceCollision(
+									session.modelRegistry.getAll?.() ?? [],
+									session.modelRegistry.getConfiguredProviderIds?.() ?? [],
+								)
+							)
+								throw Object.assign(
+									new Error(
+										`The ${SYNTHETIC_PROVIDER_ID} namespace is reserved; synthetic preset selection is disabled while a provider of the same name is configured.`,
+									),
+									{ code: "invalid_input" },
+								);
+							// An absent thinking level is allowed (matches the generic
+							// model.set and the SDK contract); a supplied-but-unparseable or
+							// non-"off" value is rejected, and the override is passed only
+							// when the caller supplied it.
+							if (
+								hasThinkingLevel &&
+								(thinkingLevel === undefined ||
+									thinkingLevel === ThinkingLevel.Inherit ||
+									thinkingLevel !== ThinkingLevel.Off)
+							)
+								throw Object.assign(
+									new Error('model.set thinkingLevel for a synthetic profile must be "off".'),
+									{ code: "invalid_input" },
+								);
+							const resolved = resolveSyntheticModelSelection(
+								selector,
+								session.modelRegistry.getModelProfiles(),
+								session.modelRegistry.getError?.(),
+							);
+							await session.setDefaultModelProfileForControl(resolved.canonicalName, {
+								persistDefault: false,
+								...(hasThinkingLevel ? { thinkingLevelOverride: ThinkingLevel.Off } : {}),
+							});
+							return {
+								provider: SYNTHETIC_PROVIDER_ID,
+								modelId: resolved.canonicalName,
+								thinkingLevel: session.thinkingLevel,
+							};
+						}
 						const slashIndex = selector.indexOf("/");
 						const model =
 							slashIndex > 0
 								? session.modelRegistry.find(selector.slice(0, slashIndex), selector.slice(slashIndex + 1))
 								: undefined;
-						const thinkingLevel =
-							typeof input.thinkingLevel === "string" ? parseThinkingLevel(input.thinkingLevel) : undefined;
 						if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
 							throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
 								code: "invalid_input",
 							});
-						return await session.setDefaultModelSelection(model, thinkingLevel);
+						// Internal host hooks (never public SDK fields): the bus surface runs
+						// its Q13 config-shadow capture/reconcile inside this selection
+						// admission so a concurrent config.patch cannot race the snapshot.
+						return await session.setDefaultModelSelection(model, thinkingLevel, {
+							...(typeof input.onBeforeMutation === "function"
+								? { onBeforeMutation: input.onBeforeMutation as () => void }
+								: {}),
+							...(typeof input.onAfterMutation === "function"
+								? { onAfterMutation: input.onAfterMutation as () => void }
+								: {}),
+						});
 					}
 					case "todo.replace": {
 						const phases = input.items;

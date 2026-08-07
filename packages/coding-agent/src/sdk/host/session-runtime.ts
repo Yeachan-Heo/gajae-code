@@ -3,10 +3,24 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
-import { isAuthenticated, kNoAuth } from "../../config/model-registry";
+import { type ModelProfileDefinition, resolveProfileBindings } from "../../config/model-profiles";
+import { resolveModelChainWithAuth } from "../../config/model-resolver";
+import { normalizeModelSelectorValue } from "../../config/model-selector-value";
+import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { parseThinkingLevel } from "../../thinking";
+import {
+	collectAuthenticatedProfileProviders,
+	parseSyntheticModelId,
+	resolveSyntheticModelSelection,
+	SYNTHETIC_PROVIDER_ID,
+	syntheticModelInputError,
+	syntheticNamespaceCollision,
+} from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ControlSurface, dispatchControl } from "./control";
@@ -52,6 +66,10 @@ export interface SessionSdkTransport {
 export interface SessionSdkRuntimeOptions
 	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame"> {
 	transport: SessionSdkTransport;
+	/** Session settings; enables `config.patch` application on this runtime. */
+	settings?: Settings;
+	/** Mutable shadow of patched config values merged into query readback. */
+	configOverrides?: Map<string, unknown>;
 }
 
 /**
@@ -204,6 +222,10 @@ export interface CreateSdkSessionRuntimeOptions {
 		token: string;
 	}): SessionSdkTransport | Promise<SessionSdkTransport>;
 	onSdkRequest?: SessionSdkHostOptions["onRequest"];
+	/** Session settings; enables `config.patch` application on this runtime. */
+	settings?: Settings;
+	/** Mutable shadow of patched config values merged into query readback. */
+	configOverrides?: Map<string, unknown>;
 }
 
 function unavailable(operation: string): () => never {
@@ -429,6 +451,8 @@ export interface SdkSurfaceFactoryOptions {
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
 	configOverrides?: ReadonlyMap<string, unknown>;
+	/** Session settings; used for model-usage preferences in profile-limit resolution. */
+	settings?: Settings;
 	promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
@@ -451,6 +475,8 @@ function createQuerySurface(
 		getInstalledDefinitions?: (capability: string) => unknown | undefined;
 		getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
 		configOverrides?: ReadonlyMap<string, unknown>;
+		/** Session settings; used for model-usage preferences in profile-limit resolution. */
+		settings?: Settings;
 		promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
@@ -530,12 +556,135 @@ function createQuerySurface(
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,
 		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () =>
-			projectQ10Models({
-				models: ctx.modelRegistry.getAll(),
-				currentModel: ctx.model,
-				currentThinkingLevel: api.getThinkingLevel(),
-			}),
+		getModels: async () => {
+			const models = ctx.modelRegistry.getAll();
+			const currentModel = ctx.model;
+			const currentThinkingLevel = api.getThinkingLevel();
+			const activeProfile =
+				typeof ctx.getActiveModelProfile === "function" ? ctx.getActiveModelProfile() : undefined;
+			// A user-defined provider under the reserved logical namespace makes
+			// `gajae-code/*` ids ambiguous: selection is rejected, so Q10 must
+			// NOT advertise any rows from that namespace (neither the colliding
+			// provider's concrete models nor synthetic profiles). The collided
+			// provider's rows are filtered out of every degraded projection too,
+			// making the documented fail-closed behavior effective.
+			const collision = syntheticNamespaceCollision(models, ctx.modelRegistry.getConfiguredProviderIds?.() ?? []);
+			const concreteRows = collision ? models.filter(model => model.provider !== SYNTHETIC_PROVIDER_ID) : models;
+			// Degraded projection: concrete rows always (minus a collided
+			// gajae-code provider), plus a bounded synthetic current readback
+			// when a profile marker is active — unless the namespace is collided,
+			// in which case no synthetic row (including the active fallback) may
+			// appear because selection is rejected.
+			const degraded = () =>
+				projectQ10Models(
+					activeProfile !== undefined && !collision
+						? {
+								models: concreteRows,
+								currentModel,
+								currentThinkingLevel,
+								profiles: new Map<string, ModelProfileDefinition>(),
+								activeProfile,
+							}
+						: { models: concreteRows, currentModel, currentThinkingLevel },
+				);
+			let profiles: ReadonlyMap<string, ModelProfileDefinition>;
+			try {
+				const registryWithProfiles = ctx.modelRegistry as {
+					getModelProfiles?: () => ReadonlyMap<string, ModelProfileDefinition>;
+				};
+				profiles =
+					typeof registryWithProfiles.getModelProfiles === "function"
+						? registryWithProfiles.getModelProfiles()
+						: new Map<string, ModelProfileDefinition>();
+			} catch {
+				// The profile registry is unreadable: keep the concrete catalog
+				// and the active marker readback; never fail the whole Q10 query.
+				return degraded();
+			}
+			if (profiles.size === 0) return degraded();
+			// An invalid models configuration must not advertise synthetic rows:
+			// the same registry error rejects selection, so Q10 fails closed to
+			// the concrete catalog (plus the active-marker readback).
+			if (ctx.modelRegistry.getError?.() !== undefined) return degraded();
+			if (collision) return degraded();
+			let authenticatedProviders: ReadonlySet<string>;
+			try {
+				authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
+					ctx.modelRegistry.getApiKeyForProvider(provider, id),
+				);
+			} catch {
+				// Availability join failed: degrade only the synthetic facade,
+				// retain concrete rows and the active marker readback.
+				return degraded();
+			}
+			// Resolve each profile's default model exactly like profile activation:
+			// walk the default mapping chain, rewrite alternative-group providers
+			// to their authenticated member, and use the same pattern-aware,
+			// managed-fallback-eligible resolver so Q10 reports the limits of the
+			// model the profile will actually activate (glob defaults such as
+			// `provider/gpt-*` and Cursor-managed-fallback skips included).
+			const resolvedDefaultModels = new Map<string, Model<Api>>();
+			const rewriteSelectorProvider = (selector: string, profile: ModelProfileDefinition): string => {
+				const slash = selector.indexOf("/");
+				if (slash < 0) return selector;
+				const provider = selector.slice(0, slash);
+				if (authenticatedProviders.has(provider)) return selector;
+				const group = (profile.alternativeProviderGroups ?? []).find(candidates => candidates.includes(provider));
+				if (!group) return selector;
+				const replacement = group.find(candidate => authenticatedProviders.has(candidate));
+				return replacement ? replacement + selector.slice(slash) : selector;
+			};
+			await Promise.all(
+				[...profiles.entries()].map(async ([name, profile]) => {
+					try {
+						const defaultSelector = resolveProfileBindings(profile).defaultSelector;
+						if (defaultSelector === undefined) return; // role-only profile
+						const selectors = normalizeModelSelectorValue(defaultSelector).map(selector =>
+							rewriteSelectorProvider(selector, profile),
+						);
+						const resolution = await resolveModelChainWithAuth(
+							selectors,
+							{
+								...ctx.modelRegistry,
+								getAvailable: () => ctx.modelRegistry.getAll(),
+								getApiKey: (model: Model<Api>, sessionId?: string) =>
+									ctx.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+							},
+							options.settings,
+							id,
+							{ managedFallback: true },
+						);
+						if (resolution.model) resolvedDefaultModels.set(name, resolution.model);
+					} catch {
+						// A provider whose credential state cannot be read must not
+						// fail the whole Q10 query: skip this profile's metadata
+						// resolution and degrade only its synthetic row.
+					}
+				}),
+			);
+			const availableProfileIds = new Set<string>();
+			for (const [name, profile] of profiles) {
+				if (!isModelProfileProviderAvailable(profile, authenticatedProviders)) continue;
+				// A profile with a default mapping is selectable only when its
+				// default chain actually resolves to an authenticated model:
+				// activation rejects unresolvable defaults even when the
+				// required providers are authenticated. Role-only profiles
+				// (no default) remain selectable.
+				if (profile.modelMapping.default !== undefined && !resolvedDefaultModels.has(name)) continue;
+				availableProfileIds.add(name);
+			}
+			const resolveProfileDefaultModel = (profile: ModelProfileDefinition) =>
+				resolvedDefaultModels.get(profile.name);
+			return projectQ10Models({
+				models,
+				currentModel,
+				currentThinkingLevel,
+				profiles,
+				availableProfileIds,
+				activeProfile,
+				resolveProfileDefaultModel,
+			});
+		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
 			const workflowGate = ctx.workflowGate;
@@ -575,23 +724,15 @@ function createQuerySurface(
 			(options.promptStatusLookup ?? (value => reconciliation.lookup("prompt", value)))(selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			(options.skillStatusLookup ?? (value => reconciliation.lookup("skill", value)))(selector),
-		getModelProfiles: () => {
+		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
-			const providers = new Set([...profiles.values()].flatMap(profile => profile.requiredProviders));
-			const authenticatedProviders = new Set<string>();
-			return Promise.all(
-				[...providers].map(async provider => {
-					try {
-						const credential = await ctx.modelRegistry.getApiKeyForProvider(provider, id);
-						if (credential === kNoAuth || isAuthenticated(credential)) authenticatedProviders.add(provider);
-					} catch {}
-				}),
-			).then(() => {
-				return projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(item => ({
-					...item,
-					available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
-				})) as unknown[];
-			});
+			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
+				ctx.modelRegistry.getApiKeyForProvider(provider, id),
+			);
+			return projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(item => ({
+				...item,
+				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
+			})) as unknown[];
 		},
 		installedQueries: policy.installedQueries,
 	};
@@ -619,6 +760,7 @@ export function createSdkSurfaceFactory(
 		getInstalledDefinitions: options.getInstalledDefinitions,
 		getLiveState: options.getLiveState,
 		configOverrides: options.configOverrides,
+		settings: options.settings,
 		promptStatusLookup: options.promptStatusLookup,
 		skillStatusLookup: options.skillStatusLookup,
 		hostTools: options.hostTools,
@@ -630,12 +772,70 @@ export function createSdkSurfaceFactory(
 	};
 }
 
+function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
+	const before = new Map<string, unknown>();
+	for (const key of configOverrides.keys()) {
+		try {
+			before.set(key, settings.get(key as never));
+		} catch {
+			before.set(key, undefined);
+		}
+	}
+	return before;
+}
+
+function reconcileConfigOverridesShadow(
+	settings: Settings,
+	configOverrides: Map<string, unknown>,
+	before: ReadonlyMap<string, unknown>,
+): void {
+	for (const [key, prior] of before) {
+		let current: unknown;
+		try {
+			current = settings.get(key as never);
+		} catch {
+			current = undefined;
+		}
+		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
+	}
+}
+
+function deepStructuralEqual(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (Array.isArray(left) && Array.isArray(right))
+		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
+	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+	const leftRecord = left as Record<string, unknown>;
+	const rightRecord = right as Record<string, unknown>;
+	const leftKeys = Object.keys(leftRecord);
+	const rightKeys = Object.keys(rightRecord);
+	return (
+		leftKeys.length === rightKeys.length &&
+		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
+	);
+}
+
+/** True when a patch contains any secret-shaped key, recursively. */
+function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
+	if (!value || typeof value !== "object") return false;
+	if (seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
+	return Object.entries(value as Record<string, unknown>).some(
+		([key, nested]) =>
+			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
+			containsSecretConfigKey(nested, seen),
+	);
+}
 function createControlSurface(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
 	reconciliation: InvocationReconciliation,
 	onAccepted: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	policy?: SdkSurfacePolicy,
+	settings?: Settings,
+	configOverrides?: Map<string, unknown>,
+	configRevision: { current: number } = { current: 0 },
 ): ControlSurface {
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -649,6 +849,45 @@ function createControlSurface(
 				: ctx.modelRegistry.getAll().find(candidate => candidate.id === id);
 		if (!model) throw Object.assign(new Error(`Model ${id} was not found.`), { code: "invalid_input" });
 		return model;
+	};
+	/**
+	 * Route a synthetic `gajae-code/<profile>` model selection into the
+	 * session-scoped activation transaction. ACP model selection never writes a
+	 * global profile default; persistence remains an explicit TUI choice. Only
+	 * an absent or `off` thinking level is forwarded (synthetic rows advertise
+	 * `validLevels: ["off"]`); any other level is rejected before admission.
+	 * A user-defined provider under the reserved namespace fails closed rather
+	 * than being shadowed. With a thinking level the typed host surface returns
+	 * the pinned `DefaultModelSelectionResult`-shaped result.
+	 */
+	const setSyntheticModel = async (id: string, requestedThinkingLevel: unknown) => {
+		const hasLevel = requestedThinkingLevel !== undefined;
+		const thinkingLevel =
+			typeof requestedThinkingLevel === "string" ? parseThinkingLevel(requestedThinkingLevel) : undefined;
+		if (
+			hasLevel &&
+			(!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit || thinkingLevel !== ThinkingLevel.Off)
+		)
+			throw syntheticModelInputError('model.set thinkingLevel for a synthetic profile must be "off".');
+		const profiles = ctx.modelRegistry.getModelProfiles();
+		const resolved = resolveSyntheticModelSelection(id, profiles, ctx.modelRegistry.getError?.());
+		if (syntheticNamespaceCollision(ctx.modelRegistry.getAll(), ctx.modelRegistry.getConfiguredProviderIds?.() ?? []))
+			throw syntheticModelInputError(
+				`The ${SYNTHETIC_PROVIDER_ID} namespace is reserved; synthetic preset selection is disabled while a provider of the same name is configured.`,
+			);
+		const setDefaultModelProfile = ctx.setDefaultModelProfile;
+		if (!setDefaultModelProfile) return unavailable("model.set")();
+		await setDefaultModelProfile(resolved.canonicalName, {
+			persistDefault: false,
+			...(hasLevel ? { thinkingLevelOverride: ThinkingLevel.Off } : {}),
+		});
+		return hasLevel
+			? {
+					provider: SYNTHETIC_PROVIDER_ID,
+					modelId: resolved.canonicalName,
+					thinkingLevel: ThinkingLevel.Off,
+				}
+			: { changed: true };
 	};
 	const newCorrelation = () => ({ commandId: crypto.randomUUID(), turnId: crypto.randomUUID() });
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
@@ -790,10 +1029,27 @@ function createControlSurface(
 			ctx.operateGoal ? ctx.operateGoal(op as never, objective) : unavailable("mode.goal.operate")(),
 		replaceTodo: items => typed("todo.replace", { items }),
 		setModel: async (id, thinkingLevel) => {
-			const changed = await api.setModelTemporaryForControl(resolveModel(id));
-			if (!changed) throw Object.assign(new Error("Model unavailable for this session."), { code: "unavailable" });
-			if (thinkingLevel !== undefined) api.setThinkingLevel(thinkingLevel as never);
-			return { changed: true };
+			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, thinkingLevel);
+			// Serialize the concrete selection (and the Q13 shadow capture/reconcile)
+			// against config.patch through the session admission boundary so a
+			// concurrent patch cannot race the snapshot.
+			const run = async () => {
+				const shadowBefore =
+					settings && configOverrides ? captureConfigOverridesShadow(settings, configOverrides) : undefined;
+				const changed = await api.setModelTemporaryForControl(
+					resolveModel(id),
+					undefined,
+					thinkingLevel as ThinkingLevel | undefined,
+				);
+				if (!changed)
+					throw Object.assign(new Error("Model unavailable for this session."), { code: "unavailable" });
+				if (settings && configOverrides && shadowBefore)
+					reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+				return { changed: true };
+			};
+			return typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function"
+				? ctx.withSdkControlMutation!(run)
+				: run();
 		},
 		setModelProfile: id => (ctx.setModelProfile ? ctx.setModelProfile(id) : unavailable("model.profile.set")()),
 		cycleModel: () => (ctx.cycleModel ? ctx.cycleModel() : unavailable("model.cycle")()),
@@ -824,7 +1080,38 @@ function createControlSurface(
 		renameSession: name => typed("session.rename", { name }),
 		handoffSession: target => typed("session.handoff", { target }),
 		exportHtml: () => typed("session.export_html"),
-		patchConfig: patch => typed("config.patch", { patch }),
+		patchConfig: patch => {
+			if (!patch || typeof patch !== "object" || Array.isArray(patch))
+				throw Object.assign(new Error("config.patch requires an object."), { code: "invalid_input" });
+			if (containsSecretConfigKey(patch))
+				throw Object.assign(new Error("config.patch rejects secret fields at the SDK host."), {
+					code: "invalid_input",
+				});
+			const patchIssues = validateSettingPatch(patch as Record<string, unknown>);
+			if (patchIssues.length > 0) {
+				const detail = patchIssues.map(issue => `${issue.path} (${issue.detail})`).join("; ");
+				throw Object.assign(new Error(`config.patch rejects invalid settings: ${detail}`), {
+					code: "invalid_input",
+				});
+			}
+			if (!settings) return unavailable("config.patch")();
+			const applyPatch = async () => {
+				const entries = Object.entries(patch as Record<string, unknown>);
+				for (const [key, value] of entries) settings.set(key as never, value as never);
+				if (configOverrides) for (const [key, value] of entries) configOverrides.set(key, value);
+				configRevision.current += 1;
+				return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
+			};
+			// Serialize config mutations against synthetic profile activation and
+			// default-model selection so an interleaved patch can never be lost or
+			// clobbered by an activation rollback. The patch itself authoritatively
+			// updates the shadow, so it must NOT be wrapped in the shadow refresh
+			// (that would delete the entry it just wrote on the second patch).
+			if (typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function") {
+				return ctx.withSdkControlMutation!(applyPatch);
+			}
+			return applyPatch();
+		},
 		reloadRuntime: components => typed("runtime.reload", { components }),
 		login: provider => typed("auth.login", { provider }),
 		registerHostTools: defs => typed("host_tools.register", { defs }),
@@ -855,6 +1142,7 @@ function createControlSurface(
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
 		installedOperations: surfacePolicy.installedControls,
+		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
 }
 
@@ -935,6 +1223,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
 		await reconciliation.hydrate();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
+		const configRevision = { current: 0 };
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
@@ -942,6 +1231,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			promptStatusLookup: selector => reconciliation.lookup("prompt", selector),
 			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
+			configOverrides: options.configOverrides,
+			settings: options.settings,
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const controlSurface = createControlSurface(
@@ -952,6 +1243,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				pending.push({ kind, correlation });
 			},
 			surfaceFactory.policy,
+			options.settings,
+			options.configOverrides,
+			configRevision,
 		);
 		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
