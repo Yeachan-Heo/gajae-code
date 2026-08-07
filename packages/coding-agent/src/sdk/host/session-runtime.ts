@@ -7,10 +7,10 @@ import { logger } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
-import { createKindAwareReconciliation, type KindAwareReconciliation } from "../bus/kind-aware-reconciliation";
-import { createReconciliationStore } from "../bus/reconciliation-store";
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "../kind-aware-reconciliation";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { createReconciliationStore } from "../reconciliation-store";
 import { type ControlSurface, dispatchControl } from "./control";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
@@ -957,8 +957,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const cursors = new CursorRegistry(token, revisions);
 		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
 		await reconciliation.hydrate();
+		const sessionFile =
+			typeof ctx.sessionManager.getSessionFile === "function"
+				? ctx.sessionManager.getSessionFile()
+				: path.join(stateRoot, `${sessionId}.jsonl`);
 		const steerReconciliation = createKindAwareReconciliation({
-			store: createReconciliationStore({ sessionFile: ctx.sessionManager.getSessionFile(), sessionId }),
+			store: createReconciliationStore({ sessionFile, sessionId }),
 		});
 		await steerReconciliation.hydrateFromStore();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];

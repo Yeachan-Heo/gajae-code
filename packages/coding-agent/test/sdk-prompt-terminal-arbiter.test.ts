@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
+import { createKindAwareReconciliation } from "../src/sdk/kind-aware-reconciliation";
+import type { SdkPromptTerminalOutcome } from "../src/sdk/prompt-status";
 import {
 	type DurableReconciliationRecord,
 	type ReconciliationStore,
 	settleProcessRestart,
-} from "../src/sdk/bus/reconciliation-store";
-import type { SdkPromptTerminalOutcome } from "../src/sdk/prompt-status";
+} from "../src/sdk/reconciliation-store";
 
 class MemoryStore implements ReconciliationStore {
 	readonly path = null;

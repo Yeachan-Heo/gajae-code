@@ -11,9 +11,9 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
-import type { ReceiptState } from "../receipt-state";
-import type { PromptCorrelation } from "./prompt-reconciliation";
+import type { PromptCorrelation } from "./bus/prompt-reconciliation";
+import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "./prompt-status";
+import type { ReceiptState } from "./receipt-state";
 
 export const RECONCILIATION_STORE_VERSION = 1;
 export const RECONCILIATION_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;

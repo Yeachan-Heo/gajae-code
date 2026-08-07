@@ -8,7 +8,7 @@ import {
 	isSafeReconciliationSessionId,
 	reconciliationStorePath,
 	settleProcessRestart,
-} from "../src/sdk/bus/reconciliation-store";
+} from "../src/sdk/reconciliation-store";
 
 describe("reconciliation-store", () => {
 	test("safe session id pattern rejects path traversal", () => {

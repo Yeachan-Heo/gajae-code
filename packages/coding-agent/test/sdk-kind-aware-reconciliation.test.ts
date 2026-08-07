@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
-import { createReconciliationStore } from "../src/sdk/bus/reconciliation-store";
+import { createKindAwareReconciliation } from "../src/sdk/kind-aware-reconciliation";
+import { createReconciliationStore } from "../src/sdk/reconciliation-store";
 
 describe("kind-aware reconciliation", () => {
 	test("prompt and skill clientRefs do not collide", () => {

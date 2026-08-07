@@ -85,8 +85,10 @@ import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime,
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "../kind-aware-reconciliation";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { createReconciliationStore } from "../reconciliation-store";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -117,11 +119,9 @@ import {
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import { createKindAwareReconciliation, type KindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
-import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
 import {
@@ -2391,20 +2391,21 @@ function sdkControlSurface(
 			await api.sendUserMessage(text, { deliverAs: "steer" });
 			return { ...correlation, accepted: true };
 		}
+		const normalizedClientRef = clientRef.trim();
 		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
 			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
-		const reservation = await skillRecon.reserveSteer(clientRef, text);
+		const reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
 		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
 		try {
 			await api.sendUserMessage(text, { deliverAs: "steer" });
 			return {
 				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(clientRef, "accepted")),
+				...(await skillRecon.settleSteer(normalizedClientRef, "accepted")),
 			};
 		} catch (error) {
 			return {
 				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(clientRef, "rejected", error)),
+				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
 			};
 		}
 	};

@@ -1,17 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-/**
- * Kind-aware invocation reconciliation (prompt | skill) with optional durable store.
- * Preserves Q26 admit/first-terminal/capacity/TTL semantics; indexes and caps are per-kind.
- */
-import type { PromptReconciliationStatus, SdkPromptTerminalOutcome, TurnPromptReconciliation } from "../prompt-status";
-import type { ReceiptState } from "../receipt-state";
 import {
 	PROMPT_RECONCILIATION_ACTIVE_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_TTL_MS,
 	type PromptCorrelation,
 	sanitizePromptFailure,
-} from "./prompt-reconciliation";
+} from "./bus/prompt-reconciliation";
+/**
+ * Kind-aware invocation reconciliation (prompt | skill) with optional durable store.
+ * Preserves Q26 admit/first-terminal/capacity/TTL semantics; indexes and caps are per-kind.
+ */
+import type { PromptReconciliationStatus, SdkPromptTerminalOutcome, TurnPromptReconciliation } from "./prompt-status";
+import type { ReceiptState } from "./receipt-state";
 import type {
 	DurableReconciliationRecord,
 	DurableSteerReconciliationRecord,

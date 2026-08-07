@@ -4,7 +4,7 @@ import {
 	type DurableReconciliationRecord,
 	RECONCILIATION_STORE_VERSION,
 	type ReconciliationStoreFs,
-} from "../src/sdk/bus/reconciliation-store";
+} from "../src/sdk/reconciliation-store";
 
 const SESSION = "session-recovery";
 
