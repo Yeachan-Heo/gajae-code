@@ -260,10 +260,15 @@ describe("workflow-settings resolver", () => {
 	test("a completed migration deactivates only the unchanged migrated source", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();
-		await fs.mkdir(path.join(home, ".myconfig"), { recursive: true });
-		const source = path.join(home, ".myconfig", "settings.json");
+		const configRoot = path.join(home, ".myconfig");
+		const agentDir = path.join(configRoot, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		const source = path.join(configRoot, "settings.json");
+		const targetPath = path.join(agentDir, "config.yml");
 		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": "root" });
 		await fs.writeFile(source, sourceRaw);
+		const canonicalTargetDir = await fs.realpath(agentDir);
+		const targetIdentity = await fs.stat(agentDir);
 		// A completed one-time migration marker for this exact source, with the
 		// matching source hash (the migrated bytes).
 		await fs.writeFile(
@@ -273,7 +278,9 @@ describe("workflow-settings resolver", () => {
 				status: "complete",
 				sourcePath: source,
 				backupPath: `${source}.bak`,
-				targetPath: path.join(home, ".myconfig", "agent", "config.yml"),
+				targetPath,
+				canonicalTargetDir,
+				canonicalTargetIdentity: `${targetIdentity.dev}:${targetIdentity.ino}`,
 				sourceSha256: createHash("sha256").update(sourceRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -303,6 +310,36 @@ describe("workflow-settings resolver", () => {
 		expect(result3.value).toBe("edited"); // the legacy fallback still works for the custom profile
 		expect(result3.source).toBe(source);
 	});
+
+	test("a complete marker without canonical target evidence keeps the legacy source active", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const configRoot = path.join(home, ".myconfig");
+		const agentDir = path.join(configRoot, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		const source = path.join(configRoot, "settings.json");
+		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": "root" });
+		await fs.writeFile(source, sourceRaw);
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "complete",
+				sourcePath: source,
+				backupPath: `${source}.bak`,
+				targetPath: path.join(agentDir, "config.yml"),
+				sourceSha256: createHash("sha256").update(sourceRaw).digest("hex"),
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+				completedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await resolveIn(cwd, { HOME: home, GJC_CONFIG_DIR: ".myconfig" });
+		expect(result.value).toBe("root");
+		expect(result.source).toBe(source);
+	});
+
 	test("a future-version migration marker does not deactivate the legacy source", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();

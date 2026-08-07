@@ -129,8 +129,9 @@ const WORKFLOW_MIGRATION_KEYS: readonly string[] = [
  * True when the one-time config-root migration has completed AND the source is
  * still the migrated file: the `<source>.migrated` marker passes the same
  * version/shape checks as the migration's own reader, has status "complete",
- * points at the same path, and the current source bytes still match the
- * marker's sourceSha256. A completed migration deactivates the legacy source
+ * points at the same path, records the canonical target directory and
+ * identity, and the current source bytes still match the marker's sourceSha256.
+ * A completed migration deactivates the legacy source
  * (removing a migrated target key returns to the default, not the legacy
  * value), but a later edit or recreate of settings.json changes the bytes and
  * REACTIVATES the documented legacy fallback. Malformed, version-mismatched,
@@ -175,7 +176,11 @@ async function isConfigRootMigrationComplete(sourcePath: string): Promise<boolea
 			typeof marker.completedAt !== "string" ||
 			Number.isNaN(Date.parse(marker.completedAt)) ||
 			!Array.isArray(marker.migratedKeys) ||
-			!marker.migratedKeys.every(key => typeof key === "string" && WORKFLOW_MIGRATION_KEYS.includes(key))
+			!marker.migratedKeys.every(key => typeof key === "string" && WORKFLOW_MIGRATION_KEYS.includes(key)) ||
+			typeof marker.canonicalTargetDir !== "string" ||
+			marker.canonicalTargetDir.length === 0 ||
+			typeof marker.canonicalTargetIdentity !== "string" ||
+			marker.canonicalTargetIdentity.length === 0
 		) {
 			return false;
 		}
@@ -183,23 +188,19 @@ async function isConfigRootMigrationComplete(sourcePath: string): Promise<boolea
 		// target identity. The marker stores the canonical agent dir at migration
 		// time; compare the CURRENT canonical dir against it (comparing two
 		// current resolutions alone cannot detect a repoint).
-		if (typeof marker.canonicalTargetDir === "string") {
-			const currentCanonicalAgentDir = await fs.realpath(getAgentDir()).catch(() => getAgentDir());
-			if (marker.canonicalTargetDir !== currentCanonicalAgentDir) {
-				return false;
-			}
+		const currentCanonicalAgentDir = await fs.realpath(getAgentDir()).catch(() => null);
+		if (currentCanonicalAgentDir === null || marker.canonicalTargetDir !== currentCanonicalAgentDir) {
+			return false;
 		}
 		// A same-pathname profile REPLACEMENT (deleted + recreated) changes the
 		// target config.yml's dev:ino; the marker records the identity at
 		// migration time.
-		if (typeof marker.canonicalTargetIdentity === "string") {
-			const currentTargetIdentity = await fs.stat(getAgentDir()).catch(() => null);
-			if (
-				!currentTargetIdentity ||
-				`${currentTargetIdentity.dev}:${currentTargetIdentity.ino}` !== marker.canonicalTargetIdentity
-			) {
-				return false;
-			}
+		const currentTargetIdentity = await fs.stat(getAgentDir()).catch(() => null);
+		if (
+			!currentTargetIdentity ||
+			`${currentTargetIdentity.dev}:${currentTargetIdentity.ino}` !== marker.canonicalTargetIdentity
+		) {
+			return false;
 		}
 		try {
 			// Hash the raw source bytes (Bun.file contract; matches the
