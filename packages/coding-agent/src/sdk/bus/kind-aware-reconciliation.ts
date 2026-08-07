@@ -217,11 +217,11 @@ export function createKindAwareReconciliation(
 					? records.get(steerKey(selector.clientRef))
 					: selector.commandId !== undefined && selector.turnId !== undefined
 						? [...records.values()].find(
-							candidate =>
-								candidate.kind === "steer" &&
-								candidate.commandId === selector.commandId &&
-								candidate.turnId === selector.turnId,
-						)
+								candidate =>
+									candidate.kind === "steer" &&
+									candidate.commandId === selector.commandId &&
+									candidate.turnId === selector.turnId,
+							)
 						: undefined;
 		return record?.kind === "steer"
 			? steerResult(record)

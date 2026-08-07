@@ -7,6 +7,8 @@ import { logger } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "../bus/kind-aware-reconciliation";
+import { createReconciliationStore } from "../bus/reconciliation-store";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ControlSurface, dispatchControl } from "./control";
@@ -19,9 +21,6 @@ import {
 	type SdkCapabilities,
 	type SdkSurfacePolicy,
 } from "./surface-policy";
-
-import { createKindAwareReconciliation, type KindAwareReconciliation } from "../bus/kind-aware-reconciliation";
-import { createReconciliationStore } from "../bus/reconciliation-store";
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
 const execFileAsync = promisify(execFile);
