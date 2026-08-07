@@ -60,8 +60,14 @@ async function runResponse(content: string) {
 	});
 	await session.prompt("respond");
 	await terminal.promise;
-	for (let attempt = 0; attempt < 100 && !(await Bun.file(stateFile).exists()); attempt++) await Bun.sleep(10);
-	return JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (await Bun.file(stateFile).exists()) {
+			const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+			if (payload.state === "completed" || payload.state === "errored") return payload;
+		}
+		await Bun.sleep(10);
+	}
+	throw new Error("Timed out waiting for terminal runtime state");
 }
 
 describe("AgentSession terminal receipt state", () => {

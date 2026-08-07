@@ -13,13 +13,13 @@ import {
 } from "../coordinator/contract";
 import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
-import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
+import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import {
 	type ActivatedPreparedSession,
 	requestPreparedSessionActivation,
@@ -163,10 +163,11 @@ interface CoordinatorFinalResponse {
 	truncated: boolean;
 }
 
-function reportableFinalResponse(response: CoordinatorFinalResponse): boolean {
-	return (
-		(typeof response.text === "string" && response.text.trim().length > 0) ||
-		(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)
+function reportableFinalResponse(response: CoordinatorFinalResponse | undefined): boolean {
+	return Boolean(
+		response &&
+			((typeof response.text === "string" && response.text.trim().length > 0) ||
+				(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)),
 	);
 }
 
@@ -2026,7 +2027,8 @@ async function markTurnTerminalFromSessionState(
 		execution: sessionState.state === "errored" ? "failed" : "completed",
 		reportable: reportableFinalResponse((sessionState as RuntimeSessionStatePayload).final_response),
 	});
-	const terminalStatus: TurnStatus = receiptState.receipt === "missing" ? "failed" : receiptState.execution;
+	const terminalStatus: TurnStatus =
+		receiptState.receipt === "missing" ? "failed" : sessionState.state === "errored" ? "failed" : "completed";
 	const runtimeState = sessionState as RuntimeSessionStatePayload;
 	const finalResponse = runtimeState.final_response ?? {
 		text: null,

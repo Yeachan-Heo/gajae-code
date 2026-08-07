@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
@@ -799,6 +800,14 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
+						const finalResponse = finalResponseForEvent(event);
+						const terminalReceipt =
+							state === "completed" || state === "errored"
+								? reduceTerminalReceiptState({
+										execution: state === "errored" ? "failed" : "completed",
+										reportable: Boolean(finalResponse?.text?.trim()),
+									})
+								: null;
 						const payload = {
 							...basePayload({
 								context,
@@ -810,11 +819,31 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 								reason: null,
 								sessionId: identity.sessionId,
 							}),
-							...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
-							...(finalResponseForEvent(event) ? { final_response: finalResponseForEvent(event) } : {}),
-							...(state === "errored"
-								? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true } }
+							...(terminalReceipt
+								? {
+										execution_state: terminalReceipt.execution,
+										receipt_state: terminalReceipt.receipt,
+										ended_at: now,
+									}
 								: {}),
+							...(finalResponse ? { final_response: finalResponse } : {}),
+							...(terminalReceipt?.receipt === "missing"
+								? {
+										error: {
+											code: "receipt_missing",
+											message: "Agent completed without reportable final response text or artifact path.",
+											recoverable: true,
+										},
+									}
+								: state === "errored"
+									? {
+											error: {
+												code: "agent_error",
+												message: "GJC agent reported an error",
+												recoverable: true,
+											},
+										}
+									: {}),
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);
