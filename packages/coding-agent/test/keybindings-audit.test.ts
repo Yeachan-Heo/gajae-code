@@ -63,18 +63,20 @@ describe("Windows-to-Darwin declared default parity", () => {
 		});
 		expect(WINDOWS_RUNTIME_SHORTCUTS.find(({ id }) => id === "app.clipboard.pasteImage")).toEqual({
 			id: "app.clipboard.pasteImage",
-			windows: ["alt+v"],
-			darwin: ["ctrl+v"],
+			windows: ["ctrl+v", "alt+v"],
+			darwin: ["ctrl+v", "super+v"],
 		});
 		expect(formatKeyHint("alt+q", { platform: "darwin" })).toBe("⌥Q");
 		expect(formatAccessibleKeyHint("alt+q", { platform: "darwin" })).toBe("⌥Q (Option+Q)");
+		expect(formatKeyHint("super+v", { platform: "darwin" })).toBe("⌘V");
+		expect(formatAccessibleKeyHint("super+v", { platform: "darwin" })).toBe("⌘V (Command+V)");
 		expect(formatKeyHint("ctrl+v", { platform: "darwin" })).toBe("⌃V");
 		expect(formatAccessibleKeyHint("ctrl+v", { platform: "darwin" })).toBe("⌃V (Control+V)");
 		expect(WINDOWS_RUNTIME_SHORTCUTS.filter(({ windows, darwin }) => windows.join() !== darwin.join())).toEqual([
 			{
 				id: "app.clipboard.pasteImage",
-				windows: ["alt+v"],
-				darwin: ["ctrl+v"],
+				windows: ["ctrl+v", "alt+v"],
+				darwin: ["ctrl+v", "super+v"],
 			},
 		]);
 	});

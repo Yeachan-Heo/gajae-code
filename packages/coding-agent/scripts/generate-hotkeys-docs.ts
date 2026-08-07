@@ -19,16 +19,18 @@ function defaultKeys(
 	bindingId: keyof typeof KEYBINDINGS,
 ): string {
 	const defaultsByPlatform = DOCUMENTATION_PLATFORMS.map(platform => {
+		let keys: string | readonly string[];
 		switch (bindingId) {
 			case "app.message.queue":
-				return defaultMessageQueueKeysForPlatform(platform);
+				keys = defaultMessageQueueKeysForPlatform(platform);
+				break;
 			case "app.clipboard.pasteImage":
-				return defaultClipboardPasteImageKeysForPlatform(platform);
-			default: {
-				const keys = value.defaultKeys;
-				return (Array.isArray(keys) ? keys : [keys]).join(", ") || "_(none)_";
-			}
+				keys = defaultClipboardPasteImageKeysForPlatform(platform);
+				break;
+			default:
+				keys = value.defaultKeys;
 		}
+		return (typeof keys === "string" ? keys : keys.join(", ")) || "_(none)_";
 	});
 	const groups = new Map<string, string[]>();
 	for (const [index, keys] of defaultsByPlatform.entries()) {

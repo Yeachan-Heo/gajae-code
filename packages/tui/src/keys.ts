@@ -425,6 +425,78 @@ const KITTY_MOD_CTRL = 4;
 const KITTY_MOD_SUPER = 8;
 const KITTY_MOD_NUM_LOCK = 128;
 const KITTY_LOCK_MASK = 64 + 128; // Caps Lock + Num Lock
+const KOREAN_DUBEOLSIK_BASE_KEYS = new Map<number, BaseKey>(
+	[
+		["ㄱ", "r"],
+		["ㄲ", "r"],
+		["ㄴ", "s"],
+		["ㄷ", "e"],
+		["ㄸ", "e"],
+		["ㄹ", "f"],
+		["ㅁ", "a"],
+		["ㅂ", "q"],
+		["ㅃ", "q"],
+		["ㅅ", "t"],
+		["ㅆ", "t"],
+		["ㅇ", "d"],
+		["ㅈ", "w"],
+		["ㅉ", "w"],
+		["ㅊ", "c"],
+		["ㅋ", "z"],
+		["ㅌ", "x"],
+		["ㅍ", "v"],
+		["ㅎ", "g"],
+		["ㅏ", "k"],
+		["ㅐ", "o"],
+		["ㅑ", "i"],
+		["ㅒ", "o"],
+		["ㅓ", "j"],
+		["ㅔ", "p"],
+		["ㅕ", "u"],
+		["ㅖ", "p"],
+		["ㅗ", "h"],
+		["ㅛ", "y"],
+		["ㅜ", "n"],
+		["ㅠ", "b"],
+		["ㅡ", "m"],
+		["ㅣ", "l"],
+	].map(([character, key]) => [character.codePointAt(0)!, key as BaseKey]),
+);
+
+function matchesKoreanDubeolsikKittySequence(data: string, keyId: KeyId): boolean {
+	const event = parseKittySequence(data);
+	if (!event || event.eventType === 3 || event.baseLayoutKey !== undefined) return false;
+
+	const baseKey = KOREAN_DUBEOLSIK_BASE_KEYS.get(event.codepoint);
+	if (!baseKey) return false;
+
+	const expected = parseKeyId(keyId);
+	if (
+		!expected ||
+		!expected.modifiers.some(modifier => modifier === "alt" || modifier === "ctrl" || modifier === "super") ||
+		expected.baseKey !== baseKey
+	)
+		return false;
+
+	let expectedModifier = 0;
+	for (const modifier of expected.modifiers) {
+		switch (modifier) {
+			case "shift":
+				expectedModifier |= KITTY_MOD_SHIFT;
+				break;
+			case "alt":
+				expectedModifier |= KITTY_MOD_ALT;
+				break;
+			case "ctrl":
+				expectedModifier |= KITTY_MOD_CTRL;
+				break;
+			case "super":
+				expectedModifier |= KITTY_MOD_SUPER;
+				break;
+		}
+	}
+	return (event.modifier & ~KITTY_LOCK_MASK) === expectedModifier;
+}
 const MODIFY_OTHER_KEYS_PATTERN = /^\x1b\[27;(\d+);(\d+)~$/;
 const KITTY_KEYPAD_OPERATOR_TEXT: Record<number, string> = {
 	57410: "/",
@@ -641,7 +713,10 @@ export function decodePrintableKey(data: string): string | undefined {
  * @param keyId - Key identifier (e.g., "ctrl+c", "escape", Key.ctrl("c"))
  */
 export function matchesKey(data: string, keyId: KeyId): boolean {
-	return nativeKeys().matchesKey(data, keyId, kittyProtocolActive);
+	return (
+		nativeKeys().matchesKey(data, keyId, kittyProtocolActive) ||
+		(kittyProtocolActive && matchesKoreanDubeolsikKittySequence(data, keyId))
+	);
 }
 
 /**

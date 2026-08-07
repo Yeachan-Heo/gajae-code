@@ -21,6 +21,7 @@
 ### Changed
 
 - Native fuzzy matching and image encoding bindings now load only when their TUI feature is used instead of at module startup.
+- Kitty-protocol shortcuts can match modified Korean Dubeolsik compatibility-jamo input when terminals omit base-layout metadata, without treating unmodified or Shift-only text input as shortcuts.
 
 ### Fixed
 

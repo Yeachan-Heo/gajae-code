@@ -35,6 +35,7 @@
 
 - Attached image placeholders such as `[image 1]`, including the `[image N] source="…"` pasted-path reference form, are now deleted atomically with Backspace when the cursor sits at the placeholder boundary or the end of the full reference, instead of being erased one character at a time.
 - Root CLI help and shell completion now share the launch flag table instead of maintaining divergent copies, advertise the working `--fork` and `--worktree` options, omit retired extension/skill flags, and reject unknown options instead of silently dropping typos (#4023).
+- Image paste now defaults to Ctrl+V before Command+V on macOS (where terminals commonly consume Command+V), while Windows also accepts Ctrl+V and Alt+V; generated hotkey guidance reflects every platform chord.
 
 ### Added
 
