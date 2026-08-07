@@ -173,8 +173,10 @@ const retainedAttemptPolicies = new Map<string, { ownedCompletionPolicy: "enable
  *  number of saturation events — fail-closed authority for those attempts.
  */
 const incompleteOwnedAttempts = new Set<string>();
-/** Evicted call key → its attempt marker until that tool call settles/registers. */
-const incompleteToolCallWindows = new Map<string, string>();
+/** Evicted call key → its attempt marker + retained lineage until that tool call settles. */
+const incompleteToolCallWindows = new Map<string, { incompleteKey: string; binding: LineageBinding }>();
+/** Number of evicted tool-call windows still capable of registering per attempt. */
+const incompleteAttemptWindowCounts = new Map<string, number>();
 /**
  * Coarser fail-closed saturation authority: once the registry has EVER been
  * saturated, no later attempt's exact causal set can be proven complete
@@ -655,7 +657,15 @@ export function bindToolLineage(toolCallId: string, binding: LineageBinding): vo
 				// over an incomplete causal set.
 				const incompleteKey = `${evicted.lineageIdHash}\u0000${evicted.promptAttemptEpoch}`;
 				markAttemptRegistrationIncomplete(evicted.lineageIdHash, evicted.promptAttemptEpoch);
-				incompleteToolCallWindows.set(oldest, incompleteKey);
+				// Retain the full lineage binding in the window: if this in-flight tool
+				// call still launches a background job, registerOwnedIfLineaged can
+				// register it under the retained lineage instead of leaving the
+				// attempt's causal set empty (review thread P2).
+				incompleteToolCallWindows.set(oldest, { incompleteKey, binding: evicted });
+				incompleteAttemptWindowCounts.set(
+					incompleteKey,
+					(incompleteAttemptWindowCounts.get(incompleteKey) ?? 0) + 1,
+				);
 				// Deliberately NOT setting the coarse ownedRegistrySaturationEver
 				// flag here: the per-attempt marker above is scoped to the
 				// evicted attempt, while the coarse flag is
@@ -691,10 +701,16 @@ export function resolveToolLineage(toolCallId: string | undefined, endpointId?: 
 /** Close an evicted tool's registration window after its execution settles. */
 export function settleToolLineageRegistrationWindow(toolCallId: string, endpointId?: string): void {
 	const key = toolCallLineageKey(endpointId, toolCallId);
-	const incompleteKey = incompleteToolCallWindows.get(key);
-	if (incompleteKey !== undefined) {
+	const window = incompleteToolCallWindows.get(key);
+	if (window !== undefined) {
 		incompleteToolCallWindows.delete(key);
-		incompleteOwnedAttempts.delete(incompleteKey);
+		const remaining = (incompleteAttemptWindowCounts.get(window.incompleteKey) ?? 1) - 1;
+		if (remaining <= 0) {
+			incompleteAttemptWindowCounts.delete(window.incompleteKey);
+			incompleteOwnedAttempts.delete(window.incompleteKey);
+		} else {
+			incompleteAttemptWindowCounts.set(window.incompleteKey, remaining);
+		}
 	}
 }
 
@@ -733,11 +749,20 @@ export function registerOwnedIfLineaged(
 	endpointId?: string,
 ): void {
 	try {
-		const lineage = resolveToolLineage(toolCallId, endpointId);
-		if (!lineage) {
-			if (toolCallId !== undefined) settleToolLineageRegistrationWindow(toolCallId, endpointId);
-			return;
+		let lineage = resolveToolLineage(toolCallId, endpointId);
+		if (!lineage && toolCallId !== undefined) {
+			// The lineage binding may have been EVICTED by the cap while this tool
+			// call was still in flight. The eviction retained the binding's lineage
+			// in the registration window: register the launched job under that
+			// retained lineage so the attempt's causal set is complete instead of
+			// empty. Settling the window here would remove the attempt's only
+			// fail-closed marker while the unregistered job keeps running and a
+			// later scope:"owned" abort could claim stopped_owned over nothing
+			// (review thread P2). The window (and attempt marker) settles at
+			// afterToolCall once the tool call's execution ends.
+			lineage = incompleteToolCallWindows.get(toolCallLineageKey(endpointId, toolCallId))?.binding;
 		}
+		if (!lineage) return;
 		const job = manager.getJob?.(jobId);
 		const jobGeneration = job?.generation;
 		if (!jobGeneration) return;
@@ -953,6 +978,7 @@ export function resetTerminalAbortRegistriesForTests(): void {
 	retainedAttemptPolicies.clear();
 	incompleteOwnedAttempts.clear();
 	incompleteToolCallWindows.clear();
+	incompleteAttemptWindowCounts.clear();
 	retentionBacklog.clear();
 	ownedRegistrySaturationEver = false;
 }

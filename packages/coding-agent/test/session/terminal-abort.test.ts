@@ -25,6 +25,7 @@ import {
 	retireOwnedRegistrationForDeadLetter,
 	retireOwnedRegistrationsForEndpoint,
 	settleOwnedWork,
+	settleToolLineageRegistrationWindow,
 	type TurnRegistrationKey,
 	unbindToolLineage,
 	unregisterOwnedRegistration,
@@ -1164,6 +1165,52 @@ test("lineage-binding eviction marks only the evicted attempt, never the whole p
 	// An unrelated attempt stays provable: ordinary historical churn does not
 	// disable owned aborts process-wide (review thread P2).
 	expect(isOwnedAttemptRegistrationIncomplete("unrelated-attempt", 999_999)).toBe(false);
+});
+
+	test("incomplete attempt evidence remains until every evicted tool window settles", () => {
+	for (let index = 0; index < 8194; index++) {
+		bindToolLineage(`shared-attempt-${index}`, {
+			lineageIdHash: "shared-attempt-lineage",
+			promptAttemptEpoch: 77,
+			endpointGeneration: 0,
+		});
+	}
+	expect(isOwnedAttemptRegistrationIncomplete("shared-attempt-lineage", 77)).toBe(true);
+	settleToolLineageRegistrationWindow("shared-attempt-0");
+	expect(isOwnedAttemptRegistrationIncomplete("shared-attempt-lineage", 77)).toBe(true);
+	settleToolLineageRegistrationWindow("shared-attempt-1");
+	expect(isOwnedAttemptRegistrationIncomplete("shared-attempt-lineage", 77)).toBe(false);
+});
+
+	test("registerOwnedIfLineaged registers an evicted tool call's job with the retained lineage", () => {
+	// Evict a binding (8192 cap) while its tool call is still in flight, then
+	// have that tool launch a background job: the job must register under the
+	// evicted binding's retained lineage so the attempt's causal set is not
+	// empty, and the attempt stays provably incomplete until the tool call
+	// settles (review thread P2).
+	for (let index = 0; index < 8193; index++) {
+		bindToolLineage(`retained-call-${index}`, {
+			lineageIdHash: "retained-lineage",
+			promptAttemptEpoch: 88,
+			endpointGeneration: 3,
+		});
+	}
+	expect(isOwnedAttemptRegistrationIncomplete("retained-lineage", 88)).toBe(true);
+	registerOwnedIfLineaged(
+		{ getJob: () => ({ generation: "gen-new", status: "running" }) },
+		"retained-call-0",
+		"job-new",
+	);
+	const registered = lookupOwnedRegistration("job-new", "gen-new");
+	expect(registered).toBeDefined();
+	expect(registered?.lineageIdHash).toBe("retained-lineage");
+	expect(registered?.promptAttemptEpoch).toBe(88);
+	expect(registered?.endpointGeneration).toBe(3);
+	// The window stays open until the tool call settles, so the attempt remains
+	// provably incomplete while the job may still be running.
+	expect(isOwnedAttemptRegistrationIncomplete("retained-lineage", 88)).toBe(true);
+	settleToolLineageRegistrationWindow("retained-call-0");
+	expect(isOwnedAttemptRegistrationIncomplete("retained-lineage", 88)).toBe(false);
 });
 
 test("retireOwnedRegistrationForDeadLetter removes the exact tuple a dead-lettered delivery leaves behind", () => {
