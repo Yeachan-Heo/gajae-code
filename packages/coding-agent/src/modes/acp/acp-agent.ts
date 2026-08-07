@@ -386,16 +386,27 @@ export interface TranscriptReplayContent {
 	images: { available: false; reason: "historical_transcript_images_unavailable" };
 }
 
-export function transcriptReplayContent(entry: unknown): TranscriptReplayContent {
+/** Machine-readable reason replay could not restore a transcript entry. */
+export type TranscriptReplaySkipReason = "transcript_body_unavailable";
+
+/**
+ * Replay decides per entry. An entry whose production body is missing is not
+ * replayable, and the caller reports that boundary instead of failing the whole
+ * load; fabricating an empty body would replay a message that never existed.
+ */
+export type TranscriptReplayEntry =
+	| { replayable: true; content: TranscriptReplayContent }
+	| { replayable: false; reason: TranscriptReplaySkipReason };
+
+export function transcriptReplayContent(entry: unknown): TranscriptReplayEntry {
 	const record = object(entry);
-	if (typeof record?.body !== "string")
-		throw new AcpSdkAdapterError(
-			"transcript_body_unavailable",
-			"ACP cannot replay a transcript entry without its production body.",
-		);
+	if (typeof record?.body !== "string") return { replayable: false, reason: "transcript_body_unavailable" };
 	return {
-		blocks: record.body.length > 0 ? [{ type: "text", text: record.body }] : [],
-		images: { available: false, reason: "historical_transcript_images_unavailable" },
+		replayable: true,
+		content: {
+			blocks: record.body.length > 0 ? [{ type: "text", text: record.body }] : [],
+			images: { available: false, reason: "historical_transcript_images_unavailable" },
+		},
 	};
 }
 
@@ -2163,6 +2174,8 @@ export class AcpAgent implements Agent {
 		if (!record) return;
 		let cursor: string | undefined;
 		let imageLimitationReported = false;
+		let unreplayableEntries = 0;
+		let unreplayableReason: TranscriptReplaySkipReason | undefined;
 		const replayTools = new Map<string, { name: string; args: unknown }>();
 		for (let pageCount = 0; pageCount < MAX_ACP_REPLAY_PAGES; pageCount++) {
 			const response = object(await adapter.query("transcript.list", {}, cursor));
@@ -2171,7 +2184,13 @@ export class AcpAgent implements Agent {
 			for (const item of Array.isArray(page?.items) ? page.items : []) {
 				const message = object(item);
 				if (!message) continue;
-				const content = transcriptReplayContent(message);
+				const replay = transcriptReplayContent(message);
+				if (!replay.replayable) {
+					unreplayableEntries++;
+					unreplayableReason ??= replay.reason;
+					continue;
+				}
+				const content = replay.content;
 				if (!imageLimitationReported) {
 					imageLimitationReported = true;
 					await this.#publishSessionUpdate(
@@ -2292,7 +2311,24 @@ export class AcpAgent implements Agent {
 				}
 			}
 			cursor = typeof page?.continuationCursor === "string" ? page.continuationCursor : undefined;
-			if (!cursor) return;
+			if (cursor) continue;
+			// An entry without its production body is skipped, never fatal: losing one
+			// transcript row must not revoke `session/load` for the whole session.
+			if (unreplayableReason)
+				await this.#publishSessionUpdate(
+					id,
+					{
+						sessionId: id,
+						update: {
+							sessionUpdate: "session_info_update",
+							_meta: {
+								gjcTranscriptReplaySkipped: { count: unreplayableEntries, reason: unreplayableReason },
+							},
+						},
+					},
+					adapter,
+				);
+			return;
 		}
 		throw new AcpSdkAdapterError("resource_exhausted", "ACP transcript replay exceeded the page limit.");
 	}
