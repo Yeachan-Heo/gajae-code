@@ -2249,7 +2249,7 @@ function sdkQuerySurface(
 	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
-	steerStatusLookup: (clientRef: string) => unknown = () => ({ status: "unknown" }),
+	_steerStatusLookup: (clientRef: string) => unknown = () => ({ status: "unknown" }),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2336,6 +2336,22 @@ function sdkControlSurface(
 		id: ctx.sessionManager.getSessionId(),
 		api,
 	}).policy;
+	const lastAssistantText = () => {
+		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const content = entry.message.content;
+			if (typeof content === "string") return content;
+			if (Array.isArray(content))
+				return content
+					.filter(
+						(block): block is { type: "text"; text: string } =>
+							block.type === "text" && typeof block.text === "string",
+					)
+					.map(block => block.text)
+					.join("");
+		}
+		return undefined;
+	};
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
 		if (missingExpectedSessionAudits.has(operation)) return;
