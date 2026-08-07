@@ -38,7 +38,10 @@ describe("correlated steer production dispatch", () => {
 			).rejects.toMatchObject({ code: "client_ref_conflict" });
 			expect(host.dispatches.filter(dispatch => dispatch.deliverAs === "steer")).toHaveLength(1);
 			const byRef = await client.query("turn.steer_status", { clientRef: "logical-steer-1" });
-			const byCanonical = await client.query("turn.steer_status", accepted);
+			const byCanonical = await client.query("turn.steer_status", {
+				commandId: accepted.commandId,
+				turnId: accepted.turnId,
+			});
 			expect(byRef).toMatchObject({ ok: true, result: accepted });
 			expect(byCanonical).toMatchObject({ ok: true, result: accepted });
 			const sessionFile = host.session.sessionManager.getSessionFile();
