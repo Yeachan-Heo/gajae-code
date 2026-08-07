@@ -3,7 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { getBundledModel, getBundledModels } from "../src/models";
 import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { buildAnthropicClientOptions, buildAnthropicHeaders } from "../src/providers/anthropic";
-import { getEnvApiKey } from "../src/stream";
+import { complete, getEnvApiKey } from "../src/stream";
 import { KNOWN_PROVIDERS } from "../src/types";
 import { getOAuthProviders } from "../src/utils/oauth";
 import { withEnv } from "./helpers";
@@ -62,6 +62,39 @@ describe("JetBrains Junie provider", () => {
 		expect(resolved.baseURL).toBe(JUNIE_BASE_URL);
 		expect(resolved.defaultHeaders?.Authorization).toBe(`Bearer ${API_KEY}`);
 		expect(resolved.defaultHeaders?.["X-LLM-Model"]).toBe("anthropic");
+	});
+
+	it("drives the request from JUNIE_API_KEY alone, with no explicit apiKey argument", async () => {
+		const realFetch = globalThis.fetch;
+		let requestUrl = "";
+		let authorization = "";
+		let hasApiKeyHeader = true;
+
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+			const headers = new Headers(init?.headers);
+			authorization = headers.get("authorization") ?? "";
+			hasApiKeyHeader = headers.has("x-api-key");
+			// Short-circuit: the assertion target is the outbound request, not the reply.
+			return new Response(JSON.stringify({ type: "error", error: { type: "halted" } }), { status: 418 });
+		}) as typeof globalThis.fetch;
+
+		try {
+			await withEnv({ JUNIE_API_KEY: API_KEY }, async () => {
+				const model = getBundledModel("jetbrains-junie", "claude-sonnet-4-6");
+				await complete(
+					model,
+					{ messages: [{ role: "user", content: "x", timestamp: Date.now() }] },
+					{ maxTokens: 8 },
+				).catch(() => undefined);
+			});
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+
+		expect(requestUrl).toBe(`${JUNIE_BASE_URL}/v1/messages`);
+		expect(authorization).toBe(`Bearer ${API_KEY}`);
+		expect(hasApiKeyHeader).toBe(false);
 	});
 
 	it("exposes no OAuth login surface", () => {
