@@ -66,11 +66,14 @@ export type ChatDaemonAction = "stop" | "reload";
  * them against an exact owner tuple, so an owner at an earlier generation may
  * not serve or answer a request captured against this contract. Discord
  * generation 27 / slack generation 26 move shared exact unlink and process-
- * incarnation authority behind lazy native bindings.
+ * incarnation authority behind lazy native bindings. Discord generation 28 /
+ * slack generation 27 dial attached-session clients on the long-lived session
+ * reconnect budget, so an owner at an earlier generation gives up reconnecting
+ * before the host heartbeat TTL expires and permanently loses its attachment.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 27,
-	slack: 26,
+	discord: 28,
+	slack: 27,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
