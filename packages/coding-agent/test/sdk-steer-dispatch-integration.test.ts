@@ -63,12 +63,9 @@ describe("correlated steer production dispatch", () => {
 			expect(byCanonical).toMatchObject({ ok: true, result: durableStatus });
 			expect((byRef as { result: Record<string, unknown> }).result).not.toHaveProperty("sessionId");
 			expect((byCanonical as { result: Record<string, unknown> }).result).not.toHaveProperty("sessionId");
-			const sessionFile = host.session.sessionManager.getSessionFile();
-			expect(sessionFile).toEqual(expect.any(String));
-			const state = fs.readFileSync(
-				path.join(path.dirname(sessionFile!), ".sdk-reconciliation", `${host.sessionId}.json`),
-				"utf8",
-			);
+			const reconciliationPath = path.join(root, ".gjc", "state", ".sdk-reconciliation", `${host.sessionId}.json`);
+			expect(fs.existsSync(reconciliationPath)).toBe(true);
+			const state = fs.readFileSync(reconciliationPath, "utf8");
 			expect(state).not.toContain("one steer");
 			const uncorrelated = await client.control("turn.steer", { text: "compatibility steer" });
 			expect(uncorrelated).toMatchObject({ ok: true, result: { accepted: true } });
