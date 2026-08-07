@@ -1755,7 +1755,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getAsyncJobManager: () => asyncJobManager,
-			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			// Subagents inherit the parent's manager; its registered endpoint is
+			// authoritative for owned-registration keying and endpoint-first
+			// manager lookup (the child's own id is never registered), so tools
+			// pass the same endpoint the manager's completion callback resolves
+			// (review thread P1). For a top-level session this equals the
+			// session id.
+			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId?.() ?? null,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
 			getActiveSkillState: () => session?.getActiveSkillState(),

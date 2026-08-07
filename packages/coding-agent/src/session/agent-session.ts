@@ -3011,7 +3011,7 @@ export class AgentSession {
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => {
-			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.sessionManager.getSessionId?.() ?? "local");
+			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.#ownedRegistrationEndpoint());
 			return this.#ttsrAfterToolCall(ctx);
 		};
 		// Bind immutable lineage/attempt metadata to each tool call id before the
@@ -3031,7 +3031,12 @@ export class AgentSession {
 					// Endpoint identity: the owned-registration registry is
 					// process-global and job ids restart per manager, so
 					// concurrent sessions must not collide (review thread P1).
-					endpointId: this.sessionManager.getSessionId?.() ?? "local",
+					// Subagents inherit the parent's manager, so the key follows
+					// the MANAGER's registered endpoint — the child's own
+					// sessionManager id is never registered, and the inherited
+					// manager's completion callback resolves registrations via
+					// AsyncJobManager.endpointIdOf(manager) (review thread P1).
+					endpointId: this.#ownedRegistrationEndpoint(),
 				});
 			}
 			return undefined;
@@ -10690,6 +10695,22 @@ export class AgentSession {
 		const lineageIdHash = this.#turnLineageIdHash;
 		if (!lineageIdHash) return undefined;
 		return this.#promptGeneration;
+	}
+	/**
+	 * Logical endpoint used to key owned-registration lineage bindings.
+	 * Subagents inherit the parent's AsyncJobManager, whose completion callback
+	 * resolves registrations via AsyncJobManager.endpointIdOf(manager); the
+	 * child's own sessionManager id is never registered under the manager, so
+	 * binding/registering under it would make the parent's lookup miss and
+	 * demote the completion to an ordinary follow-up — purgeable by a parent
+	 * terminal turn abort and outside owned-scope delivery denial (review
+	 * thread P1). The manager's registered endpoint (owned for a top-level
+	 * session, inherited for a child) is authoritative for both binding and
+	 * lookup.
+	 */
+	#ownedRegistrationEndpoint(): string {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		return AsyncJobManager.endpointIdOf(manager) ?? this.sessionManager.getSessionId() ?? "local";
 	}
 	async abortPromptAndWait(
 		handle: string,
