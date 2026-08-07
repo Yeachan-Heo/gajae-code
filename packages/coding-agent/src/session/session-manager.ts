@@ -60,19 +60,19 @@ import {
 import {
 	canonicalizeTrustedPath,
 	deleteManagedSessionCandidate,
+	isRecoverableOwnerOnlyModeDrift,
 	listManagedCandidates,
 	type ManagedCandidateWriteAuthority,
 	type ManagedMigrationPolicy,
 	type ManagedOpenCandidateResult,
 	type ManagedScope,
-	isRecoverableOwnerOnlyModeDrift,
 	managedDirectoryAuthorityForScope,
 	managedRootForScope,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
+	resecureOwnerOnlyManagedTree,
 	resolveManagedScope,
 	resolveManagedScopeForWrite,
-	resecureOwnerOnlyManagedTree,
 } from "./internal/managed-session-scope";
 import {
 	assertManagedDirectoryRoot,
