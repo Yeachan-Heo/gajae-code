@@ -232,6 +232,31 @@ describe("atomic YAML patches", () => {
 
 		expect(YAML.parse(await fs.readFile(configPath, "utf8"))).toEqual({ theme: { dark: "blue" } });
 	});
+	test("an empty file deleted between the transaction read and write is a conflict", async () => {
+		const target = await configPathForTest();
+		await fs.writeFile(target, "", "utf8");
+
+		await expect(
+			withAtomicYamlConfigTransaction(target, async tx => {
+				await fs.rm(target);
+				await tx.applyPatches([{ path: "b", op: "set", value: 2 }]);
+			}),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await fs.stat(target).catch((error: NodeJS.ErrnoException) => error.code)).toBe("ENOENT");
+	});
+
+	test("an empty file created at an absent path between the transaction read and write is a conflict", async () => {
+		const target = await configPathForTest();
+
+		await expect(
+			withAtomicYamlConfigTransaction(target, async tx => {
+				await fs.writeFile(target, "", "utf8");
+				await tx.applyPatches([{ path: "b", op: "set", value: 2 }]);
+			}),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await fs.readFile(target, "utf8")).toBe("");
+	});
+
 	test("an external edit between the transaction read and write is not overwritten", async () => {
 		const target = await configPathForTest();
 		await fs.writeFile(target, YAML.stringify({ a: 1 }, null, 2));
