@@ -2105,6 +2105,28 @@
 			},
 			"additionalProperties": false
 		},
+		"clipboard": {
+			"type": "object",
+			"properties": {
+				"transport": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"native",
+						"osc52",
+						"ssh"
+					],
+					"description": "auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+					"default": "auto"
+				},
+				"sshHost": {
+					"type": "string",
+					"description": "SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
+					"default": ""
+				}
+			},
+			"additionalProperties": false
+		},
 		"web_search": {
 			"type": "object",
 			"properties": {

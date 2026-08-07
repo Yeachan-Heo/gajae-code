@@ -14,6 +14,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -42,6 +43,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -61,6 +63,7 @@ describe("prompt action autocomplete", () => {
 			"Copy current line",
 			"Copy whole prompt",
 			"Paste image from clipboard",
+			"Paste text from configured clipboard",
 			"Scroll to previous user input",
 			"Undo",
 			"Move cursor to end of message",
@@ -76,6 +79,9 @@ describe("prompt action autocomplete", () => {
 		);
 		expect(suggestions?.items.find(item => item.label === "Paste image from clipboard")?.description).toBe(
 			keybindings.getDisplayString("app.clipboard.pasteImage"),
+		);
+		expect(suggestions?.items.find(item => item.label === "Paste text from configured clipboard")?.description).toBe(
+			"requires --clipboard-transport ssh",
 		);
 		expect(suggestions?.items.find(item => item.label === "Move cursor to beginning of line")?.description).toBe(
 			keybindings.getDisplayString("tui.editor.cursorLineStart"),
@@ -106,6 +112,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -135,6 +142,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -244,6 +252,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -286,6 +295,7 @@ describe("prompt action autocomplete", () => {
 			pasteImage: () => {
 				pasteCalls += 1;
 			},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -320,6 +330,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {
 				newSessionCalls += 1;
 			},
@@ -354,6 +365,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {
@@ -389,6 +401,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -411,6 +424,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -434,6 +448,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},

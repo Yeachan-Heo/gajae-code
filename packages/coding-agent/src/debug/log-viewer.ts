@@ -894,15 +894,17 @@ export class DebugLogViewerComponent implements Component {
 			return;
 		}
 
-		try {
-			copyToClipboard(selectedPayload);
-			const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
-			this.#statusMessage = message;
-			this.#onStatus?.(message);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			this.#statusMessage = `Copy failed: ${message}`;
-			this.#onError?.(`Failed to copy logs: ${message}`);
-		}
+		copyToClipboard(selectedPayload).then(
+			() => {
+				const message = `Copied ${selected.length} log ${selected.length === 1 ? "entry" : "entries"}`;
+				this.#statusMessage = message;
+				this.#onStatus?.(message);
+			},
+			(error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				this.#statusMessage = `Copy failed: ${message}`;
+				this.#onError?.(`Failed to copy logs: ${message}`);
+			},
+		);
 	}
 }
