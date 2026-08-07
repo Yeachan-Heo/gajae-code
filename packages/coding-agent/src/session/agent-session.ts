@@ -10816,21 +10816,21 @@ export class AgentSession {
 				this.agent
 					.snapshotQueues()
 					.followUp.some(message => ownedCompletionResumeAction(message as never) === "fresh");
-			if (hasOwnedFollowUp()) {
-				// Admit the rearm as an owned-completion RESUME, not a same-turn
-				// continuation: allocate a fresh lineage FIRST so the continue's
-				// final boundary fence check (keyed by the ABORTED epoch) no
-				// longer matches and does not skip with terminal_turn — otherwise
-				// an owned completion queued before settlement stays stranded
-				// (review thread P1). The continue's onFollowUpConsumed hook
-				// settles the delivered envelopes at dequeue; a second fresh
-				// allocation there mints the same distinct-turn lineage and is
-				// benign.
-				this.#resumeFromOwnedCompletion();
+			const hasPreservedFollowUp = () =>
+				this.agent
+					.snapshotQueues()
+					.followUp.some(
+						message => ownedCompletionResumeAction(message as never) === "fresh" || this.#externalFollowUps.has(message),
+					);
+			if (hasPreservedFollowUp()) {
+				// Owned-completion resumes need a fresh lineage before their continue.
+				// Independently requested SDK follow-ups survive terminal abort too, but
+				// must not be reclassified as agent-initiated owned work.
+				if (hasOwnedFollowUp()) this.#resumeFromOwnedCompletion();
 				this.#scheduleAgentContinue({
 					delayMs: 1,
 					generation: this.#promptGeneration,
-					shouldContinue: hasOwnedFollowUp,
+					shouldContinue: hasPreservedFollowUp,
 				});
 			}
 		}
