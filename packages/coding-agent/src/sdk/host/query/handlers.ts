@@ -54,6 +54,7 @@ export interface SessionSurface {
 		turnId?: string;
 		clientRef?: string;
 	}): unknown | Promise<unknown>;
+	getSteerStatus?(selector: { clientRef: string }): unknown | Promise<unknown>;
 	/** Q27 effective model-profile catalog from the live session registry. */
 	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/** Query rows backed by the session's installed binding map. */
@@ -138,6 +139,7 @@ const names = [
 	"models.profiles.list",
 	"skill.invoke_status",
 	"providers.list/active",
+	"turn.steer_status",
 ];
 
 export class QueryHandlers {
@@ -168,6 +170,7 @@ export class QueryHandlers {
 			if (query === "Q23") return await this.#resourceBody(request);
 			if (query === "Q26") return await this.#promptStatus(request);
 			if (query === "Q28") return await this.#skillInvokeStatus(request);
+			if (query === "Q30") return await this.#steerStatus(request);
 			if (query === "Q24") return await this.#artifact(request);
 			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
 				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
@@ -543,6 +546,23 @@ export class QueryHandlers {
 		return { id: request.id, ok: true, page };
 	}
 
+	async #steerStatus(request: QueryRequest): Promise<QueryResponse> {
+		if (request.cursor)
+			return this.#error(request, "invalid_request", false, "turn.steer_status does not support cursors.");
+		const input = request.input ?? {};
+		const rawClientRef = input.clientRef;
+		const clientRef = typeof rawClientRef === "string" ? rawClientRef.trim() : "";
+		if (Object.keys(input).length !== 1 || !clientRef || clientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"turn.steer_status requires exactly one valid clientRef.",
+			);
+		if (typeof this.surface.getSteerStatus !== "function")
+			return this.#error(request, "unavailable", false, "turn.steer_status is unavailable for this session.");
+		return { id: request.id, ok: true, result: await this.surface.getSteerStatus({ clientRef }) };
+	}
 	async #skillInvokeStatus(request: QueryRequest): Promise<QueryResponse> {
 		if (request.cursor)
 			return this.#error(request, "invalid_request", false, "skill.invoke_status does not support cursors.");
