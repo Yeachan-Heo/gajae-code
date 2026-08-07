@@ -58,6 +58,8 @@ bun run clean:native         # also drop compiled .node addons (rebuild via buil
 bun scripts/clean.ts --dry-run  # list targets without deleting
 ```
 
+`clean` removes `packages/coding-agent/dist/`, so a `--binary`-linked `gjc` (see `dev:doctor`) stops resolving until you run `bun run --cwd=packages/coding-agent build` again. Source-linked setups are unaffected.
+
 Verification (never run `tsc`/`npx tsc` directly at repo root; use these):
 
 ```sh
