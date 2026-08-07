@@ -54,7 +54,7 @@ export interface SessionSurface {
 		turnId?: string;
 		clientRef?: string;
 	}): unknown | Promise<unknown>;
-	getSteerStatus?(selector: { clientRef: string }): unknown | Promise<unknown>;
+	getSteerStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
 	/** Q27 effective model-profile catalog from the live session registry. */
 	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/** Query rows backed by the session's installed binding map. */
