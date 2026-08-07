@@ -5,6 +5,7 @@ import { type IndexedSession, SessionIndex } from "../broker/session-index";
 import { SdkClient, SdkClientError } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import { SESSION_PREPARED_EVENT } from "../host/host";
+import { ACP_SESSION_RECONNECT } from "../session-reconnect";
 
 import { createDiscordAdapter, createSlackAdapter } from "./chat-adapters";
 import { type ChatTransport, projectChatCommandOutcome, sendAuthorizedChatOperation } from "./chat-command-policy";
@@ -85,6 +86,19 @@ type AttachedSession = Readonly<{
 	client: ChatDaemonSdkClient;
 	dispose: () => void;
 }>;
+
+/**
+ * Default transport for one attached session.
+ *
+ * The attachment is long-lived — its frame subscription survives until an
+ * explicit detach or endpoint roll — and it sits under the host's liveness
+ * reaper, which drops any session that has not ponged within HEARTBEAT_TTL_MS.
+ * The transport's one-shot defaults give up after 175ms, so every stall the host
+ * reaps would be unrecoverable; the shared session budget outlives that TTL.
+ */
+async function connectAttachedSession(endpoint: SdkSessionEndpoint): Promise<ChatDaemonSdkClient> {
+	return await SdkClient.connect(endpoint.url, endpoint.token, { ...ACP_SESSION_RECONNECT });
+}
 
 /**
  * The lifecycle signals that decide whether a chat root exists at all. They are
@@ -472,9 +486,7 @@ export class ChatDaemonRuntime {
 			existing.dispose();
 			await existing.client.close();
 		}
-		const client = await (this.deps.createClient ?? (async value => await SdkClient.connect(value.url, value.token)))(
-			endpoint,
-		);
+		const client = await (this.deps.createClient ?? connectAttachedSession)(endpoint);
 		let attached: AttachedSession | undefined;
 		const dispose = client.onFrame(frame => {
 			if (attached) this.schedule(this.enqueueFrame(attached, frame));
