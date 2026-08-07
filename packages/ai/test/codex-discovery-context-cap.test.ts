@@ -41,6 +41,10 @@ describe("Codex GPT-5.6 discovery context cap", () => {
 			expect(await discover(id, 1_050_000)).toBe(372_000);
 			// Even smaller live metadata is overridden — the tier is forced to 372K.
 			expect(await discover(id, 200_000)).toBe(372_000);
+			// Invalid metadata shapes (JSON-safe: null/zero/string) are forced too.
+			expect(await discover(id, null)).toBe(372_000);
+			expect(await discover(id, 0)).toBe(372_000);
+			expect(await discover(id, "373000")).toBe(372_000);
 		}
 	});
 

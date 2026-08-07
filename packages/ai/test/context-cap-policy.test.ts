@@ -38,6 +38,19 @@ describe("Codex GPT-5.6 context cap policy", () => {
 		expect(resolveCodexGpt56DiscoveryContext(model({ id: "gpt-5.5" }), 373_000)).toBe(373_000);
 	});
 
+	it("forces 372K for invalid observations on the tier", () => {
+		// The tier branch ignores the observation entirely, so every invalid shape
+		// must resolve to the enforced window without crashing or falling through.
+		for (const raw of [null, "373000", 0, -100, Number.NaN, Number.POSITIVE_INFINITY] as const) {
+			expect(resolveCodexGpt56DiscoveryContext(model(), raw)).toBe(372_000);
+		}
+		for (const bad of [Number.NaN, 0, -1, undefined as unknown as number]) {
+			expect(applyFinalCodexGpt56ContextCap([model({ contextWindow: bad })])[0]?.contextWindow).toBe(372_000);
+		}
+		// The generic fallback still applies to non-tier rows with invalid metadata.
+		expect(resolveCodexGpt56DiscoveryContext(model({ id: "gpt-5.5" }), null)).toBe(272_000);
+	});
+
 	it("scopes the forced window to exact tiers and Codex product transports", () => {
 		const capped = applyFinalCodexGpt56ContextCap([
 			model({ id: "gpt-5.6" }),
