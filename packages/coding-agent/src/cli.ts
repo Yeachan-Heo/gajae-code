@@ -66,6 +66,7 @@ export const commands: CommandEntry[] = [
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
 	{ name: "completion", load: () => import("./commands/completion").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
+	{ name: "quick-lane", load: () => import("./commands/quick-lane").then(m => m.default) },
 ];
 
 async function showHelp(config: CliConfig): Promise<void> {
