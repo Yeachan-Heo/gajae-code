@@ -247,10 +247,11 @@ describe("MCP delegate-flow host context", () => {
 			sessionId: "valid",
 			prompt: "$gjc-mcp-delegate-flow",
 		});
+		expect(valid).not.toBeNull();
 
 		const listed = await listMcpDelegateHostContexts(root);
 
-		expect(listed.contexts).toEqual([valid?.context]);
+		expect(listed.contexts).toEqual([valid!.context]);
 		expect(listed.failures).toBe(2);
 	});
 	it("continues dispatching when host-context persistence fails", async () => {

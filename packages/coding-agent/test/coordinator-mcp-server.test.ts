@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readCodexHandoff, registerCodexHandoff } from "../src/coordinator-mcp/codex-handoff";
+import {
+	type CodexHandoffOriginV1,
+	readCodexHandoff,
+	registerCodexHandoff,
+} from "../src/coordinator-mcp/codex-handoff";
 import {
 	appendCoordinatorEventForTest,
 	awaitCodexWakePublishesForTest,
@@ -78,7 +82,9 @@ type SdkControlServerOptions = {
 	/** Every raw session frame the server sent, in order (activation frames included). */
 	sessionFrames?: Array<Record<string, unknown>>;
 	sessionFrameResult?: (frame: Record<string, unknown>) => unknown;
-	codexTransportFactory?: Parameters<typeof createCoordinatorMcpServer>[0]["services"]["codexTransportFactory"];
+	codexTransportFactory?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["codexTransportFactory"];
 };
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(
@@ -1628,7 +1634,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			]),
 		);
 		expect(new Set(sessionIds).size).toBe(2);
-		const origins: Array<Record<string, unknown>> = [];
+		const origins: CodexHandoffOriginV1[] = [];
 		for (const [index, sessionId] of sessionIds.entries()) {
 			const bound = await readCodexHandoff(namespace, sessionId);
 			expect(bound).toMatchObject({
@@ -1647,7 +1653,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					workflow: "execute",
 				},
 			});
-			origins.push(bound?.origin as Record<string, unknown>);
+			if (bound?.origin) origins.push(bound.origin);
 		}
 		// Two delegates: DISTINCT GJC session + turn identities...
 		expect(origins[0]?.gjc_session_id).not.toBe(origins[1]?.gjc_session_id);
@@ -1893,7 +1899,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
 			codexTransportFactory: async () => ({
-				request: async (method, params) => {
+				request: async (method: string, params: Record<string, unknown>) => {
 					requests.push({ method, params });
 					return method === "thread/resume" ? { thread: { status: { type: "idle" } } } : {};
 				},

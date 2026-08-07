@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { sessionStateDir } from "../gjc-runtime/session-layout";
@@ -107,7 +108,7 @@ export async function readMcpDelegateHostContext(
 export async function listMcpDelegateHostContexts(
 	cwd: string,
 ): Promise<{ contexts: McpDelegateHostContextV1[]; failures: number }> {
-	let entries: fs.Dirent[];
+	let entries: Dirent[];
 	try {
 		entries = await fs.readdir(path.join(cwd, ".gjc"), { withFileTypes: true });
 	} catch (error) {

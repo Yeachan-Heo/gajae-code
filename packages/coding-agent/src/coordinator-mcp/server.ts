@@ -1016,7 +1016,8 @@ function boundedCodexHandoffResponse(response: Record<string, unknown>): Record<
 	}
 	const handoff = boundedCodexHandoff(response.handoff);
 	if (handoff) output.handoff = handoff;
-	if (response.heartbeat?.supported === false && response.heartbeat.reason === "automation_update_unavailable")
+	const heartbeat = asRecord(response.heartbeat);
+	if (heartbeat?.supported === false && heartbeat.reason === "automation_update_unavailable")
 		output.heartbeat = { supported: false, reason: "automation_update_unavailable" };
 	return output;
 }

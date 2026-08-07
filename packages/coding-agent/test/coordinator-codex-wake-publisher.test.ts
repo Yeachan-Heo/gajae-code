@@ -104,9 +104,9 @@ async function createWebSocketFixture(
 	const server = net.createServer(socket => {
 		let handshaken = false;
 		let initialized = false;
-		let buffer = Buffer.alloc(0);
+		let buffer: Buffer = Buffer.alloc(0);
 		socket.on("data", chunk => {
-			buffer = Buffer.concat([buffer, chunk]);
+			buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
 			if (!handshaken) {
 				// Real app-server transports are WebSocket only; raw JSONL clients never upgrade.
 				if (!buffer.subarray(0, 4).toString("latin1").startsWith("GET")) {

@@ -5,7 +5,11 @@ import { YAML } from "bun";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
 import { sessionLogsDir } from "../gjc-runtime/session-layout";
-import { detectMcpDelegateFlowActivation, persistMcpDelegateHostContext } from "./mcp-delegate-host-context";
+import {
+	detectMcpDelegateFlowActivation,
+	type McpDelegateHostContextV1,
+	persistMcpDelegateHostContext,
+} from "./mcp-delegate-host-context";
 import {
 	buildActiveUltragoalPromptContext,
 	buildSkillActivationAdditionalContext,
