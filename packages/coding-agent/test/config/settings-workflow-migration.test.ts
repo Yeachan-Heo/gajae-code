@@ -1215,6 +1215,45 @@ describe("config-root workflow settings migration", () => {
 		expect(result.targetValue).toBe(11); // the user's override is preserved
 	});
 
+	test("an unapplied pending marker never claims an editor value as migration-owned", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source, agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		const target = path.join(agentDir, "config.yml");
+		const sourceRaw = '{"gjc.ralplan.maxIterations":7}';
+		// The crashed run wrote its pending marker but an editor changed
+		// config.yml (9) before the target patch; no backup exists because the
+		// source move happens only after the patch commits.
+		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 9 } } }, null, 2));
+		await fs.writeFile(source, sourceRaw);
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "pending",
+				sourcePath: source,
+				backupPath: `${source}.bak`,
+				targetPath: target,
+				sourceSha256: createHash("sha256").update(sourceRaw).digest("hex"),
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		// The editor's 9 is a genuine override: not overwritten, not recorded as
+		// migration-owned (migratedKeys is rebuilt empty), migration completes.
+		expect(result.targetValue).toBe(9);
+		expect(result.markerStatus).toBe("complete");
+		expect(result.backupExists).toBe(true);
+
+		// Deleting the legacy source must NOT revert the editor's 9.
+		await fs.rm(source, { force: true });
+		const afterDelete = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(afterDelete.targetValue).toBe(9);
+	});
+
 	test("a pre-apply repair marker does not reclaim a matching user override after source deletion", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();

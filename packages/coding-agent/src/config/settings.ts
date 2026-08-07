@@ -1548,6 +1548,13 @@ export class Settings implements NotificationSettingsReader {
 		const preBackupExists = await this.#pathExists(backup);
 		const preMarkerExists = await this.#pathExists(markerPath);
 		if (!preSourceExists && !preBackupExists && !preMarkerExists) return;
+		// Tracks whether THIS run durably wrote the pending marker and whether its
+		// target patch committed. A CAS rejection with a pending marker written by
+		// this run but no committed target write must clear the marker (its
+		// migratedKeys claim ownership of never-applied patches); a prior run's
+		// marker is retained as the only evidence its values are migration-written.
+		let pendingMarkerWritten = false;
+		let targetPatchCommitted = false;
 		try {
 			await withAtomicYamlConfigTransaction(target, async tx => {
 				// A config.yml written by a NEWER schema version is intentionally
@@ -2113,6 +2120,14 @@ export class Settings implements NotificationSettingsReader {
 							// the key in the rebuilt migratedKeys so ownership
 							// survives the marker rewrite.
 							if (marker?.migratedKeys.includes(key)) {
+								// A pending marker WITHOUT a backup cannot prove its write ever
+								// applied (the backup is created only after the target patch
+								// commits). The present value may be an editor's genuine
+								// override from a pre-apply CAS rejection or a crash after
+								// the pending write; never re-record it as migration-owned
+								// or touch its flat form, so a later source edit cannot
+								// unset the editor's value.
+								if (marker.status === "pending" && !backupExists) continue;
 								if (Object.hasOwn(targetDoc, key)) flatKeysToRemove.push(key);
 								if (!migratedKeys.includes(key)) migratedKeys.push(key);
 							}
@@ -2242,6 +2257,7 @@ export class Settings implements NotificationSettingsReader {
 					migratedKeys,
 					startedAt,
 				});
+				pendingMarkerWritten = true;
 
 				// The legacy source may have been edited since `sourceSha256` was
 				// computed and the patches built. Re-hash BEFORE writing anything so
@@ -2277,6 +2293,7 @@ export class Settings implements NotificationSettingsReader {
 				// config.yml change (which does not participate in the file lock)
 				// land between them and be overwritten.
 				await tx.applyPatchesAndRemoveTopLevelKeys(patches, flatKeysToRemove);
+				targetPatchCommitted = true;
 
 				// Re-hash immediately before the no-replace move; on mismatch, revert
 				// the target to its pre-patch state so the next load re-runs against
@@ -2413,9 +2430,23 @@ export class Settings implements NotificationSettingsReader {
 			// retained marker whose claims were never applied is handled safely
 			// by the unverifiable-ownership abort, which keeps the source active.)
 			if (error instanceof AtomicYamlConflictError) {
-				this.#warnLegacyFallbackMigration(
-					`Settings: config-root workflow migration aborted: ${target} changed externally during migration; pending marker retained`,
-				);
+				// A fresh migration wrote its pending marker but an external editor
+				// changed config.yml before the target patch: nothing was applied,
+				// so the marker's migratedKeys must not claim ownership of
+				// never-applied writes (a retry would otherwise record the editor's
+				// matching value as migration-owned). Clear it; a PRIOR run's marker
+				// (preMarkerExists) or a committed target write stays as ownership
+				// evidence for the changed-pending recovery.
+				if (pendingMarkerWritten && !targetPatchCommitted && !preMarkerExists) {
+					await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: ${target} changed externally before the target write; unapplied pending marker cleared`,
+					);
+				} else {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration aborted: ${target} changed externally during migration; pending marker retained`,
+					);
+				}
 				return;
 			}
 			// A malformed target config.yml must not abort settings load: warn and
