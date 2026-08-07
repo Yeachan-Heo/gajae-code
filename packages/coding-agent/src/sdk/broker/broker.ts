@@ -3,6 +3,7 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import {
 	type DirectoryMigrationPolicy,
@@ -395,6 +396,148 @@ type BrokerLockSnapshot = {
 	lockIdentity: string;
 };
 
+/** Tombstone prefix used by {@link Broker.reclaimStaleLock} when a dead owner's lock is renamed aside. */
+export const BROKER_LOCK_TOMBSTONE_PREFIX = ".broker.lock.stale-";
+
+/**
+ * Recovery directories left beside the lock by manual and older automated broker
+ * restarts. Nothing writes them today, but installs that ever recovered by hand
+ * still carry them, so the reaper owns them alongside its own tombstones.
+ */
+export const BROKER_LOCK_BACKUP_PREFIXES = ["broker-restart-backup-", "broker-stale-backup-"] as const;
+
+/**
+ * Age bound before a reclaimed lock artifact may be removed. Generous enough
+ * that a broker still settling after a reclaim can never have its own successor
+ * state deleted underneath it.
+ */
+export const BROKER_LOCK_ARTIFACT_GRACE_MS = 24 * 60 * 60 * 1_000;
+
+/** Why a candidate lock artifact survived a reap pass. */
+export type BrokerLockArtifactRetentionReason =
+	| "within-grace"
+	| "owner-alive"
+	| "owner-record-unreadable"
+	| "owner-record-missing"
+	| "not-a-directory"
+	| "removal-failed";
+
+export interface BrokerLockArtifactRetention {
+	path: string;
+	reason: BrokerLockArtifactRetentionReason;
+}
+
+export interface BrokerLockArtifactReapResult {
+	removed: string[];
+	retained: BrokerLockArtifactRetention[];
+}
+
+function isBrokerLockArtifactName(name: string): boolean {
+	return (
+		name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX) ||
+		BROKER_LOCK_BACKUP_PREFIXES.some(prefix => name.startsWith(prefix))
+	);
+}
+
+/**
+ * Decide whether one candidate directory is provably abandoned.
+ *
+ * Fail-closed by construction: every branch that cannot prove abandonment
+ * returns a retention reason. A tombstone is only abandoned when its owner
+ * record parses and names a dead PID — an unreadable, permission-denied, or
+ * absent record keeps it forever. Backup directories carry no owner contract,
+ * so an absent record there is not ambiguity and age alone governs.
+ */
+async function classifyBrokerLockArtifact(
+	directory: string,
+	name: string,
+	now: number,
+	graceMs: number,
+	pidAlive: (pid: number) => boolean,
+): Promise<BrokerLockArtifactRetentionReason | "abandoned"> {
+	const target = path.join(directory, name);
+	// lstat, never stat: a symlink pointing at live state must never be followed
+	// into a recursive removal.
+	const stat = await fs.lstat(target);
+	if (!stat.isDirectory()) return "not-a-directory";
+	if (!Number.isFinite(stat.mtimeMs) || now - stat.mtimeMs < graceMs) return "within-grace";
+	let raw: string;
+	try {
+		raw = await fs.readFile(path.join(target, BROKER_LOCK_RECORD), "utf8");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "ENOENT" && code !== "ENOTDIR") return "owner-record-unreadable";
+		return name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX) ? "owner-record-missing" : "abandoned";
+	}
+	let pid: unknown;
+	try {
+		pid = (JSON.parse(raw) as { pid?: unknown }).pid;
+	} catch {
+		return "owner-record-unreadable";
+	}
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return "owner-record-unreadable";
+	return pidAlive(pid) ? "owner-alive" : "abandoned";
+}
+
+/**
+ * Remove reclaimed broker lock tombstones and legacy restart backups older than
+ * the grace window.
+ *
+ * `#reclaimStaleLock` renames a dead owner's lock to a tombstone named by a hash
+ * of the lock's dev+ino, so a machine accrues one directory per dead owner and
+ * nothing ever removed them (54 on the install in #3963). Reaping is
+ * best-effort and fail-closed: anything live, unreadable, permission-denied, or
+ * otherwise ambiguous is kept and the reason is logged.
+ */
+export async function reapStaleBrokerLockArtifacts(input: {
+	agentDir: string;
+	now?: number;
+	graceMs?: number;
+	pidAlive?: (pid: number) => boolean;
+}): Promise<BrokerLockArtifactReapResult> {
+	const directory = path.join(input.agentDir, "sdk");
+	const now = input.now ?? Date.now();
+	const graceMs = input.graceMs ?? BROKER_LOCK_ARTIFACT_GRACE_MS;
+	const pidAlive = input.pidAlive ?? isPidAlive;
+	const removed: string[] = [];
+	const retained: BrokerLockArtifactRetention[] = [];
+	let names: string[];
+	try {
+		names = await fs.readdir(directory);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return { removed, retained };
+		throw error;
+	}
+	for (const name of names) {
+		if (!isBrokerLockArtifactName(name)) continue;
+		const target = path.join(directory, name);
+		let verdict: BrokerLockArtifactRetentionReason | "abandoned";
+		try {
+			verdict = await classifyBrokerLockArtifact(directory, name, now, graceMs, pidAlive);
+		} catch (error) {
+			// A vanished candidate needs no decision; anything else is ambiguous.
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			verdict = "owner-record-unreadable";
+		}
+		if (verdict !== "abandoned") {
+			retained.push({ path: target, reason: verdict });
+			if (verdict !== "within-grace") logger.warn(`sdk broker: retained stale lock artifact ${name} (${verdict})`);
+			continue;
+		}
+		try {
+			await fs.rm(target, { recursive: true });
+			removed.push(target);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			retained.push({ path: target, reason: "removal-failed" });
+			logger.warn(`sdk broker: retained stale lock artifact ${name} (removal-failed)`);
+		}
+	}
+	if (removed.length > 0) logger.info(`sdk broker: reaped ${removed.length} stale lock artifact(s)`);
+	return { removed, retained };
+}
+
 const BROKER_PUBLICATION_CADENCE_MS = 5_000;
 const BROKER_PUBLICATION_GRACE_MS = 15_000;
 // A broker that cannot observe its own publication is not provably the root, but
@@ -417,6 +560,7 @@ type BrokerStopMode = "owned-root" | "lost-root";
 const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
+const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
 
 export class Broker {
 	readonly settings: ResolvedBrokerSettings;
@@ -565,6 +709,22 @@ export class Broker {
 		}
 	}
 
+	/**
+	 * Best-effort startup reap of reclaimed lock tombstones and legacy restart
+	 * backups. Cleanup debris must never fail an otherwise healthy startup, so a
+	 * fault here is logged and swallowed.
+	 */
+	async #reapLockArtifacts(): Promise<void> {
+		try {
+			await reapStaleBrokerLockArtifacts({
+				agentDir: this.settings.agentDir,
+				graceMs: lockArtifactGraceOverridesForTest.get(this),
+			});
+		} catch (error) {
+			logger.warn(`sdk broker: stale lock artifact reap failed: ${String(error)}`);
+		}
+	}
+
 	async start(): Promise<BrokerDiscovery> {
 		if (this.#completionTask) {
 			await this.#completionTask;
@@ -590,6 +750,11 @@ export class Broker {
 
 			const live = await readBrokerDiscovery(this.settings.agentDir, this.settings.heartbeatTtlMs);
 			if (live) {
+				// This process loses the ownership race and its caller only ever sees a
+				// clean exit, so name the reason here (#3963).
+				logger.info(
+					`sdk broker: lock contention, yielding to the live broker owner (ownerId=${live.ownerId}, pid=${live.pid}); this process exits without owning discovery`,
+				);
 				this.discovery = live;
 				return live;
 			}
@@ -598,16 +763,25 @@ export class Broker {
 			if (snapshot.pid > 0 && isPidAlive(snapshot.pid)) {
 				const starting = await this.#waitForBrokerDiscovery();
 				if (starting) {
+					logger.info(
+						`sdk broker: lock contention, yielding to the broker that just started (ownerId=${starting.ownerId}, pid=${starting.pid}); this process exits without owning discovery`,
+					);
 					this.discovery = starting;
 					return starting;
 				}
 				const current = await this.#readLock();
-				if (current && current.identity === snapshot.identity && current.pid > 0 && isPidAlive(current.pid))
-					throw new Error("Broker lock is held by a live owner");
+				if (current && current.identity === snapshot.identity && current.pid > 0 && isPidAlive(current.pid)) {
+					logger.warn(
+						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by live pid ${current.pid} that published no discovery record`,
+					);
+					throw new Error(`Broker lock is held by a live owner (pid ${current.pid})`);
+				}
 				continue;
 			}
 			await this.#reclaimStaleLock(snapshot);
 		}
+		// Only the lock holder reaps, so concurrent brokers cannot race the removal.
+		await this.#reapLockArtifacts();
 		try {
 			await this.index.open();
 			await this.ledger.open();
@@ -1006,6 +1180,12 @@ export function setTerminalPersistenceHookForTest(broker: Broker, hook: (() => v
 export function setAmbiguityGraceForTest(broker: Broker, graceMs: number | undefined): void {
 	if (graceMs === undefined) ambiguityGraceOverridesForTest.delete(broker);
 	else ambiguityGraceOverridesForTest.set(broker, graceMs);
+}
+
+/** Test-only hook for shortening the startup lock-artifact reap bound. */
+export function setLockArtifactGraceForTest(broker: Broker, graceMs: number | undefined): void {
+	if (graceMs === undefined) lockArtifactGraceOverridesForTest.delete(broker);
+	else lockArtifactGraceOverridesForTest.set(broker, graceMs);
 }
 
 /** Test-only hook for forcing the observation the publication watchdog sees. */

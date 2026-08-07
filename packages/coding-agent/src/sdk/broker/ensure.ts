@@ -1,4 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import type { FileHandle } from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import path from "node:path";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 export interface EnsureBrokerSettings {
@@ -18,6 +21,47 @@ const FIXTURE_DISCOVERY_TIMEOUT_MS = 30_000;
 // owned-process teardown convention (SIGTERM -> grace -> SIGKILL -> hard cap).
 const REAP_GRACEFUL_MS = 2_000;
 const REAP_SIGKILL_CAP_MS = 2_000;
+
+/**
+ * Tail of the detached broker's stderr folded into a discovery failure.
+ *
+ * The broker used to spawn with `stdio: "ignore"`, so a broker that exited
+ * cleanly told the caller nothing beyond `code=0` (#3963). Its stderr goes to a
+ * file instead of a pipe because the child is detached and outlives this
+ * process: a pipe would break under it the moment the parent exits.
+ */
+const BROKER_SPAWN_LOG_TAIL_BYTES = 4_096;
+
+function brokerSpawnLogPath(agentDir: string): string {
+	return path.join(agentDir, "sdk", "broker-spawn.log");
+}
+
+/**
+ * Open the diagnostic sink for one spawn. Truncating on every open bounds the
+ * file to a single broker's output, so the sink cannot become the next
+ * unbounded artifact.
+ */
+async function openBrokerSpawnLog(agentDir: string): Promise<FileHandle | undefined> {
+	try {
+		await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true, mode: 0o700 });
+		return await fs.open(brokerSpawnLogPath(agentDir), "w", 0o600);
+	} catch {
+		// Diagnostics are never allowed to block a broker spawn.
+		return undefined;
+	}
+}
+
+async function readBrokerSpawnLogTail(agentDir: string): Promise<string> {
+	try {
+		const file = Bun.file(brokerSpawnLogPath(agentDir));
+		const size = file.size;
+		if (!Number.isFinite(size) || size <= 0) return "";
+		const tail = size > BROKER_SPAWN_LOG_TAIL_BYTES ? file.slice(size - BROKER_SPAWN_LOG_TAIL_BYTES) : file;
+		return (await tail.text()).trim();
+	} catch {
+		return "";
+	}
+}
 export interface FixtureBrokerLease {
 	/** Backward-compatible fixture cleanup alias for exact child termination. */
 	close(): Promise<void>;
@@ -245,12 +289,15 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
+	const spawnLog = await openBrokerSpawnLog(settings.agentDir);
 	const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 		detached: true,
-		stdio: "ignore",
+		stdio: ["ignore", "ignore", spawnLog ? spawnLog.fd : "ignore"],
 		env: brokerSpawnEnvironment(command, settings.env),
 		...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 	});
+	// The child holds its own duplicate of the descriptor; this one is done.
+	await spawnLog?.close();
 	child.unref();
 	let spawnError: Error | undefined;
 	child.once("error", error => {
@@ -298,11 +345,16 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			// fall through to cleanup + failure
 		}
 	}
+	const spawnLogTail = exitedBeforeDiscovery ? await readBrokerSpawnLogTail(settings.agentDir) : "";
 	const failure = spawnError
 		? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 		: exitedBeforeDiscovery
 			? new Error(
-					`Detached SDK broker exited before discovery (code=${child.exitCode}, signal=${child.signalCode}).`,
+					`Detached SDK broker exited before discovery (code=${child.exitCode}, signal=${child.signalCode}).${
+						spawnLogTail
+							? ` Broker stderr: ${spawnLogTail}`
+							: " The broker wrote no stderr; see the gjc log for its lock-contention diagnostic."
+					}`,
 				)
 			: discoveryError
 				? discoveryError
