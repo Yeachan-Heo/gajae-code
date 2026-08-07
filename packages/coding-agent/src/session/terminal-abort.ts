@@ -938,6 +938,21 @@ export function registerTerminalTurnScope(options: {
 	ownedCompletionPolicy?: OwnedCompletionPolicy;
 	blockedContinuationIds?: readonly string[];
 }): RegisteredTerminalScope | undefined {
+	// Concurrent aborts of the SAME turn (dispatch-cache eviction can admit two
+	// same-turn requests before either settles) must not overwrite the attempt
+	// index with a second scope of a different owned-completion policy — a
+	// losing scope:"owned" request would otherwise make a successful
+	// scope:"turn" request's completions drop instead of resuming the fresh
+	// turn (review thread P2). Reuse the first scope's authority.
+	const existing = lookupTerminalScope(options.lineageIdHash, options.promptAttemptEpoch);
+	if (existing) {
+		return {
+			scopeId: existing.scopeId,
+			lineageIdHash: existing.lineageIdHash,
+			promptAttemptEpoch: existing.abortedAttemptEpoch,
+			seam: { fence: existing.fence, gate: existing.gate },
+		};
+	}
 	const terminalScopeId = options.terminalScopeId ?? newTerminalScopeId();
 	const seam = createTurnContinuationSeam({
 		lineageIdHash: options.lineageIdHash,

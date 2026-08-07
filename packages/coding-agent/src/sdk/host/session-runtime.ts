@@ -1003,14 +1003,25 @@ function createControlSurface(
 				terminal: "terminal_no_effect",
 			};
 		}
+		let pendingReplay: SdkOnlyTerminalScopeRecord | undefined;
 		try {
 			await store.transactTerminalState(state => {
 				// Atomic recheck (same rationale as writeNoEffect): never wipe a
-				// row a concurrent request committed under this key with a
-				// different input (review thread P2).
+				// row a concurrent request committed under this key (review thread
+				// P2). A same-input PENDING row is an in-flight duplicate admitted
+				// past the snapshot (dispatch-cache eviction): replay it instead of
+				// replacing the marker, so the duplicate cannot race terminalization
+				// and flip the row to uncertain while the original returns stopped
+				// (or execute the abort twice).
 				const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
-				if (conflicting && conflicting.idempotencyInputHash !== inputHash)
-					throw new SdkOnlyIdempotencyConflictError();
+				if (conflicting) {
+					if (conflicting.idempotencyInputHash !== inputHash)
+						throw new SdkOnlyIdempotencyConflictError();
+					if (conflicting.turnDisposition === "pending") {
+						pendingReplay = conflicting;
+						return { scopes: state.scopes, keys: state.keys };
+					}
+				}
 				const preBound: SdkOnlyTerminalScopeRecord[] = [
 					...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
 					{
@@ -1060,6 +1071,25 @@ function createControlSurface(
 				selection: scope,
 				turn: "no_effect",
 				terminal: "terminal_no_effect",
+			};
+		}
+		if (pendingReplay) {
+			// An in-flight duplicate of this exact key+input was already admitted;
+			// replay its pending row WITHOUT touching the seam, so the duplicate
+			// cannot abort the run a second time or race the terminalization.
+			return {
+				ok: true,
+				selection: scope,
+				turn: "uncertain",
+				ownedWork: scope === "turn" ? "left_running" : "uncertain",
+				automaticDelivery: scope === "turn" ? "enabled" : "none",
+				resumeOnOwnedCompletion: scope === "turn",
+				reason: "replay_pending",
+				replay: {
+					responseState: pendingReplay.responseState,
+					responsePayloadHash: pendingReplay.responsePayloadHash,
+					terminalPublished: pendingReplay.terminalPublished === true,
+				},
 			};
 		}
 		// A new prompt won the race while the marker was being persisted. Never

@@ -4965,6 +4965,7 @@ export function createNotificationsExtension(
 				// process-local no-effect (AC 10) — nothing destructive has run yet.
 				const markerEpoch = terminalAbortSeams?.getTerminalTurnEpoch?.();
 				if (markerEpoch === undefined) return { ok: true as const, outcome: "no_effect" as const };
+				let pendingReplay: DurableTerminalScopeRecord | undefined;
 				try {
 					// Write the marker and any evicted-row key tombstones in ONE
 					// atomic document transaction so a crash cannot leave the
@@ -4977,10 +4978,20 @@ export function createNotificationsExtension(
 						// check (dispatch-cache eviction), and the filter below must
 						// never wipe that row — replacing it would let a later replay
 						// of the SUCCEEDED request report a conflict (review thread
-						// P2).
+						// P2). A same-input PENDING row is an in-flight duplicate:
+						// replay it instead of installing a second marker, so the
+						// duplicate cannot race terminalization and flip the row to
+						// uncertain while the original returns stopped (review
+						// thread P2).
 						const conflicting = state.scopes.find(s => keyHash && s.idempotencyKeyHash === keyHash);
-						if (conflicting && conflicting.idempotencyInputHash !== inputHash)
-							throw new TerminalIdempotencyConflictError();
+						if (conflicting) {
+							if (conflicting.idempotencyInputHash !== inputHash)
+								throw new TerminalIdempotencyConflictError();
+							if (conflicting.turnDisposition === "pending") {
+								pendingReplay = conflicting;
+								return { scopes: state.scopes, keys: state.keys };
+							}
+						}
 						const retained = state.scopes.filter(s => !(keyHash && s.idempotencyKeyHash === keyHash));
 						const preBound: DurableTerminalScopeRecord[] = [
 							...retained,
@@ -5033,6 +5044,20 @@ export function createNotificationsExtension(
 						return { ok: false as const, reason: "reservation_failed" as const };
 					}
 					return { ok: true as const, outcome: "no_effect" as const };
+				}
+				if (pendingReplay) {
+					// An in-flight duplicate of this exact key+input was already
+					// admitted; replay its pending row WITHOUT re-running the stop,
+					// cleanup, or event.
+					return {
+						ok: true as const,
+						outcome: "pending_replay" as const,
+						stored: {
+							responseState: pendingReplay.responseState,
+							responsePayloadHash: pendingReplay.responsePayloadHash,
+							terminalPublished: pendingReplay.terminalPublished === true,
+						},
+					};
 				}
 				const captured: {
 					proof?: RunSettlementProof & {
