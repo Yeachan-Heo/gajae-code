@@ -1821,6 +1821,7 @@ export class AgentSession {
 	#activeModelProfile: string | undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
+	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
 	#sessionAdmissionClosed = false;
@@ -10579,14 +10580,17 @@ export class AgentSession {
 		const droppingSessionOnlyProfile =
 			this.getActiveModelProfile() !== undefined &&
 			this.settings.get("modelProfile.default") !== this.getActiveModelProfile();
+		const preProfileModel = this.#preProfileModel;
 		this.#resetSessionScopedModelProfileState();
 		// A dropped session-only profile must not leak its concrete model into
 		// the successor: restore the configured global default model before it is
 		// recorded as the new session's model.
 		if (droppingSessionOnlyProfile) {
-			const configuredDefault = this.resolveConfiguredDefaultModel();
-			if (configuredDefault && (!this.model || !modelsAreEqual(this.model, configuredDefault))) {
-				this.#setModelAuthoritatively(configuredDefault, "restore");
+			// A session-only profile has no durable default, so its pre-activation
+			// model is the only correct restore target.
+			const restoredDefault = this.resolveConfiguredDefaultModel() ?? preProfileModel;
+			if (restoredDefault && (!this.model || !modelsAreEqual(this.model, restoredDefault))) {
+				this.#setModelAuthoritatively(restoredDefault, "restore");
 			}
 		}
 		this.#clearConstructorToolSelectionAuthority();
@@ -10864,6 +10868,7 @@ export class AgentSession {
 			this.setConfiguredModelChain("default", [], "user-selection");
 		}
 		this.setActiveModelProfile(undefined);
+		this.#preProfileModel = undefined;
 	}
 
 	/**
@@ -10873,8 +10878,16 @@ export class AgentSession {
 	 * profile switch never captures the previous profile's roles as the
 	 * baseline. The session-scoped reset restores exactly these keys.
 	 */
-	noteProfileInstalledOverrides(modelRoles: readonly string[], agentModelOverrides: readonly string[]): void {
+	noteProfileInstalledOverrides(
+		modelRoles: readonly string[],
+		agentModelOverrides: readonly string[],
+		preProfileModel: Model | undefined,
+	): void {
 		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
+		// Captured by the caller before activation replaced the runtime model; reading
+		// `this.model` here would record the profile's own model. First activation wins,
+		// so a chain of session-only profiles still restores the original selection.
+		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
 		for (const role of modelRoles) {
 			if (this.#activeProfileInstalledRoles.has(role)) continue;
 			const bindingValue = bindings?.modelRoles?.[role];
@@ -10932,7 +10945,8 @@ export class AgentSession {
 	 */
 	/** Persist effective roles only when the active profile is a durable default. */
 	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
-		const persistedProfile = this.settings.get("modelProfile.default");
+		// A merged read could let a project-scoped value authorize durable global writes.
+		const persistedProfile = this.settings.getGlobal("modelProfile.default");
 		if (persistedProfile === undefined || persistedProfile !== this.getActiveModelProfile()) return false;
 		return materializeActiveModelProfileAssignment({
 			session: this,

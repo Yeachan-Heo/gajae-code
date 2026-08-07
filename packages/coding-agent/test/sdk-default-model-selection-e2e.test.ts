@@ -254,6 +254,108 @@ test("model.set executes every Q10-advertised selection and persists the public 
 	expect(freshSession.model?.id).toBe(persistedSelection.modelId);
 	expect(freshSession.thinkingLevel).toBe(persistedSelection.thinkingLevel);
 }, 30000);
+test("session-only profile restores the starting model without a durable default", async () => {
+	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-session-profile-successor-"));
+	const agentDir = path.join(tempDir, "agent");
+	const fixtureEnv = createFixtureBrokerEnvironment(tempDir, agentDir);
+	const started = await withFixtureBrokerEnvironment(() =>
+		startFixtureBrokerWithLeaseForTest({ agentDir, env: fixtureEnv }),
+	);
+	fixtureCleanup = createFixtureRootCleanup(tempDir, agentDir, started.lease);
+	authStorage = await AuthStorage.create(path.join(agentDir, "auth.db"));
+	if (!fixtureCleanup) throw new Error("Expected fixture broker cleanup.");
+	registerFixtureRuntime(fixtureCleanup, {
+		key: "auth-storage",
+		requiredOwner: "runtime",
+		dispose: async () => authStorage?.close(),
+	});
+	registerFixtureRuntime(fixtureCleanup, {
+		key: "model-cache",
+		requiredOwner: "runtime",
+		dispose: async () => void closeModelCache(path.join(agentDir, "models.db")),
+	});
+
+	await fs.mkdir(agentDir, { recursive: true });
+	await fs.writeFile(
+		path.join(agentDir, "models.yml"),
+		YAML.stringify({
+			profiles: {
+				"custom-eco": {
+					display_name: "Custom Eco",
+					required_providers: ["runtime-provider"],
+					model_mapping: { default: "runtime-provider/profile-model" },
+				},
+			},
+		}),
+	);
+
+	const modelRegistry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"));
+	modelRegistry.registerProvider("runtime-provider", {
+		baseUrl: "http://127.0.0.1:9/v1",
+		apiKey: "RUNTIME_KEY",
+		api: "openai-completions",
+		models: [
+			{
+				id: "initial-model",
+				name: "Initial Model",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 8_192,
+			},
+			{
+				id: "profile-model",
+				name: "Profile Model",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 8_192,
+			},
+		],
+	});
+	const settings = await Settings.init({ cwd: tempDir, agentDir });
+	const initialModel = modelRegistry.find("runtime-provider", "initial-model");
+	const profileModel = modelRegistry.find("runtime-provider", "profile-model");
+	if (!initialModel || !profileModel) throw new Error("Expected profile model fixtures");
+	vi.spyOn(modelRegistry, "getAll").mockReturnValue([initialModel, profileModel]);
+
+	const { session } = await createAgentSession({
+		cwd: tempDir,
+		agentDir,
+		authStorage,
+		modelRegistry,
+		settings,
+		model: initialModel,
+		sessionManager: SessionManager.inMemory(tempDir),
+		disableExtensionDiscovery: true,
+		extensions: [],
+		skills: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		enableMCP: false,
+		enableLsp: false,
+	});
+	if (!fixtureCleanup) throw new Error("Expected fixture broker cleanup.");
+	registerFixtureRuntime(fixtureCleanup, {
+		key: `session:${session.sessionId}`,
+		requiredOwner: "runtime-and-broker",
+		dispose: () => session.dispose(),
+	});
+
+	expect(settings.getGlobal("modelRoles")).toBeUndefined();
+	expect(session.model?.id).toBe("initial-model");
+	await session.setDefaultModelProfileForControl("custom-eco", { persistDefault: false });
+	expect(session.getActiveModelProfile()).toBe("custom-eco");
+	expect(session.model?.id).toBe("profile-model");
+	expect(await session.newSession()).toBe(true);
+	expect(session.getActiveModelProfile()).toBeUndefined();
+	// A failure leaks the session-only profile model and lets /new invent a durable default.
+	expect(session.model?.id).toBe("initial-model");
+	expect(settings.getGlobal("modelRoles")).toBeUndefined();
+}, 30000);
 test("selecting a synthetic gajae-code profile remains session-scoped across concrete selection and restart", async () => {
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-synthetic-profile-"));
 	const agentDir = path.join(tempDir, "agent");

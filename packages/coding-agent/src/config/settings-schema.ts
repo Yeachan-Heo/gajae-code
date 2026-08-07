@@ -3874,7 +3874,19 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 			continue;
 		}
 		if (!validSettingValue(definition, value)) {
-			issues.push({ path, detail: `Expected ${definition.type}.` });
+			// `Expected array.` is wrong for a real array carrying bad elements, and an
+			// SDK client reaching this through `config.patch` cannot act on it. Name the
+			// element constraint that actually failed.
+			const arrayItemEnum =
+				definition.type === "array" && Array.isArray(value) && "items" in definition
+					? definition.items?.enum
+					: undefined;
+			const detail = arrayItemEnum
+				? `Expected array items to be one of: ${arrayItemEnum.join(", ")}.`
+				: definition.type === "array" && Array.isArray(value)
+					? "Expected array items to be strings."
+					: `Expected ${definition.type}.`;
+			issues.push({ path, detail });
 			continue;
 		}
 		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {

@@ -35,7 +35,11 @@ type ModelProfileActivationSession = Pick<
 	setActiveModelProfile?: (name: string | undefined) => void;
 	getActiveModelProfile?: () => string | undefined;
 	/** Record which runtime override keys this activation installed (session-scoped). */
-	noteProfileInstalledOverrides?: (modelRoles: readonly string[], agentModelOverrides: readonly string[]) => void;
+	noteProfileInstalledOverrides?: (
+		modelRoles: readonly string[],
+		agentModelOverrides: readonly string[],
+		preProfileModel: Model<Api> | undefined,
+	) => void;
 	/** Drop the recorded profile-installed override keys (e.g. after materialization). */
 	clearProfileInstalledOverrides?: () => void;
 	/** Current profile-installed override keys, for deriving the activation base. */
@@ -494,7 +498,7 @@ export async function applyPreparedModelProfileActivation(
 	const previousThinkingLevel = prepared.previousThinkingLevel;
 	const previousAgentModelOverrides = prepared.previousAgentModelOverrides;
 	const previousModelRoles = prepared.previousModelRoles;
-	const previousPersistedDefault = prepared.settings.get("modelProfile.default");
+	const previousPersistedDefault = prepared.settings.getGlobal("modelProfile.default");
 	const previousDefaultThinkingLevel = prepared.settings.get("defaultThinkingLevel");
 	const previousActiveModelProfile = prepared.previousActiveModelProfile;
 	const previousSessionDefaultModel = prepared.previousSessionDefaultModel;
@@ -561,6 +565,8 @@ export async function applyPreparedModelProfileActivation(
 		prepared.session.noteProfileInstalledOverrides?.(
 			Object.keys(prepared.modelRoles),
 			Object.keys(prepared.agentModelOverrides),
+			// Snapshotted before this activation replaced the runtime model.
+			previousModel,
 		);
 	} catch (error) {
 		if (defaultChanged) {
