@@ -106,6 +106,69 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "opencode-go/mimo-v2.5-pro",
 		architect: "opencode-go/deepseek-v4-pro",
 	}),
+	profile("open-weights-glm", [], {
+		default: "glm-5.2:medium",
+		executor: "glm-5.2:low",
+		planner: "glm-5.2:high",
+		critic: "glm-5.2:high",
+		architect: "glm-5.2:xhigh",
+	}),
+	profile("open-weights-deepseek", [], {
+		default: "deepseek-v4-flash:high",
+		executor: "deepseek-v4-flash:medium",
+		planner: "deepseek-v4-flash:high",
+		critic: "deepseek-v4-flash:xhigh",
+		architect: "deepseek-v4-flash:xhigh",
+	}),
+	profile("open-weights-kimi", [], {
+		default: "kimi-k3:high",
+		executor: "kimi-k3:high",
+		planner: "kimi-k3:xhigh",
+		critic: "kimi-k3:high",
+		architect: "kimi-k3:xhigh",
+	}),
+	profile("open-weights-luna", [], {
+		default: "gpt-5.6-luna:high",
+		executor: "gpt-5.6-luna:high",
+		planner: "gpt-5.6-luna:xhigh",
+		critic: "gpt-5.6-luna:xhigh",
+		architect: "gpt-5.6-luna:xhigh",
+	}),
+	profile("open-weights-glm-deepseek", [], {
+		default: "glm-5.2:medium",
+		executor: "deepseek-v4-flash:high",
+		planner: "glm-5.2:high",
+		critic: "deepseek-v4-flash:xhigh",
+		architect: "glm-5.2:xhigh",
+	}),
+	profile("open-weights-kimi-deepseek", [], {
+		default: "kimi-k3:high",
+		executor: "deepseek-v4-flash:high",
+		planner: "kimi-k3:xhigh",
+		critic: "deepseek-v4-flash:xhigh",
+		architect: "kimi-k3:xhigh",
+	}),
+	profile("open-weights-kimi-glm", [], {
+		default: "glm-5.2:high",
+		executor: "glm-5.2:high",
+		planner: "kimi-k3:high",
+		critic: "glm-5.2:xhigh",
+		architect: "kimi-k3:xhigh",
+	}),
+	profile("open-weights-kimi-glm-deepseek", [], {
+		default: "glm-5.2:medium",
+		executor: "deepseek-v4-flash:high",
+		planner: "kimi-k3:high",
+		critic: "glm-5.2:high",
+		architect: "kimi-k3:xhigh",
+	}),
+	profile("open-weights-all", [], {
+		default: "gpt-5.6-luna:high",
+		executor: "deepseek-v4-flash:high",
+		planner: "kimi-k3:high",
+		critic: "glm-5.2:high",
+		architect: "gpt-5.6-luna:xhigh",
+	}),
 	profile("claude-opus", ["anthropic"], {
 		default: "anthropic/claude-opus-5:xhigh",
 		executor: "anthropic/claude-sonnet-5",
@@ -357,6 +420,33 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
 	lunamaxxing: { displayName: "LunaMaxxing", providerGroup: "CODEX" },
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
+	"open-weights-glm": { displayName: "GLM", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
+	"open-weights-deepseek": {
+		displayName: "DeepSeek",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
+	"open-weights-kimi": { displayName: "Kimi", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
+	"open-weights-luna": { displayName: "Luna", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
+	"open-weights-glm-deepseek": {
+		displayName: "GLM + DeepSeek",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
+	"open-weights-kimi-deepseek": {
+		displayName: "Kimi + DeepSeek",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
+	"open-weights-kimi-glm": {
+		displayName: "Kimi + GLM",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
+	"open-weights-kimi-glm-deepseek": {
+		displayName: "Kimi + GLM + DeepSeek",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
+	"open-weights-all": {
+		displayName: "Kimi + GLM + DeepSeek + Luna",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
 	"claude-opus": { displayName: "Claude Opus", providerGroup: "CLAUDE" },
 	"claude-fable": { displayName: "Claude Fable", providerGroup: "CLAUDE" },
 	"glm-eco": { displayName: "GLM Eco", providerGroup: "GLM" },
@@ -394,6 +484,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 const PROFILE_GROUP_ORDER = [
 	"CODEX",
 	"OPENCODEGO",
+	"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 	"CLAUDE",
 	"GLM",
 	"KIMI CODING PLAN",
@@ -404,6 +495,19 @@ const PROFILE_GROUP_ORDER = [
 	"ALIBABA TOKEN PLAN",
 	"COMBOS",
 ];
+
+const OPEN_WEIGHT_PROFILE_ORDER = [
+	"open-weights-glm",
+	"open-weights-deepseek",
+	"open-weights-kimi",
+	"open-weights-luna",
+	"open-weights-glm-deepseek",
+	"open-weights-kimi-deepseek",
+	"open-weights-kimi-glm",
+	"open-weights-kimi-glm-deepseek",
+	"open-weights-all",
+] as const;
+const OPEN_WEIGHT_PROFILE_RANK = new Map<string, number>(OPEN_WEIGHT_PROFILE_ORDER.map((name, index) => [name, index]));
 
 const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"openai-codex": "codex-medium",
@@ -451,8 +555,19 @@ export function groupModelProfilesForPresetLanding(
 		groups.get(group)?.push(profile);
 	}
 	for (const [group, entries] of groups) {
-		if (entries.length === 0) groups.delete(group);
-		else entries.sort((a, b) => a.name.localeCompare(b.name));
+		if (entries.length === 0) {
+			groups.delete(group);
+			continue;
+		}
+		if (group === "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)") {
+			entries.sort(
+				(a, b) =>
+					(OPEN_WEIGHT_PROFILE_RANK.get(a.name) ?? Number.MAX_SAFE_INTEGER) -
+					(OPEN_WEIGHT_PROFILE_RANK.get(b.name) ?? Number.MAX_SAFE_INTEGER),
+			);
+		} else {
+			entries.sort((a, b) => a.name.localeCompare(b.name));
+		}
 	}
 	return groups;
 }

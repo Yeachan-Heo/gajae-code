@@ -24,6 +24,15 @@ export interface CanonicalModelIndex {
 	records: CanonicalModelRecord[];
 	byId: Map<string, CanonicalModelRecord>;
 	bySelector: Map<string, string>;
+	/**
+	 * Final-slash-segment lookup aliases: normalized alias key -> normalized
+	 * variant selectors ("provider/id") of every variant whose model id ends in
+	 * that segment. Variant-level: an alias never widens to sibling variants in
+	 * the same canonical record that end in a different segment. Multi-target
+	 * when distinct variants collide on the same segment. Built without
+	 * rewriting the canonical or runtime identity of any variant.
+	 */
+	aliases: Map<string, string[]>;
 }
 
 interface CanonicalReferenceData {
@@ -105,6 +114,22 @@ export function formatCanonicalVariantSelector(model: Model<Api>): string {
 }
 
 /**
+ * Normalize a model id into its final-slash-segment alias key (trimmed and
+ * lowercased). A bare id without a slash yields the id itself; a multi-level
+ * id yields its last path segment. Returns undefined for empty ids.
+ */
+export function getFinalSlashSegmentAliasKey(modelId: string): string | undefined {
+	const normalized = modelId.trim();
+	if (!normalized) {
+		return undefined;
+	}
+	const slashIndex = normalized.lastIndexOf("/");
+	const segment = slashIndex >= 0 ? normalized.slice(slashIndex + 1) : normalized;
+	const key = segment.trim().toLowerCase();
+	return key || undefined;
+}
+
+/**
  * Compare equivalent provider variants using the caller's ranking policy.
  *
  * The ordered criteria intentionally mirror the historical canonical resolver:
@@ -112,11 +137,16 @@ export function formatCanonicalVariantSelector(model: Model<Api>): string {
  * source, input plus cache-read cost, and original catalog order. Callers that
  * do not have a canonical index can omit those axes while retaining a stable,
  * total comparison.
+ *
+ * `providerRankFirst` swaps the first two axes so configured provider rank wins
+ * over vision support; canonical/alias resolution uses this order while every
+ * existing caller keeps the legacy vision-first order by default.
  */
 export function compareEquivalentModelVariants(
 	left: Model<Api>,
 	right: Model<Api>,
 	options: {
+		providerRankFirst?: boolean;
 		providerRank?: ReadonlyMap<string, number>;
 		canonicalId?: string;
 		leftSourceRank?: number;
@@ -128,17 +158,32 @@ export function compareEquivalentModelVariants(
 ): number {
 	const leftVisionRank = Number(!left.input.includes("image"));
 	const rightVisionRank = Number(!right.input.includes("image"));
-	if (leftVisionRank !== rightVisionRank) return leftVisionRank - rightVisionRank;
 
-	if (options.providerRank) {
+	const compareProviderRank = (): number => {
+		if (!options.providerRank) {
+			return 0;
+		}
 		const leftProviderRank = options.providerRank.get(left.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
 		const rightProviderRank = options.providerRank.get(right.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
-		if (leftProviderRank !== rightProviderRank) return leftProviderRank - rightProviderRank;
+		return leftProviderRank - rightProviderRank;
+	};
+
+	if (options.providerRankFirst) {
+		const providerRankDiff = compareProviderRank();
+		if (providerRankDiff !== 0) return providerRankDiff;
+		if (leftVisionRank !== rightVisionRank) return leftVisionRank - rightVisionRank;
+	} else {
+		if (leftVisionRank !== rightVisionRank) return leftVisionRank - rightVisionRank;
+		const providerRankDiff = compareProviderRank();
+		if (providerRankDiff !== 0) return providerRankDiff;
 	}
 
 	if (options.canonicalId) {
-		const leftExactRank = Number(left.id !== options.canonicalId);
-		const rightExactRank = Number(right.id !== options.canonicalId);
+		// Compare case-insensitively against the normalized exactness key so a
+		// mixed-case model id still matches the alias/canonical lookup key.
+		const normalizedExactnessKey = options.canonicalId.trim().toLowerCase();
+		const leftExactRank = Number(left.id.trim().toLowerCase() !== normalizedExactnessKey);
+		const rightExactRank = Number(right.id.trim().toLowerCase() !== normalizedExactnessKey);
 		if (leftExactRank !== rightExactRank) return leftExactRank - rightExactRank;
 	}
 
@@ -835,6 +880,8 @@ export function buildCanonicalModelIndex(
 	const compiledEquivalence = compileEquivalenceConfig(equivalence);
 	const byId = new Map<string, CanonicalModelRecord>();
 	const bySelector = new Map<string, string>();
+	const aliases = new Map<string, Set<string>>();
+	const ambiguousSelectors = new Set<string>();
 
 	const compiledWithCache = compiledEquivalence as CompiledEquivalenceConfigWithCache;
 	let modelCache = compiledWithCache[kModelResolutionCache];
@@ -865,7 +912,23 @@ export function buildCanonicalModelIndex(
 		};
 		nextRecord.variants.push(variant);
 		byId.set(canonicalKey, nextRecord);
-		bySelector.set(normalizeSelectorKey(selector), canonical.id);
+		const selectorKey = normalizeSelectorKey(selector);
+		if (bySelector.has(selectorKey) || ambiguousSelectors.has(selectorKey)) {
+			bySelector.delete(selectorKey);
+			ambiguousSelectors.add(selectorKey);
+		} else {
+			bySelector.set(selectorKey, canonical.id);
+		}
+		const aliasKey = getFinalSlashSegmentAliasKey(model.id);
+		if (aliasKey) {
+			const aliasSelector = selectorKey;
+			let targets = aliases.get(aliasKey);
+			if (!targets) {
+				targets = new Set<string>();
+				aliases.set(aliasKey, targets);
+			}
+			targets.add(aliasSelector);
+		}
 	}
 
 	const records = [...byId.values()].sort(compareCanonicalRecords);
@@ -873,5 +936,11 @@ export function buildCanonicalModelIndex(
 		record.variants.sort(compareCanonicalVariants);
 	}
 
-	return { records, byId, bySelector };
+	const aliasesByKey = new Map<string, string[]>();
+	for (const [aliasKey, targets] of aliases) {
+		for (const ambiguousSelector of ambiguousSelectors) targets.delete(ambiguousSelector);
+		if (targets.size > 0) aliasesByKey.set(aliasKey, [...targets]);
+	}
+
+	return { records, byId, bySelector, aliases: aliasesByKey };
 }

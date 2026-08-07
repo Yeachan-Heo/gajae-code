@@ -88,13 +88,13 @@ export const ModelBindingsSchema = z.object({
 });
 
 export const ProfileRoleSchema = z.enum(GJC_MODEL_ASSIGNMENT_TARGET_IDS);
-export const ProfileModelSelectorPattern = `^[^,/]+/[^,:]+(?::(?:${EffortSchema.options.join("|")}))?$`;
+export const ProfileModelSelectorPattern = `^(?:[^,/]+/[^,:]+|[^/,:]+)(?::(?:${EffortSchema.options.join("|")}))?$`;
 
 export const ProfileModelSelectorSchema = z
 	.string()
 	.trim()
 	.min(1)
-	.regex(new RegExp(ProfileModelSelectorPattern), "Expected provider/modelId with optional :effort suffix");
+	.regex(new RegExp(ProfileModelSelectorPattern), "Expected modelId or provider/modelId with optional :effort suffix");
 export const ProfileModelMappingSchema = z.partialRecord(
 	ProfileRoleSchema,
 	stringOrNonEmptyArray(ProfileModelSelectorSchema),
@@ -102,7 +102,7 @@ export const ProfileModelMappingSchema = z.partialRecord(
 
 export const ProfileDefinitionSchema = z
 	.object({
-		required_providers: z.array(z.string().min(1)).min(1),
+		required_providers: z.array(z.string().min(1)),
 		display_name: z.string().min(1).optional(),
 		model_mapping: ProfileModelMappingSchema,
 	})

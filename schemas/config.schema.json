@@ -364,6 +364,7 @@
 		"modelProviderOrder": {
 			"type": "array",
 			"items": true,
+			"description": "Ordered provider priority for automatic model resolution. Providers listed earlier win ties; omitted providers fall back to curated ranking. Unavailable saved entries are retained and skipped at runtime.",
 			"default": []
 		},
 		"cycleOrder": {

@@ -75,8 +75,15 @@ import {
 	type ProviderAuthMode,
 	type ProviderDiscovery,
 } from "./models-config-schema";
+import {
+	buildProviderSelectionCatalog,
+	createProviderSelectionPolicy,
+	type EffectiveProviderAuth,
+	type ProviderSelectionPolicy,
+} from "./provider-selection-policy";
 import { type Settings, settings } from "./settings";
 
+export type { EffectiveProviderAuth, ProviderSelectionPolicy } from "./provider-selection-policy";
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
 
 export { isAuthenticated, kNoAuth };
@@ -565,6 +572,8 @@ export interface CanonicalModelQueryOptions {
 	candidates?: readonly Model<Api>[];
 	/** Stable session identity used to keep a canonical variant sticky within a session. */
 	sessionId?: string;
+	/** Credential-selection session used to classify effective provider auth. Defaults to sessionId. */
+	credentialSessionId?: string;
 }
 
 /** Result of loading custom models from models.json */
@@ -1031,7 +1040,8 @@ function getDisabledProviderIdsFromSettings(): Set<string> {
 
 function getConfiguredProviderOrderFromSettings(): string[] {
 	try {
-		return settings.get("modelProviderOrder");
+		const configured = settings.getGlobal("modelProviderOrder");
+		return Array.isArray(configured) ? configured.filter((value): value is string => typeof value === "string") : [];
 	} catch {
 		return [];
 	}
@@ -1060,7 +1070,12 @@ interface ModelManagerDiscoveryOptions {
  */
 export class ModelRegistry {
 	#models: Model<Api>[] = [];
-	#canonicalIndex: CanonicalModelIndex = { records: [], byId: new Map(), bySelector: new Map() };
+	#canonicalIndex: CanonicalModelIndex = {
+		records: [],
+		byId: new Map(),
+		bySelector: new Map(),
+		aliases: new Map(),
+	};
 	#availableModelsCache: Model<Api>[] | undefined;
 	#availableModelsDisabledProviders: string | undefined;
 	#availableModelsEnvFingerprint: string | undefined;
@@ -1227,17 +1242,20 @@ export class ModelRegistry {
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
 		this.authStorage.clearConfigApiKeys();
-		// Restore runtime API keys before #loadModels — survives because
-		// #loadModels only calls .set() on #customProviderApiKeys, never reassigns it.
-		for (const [k, v] of this.#runtimeProviderApiKeys) {
-			this.#customProviderApiKeys.set(k, v);
-		}
+		// Runtime provider keys are reapplied after #loadModels so they retain
+		// registration-time precedence over colliding static provider keys.
 		this.#providerOverrides.clear();
 		this.#modelOverrides.clear();
 		this.#equivalenceConfig = undefined;
 		this.#modelBindingsApplier.setBindings(undefined);
 		this.#configError = undefined;
 		this.#loadModels();
+		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
+			const resolved = resolveApiKeyConfig(apiKeyConfig);
+			if (!resolved) continue;
+			this.#customProviderApiKeys.set(provider, resolved);
+			this.authStorage.setConfigApiKey(provider, resolved);
+		}
 		this.#lastDisabledProviderKey = disabledProviderKey;
 	}
 
@@ -3020,54 +3038,123 @@ export class ModelRegistry {
 		});
 	}
 
-	#providerRank(models: readonly Model<Api>[]): Map<string, number> {
-		const configuredProviders = getConfiguredProviderOrderFromSettings();
-		const result = new Map<string, number>();
-		let nextRank = 0;
-		for (const provider of configuredProviders) {
-			const normalized = provider.trim().toLowerCase();
-			if (!normalized || result.has(normalized)) {
+	/**
+	 * Effective credential provenance for a provider, derived from existing
+	 * AuthStorage/session credential surfaces — never from token shape.
+	 *
+	 * Precedence mirrors actual credential selection (`getApiKey`):
+	 * 1. Runtime/config API-key overrides (the actual credential resolver's
+	 *    highest-priority surfaces)
+	 * 2. Session-recorded stored credential type
+	 * 3. Stored/custom API-key surfaces
+	 * 4. OAuth, only when it is the effective remaining stored credential
+	 * 5. Keyless providers
+	 * 6. Unknown (no credential surface)
+	 */
+	#effectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
+		if (this.authStorage.hasRuntimeApiKey(provider) || this.authStorage.hasConfigApiKey(provider)) return "key";
+
+		const sessionType = this.authStorage.getSessionCredentialType(provider, sessionId);
+		if (sessionType === "oauth") return "oauth";
+		if (sessionType === "api_key") return "key";
+
+		const stored = this.authStorage.getAll()[provider];
+		const entries = Array.isArray(stored) ? stored : stored ? [stored] : [];
+		if (entries.some(entry => entry.type === "api_key")) return "key";
+		if (this.#customProviderApiKeys.has(provider)) return "key";
+		if (this.authStorage.hasOAuth(provider)) return "oauth";
+
+		if (this.authStorage.hasAuth(provider)) return "key";
+		if (this.#keylessProviders.has(provider)) return "keyless";
+		return "unknown";
+	}
+
+	/**
+	 * Build the pure provider selection policy from the registry catalog order,
+	 * configured `modelProviderOrder`, and effective credential provenance for
+	 * the given session. Caller candidate order never influences the resulting
+	 * ranks or tie data; session provenance can (a session that authenticated
+	 * with an API key moves a mixed-credential provider out of the OAuth band).
+	 */
+	#buildProviderSelectionPolicy(sessionId?: string): ProviderSelectionPolicy {
+		const { catalogProviders, catalogModels } = buildProviderSelectionCatalog(this.#models);
+		const effectiveAuth = new Map<string, EffectiveProviderAuth>();
+		for (const model of this.#models) {
+			const providerKey = model.provider.trim().toLowerCase();
+			if (!providerKey || effectiveAuth.has(providerKey)) {
 				continue;
 			}
-			result.set(normalized, nextRank);
-			nextRank += 1;
+			effectiveAuth.set(providerKey, this.#effectiveProviderAuth(model.provider, sessionId));
 		}
-		for (const model of models) {
-			const normalized = model.provider.toLowerCase();
-			if (result.has(normalized)) {
-				continue;
+		return createProviderSelectionPolicy({
+			explicitProviderOrder: getConfiguredProviderOrderFromSettings(),
+			effectiveAuth,
+			catalogProviders,
+			catalogModels,
+		});
+	}
+
+	#providerRankMap(policy: ProviderSelectionPolicy): Map<string, number> {
+		const providerRank = new Map<string, number>();
+		for (const provider of policy.orderedProviders()) {
+			if (!providerRank.has(provider)) {
+				providerRank.set(provider, policy.rank(provider));
 			}
-			result.set(normalized, nextRank);
-			nextRank += 1;
 		}
-		return result;
+		return providerRank;
+	}
+
+	/** Stable model order from the registry catalog (never caller candidate order). */
+	#catalogModelOrder(): Map<string, number> {
+		const modelOrder = new Map<string, number>();
+		for (let index = 0; index < this.#models.length; index += 1) {
+			const selector = formatCanonicalVariantSelector(this.#models[index]!);
+			if (!modelOrder.has(selector)) {
+				modelOrder.set(selector, index);
+			}
+		}
+		return modelOrder;
 	}
 
 	#rememberCanonicalVariant(sessionId: string, selector: string): void {
-		this.#sessionCanonicalVariants.delete(sessionId);
-		this.#sessionCanonicalVariants.set(sessionId, selector);
+		const normalizedSessionId = sessionId.trim();
+		if (!normalizedSessionId) return;
+		this.#sessionCanonicalVariants.delete(normalizedSessionId);
+		this.#sessionCanonicalVariants.set(normalizedSessionId, selector);
 		if (this.#sessionCanonicalVariants.size > MAX_SESSION_CANONICAL_VARIANTS) {
 			this.#sessionCanonicalVariants.delete(this.#sessionCanonicalVariants.keys().next().value!);
 		}
 	}
+
+	/**
+	 * Resolve the winning variant among equivalent candidates. Session stickiness
+	 * wins when the remembered selector is still eligible; otherwise the variant
+	 * is ranked with provider-rank-first axis order when `providerRankFirst` is
+	 * set (alias resolution), or the legacy vision-first order by default
+	 * (canonical resolution). `exactnessKey` (the alias lookup key) replaces the
+	 * canonical-id exactness axis so `model.id === alias` beats slash-prefixed
+	 * ids before source/cost/catalog ties. Provider/model tie data always comes
+	 * from the registry catalog.
+	 */
 	#resolveCanonicalVariant(
 		variants: readonly CanonicalModelVariant[],
-		allCandidates: readonly Model<Api>[],
 		sessionId?: string,
+		options: { providerRankFirst?: boolean; exactnessKey?: string; credentialSessionId?: string } = {},
 	): CanonicalModelVariant | undefined {
 		if (variants.length === 0) return undefined;
-		const stickySelector = sessionId ? this.#sessionCanonicalVariants.get(sessionId) : undefined;
-		const stickyVariant = stickySelector ? variants.find(variant => variant.selector === stickySelector) : undefined;
+		const normalizedSessionId = sessionId?.trim();
+		const stickySelector = normalizedSessionId ? this.#sessionCanonicalVariants.get(normalizedSessionId) : undefined;
+		const stickyVariant = stickySelector
+			? variants.find(variant => variant.selector.toLowerCase() === stickySelector.toLowerCase())
+			: undefined;
 		if (stickyVariant) {
-			this.#rememberCanonicalVariant(sessionId!, stickyVariant.selector);
+			this.#rememberCanonicalVariant(normalizedSessionId!, stickyVariant.selector);
 			return stickyVariant;
 		}
-		if (sessionId && stickySelector) this.#sessionCanonicalVariants.delete(sessionId);
-		const providerRank = this.#providerRank(allCandidates);
-		const modelOrder = new Map<string, number>();
-		for (let index = 0; index < allCandidates.length; index += 1) {
-			modelOrder.set(formatCanonicalVariantSelector(allCandidates[index]!), index);
-		}
+		if (normalizedSessionId && stickySelector) this.#sessionCanonicalVariants.delete(normalizedSessionId);
+		const policy = this.#buildProviderSelectionPolicy(options.credentialSessionId ?? normalizedSessionId);
+		const providerRank = this.#providerRankMap(policy);
+		const modelOrder = this.#catalogModelOrder();
 		const sourceRank: Record<CanonicalModelVariant["source"], number> = {
 			override: 1,
 			bundled: 1,
@@ -3076,8 +3163,10 @@ export class ModelRegistry {
 		};
 		return [...variants].sort((left, right) =>
 			compareEquivalentModelVariants(left.model, right.model, {
+				providerRankFirst: options.providerRankFirst,
 				providerRank,
-				canonicalId: left.canonicalId === right.canonicalId ? left.canonicalId : undefined,
+				canonicalId:
+					options.exactnessKey ?? (left.canonicalId === right.canonicalId ? left.canonicalId : undefined),
 				leftSourceRank: sourceRank[left.source],
 				rightSourceRank: sourceRank[right.source],
 				includeCost: true,
@@ -3110,13 +3199,140 @@ export class ModelRegistry {
 		return this.#filterCanonicalVariants(record, options);
 	}
 
+	/**
+	 * Resolve an exact canonical id to a concrete model.
+	 *
+	 * Canonical ids remain exact lookup keys, but their provider variant uses the
+	 * same provider-rank-first policy as preset aliases. Availability filtering
+	 * remains opt-in through `availableOnly`; final-segment aliases never fall
+	 * back implicitly — use {@link resolveModelByLookupAlias} for alias intent.
+	 */
 	resolveCanonicalModel(canonicalId: string, options?: CanonicalModelQueryOptions): Model<Api> | undefined {
 		const variants = this.getCanonicalVariants(canonicalId, options);
 		if (variants.length === 0) return undefined;
-		const candidates = options?.candidates ?? (options?.availableOnly ? this.getAvailable() : this.getAll());
-		const resolved = this.#resolveCanonicalVariant(variants, candidates, options?.sessionId);
+		const resolved = this.#resolveCanonicalVariant(variants, options?.sessionId, {
+			providerRankFirst: true,
+			credentialSessionId: options?.credentialSessionId,
+		});
 		if (resolved && options?.sessionId) this.#rememberCanonicalVariant(options.sessionId, resolved.selector);
 		return resolved?.model;
+	}
+
+	/**
+	 * Resolve a final-slash-segment alias to a concrete model, explicitly.
+	 *
+	 * The alias gathers every matching variant selector from the variant-level
+	 * alias index — never sibling variants in the same canonical record that end
+	 * in a different segment — then ranks all eligible variants together by the
+	 * centralized provider policy (provider-rank-first axis order), with the
+	 * canonical/exactness axis preserved relative to the alias lookup key
+	 * (`model.id === alias` beats slash-prefixed ids before source/cost/catalog
+	 * ties). Fails closed: availability/disabled filtering applies even to
+	 * supplied candidate arrays, alias variants are intersected with the
+	 * filtered candidate selectors before ranking, and zero eligible candidates
+	 * returns an authoritative `undefined` without rewriting the variant's
+	 * model/wire ids. Winners stay sticky per session.
+	 */
+	resolveModelByLookupAlias(alias: string, options?: CanonicalModelQueryOptions): Model<Api> | undefined {
+		const normalizedAlias = alias.trim().toLowerCase();
+		const aliasSelectors = this.#canonicalIndex.aliases.get(normalizedAlias);
+		if (!aliasSelectors || aliasSelectors.length === 0) return undefined;
+
+		const candidateKeys = options?.candidates
+			? new Set(
+					options.candidates
+						.filter(candidate => this.#isModelAvailable(candidate))
+						.map(candidate => formatCanonicalVariantSelector(candidate)),
+				)
+			: undefined;
+		const eligible: CanonicalModelVariant[] = [];
+		for (const aliasSelector of aliasSelectors) {
+			const canonicalId = this.#canonicalIndex.bySelector.get(aliasSelector);
+			if (canonicalId === undefined) continue;
+			const record = this.#canonicalIndex.byId.get(canonicalId.trim().toLowerCase());
+			if (!record) continue;
+			const variant = record.variants.find(entry => entry.selector.toLowerCase() === aliasSelector);
+			if (!variant) continue;
+			if (candidateKeys && !candidateKeys.has(variant.selector)) continue;
+			if (!this.#isModelAvailable(variant.model)) continue;
+			eligible.push(variant);
+		}
+		if (eligible.length === 0) return undefined;
+
+		const resolved = this.#resolveCanonicalVariant(eligible, options?.sessionId, {
+			providerRankFirst: true,
+			exactnessKey: normalizedAlias,
+			credentialSessionId: options?.credentialSessionId,
+		});
+		if (resolved && options?.sessionId) this.#rememberCanonicalVariant(options.sessionId, resolved.selector);
+		return resolved?.model;
+	}
+
+	/**
+	 * Whether a final-slash-segment alias is known in the current canonical
+	 * index. Knownness is decided from the full multi-target alias index and is
+	 * independent of availability: a known-but-unavailable alias still reports
+	 * `true` while {@link resolveModelByLookupAlias} returns an authoritative
+	 * `undefined`.
+	 */
+	lookupAliasExists(alias: string): boolean {
+		const normalized = alias.trim().toLowerCase();
+		return this.#canonicalIndex.aliases.has(normalized);
+	}
+
+	/**
+	 * Effective credential provenance for a provider, derived from existing
+	 * AuthStorage/session credential surfaces (never from token shape).
+	 * Session-specific provenance wins; API-key surfaces (runtime, config,
+	 * custom/manual, stored api_key) beat OAuth presence; OAuth remains the
+	 * provenance when it is the effective remaining stored credential;
+	 * unknown/keyless providers fall back to non-OAuth.
+	 */
+	getEffectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
+		return this.#effectiveProviderAuth(provider, sessionId);
+	}
+
+	/**
+	 * Forget a session's remembered canonical variant so the next resolution
+	 * for that session re-ranks from scratch (explicit reselection
+	 * integration). Returns whether an entry was actually removed.
+	 */
+	clearCanonicalVariant(sessionId: string): boolean {
+		const scope = sessionId.trim();
+		if (!scope) return false;
+		return this.#sessionCanonicalVariants.delete(scope);
+	}
+	/**
+	 * Snapshot a session's remembered sticky canonical variant selector — the exact
+	 * concrete "provider/id" selector, captured verbatim rather than re-derived
+	 * from any live model. Returns undefined when the session has no remembered
+	 * variant. The caller owns restoring it later via
+	 * {@link restoreSessionCanonicalVariant}.
+	 */
+	getSessionCanonicalVariant(sessionId: string): string | undefined {
+		const scope = sessionId.trim();
+		if (!scope) return undefined;
+		return this.#sessionCanonicalVariants.get(scope);
+	}
+
+	/**
+	 * Restore a session's sticky canonical variant selector exactly, preserving the
+	 * concrete provider/model previously remembered (never re-derived from a live
+	 * model). The selector must still be present in the canonical index, otherwise
+	 * the stale variant is left untouched and `false` is returned.
+	 */
+	restoreSessionCanonicalVariant(sessionId: string, selector: string): boolean {
+		const scope = sessionId.trim();
+		if (!scope) return false;
+		const normalized = selector.trim();
+		if (!normalized) return false;
+		const canonicalId = this.#canonicalIndex.bySelector.get(normalized.toLowerCase());
+		if (!canonicalId) return false;
+		const record = this.#canonicalIndex.byId.get(canonicalId.trim().toLowerCase());
+		const variant = record?.variants.find(candidate => candidate.selector.toLowerCase() === normalized.toLowerCase());
+		if (!variant) return false;
+		this.#rememberCanonicalVariant(scope, variant.selector);
+		return true;
 	}
 
 	getCanonicalId(model: Model<Api>): string | undefined {

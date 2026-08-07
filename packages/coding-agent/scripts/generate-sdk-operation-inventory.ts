@@ -35,6 +35,14 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getConfiguredModelChainState":
+		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
+	"agent_session:getDefaultFallbackRuntimeState":
+		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
+	"agent_session:restoreDefaultFallbackRuntimeState":
+		"internal rollback compensation, not a user-facing SDK control seam",
+	"agent_session:restoreModelSelectionForRollback":
+		"internal rollback compensation, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionCleanup":
 		"internal tool lifecycle cleanup registration, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionTransitionCleanup":

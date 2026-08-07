@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added provider-agnostic model presets that resolve bare model-family aliases across authenticated bundled and custom providers while preserving concrete provider/model identity, session stickiness, and exact provider pins. Settings now includes a durable global Provider Priority Order editor, and the preset catalog includes a curated Open Weight Models group for GLM, DeepSeek, Kimi, Luna, and mixed-role combinations.
+
 ### Fixed
 
 - Made Telegram reference-client capability diagnostics safe for TUI embedding.

@@ -89,17 +89,28 @@ describe("model profile schema", () => {
 		}
 	});
 
-	test("invalid selector and bad effort are rejected", () => {
-		const missingSlash = ModelsConfigSchema.safeParse({
-			profiles: { bad: { required_providers: ["x"], model_mapping: { default: "gpt-5.4" } } },
+	test("bare aliases and nested qualified selectors are accepted while bad effort is rejected", () => {
+		const bareAlias = ModelsConfigSchema.safeParse({
+			profiles: { agnostic: { required_providers: [], model_mapping: { default: "gpt-5.4" } } },
+		});
+		const nestedQualified = ModelsConfigSchema.safeParse({
+			profiles: {
+				routed: {
+					required_providers: ["openrouter"],
+					model_mapping: { default: "openrouter/anthropic/claude-sonnet-5:high" },
+				},
+			},
 		});
 		const badEffort = ModelsConfigSchema.safeParse({
 			profiles: { bad: { required_providers: ["x"], model_mapping: { default: "x/model:ultra" } } },
 		});
-		expect(missingSlash.success).toBe(false);
+		expect(bareAlias.success).toBe(true);
+		expect(nestedQualified.success).toBe(true);
 		expect(badEffort.success).toBe(false);
 		if (!badEffort.success) {
-			expect(badEffort.error.issues[0]?.message).toBe("Expected provider/modelId with optional :effort suffix");
+			expect(badEffort.error.issues[0]?.message).toBe(
+				"Expected modelId or provider/modelId with optional :effort suffix",
+			);
 		}
 	});
 
@@ -129,7 +140,9 @@ describe("model profile schema", () => {
 		for (const result of [commaChain, badEffort, badProvider]) {
 			if (!result.success) {
 				expect(issuePaths(result.error)).toContain("profiles.bad.model_mapping.default");
-				expect(result.error.issues[0]?.message).toBe("Expected provider/modelId with optional :effort suffix");
+				expect(result.error.issues[0]?.message).toBe(
+					"Expected modelId or provider/modelId with optional :effort suffix",
+				);
 			}
 		}
 	});

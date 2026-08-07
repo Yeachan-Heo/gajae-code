@@ -59,7 +59,7 @@ describe("SettingsSelectorComponent Default Model Profile", () => {
 		expect(opened).not.toContain("No matching commands");
 	});
 
-	it("persists the chosen profile to modelProfile.default on confirmation", () => {
+	it("defers profile persistence to the activation transaction", () => {
 		settings.set("modelProfile.default", "orchestra");
 		const { component, changedSettings } = createSelector(["orchestra", "balanced"]);
 		focusModelTab(component);
@@ -68,7 +68,7 @@ describe("SettingsSelectorComponent Default Model Profile", () => {
 		component.handleInput("\x1b[B"); // Move to "balanced".
 		component.handleInput("\n"); // Confirm.
 
-		expect(settings.get("modelProfile.default")).toBe("balanced");
+		expect(settings.get("modelProfile.default")).toBe("orchestra");
 		expect(changedSettings).toContainEqual({ path: "modelProfile.default", value: "balanced" });
 	});
 

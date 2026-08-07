@@ -53,6 +53,63 @@ test("does not skip a Cursor single-entry selection when managed fallback is req
 	expect(resolution.skips).toEqual([]);
 });
 
+test("uses provider credential session separately from canonical stickiness", async () => {
+	const alpha = { ...mockModels[1], provider: "alpha", id: "org/shared-model" } as Model;
+	const beta = { ...mockModels[1], provider: "beta", id: "org/shared-model" } as Model;
+	let observedCredentialSessionId: string | undefined;
+	const resolution = await resolveModelChainWithAuth(
+		["shared-model"],
+		{
+			getAvailable: () => [alpha, beta],
+			lookupAliasExists: () => true,
+			resolveModelByLookupAlias: (
+				_alias: string,
+				options?: { credentialSessionId?: string; candidates?: readonly Model[] },
+			) => {
+				observedCredentialSessionId = options?.credentialSessionId;
+				return options?.credentialSessionId === "provider-session" ? beta : alpha;
+			},
+			getApiKey: async () => "key",
+		} as never,
+		undefined,
+		"provider-session",
+		{ canonicalSessionId: "logical-session", aliasIntent: "preset-equivalent" },
+	);
+
+	expect(observedCredentialSessionId).toBe("provider-session");
+	expect(resolution.model).toBe(beta);
+});
+
+test("retries an equivalent alias provider after the preferred candidate fails authentication", async () => {
+	const alpha = { ...mockModels[1], provider: "alpha", id: "org/shared-model" } as Model;
+	const beta = { ...mockModels[1], provider: "beta", id: "org/shared-model" } as Model;
+	const cleared: string[] = [];
+	const resolution = await resolveModelChainWithAuth(
+		["shared-model"],
+		{
+			getAvailable: () => [alpha, beta],
+			lookupAliasExists: () => true,
+			resolveModelByLookupAlias: (
+				_alias: string,
+				options?: { credentialSessionId?: string; candidates?: readonly Model[] },
+			) => options?.candidates?.[0],
+			clearCanonicalVariant: (sessionId: string) => {
+				cleared.push(sessionId);
+				return true;
+			},
+			getApiKey: async (candidate: Model) => (candidate.provider === "beta" ? "key" : undefined),
+		} as never,
+		undefined,
+		"provider-session",
+		{ canonicalSessionId: "logical-session", aliasIntent: "preset-equivalent" },
+	);
+
+	expect(resolution.model).toBe(beta);
+	expect(resolution.activeIndex).toBe(0);
+	expect(resolution.skips).toEqual([{ selector: "shared-model", reason: "unauthenticated" }]);
+	expect(cleared).toEqual(["logical-session"]);
+});
+
 // Mock models for testing
 const mockModels: Model<"anthropic-messages">[] = [
 	{
@@ -340,6 +397,21 @@ describe("parseModelPattern", () => {
 			expect(result.explicitThinkingLevel).toBe(false);
 			expect(result.warning).toContain("Invalid thinking level");
 		});
+	});
+
+	test("strict preset alias resolution rejects an invalid thinking suffix", () => {
+		const candidate = mockModels[0];
+		const result = parseModelPattern("claude-sonnet-4-5:ultra", [candidate], undefined, {
+			allowInvalidThinkingSelectorFallback: false,
+			aliasIntent: "preset-equivalent",
+			modelRegistry: {
+				lookupAliasExists: alias => alias === "claude-sonnet-4-5",
+				resolveModelByLookupAlias: () => candidate,
+			},
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.warning).toBeUndefined();
 	});
 
 	describe("OpenRouter models with colons in IDs", () => {
@@ -970,5 +1042,219 @@ describe("expandRoleAlias", () => {
 		const settings = Settings.isolated();
 
 		expect(expandRoleAlias("pi/vision", settings)).toBe("pi/vision");
+	});
+});
+describe("preset-equivalent alias resolution", () => {
+	const aliasVariantModels: Model<"anthropic-messages">[] = [
+		{
+			id: "claude-4-7",
+			name: "Claude 4.7 Opus",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			thinking: { mode: "budget", minLevel: Effort.Minimal, maxLevel: Effort.High },
+			input: ["text", "image"],
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+			contextWindow: 200000,
+			maxTokens: 8192,
+		},
+		{
+			id: "claude-4-6",
+			name: "Claude 4.6 Sonnet",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			thinking: { mode: "budget", minLevel: Effort.Minimal, maxLevel: Effort.High },
+			input: ["text", "image"],
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+			contextWindow: 200000,
+			maxTokens: 8192,
+		},
+	];
+	const exactOpus: Model<"anthropic-messages"> = {
+		...aliasVariantModels[0]!,
+		id: "opus",
+		provider: "openai",
+	};
+
+	const makeAliasRegistry = (aliases: Map<string, Model<"anthropic-messages">>, track?: { called: number }) => ({
+		getAvailable: () => aliasVariantModels,
+		lookupAliasExists: (alias: string) => {
+			if (track) track.called += 1;
+			return aliases.has(alias);
+		},
+		resolveModelByLookupAlias: (
+			alias: string,
+			options?: { availableOnly?: boolean; candidates?: readonly Model[]; sessionId?: string },
+		) => {
+			if (track) track.called += 1;
+			const target = aliases.get(alias);
+			if (!target) return undefined;
+			return options?.candidates?.find(m => m.provider === target.provider && m.id === target.id);
+		},
+	});
+
+	test("resolves a bare preset alias intent", () => {
+		const result = parseModelPattern("opus", aliasVariantModels, undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: makeAliasRegistry(new Map([["opus", aliasVariantModels[0]!]])),
+		});
+
+		expect(result.model).toBe(aliasVariantModels[0]);
+		expect(result.explicitThinkingLevel).toBe(false);
+		expect(result.warning).toBeUndefined();
+	});
+
+	test("keeps slash-qualified preset assignments pinned to their provider", () => {
+		const track = { called: 0 };
+		const result = parseModelPattern("anthropic/opus", aliasVariantModels, undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: makeAliasRegistry(new Map([["opus", aliasVariantModels[0]!]]), track),
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(track.called).toBe(0);
+	});
+
+	test("fails closed for provider pins that collide with slash-embedded model ids", () => {
+		const routerModel: Model<"anthropic-messages"> = {
+			...aliasVariantModels[0]!,
+			provider: "router",
+			id: "openai/gpt-5",
+			name: "Routed GPT-5",
+		};
+		const registry = makeAliasRegistry(new Map([["gpt-5", routerModel]]));
+
+		const pinned = parseModelPattern("openai/gpt-5", [routerModel], undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: registry,
+		});
+		const pinnedWithThinking = parseModelPattern("openai/gpt-5:high", [routerModel], undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: registry,
+		});
+		const automatic = parseModelPattern("gpt-5", [routerModel], undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: registry,
+		});
+
+		expect(pinned.model).toBeUndefined();
+		expect(pinnedWithThinking.model).toBeUndefined();
+		expect(automatic.model).toBe(routerModel);
+	});
+
+	test("fails closed when a provider-qualified pin contains a colon in the provider id", () => {
+		const routerModel: Model<"anthropic-messages"> = {
+			...aliasVariantModels[0]!,
+			provider: "router",
+			id: "foo:bar/model",
+		};
+
+		const result = parseModelPattern("foo:bar/model", [routerModel], undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: makeAliasRegistry(new Map()),
+		});
+
+		expect(result.model).toBeUndefined();
+	});
+
+	test("fails closed when both a pinned provider and model id contain colons", () => {
+		const routerModel: Model<"anthropic-messages"> = {
+			...aliasVariantModels[0]!,
+			provider: "router",
+			id: "foo:bar/model:nitro",
+		};
+
+		const result = parseModelPattern("foo:bar/model:nitro", [routerModel], undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: makeAliasRegistry(new Map()),
+		});
+
+		expect(result.model).toBeUndefined();
+	});
+
+	test("exact selector precedence wins over a preset alias", () => {
+		const candidates = [exactOpus, aliasVariantModels[0]!];
+		const result = parseModelPattern("opus", candidates, undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: makeAliasRegistry(new Map([["opus", aliasVariantModels[0]!]])),
+		});
+
+		expect(result.model).toBe(exactOpus);
+		expect(result.model?.provider).toBe("openai");
+	});
+
+	test("default and reject callers do not resolve preset aliases", () => {
+		const track = { called: 0 };
+		const registry = makeAliasRegistry(new Map([["opus", aliasVariantModels[0]!]]), track);
+
+		const defaultResult = parseModelPattern("router/opus", aliasVariantModels, undefined, {
+			modelRegistry: registry,
+		});
+		expect(defaultResult.model).toBeUndefined();
+		expect(track.called).toBe(0);
+
+		const rejectResult = parseModelPattern("router/opus", aliasVariantModels, undefined, {
+			aliasIntent: "reject",
+			modelRegistry: registry,
+		});
+		expect(rejectResult.model).toBeUndefined();
+		expect(track.called).toBe(0);
+	});
+
+	test("known-but-unavailable preset aliases fail closed without glob fallback", () => {
+		const opusMax: Model<"anthropic-messages"> = { ...aliasVariantModels[0]!, id: "opus-max", provider: "openai" };
+		const result = parseModelPattern("opus*", [opusMax], undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: {
+				lookupAliasExists: () => true,
+				resolveModelByLookupAlias: () => undefined,
+			},
+		});
+
+		expect(result.model).toBeUndefined();
+	});
+
+	test("preset alias resolves with a thinking suffix", () => {
+		const result = parseModelPattern("opus:high", aliasVariantModels, undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: makeAliasRegistry(new Map([["opus", aliasVariantModels[0]!]])),
+		});
+
+		expect(result.model).toBe(aliasVariantModels[0]);
+		expect(result.thinkingLevel).toBe(Effort.High);
+		expect(result.explicitThinkingLevel).toBe(true);
+		expect(result.warning).toBeUndefined();
+	});
+
+	test("forwards the active session id to preset alias lookup", () => {
+		let receivedSessionId: string | undefined;
+		const result = parseModelPattern("opus", aliasVariantModels, undefined, {
+			aliasIntent: "preset-equivalent",
+			sessionId: "session-abc",
+			modelRegistry: {
+				lookupAliasExists: () => true,
+				resolveModelByLookupAlias: (_alias, options) => {
+					receivedSessionId = options?.sessionId;
+					return aliasVariantModels[0];
+				},
+			},
+		});
+
+		expect(result.model).toBe(aliasVariantModels[0]);
+		expect(receivedSessionId).toBe("session-abc");
+	});
+
+	test("resolveModelRoleValue threads preset-equivalent alias intent", () => {
+		const result = resolveModelRoleValue("opus", aliasVariantModels, {
+			aliasIntent: "preset-equivalent",
+			sessionId: "session-abc",
+			modelRegistry: makeAliasRegistry(new Map([["opus", aliasVariantModels[0]!]])),
+		});
+
+		expect(result.model).toBe(aliasVariantModels[0]);
+		expect(result.warning).toBeUndefined();
 	});
 });

@@ -189,6 +189,7 @@ import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
 import { activateModelProfile } from "../config/model-profile-activation";
+import { resolveModelProfileName } from "../config/model-profile-contract";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
@@ -376,6 +377,7 @@ import {
 	compactionRetryDelay,
 	effectiveFallbackDelay,
 	FallbackChainController,
+	type FallbackChainRuntimeState,
 } from "./fallback-chain-controller";
 
 export { DefaultModelSelectionRecoveryError } from "./default-model-selection";
@@ -1722,6 +1724,12 @@ type SessionAdmissionEntry = {
 type SessionAdmissionLease = {
 	release(): void;
 };
+
+export interface DefaultFallbackRuntimeState {
+	chain: ConfiguredFallbackChain;
+	controller: FallbackChainRuntimeState;
+	exhaustedLastTurn: boolean;
+}
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -10407,6 +10415,18 @@ export class AgentSession {
 		previousSessionFile: string | undefined,
 	): Promise<void> {
 		this.#clearConstructorToolSelectionAuthority();
+		const configuredDefaultProfile = this.settings.get("modelProfile.default");
+		const configuredDefaultProfileIdentity = configuredDefaultProfile
+			? resolveModelProfileName(
+					configuredDefaultProfile,
+					this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>(),
+				)
+			: undefined;
+		if (this.#activeModelProfile && this.#activeModelProfile !== configuredDefaultProfileIdentity) {
+			this.settings.clearOverride("modelRoles");
+			this.settings.clearOverride("task.agentModelOverrides");
+			this.#activeModelProfile = undefined;
+		}
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -10572,7 +10592,12 @@ export class AgentSession {
 	async setModel(
 		model: Model,
 		role: string = "default",
-		options?: { selector?: string; thinkingLevel?: ThinkingLevel; cause?: ModelChangeCause },
+		options?: {
+			selector?: string;
+			thinkingLevel?: ThinkingLevel;
+			cause?: ModelChangeCause;
+			onMutationStarted?: () => void;
+		},
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
@@ -10580,7 +10605,9 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
+		options?.onMutationStarted?.();
 		this.#setModelAuthoritatively(model, options?.cause ?? "user-selection");
+		this.#seedSessionCanonicalVariant(model);
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
 		this.settings.setModelRole(
 			role,
@@ -10627,6 +10654,18 @@ export class AgentSession {
 		return this.#activeModelProfile;
 	}
 
+	/**
+	 * Resolver intent for persisted chain consumers (profile roles/agent
+	 * overrides, default fallback, resume) that are owned by an active model
+	 * profile. A bare profile alias may re-resolve to an equivalent provider
+	 * variant; provider-qualified pins stay exact. Returns undefined (exact
+	 * behavior) when no active profile claims those persisted assignments, so
+	 * direct/CLI/manual chains are never affected.
+	 */
+	#persistedModelProfileAliasIntent(): { aliasIntent: "preset-equivalent" } | undefined {
+		return this.#activeModelProfile ? { aliasIntent: "preset-equivalent" } : undefined;
+	}
+
 	/** Activate a complete model profile through a nonvisual session control. */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
 		await activateModelProfile({
@@ -10641,6 +10680,25 @@ export class AgentSession {
 	/** Return the persisted configured fallback selectors for a model role. */
 	getConfiguredModelChain(role: string): readonly string[] | undefined {
 		return getSessionContextForInternalRead(this.sessionManager).configuredModelChains[role]?.entries;
+	}
+
+	/** Return the persisted configured chain with its durable ownership metadata. */
+	getConfiguredModelChainState(role: string):
+		| {
+				entries: readonly string[];
+				origin: string;
+				identity?: string;
+				explicitHead: boolean;
+		  }
+		| undefined {
+		const chain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains[role];
+		if (!chain) return undefined;
+		return {
+			entries: [...chain.entries],
+			origin: chain.origin,
+			identity: chain.identity,
+			explicitHead: chain.explicitHead,
+		};
 	}
 
 	/** Persist the configured fallback selectors for a model role. */
@@ -10659,6 +10717,10 @@ export class AgentSession {
 			explicitHead,
 			cleared: entries.length === 0,
 		});
+		if (role === "default") {
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		}
 	}
 
 	/**
@@ -10684,6 +10746,25 @@ export class AgentSession {
 		this.#emitResolutionFallbackSwitch(controller);
 	}
 
+	getDefaultFallbackRuntimeState(): DefaultFallbackRuntimeState {
+		const controller = this.#defaultFallbackChain(false);
+		return {
+			chain: { ...controller.chain, entries: [...controller.chain.entries] },
+			controller: controller.snapshotRuntimeState(),
+			exhaustedLastTurn: this.#defaultFallbackExhaustedLastTurn,
+		};
+	}
+
+	restoreDefaultFallbackRuntimeState(state: DefaultFallbackRuntimeState): void {
+		const controller = new FallbackChainController(
+			{ ...state.chain, entries: [...state.chain.entries] },
+			this.settings.get("fallback.maxAttempts"),
+		);
+		controller.restoreRuntimeState(state.controller);
+		this.#defaultFallbackController = controller;
+		this.#defaultFallbackExhaustedLastTurn = state.exhaustedLastTurn;
+	}
+
 	/**
 	 * The model selector ("provider/id") that resume restores as the session
 	 * default — the latest session-log `model_change` with role="default".
@@ -10706,13 +10787,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Re-assert the session resume default ("provider/id") in the session log
-	 * WITHOUT touching the live runtime model. Appends a `model_change` with
-	 * role="default"; never writes to global settings (apply-for-this-session
-	 * semantics). Used by model-profile activation rollback to neutralize the
-	 * profile main model the failed activation already recorded as the default.
+	 * Record or clear the session resume default ("provider/id") without touching
+	 * the live runtime model. An undefined selector appends an explicit clear
+	 * marker so rollback preserves the absence of a prior default during replay.
+	 * Never writes global settings.
 	 */
-	recordResumeDefaultModel(selector: string): void {
+	recordResumeDefaultModel(selector: string | undefined): void {
+		if (selector === undefined) {
+			this.sessionManager.clearModelRole("default");
+			return;
+		}
 		this.sessionManager.appendModelChange(selector, "default");
 	}
 
@@ -10723,10 +10807,9 @@ export class AgentSession {
 	 * The change is recorded in the session log as `role: "temporary"` by
 	 * default, which means it is NOT restored as the session default on resume —
 	 * transient retry/fallback/context-promotion/plan switches must not clobber
-	 * the user's explicit pick (issue #849). Model-profile activation passes
-	 * `persistAsSessionDefault: true` so the profile's main model becomes the
-	 * session default and survives resume, while still not being written to
-	 * global settings (new sessions keep the global default).
+	 * the user's explicit pick (issue #849). Callers that intentionally own the
+	 * session resume default may opt into `persistAsSessionDefault: true` without
+	 * changing global settings.
 	 * @throws Error if no API key available for the model
 	 */
 	async setModelTemporary(
@@ -10785,6 +10868,9 @@ export class AgentSession {
 				options?.persistAsSessionDefault ? "default" : "temporary",
 			);
 			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+			if (options?.persistAsSessionDefault) {
+				this.#seedSessionCanonicalVariant(model);
+			}
 
 			// Apply explicit thinking level if given; otherwise prefer the model's
 			// configured defaultLevel; otherwise re-clamp the current level.
@@ -10795,6 +10881,22 @@ export class AgentSession {
 			throw error;
 		}
 		return scope;
+	}
+
+	/** Restore the exact live-model state captured before a failed selector transaction. */
+	async restoreModelSelectionForRollback(
+		model: Model | undefined,
+		thinkingLevel: ThinkingLevel | undefined,
+	): Promise<void> {
+		if (model) {
+			await this.setModelTemporary(model, thinkingLevel, { cause: "rollback", reason: "other" });
+			return;
+		}
+		const previousEditMode = this.#resolveActiveEditMode();
+		this.#clearActiveRetryFallback();
+		this.#setModelWithProviderSessionReset(undefined);
+		this.setThinkingLevel(thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	async #restoreDefaultModelSelectionCommit(
@@ -10859,6 +10961,7 @@ export class AgentSession {
 	#publishDefaultModelSelection(model: Model, thinkingLevel: ThinkingLevel, systemPrompt: string[] | undefined): void {
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
+		this.#seedSessionCanonicalVariant(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -11034,6 +11137,7 @@ export class AgentSession {
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
 				sessionId: this.sessionId,
+				...(this.#persistedModelProfileAliasIntent() ?? {}),
 			});
 			if (!resolved.model) continue;
 
@@ -13310,6 +13414,22 @@ export class AgentSession {
 		this.#syncAppendOnlyContext(model);
 	}
 
+	/**
+	 * Seed (or clear) the session's sticky canonical variant to reflect an
+	 * explicit user/control model selection. When the selected concrete model has
+	 * a canonical identity it becomes the session's preferred variant; otherwise
+	 * any stale sticky variant is cleared so a previous provider selection cannot
+	 * silently resurrect. Never invoked from settings-edit paths — only explicit
+	 * model selections remap the session's canonical stickiness.
+	 */
+	#seedSessionCanonicalVariant(model: Model): void {
+		if (this.#modelRegistry.getCanonicalId?.(model)) {
+			this.#modelRegistry.seedCanonicalVariant?.(this.sessionId, model);
+		} else {
+			this.#modelRegistry.clearCanonicalVariant?.(this.sessionId);
+		}
+	}
+
 	#closeCodexProviderSessionsForHistoryRewrite(): void {
 		const currentModel = this.model;
 		if (currentModel?.api !== "openai-codex-responses") return;
@@ -13645,6 +13765,7 @@ export class AgentSession {
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry: this.#modelRegistry,
 			sessionId: this.sessionId,
+			...(this.#persistedModelProfileAliasIntent() ?? {}),
 		});
 	}
 
@@ -14703,7 +14824,7 @@ export class AgentSession {
 			this.#modelRegistry,
 			this.settings,
 			this.sessionId,
-			{ managedFallback: true },
+			{ managedFallback: true, ...(this.#persistedModelProfileAliasIntent() ?? {}) },
 		);
 		const activeIndex = resolutionStart + resolution.activeIndex;
 		if (activeIndex > resolutionStart) {
@@ -14721,7 +14842,7 @@ export class AgentSession {
 	 * metadata. Consumers seed only resolution state; role/origin/identity stay
 	 * intrinsic to controller construction and are never inferred at runtime.
 	 */
-	#defaultFallbackChain(): FallbackChainController {
+	#defaultFallbackChain(materializeLegacyChain = true): FallbackChainController {
 		const configuredChain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains.default;
 
 		const settingsEntries = normalizeModelSelectorValue(
@@ -14731,7 +14852,7 @@ export class AgentSession {
 			configuredChain?.origin === "legacy_session" &&
 			configuredChain.entries.length === 1 &&
 			settingsEntries.length > 1;
-		if (materializeSettingsChain) {
+		if (materializeSettingsChain && materializeLegacyChain) {
 			this.setConfiguredModelChain("default", settingsEntries, "modelRoles");
 		}
 		const chain: ConfiguredFallbackChain = materializeSettingsChain
@@ -14877,6 +14998,7 @@ export class AgentSession {
 				matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,
 				sessionId: this.sessionId,
+				...(this.#persistedModelProfileAliasIntent() ?? {}),
 			});
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
@@ -16503,6 +16625,7 @@ export class AgentSession {
 			const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 			const previousModel = this.model;
 			const previousThinkingLevel = this.#thinkingLevel;
+			const previousActiveModelProfile = this.#activeModelProfile;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 			const previousTools = [...this.agent.state.tools];
@@ -16554,12 +16677,31 @@ export class AgentSession {
 				}
 
 				const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
-				const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
+				const configuredDefaultChain = sessionContext.configuredModelChains.default;
 				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
 				const defaultEntries =
 					resumeModelBehavior === "useCurrentDefault"
 						? settingsDefaultEntries
-						: (configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []));
+						: (configuredDefaultChain?.entries ??
+							(sessionContext.models.default ? [sessionContext.models.default] : []));
+				const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
+				const configuredProfileName = this.settings.get("modelProfile.default");
+				const configuredProfileIdentity = configuredProfileName
+					? resolveModelProfileName(configuredProfileName, profileDefinitions)
+					: undefined;
+				const persistedProfileIdentity = configuredDefaultChain?.identity
+					? resolveModelProfileName(configuredDefaultChain.identity, profileDefinitions)
+					: undefined;
+				this.#activeModelProfile =
+					resumeModelBehavior === "useCurrentDefault"
+						? configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
+							? configuredProfileIdentity
+							: undefined
+						: configuredDefaultChain?.origin === "profile-activation" &&
+								persistedProfileIdentity &&
+								profileDefinitions.has(persistedProfileIdentity)
+							? persistedProfileIdentity
+							: undefined;
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -16567,7 +16709,7 @@ export class AgentSession {
 						this.#modelRegistry,
 						this.settings,
 						this.sessionId,
-						{ managedFallback: true },
+						{ managedFallback: true, ...(this.#persistedModelProfileAliasIntent() ?? {}) },
 					);
 					const controller = this.#defaultFallbackChain();
 					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
@@ -16681,6 +16823,7 @@ export class AgentSession {
 				this.sessionManager.restoreState(previousSessionState);
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
+				this.#activeModelProfile = previousActiveModelProfile;
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				let restoreMcpError: unknown;

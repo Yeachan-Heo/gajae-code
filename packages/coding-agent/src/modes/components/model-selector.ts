@@ -18,6 +18,7 @@ import {
 	getModelProfilePresentation,
 	groupModelProfilesForPresetLanding,
 	type ModelProfileDefinition,
+	resolveProfileBindings,
 } from "../../config/model-profiles";
 import type { GjcModelAssignmentTargetId, ModelRegistry } from "../../config/model-registry";
 import {
@@ -30,6 +31,7 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
+	splitSelectorThinkingSuffix,
 } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue, selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
@@ -515,6 +517,9 @@ export class ModelSelectorComponent extends Container {
 				settings: this.#settings,
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
+				aliasIntent: this.#activeModelProfile ? "preset-equivalent" : undefined,
+				sessionId: this.#authSessionId,
+				credentialSessionId: this.#authSessionId,
 			});
 			return resolved.model !== undefined && modelsAreEqual(resolved.model, this.#currentModel);
 		});
@@ -535,6 +540,9 @@ export class ModelSelectorComponent extends Container {
 				settings: this.#settings,
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
+				aliasIntent: this.#activeModelProfile ? "preset-equivalent" : undefined,
+				sessionId: this.#authSessionId,
+				credentialSessionId: this.#authSessionId,
 			});
 			if (resolved.model) {
 				roles[role] = {
@@ -1104,6 +1112,9 @@ export class ModelSelectorComponent extends Container {
 					settings: this.#settings,
 					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 					modelRegistry: this.#modelRegistry,
+					aliasIntent: this.#activeModelProfile ? "preset-equivalent" : undefined,
+					sessionId: this.#authSessionId,
+					credentialSessionId: this.#authSessionId,
 				});
 				if (resolved.model) {
 					resolvedSelectors.push(
@@ -1215,7 +1226,28 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#isPresetAuthenticated(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
-		return this.#getMissingProviders(profileOrProfiles).length === 0;
+		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
+		return profiles.every(profile => {
+			if (this.#getMissingProviders(profile).length > 0) return false;
+			const bindings = resolveProfileBindings(profile);
+			const values = [
+				...(bindings.defaultSelector ? [bindings.defaultSelector] : []),
+				...Object.values(bindings.modelRoles),
+				...Object.values(bindings.agentModelOverrides),
+			];
+			return values.every(value =>
+				normalizeModelSelectorValue(value).every(selector => {
+					if (splitSelectorThinkingSuffix(selector).selector.includes("/")) return true;
+					return (
+						resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+							settings: this.#settings,
+							modelRegistry: this.#modelRegistry,
+							aliasIntent: "preset-equivalent",
+						}).model !== undefined
+					);
+				}),
+			);
+		});
 	}
 
 	/**

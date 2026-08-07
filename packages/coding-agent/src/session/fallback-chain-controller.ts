@@ -17,6 +17,17 @@ export interface FallbackFailure {
 
 export type FallbackFailureResult = "retry" | "advance" | "exhausted";
 
+export interface FallbackChainRuntimeState {
+	activeIndex: number;
+	attemptsUsed: number;
+	totalAttemptsUsed: number;
+	attemptStarted: boolean;
+	restoredEntryIndices: number[];
+	tried: FallbackFailure[];
+	skips: Array<{ selector: string; reason: string }>;
+	exhaustedForTurn: boolean;
+}
+
 /**
  * In-memory policy state for one fallback-chain scope. A controller is deliberately
  * not serializable: configured chain intent is durable, current position is not.
@@ -41,6 +52,30 @@ export class FallbackChainController {
 		this.chain = { ...chain, entries: [...chain.entries] };
 		this.maxAttempts = maxAttempts;
 		if (this.chain.entries.length === 0) this.exhaustedForTurn = true;
+	}
+
+	snapshotRuntimeState(): FallbackChainRuntimeState {
+		return {
+			activeIndex: this.activeIndex,
+			attemptsUsed: this.attemptsUsed,
+			totalAttemptsUsed: this.#totalAttemptsUsed,
+			attemptStarted: this.#attemptStarted,
+			restoredEntryIndices: [...this.#restoredEntryIndices],
+			tried: this.tried.map(failure => ({ ...failure })),
+			skips: this.skips.map(skip => ({ ...skip })),
+			exhaustedForTurn: this.exhaustedForTurn,
+		};
+	}
+
+	restoreRuntimeState(state: FallbackChainRuntimeState): void {
+		this.activeIndex = state.activeIndex;
+		this.attemptsUsed = state.attemptsUsed;
+		this.#totalAttemptsUsed = state.totalAttemptsUsed;
+		this.#attemptStarted = state.attemptStarted;
+		this.#restoredEntryIndices = new Set(state.restoredEntryIndices);
+		this.tried = state.tried.map(failure => ({ ...failure }));
+		this.skips = state.skips.map(skip => ({ ...skip }));
+		this.exhaustedForTurn = state.exhaustedForTurn;
 	}
 
 	get totalAttemptsUsed(): number {

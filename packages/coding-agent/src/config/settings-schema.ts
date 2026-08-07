@@ -529,7 +529,16 @@ export const SETTINGS_SCHEMA = {
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 
-	modelProviderOrder: { type: "array", default: EMPTY_STRING_ARRAY },
+	modelProviderOrder: {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "providers",
+			label: "Provider Priority Order",
+			description:
+				"Ordered provider priority for automatic model resolution. Providers listed earlier win ties; omitted providers fall back to curated ranking. Unavailable saved entries are retained and skipped at runtime.",
+		},
+	},
 
 	cycleOrder: { type: "array", default: DEFAULT_CYCLE_ORDER },
 

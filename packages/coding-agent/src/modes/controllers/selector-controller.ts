@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Api, Model } from "@gajae-code/ai";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
@@ -20,6 +21,7 @@ import { formatModelSelectorValue } from "../../config/model-resolver";
 import { selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
+import type { SettingValue } from "../../config/settings-schema";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -91,6 +93,7 @@ import {
 } from "../../sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
+import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 
@@ -171,6 +174,8 @@ import {
 	type ProviderOnboardingAction,
 	ProviderOnboardingSelectorComponent,
 } from "../components/provider-onboarding-selector";
+import { ProviderOrderContext } from "../components/provider-order-context";
+import { ProviderOrderEditorComponent } from "../components/provider-order-editor";
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
@@ -1195,6 +1200,21 @@ export function createNotificationsEditorOperations(
 	};
 }
 
+interface DefaultAssignmentRollbackSnapshot {
+	model: Model<Api> | undefined;
+	thinkingLevel: ThinkingLevel | undefined;
+	persistedModelRoles: SettingValue<"modelRoles"> | undefined;
+	persistedAgentOverrides: SettingValue<"task.agentModelOverrides"> | undefined;
+	persistedProfile: SettingValue<"modelProfile.default"> | undefined;
+	modelRolesOverride: SettingValue<"modelRoles"> | undefined;
+	agentOverridesOverride: SettingValue<"task.agentModelOverrides"> | undefined;
+	profileOverride: SettingValue<"modelProfile.default"> | undefined;
+	chain: { entries: readonly string[]; origin: string; identity?: string; explicitHead?: boolean } | undefined;
+	activeProfile: string | undefined;
+	canonicalVariant: string | undefined;
+	resumeDefaultSelector: string | undefined;
+	fallbackRuntimeState: DefaultFallbackRuntimeState;
+}
 export class SelectorController {
 	#transcriptViewerOpen = false;
 	#transcriptViewer?: TranscriptViewerOverlay;
@@ -1211,6 +1231,113 @@ export class SelectorController {
 		private readonly clipboard: (text: string) => void = copyToClipboard,
 	) {
 		this.#credentialAutoImportStateStore = credentialAutoImportStateStore;
+	}
+
+	#captureDefaultAssignmentRollback(): DefaultAssignmentRollbackSnapshot {
+		return {
+			model: this.ctx.session.model,
+			thinkingLevel: this.ctx.session.thinkingLevel,
+			persistedModelRoles: this.ctx.settings.getGlobal("modelRoles"),
+			persistedAgentOverrides: this.ctx.settings.getGlobal("task.agentModelOverrides"),
+			persistedProfile: this.ctx.settings.getGlobal("modelProfile.default"),
+			modelRolesOverride: this.ctx.settings.getOverride("modelRoles"),
+			agentOverridesOverride: this.ctx.settings.getOverride("task.agentModelOverrides"),
+			profileOverride: this.ctx.settings.getOverride("modelProfile.default"),
+			chain: this.ctx.session.getConfiguredModelChainState("default"),
+			activeProfile: this.ctx.session.getActiveModelProfile?.(),
+			canonicalVariant: this.ctx.session.modelRegistry.getSessionCanonicalVariant?.(this.ctx.session.sessionId),
+			resumeDefaultSelector: this.ctx.session.sessionManager.buildSessionContext().models.default,
+			fallbackRuntimeState: this.ctx.session.getDefaultFallbackRuntimeState(),
+		};
+	}
+
+	async #restoreDefaultAssignmentRollback(
+		snapshot: DefaultAssignmentRollbackSnapshot,
+		error: unknown,
+		restoreLiveModel: boolean = true,
+		restoreProfileState: boolean = true,
+	): Promise<never> {
+		if (!restoreLiveModel && !restoreProfileState) throw error;
+		const rollbackErrors: unknown[] = [];
+		const restore = (action: () => void): void => {
+			try {
+				action();
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		};
+		restore(() =>
+			snapshot.persistedModelRoles === undefined
+				? this.ctx.settings.unset("modelRoles")
+				: this.ctx.settings.set("modelRoles", snapshot.persistedModelRoles),
+		);
+		restore(() =>
+			snapshot.persistedAgentOverrides === undefined
+				? this.ctx.settings.unset("task.agentModelOverrides")
+				: this.ctx.settings.set("task.agentModelOverrides", snapshot.persistedAgentOverrides),
+		);
+		restore(() =>
+			snapshot.persistedProfile === undefined
+				? this.ctx.settings.unset("modelProfile.default")
+				: this.ctx.settings.set("modelProfile.default", snapshot.persistedProfile),
+		);
+		restore(() =>
+			snapshot.modelRolesOverride === undefined
+				? this.ctx.settings.clearOverride("modelRoles")
+				: this.ctx.settings.override("modelRoles", snapshot.modelRolesOverride),
+		);
+		restore(() =>
+			snapshot.agentOverridesOverride === undefined
+				? this.ctx.settings.clearOverride("task.agentModelOverrides")
+				: this.ctx.settings.override("task.agentModelOverrides", snapshot.agentOverridesOverride),
+		);
+		restore(() =>
+			snapshot.profileOverride === undefined
+				? this.ctx.settings.clearOverride("modelProfile.default")
+				: this.ctx.settings.override("modelProfile.default", snapshot.profileOverride),
+		);
+		if (restoreProfileState) {
+			restore(() =>
+				this.ctx.session.setConfiguredModelChain(
+					"default",
+					snapshot.chain?.entries ?? [],
+					snapshot.chain?.origin ?? "rollback",
+					snapshot.chain?.identity,
+					snapshot.chain?.explicitHead ?? true,
+				),
+			);
+			restore(() => this.ctx.session.restoreDefaultFallbackRuntimeState(snapshot.fallbackRuntimeState));
+			restore(() => {
+				if (snapshot.canonicalVariant) {
+					this.ctx.session.modelRegistry.restoreSessionCanonicalVariant?.(
+						this.ctx.session.sessionId,
+						snapshot.canonicalVariant,
+					);
+				} else {
+					this.ctx.session.modelRegistry.clearCanonicalVariant?.(this.ctx.session.sessionId);
+				}
+			});
+		}
+		if (restoreLiveModel) {
+			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
+		}
+		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
+		try {
+			await this.ctx.settings.flushOrThrow();
+		} catch (rollbackError) {
+			rollbackErrors.push(rollbackError);
+		}
+		if (restoreLiveModel) {
+			try {
+				await this.ctx.session.restoreModelSelectionForRollback(snapshot.model, snapshot.thinkingLevel);
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		}
+		if (rollbackErrors.length > 0) {
+			throw new AggregateError([error, ...rollbackErrors], "Model assignment failed and rollback was incomplete");
+		}
+		throw error;
 	}
 
 	isTranscriptViewerOpen(): boolean {
@@ -1745,6 +1872,35 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						},
 						onRenderRequested: () => this.ctx.ui.requestRender(),
+						createProviderOrderEditor: closeEditor => {
+							// The editor owns the context lifecycle: dispose() on
+							// close or external teardown releases the subscriptions,
+							// so the controller only wires change repaints here.
+							let editor: ProviderOrderEditorComponent | undefined;
+							const context = new ProviderOrderContext(this.ctx.session.modelRegistry, this.ctx.settings, () => {
+								editor?.refresh();
+								this.ctx.ui.requestRender();
+							});
+							try {
+								editor = new ProviderOrderEditorComponent(
+									context,
+									() => {
+										closeEditor();
+										this.ctx.ui.requestRender();
+									},
+									message => this.ctx.showError(message),
+								);
+							} catch (error) {
+								// The context subscribed to settings/auth in its constructor.
+								// If editor construction fails the editor disposes it before
+								// rethrowing (initial rebuild failure); dispose again here so
+								// failures before that point (e.g. UI setup) can't leak the
+								// subscriptions this closure created.
+								context.dispose();
+								throw error;
+							}
+							return editor;
+						},
 						onCancel: () => {
 							done();
 							// Restore status line to saved settings
@@ -2238,6 +2394,13 @@ export class SelectorController {
 									throw new Error(`No API key for ${model.provider}/${model.id}`);
 								}
 							}
+							if (includesDefault && !includesRoleAgent) {
+								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+									model,
+									this.ctx.session.sessionId,
+								);
+								if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+							}
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
 							const assignments = new Map<GjcModelAssignmentTargetId, string>();
@@ -2247,30 +2410,47 @@ export class SelectorController {
 									? selectedSelector.slice(0, -thinkingLevel.length - 1)
 									: selectedSelector;
 
-							if (includesDefault) {
-								await this.ctx.session.setModel(model, "default", {
-									selector: defaultSelector,
-									thinkingLevel,
-									cause: "user-selection",
-								});
-								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(thinkingLevel);
-								}
-							}
-							const materializedProfile = materializeActiveModelProfileAssignments({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								assignments,
-							});
-							if (!materializedProfile) {
-								for (const targetRole of targetRoles) {
-									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
-									if (target.settingsPath === "modelRoles") {
-										this.ctx.settings.setModelRole(targetRole, value);
-									} else {
-										this.ctx.settings.setAgentModelOverride(targetRole, value);
+							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
+							let defaultMutationStarted = false;
+							let assignmentMutationStarted = false;
+							let materializedProfile = false;
+							try {
+								if (includesDefault) {
+									await this.ctx.session.setModel(model, "default", {
+										selector: defaultSelector,
+										thinkingLevel,
+										cause: "user-selection",
+										onMutationStarted: () => {
+											defaultMutationStarted = true;
+										},
+									});
+									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+										this.ctx.session.setThinkingLevel(thinkingLevel);
 									}
 								}
+								assignmentMutationStarted = true;
+								materializedProfile = materializeActiveModelProfileAssignments({
+									session: this.ctx.session,
+									settings: this.ctx.settings,
+									assignments,
+								});
+								if (!materializedProfile) {
+									for (const targetRole of targetRoles) {
+										const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+										if (target.settingsPath === "modelRoles") {
+											this.ctx.settings.setModelRole(targetRole, value);
+										} else {
+											this.ctx.settings.setAgentModelOverride(targetRole, value);
+										}
+									}
+								}
+							} catch (error) {
+								await this.#restoreDefaultAssignmentRollback(
+									rollbackSnapshot,
+									error,
+									defaultMutationStarted,
+									defaultMutationStarted || assignmentMutationStarted,
+								);
 							}
 							modelSelector.refreshRoleAssignments({
 								currentModel: this.ctx.session.model,
@@ -2294,27 +2474,44 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
 							// Default: update agent state and persist as the active default model.
-							await this.ctx.session.setModel(model, role, {
-								selector: selectedSelector,
-								thinkingLevel,
-								cause: "user-selection",
-							});
+							const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
+							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
+							let defaultMutationStarted = false;
+							let assignmentMutationStarted = false;
 							const value = formatModelSelectorValue(
 								selectedSelector ?? `${model.provider}/${model.id}`,
 								thinkingLevel,
 							);
-							if (
-								!materializeActiveModelProfileAssignment({
+							try {
+								await this.ctx.session.setModel(model, role, {
+									selector: selectedSelector,
+									thinkingLevel,
+									cause: "user-selection",
+									onMutationStarted: () => {
+										defaultMutationStarted = true;
+									},
+								});
+								assignmentMutationStarted = true;
+								const materializedProfile = materializeActiveModelProfileAssignment({
 									session: this.ctx.session,
 									settings: this.ctx.settings,
 									role,
 									selector: value,
-								})
-							) {
-								this.ctx.settings.setModelRole(role, value);
-							}
-							if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-								this.ctx.session.setThinkingLevel(thinkingLevel);
+								});
+								if (!materializedProfile) {
+									this.ctx.settings.setModelRole(role, value);
+								}
+								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+									this.ctx.session.setThinkingLevel(thinkingLevel);
+								}
+							} catch (error) {
+								await this.#restoreDefaultAssignmentRollback(
+									rollbackSnapshot,
+									error,
+									defaultMutationStarted,
+									defaultMutationStarted || assignmentMutationStarted,
+								);
 							}
 							refreshRoleAssignments();
 							this.ctx.statusLine.invalidate();

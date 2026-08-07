@@ -27,7 +27,12 @@ function createControllerContext() {
 	const setModelCalls: Array<{
 		model: Model;
 		role: string;
-		options?: { cause?: "user-selection"; selector?: string; thinkingLevel?: ThinkingLevel };
+		options?: {
+			cause?: "user-selection";
+			selector?: string;
+			thinkingLevel?: ThinkingLevel;
+			onMutationStarted?: () => void;
+		};
 	}> = [];
 	const setModelTemporary = vi.fn(async () => {});
 	const setDefaultFallbackRuntimeModel = vi.fn();
@@ -48,19 +53,62 @@ function createControllerContext() {
 			getAvailableModelProfileNames: () => [],
 			getModelProfiles: () => new Map(),
 			resolveCanonicalModel: () => undefined,
-			getApiKey: vi.fn(async (): Promise<string | undefined> => "key"),
+			getApiKey: vi.fn(async (_model?: Model, _sessionId?: string): Promise<string | undefined> => "key"),
+			getSessionCanonicalVariant: () => undefined,
+			restoreSessionCanonicalVariant: vi.fn(),
+			clearCanonicalVariant: vi.fn(),
 		},
 		async setModel(
 			nextModel: Model,
 			role: string,
-			options?: { cause?: "user-selection"; selector?: string; thinkingLevel?: ThinkingLevel },
+			options?: {
+				cause?: "user-selection";
+				selector?: string;
+				thinkingLevel?: ThinkingLevel;
+				onMutationStarted?: () => void;
+			},
 		) {
 			setModelCalls.push({ model: nextModel, role, options });
+			options?.onMutationStarted?.();
 			this.model = nextModel;
 			if (options?.thinkingLevel) this.thinkingLevel = options.thinkingLevel;
 		},
 		setModelTemporary,
 		setDefaultFallbackRuntimeModel,
+		async restoreModelSelectionForRollback(nextModel: Model | undefined, thinkingLevel: ThinkingLevel | undefined) {
+			this.model = nextModel;
+			this.thinkingLevel = thinkingLevel;
+		},
+		getConfiguredModelChainState: () => undefined,
+		setConfiguredModelChain: vi.fn(),
+		getDefaultFallbackRuntimeState: () => ({
+			chain: {
+				role: "default",
+				entries: ["provider-a/original-default:medium"],
+				origin: "runtime",
+				explicitHead: true,
+			},
+			controller: {
+				activeIndex: 0,
+				attemptsUsed: 0,
+				totalAttemptsUsed: 0,
+				attemptStarted: false,
+				restoredEntryIndices: [],
+				tried: [],
+				skips: [],
+				exhaustedForTurn: false,
+			},
+			exhaustedLastTurn: false,
+		}),
+		restoreDefaultFallbackRuntimeState: vi.fn(),
+		setActiveModelProfile: vi.fn(),
+		recordResumeDefaultModel: vi.fn(),
+		sessionManager: {
+			buildSessionContext: (): { models: { default: string | undefined } } => ({
+				models: { default: "provider-a/original-default:medium" },
+			}),
+			appendModelChange: vi.fn(),
+		},
 
 		setThinkingLevel(thinkingLevel: ThinkingLevel) {
 			this.thinkingLevel = thinkingLevel;
@@ -99,8 +147,7 @@ async function openSelector(ctx: ReturnType<typeof createControllerContext>["ctx
 	return ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 }
 async function settleSelectorInput(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
+	await Bun.sleep(0);
 	await Promise.resolve();
 }
 
@@ -165,7 +212,12 @@ describe("SelectorController model batch assignments", () => {
 			{
 				model: selectedModel,
 				role: "default",
-				options: { cause: "user-selection", selector: "provider-a/selected", thinkingLevel: ThinkingLevel.Inherit },
+				options: {
+					cause: "user-selection",
+					onMutationStarted: expect.any(Function),
+					selector: "provider-a/selected",
+					thinkingLevel: ThinkingLevel.Inherit,
+				},
 			},
 		]);
 		expect(settings.getModelRole("default")).toBe("provider-a/selected");
@@ -179,6 +231,110 @@ describe("SelectorController model batch assignments", () => {
 			"All model targets set to provider-a/selected for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+
+	test("rolls back all targets when a later role setting write fails", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const originalModel = session.model;
+		const originalSetAgentModelOverride = settings.setAgentModelOverride.bind(settings);
+		vi.spyOn(settings, "setAgentModelOverride").mockImplementation((role, value) => {
+			if (role === "architect") throw new Error("role write failed");
+			originalSetAgentModelOverride(role, value);
+		});
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 6);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("role write failed"));
+		expect(session.model).toBe(originalModel);
+		expect(settings.get("modelRoles")).toEqual({ default: "provider-a/original-default:medium" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/original-executor:low",
+		});
+	});
+
+	test("restores a model-less session when all-target assignment fails", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		session.model = undefined;
+		vi.spyOn(settings, "setAgentModelOverride").mockImplementation(() => {
+			throw new Error("role write failed");
+		});
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 6);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("role write failed"));
+		expect(session.model).toBeUndefined();
+	});
+
+	test("role-only assignment failure restores profile-owned default state without rewriting the live model", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+		vi.spyOn(settings, "setAgentModelOverride").mockImplementation(() => {
+			throw new Error("role write failed");
+		});
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 5);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("role write failed"));
+		expect(restoreModel).not.toHaveBeenCalled();
+		expect(session.setConfiguredModelChain).toHaveBeenCalledTimes(1);
+		expect(session.restoreDefaultFallbackRuntimeState).toHaveBeenCalledTimes(1);
+		expect(session.recordResumeDefaultModel).not.toHaveBeenCalled();
+	});
+
+	test("default API-key preflight failure bypasses rollback side effects", async () => {
+		const { ctx, session } = createControllerContext();
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+		session.modelRegistry.getApiKey.mockResolvedValue(undefined);
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("No API key"));
+		expect(restoreModel).not.toHaveBeenCalled();
+		expect(session.sessionManager.appendModelChange).not.toHaveBeenCalled();
+	});
+	test("second credential check failure preserves the original auth error without compensation", async () => {
+		const { ctx, session } = createControllerContext();
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+		session.modelRegistry.getApiKey.mockResolvedValueOnce("key").mockResolvedValueOnce(undefined);
+		session.setModel = async nextModel => {
+			const apiKey = await session.modelRegistry.getApiKey(nextModel, session.sessionId);
+			if (!apiKey) throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
+		};
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("No API key"));
+		expect(restoreModel).not.toHaveBeenCalled();
+		expect(session.setConfiguredModelChain).not.toHaveBeenCalled();
+		expect(session.recordResumeDefaultModel).not.toHaveBeenCalled();
+	});
+	test("post-mutation default failure restores an absent resume selector explicitly", async () => {
+		const { ctx, session } = createControllerContext();
+		const previousModel = session.model;
+		session.sessionManager.buildSessionContext = () => ({ models: { default: undefined } });
+		session.setModel = async (nextModel, _role, options) => {
+			options?.onMutationStarted?.();
+			session.model = nextModel;
+			throw new Error("post-mutation failure");
+		};
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("post-mutation failure"));
+		expect(session.recordResumeDefaultModel).toHaveBeenCalledWith(undefined);
+		expect(session.model).toBe(previousModel);
 	});
 	test("individual DEFAULT assignment stays open until cancel", async () => {
 		const { ctx, settings } = createControllerContext();

@@ -1095,6 +1095,11 @@ export class AuthStorage {
 		return Boolean(this.#runtimeOverrides.get(provider));
 	}
 
+	/** Whether a provider is currently authenticated by a config API-key override. */
+	hasConfigApiKey(provider: string): boolean {
+		return Boolean(this.#configOverrides.get(provider));
+	}
+
 	/**
 	 * Whether credential selection for a provider is pinned to one stored row by
 	 * a runtime selector (`--credential`).

@@ -89,7 +89,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"modelProfile.default": "old-profile",
 	});
 	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {

@@ -202,7 +202,7 @@ profiles:
       critic: openai/o3:high
 ```
 
-`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Every role accepts either one `provider/modelId[:effort]` selector or a non-empty ordered array of selectors; the first entry is primary and later entries are fallback candidates. `required_providers` is the aggregate set of providers required across the profile's mapped roles.
+`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Every role accepts either one selector or a non-empty ordered array of selectors; the first entry is primary and later entries are fallback candidates. A selector may be a provider-agnostic bare alias such as `glm-5.2[:effort]` or an explicit `provider/modelId[:effort]` pin, including nested model IDs such as `openrouter/anthropic/claude-sonnet-5`. `required_providers` lists explicit provider prerequisites and may be empty when availability is resolved from bare aliases.
 
 ### Fallback chains
 
@@ -231,6 +231,7 @@ Built-in profiles are grouped by provider mix and tier:
 
 - `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort; `lunamaxxing` — OpenAI Codex Luna-only profile with maximum reasoning on delegated roles
 - `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
+- Provider-agnostic open-model profiles are named by the model families they require. Single-family choices are `open-weights-{glm,deepseek,kimi,luna}`; two-family choices are `open-weights-glm-deepseek`, `open-weights-kimi-deepseek`, and `open-weights-kimi-glm`; `open-weights-kimi-glm-deepseek` uses all three open-weight families; `open-weights-all` adds GPT-5.6 Luna. Choose the smallest combination covered by the models available through your configured providers. Every selector is a bare final-segment alias with `required_providers: []`, so each family may come from any authenticated bundled or custom provider under Provider Priority. GPT-5.6 Luna is proprietary despite its inclusion in this group.
 - `claude-opus` — Anthropic OAuth preset centered on `claude-opus-5`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
 - Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen-3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
@@ -246,7 +247,7 @@ gjc --mpreset codex-medium
 gjc --mpreset opencodego --default
 ```
 
-The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically.
+The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful login to a recognized bundled provider, its matching preset is recommended automatically. Custom providers participate in provider-agnostic alias resolution but require manual preset selection.
 
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 
@@ -494,18 +495,21 @@ Current heuristics are intentionally narrow:
 - dotted and dashed version variants can normalize only when they map to an existing official id, for example `4.6 -> 4-6`
 - ambiguous families or versions are not merged without a bundled match or explicit override
 
-### Canonical resolution behavior
+### Canonical and preset-equivalent resolution behavior
 
-When multiple concrete variants share a canonical id, resolution uses:
+When multiple concrete variants are eligible for automatic resolution, the global provider policy uses this order:
 
-1. availability and auth
-2. `config.yml` `modelProviderOrder`
-3. the lowest combined `cost.input + cost.cacheRead`
-4. existing registry/provider order if the earlier ranks tie
+1. explicit `config.yml` `modelProviderOrder` entries, in their saved order
+2. omitted providers whose effective credential came from OAuth
+3. omitted providers using a manual API key, unknown credential provenance, or keyless access
+4. vision capability, exact canonical identity, canonical source quality, lowest `cost.input + cost.cacheRead`, stable registry model order, then concrete selector order
 
-Disabled or unauthenticated providers are skipped. A session that resolves a canonical selector keeps its concrete variant across discovery refreshes; it changes only after an explicit concrete selection or when that variant is no longer available.
+The explicit provider list may be partial. A listed API-key provider beats every omitted OAuth provider. Resetting Provider Priority clears the explicit list and restores OAuth-first plus deterministic fallback. Saved providers that are not currently available remain visible and persisted, but runtime resolution skips them.
 
-Session state and transcripts continue to record the concrete provider/model that actually executed the turn.
+Model-profile and preset assignments support a lookup-only alias when the assignment does not explicitly name a provider. For example, a bare preset assignment `gpt-5` can select any available concrete variant whose final model-id segment is `gpt-5`, ranked by the same global policy. An assignment such as `openai/gpt-5` is an explicit provider pin: if that exact model is unavailable, activation reports it unavailable instead of switching providers. Alias lookup never rewrites the selected model's concrete provider, full model id, or `wireModelId`; a known bare alias with no eligible variant is unavailable and does not fall through to a different fuzzy match. Direct model selection remains unchanged.
+Runtime custom providers participate in the same lookup automatically. A custom provider model such as `hosted/glm-5.2` contributes the alias `glm-5.2` when the provider is registered, authenticated, and available; Provider Priority can rank that custom provider ahead of bundled providers without changing the preset. Custom IDs whose final segment differs (for example `glm-5.2-special`) do not join the alias.
+
+A session that resolves a canonical or alias selector keeps its concrete variant across provider-priority edits and discovery refreshes. Updated priority applies to new or unpinned resolutions. The session re-ranks only after explicit reselection or when the sticky variant becomes unavailable. Session state and transcripts continue to record the concrete provider/model that executed the turn.
 
 Provider defaults vs per-model overrides:
 
@@ -639,6 +643,8 @@ Resolution precedence for exact selectors:
 
 Thinking suffixes are split once from the final `:` only after the complete selector does not resolve. This preserves concrete OpenRouter route IDs such as `openrouter/z-ai/glm-4.7:nitro`; `:high` can follow that route suffix. Multiple suffixes are not recursively consumed. A complete `provider/modelId` selector is exact-only: it never falls back to fuzzy, substring, glob, or another provider when that concrete selector is absent. Exact-case provider/model entries resolve deterministically for custom replacement semantics; a case-insensitive selector that remains ambiguous does not guess.
 
+Preset/profile activation may use an unqualified assignment as a final-segment lookup alias after exact resolution fails. Provider-qualified assignments remain exact pins, and this opt-in does not apply to CLI or direct concrete model selection.
+
 ### Initial model selection priority
 
 `findInitialModel(...)` uses this order:
@@ -663,7 +669,7 @@ Related settings:
 
 - `modelRoles` (record)
 - `enabledModels` (scoped pattern list)
-- `modelProviderOrder` (global canonical-provider precedence)
+- `modelProviderOrder` (global automatic provider precedence; editable under Settings → Providers with add/remove, move up/down, unavailable-entry retention, and Reset)
 - `providers.kimiApiFormat` (`openai` or `anthropic` request format)
 - `providers.openaiWebsockets` (`auto|off|on` websocket preference for OpenAI code provider transport)
 

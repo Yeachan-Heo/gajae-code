@@ -312,9 +312,9 @@ describe("custom model preset creation", () => {
 			registry.saveCustomModelProfile("broken", {
 				display_name: "Broken",
 				required_providers: ["my-oai"],
-				model_mapping: { default: "missing-provider-slash" },
+				model_mapping: { default: "missing,selector" },
 			}),
-		).rejects.toThrow("Expected provider/modelId with optional :effort suffix");
+		).rejects.toThrow("Expected modelId or provider/modelId with optional :effort suffix");
 	});
 
 	it("surfaces create custom preset with the generated current model snapshot", async () => {
@@ -725,7 +725,7 @@ describe("custom model preset creation", () => {
 			},
 			getActiveModelProfile: () => activeProfiles.at(-1),
 		};
-		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
 
 		try {
 			await expect(

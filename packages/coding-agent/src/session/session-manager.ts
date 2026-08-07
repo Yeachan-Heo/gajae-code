@@ -419,6 +419,8 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	model: string;
 	/** Role: "default" or an agent role. Undefined treated as "default" */
 	role?: string;
+	/** Clears the role's previously recorded model when replaying session context. */
+	cleared?: boolean;
 	/** Requested model before a runtime substitution/fallback, in "provider/modelId" format. */
 	previousModel?: string;
 	/** Machine-readable reason for runtime model substitution/fallback. */
@@ -1551,13 +1553,13 @@ export function buildSessionContext(
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel ?? "off";
 		} else if (entry.type === "model_change") {
-			// New format: { model: "provider/id", role?: string }
-			if (entry.model) {
-				const role = entry.role ?? "default";
+			const role = entry.role ?? "default";
+			if (entry.cleared) {
+				delete models[role];
+				if (role === "default") hasExplicitDefaultModel = true;
+			} else if (entry.model) {
 				models[role] = entry.model;
-				if (role === "default") {
-					hasExplicitDefaultModel = true;
-				}
+				if (role === "default") hasExplicitDefaultModel = true;
 			}
 		} else if (entry.type === "configured_model_chain") {
 			const configuredChain = normalizeConfiguredModelChainEntry(entry);
@@ -8620,6 +8622,21 @@ export class SessionManager {
 			previousModel: metadata?.previousModel,
 			reason: metadata?.reason,
 			thinkingLevel: metadata?.thinkingLevel,
+		};
+		this.#appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append an explicit role-model clear marker, preserving absence during replay. */
+	clearModelRole(role: string): string {
+		const entry: ModelChangeEntry = {
+			type: "model_change",
+			id: generateId(this.#byId),
+			parentId: this.#leafId,
+			timestamp: new Date().toISOString(),
+			model: "",
+			role,
+			cleared: true,
 		};
 		this.#appendEntry(entry);
 		return entry.id;

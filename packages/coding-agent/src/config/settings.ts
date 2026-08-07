@@ -808,6 +808,12 @@ export class Settings implements NotificationSettingsReader {
 		this.#rebuildMerged();
 	}
 
+	/** Read the exact runtime override without merged defaults. */
+	getOverride<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#overrides, path.split("."));
+		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
 	/**
 	 * Clear a runtime override.
 	 */

@@ -1642,6 +1642,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
 		const settingsModelOverride = agentModelOverrides[agentName];
 		const parentActiveModelPattern = this.session.getActiveModelString?.();
+		// A live active model profile claims persisted agent overrides: bare
+		// profile aliases may re-resolve to an equivalent provider variant at
+		// dispatch. Manual/direct sessions (no active profile) stay exact.
+		const parentActiveModelProfile = (
+			this.session as { getActiveModelProfile?: () => string | undefined }
+		).getActiveModelProfile?.();
 		const modelOverride = resolveAgentModelPatterns({
 			settingsOverride: settingsModelOverride,
 			agentModel: effectiveAgent.model,
@@ -1985,6 +1991,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
+						parentActiveModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
@@ -2059,6 +2066,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
+						parentActiveModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,

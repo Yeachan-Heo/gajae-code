@@ -45,6 +45,7 @@ import {
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
+import { resolveModelProfileName } from "../config/model-profile-contract";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -353,6 +354,8 @@ export interface CreateAgentSessionOptions {
 	/** Raw model pattern string (e.g. from --model CLI flag) to resolve after extensions load.
 	 * Used when model lookup is deferred because extension-provided models aren't registered yet. */
 	modelPattern?: string;
+	/** Active profile inherited by a nested SDK/subagent session. */
+	activeModelProfile?: string;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
 	/** Runtime substitution metadata for the initial model_change session event. */
@@ -1319,6 +1322,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const modelMatchPreferences = {
 			usageOrder: settings.getStorage()?.getModelUsageOrder(),
 		};
+		const persistedProfiles = modelRegistry.getModelProfiles();
+		const resolvedInheritedProfileName = options.activeModelProfile
+			? resolveModelProfileName(options.activeModelProfile, persistedProfiles)
+			: undefined;
+		const acceptedInheritedProfileName =
+			resolvedInheritedProfileName && persistedProfiles.has(resolvedInheritedProfileName)
+				? resolvedInheritedProfileName
+				: undefined;
+		const settingsProfileAliasIntent: { aliasIntent: "preset-equivalent" } | undefined = acceptedInheritedProfileName
+			? { aliasIntent: "preset-equivalent" }
+			: undefined;
 		const allowedModels = await logger.time("resolveAllowedModels", () =>
 			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
 		);
@@ -1327,20 +1341,36 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				settings,
 				matchPreferences: modelMatchPreferences,
 				modelRegistry,
+				...(settingsProfileAliasIntent ?? {}),
 			}),
 		);
 		let model = options.model;
 		let modelFallbackMessage: string | undefined;
 		const resumeModelBehavior = settings.get("session.resumeModelBehavior");
-		const persistedDefaultChain = existingSession.configuredModelChains.default?.entries;
+		const persistedDefaultChain = existingSession.configuredModelChains.default;
 		const defaultModelEntries =
 			resumeModelBehavior === "useCurrentDefault"
 				? []
-				: persistedDefaultChain && persistedDefaultChain.length > 0
-					? persistedDefaultChain
+				: persistedDefaultChain?.entries && persistedDefaultChain.entries.length > 0
+					? persistedDefaultChain.entries
 					: existingSession.models.default
 						? [existingSession.models.default]
 						: [];
+		const persistedProfileName =
+			persistedDefaultChain?.origin === "profile-activation" ? persistedDefaultChain.identity : undefined;
+		const resolvedPersistedProfileName = persistedProfileName
+			? resolveModelProfileName(persistedProfileName, persistedProfiles)
+			: undefined;
+		const acceptedPersistedProfileName =
+			resolvedPersistedProfileName &&
+			persistedProfiles.has(resolvedPersistedProfileName) &&
+			(!acceptedInheritedProfileName || acceptedInheritedProfileName === resolvedPersistedProfileName) &&
+			resumeModelBehavior !== "useCurrentDefault"
+				? resolvedPersistedProfileName
+				: undefined;
+		const startupActiveModelProfile =
+			acceptedInheritedProfileName ??
+			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 		// If session has data, restore its configured default chain rather than the
 		// scalar runtime model, which may be a stale fallback from the prior run.
 		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
@@ -1350,7 +1380,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					modelRegistry,
 					settings,
 					providerSessionId,
-					{ managedFallback: defaultModelEntries.length > 1 },
+					{
+						managedFallback: defaultModelEntries.length > 1,
+						canonicalSessionId: logicalSessionId,
+						...(acceptedPersistedProfileName ? { aliasIntent: "preset-equivalent" as const } : {}),
+					},
 				);
 				model = restoredDefaultResolution.model;
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
@@ -1700,6 +1734,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
+		// Live parent profile accessor for task/subagent dispatch: profile-owned
+		// persisted model overrides may resolve through preset-equivalent aliases
+		// only while an active profile claims them (see task/executor.ts).
+		(toolSession as ToolSession & { getActiveModelProfile?: () => string | undefined }).getActiveModelProfile = () =>
+			session?.getActiveModelProfile();
 		toolSession.getAuthorizedArtifactsDirs = () => {
 			const manager = sessionManager.getArtifactManager();
 			return manager ? [manager.dir] : [];
@@ -2864,6 +2903,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
 		hasSession = true;
 		if (asyncJobManager) {
