@@ -64,6 +64,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"artifacts/architecture-2383-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 };
 
 export interface PackageManifest {

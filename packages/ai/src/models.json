@@ -13299,6 +13299,450 @@
 			}
 		}
 	},
+	"jetbrains-junie": {
+		"claude-fable-5": {
+			"id": "claude-fable-5",
+			"name": "Anthropic Fable 5 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"claude-opus-4-6": {
+			"id": "claude-opus-4-6",
+			"name": "Anthropic Opus 4.6 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max",
+				"levels": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"max"
+				]
+			}
+		},
+		"claude-opus-4-7": {
+			"id": "claude-opus-4-7",
+			"name": "Anthropic Opus 4.7 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-opus-4-8": {
+			"id": "claude-opus-4-8",
+			"name": "Anthropic Opus 4.8 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-opus-5": {
+			"id": "claude-opus-5",
+			"name": "Anthropic Opus 5 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-sonnet-4-6": {
+			"id": "claude-sonnet-4-6",
+			"name": "Anthropic Sonnet 4.6 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"claude-sonnet-5": {
+			"id": "claude-sonnet-5",
+			"name": "Anthropic Sonnet 5 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"gpt-5-2025-08-07": {
+			"id": "gpt-5-2025-08-07",
+			"name": "GPT-5 (Junie)",
+			"api": "openai-completions",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 922000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"gpt-5.2-2025-12-11": {
+			"id": "gpt-5.2-2025-12-11",
+			"name": "GPT-5.2 (Junie)",
+			"api": "openai-completions",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 922000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"gpt-5.3-codex": {
+			"id": "gpt-5.3-codex",
+			"name": "GPT-5.3 OpenAI code (Junie)",
+			"api": "openai-responses",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "xhigh"
+			}
+		},
+		"gpt-5.4": {
+			"id": "gpt-5.4",
+			"name": "GPT-5.4 (Junie)",
+			"api": "openai-completions",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 922000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "xhigh"
+			}
+		},
+		"gpt-5.5": {
+			"id": "gpt-5.5",
+			"name": "GPT-5.5 (Junie)",
+			"api": "openai-completions",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 922000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "xhigh"
+			}
+		},
+		"gpt-5.6-luna": {
+			"id": "gpt-5.6-luna",
+			"name": "GPT-5.6 Luna (Junie)",
+			"api": "openai-completions",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 922000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"gpt-5.6-sol": {
+			"id": "gpt-5.6-sol",
+			"name": "GPT-5.6 Sol (Junie)",
+			"api": "openai-completions",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 922000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"gpt-5.6-terra": {
+			"id": "gpt-5.6-terra",
+			"name": "GPT-5.6 Terra (Junie)",
+			"api": "openai-completions",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 922000,
+			"maxTokens": 128000,
+			"headers": {
+				"X-LLM-Model": "openai",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		}
+	},
 	"kilo": {
 		"~anthropic/claude-fable-latest": {
 			"id": "~anthropic/claude-fable-latest",

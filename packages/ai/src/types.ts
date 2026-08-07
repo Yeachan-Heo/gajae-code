@@ -134,6 +134,7 @@ export const KNOWN_PROVIDERS = [
 	"fugu",
 	"gitlab-duo",
 	"cursor",
+	"jetbrains-junie",
 	"deepseek",
 	"deepinfra",
 	"xai",

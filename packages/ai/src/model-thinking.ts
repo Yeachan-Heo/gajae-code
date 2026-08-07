@@ -523,6 +523,12 @@ function inferGeneratedApplyPatchToolType(
 
 function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
 	if (parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
+		// JetBrains AI serves GPT through its own gateway, which enforces a probed
+		// 922K prompt cap for every GPT model regardless of the first-party figure.
+		// Its bundled value is measured, so leave it alone.
+		if (model.provider === "jetbrains-junie") {
+			return true;
+		}
 		// The first-party OpenAI GPT-5.5 model advertises a 1M total window, but
 		// the OpenAI code backend request path still enforces the smaller prompt
 		// budget. GJC's `contextWindow` is the usable prompt/input cap, not the

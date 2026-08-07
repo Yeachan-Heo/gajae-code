@@ -1161,6 +1161,31 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "toctou-not-found"))).toBe(true);
 	});
 
+	it("continues reconcile when a canonical receipt disappears before first capture (ENOENT)", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const realOpenSync = fs.openSync;
+		let receiptRemoved = false;
+		vi.spyOn(fs, "openSync").mockImplementation(((file, flags, mode) => {
+			if (!receiptRemoved && file === receipt) {
+				receiptRemoved = true;
+				fs.unlinkSync(receipt);
+			}
+			return realOpenSync(file, flags, mode);
+		}) as typeof fs.openSync);
+
+		replay("toctou-canonical-enoent");
+
+		expect(receiptRemoved).toBe(true);
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "toctou-canonical-enoent"))).toBe(true);
+	});
+
 	it("continues reconcile when a legacy receipt disappears before first capture (ENOENT)", () => {
 		const predecessorSeed = path.join(root, ".predecessor");
 		const predecessorContents = "predecessor\n";
@@ -1193,8 +1218,16 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 			JSON.stringify({ arbitrary: "second receipt contents are advisory" }),
 		);
 
-		// Remove the legacy receipt before reconcile runs — simulates concurrent disappearance.
-		fs.unlinkSync(receipt);
+		// Remove the legacy receipt after readdir returns but before capture opens it.
+		const realOpenSync = fs.openSync;
+		let receiptRemoved = false;
+		vi.spyOn(fs, "openSync").mockImplementation(((file, flags, mode) => {
+			if (!receiptRemoved && file === receipt) {
+				receiptRemoved = true;
+				fs.unlinkSync(receipt);
+			}
+			return realOpenSync(file, flags, mode);
+		}) as typeof fs.openSync);
 
 		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
 			const stat = fs.lstatSync(pathname, { bigint: true });
@@ -1217,7 +1250,8 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 			return { ok: true, detachedPath };
 		});
 
-		expect(() => replay("toctou-legacy-enoent")).not.toThrow();
+		replay("toctou-legacy-enoent");
+		expect(receiptRemoved).toBe(true);
 
 		expect(fs.existsSync(path.join(root, "toctou-legacy-enoent"))).toBe(true);
 		expect(fs.existsSync(secondReceipt)).toBe(false);

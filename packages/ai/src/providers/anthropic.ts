@@ -2228,6 +2228,25 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		};
 	}
 
+	// JetBrains AI (Ingrazzio) authenticates with a plain `Authorization: Bearer`
+	// token and rejects requests that also carry `X-Api-Key`. `buildAnthropicHeaders`
+	// already emits the bearer for non-Anthropic hosts, so keep the SDK from adding
+	// its own API-key header on top of it.
+	if (model.provider === "jetbrains-junie") {
+		return {
+			isOAuthToken: false,
+			apiKey: null,
+			authToken: null,
+			baseURL: baseUrl,
+			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
+			dangerouslyAllowBrowser: true,
+			defaultHeaders,
+			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
+			fetch: debugFetch,
+			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
+		};
+	}
+
 	return {
 		isOAuthToken: oauthToken,
 		apiKey: oauthToken ? null : apiKey,
