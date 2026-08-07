@@ -32,15 +32,21 @@ export default class Update extends Command {
 			channel = flags.channel;
 		} else {
 			const settings = await Settings.init({ cwd: getProjectDir() });
-			const configured = settings.get("startup.updateChannel");
-			if (isUpdateChannel(configured)) {
+			// Update selection is machine-local: a project `.gjc/config.yml`
+			// startup.updateChannel override must never silently pick the
+			// global release channel, so read the user/global layer only and
+			// fall back to the stable schema default when it is unset.
+			const configured = settings.getGlobal("startup.updateChannel");
+			if (configured !== undefined && isUpdateChannel(configured)) {
 				channel = configured;
-			} else {
-				// A hand-edited invalid value degrades to the schema default instead of
-				// leaking into output or the registry lookup.
+			} else if (configured !== undefined) {
+				// A hand-edited invalid global value degrades to the schema
+				// default instead of leaking into output or the registry lookup.
 				process.stderr.write(
 					`Ignoring invalid startup.updateChannel "${configured}". Expected one of: ${UPDATE_CHANNELS.join(", ")}; using stable.\n`,
 				);
+				channel = "stable";
+			} else {
 				channel = "stable";
 			}
 		}
