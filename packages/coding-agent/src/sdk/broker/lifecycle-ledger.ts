@@ -363,12 +363,16 @@ export class LifecycleLedger {
 		return this;
 	}
 	/**
-	 * Reads terminal proof for one request without recovering or changing the ledger.
+	 * Reads the durable terminal record for one request without recovering or changing the ledger.
 	 *
 	 * This intentionally accepts an unrelated unterminated final write: concurrent
 	 * appenders may have started a different row after this request's synced terminal
 	 * row. Complete rows are still decoded and validated strictly, and any incomplete
 	 * tail that identifies this request withholds proof.
+	 *
+	 * `terminal_uncertain` is a durable terminal record too: an operation that concluded
+	 * uncertainly persists that conclusion, and refusing to read it back would report a
+	 * synced row as unpersisted and replace its true reason with a generic one.
 	 */
 	async readTerminal(identity: string, requestHash: string): Promise<LifecycleLedgerEntry | undefined> {
 		const source = await this.#readBoundedSourceReadOnly();
@@ -413,12 +417,20 @@ export class LifecycleLedger {
 			const identityMarker = Buffer.from(`"identity":${JSON.stringify(identity)}`);
 			if (tail.includes(identityMarker)) return undefined;
 		}
-		return latest && terminal(latest.state) ? latest : undefined;
+		return latest && final(latest.state) ? latest : undefined;
 	}
 
+	/**
+	 * A recovery pass appends `terminal_uncertain` for every row it finds mid-flight, so a
+	 * long-running operation can have that marker interleaved before its own terminal row
+	 * lands. The marker records unresolved work, not a proven outcome: the owner that ran
+	 * the effects stays authoritative and may still resolve it. A proven terminal row is
+	 * immutable and admits no successor.
+	 */
 	#isValidHistoryContinuation(previous: LifecycleLedgerEntry | undefined, next: LifecycleLedgerEntry): boolean {
 		if (!previous) return next.state === "accepted";
-		if (previous.requestHash !== next.requestHash || final(previous.state)) return false;
+		if (previous.requestHash !== next.requestHash || terminal(previous.state)) return false;
+		if (previous.state === "terminal_uncertain") return final(next.state);
 		if (previous.state === "accepted") return true;
 		return next.state === "effect_started" || next.state === "awaiting_ready" || final(next.state);
 	}
