@@ -1857,6 +1857,16 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("https://my-proxy.example.com/v1");
 		});
 
+		test("bundled jetbrains-junie gpt-5.4 keeps its probed 922K window", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			// The generic gpt-5.4 policy raises the window to 1M for everyone except
+			// gateway-fronted providers. JetBrains AI enforces 922K, so the measured
+			// bundled value must survive; raising it would delay compaction past the
+			// point the gateway accepts.
+			expect(registry.find("jetbrains-junie", "gpt-5.4")?.contextWindow).toBe(922_000);
+			expect(registry.find("openai-codex", "gpt-5.4")?.contextWindow).toBe(1_000_000);
+		});
+
 		test("discoverable custom-only gpt-5.4 survives refresh", async () => {
 			writeRawModelsJson({
 				"custom-local": {

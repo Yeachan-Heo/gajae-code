@@ -27,16 +27,20 @@ describe("JetBrains Junie provider", () => {
 		});
 	});
 
-	it("bundles the JetBrains-served Claude catalog on the Ingrazzio gateway", () => {
-		const models = getBundledModels("jetbrains-junie");
-		expect(models.map(m => m.id).sort()).toEqual([
+	it("bundles the Claude lane on the Anthropic Messages transport", () => {
+		const claude = getBundledModels("jetbrains-junie").filter(m => m.id.startsWith("claude-"));
+		expect(claude.map(m => m.id).sort()).toEqual([
+			"claude-fable-5",
+			"claude-opus-4-6",
+			"claude-opus-4-7",
 			"claude-opus-4-8",
 			"claude-opus-5",
 			"claude-sonnet-4-6",
 			"claude-sonnet-5",
 		]);
-		for (const model of models) {
+		for (const model of claude) {
 			expect(model.api).toBe("anthropic-messages");
+			// The Anthropic transport supplies its own /v1 prefix.
 			expect(model.baseUrl).toBe(JUNIE_BASE_URL);
 			expect(model.headers?.["X-LLM-Model"]).toBe("anthropic");
 			expect(model.headers?.["X-Keep-Path"]).toBe("true");
@@ -45,6 +49,42 @@ describe("JetBrains Junie provider", () => {
 			// endpoint limit -- do not copy them back in.
 			expect(model.contextWindow).toBe(1_000_000);
 			expect(model.maxTokens).toBe(128_000);
+		}
+	});
+
+	it("bundles the GPT lane with the /v1-prefixed base URL the OpenAI transports need", () => {
+		const gpt = getBundledModels("jetbrains-junie").filter(m => m.id.startsWith("gpt-"));
+		expect(gpt.map(m => m.id).sort()).toEqual([
+			"gpt-5-2025-08-07",
+			"gpt-5.2-2025-12-11",
+			"gpt-5.3-codex",
+			"gpt-5.4",
+			"gpt-5.5",
+			"gpt-5.6-luna",
+			"gpt-5.6-sol",
+			"gpt-5.6-terra",
+		]);
+		for (const model of gpt) {
+			// The OpenAI transports append a bare /chat/completions or /responses,
+			// so without this suffix every GPT request 404s on the gateway.
+			expect(model.baseUrl).toBe(`${JUNIE_BASE_URL}/v1`);
+			expect(model.headers?.["X-LLM-Model"]).toBe("openai");
+			expect(model.maxTokens).toBe(128_000);
+		}
+		// gpt-5.3-codex is Responses-only; Chat Completions rejects it outright.
+		const byId = new Map(gpt.map(m => [m.id, m]));
+		expect(byId.get("gpt-5.3-codex")?.api).toBe("openai-responses");
+		expect(byId.get("gpt-5.6-sol")?.api).toBe("openai-completions");
+		// GPT is capped lower than Claude, and a generic GPT-5.5 policy must not
+		// raise it back to 1M for this provider.
+		expect(byId.get("gpt-5.5")?.contextWindow).toBe(922_000);
+		expect(byId.get("gpt-5.6-sol")?.contextWindow).toBe(922_000);
+	});
+
+	it("excludes the CLI-only aliases the gateway rejects", () => {
+		const ids = new Set(getBundledModels("jetbrains-junie").map(m => m.id));
+		for (const alias of ["opus", "sonnet", "gpt", "grok"]) {
+			expect(ids.has(alias)).toBe(false);
 		}
 	});
 
