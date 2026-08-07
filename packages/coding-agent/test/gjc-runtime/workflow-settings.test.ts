@@ -430,16 +430,18 @@ describe("workflow-settings resolver", () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(home, ".myconfig"), { recursive: true });
 		await fs.mkdir(path.join(home, ".myconfig", "agent"), { recursive: true });
+		const agentDir = path.join(home, ".myconfig", "agent");
 		const source = path.join(home, ".myconfig", "settings.json");
 		const oldRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
 		// The agent config holds the stale MIGRATION-WRITTEN value.
 		await fs.writeFile(
-			path.join(home, ".myconfig", "agent", "config.yml"),
+			path.join(agentDir, "config.yml"),
 			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
 		);
 		await fs.writeFile(`${source}.bak`, JSON.stringify({ "gjc.ralplan.maxIterations": 7 })); // migration copy
 		// The user EDITED the legacy source after completion.
 		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": 9 }));
+		const targetIdentity = await fs.stat(agentDir);
 		await fs.writeFile(
 			`${source}.migrated`,
 			JSON.stringify({
@@ -447,7 +449,9 @@ describe("workflow-settings resolver", () => {
 				status: "complete",
 				sourcePath: source,
 				backupPath: `${source}.bak`,
-				targetPath: path.join(home, ".myconfig", "agent", "config.yml"),
+				targetPath: path.join(agentDir, "config.yml"),
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${targetIdentity.dev}:${targetIdentity.ino}`,
 				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -461,21 +465,24 @@ describe("workflow-settings resolver", () => {
 		expect(result.source).toBe(source);
 	});
 
-	test("a malformed agent config.yml during stale-key inspection does not crash resolution", async () => {
+	test("an identity-less marker never claims stale ownership of the agent value", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(home, ".myconfig"), { recursive: true });
 		await fs.mkdir(path.join(home, ".myconfig", "agent"), { recursive: true });
+		const agentDir = path.join(home, ".myconfig", "agent");
 		const source = path.join(home, ".myconfig", "settings.json");
 		const oldRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
-		// The agent config is syntactically MALFORMED: the stale-key inspection
-		// must not let the YAML syntax error escape and crash tolerant
-		// resolution - it defers to the regular layer parser, which reports an
-		// invalid diagnostic and continues to the edited legacy source.
-		await fs.writeFile(path.join(home, ".myconfig", "agent", "config.yml"), "broken: [unclosed", "utf8");
-		await fs.writeFile(`${source}.bak`, JSON.stringify({ "gjc.ralplan.maxIterations": 7 })); // migration copy
-		// The user EDITED the legacy source after completion.
-		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": 9 }));
+		// The (possibly replaced) profile's agent config holds a value matching
+		// the old backup; without target identity the marker cannot prove this
+		// value is migration-owned, so it must stay a genuine override.
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.writeFile(`${source}.bak`, JSON.stringify({ "gjc.ralplan.maxIterations": 7 })); // old migration copy
+		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": 9 })); // edited legacy source
+		// An older/manually repaired complete marker WITHOUT target identity.
 		await fs.writeFile(
 			`${source}.migrated`,
 			JSON.stringify({
@@ -483,7 +490,48 @@ describe("workflow-settings resolver", () => {
 				status: "complete",
 				sourcePath: source,
 				backupPath: `${source}.bak`,
-				targetPath: path.join(home, ".myconfig", "agent", "config.yml"),
+				targetPath: path.join(agentDir, "config.yml"),
+				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+				completedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await resolveIn(cwd, { HOME: home, GJC_CONFIG_DIR: ".myconfig" });
+		// The agent value is a genuine override, not a migration-owned value to
+		// suppress: it wins over the edited legacy source.
+		expect(result.value).toBe(7);
+		expect(result.source).toBe(path.join(agentDir, "config.yml"));
+	});
+
+	test("a malformed agent config.yml during stale-key inspection does not crash resolution", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		await fs.mkdir(path.join(home, ".myconfig"), { recursive: true });
+		await fs.mkdir(path.join(home, ".myconfig", "agent"), { recursive: true });
+		const agentDir = path.join(home, ".myconfig", "agent");
+		const source = path.join(home, ".myconfig", "settings.json");
+		const oldRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		// The agent config is syntactically MALFORMED: the stale-key inspection
+		// must not let the YAML syntax error escape and crash tolerant
+		// resolution - it defers to the regular layer parser, which reports an
+		// invalid diagnostic and continues to the edited legacy source.
+		await fs.writeFile(path.join(agentDir, "config.yml"), "broken: [unclosed", "utf8");
+		await fs.writeFile(`${source}.bak`, JSON.stringify({ "gjc.ralplan.maxIterations": 7 })); // migration copy
+		// The user EDITED the legacy source after completion.
+		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": 9 }));
+		const targetIdentity = await fs.stat(agentDir);
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "complete",
+				sourcePath: source,
+				backupPath: `${source}.bak`,
+				targetPath: path.join(agentDir, "config.yml"),
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${targetIdentity.dev}:${targetIdentity.ino}`,
 				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),

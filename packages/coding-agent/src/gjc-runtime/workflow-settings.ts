@@ -281,29 +281,32 @@ async function getStaleMigrationOwnedKeys(sourcePath: string): Promise<ReadonlyS
 			typeof marker.targetPath !== "string" ||
 			path.resolve(marker.targetPath) !== path.resolve(getAgentDir(), "config.yml") ||
 			typeof marker.sourceSha256 !== "string" ||
-			!Array.isArray(marker.migratedKeys)
+			!Array.isArray(marker.migratedKeys) ||
+			typeof marker.canonicalTargetDir !== "string" ||
+			marker.canonicalTargetDir.length === 0 ||
+			typeof marker.canonicalTargetIdentity !== "string" ||
+			marker.canonicalTargetIdentity.length === 0
 		) {
+			// An identity-less marker (older build or manual repair) cannot prove
+			// its ownership claims apply to the CURRENT profile; reject it before
+			// classifying any agent value as migration-owned.
 			return null;
 		}
 		// A same-pathname profile REPLACEMENT changes the target config.yml's
 		// dev:ino; the marker records the identity at migration time.
-		if (typeof marker.canonicalTargetIdentity === "string") {
-			const currentTargetIdentity = await fs.stat(getAgentDir()).catch(() => null);
-			if (
-				!currentTargetIdentity ||
-				`${currentTargetIdentity.dev}:${currentTargetIdentity.ino}` !== marker.canonicalTargetIdentity
-			) {
-				return null;
-			}
+		const currentTargetIdentity = await fs.stat(getAgentDir()).catch(() => null);
+		if (
+			!currentTargetIdentity ||
+			`${currentTargetIdentity.dev}:${currentTargetIdentity.ino}` !== marker.canonicalTargetIdentity
+		) {
+			return null;
 		}
 		// A symlinked agent dir repointed after migration changes the canonical
 		// target identity: the marker must have been created for the CURRENT
 		// canonical agent dir, or the new profile never received the migration.
-		if (typeof marker.canonicalTargetDir === "string") {
-			const currentCanonicalAgentDir = await fs.realpath(getAgentDir()).catch(() => getAgentDir());
-			if (marker.canonicalTargetDir !== currentCanonicalAgentDir) {
-				return null;
-			}
+		const currentCanonicalAgentDir = await fs.realpath(getAgentDir()).catch(() => null);
+		if (currentCanonicalAgentDir === null || marker.canonicalTargetDir !== currentCanonicalAgentDir) {
+			return null;
 		}
 		let sourceRaw: string | null = null;
 		try {
