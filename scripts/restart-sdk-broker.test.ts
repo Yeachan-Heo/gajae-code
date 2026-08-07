@@ -31,6 +31,10 @@ class UnknownOperationError extends Error {
 	readonly code = "unknown_operation";
 }
 
+class CloseRefusedError extends Error {
+	readonly code = "close_refused";
+}
+
 test("starts an SDK broker when no owner is published", async () => {
 	const ttlValues: number[] = [];
 	await expect(
@@ -147,6 +151,70 @@ test("closes session hosts through the live broker before shutting it down", asy
 		{ kind: "shutdown", pid: 1 },
 	]);
 	expect(result).toEqual({ previousPid: 1, pid: 2, closedSessionIds: ["session-a", "session-b"] });
+});
+
+test("still replaces the broker when a session host cannot be closed", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const discoveries = [previous, null, null];
+	const calls: unknown[] = [];
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent", closeSessionHosts: true },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? null,
+			listSessionHosts: async () => ["session-a", "session-b", "session-c"],
+			closeSession: async (_value, sessionId) => {
+				calls.push({ kind: "close", sessionId });
+				if (sessionId === "session-b") throw new CloseRefusedError("endpoint is unavailable");
+			},
+			shutdown: async () => {
+				calls.push({ kind: "shutdown" });
+			},
+		}),
+	);
+
+	expect(calls).toEqual([
+		{ kind: "close", sessionId: "session-a" },
+		{ kind: "close", sessionId: "session-b" },
+		{ kind: "close", sessionId: "session-c" },
+		{ kind: "shutdown" },
+	]);
+	expect(result).toEqual({
+		previousPid: 1,
+		pid: 2,
+		closedSessionIds: ["session-a", "session-c"],
+		unclosedSessionHosts: [{ sessionId: "session-b", reason: "close_refused: endpoint is unavailable" }],
+	});
+});
+
+test("omits the unclosed report when every session host closes", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const discoveries = [previous, null, null];
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent", closeSessionHosts: true },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? null,
+			listSessionHosts: async () => ["session-a"],
+		}),
+	);
+
+	expect(result).toEqual({ previousPid: 1, pid: 2, closedSessionIds: ["session-a"] });
+});
+
+test("reports a codeless close failure with its message alone", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const discoveries = [previous, null, null];
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent", closeSessionHosts: true },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? null,
+			listSessionHosts: async () => ["session-a"],
+			closeSession: async () => {
+				throw new Error("socket hang up");
+			},
+		}),
+	);
+
+	expect(result.unclosedSessionHosts).toEqual([{ sessionId: "session-a", reason: "socket hang up" }]);
 });
 
 test("leaves session hosts running unless closing them was requested", async () => {
