@@ -28,11 +28,26 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
-import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
+import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
+import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
+
+type NativeSdkBusBindings = Pick<typeof import("@gajae-code/natives"), "NotificationServer" | "nativeBuildInfo">;
+let nativeSdkBusBindings: NativeSdkBusBindings | undefined;
+
+/**
+ * Lazy native access for the SDK bus. `require` is synchronous on purpose:
+ * `startSession` must reach its `sessionStartPromises` registration without an
+ * intervening microtask yield, or two concurrent starts (two `/notify on`
+ * calls) each build a runtime and the loser observes a foreign registration.
+ */
+function sdkBusNatives(): NativeSdkBusBindings {
+	nativeSdkBusBindings ??= require("@gajae-code/natives") as NativeSdkBusBindings;
+	return nativeSdkBusBindings;
+}
+
+type NotificationServer = NativeNotificationServer;
+
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
-import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
-import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
@@ -57,17 +72,21 @@ import type {
 	AskSettlement,
 	AskSettlementResult,
 } from "../../tools";
-import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
+import { RECOMMENDED_SUFFIX } from "../../tools/ask";
+import {
+	GJC_ASK_TIMEOUT_CODE,
+	registerAskAnswerSource,
+	registerWorkflowGateEmitterListener,
+} from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
-import { SessionSdkHost, shouldHostSdk } from "../host";
+import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
-import { projectQ10Models } from "../models.js";
+import type { SdkFrame } from "../host/types";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -79,6 +98,7 @@ import {
 	getCurrentTelegramActivationMarker,
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
+	isSlackComplete,
 	type NotificationConfig,
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
@@ -90,13 +110,20 @@ import {
 	runIdentityControlSuccessPath,
 	type TerminalSendOutcome,
 } from "./control-drain-lease";
+import { ConversationStore } from "./conversation-store";
+import {
+	createSlackBindingActivationGate,
+	EXISTING_THREAD_BIND_ENV,
+	isExistingThreadBindingRequested,
+} from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import { createKindAwareReconciliation, type KindAwareReconciliation } from "./kind-aware-reconciliation";
+import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
 import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
+import type { SlackConversation } from "./slack-conversation";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
@@ -421,15 +448,6 @@ async function readGitDiffStat(cwd: string): Promise<string | undefined> {
 	}
 }
 
-class DiffQueryError extends Error {
-	constructor(
-		readonly code: "not_git_repository" | "diff_too_large",
-		message: string,
-	) {
-		super(message);
-	}
-}
-
 interface PendingInteractiveAsk {
 	resolve: (result: AskAnswerSourceResult) => void;
 	options: string[];
@@ -469,6 +487,27 @@ function recommendedIndexFromGateOptions(options: readonly unknown[]): number | 
 type RetireStatus = "retired" | "already_terminal" | "claimed" | "stale";
 type DirectControlOutcome = "accepted" | "rejected" | "unknown";
 
+interface PresentationRetentionOptions {
+	publish?: boolean;
+	sourceEpoch?: number;
+}
+
+type PreparedDirectControl =
+	| { status: "retired"; ordinal: number }
+	| {
+			status: "queued";
+			ordinal: number;
+			/** Exact proof retained from a previously published route, if any. */
+			terminalProof?: "retired" | "already_terminal";
+	  };
+
+interface DirectControlPreparationLease {
+	gateId: string;
+	presentation: UnattendedGatePresentation;
+	presentationGeneration: number;
+	sourceEpoch?: number;
+}
+
 function parseRetireStatus(status: string): RetireStatus {
 	if (status === "retired" || status === "already_terminal" || status === "claimed" || status === "stale")
 		return status;
@@ -486,9 +525,20 @@ export class PresentationArbiter {
 	private readonly queue: string[] = [];
 	private readonly retries = new Map<string, { attempts: number; exhausted: boolean; nextAt: number }>();
 	private readonly retiredProofs = new Map<string, WorkflowGateTerminalProof>();
+	/** Gate ids that have had a successfully registered presentation in this retention lifetime. */
+	private readonly publishedGateIds = new Set<string>();
 	private readonly directControls = new Map<string, number>();
+	/** Binds an in-flight direct control to the exact retained presentation it retired. */
+	private readonly directControlPreparations = new WeakMap<object, DirectControlPreparationLease>();
+	/** Retained presentation identity generations fence same-gate replays. */
+	private readonly presentationGenerations = new WeakMap<UnattendedGatePresentation, number>();
+	private readonly presentationSourceEpochs = new WeakMap<UnattendedGatePresentation, number | undefined>();
+	private presentationGeneration = 0;
 	/** Explicit terminal proof for a direct control fenced before native publication. */
 	private readonly queuedDirectControls = new Set<string>();
+	/** Retained presentations that must wait for committed notification policy. */
+	private readonly deferredPublications = new Map<string, number | undefined>();
+	private publicationSuspended = false;
 	private retryTimer: ReturnType<typeof setTimeout> | undefined;
 	private retryTimerGateId: string | undefined;
 	private retryTimerGeneration = 0;
@@ -522,6 +572,15 @@ export class PresentationArbiter {
 		this.terminalCancellationTimers.delete(gateId);
 	}
 
+	#clearRetry(gateId: string): void {
+		this.retries.delete(gateId);
+		this.#clearTerminalCancellation(gateId);
+		if (this.retryTimerGateId !== gateId) return;
+		if (this.retryTimer) clearTimeout(this.retryTimer);
+		this.retryTimer = undefined;
+		this.retryTimerGateId = undefined;
+	}
+
 	#scheduleTerminalCancellation(gateId: string): void {
 		const presentation = this.presentations.get(gateId);
 		if (presentation?.workflowGateId || this.terminalCancellationTimers.has(gateId)) return;
@@ -541,7 +600,14 @@ export class PresentationArbiter {
 		this.#observeHead();
 		const gateId = this.queue[0];
 		const retry = gateId ? this.retries.get(gateId) : undefined;
-		if (!this.active && gateId && !this.directControls.has(gateId) && !retry?.exhausted) {
+		if (
+			!this.publicationSuspended &&
+			!this.active &&
+			gateId &&
+			!this.deferredPublications.has(gateId) &&
+			!this.directControls.has(gateId) &&
+			!retry?.exhausted
+		) {
 			if (retry && retry.nextAt > Date.now()) this.#scheduleRetry(gateId);
 			else this.reissue(gateId);
 		}
@@ -572,6 +638,8 @@ export class PresentationArbiter {
 		if (
 			!gateId ||
 			!this.presentations.has(gateId) ||
+			this.publicationSuspended ||
+			this.deferredPublications.has(gateId) ||
 			this.active ||
 			this.directControls.has(gateId) ||
 			retry?.exhausted
@@ -586,7 +654,14 @@ export class PresentationArbiter {
 
 	/** Explicit production recovery for a previously exhausted endpoint queue head. */
 	recover(gateId = this.queue[0]): void {
-		if (!gateId || this.queue[0] !== gateId || !this.presentations.has(gateId)) return;
+		if (
+			!gateId ||
+			this.queue[0] !== gateId ||
+			!this.presentations.has(gateId) ||
+			this.publicationSuspended ||
+			this.deferredPublications.has(gateId)
+		)
+			return;
 		this.retries.delete(gateId);
 		this.#clearTerminalCancellation(gateId);
 
@@ -596,6 +671,34 @@ export class PresentationArbiter {
 
 	hasActivePresentation(): boolean {
 		return this.active !== undefined;
+	}
+
+	#bindDirectControl(
+		gateId: string,
+		presentation: UnattendedGatePresentation,
+		prepared: PreparedDirectControl,
+	): PreparedDirectControl {
+		const presentationGeneration = this.presentationGenerations.get(presentation);
+		if (presentationGeneration === undefined)
+			throw new Error(`workflow gate ${gateId} presentation lacks a retention generation`);
+		this.directControlPreparations.set(prepared, {
+			gateId,
+			presentation,
+			presentationGeneration,
+			sourceEpoch: this.presentationSourceEpochs.get(presentation),
+		});
+		return prepared;
+	}
+
+	#isCurrentDirectControl(gateId: string, prepared: PreparedDirectControl): boolean {
+		const lease = this.directControlPreparations.get(prepared);
+		if (!lease || lease.gateId !== gateId) return false;
+		const presentation = this.presentations.get(gateId);
+		return (
+			presentation === lease.presentation &&
+			this.presentationGenerations.get(presentation) === lease.presentationGeneration &&
+			this.presentationSourceEpochs.get(presentation) === lease.sourceEpoch
+		);
 	}
 
 	retireForDirectControl(gateId: string): RetireStatus {
@@ -613,29 +716,38 @@ export class PresentationArbiter {
 		return status;
 	}
 
-	prepareDirectControl(
-		gateId: string,
-	): { status: "retired" | "queued"; ordinal: number } | { status: "claimed" | "stale" } {
+	prepareDirectControl(gateId: string): PreparedDirectControl | { status: "claimed" | "stale" } {
 		const ordinal = this.queue.indexOf(gateId);
+		const presentation = this.presentations.get(gateId);
 		if (this.active?.gateId === gateId) {
 			const status = this.retireForDirectControl(gateId);
-			return status === "retired"
-				? { status, ordinal }
-				: { status: status === "already_terminal" ? "stale" : status };
+			if (status !== "retired") return { status: status === "already_terminal" ? "stale" : status };
+			if (!presentation) return { status: "stale" };
+			return this.#bindDirectControl(gateId, presentation, { status, ordinal });
 		}
-		if (!this.presentations.has(gateId) || ordinal < 0 || this.directControls.has(gateId)) return { status: "stale" };
+		if (!presentation || ordinal < 0 || this.directControls.has(gateId)) return { status: "stale" };
+		const terminalProof = this.retiredProofs.get(gateId);
+		if (terminalProof !== "retired" && terminalProof !== "already_terminal" && this.publishedGateIds.has(gateId))
+			return { status: "stale" };
 		// Fence the queued entry before awaiting durable resolution; promotion cannot
 		// republish it until the control has a known terminal outcome.
 		this.directControls.set(gateId, ordinal);
 		this.queuedDirectControls.add(gateId);
-		return { status: "queued", ordinal };
+		return this.#bindDirectControl(
+			gateId,
+			presentation,
+			terminalProof === "retired" || terminalProof === "already_terminal"
+				? { status: "queued", ordinal, terminalProof }
+				: { status: "queued", ordinal },
+		);
 	}
 
-	finishDirectControl(
-		gateId: string,
-		prepared: { status: "retired" | "queued"; ordinal: number },
-		outcome: DirectControlOutcome,
-	): void {
+	finishDirectControl(gateId: string, prepared: PreparedDirectControl, outcome: DirectControlOutcome): void {
+		// The emitter may have been replaced while the durable resolution was in
+		// flight. Never let that old completion act on a replacement presentation
+		// that happens to reuse the same gate id.
+		if (!this.#isCurrentDirectControl(gateId, prepared)) return;
+		this.directControlPreparations.delete(prepared);
 		if (outcome === "accepted") {
 			this.directControls.delete(gateId);
 			this.complete(gateId);
@@ -651,7 +763,6 @@ export class PresentationArbiter {
 		}
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
-		this.retiredProofs.delete(gateId);
 		if (!this.presentations.has(gateId)) return;
 		const current = this.queue.indexOf(gateId);
 		if (current >= 0) this.queue.splice(current, 1);
@@ -665,7 +776,29 @@ export class PresentationArbiter {
 		private readonly tag: string,
 	) {}
 
-	retain(presentation: UnattendedGatePresentation): void {
+	/** Gate retention remains available while notification publication is suspended. */
+	setPublicationSuspended(suspended: boolean): void {
+		this.publicationSuspended = suspended;
+		if (!suspended) this.#promote();
+	}
+
+	/** Publish only deferred presentations from the still-authoritative source. */
+	activateDeferred(sourceEpoch?: number): void {
+		for (const [gateId, deferredEpoch] of this.deferredPublications) {
+			if (sourceEpoch !== undefined && deferredEpoch !== undefined && deferredEpoch !== sourceEpoch) continue;
+			this.deferredPublications.delete(gateId);
+			this.#clearRetry(gateId);
+		}
+		this.#promote();
+	}
+
+	retain(presentation: UnattendedGatePresentation, options: PresentationRetentionOptions = {}): void {
+		if (options.publish === false || this.publicationSuspended) {
+			this.deferredPublications.set(presentation.gateId, options.sourceEpoch);
+			this.#clearRetry(presentation.gateId);
+		} else {
+			this.deferredPublications.delete(presentation.gateId);
+		}
 		const existing = this.presentations.get(presentation.gateId);
 		if (
 			existing &&
@@ -684,6 +817,7 @@ export class PresentationArbiter {
 			if (!isTerminalProof(status)) return;
 			this.routes.delete(active.actionId);
 			this.active = undefined;
+			this.retiredProofs.set(presentation.gateId, status);
 		}
 		const alreadyPresent = existing !== undefined;
 		if (existing?.multi && presentation.multi) {
@@ -692,6 +826,8 @@ export class PresentationArbiter {
 			);
 		}
 		if (!alreadyPresent) this.queue.push(presentation.gateId);
+		this.presentationGenerations.set(presentation, ++this.presentationGeneration);
+		this.presentationSourceEpochs.set(presentation, options.sourceEpoch);
 		this.presentations.set(presentation.gateId, presentation);
 		// A fresh durable replay is explicit production recovery after transient N-API exhaustion.
 		if (alreadyPresent) this.recover(presentation.gateId);
@@ -713,6 +849,9 @@ export class PresentationArbiter {
 		if (!presentation?.multi || !presentation.options.includes(label)) return false;
 		this.routes.delete(actionId);
 		if (this.active?.actionId === actionId) this.active = undefined;
+		// Native claim resolution terminalized the published route; preserve that
+		// exact proof if the replacement publication cannot be registered.
+		this.retiredProofs.set(presentation.gateId, "already_terminal");
 		const selected = new Set(presentation.selectedOptions);
 		if (selected.has(label)) selected.delete(label);
 		else selected.add(label);
@@ -732,6 +871,8 @@ export class PresentationArbiter {
 		const presentation = this.presentations.get(gateId);
 		if (!presentation) return;
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -749,6 +890,8 @@ export class PresentationArbiter {
 		const presentation = this.presentations.get(gateId);
 		if (!presentation) return;
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -779,6 +922,8 @@ export class PresentationArbiter {
 		const presentation = this.presentations.get(gateId);
 		if (!presentation) return;
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -801,7 +946,14 @@ export class PresentationArbiter {
 
 	reissue(gateId: string): string | undefined {
 		const presentation = this.presentations.get(gateId);
-		if (!presentation || this.directControls.has(gateId) || this.active) return undefined;
+		if (
+			!presentation ||
+			this.publicationSuspended ||
+			this.deferredPublications.has(gateId) ||
+			this.directControls.has(gateId) ||
+			this.active
+		)
+			return undefined;
 		const actionId = `${presentation.workflowGateId ? "gate-interaction" : "ask"}:${crypto.randomUUID()}`;
 		this.routes.set(actionId, gateId);
 		try {
@@ -829,16 +981,22 @@ export class PresentationArbiter {
 							...(presentation.recommendedIndex === undefined
 								? {}
 								: { recommendedIndex: presentation.recommendedIndex }),
-							controls: presentation.multi
-								? [
-										{
-											id: "navigation_forward",
-											kind: "navigation",
-											label: presentation.navigationLabel ?? "Done",
-											enabled: presentation.allowEmpty || presentation.selectedOptions.length > 0,
-										},
-									]
-								: presentation.controls,
+							// A presentation that carries its own controls (the ask tool's
+							// Next/Done) keeps them; a durable workflow gate presents none,
+							// so its navigation control is synthesized here.
+							controls:
+								presentation.controls.length > 0
+									? presentation.controls
+									: presentation.multi
+										? [
+												{
+													id: "navigation_forward",
+													kind: "navigation",
+													label: presentation.navigationLabel ?? "Done",
+													enabled: presentation.allowEmpty || presentation.selectedOptions.length > 0,
+												},
+											]
+										: [],
 						},
 						{ redact: this.redact(), sessionTag: this.tag },
 					),
@@ -847,6 +1005,10 @@ export class PresentationArbiter {
 			);
 			if (lease.actionId !== actionId) throw new Error("native arbitrated action id mismatch");
 			this.active = { actionId, gateId, registrationEpoch: lease.registrationEpoch };
+			this.publishedGateIds.add(gateId);
+			// A replacement route now has its own exact proof; do not reuse a
+			// terminal proof retained for the route it replaced.
+			this.retiredProofs.delete(gateId);
 			this.retries.delete(gateId);
 			presentation.onActivated?.(actionId, lease);
 			return actionId;
@@ -888,6 +1050,11 @@ export class PresentationArbiter {
 		if (isTerminalProof(status)) {
 			this.routes.delete(actionId);
 			this.active = undefined;
+			// Preserve the exact lease proof after removing the route. A later
+			// terminalization must not fall back to a broad publication-suspended
+			// heuristic and misclassify a previously published lease as not_published.
+			this.publishedGateIds.add(gateId);
+			this.retiredProofs.set(gateId, status);
 			void reason;
 			return true;
 		}
@@ -902,13 +1069,17 @@ export class PresentationArbiter {
 			if (routeGateId !== gateId) continue;
 			if (!this.closeInteraction(actionId, "gate_complete"))
 				throw new Error(`workflow gate ${gateId} presentation lacks exact terminal proof`);
-			proof = "retired";
+			proof = this.retiredProofs.get(gateId) ?? proof;
 		}
 		const presentation = this.presentations.get(gateId);
 		if (!proof && this.queuedDirectControls.has(gateId)) proof = "not_published";
+		if (!proof && this.deferredPublications.has(gateId)) proof = "not_published";
+		if (!proof && this.publicationSuspended && presentation) proof = "not_published";
 		if (!proof && presentation)
 			throw new Error(`workflow gate ${gateId} presentation lacks an active terminal lease`);
 		this.presentations.delete(gateId);
+		this.publishedGateIds.delete(gateId);
+		this.deferredPublications.delete(gateId);
 		this.directControls.delete(gateId);
 		this.queuedDirectControls.delete(gateId);
 		this.retiredProofs.delete(gateId);
@@ -934,7 +1105,11 @@ export class PresentationArbiter {
 	}
 
 	dispose(): void {
+		const publicationSuspended = this.publicationSuspended;
+		this.publicationSuspended = true;
 		for (const gateId of [...this.presentations.keys()]) this.cancel(gateId, "session_shutdown");
+		this.deferredPublications.clear();
+		this.publicationSuspended = publicationSuspended;
 	}
 }
 
@@ -981,6 +1156,8 @@ interface SessionRuntime {
 	policySuspended: boolean;
 	/** Monotonic policy epoch fences asynchronous notification delivery. */
 	policyGeneration: number;
+	/** Monotonic source lease epoch for workflow-gate presentation retention. */
+	workflowGatePublicationEpoch: number;
 	/** True only after the exact host generation was registered with the broker index. */
 	brokerRegistrationActive: boolean;
 	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
@@ -1067,8 +1244,6 @@ interface SessionRuntime {
 	 * remote clients. Cleared after flush or when replaced by a newer turn.
 	 */
 	pendingSettled?: { text: string; messageRef?: string };
-	/** Durable gates emitted while ownership is provisional; presented only after stable activation. */
-	deferredGatePresentations: Array<() => void>;
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
 	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
@@ -1769,6 +1944,158 @@ function createSdkUiAskAnswerSource(
 		awaitAnswerRequest,
 	};
 }
+
+/**
+ * Ask-answer source that bridges workflow-gate asks to the ACP permission
+ * channel (`session/request_permission`). Used when the client does not
+ * advertise ACP form elicitation (e.g. Paseo): the gate question is sent as
+ * a permission request whose options are the answer choices, and the
+ * selected optionId maps back to the answer. Only selector asks are bridged;
+ * free-text asks have no permission-option representation and stay
+ * unanswered (unchanged from today). Auto-approval follows the client's
+ * permission mode, so gates never self-approve under `prompt`.
+ */
+export function createSdkPermissionAskAnswerSource(
+	requestPermission: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>,
+): AskAnswerSource {
+	const awaitAnswerRequest = async (
+		request: AskAnswerRequest,
+		signal?: AbortSignal,
+	): Promise<AskAnswerSourceResult> => {
+		if (signal?.aborted) return undefined;
+		if (request.interaction !== "selector") return undefined;
+		// AskTool appends its synthetic "Other"/clarification transition entries
+		// at the end; a free-text editor this channel cannot complete. Remove
+		// exactly those trailing entries so a legitimate option that happens to
+		// share a transition label is preserved and recommendedIndex stays valid.
+		const transitionCount =
+			typeof request.transitionCount === "number" &&
+			Number.isInteger(request.transitionCount) &&
+			request.transitionCount > 0
+				? Math.min(request.transitionCount, request.options.length)
+				: 0;
+		const bridgedOptions =
+			transitionCount > 0 ? request.options.slice(0, request.options.length - transitionCount) : request.options;
+		// An ask with no model-supplied choices leaves only the synthetic
+		// transition entries; do not send an unanswerable permission request.
+		// An ask with no model-supplied choices leaves only the synthetic
+		// transition entries; do not send an unanswerable permission request
+		// unless an enabled control can still commit something.
+		if (bridgedOptions.length === 0 && !request.controls.some(control => control.enabled)) return undefined;
+		const recommendedLabel =
+			typeof request.recommendedIndex === "number" &&
+			Number.isInteger(request.recommendedIndex) &&
+			request.recommendedIndex >= 0 &&
+			request.recommendedIndex < bridgedOptions.length
+				? bridgedOptions[request.recommendedIndex]
+				: undefined;
+		const selectedOptions = request.selectedOptions;
+		const markSelection = selectedOptions !== undefined && selectedOptions.length > 0;
+		const choices = new Map<string, AskRemoteInteraction>();
+		const options: Array<Record<string, unknown>> = bridgedOptions.map((label, index) => {
+			const optionId = `option:${index}`;
+			choices.set(optionId, { kind: "value", value: label });
+			const selected = markSelection && selectedOptions?.includes(label) === true;
+			const name = markSelection ? `${selected ? "[x] " : "[ ] "}${label}` : label;
+			return {
+				optionId,
+				name: label === recommendedLabel ? `${name}${RECOMMENDED_SUFFIX}` : name,
+				kind: "allow_once",
+			};
+		});
+		for (const control of request.controls) {
+			if (!control.enabled) continue;
+			const optionId = `control:${control.id}`;
+			choices.set(optionId, { kind: "control", controlId: control.id });
+			options.push({ optionId, name: control.label, kind: "allow_once" });
+		}
+		const requestController = new AbortController();
+		const onRequestAbort = () => requestController.abort();
+		signal?.addEventListener("abort", onRequestAbort, { once: true });
+		const {
+			promise: requestPromise,
+			resolve: resolveRequest,
+			reject: rejectRequest,
+		} = Promise.withResolvers<unknown>();
+		const timeoutTimer =
+			request.timeoutMs === undefined
+				? undefined
+				: setTimeout(() => {
+						requestController.abort();
+						resolveRequest(undefined);
+					}, request.timeoutMs);
+		void requestPermission(
+			{
+				toolCall: {
+					toolCallId: crypto.randomUUID(),
+					toolName: "ask",
+					title: request.question,
+					rawInput: { question: request.question },
+				},
+				options,
+			},
+			requestController.signal,
+		).then(
+			value => {
+				resolveRequest(value);
+			},
+			error => {
+				rejectRequest(error);
+			},
+		);
+		const askTimeoutError = Object.assign(new Error("ask timed out"), { code: GJC_ASK_TIMEOUT_CODE });
+		let response: unknown;
+		try {
+			response = await requestPromise;
+		} catch (error) {
+			if (requestController.signal.aborted && !signal?.aborted) throw askTimeoutError;
+			throw error;
+		} finally {
+			if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+			signal?.removeEventListener("abort", onRequestAbort);
+		}
+		if (signal?.aborted) return undefined;
+		// The configured ask timeout elapsed with no answer: throw the marked
+		// timeout error so the ask tool distinguishes it from a genuine
+		// cancellation (which must never auto-select) and its own
+		// auto-selection-on-timeout policy stays authoritative.
+		if (requestController.signal.aborted) throw askTimeoutError;
+		if (!isRecord(response)) return undefined;
+		// ACP clients (e.g. Paseo) return `{ outcome: { outcome, optionId } }`;
+		// accept the flat legacy shape as well.
+		const outcome = isRecord(response.outcome) ? response.outcome : response;
+		if (outcome.outcome === "cancelled") return undefined;
+		if (outcome.outcome !== "selected" || typeof outcome.optionId !== "string") return undefined;
+		const interaction = choices.get(outcome.optionId);
+		if (!interaction) return undefined;
+		if (interaction.kind === "value") return interaction.value;
+		let settled: Promise<AskSettlementResult> | undefined;
+		return {
+			source: "remote",
+			interaction,
+			settle(settlement) {
+				if (!settled) {
+					settled = Promise.resolve(
+						settlement.kind === "commit"
+							? { kind: "committed", ack: { status: "failed", reason: "unsupported" } }
+							: settlement.kind === "invalid"
+								? { kind: "invalid_closed" }
+								: { kind: "resolved_without_commit" },
+					);
+				}
+				return settled;
+			},
+		};
+	};
+	return {
+		async awaitAnswer(question, options, signal) {
+			const answer = await awaitAnswerRequest({ question, options, interaction: "selector", controls: [] }, signal);
+			if (!answer || typeof answer === "string") return answer;
+			return answer.interaction.kind === "value" ? answer.interaction.value : undefined;
+		},
+		awaitAnswerRequest,
+	};
+}
 /** Register the interactive `ask` answer source for a session (the ask tool
  * races the local UI against a remote reply). Returns the deregister disposer. */
 function registerInteractiveAnswerSource(
@@ -1816,9 +2143,12 @@ function registerInteractiveAnswerSource(
 					options: request.options,
 					controls: request.controls,
 					recommendedIndex: request.recommendedIndex,
-					multi: false,
+					// The ask tool owns the multi-select loop and re-issues one request per
+					// toggle; carrying its selection here is what makes the toggle visible
+					// on a remote transport instead of an identical repeated prompt.
+					multi: request.multi === true,
 					allowEmpty: false,
-					selectedOptions: [],
+					selectedOptions: [...(request.selectedOptions ?? [])],
 					onActivated: (actionId, lease) => {
 						if (pending.actionId && pendingInteractive.get(pending.actionId) === pending)
 							pendingInteractive.delete(pending.actionId);
@@ -1878,57 +2208,6 @@ function validateProviderDefinitions(capability: string, definitions: unknown): 
 	}
 }
 
-const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.register", "host_uri.register"]);
-
-const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
-	"model.cycle": "cycleModel",
-	"model.profile.set": "setModelProfile",
-	"thinking.cycle": "cycleThinkingLevel",
-	"queue.steering_mode.set": "setQueueMode",
-	"queue.follow_up_mode.set": "setQueueMode",
-	"queue.interrupt_mode.set": "setQueueMode",
-	"todo.replace": "sdkControl",
-	"permission_mode.set": "sdkControl",
-	"skill.invoke": "invokeSkill",
-	"mode.plan.set": "setPlanMode",
-	"mode.goal.operate": "operateGoal",
-
-	"compaction.auto.set": "sdkControl",
-	"retry.auto.set": "sdkControl",
-	"retry.abort": "sdkControl",
-	"bash.execute": "sdkControl",
-	"bash.abort": "sdkControl",
-	"session.new": "sdkControl",
-	"session.fork": "sdkControl",
-	"session.resume": "sdkControl",
-	"session.close": "sdkControl",
-	"session.switch": "sdkControl",
-	"session.branch": "sdkControl",
-	"session.rename": "sdkControl",
-	"session.handoff": "sdkControl",
-	"session.export_html": "sdkControl",
-	"runtime.reload": "sdkControl",
-	"service_tier.set": "sdkControl",
-	"queue.message.remove": "sdkControl",
-	"queue.message.move": "sdkControl",
-	"queue.message.update": "sdkControl",
-	"extension.set_enabled": "sdkControl",
-	"session.delete": "sdkControl",
-	"session.cwd.move": "sdkControl",
-	"retry.last": "sdkControl",
-	"retry.now": "sdkControl",
-	"bash.background": "sdkControl",
-};
-const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
-	"skill.list/state": "getSkillState",
-	"config.list/get": "getConfigItems",
-	"session.branch_candidates": "getBranchCandidates",
-	"extensions.list": "getExtensions",
-	"artifact.read": "getArtifactRange",
-
-	"runtime.jobs.list": "getJobs",
-};
-
 function hasTerminalArbitrationCapability(
 	workflowGate: WorkflowGateEmitter | undefined,
 ): workflowGate is WorkflowGateEmitter &
@@ -1953,21 +2232,6 @@ function hasTerminalArbitrationCapability(
 	);
 }
 
-function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): Set<string> {
-	const bindings = new Set(ctx.sdkBindings?.() ?? []);
-	const required = kind === "control" ? CONTROL_BINDINGS : QUERY_BINDINGS;
-	const candidates = OPERATIONS.filter(
-		operation =>
-			operation.kind === kind &&
-			(kind !== "control" ||
-				(!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
-					((operation.sdkId !== "workflow.gate_answer" && operation.sdkId !== "workflow.plan_approve") ||
-						hasTerminalArbitrationCapability(ctx.workflowGate)) &&
-					(!required[operation.sdkId] || bindings.has(required[operation.sdkId]!)))),
-	);
-	return new Set(candidates.map(operation => operation.sdkId));
-}
-
 function sdkQuerySurface(
 	ctx: ExtensionContext,
 	id: string,
@@ -1979,152 +2243,24 @@ function sdkQuerySurface(
 		followupQueueDepth: 0,
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
-	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
+	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
-	steerStatusLookup: (clientRef: string) => unknown = () => ({ status: "unknown" }),
 ): SessionSurface {
-	const metadata = () => ({
-		sessionId: id,
-		name: ctx.sessionManager.getSessionName(),
-		cwd: ctx.cwd,
-		kind: ctx.sessionMetadata?.kind ?? "main",
-	});
-	const lastAssistantText = () => {
-		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			const { content } = entry.message;
-			if (typeof content === "string") return content;
-			if (Array.isArray(content))
-				return content
-					.filter(
-						(block): block is { type: "text"; text: string } =>
-							block.type === "text" && typeof block.text === "string",
-					)
-					.map(block => block.text)
-					.join("");
-		}
-		return undefined;
-	};
-	const getDiff = async () => {
-		try {
-			const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff"], {
-				cwd: ctx.cwd,
-				maxBuffer: 1024 * 1024,
-			});
-			return stdout
-				.split(/^diff --git /m)
-				.filter(Boolean)
-				.map(section => {
-					const header = section.split("\n", 1)[0] ?? "";
-					const match = /a\/(.+?) b\/(.+)$/.exec(header);
-					return { id: match?.[2] ?? header, path: match?.[2] ?? header, body: `diff --git ${section}` };
-				});
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "") : "";
-			if (/not a git repository/i.test(`${detail}\n${stderr}`))
-				throw new DiffQueryError("not_git_repository", "diff queries require a Git working tree");
-			if (/maxbuffer|ERR_CHILD_PROCESS_STDIO_MAXBUFFER/i.test(detail))
-				throw new DiffQueryError("diff_too_large", "diff exceeds the 1 MiB query limit");
-			throw error;
-		}
-	};
-	return {
-		getTranscriptEntries: () =>
-			typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [],
-		getContextSnapshot: () => ({
-			usage: ctx.getContextUsage(),
-			systemPrompt: ctx.getSystemPrompt(),
-			...getLiveState(),
-		}),
-		getGoalState: () =>
-			typeof (ctx as Partial<ExtensionContext>).getGoalState === "function" ? ctx.getGoalState() : undefined,
-		getTodoState: () =>
-			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
-		getDiff,
-		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () => {
-			const models = ctx.modelRegistry.getAll();
-			const currentModel = ctx.model;
-			const currentThinkingLevel = api.getThinkingLevel();
-			return projectQ10Models({ models, currentModel, currentThinkingLevel });
-		},
-		getModelProfiles: async () => {
-			const profiles = ctx.modelRegistry.getModelProfiles();
-			const catalog = projectModelProfileCatalog(profiles, ctx.modelRegistry.getError());
-			const providers = new Set([...profiles.values()].flatMap(profile => profile.requiredProviders));
-			const authenticatedProviders = new Set<string>();
-			await Promise.all(
-				[...providers].map(async provider => {
-					try {
-						const credential = await ctx.modelRegistry.getApiKeyForProvider(provider, id);
-						if (credential === kNoAuth || isAuthenticated(credential)) authenticatedProviders.add(provider);
-					} catch {
-						// A provider whose credential state cannot be read is not currently configurable.
-					}
-				}),
-			);
-			return catalog.map(item => ({
-				...item,
-				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
-			}));
-		},
-		getSkillState: () => ctx.getSkillState(),
-		getGates: () => {
-			const workflowGate = ctx.workflowGate;
-			if (!workflowGate) return [];
-			return (
-				workflowGate.listWorkflowGateQueryRecords?.() ??
-				workflowGate.listPendingGates?.().map(gate => ({
-					...gate,
-					id: `pending:${gate.gate_id}`,
-					tag: "pending" as const,
-				})) ??
-				[]
-			);
-		},
-		getConfigItems: () => {
-			const items = ctx.getConfigItems();
-			return items && typeof items === "object" && !Array.isArray(items)
-				? { ...(items as Record<string, unknown>), ...Object.fromEntries(configOverrides) }
-				: items;
-		},
-
-		getSessionMetadata: metadata,
-		getStats: () => ctx.sessionManager.getUsageStatistics(),
-		getBranchCandidates: () => ctx.getBranchCandidates(),
-		getLastAssistant: lastAssistantText,
-
-		getCapabilities: () => ({
-			operations: [...installedOperations(ctx, "control"), ...installedOperations(ctx, "query")],
-			hostTools: getInstalledDefinitions("host_tools") !== undefined,
-			promptTerminalOutcomeVersion: 1,
-		}),
-		getAuthProviders: () => [...new Set(ctx.modelRegistry.getAll().map(model => model.provider))],
-		getActiveProviders: () => {
-			try {
-				return ctx.modelRegistry.getActiveProviders();
-			} catch {
-				throw new ActiveProviderResolutionError();
-			}
-		},
-		getTools: () => {
-			const tools = typeof (ctx as Partial<ExtensionContext>).getAllTools === "function" ? ctx.getAllTools() : [];
-			return tools.length > 0 ? tools : (getInstalledDefinitions("host_tools") ?? []);
-		},
-		getQueueMessages: () => ctx.getQueuedMessages(),
-		getExtensions: () => ctx.getExtensions(),
-		getArtifactRange: (id, offset, length) => ctx.getArtifactRange?.(id, offset, length),
-		getJobs: () => ctx.getJobs(),
-		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			promptStatusLookup(selector),
-		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			skillStatusLookup(selector),
-		getSteerStatus: ({ clientRef }: { clientRef: string }) => steerStatusLookup(clientRef),
-		installedQueries: installedOperations(ctx, "query"),
-	};
+	return createSdkSurfaceFactory({
+		ctx,
+		id,
+		api,
+		getInstalledDefinitions,
+		getLiveState,
+		configOverrides,
+		promptStatusLookup,
+		skillStatusLookup,
+		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
+	}).query;
 }
 
 function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
@@ -2177,14 +2313,9 @@ function sdkControlSurface(
 		) => Promise<void>;
 		noteTransition: (
 			correlation: { commandId: string; turnId: string } | undefined,
-			frame:
-				| { type: "agent_start" }
-				| { type: "agent_end"; finalText?: string }
-				| { type: "agent_failed"; error: unknown; finalText?: string },
+			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
 		) => Promise<void>;
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
-		reserveSteer?: KindAwareReconciliation["reserveSteer"];
-		settleSteer?: KindAwareReconciliation["settleSteer"];
 	},
 ): ControlSurface & {
 	cancelPendingPreflights(): void;
@@ -2194,30 +2325,22 @@ function sdkControlSurface(
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
 	const bindings = new Set(ctx.sdkBindings?.() ?? []);
-	const lastAssistantText = () => {
-		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			const { content } = entry.message;
-			if (typeof content === "string") return content;
-			if (Array.isArray(content))
-				return content
-					.filter(
-						(block): block is { type: "text"; text: string } =>
-							block.type === "text" && typeof block.text === "string",
-					)
-					.map(block => block.text)
-					.join("");
-		}
-		return undefined;
-	};
+	const surfacePolicy = createSdkSurfaceFactory({
+		ctx,
+		id: ctx.sessionManager.getSessionId(),
+		api,
+	}).policy;
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
 		if (missingExpectedSessionAudits.has(operation)) return;
 		missingExpectedSessionAudits.add(operation);
 		logger.warn("workflow_control_missing_expected_session_id", { operation });
 	};
-	const reconcileUnknownGateFailure = (gateId: string): "pending" | "terminal" | "unavailable" => {
-		const pending = ctx.workflowGate?.listPendingGates;
+	const reconcileUnknownGateFailure = (
+		workflowGate: WorkflowGateEmitter,
+		gateId: string,
+	): "pending" | "terminal" | "unavailable" => {
+		const pending = workflowGate.listPendingGates;
 		if (!pending) return "unavailable";
 		try {
 			return pending().some(gate => gate.gate_id === gateId) ? "pending" : "terminal";
@@ -2226,38 +2349,22 @@ function sdkControlSurface(
 			return "unavailable";
 		}
 	};
-	const reconcileDirectControlFailure = (gateId: string): DirectControlOutcome => {
-		const durable = reconcileUnknownGateFailure(gateId);
+	const reconcileDirectControlFailure = (workflowGate: WorkflowGateEmitter, gateId: string): DirectControlOutcome => {
+		const durable = reconcileUnknownGateFailure(workflowGate, gateId);
 		if (durable === "pending") return "rejected";
 		if (durable === "terminal") return "accepted";
 		try {
-			ctx.workflowGate?.quarantineGate?.(gateId);
+			workflowGate.quarantineGate?.(gateId);
 		} catch {
 			// The local arbiter still fails closed when the durable fence is unavailable.
 		}
 		return "unknown";
 	};
-	const sendSteer = async (text: string, clientRef?: string) => {
-		if (!clientRef) {
-			await api.sendUserMessage(text, { deliverAs: "steer" });
-			return { commandId: crypto.randomUUID(), accepted: true };
-		}
-		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
-			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
-		const reservation = await skillRecon.reserveSteer(clientRef, text);
-		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
-		try {
-			await api.sendUserMessage(text, { deliverAs: "steer" });
-			return {
-				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(clientRef, "accepted")),
-			};
-		} catch (error) {
-			return {
-				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(clientRef, "rejected", error)),
-			};
-		}
+	const sendSteer = async (text: string) => {
+		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
+		// control error instead of a false `accepted: true`.
+		await api.sendUserMessage(text, { deliverAs: "steer" });
+		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
 		const [provider, ...modelId] = id.split("/");
@@ -2442,7 +2549,7 @@ function sdkControlSurface(
 	} = {
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
-		steer: (text, clientRef) => sendSteer(text, clientRef),
+		steer: text => sendSteer(text),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
 			const requesterConnectionId = controlRequesterContext.getStore();
@@ -2514,9 +2621,8 @@ function sdkControlSurface(
 				throw Object.assign(new Error("The active action is already being answered."), { code: "action_claimed" });
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
-			if (
-				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
-			) {
+			const terminalProof = prepared.status === "retired" ? "retired" : (prepared.terminalProof ?? "not_published");
+			if (workflowGate.prepareTerminalization(id, terminalProof) !== true) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow gate lacks a terminalization proof."), { code: "resource_gone" });
 			}
@@ -2529,7 +2635,7 @@ function sdkControlSurface(
 					return resolution;
 				}
 			} catch (error) {
-				const outcome = reconcileDirectControlFailure(id);
+				const outcome = reconcileDirectControlFailure(workflowGate, id);
 				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
@@ -2538,7 +2644,7 @@ function sdkControlSurface(
 					});
 				throw error;
 			}
-			const outcome = reconcileDirectControlFailure(id);
+			const outcome = reconcileDirectControlFailure(workflowGate, id);
 			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
@@ -2586,9 +2692,8 @@ function sdkControlSurface(
 				throw Object.assign(new Error("The active action is already being answered."), { code: "action_claimed" });
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
-			if (
-				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
-			) {
+			const terminalProof = prepared.status === "retired" ? "retired" : (prepared.terminalProof ?? "not_published");
+			if (workflowGate.prepareTerminalization(id, terminalProof) !== true) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow plan lacks a terminalization proof."), { code: "resource_gone" });
 			}
@@ -2601,7 +2706,7 @@ function sdkControlSurface(
 					return resolution;
 				}
 			} catch (error) {
-				const outcome = reconcileDirectControlFailure(id);
+				const outcome = reconcileDirectControlFailure(workflowGate, id);
 				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
@@ -2610,7 +2715,7 @@ function sdkControlSurface(
 					});
 				throw error;
 			}
-			const outcome = reconcileDirectControlFailure(id);
+			const outcome = reconcileDirectControlFailure(workflowGate, id);
 			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
@@ -2693,7 +2798,7 @@ function sdkControlSurface(
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
 					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_end", finalText: lastAssistantText() });
+						void skillRecon.noteTransition(correlation, { type: "agent_end" });
 					}
 					return result;
 				},
@@ -2702,11 +2807,7 @@ function sdkControlSurface(
 						if (skillRecon) skillRecon.release(trimmedClientRef);
 						settleReject(error);
 					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, {
-							type: "agent_failed",
-							error,
-							finalText: lastAssistantText(),
-						});
+						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
 					}
 					throw error;
 				},
@@ -2844,7 +2945,7 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
-		installedOperations: installedOperations(ctx, "control"),
+		installedOperations: surfacePolicy.installedControls,
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
 	return surface;
@@ -3557,6 +3658,8 @@ export function createNotificationsExtension(
 		const sdkEnabledForSession =
 			(options.sdkHostModeSupported ?? true) && shouldHostSdk(settings, isNotificationEligibleContext(ctx));
 		const lifecycleRequired = lifecycleStartupCapability !== undefined;
+		/** The broker-issued readiness intent for this exact lifecycle-managed session. */
+		const lifecycleReadiness = lifecycleStartupCapability?.readiness ?? "immediate";
 		const failLifecycleStartup = (
 			reason: "disabled" | "ineligible" | "failed",
 			error?: unknown,
@@ -3629,6 +3732,7 @@ export function createNotificationsExtension(
 		const token = resolveToken();
 		let server: NotificationServer;
 		try {
+			const { NotificationServer, nativeBuildInfo } = sdkBusNatives();
 			assertNativeRuntimeCompatibility({
 				runtimeVersion: VERSION,
 				nativeVersion: nativeBuildInfo().version,
@@ -3640,6 +3744,7 @@ export function createNotificationsExtension(
 			throw error;
 		}
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? true, tag);
+		gatePresentations.setPublicationSuspended(true);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
@@ -3654,7 +3759,19 @@ export function createNotificationsExtension(
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
+		let sdkRuntime: SessionSdkSessionRuntime | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
+		let disposePermissionAnswerSource: (() => void) | undefined;
+		let permissionCapabilityActive = false;
+		const installPermissionAnswerSource = () => {
+			if (disposeUiAnswerSource || disposePermissionAnswerSource) return;
+			disposePermissionAnswerSource = registerAskAnswerSource(
+				id,
+				createSdkPermissionAskAnswerSource(
+					async (params, signal) => await host!.reverse.request("permission", "request", params, signal),
+				),
+			);
+		};
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
@@ -3682,6 +3799,11 @@ export function createNotificationsExtension(
 						};
 					throw new Error("permission provider returned an invalid response");
 				});
+				permissionCapabilityActive = true;
+				// Clients without ACP form elicitation (e.g. Paseo) still surface
+				// workflow-gate asks through the permission channel; a client that
+				// advertises `elicitation.form` keeps the richer `ui` source instead.
+				installPermissionAnswerSource();
 				return;
 			}
 			if (capability === "ui") {
@@ -3692,6 +3814,8 @@ export function createNotificationsExtension(
 						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
 					),
 				);
+				disposePermissionAnswerSource?.();
+				disposePermissionAnswerSource = undefined;
 				return;
 			}
 			if (capability !== "fs") return;
@@ -3728,11 +3852,19 @@ export function createNotificationsExtension(
 			ctx.setSdkClientBridge?.(bridge);
 		};
 		const removeProviderDefinitions = (capability: string) => {
-			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
+			if (capability === "permission") {
+				ctx.setSdkPermissionProvider?.(undefined);
+				permissionCapabilityActive = false;
+				disposePermissionAnswerSource?.();
+				disposePermissionAnswerSource = undefined;
+			}
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 			if (capability === "ui") {
 				disposeUiAnswerSource?.();
 				disposeUiAnswerSource = undefined;
+				// The permission lease may still be live; restore its ask source so
+				// later headless asks keep an ACP answer channel.
+				if (permissionCapabilityActive) installPermissionAnswerSource();
 			}
 		};
 
@@ -4079,13 +4211,12 @@ export function createNotificationsExtension(
 			options: { fence?: boolean } = {},
 			extra?: { finalText?: string; error?: { code: string; message: string } },
 		) => {
-			const receiptState = extra?.finalText?.trim() ? "present" : "missing";
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
 			submission.phase = "outcome_claimed";
 			let winner: SdkPromptTerminalOutcome;
 			try {
-				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome, receiptState);
+				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome);
 			} catch (error) {
 				// The claim is the durability boundary: without it nothing may be published
 				// and the endpoint must fail closed so the client rejects exactly once. The
@@ -4226,7 +4357,6 @@ export function createNotificationsExtension(
 				configOverrides,
 				lookupPromptStatus,
 				selector => kindReconciliation.lookup("skill", selector),
-				clientRef => kindReconciliation.lookupSteer(clientRef),
 			),
 			id,
 			revisions,
@@ -4270,8 +4400,6 @@ export function createNotificationsExtension(
 					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
 				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
 				lookup: selector => kindReconciliation.lookup("skill", selector),
-				reserveSteer: kindReconciliation.reserveSteer,
-				settleSteer: kindReconciliation.settleSteer,
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
@@ -4324,20 +4452,85 @@ export function createNotificationsExtension(
 			}
 		};
 
-		host = new SessionSdkHost({
-			sessionId: id,
-			stateRoot,
-			token,
-			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
+		/**
+		 * Existing-thread preparation.
+		 *
+		 * A prepared session withholds its readiness signal so
+		 * `gjc notify bind-thread` can adopt an operator-supplied Slack root before
+		 * any stock root is published; activation then publishes readiness once and
+		 * the daemon adopts that root.
+		 *
+		 * Preparation has exactly two authorities, and they never overlap. A
+		 * broker lifecycle-managed session is prepared only by the broker-issued,
+		 * session-scoped readiness intent on its launch request, which the
+		 * lifecycle wait completes on the prepared signal instead of readiness. A
+		 * manual/source session keeps the explicit `GJC_NOTIFY_BIND_EXISTING_THREAD`
+		 * opt-in, which is refused for lifecycle-managed sessions so an inherited
+		 * process-global flag can never silently defer a broker-created session.
+		 *
+		 * The activation gate is the existing-thread bind authority itself: it
+		 * proves a daemon-owned mapping exists at this exact endpoint generation,
+		 * so activation before a binding fails closed with no grace period. It can
+		 * only be built from a configured, enabled Slack target plus the agent
+		 * directory holding that mapping, so a preparation request that cannot
+		 * produce one has no bind authority at all and is refused here. Degrading
+		 * such a request to ordinary immediate readiness would answer "prepare" with
+		 * a session that publishes its own root anyway, and preparing without the
+		 * gate would hand back a prepared session that activates with no binding.
+		 */
+		const preparationAgentDir = settings?.getAgentDir?.();
+		const slackBindTarget =
+			notificationsEnabledForSession && isSlackComplete(cfg)
+				? { teamId: cfg.slack.workspaceId, channelId: cfg.slack.channelId }
+				: undefined;
+		const envRequestsPreparation = isExistingThreadBindingRequested(process.env);
+		if (envRequestsPreparation && lifecycleRequired)
+			return failLifecycleStartup(
+				"failed",
+				`${EXISTING_THREAD_BIND_ENV}=1 is not supported for broker lifecycle-managed sessions; use the broker readiness intent.`,
+			);
+		const preparesExistingThread = lifecycleRequired ? lifecycleReadiness === "deferred" : envRequestsPreparation;
+		const activationGate =
+			preparesExistingThread && preparationAgentDir && slackBindTarget
+				? createSlackBindingActivationGate({
+						store: new ConversationStore<SlackConversation>({ agentDir: preparationAgentDir, kind: "slack" }),
+						teamId: slackBindTarget.teamId,
+						channelId: slackBindTarget.channelId,
+					})
+				: undefined;
+		if (preparesExistingThread && !activationGate) {
+			const missing = slackBindTarget
+				? "an agent directory"
+				: "a configured Slack notification target for this session";
+			if (lifecycleRequired)
+				return failLifecycleStartup(
+					"failed",
+					`Existing-thread preparation requires ${missing} to prove the existing-thread binding.`,
+				);
+			throw new Error(`${EXISTING_THREAD_BIND_ENV}=1 requires ${missing} to prove the existing-thread binding.`);
+		}
+
+		sdkRuntime = new SessionSdkSessionRuntime({
+			transport: {
+				sessionId: id,
+				stateRoot,
+				token,
+				sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
+				onFrame: handler => {
+					inboundSdkFrame = handler as (connectionId: string, frame: SdkFrame) => void;
+					return () => {
+						inboundSdkFrame = undefined;
+					};
+				},
+				start: async () => await server.start(),
+				stop: async () => await server.stopAndWait(),
+				broadcastFrame: frame => server.pushFrame(JSON.stringify(frame)),
+			},
+			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
+			...(activationGate ? { activationGate } : {}),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
-			onFrame: handler => {
-				inboundSdkFrame = handler;
-				return () => {
-					inboundSdkFrame = undefined;
-				};
-			},
 			onRequest: options.onSdkRequest,
 			beforeControlResponse: async (_connectionId, request, response, sendTerminal) => {
 				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
@@ -4500,6 +4693,7 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		host = sdkRuntime.host;
 
 		// Install the runtime before either transport can expose the host. session_start
 		// is deliberately fire-and-forget, so agent lifecycle events and direct v3
@@ -4544,6 +4738,7 @@ export function createNotificationsExtension(
 			verbosity: "lean",
 			stream: false,
 			policyGeneration: 0,
+			workflowGatePublicationEpoch: 0,
 			sessionTag: tag,
 			busy: false,
 			pendingPromptCorrelations,
@@ -4563,7 +4758,6 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
-			deferredGatePresentations: [],
 			deferredInboundControls: [],
 			notificationRootRegistration: undefined,
 		};
@@ -4630,13 +4824,32 @@ export function createNotificationsExtension(
 				server.sendTo(connectionId, JSON.stringify({ type: responseType, id, ok: false, error }));
 			} catch {}
 		};
+		const sendMalformed = (connectionId: string, message: string): void => {
+			try {
+				server.sendTo(
+					connectionId,
+					JSON.stringify({ type: "protocol_error", ok: false, error: { code: "invalid_frame", message } }),
+				);
+			} catch {}
+		};
 		try {
 			server.onSdkFrame((err, inbound) => {
-				if (err || !inbound) return;
+				if (err) {
+					if (inbound?.connectionId) sendMalformed(inbound.connectionId, err.message);
+					return;
+				}
+				if (!inbound) return;
 				try {
 					const frame = JSON.parse(inbound.json) as unknown;
-					if (!frame || typeof frame !== "object") return;
+					if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+						sendMalformed(inbound.connectionId, "SDK frame must be a JSON object.");
+						return;
+					}
 					const typedFrame = frame as Record<string, unknown>;
+					if (typeof typedFrame.type !== "string" || typedFrame.type.length === 0) {
+						sendMalformed(inbound.connectionId, "SDK frame type must be a non-empty string.");
+						return;
+					}
 					if (inbound.connectionId && fencedConnections.has(inbound.connectionId)) {
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
@@ -4654,7 +4867,12 @@ export function createNotificationsExtension(
 						);
 					}
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
-				} catch {}
+				} catch (error) {
+					sendMalformed(
+						inbound.connectionId,
+						error instanceof SyntaxError ? "SDK frame is not valid JSON." : String(error),
+					);
+				}
 			});
 			// Required: the negotiated-capability callback is how the TS host learns
 			// each connection's caps for replay-frame gating. If the linked
@@ -5087,7 +5305,7 @@ export function createNotificationsExtension(
 				}
 			});
 
-			await host.start();
+			await sdkRuntime.startHost();
 			lifecycleStartupCapability?.rollback?.recordGeneration(host.generation);
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
@@ -5136,7 +5354,7 @@ export function createNotificationsExtension(
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
-			const endpoint = await server.start();
+			const endpoint = await sdkRuntime.startTransport();
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
 				endpointDigest: endpointAuthorityDigest(endpoint.url, token),
@@ -5259,6 +5477,7 @@ export function createNotificationsExtension(
 			// Attach dynamically so the SDK bus presents every durable gate.
 			const attachWorkflowGate = (gate: WorkflowGateEmitter | undefined): void => {
 				if (activeRuntime.workflowGate === gate) return;
+				const sourceEpoch = ++activeRuntime.workflowGatePublicationEpoch;
 				activeRuntime.disposeGateListener();
 				activeRuntime.workflowGate?.setRuntimeTurnProvider?.(null);
 				activeRuntime.disposeAckRecoveryParticipant();
@@ -5273,6 +5492,8 @@ export function createNotificationsExtension(
 				}
 				activeRuntime.workflowGate = gate;
 				gate.setRuntimeTurnProvider?.(() => activeRuntime.activePromptCorrelation?.turnId);
+				const isCurrentSource = (): boolean =>
+					activeRuntime.workflowGate === gate && activeRuntime.workflowGatePublicationEpoch === sourceEpoch;
 				if (hasTerminalArbitrationCapability(gate)) {
 					const controller: WorkflowGateTerminalController = {
 						completeGateInteractions: gateId => gatePresentations.complete(gateId),
@@ -5289,6 +5510,7 @@ export function createNotificationsExtension(
 						? Gate
 						: never,
 				): void => {
+					if (!isCurrentSource()) return;
 					const rawGateOptions = g.options ?? [];
 					const options = rawGateOptions.map(o => String((o as { label?: unknown }).label ?? ""));
 					const recommendedIndex = recommendedIndexFromGateOptions(rawGateOptions);
@@ -5301,25 +5523,27 @@ export function createNotificationsExtension(
 						typeof g.context?.stage_state === "object" && g.context.stage_state !== null
 							? (g.context.stage_state as Record<string, unknown>)
 							: {};
-					gatePresentations.retain({
-						gateId: g.gate_id,
-						workflowGateId: g.gate_id,
-						sessionId: id,
-						question,
-						options,
-						...(recommendedIndex === undefined ? {} : { recommendedIndex }),
-						controls: [],
-						multi: stageState.multi === true,
-						allowEmpty: stageState.allow_empty === true,
-						navigationLabel: stageState.navigation_label === "Next" ? "Next" : "Done",
-						selectedOptions: [],
-					});
+					gatePresentations.retain(
+						{
+							gateId: g.gate_id,
+							workflowGateId: g.gate_id,
+							sessionId: id,
+							question,
+							options,
+							...(recommendedIndex === undefined ? {} : { recommendedIndex }),
+							controls: [],
+							multi: stageState.multi === true,
+							allowEmpty: stageState.allow_empty === true,
+							navigationLabel: stageState.navigation_label === "Next" ? "Next" : "Done",
+							selectedOptions: [],
+						},
+						{
+							publish: !activeRuntime.policySuspended,
+							sourceEpoch,
+						},
+					);
 				};
 				activeRuntime.disposeGateListener = gate.onGateEmitted(g => {
-					if (activeRuntime.policySuspended) {
-						activeRuntime.deferredGatePresentations.push(() => presentGate(g));
-						return;
-					}
 					presentGate(g);
 				});
 				if (gate.setAckRecoveryParticipant) {
@@ -5413,6 +5637,7 @@ export function createNotificationsExtension(
 			if (policy.mode === "provisional") {
 				runtime.policyGeneration++;
 				runtime.policySuspended = true;
+				runtime.gatePresentations?.setPublicationSuspended(true);
 				runtime.redact = true;
 				runtime.verbosity = "lean";
 				runtime.stream = false;
@@ -5438,9 +5663,13 @@ export function createNotificationsExtension(
 		activate: binding => {
 			const runtime = runtimes.get(binding.sessionId);
 			if (!runtime || runtime.stopping) return;
+			// Activation is only valid after the controller commits a stable policy;
+			// never expose deferred presentations while provisional policy is held.
+			if (runtime.policySuspended) return;
 			runtime.enableNotifications();
+			runtime.gatePresentations?.setPublicationSuspended(false);
+			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
-			for (const present of runtime.deferredGatePresentations.splice(0)) present();
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		ensureTelegramDaemon: async binding => {
@@ -5814,9 +6043,16 @@ export function createNotificationsExtension(
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
-		const correlation = rt.pendingPromptCorrelations.shift();
+		// A continuation re-enters the agent loop inside the same prompt and emits
+		// another `agent_start`. Shifting again would pop nothing and clobber the
+		// live correlation with `undefined`, so the prompt's `agent_end` could no
+		// longer be terminalized and the caller would hang until the deadline.
+		// Only claim the next pending correlation when this session has no active one.
+		const correlation = rt.activePromptCorrelation ?? rt.pendingPromptCorrelations.shift();
+		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
-		if (correlation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
+		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
+		if (continuation) return;
 		rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {

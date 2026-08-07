@@ -139,7 +139,7 @@ function invoke(
 		case "turn.prompt":
 			return surface.prompt(text(input), input.images, input.clientRef as string | undefined);
 		case "turn.steer":
-			return surface.steer(text(input), typeof input.clientRef === "string" ? input.clientRef : undefined);
+			return surface.steer(text(input));
 		case "turn.follow_up":
 			return surface.followUp(text(input));
 		case "turn.abort":
