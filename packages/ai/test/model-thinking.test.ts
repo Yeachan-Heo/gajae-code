@@ -532,7 +532,7 @@ describe("generated model policies", () => {
 		}
 	});
 
-	it("caps only Codex product GPT-5.6 tiers at the 272K prompt budget", () => {
+	it("forces only Codex product GPT-5.6 tiers to the 372K prompt budget", () => {
 		const models: Model<Api>[] = [
 			{
 				...createModel({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
@@ -558,9 +558,26 @@ describe("generated model policies", () => {
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models.map(model => model.contextWindow)).toEqual([272_000, 1_050_000, 200_000, 272_000]);
+		expect(models.map(model => model.contextWindow)).toEqual([372_000, 1_050_000, 372_000, 272_000]);
 		expect(models[0]?.applyPatchToolType).toBe("freeform");
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
+	});
+
+	it("forces every GPT-5.6 tier id to 372K through generated policies regardless of observation", () => {
+		const models: Model<Api>[] = [];
+		for (const id of ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const) {
+			for (const contextWindow of [200_000, 272_000, 373_000, 1_050_000]) {
+				models.push({
+					...createModel({ id, api: "openai-codex-responses", provider: "openai-codex" }),
+					contextWindow,
+					maxTokens: 128000,
+				});
+			}
+		}
+		applyGeneratedModelPolicies(models);
+		for (const model of models) {
+			expect(model.contextWindow).toBe(372_000);
+		}
 	});
 });
 

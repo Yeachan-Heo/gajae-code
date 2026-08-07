@@ -1212,6 +1212,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");
 	});
+	test("clean core changes select the clean script test alongside root tooling fallback", () => {
+		const keys = targeted(["scripts/clean-core.ts"]).map(task => task.key);
+		expect(keys).toContain("test:scripts/clean.test.ts");
+		expect(keys).toContain("root-check");
+	});
 	test("cache-eval evidence artifact adds its focused AI test without bypassing root fallback coverage", () => {
 		const tasks = targeted(["artifacts/architecture-2383-eval.json"]);
 		expect(tasks.map(task => task.key)).toEqual([
