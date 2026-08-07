@@ -219,7 +219,7 @@ export interface InvocationCorrelation {
 	turnId: string;
 }
 
-export type InvocationKind = "prompt" | "skill";
+export type InvocationKind = "prompt" | "skill" | "steer";
 type InvocationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
 interface InvocationRecord extends InvocationCorrelation {
 	kind: InvocationKind;
@@ -254,6 +254,7 @@ function createInvocationReconciliation(
 	const reservationCounts = new Map<InvocationKind, number>([
 		["prompt", 0],
 		["skill", 0],
+		["steer", 0],
 	]);
 	const key = (kind: InvocationKind, correlation: InvocationCorrelation) =>
 		`${kind}:${correlation.commandId}:${correlation.turnId}`;
@@ -431,6 +432,7 @@ export interface SdkSurfaceFactoryOptions {
 	configOverrides?: ReadonlyMap<string, unknown>;
 	promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+	steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
 }
 
@@ -453,6 +455,7 @@ function createQuerySurface(
 		configOverrides?: ReadonlyMap<string, unknown>;
 		promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
 	} = {},
 ): SessionSurface {
@@ -575,6 +578,8 @@ function createQuerySurface(
 			(options.promptStatusLookup ?? (value => reconciliation.lookup("prompt", value)))(selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			(options.skillStatusLookup ?? (value => reconciliation.lookup("skill", value)))(selector),
+		getSteerStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
+			(options.steerStatusLookup ?? (value => reconciliation.lookup("steer", value)))(selector),
 		getModelProfiles: () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
 			const providers = new Set([...profiles.values()].flatMap(profile => profile.requiredProviders));
@@ -700,7 +705,8 @@ function createControlSurface(
 			void submission.then(
 				() => {
 					if (settled) {
-						if (kind === "skill") void reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
+						if (kind === "skill" || kind === "steer")
+							void reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
 						return;
 					}
 					if (allowCompletionFallback) {
@@ -716,7 +722,7 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
-						if (kind === "skill")
+						if (kind === "skill" || kind === "steer")
 							void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 						return;
 					}
@@ -744,10 +750,17 @@ function createControlSurface(
 					options,
 				),
 			),
-		steer: async text => {
-			await api.sendUserMessage(text, { deliverAs: "steer" });
-			return { commandId: crypto.randomUUID(), accepted: true };
-		},
+		steer: async (text, clientRef) =>
+			submit(
+				"steer",
+				clientRef,
+				async options => {
+					await options.onPreflightAcceptCommit();
+					await api.sendUserMessage(text, { deliverAs: "steer" });
+				},
+				undefined,
+				true,
+			),
 		followUp: async text =>
 			submit("prompt", undefined, options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" })),
 		abort: () => {
@@ -942,6 +955,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			promptStatusLookup: selector => reconciliation.lookup("prompt", selector),
 			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
+			steerStatusLookup: selector => reconciliation.lookup("steer", selector),
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const controlSurface = createControlSurface(
