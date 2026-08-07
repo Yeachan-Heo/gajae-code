@@ -99,6 +99,7 @@ export class AtomicYamlReplaceError extends Error {
 		readonly configPath: string,
 		readonly attempts: number,
 		readonly cause: unknown,
+		readonly preserveTempPath = false,
 	) {
 		super(`Failed to atomically replace ${configPath} after ${attempts} rename attempts.`);
 		this.name = "AtomicYamlReplaceError";
@@ -367,16 +368,28 @@ async function replaceWithExpectedIdentity(
 	// `exactReplacePath` validates both identities inside one native atomic
 	// namespace exchange. A save after the snapshots therefore rejects the
 	// exchange without replacing the editor's newer destination.
-	const replaced = options.exactReplace
+	const replaced: NativeExactUnlinkResult = options.exactReplace
 		? await options.exactReplace(tempPath, configPath, source, destination)
-		: await runNativeAtomicYamlWorker({
+		: ((await runNativeAtomicYamlWorker({
 				operation: "exact-replace",
 				sourcePath: tempPath,
 				destinationPath: configPath,
 				expectedSource: source,
 				expectedDestination: destination,
-			});
+			})) as NativeExactUnlinkResult);
 	if (replaced.ok) return;
+	// A retained successor proves the namespace exchange published the staged
+	// document. It may still report a post-exchange verification or durability
+	// failure, so this is not a CAS rejection and the detached temp-path object
+	// must be retained for native recovery rather than unlinked by the caller.
+	if (replaced.retainedSuccessorPath) {
+		throw new AtomicYamlReplaceError(
+			configPath,
+			1,
+			new Error(`native exact replacement completed with retained recovery paths: ${replaced.code ?? "unknown"}`),
+			true,
+		);
+	}
 	if (replaced.code === "identity_mismatch") {
 		const actual = await currentRawOrEmpty(configPath);
 		throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update(actual).digest("hex"));
@@ -430,6 +443,7 @@ async function writeAtomicYaml(
 ): Promise<string> {
 	const directory = path.dirname(configPath);
 	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${randomUUID()}.tmp`);
+	let preserveTempPath = false;
 	try {
 		const tempHandle = await fs.open(tempPath, "wx", 0o600);
 		try {
@@ -456,10 +470,15 @@ async function writeAtomicYaml(
 				);
 			}
 		}
-		await replaceWithRetry(tempPath, configPath, options, expectedRaw);
+		try {
+			await replaceWithRetry(tempPath, configPath, options, expectedRaw);
+		} catch (error) {
+			preserveTempPath = error instanceof AtomicYamlReplaceError && error.preserveTempPath;
+			throw error;
+		}
 		await syncParentDirectory(directory);
 	} finally {
-		await fs.rm(tempPath, { force: true }).catch(() => undefined);
+		if (!preserveTempPath) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
 	return YAML.stringify(value, null, 2);
 }

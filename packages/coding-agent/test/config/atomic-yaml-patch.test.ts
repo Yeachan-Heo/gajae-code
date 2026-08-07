@@ -272,4 +272,33 @@ describe("atomic YAML patches", () => {
 		expect(await readYaml(configPath)).toEqual({ durable: { value: "edited" } });
 		expect((await fs.readdir(path.dirname(configPath))).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
 	});
+
+	test("retains recovery state after a post-exchange native failure", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, YAML.stringify({ durable: { value: "old" } }, null, 2));
+
+		await expect(
+			withAtomicYamlConfigTransaction(configPath, async tx => {
+				await tx.applyPatches([{ path: "durable.value", op: "set", value: "new" }], {
+					exactReplace: async (sourcePath, destinationPath) => {
+						// Model an exchange that published the successor but left the
+						// predecessor at the staged path for recovery.
+						const predecessorPath = `${sourcePath}.predecessor`;
+						await fs.rename(destinationPath, predecessorPath);
+						await fs.rename(sourcePath, destinationPath);
+						await fs.rename(predecessorPath, sourcePath);
+						return {
+							ok: false,
+							code: "durability_failed",
+							retainedSuccessorPath: destinationPath,
+							detachedPath: sourcePath,
+						};
+					},
+				});
+			}),
+		).rejects.toBeInstanceOf(AtomicYamlReplaceError);
+
+		expect(await readYaml(configPath)).toEqual({ durable: { value: "new" } });
+		expect((await fs.readdir(path.dirname(configPath))).filter(entry => entry.endsWith(".tmp"))).toHaveLength(1);
+	});
 });
