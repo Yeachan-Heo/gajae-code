@@ -1877,6 +1877,25 @@ export class Editor implements Component, Focusable {
 		this.#exitHistoryForEditing();
 		this.#insertTextAtCursor(text);
 	}
+	/**
+	 * Delete an exact text run immediately before the cursor as one edit.
+	 * Returns false without changing the document when the text is not present.
+	 */
+	deleteTextBeforeCursor(text: string): boolean {
+		if (text.length === 0 || this.#state.cursorCol < text.length) return false;
+
+		const line = this.#state.lines[this.#state.cursorLine] || "";
+		const startCol = this.#state.cursorCol - text.length;
+		if (line.slice(startCol, this.#state.cursorCol) !== text) return false;
+
+		this.#exitHistoryForEditing();
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.#state.lines[this.#state.cursorLine] = line.slice(0, startCol) + line.slice(this.#state.cursorCol);
+		this.#setCursorCol(startCol);
+		this.#notifyBackwardDelete();
+		return true;
+	}
 
 	// All the editor methods from before...
 	#insertCharacter(char: string): void {
@@ -2129,6 +2148,10 @@ export class Editor implements Component, Focusable {
 			this.#setCursorCol(previousLine.length);
 		}
 
+		this.#notifyBackwardDelete();
+	}
+
+	#notifyBackwardDelete(): void {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}

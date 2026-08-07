@@ -50,6 +50,9 @@ type FakeEditor = {
 	setText(text: string): void;
 	getText(): string;
 	insertText(text: string): void;
+	getLines(): string[];
+	getCursor(): { line: number; col: number };
+	deleteTextBeforeCursor(text: string): boolean;
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => boolean | undefined): void;
@@ -71,6 +74,7 @@ async function createContext(options?: {
 		"app.irc.sidebar.toggle": options?.ircSidebarToggleKeys ?? ["alt+i"],
 		"tui.select.confirm": ["enter"],
 		"tui.select.cancel": ["escape"],
+		"tui.editor.deleteCharBackward": ["backspace"],
 	};
 
 	const setActionKeys = vi.fn();
@@ -149,6 +153,19 @@ async function createContext(options?: {
 		},
 		getText() {
 			return editorText;
+		},
+		getLines() {
+			return editorText.split("\n");
+		},
+		getCursor() {
+			const lines = editorText.split("\n");
+			return { line: lines.length - 1, col: lines.at(-1)?.length ?? 0 };
+		},
+		deleteTextBeforeCursor(text: string) {
+			if (!editorText.endsWith(text)) return false;
+			editorText = editorText.slice(0, -text.length);
+			editor.onChange?.(editorText);
+			return true;
 		},
 		insertText(text: string) {
 			editorText += text;
@@ -789,6 +806,52 @@ describe("InputController keybinding setup", () => {
 			images: undefined,
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+	it("deletes an attached image placeholder atomically and restores its attachment on undo", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "image",
+			mimeType: "image/png",
+		};
+		const editor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = editor;
+		ctx.pendingImages = [image];
+		editor.setText("describe [image 1]");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		editor.handleInput("\x7f");
+
+		expect(editor.getText()).toBe("describe ");
+		expect(ctx.pendingImages).toEqual([]);
+
+		editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+		expect(editor.getText()).toBe("describe [image 1]");
+		expect(ctx.pendingImages).toEqual([image]);
+
+		await editor.onSubmit?.(editor.getText());
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe [image 1]",
+			images: [image],
+		});
+	});
+
+	it("leaves ordinary Backspace handling to the editor", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		ctx.pendingImages = [{ type: "image", data: "image", mimeType: "image/png" }];
+		editor.setText("describe image");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "backspace",
+		);
+		const handler = registration?.[1] as (() => boolean) | undefined;
+
+		expect(handler?.()).toBe(false);
+		expect(editor.getText()).toBe("describe image");
 	});
 	it("omits pasted image attachments when their placeholders were deleted", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();

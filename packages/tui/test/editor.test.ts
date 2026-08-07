@@ -776,6 +776,28 @@ describe("Editor component", () => {
 			}
 		});
 
+		it("deletes an exact text run before the cursor as one undoable edit", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 1] after");
+			for (let index = 0; index < " after".length; index++) {
+				editor.handleInput("\x1b[D");
+			}
+
+			expect(editor.deleteTextBeforeCursor("[image 1]")).toBe(true);
+			expect(editor.getText()).toBe("before  after");
+			expect(editor.getCursor()).toEqual({ line: 0, col: "before ".length });
+
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe("before [image 1] after");
+		});
+
+		it("does not delete when the exact text is absent before the cursor", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 2]");
+
+			expect(editor.deleteTextBeforeCursor("[image 1]")).toBe(false);
+			expect(editor.getText()).toBe("before [image 2]");
+		});
 		it("deletes single-code-unit unicode characters (umlauts) with Backspace", () => {
 			const editor = new Editor(defaultEditorTheme);
 

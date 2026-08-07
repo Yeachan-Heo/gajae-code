@@ -52,6 +52,7 @@ const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
+const IMAGE_PLACEHOLDER_BEFORE_CURSOR_PATTERN = /\[image ([1-9]\d*)\]$/;
 
 interface InputControllerDependencies {
 	loadPastedImageBatch?: typeof loadPastedImageBatch;
@@ -64,6 +65,11 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	#imagePlaceholderDeletionUndo?: {
+		beforeText: string;
+		afterText: string;
+		pendingImages: InteractiveModeContext["pendingImages"];
+	};
 
 	constructor(
 		private ctx: InteractiveModeContext,
@@ -638,6 +644,12 @@ export class InputController {
 		};
 
 		this.ctx.editor.clearCustomKeyHandlers();
+		for (const key of new Set([
+			...this.ctx.keybindings.getKeys("tui.editor.deleteCharBackward"),
+			"shift+backspace" as const,
+		])) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.#deleteImagePlaceholderBeforeCursor());
+		}
 		// Wire up extension shortcuts
 		this.registerExtensionShortcuts();
 
@@ -754,6 +766,7 @@ export class InputController {
 			this.ctx.isBashMode = trimmed.startsWith("!");
 			this.ctx.isBashNoContext = trimmed.startsWith("!!");
 			this.ctx.isPythonMode = trimmed.startsWith("$") && !trimmed.startsWith("${");
+			this.#restorePendingImagesAfterPlaceholderUndo(text);
 			this.#clearPendingImagesIfPlaceholdersRemoved(text);
 			if (
 				wasBashMode !== this.ctx.isBashMode ||
@@ -770,6 +783,7 @@ export class InputController {
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
+		this.#imagePlaceholderDeletionUndo = undefined;
 		text = text.trim();
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 		if (this.ctx.hasActiveBtw()) {
@@ -1711,6 +1725,45 @@ export class InputController {
 				imagePaths.length === 1 ? "Failed to attach pasted image" : "Failed to attach pasted images",
 			);
 			return false;
+		}
+	}
+
+	#deleteImagePlaceholderBeforeCursor(): boolean {
+		if (this.ctx.pendingImages.length === 0) return false;
+
+		const { line, col } = this.ctx.editor.getCursor();
+		const currentLine = this.ctx.editor.getLines()[line] ?? "";
+		const match = currentLine.slice(0, col).match(IMAGE_PLACEHOLDER_BEFORE_CURSOR_PATTERN);
+		const placeholderNumberText = match?.[1];
+		if (!match || !placeholderNumberText) return false;
+
+		const imageIndex = Number.parseInt(placeholderNumberText, 10) - 1;
+		if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length) return false;
+
+		const beforeText = this.ctx.editor.getText();
+		const pendingImages = this.ctx.pendingImages;
+		const deleted = this.ctx.editor.deleteTextBeforeCursor(match[0]);
+		if (deleted) {
+			this.#imagePlaceholderDeletionUndo = {
+				beforeText,
+				afterText: this.ctx.editor.getText(),
+				pendingImages,
+			};
+		}
+		return deleted;
+	}
+
+	#restorePendingImagesAfterPlaceholderUndo(text: string): void {
+		const deletion = this.#imagePlaceholderDeletionUndo;
+		if (!deletion) return;
+
+		if (text === deletion.beforeText) {
+			if (this.ctx.pendingImages.length === 0) {
+				this.ctx.pendingImages = deletion.pendingImages;
+			}
+			this.#imagePlaceholderDeletionUndo = undefined;
+		} else if (text !== deletion.afterText) {
+			this.#imagePlaceholderDeletionUndo = undefined;
 		}
 	}
 
