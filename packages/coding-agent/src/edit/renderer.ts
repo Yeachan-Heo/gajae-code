@@ -412,10 +412,12 @@ function resolveCompletedEditIdentity(
 	args: EditRenderArgs | undefined,
 	editMode: EditMode | undefined,
 	isPartial: boolean,
+
 ): { path: string; op: Operation | undefined; move: string | undefined; firstChangedLine: number | undefined } {
 	const firstEdit = args?.edits?.[0];
 	const inventory = getEditRequestTargetInventory(args, editMode, { isPartial });
 	const detailsPath = details && "path" in details ? details.path : undefined;
+
 	return {
 		path: detailsPath ?? args?.file_path ?? args?.path ?? firstEdit?.path ?? inventory.paths[0] ?? "",
 		op: details?.op ?? args?.op ?? firstEdit?.op,
