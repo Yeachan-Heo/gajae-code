@@ -159,6 +159,52 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 	}
 }
 
+/**
+ * JetBrains AI (Junie) is not published on models.dev and exposes no model-list
+ * endpoint, so its catalog is declared statically. Model ids, the Anthropic
+ * Messages transport, adaptive thinking and the `x-llm-model: anthropic` routing
+ * header were captured from Junie CLI 2470.4 traffic against the documented
+ * Ingrazzio gateway.
+ */
+export const JETBRAINS_JUNIE_BASE_URL = "https://ingrazzio-cloud-prod.labs.jb.gg";
+
+const JETBRAINS_JUNIE_HEADERS: Record<string, string> = {
+	"X-LLM-Model": "anthropic",
+	"X-Keep-Path": "true",
+};
+
+export function injectJetBrainsJunieModels(models: Model[]): void {
+	const junieModels: Model<"anthropic-messages">[] = [
+		{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
+		{ id: "claude-sonnet-5", name: "Claude Sonnet 5 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
+		{ id: "claude-opus-4-8", name: "Claude Opus 4.8 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
+		{ id: "claude-opus-5", name: "Claude Opus 5 (Junie)", contextWindow: 200_000, maxTokens: 64_000 },
+	].map(({ id, name, contextWindow, maxTokens }) => ({
+		id,
+		name,
+		api: "anthropic-messages",
+		provider: "jetbrains-junie",
+		baseUrl: JETBRAINS_JUNIE_BASE_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		// JetBrains bills these through a JetBrains AI subscription, not per token.
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow,
+		maxTokens,
+		// `applyGeneratedModelPolicies` derives the adaptive thinking config from the model id.
+		headers: JETBRAINS_JUNIE_HEADERS,
+	}));
+
+	for (const metadata of junieModels) {
+		const existing = models.find(model => model.provider === "jetbrains-junie" && model.id === metadata.id);
+		if (existing) {
+			Object.assign(existing, metadata);
+		} else {
+			models.push(metadata);
+		}
+	}
+}
+
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
 		const value = $env[envVar as keyof typeof $env];
@@ -546,6 +592,7 @@ async function generateModels() {
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyClaudeOpusVisionCorrections(allModels);
 	injectAlibabaTokenPlanModels(allModels);
+	injectJetBrainsJunieModels(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);
 	injectImageGenerationModels(allModels);

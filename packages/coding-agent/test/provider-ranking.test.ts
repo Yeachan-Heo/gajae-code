@@ -117,6 +117,7 @@ describe("famous provider list", () => {
 			"bizrouter",
 			"mara",
 			"github-copilot",
+			"jetbrains-junie",
 			"cursor",
 		];
 		expect([...FAMOUS_PROVIDER_ORDER]).toEqual(agreedOrder);

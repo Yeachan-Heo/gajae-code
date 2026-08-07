@@ -54,6 +54,7 @@ Environment Variables:
   KILO_API_KEY               - Kilo Gateway models
   MISTRAL_API_KEY            - Mistral models
   ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
+  JUNIE_API_KEY              - JetBrains AI models (Junie; Claude via JetBrains AI)
   MINIMAX_API_KEY            - MiniMax models
   OPENCODE_API_KEY           - OpenCode Zen/OpenCode Go models
   CURSOR_ACCESS_TOKEN        - Cursor AI models

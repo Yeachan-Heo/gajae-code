@@ -4,6 +4,7 @@
 ### Added
 
 - Added opt-in `compat.supportsResponsesSessionAffinity` for OpenAI Responses custom relays. When enabled, supported `openai-responses` models may send `session_id` and `x-client-request-id` affinity headers to a custom endpoint; canonical OpenAI routing remains automatic and known non-OpenAI provider IDs remain excluded.
+- Added the `jetbrains-junie` provider, serving JetBrains-hosted Claude models (`claude-sonnet-4-6` default, `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-5`) over the documented Ingrazzio gateway `https://ingrazzio-cloud-prod.labs.jb.gg` with the Anthropic Messages transport (#3626). Auth is the officially documented `JUNIE_API_KEY` access token only — no OAuth login flow and no reverse-engineered client credentials. JetBrains AI rejects requests carrying `x-api-key`, so the provider passes `apiKey: null` to the Anthropic SDK and relies solely on the `Authorization: Bearer` header that `buildAnthropicHeaders` already emits for non-Anthropic hosts. Model ids, the `/v1/messages` route, the `X-LLM-Model: anthropic` routing header and adaptive thinking were captured from Junie CLI 2470.4 traffic against that gateway; the catalog is declared statically because JetBrains AI is absent from models.dev and exposes no model-list endpoint.
 
 ### Fixed
 

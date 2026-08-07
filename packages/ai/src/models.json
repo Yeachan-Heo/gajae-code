@@ -13299,6 +13299,124 @@
 			}
 		}
 	},
+	"jetbrains-junie": {
+		"claude-opus-4-8": {
+			"id": "claude-opus-4-8",
+			"name": "Anthropic Opus 4.8 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-opus-5": {
+			"id": "claude-opus-5",
+			"name": "Anthropic Opus 5 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		},
+		"claude-sonnet-4-6": {
+			"id": "claude-sonnet-4-6",
+			"name": "Anthropic Sonnet 4.6 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"claude-sonnet-5": {
+			"id": "claude-sonnet-5",
+			"name": "Anthropic Sonnet 5 (Junie)",
+			"api": "anthropic-messages",
+			"provider": "jetbrains-junie",
+			"baseUrl": "https://ingrazzio-cloud-prod.labs.jb.gg",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"headers": {
+				"X-LLM-Model": "anthropic",
+				"X-Keep-Path": "true"
+			},
+			"thinking": {
+				"mode": "anthropic-adaptive",
+				"minLevel": "minimal",
+				"maxLevel": "max"
+			}
+		}
+	},
 	"kilo": {
 		"~anthropic/claude-fable-latest": {
 			"id": "~anthropic/claude-fable-latest",

@@ -283,6 +283,24 @@ providers:
     models:
       - id: glm-4.6
 ```
+
+### JetBrains AI (Junie)
+
+`jetbrains-junie` is a first-class provider serving JetBrains-hosted Claude models through the documented
+Ingrazzio gateway (`https://ingrazzio-cloud-prod.labs.jb.gg`) with the Anthropic Messages transport.
+
+Authenticate with an access token generated at [junie.jetbrains.com/cli](https://junie.jetbrains.com/cli):
+
+```sh
+export JUNIE_API_KEY=...
+```
+
+The token is sent as `Authorization: Bearer` — JetBrains AI rejects requests that also carry `x-api-key`, so
+this provider never lets the Anthropic SDK attach one. Bundled models: `claude-sonnet-4-6` (default),
+`claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-5`. Usage is billed against your JetBrains AI subscription,
+so bundled per-token costs are zero. There is no OAuth login flow; the environment variable is the only
+supported credential source.
+
 ### Allowed auth/discovery values
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
