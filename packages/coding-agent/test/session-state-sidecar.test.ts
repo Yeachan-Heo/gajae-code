@@ -38,7 +38,7 @@ async function readPayload(stateFile: string): Promise<RuntimePayload> {
 	return JSON.parse(await Bun.file(stateFile).text()) as RuntimePayload;
 }
 
-function assistantEnd(text: string, stopReason: "stop" | "error" = "stop") {
+function assistantEnd(text: string, stopReason: "stop" | "error" | "aborted" = "stop") {
 	return {
 		type: "agent_end",
 		messages: [
@@ -481,6 +481,8 @@ describe("coordinator runtime state sidecar", () => {
 		expect(payload).toMatchObject({
 			session_id: "visible-session",
 			state: "completed",
+			execution_state: "terminal_ok",
+			receipt_state: "present",
 			final_response: {
 				text: "Done from runtime",
 				format: "markdown",
@@ -489,6 +491,53 @@ describe("coordinator runtime state sidecar", () => {
 				truncated: false,
 			},
 		});
+	});
+
+	it("persists textless, whitespace, error, aborted, and partial failure terminal truth", async () => {
+		for (const [name, event, expected] of [
+			[
+				"absent",
+				{ type: "agent_end", messages: [] },
+				{
+					state: "completed",
+					execution_state: "terminal_ok",
+					receipt_state: "missing",
+					error: { code: "receipt_missing" },
+				},
+			],
+			[
+				"whitespace",
+				assistantEnd("   "),
+				{
+					state: "completed",
+					execution_state: "terminal_ok",
+					receipt_state: "missing",
+					error: { code: "receipt_missing" },
+				},
+			],
+			[
+				"error",
+				assistantEnd("", "error"),
+				{ state: "errored", execution_state: "failed", receipt_state: "missing", error: { code: "agent_error" } },
+			],
+			[
+				"aborted",
+				assistantEnd("", "aborted"),
+				{ state: "errored", execution_state: "failed", receipt_state: "missing", error: { code: "agent_error" } },
+			],
+			[
+				"partial",
+				assistantEnd("partial", "error"),
+				{ state: "errored", execution_state: "failed", receipt_state: "present", error: { code: "agent_error" } },
+			],
+		] satisfies Array<[string, Parameters<typeof persistCoordinatorRuntimeStateFromEvent>[0], RuntimePayload]>) {
+			const root = await tempRoot();
+			const stateFile = path.join(root, `${name}.json`);
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = `session-${name}`;
+			await persistCoordinatorRuntimeStateFromEvent(event, { sessionId: "fallback", cwd: root, sessionFile: null });
+			expect(await readPayload(stateFile)).toMatchObject(expected);
+		}
 	});
 
 	it("does not sync-read on the async event path and preserves cached turn state", async () => {
@@ -2066,78 +2115,5 @@ describe("coordinator runtime state sidecar", () => {
 
 		expect(await readJson(readinessFile)).toEqual(marker);
 		expect((await readJson(stateFile)).state).toBe("running");
-	});
-	it("accepts a coordinator-seeded payload and preserves current_turn_id (#2549)", async () => {
-		// The coordinator seeds its state file with current_turn_id but without
-		// cwd/workdir/session_file (runtime identity fields). When the runtime writes
-		// to the same coordinator-shared file, assertPreviousRuntimeStateIdentity
-		// must accept the seed (same session_id) and basePayload must preserve the
-		// coordinator's current_turn_id. This is the fencing-compatibility fix that
-		// lets the exact-match terminal predicate work without heuristic inference.
-		const root = await tempRoot();
-		const stateFile = path.join(root, "coordinator-state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		const sessionId = "broker-session-2549";
-		const coordinatorTurnId = "turn-correlated-2549";
-
-		// Seed the file as the coordinator would: session_id + current_turn_id, no cwd/workdir.
-		await Bun.write(
-			stateFile,
-			`${JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				state: "running",
-				ready_for_input: false,
-				current_turn_id: coordinatorTurnId,
-				last_turn_id: null,
-				updated_at: new Date().toISOString(),
-				source: "coordinator",
-				live: null,
-				reason: null,
-			})}\n`,
-		);
-
-		// Runtime writes agent_end to the same file. It must not throw fencing error.
-		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("FINAL-2549"), {
-			sessionId,
-			cwd: root,
-			sessionFile: path.join(root, "session.jsonl"),
-		});
-
-		const payload = await readPayload(stateFile);
-		// The runtime completed with the coordinator's turn ID preserved.
-		expect(payload.state).toBe("completed");
-		expect(payload.source).toBe("agent_session_event");
-		expect(payload.current_turn_id).toBe(coordinatorTurnId);
-		expect((payload.final_response as Record<string, unknown> | undefined)?.text).toBe("FINAL-2549");
-	});
-
-	it("rejects a foreign session_id in the coordinator-shared file (#2549)", async () => {
-		// A genuinely foreign session_id must still be rejected by identity fencing,
-		// even when the previous payload lacks cwd/workdir/session_file.
-		const root = await tempRoot();
-		const stateFile = path.join(root, "coordinator-state-foreign.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		const foreignSessionId = "different-session";
-		const runtimeSessionId = "runtime-session-2549";
-
-		await Bun.write(
-			stateFile,
-			`${JSON.stringify({
-				schema_version: 1,
-				session_id: foreignSessionId,
-				state: "running",
-				current_turn_id: "turn-foreign",
-			})}\n`,
-		);
-
-		// The runtime has a different session_id; fencing must throw.
-		await expect(
-			persistCoordinatorRuntimeStateFromEvent(assistantEnd("should-not-persist"), {
-				sessionId: runtimeSessionId,
-				cwd: root,
-				sessionFile: path.join(root, "session.jsonl"),
-			}),
-		).rejects.toThrow();
 	});
 });

@@ -27,7 +27,7 @@ describe("reconciliation-store", () => {
 		expect(storePath.includes("abc/")).toBe(false); // not under artifact stem abc/
 	});
 
-	test("settleProcessRestart never invents terminal_ok", () => {
+	test("settleProcessRestart preserves dual-axis truth without inventing receipt presence", () => {
 		const now = 1_000_000;
 		const input: DurableReconciliationRecord[] = [
 			{
@@ -36,6 +36,23 @@ describe("reconciliation-store", () => {
 				turnId: "t1",
 				status: "accepted",
 				acceptedAt: 1,
+			},
+			{
+				kind: "prompt",
+				commandId: "legacy-pending",
+				turnId: "legacy-pending-turn",
+				status: "accepted",
+				acceptedAt: 1,
+				pendingOutcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+			{
+				kind: "prompt",
+				commandId: "pending",
+				turnId: "pending-turn",
+				status: "accepted",
+				acceptedAt: 1,
+				pendingOutcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+				pendingReceiptState: "missing",
 			},
 			{
 				kind: "skill",
@@ -60,9 +77,16 @@ describe("reconciliation-store", () => {
 		expect(settled[0]?.status).toBe("failed");
 		expect(settled[0]?.error?.code).toBe("prompt_failed");
 		expect(settled[0]?.outcome).toMatchObject({ kind: "failed", code: "prompt_failed" });
-		expect(settled[1]?.status).toBe("failed");
-		expect(settled[1]?.error?.code).toBe("process_restart");
+		expect(settled[0]?.receiptState).toBe("unknown");
+		expect(settled[1]?.status).toBe("terminal_ok");
+		expect(settled[1]?.receiptState).toBe("missing");
 		expect(settled[2]?.status).toBe("terminal_ok");
+		expect(settled[2]?.receiptState).toBe("missing");
+		expect(settled[3]?.status).toBe("failed");
+		expect(settled[3]?.error?.code).toBe("process_restart");
+		expect(settled[3]?.receiptState).toBe("unknown");
+		expect(settled[4]?.status).toBe("terminal_ok");
+		expect(settled[4]?.receiptState).toBeUndefined();
 	});
 
 	test("transact persists and reload settles a non-terminal prompt with its normalized outcome", async () => {
