@@ -194,7 +194,9 @@ describe("atomic YAML patches", () => {
 		}
 
 		try {
+			let iteration = 0;
 			for (const terminalEvent of ["close", "exit"] as const) {
+				iteration++;
 				const worker = new TerminalWorker(terminalEvent);
 				(globalThis as unknown as { Worker: typeof Worker }).Worker = class {
 					constructor() {
@@ -208,6 +210,11 @@ describe("atomic YAML patches", () => {
 					}),
 				).rejects.toBeInstanceOf(AtomicYamlReplaceError);
 				expect(worker.listenerCount()).toBe(0);
+				// The native op was already dispatched: its outcome is unknown, so
+				// the staged path must be retained for recovery, never unlinked.
+				expect((await fs.readdir(path.dirname(configPath))).filter(entry => entry.endsWith(".tmp"))).toHaveLength(
+					iteration,
+				);
 			}
 		} finally {
 			(globalThis as unknown as { Worker: typeof Worker }).Worker = originalWorker;

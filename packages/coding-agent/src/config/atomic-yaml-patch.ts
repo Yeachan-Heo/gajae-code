@@ -350,7 +350,10 @@ async function runNativeAtomicYamlWorker(
 		worker.postMessage(request);
 		return await promise;
 	} catch (error) {
-		throw new AtomicYamlReplaceError(request.destinationPath, 1, error);
+		// The native op was already dispatched; a termination without a response
+		// leaves the exchange outcome unknown (it may have committed), so the
+		// staged path must be retained for recovery instead of unlinked.
+		throw new AtomicYamlReplaceError(request.destinationPath, 1, error, true);
 	} finally {
 		cleanup();
 		worker.terminate();
