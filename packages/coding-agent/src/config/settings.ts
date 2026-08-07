@@ -107,6 +107,10 @@ type WorkflowMigrationMarker = {
 	 * same-pathname profile REPLACEMENT (deleted + recreated), which realpath
 	 * alone cannot. */
 	canonicalTargetIdentity?: string;
+	/** `dev:ino` of the config.yml FILE that received the migration write; a
+	 * later atomic editor save or file replacement yields a new inode that must
+	 * not be published as migration-owned. */
+	targetFileIdentity?: string;
 	sourceSha256: string;
 	migratedKeys: WorkflowSettingKey[];
 	startedAt: string;
@@ -1837,6 +1841,16 @@ export class Settings implements NotificationSettingsReader {
 									this.#warnLegacyFallbackMigration(
 										`Settings: config-root workflow migration cannot publish completion because the target directory identity is unavailable; leaving source, backup, and marker pending`,
 									);
+								} else if (
+									typeof marker.targetFileIdentity === "string" &&
+									(await this.#targetFileIdentity(target)) !== marker.targetFileIdentity
+								) {
+									// The marker recorded the FILE that received the migration
+									// write; a replaced file is a genuine override, not a
+									// migration write - never complete behind it.
+									this.#warnLegacyFallbackMigration(
+										`Settings: config-root workflow migration target file ${target} was replaced after the migration write; leaving source, backup, and marker pending`,
+									);
 								} else {
 									await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
 										...marker,
@@ -2066,9 +2080,23 @@ export class Settings implements NotificationSettingsReader {
 						// the crash is a genuine override and must not be cleared
 						// merely because the source is now malformed.
 						if (marker?.status === "pending") {
-							const staleBackupDoc = backupExists
-								? (JSON.parse(await Bun.file(backup).text()) as unknown as Record<string, unknown>)
-								: null;
+							// Hash-verify the backup against the marker BEFORE trusting its
+							// contents: an edited/corrupted backup is not evidence of what
+							// the migration wrote, and a coincidentally matching override
+							// must never be classified as migration-owned.
+							let staleBackupDoc: Record<string, unknown> | null = null;
+							if (backupExists) {
+								try {
+									const staleRead = await this.#readBackupBytes(backup);
+									const staleHash = createHash("sha256").update(Buffer.from(staleRead.bytes)).digest("hex");
+									if (staleHash === marker.sourceSha256 || staleHash === marker.priorSourceSha256) {
+										staleBackupDoc = JSON.parse(staleRead.text) as Record<string, unknown>;
+									}
+								} catch {
+									// Unreadable or hash-mismatched backup: cannot verify
+									// ownership; leave recovery state untouched.
+								}
+							}
 							const staleUnsets: AtomicYamlPatch[] = [];
 							const staleFlatKeys: string[] = [];
 							for (const ownedKey of marker.migratedKeys) {
@@ -2376,6 +2404,17 @@ export class Settings implements NotificationSettingsReader {
 				// land between them and be overwritten.
 				await tx.applyPatchesAndRemoveTopLevelKeys(patches, flatKeysToRemove);
 				targetPatchCommitted = true;
+				// Capture the identity of the config.yml FILE this write produced.
+				// An external editor atomically replacing the file after this point
+				// yields a NEW inode; completion must reject that replacement instead
+				// of publishing ownership for a value the migration never wrote.
+				const targetFileIdentityAfterPatch = await this.#targetFileIdentity(target);
+				if (targetFileIdentityAfterPatch === null) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration could not verify the patched target file ${target}; leaving source, backup, and marker pending`,
+					);
+					return;
+				}
 
 				// Re-hash immediately before the no-replace move; on mismatch, revert
 				// the target to its pre-patch state so the next load re-runs against
@@ -2482,6 +2521,12 @@ export class Settings implements NotificationSettingsReader {
 					);
 					return;
 				}
+				if ((await this.#targetFileIdentity(target)) !== targetFileIdentityAfterPatch) {
+					this.#warnLegacyFallbackMigration(
+						`Settings: config-root workflow migration target file ${target} was replaced after the patch; leaving source, backup, and marker pending`,
+					);
+					return;
+				}
 				await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
 					version: WORKFLOW_MIGRATION_MARKER_VERSION,
 					status: "complete",
@@ -2489,6 +2534,7 @@ export class Settings implements NotificationSettingsReader {
 					backupPath: backup,
 					targetPath: target,
 					...targetIdentity,
+					targetFileIdentity: targetFileIdentityAfterPatch,
 					sourceSha256,
 					migratedKeys,
 					startedAt,
@@ -2774,6 +2820,13 @@ export class Settings implements NotificationSettingsReader {
 			repairsApplied: false,
 			sourceSha256: currentSourceHash,
 			migratedKeys: [...new Set([...retainedOwnedKeys, ...newlyPropagatedKeys])],
+			// The repairs REWRITE config.yml (a new inode), so the pre-reconcile
+			// complete marker's targetFileIdentity is stale from this point on.
+			// Clear it: a crash-and-resume must not compare the repaired file
+			// against the pre-reconcile inode (which would deadlock the migration
+			// in a permanent pending state). The completion below captures a
+			// FRESH file identity after the repairs.
+			targetFileIdentity: undefined,
 		};
 		await this.#writeWorkflowMigrationMarkerAtomic(markerPath, pendingRepairMarker);
 		// Capture the target identity BEFORE applying the repairs: the completion
@@ -2805,6 +2858,17 @@ export class Settings implements NotificationSettingsReader {
 				...pendingRepairMarker,
 				repairsApplied: true,
 			});
+		}
+		// Bind completion to the target FILE this run's repairs produced: the
+		// repair apply rewrites config.yml (a new inode), so capture the identity
+		// AFTER it; an editor atomically saving the file later yields yet another
+		// inode that must not be published as migration-owned.
+		const reconcileTargetFileIdentityAfterRepair = await this.#targetFileIdentity(target);
+		if (reconcileTargetFileIdentityAfterRepair === null) {
+			this.#warnLegacyFallbackMigration(
+				`Settings: config-root workflow migration cannot verify target file ${target} after reconcile repairs; leaving source/backup/marker pending`,
+			);
+			return;
 		}
 		// The editor may have saved again during the reconcile: only
 		// publish when the source still holds the exact bytes we
@@ -2892,6 +2956,12 @@ export class Settings implements NotificationSettingsReader {
 			);
 			return;
 		}
+		if ((await this.#targetFileIdentity(target)) !== reconcileTargetFileIdentityAfterRepair) {
+			this.#warnLegacyFallbackMigration(
+				`Settings: config-root workflow migration target file ${target} was replaced during reconciliation; leaving source, backup, and marker pending`,
+			);
+			return;
+		}
 		await this.#writeWorkflowMigrationMarkerAtomic(markerPath, {
 			...marker,
 			// The resume enters with a pending marker; the repairs and backup
@@ -2902,6 +2972,7 @@ export class Settings implements NotificationSettingsReader {
 			repairsApplied: undefined,
 			preRepairTargetHashes: undefined,
 			...targetIdentity,
+			targetFileIdentity: reconcileTargetFileIdentityAfterRepair,
 			sourceSha256: currentSourceHash,
 			migratedKeys: [...new Set([...retainedOwnedKeys, ...newlyPropagatedKeys])],
 			completedAt: new Date().toISOString(),
@@ -2923,6 +2994,11 @@ export class Settings implements NotificationSettingsReader {
 	async #statIdentity(filePath: string): Promise<string | undefined> {
 		const st = await fs.promises.stat(filePath).catch(() => null);
 		return st ? `${st.dev}:${st.ino}` : undefined;
+	}
+
+	async #targetFileIdentity(target: string): Promise<string | null> {
+		const identity = await this.#statIdentity(target);
+		return identity ?? null;
 	}
 
 	async #workflowMigrationTargetIdentity(
