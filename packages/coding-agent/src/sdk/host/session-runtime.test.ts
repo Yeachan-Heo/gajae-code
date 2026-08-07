@@ -218,6 +218,69 @@ describe("SessionSdkSessionRuntime", () => {
 		}
 	});
 
+	test("SDK-only host rejects a same-key different-scope race atomically inside the durable transaction", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-race-"));
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const seamCalls: Array<{ handle: string; scope: string }> = [];
+		createSdkSessionRuntimeExtension(api, {
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => 7,
+				getActivePromptHandle: () => "exact-run-handle",
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async (handle, options) => {
+					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = extensionContext(transport.sessionId, cwd);
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			const race = {
+				type: "control_request",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "race-key",
+			} as SdkFrame;
+			// Both requests pass the earlier snapshot check before either durable
+			// row lands; the serialized transaction must reject the second
+			// (different scope) atomically instead of appending a duplicate-key
+			// row that would make later replay of the first ambiguous (review
+			// thread P2).
+			transport.feed("client", { ...race, id: "race-turn" });
+			transport.feed("client", { ...race, id: "race-owned", input: { mode: "terminal", scope: "owned" } });
+			await Bun.sleep(25);
+			const turnResponse = transport.sent.find(frame => frame.id === "race-turn");
+			const ownedResponse = transport.sent.find(frame => frame.id === "race-owned");
+			expect(turnResponse).toMatchObject({ type: "control_response", ok: true });
+			expect(ownedResponse).toMatchObject({
+				type: "control_response",
+				ok: false,
+				error: expect.objectContaining({ code: "idempotency_conflict" }),
+			});
+			// Only the admitted request reached the session seam; the loser never
+			// touched the run.
+			expect(seamCalls).toEqual([{ handle: "exact-run-handle", scope: "turn" }]);
+			// Exactly ONE durable row exists for the key: the winner's.
+			expect(reconciliationStore.snapshotTerminalScopes().filter(s => s.idempotencyKeyHash).length).toBe(1);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("native-like and loopback transports share the same SDK contract matrix", async () => {
 		const nativePolicy = createSdkSurfacePolicy({
 			bindings: ["sdkControl", "cycleModel", "getSkillState"],

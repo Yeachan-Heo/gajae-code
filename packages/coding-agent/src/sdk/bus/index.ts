@@ -155,6 +155,20 @@ export {
 const PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT = 8;
 const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
 
+/**
+ * Thrown from a serialized durable terminal-scope transaction when the
+ * idempotency key is already owned by a DIFFERENT input (scope). The generic
+ * dispatch cache normally rejects this before the surface, but after its
+ * 256-entry eviction two concurrent requests can both pass the earlier
+ * snapshot check; the atomic recheck inside the transaction must reject the
+ * second instead of appending a duplicate-key row (review thread P2).
+ */
+class TerminalIdempotencyConflictError extends Error {
+	constructor() {
+		super("Idempotency key was reused with different input.");
+	}
+}
+
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
 	now = Date.now(),
@@ -4782,10 +4796,21 @@ export function createNotificationsExtension(
 				// are untouched.
 				const MAX_DURABLE_TERMINAL_RESERVATIONS = 256;
 				const MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
-				const reserveTerminalNoEffect = async (): Promise<"ok" | "failed"> => {
+				const reserveTerminalNoEffect = async (): Promise<"ok" | "failed" | "conflict"> => {
 					if (!keyHash) return "ok";
 					try {
 						await durableStore.transactTerminalState(state => {
+							// Atomic recheck: a concurrent request may have committed a
+							// DIFFERENT input under this key after the earlier snapshot
+							// check (the 256-entry dispatch cache evicted the in-flight
+							// entry). Appending a second same-key row would make later
+							// replay's .find() by key hash ambiguous and could report a
+							// conflict for a request that already succeeded; reject the
+							// conflicting input inside the transaction instead (review
+							// thread P2).
+							const conflicting = state.scopes.find(s => s.idempotencyKeyHash === keyHash);
+							if (conflicting && conflicting.idempotencyInputHash !== inputHash)
+								throw new TerminalIdempotencyConflictError();
 							const retained = state.scopes.filter(
 								s => !(s.idempotencyKeyHash === keyHash && s.idempotencyInputHash === inputHash),
 							);
@@ -4827,6 +4852,7 @@ export function createNotificationsExtension(
 						});
 						return "ok";
 					} catch (error) {
+						if (error instanceof TerminalIdempotencyConflictError) return "conflict";
 						logger.warn(`sdk: terminal no-effect reservation failed: ${String(error)}`);
 						return "failed";
 					}
@@ -4842,7 +4868,9 @@ export function createNotificationsExtension(
 					// unrelated turn (review thread P2). No active turn means no
 					// fence epoch; the marker uses sentinel 0. The reservation is
 					// bounded (see reserveTerminalNoEffect).
-					if ((await reserveTerminalNoEffect()) === "failed") {
+					const reservation = await reserveTerminalNoEffect();
+					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
+					if (reservation === "failed") {
 						// Without the durable reservation a same-key retry after
 						// eviction/restart could abort an unrelated later turn, so a
 						// failed reservation must NOT report success.
@@ -4875,7 +4903,9 @@ export function createNotificationsExtension(
 				}
 				const [commandId, turnId] = active[0].split(":", 2);
 				if (!commandId || !turnId) {
-					if ((await reserveTerminalNoEffect()) === "failed") {
+					const reservation = await reserveTerminalNoEffect();
+					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
+					if (reservation === "failed") {
 						// Same durable-reservation guarantee as the no-active path.
 						return { ok: false as const, reason: "reservation_failed" as const };
 					}
@@ -4897,7 +4927,9 @@ export function createNotificationsExtension(
 					// prompt cancelled with no durable row (a later same-key retry
 					// after eviction/restart could then abort an unrelated turn —
 					// review thread P2).
-					if ((await reserveTerminalNoEffect()) === "failed") {
+					const reservation = await reserveTerminalNoEffect();
+					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
+					if (reservation === "failed") {
 						return { ok: false as const, reason: "reservation_failed" as const };
 					}
 					// RECHCK after the async write: agent_start may have bound the
@@ -4940,6 +4972,15 @@ export function createNotificationsExtension(
 					// (review thread P2). The marker itself stays pending (never
 					// evicted); only completed rows are bounded.
 					await durableStore.transactTerminalState(state => {
+						// Atomic recheck: a concurrent request may have committed a
+						// DIFFERENT input under this key after the earlier snapshot
+						// check (dispatch-cache eviction), and the filter below must
+						// never wipe that row — replacing it would let a later replay
+						// of the SUCCEEDED request report a conflict (review thread
+						// P2).
+						const conflicting = state.scopes.find(s => keyHash && s.idempotencyKeyHash === keyHash);
+						if (conflicting && conflicting.idempotencyInputHash !== inputHash)
+							throw new TerminalIdempotencyConflictError();
 						const retained = state.scopes.filter(s => !(keyHash && s.idempotencyKeyHash === keyHash));
 						const preBound: DurableTerminalScopeRecord[] = [
 							...retained,
@@ -4976,12 +5017,19 @@ export function createNotificationsExtension(
 						return { scopes: bounded, keys: combined };
 					});
 				} catch (error) {
+					if (error instanceof TerminalIdempotencyConflictError) {
+						// A different input won the durable key race inside the
+						// transaction; reject rather than replacing its row.
+						return { ok: false as const, reason: "conflict" as const };
+					}
 					logger.warn(`sdk: terminal initial marker persistence failed: ${String(error)}`);
 					// No durable marker exists: do NOT acknowledge success without a
 					// durable row — a same-key retry after restart/expiry would miss
 					// replay and could abort an unrelated later prompt. Persist a
 					// bounded no-effect reservation first (review thread P2).
-					if ((await reserveTerminalNoEffect()) === "failed") {
+					const reservation = await reserveTerminalNoEffect();
+					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
+					if (reservation === "failed") {
 						return { ok: false as const, reason: "reservation_failed" as const };
 					}
 					return { ok: true as const, outcome: "no_effect" as const };

@@ -24,6 +24,21 @@ import type { BrokerIndexWriter, SdkFrame } from "./types";
 
 const execFileAsync = promisify(execFile);
 const sdkControlRequesterContext = new AsyncLocalStorage<string>();
+
+/**
+ * Thrown from a serialized durable terminal-scope transaction when the
+ * idempotency key is already owned by a DIFFERENT input (scope). After the
+ * dispatch cache evicts an in-flight entry, two concurrent requests can both
+ * pass the earlier snapshot check; the atomic recheck inside the transaction
+ * must reject the second instead of appending a duplicate-key row (review
+ * thread P2).
+ */
+class SdkOnlyIdempotencyConflictError extends Error {
+	constructor() {
+		super("Idempotency key was reused with different input.");
+	}
+}
+
 class DiffQueryError extends Error {
 	constructor(
 		readonly code: "not_git_repository" | "diff_too_large",
@@ -903,8 +918,17 @@ function createControlSurface(
 		};
 		const prior = replay();
 		if (prior !== undefined) return prior;
-		const writeNoEffect = async (): Promise<void> => {
-			await store.transactTerminalState(state => ({
+		const writeNoEffect = async (): Promise<"ok" | "conflict"> => {
+			try {
+				await store.transactTerminalState(state => {
+					// Atomic recheck: a concurrent request may have committed a
+					// DIFFERENT input under this key after the earlier snapshot
+					// check; appending a second same-key row would make later
+					// replay's .find() by key hash ambiguous (review thread P2).
+					const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
+					if (conflicting && conflicting.idempotencyInputHash !== inputHash)
+						throw new SdkOnlyIdempotencyConflictError();
+					return {
 				scopes: [
 					...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
 					{
@@ -927,7 +951,13 @@ function createControlSurface(
 					},
 				],
 				keys: state.keys,
-			}));
+					};
+				});
+				return "ok";
+			} catch (error) {
+				if (error instanceof SdkOnlyIdempotencyConflictError) return "conflict";
+				throw error;
+			}
 		};
 		const handle = terminalAbortSeams.getActivePromptHandle();
 		const epoch = terminalAbortSeams.getTerminalTurnEpoch();
@@ -938,7 +968,11 @@ function createControlSurface(
 			terminalAbortSeams.cancelPendingPreflightForTerminalAbort();
 		};
 		if (!handle || epoch === undefined) {
-			await writeNoEffect();
+			if ((await writeNoEffect()) === "conflict") {
+				throw Object.assign(new Error("Idempotency key was reused with different input."), {
+					code: "idempotency_conflict",
+				});
+			}
 			cancelRequesterPreflights();
 			return {
 				ok: true,
@@ -948,7 +982,14 @@ function createControlSurface(
 			};
 		}
 		try {
-			await store.transactTerminalState(state => ({
+			await store.transactTerminalState(state => {
+				// Atomic recheck (same rationale as writeNoEffect): never wipe a
+				// row a concurrent request committed under this key with a
+				// different input (review thread P2).
+				const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
+				if (conflicting && conflicting.idempotencyInputHash !== inputHash)
+					throw new SdkOnlyIdempotencyConflictError();
+				return {
 				scopes: [
 					...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
 					{
@@ -972,9 +1013,19 @@ function createControlSurface(
 					},
 				],
 				keys: state.keys,
-			}));
-		} catch {
-			await writeNoEffect();
+				};
+			});
+		} catch (error) {
+			if (error instanceof SdkOnlyIdempotencyConflictError) {
+				throw Object.assign(new Error("Idempotency key was reused with different input."), {
+					code: "idempotency_conflict",
+				});
+			}
+			if ((await writeNoEffect()) === "conflict") {
+				throw Object.assign(new Error("Idempotency key was reused with different input."), {
+					code: "idempotency_conflict",
+				});
+			}
 			return {
 				ok: true,
 				selection: scope,
