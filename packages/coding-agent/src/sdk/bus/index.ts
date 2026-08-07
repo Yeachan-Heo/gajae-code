@@ -2249,7 +2249,9 @@ function sdkQuerySurface(
 	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
-	_steerStatusLookup: (clientRef: string) => unknown = () => ({ status: "unknown" }),
+	steerStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2260,6 +2262,7 @@ function sdkQuerySurface(
 		configOverrides,
 		promptStatusLookup,
 		skillStatusLookup,
+		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 	}).query;
 }
