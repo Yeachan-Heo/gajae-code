@@ -483,6 +483,22 @@ test("findOwnedRegistrationsForTurn returns only exact lineage+epoch registratio
 	});
 });
 
+test("settling an evicted tuple removes it despite a live replacement", () => {
+	for (let index = 0; index <= 8192; index++) {
+		registerOwnedRegistration(
+			{ ...registration, jobId: `evicted-${index}`, jobGeneration: `generation-${index}` },
+			{ isJobTerminal: () => true },
+		);
+	}
+	const evicted = { ...registration, jobId: "evicted-0", jobGeneration: "generation-0" };
+	expect(lookupOwnedRegistration(evicted.jobId, evicted.jobGeneration, evicted.endpointId)).toEqual(evicted);
+	const replacement = { ...evicted, lineageIdHash: "replacement-lineage", promptAttemptEpoch: 8 };
+	registerOwnedRegistration(replacement, { isJobTerminal: () => true });
+	unregisterOwnedRegistration(evicted);
+	unregisterOwnedRegistration(replacement);
+	expect(lookupOwnedRegistration(evicted.jobId, evicted.jobGeneration, evicted.endpointId)).toBeUndefined();
+});
+
 test("settleOwnedWork stops exact jobs, purges deliveries, and returns stopped", async () => {
 	const cancelled: string[] = [];
 	const purged: string[][] = [];
@@ -535,6 +551,34 @@ test("settleOwnedWork fails closed on a reused id with a new generation (no fore
 	// The foreign (reused) job must NOT be cancelled or purged.
 	expect(cancelled).toEqual([]);
 	expect(purged).toEqual([]);
+});
+
+test("settleOwnedWork cancels every generation-matching job despite another reused id", async () => {
+	const cancelled: string[] = [];
+	const jobs = new Map([
+		["mismatched", { generation: "new-generation", status: "running" }],
+		["matching-after", { generation: "gen-2", status: "running" }],
+	]);
+	const manager = {
+		cancel: (jobId: string) => {
+			cancelled.push(jobId);
+			const job = jobs.get(jobId);
+			if (job) job.status = "cancelled";
+			return true;
+		},
+		getJob: (jobId: string) => jobs.get(jobId),
+		acknowledgeDeliveries: () => 0,
+	};
+	const outcome = await settleOwnedWork(
+		manager,
+		[
+			{ ...registration, jobId: "mismatched", jobGeneration: "old-generation" },
+			{ ...registration, jobId: "matching-after", jobGeneration: "gen-2" },
+		],
+		5,
+	);
+	expect(outcome).toBe("unsettled");
+	expect(cancelled).toEqual(["matching-after"]);
 });
 
 test("settleOwnedWork fails closed when a captured job is still running or missing after grace", async () => {

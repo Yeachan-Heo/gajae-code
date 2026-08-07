@@ -409,8 +409,7 @@ export function unregisterOwnedRegistration(key: TurnRegistrationKey): void {
 		r.jobId === key.jobId &&
 		r.jobGeneration === key.jobGeneration;
 	const existing = ownedRegistrations.get(mapKey);
-	if (existing) {
-		if (!matches(existing)) return;
+	if (existing && matches(existing)) {
 		ownedRegistrations.delete(mapKey);
 	}
 	// The registration may already have been EVICTED into the retained
@@ -561,12 +560,15 @@ export async function settleOwnedWork(
 	exactJobs: TurnRegistrationKey[],
 	graceMs: number,
 ): Promise<"stopped" | "unsettled"> {
-	const generationExact = exactJobs.every(reg => {
+	let generationExact = true;
+	for (const reg of exactJobs) {
 		const live = manager.getJob(reg.jobId);
-		if (live !== undefined && live.generation !== reg.jobGeneration) return false;
+		if (live !== undefined && live.generation !== reg.jobGeneration) {
+			generationExact = false;
+			continue;
+		}
 		manager.cancel(reg.jobId);
-		return true;
-	});
+	}
 	if (!generationExact) return "unsettled";
 	const deadline = Date.now() + graceMs;
 	await Bun.sleep(graceMs);
