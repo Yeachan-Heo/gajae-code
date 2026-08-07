@@ -72,6 +72,23 @@ export function buildGcReportText(report: GcReport): string {
 		lines.push("");
 	}
 
+	if (report.session_scope) {
+		const scope = report.session_scope;
+		const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+		const headline =
+			scope.status === "over_limit"
+				? "Session scope is OVER the managed budget — new sessions in this directory will fail to start"
+				: "Session scope is approaching the managed budget";
+		lines.push(headline);
+		lines.push(
+			`  ${mib(scope.total_bytes)} MiB of ${mib(scope.limit_bytes)} MiB across ${scope.entries} entries` +
+				`${scope.truncated ? " (walk truncated; totals are a floor)" : ""}`,
+		);
+		lines.push(`  ${scope.path}`);
+		lines.push("  gc does not reclaim session records; move stale session directories out of the scope by hand.");
+		lines.push("");
+	}
+
 	if (report.warnings.length > 0) {
 		lines.push(`Warnings (${report.warnings.length})`);
 		for (const warning of report.warnings) lines.push(`  [${warning.store}/${warning.scope}] ${warning.message}`);
