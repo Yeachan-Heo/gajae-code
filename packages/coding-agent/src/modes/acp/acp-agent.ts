@@ -51,6 +51,11 @@ import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/cli
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-model";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import {
+	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+	type PromptWatchdogClock,
+	systemPromptWatchdogClock,
+} from "../../sdk/prompt-watchdog";
+import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
 	mapAgentWireEventPayloadToAcpSessionUpdates,
@@ -104,6 +109,12 @@ interface PromptWaiter {
 	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
 	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
 	deferredFrames: JsonObject[];
+	/** Clock reading of the last inbound frame for this prompt; baseline of the inactivity watchdog. */
+	lastFrameAt: number;
+	/** Frame (or wire event) type of that last frame, reported when the watchdog expires. */
+	lastFrameType: string;
+	/** Cancels the armed inactivity watchdog; re-armed by every inbound frame for this prompt. */
+	cancelWatchdog?: () => void;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -160,6 +171,14 @@ function parseAcpStartupOptions(value: unknown): AcpStartupOptions | undefined {
 				...(modelPreset ? { modelPreset } : {}),
 				...(thinkingLevel ? { thinkingLevel } : {}),
 			}
+		: undefined;
+}
+
+/** Tests inject a virtual clock so watchdog coverage never sleeps in real time. */
+function parsePromptWatchdogClock(value: unknown): PromptWatchdogClock | undefined {
+	const candidate = object(value);
+	return typeof candidate?.now === "function" && typeof candidate.schedule === "function"
+		? (candidate as unknown as PromptWatchdogClock)
 		: undefined;
 }
 
@@ -298,6 +317,15 @@ function hasCompleteCorrelation(correlation: PromptCorrelation): correlation is 
 		typeof correlation.turnId === "string" &&
 		correlation.turnId.trim().length > 0
 	);
+}
+
+function clearPromptWatchdog(waiter: PromptWaiter): void {
+	waiter.cancelWatchdog?.();
+	waiter.cancelWatchdog = undefined;
+}
+
+function describeCorrelation(correlation: PromptCorrelation): string {
+	return `commandId=${correlation.commandId ?? "none"} turnId=${correlation.turnId ?? "none"}`;
 }
 
 function correlationsExactlyMatch(expected: PromptCorrelation, actual: PromptCorrelation): boolean {
@@ -900,12 +928,20 @@ export class AcpAgent implements Agent {
 	#broker: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
+	readonly #promptWatchdogClock: PromptWatchdogClock;
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
 	constructor(
 		connection: AgentSideConnection,
-		options?: { agentDir?: string; startupOptions?: AcpStartupOptions; cancelSettlementGraceMs?: number } | unknown,
+		options?:
+			| {
+					agentDir?: string;
+					startupOptions?: AcpStartupOptions;
+					cancelSettlementGraceMs?: number;
+					promptWatchdogClock?: PromptWatchdogClock;
+			  }
+			| unknown,
 	) {
 		this.#connection = connection;
 		const candidate = object(options);
@@ -916,6 +952,7 @@ export class AcpAgent implements Agent {
 			Number.isSafeInteger(candidate.cancelSettlementGraceMs)
 				? candidate.cancelSettlementGraceMs
 				: CANCEL_SETTLEMENT_GRACE_MS;
+		this.#promptWatchdogClock = parsePromptWatchdogClock(candidate?.promptWatchdogClock) ?? systemPromptWatchdogClock;
 		queueMicrotask(() => {
 			if (connection.signal.aborted) {
 				this.#beginDispose();
@@ -1235,11 +1272,16 @@ export class AcpAgent implements Agent {
 				emittedAssistantText: "",
 				settled: false,
 				deferredFrames: [],
+				lastFrameAt: this.#promptWatchdogClock.now(),
+				lastFrameType: "prompt_dispatch",
 				resolve,
 				reject,
 			};
 			record.activePrompt = waiter;
 		});
+		// Silence has to be bounded from the moment the prompt owns the session: a host that
+		// dies before it ever answers is exactly the failure that leaves the client running.
+		this.#armPromptWatchdog(params.sessionId, record, waiter);
 		// Echo the user's own message back as `user_message_chunk`. Clients render their
 		// transcript from session/update, so without this a prompt's text and any attached
 		// image never appear in the client UI — only the agent's reply does. Replay
@@ -1283,6 +1325,7 @@ export class AcpAgent implements Agent {
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
 			waiter.deferredFrames.length = 0;
+			clearPromptWatchdog(waiter);
 			waiter.terminal = undefined;
 			waiter.settled = true;
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
@@ -1337,6 +1380,7 @@ export class AcpAgent implements Agent {
 		// when nothing settled the prompt the client already asked to cancel.
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
+		clearPromptWatchdog(waiter);
 		record.cancelRequested = false;
 		waiter.settled = true;
 		waiter.deferredFrames.length = 0;
@@ -1685,6 +1729,7 @@ export class AcpAgent implements Agent {
 				// MUST catch these errors and return the semantically meaningful `cancelled`
 				// stop reason." Involuntary teardown (transport loss) still rejects.
 				if (waiter && !waiter.settled) {
+					clearPromptWatchdog(waiter);
 					if (reason === "closed" || reason === "discarded") {
 						waiter.settled = true;
 						waiter.resolve({ stopReason: "cancelled" });
@@ -1732,6 +1777,7 @@ export class AcpAgent implements Agent {
 		record.reconnectUnsubscribe();
 		const waiter = record.activePrompt;
 		record.activePrompt = undefined;
+		if (waiter) clearPromptWatchdog(waiter);
 		waiter?.reject(error);
 		try {
 			await adapter.close();
@@ -1817,11 +1863,79 @@ export class AcpAgent implements Agent {
 		return new AcpSdkAdapterError("frame_processing_failed", `ACP session frame processing failed: ${detail}`);
 	}
 
+	/**
+	 * Bounds how long one prompt may stay silent. A session host that stops producing
+	 * never publishes a terminal frame, and an ACP prompt only settles on a terminal, so
+	 * without this bound `session/prompt` never returns and the client reports the turn as
+	 * running forever behind a dead session.
+	 */
+	#armPromptWatchdog(id: string, record: SessionRecord, waiter: PromptWaiter): void {
+		if (waiter.settled) return;
+		waiter.cancelWatchdog?.();
+		// No frame can still arrive once the transport is known to be gone, so waiting out
+		// the full bound would only add dead time to an outcome that is already decided.
+		const delayMs = this.#promptTransportGone(id, record) ? 0 : ACP_PROMPT_INACTIVITY_TIMEOUT_MS;
+		waiter.cancelWatchdog = this.#promptWatchdogClock.schedule(() => {
+			void this.#expirePromptWatchdog(id, record, waiter);
+		}, delayMs);
+	}
+
+	/** Any frame proves the producer is alive, so every one of them restarts the bound. */
+	#refreshPromptWatchdog(id: string, record: SessionRecord, frame: JsonObject): void {
+		const waiter = record.activePrompt;
+		if (!waiter || waiter.settled) return;
+		const event = receivedSdkEvent(frame)?.event;
+		waiter.lastFrameAt = this.#promptWatchdogClock.now();
+		waiter.lastFrameType =
+			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
+		this.#armPromptWatchdog(id, record, waiter);
+	}
+
+	/** Names why the prompt can be settled at once instead of waiting out the inactivity bound. */
+	#promptTransportGone(id: string, record: SessionRecord): string | undefined {
+		if (this.#disposed || this.#connection.signal.aborted) return "the ACP client connection is closed";
+		if (this.#sessions.get(id) !== record) return "the SDK session host record was already discarded";
+		return undefined;
+	}
+
+	/**
+	 * Settles the ACP prompt only. The agent's own work is left alone: this reports that the
+	 * turn can no longer be observed, it does not cancel or tear down the session.
+	 */
+	async #expirePromptWatchdog(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
+		if (record.activePrompt !== waiter || waiter.settled) return;
+		const silenceMs = Math.max(0, this.#promptWatchdogClock.now() - waiter.lastFrameAt);
+		const cause = this.#promptTransportGone(id, record) ?? "the SDK session host stopped producing frames";
+		logger.error("acp_prompt_watchdog_expired", {
+			sessionId: id,
+			cause,
+			silenceMs,
+			lastFrameType: waiter.lastFrameType,
+			inactivityBoundMs: ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+			...(waiter.correlation.commandId ? { commandId: waiter.correlation.commandId } : {}),
+			...(waiter.correlation.turnId ? { turnId: waiter.correlation.turnId } : {}),
+		});
+		await this.#rejectPrompt(
+			record,
+			id,
+			waiter,
+			new AcpSdkAdapterError(
+				"prompt_abandoned",
+				`ACP prompt was abandoned after ${Math.round(silenceMs / 1_000)}s of silence: ${cause}. Last frame was ` +
+					`"${waiter.lastFrameType}" (${describeCorrelation(waiter.correlation)}). The turn was settled so the ` +
+					`client stops waiting; the session still accepts the next prompt.`,
+			),
+		);
+	}
+
 	#enqueueSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
 		// Ingress ordering is recorded before queued work begins.
 		this.#observeSessionActivity(record, frame);
+		// Any frame at all proves the producer is still alive, so it refreshes the
+		// inactivity watchdog before the queued work that may take a long time to run.
+		this.#refreshPromptWatchdog(id, record, frame);
 		++record.inboundSequence;
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
 		record.frameTail = task.catch(
@@ -1839,6 +1953,7 @@ export class AcpAgent implements Agent {
 				const waiter = record.activePrompt;
 				if (waiter && !waiter.settled && !waiter.terminal) {
 					record.activePrompt = undefined;
+					clearPromptWatchdog(waiter);
 					waiter.settled = true;
 					if (hasCorrelation(waiter.correlation)) {
 						record.settledPromptCorrelations.push(waiter.correlation);
@@ -1989,6 +2104,7 @@ export class AcpAgent implements Agent {
 	): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
+		clearPromptWatchdog(waiter);
 		waiter.settled = true;
 		waiter.deferredFrames.length = 0;
 		waiter.terminal = undefined;
@@ -2035,6 +2151,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 		record.activePrompt = undefined;
+		clearPromptWatchdog(waiter);
 		waiter.settled = true;
 		if (hasCorrelation(waiter.correlation)) {
 			record.settledPromptCorrelations.push(waiter.correlation);
