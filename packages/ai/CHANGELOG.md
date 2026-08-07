@@ -5,6 +5,10 @@
 
 - Added opt-in `compat.supportsResponsesSessionAffinity` for OpenAI Responses custom relays. When enabled, supported `openai-responses` models may send `session_id` and `x-client-request-id` affinity headers to a custom endpoint; canonical OpenAI routing remains automatic and known non-OpenAI provider IDs remain excluded.
 
+### Changed
+
+- Raised the enforced OpenAI code (Codex) GPT-5.6 family prompt budget from 272K to 372K input tokens: `CODEX_GPT_5_6_CONTEXT_CAP` fallback/ceiling is now 372K, live `openai-codex` discovery metadata above 372K is capped to it, and the bundled `openai-codex` GPT-5.6 Sol/Terra/Luna catalog entries now advertise 372K context. Smaller observed live limits remain authoritative, first-party OpenAI and non-5.6 codex variants (e.g. `gpt-5.4-codex`, `gpt-5.6-codex`) are untouched, and the 272K long-context pricing threshold is unchanged.
+
 ### Fixed
 
 - Anthropic requests rejected with `A maximum of 4 blocks with cache_control may be provided. Found N.` now step their generated breakpoints down instead of dying on the first attempt (#3934, supersedes #3943). An Anthropic-compatible gateway may attach its own block-level cache markers before forwarding, and those never appear in the params we serialize, so the total is unpredictable locally and the rejection itself is the only usable signal. Because that rejection says "too many", not "none allowed", recovery gives up one breakpoint at a time: explicit mode normally emits two (a conversation-prefix anchor plus a current-turn refresh point), so the first retry keeps the prefix anchor — the higher-value marker — and only a second rejection disables generated caching entirely. The reduced budget persists for the provider session so later turns neither re-trigger the 400 nor lose more caching than the endpoint requires. Only a genuine breakpoint-overflow `invalid_request_error` is claimed — other `cache_control` complaints, unrelated 400s, non-400 statuses, and our own pre-flight validation failure still surface immediately. The classifier is exported as `isAnthropicCacheBreakpointOverflowError`.

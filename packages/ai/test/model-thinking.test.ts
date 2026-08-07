@@ -532,7 +532,7 @@ describe("generated model policies", () => {
 		}
 	});
 
-	it("caps only Codex product GPT-5.6 tiers at the 272K prompt budget", () => {
+	it("caps only Codex product GPT-5.6 tiers at the 372K prompt budget", () => {
 		const models: Model<Api>[] = [
 			{
 				...createModel({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
@@ -558,7 +558,7 @@ describe("generated model policies", () => {
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models.map(model => model.contextWindow)).toEqual([272_000, 1_050_000, 200_000, 272_000]);
+		expect(models.map(model => model.contextWindow)).toEqual([372_000, 1_050_000, 200_000, 272_000]);
 		expect(models[0]?.applyPatchToolType).toBe("freeform");
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
 	});

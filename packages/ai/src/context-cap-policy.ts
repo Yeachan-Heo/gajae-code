@@ -6,8 +6,11 @@ export interface CodexGpt56ContextCapPolicy {
 }
 
 export const CODEX_GPT_5_6_CONTEXT_CAP: CodexGpt56ContextCapPolicy = {
-	fallback: 272_000,
-	ceiling: 272_000,
+	// 372K is the currently enforced usable prompt budget for the OpenAI code
+	// backend (raised from 272K); discovery metadata above it is a total-window
+	// figure that includes the output budget and must not be trusted as input.
+	fallback: 372_000,
+	ceiling: 372_000,
 };
 
 const CODEX_GPT_5_6_MODEL_IDS: ReadonlySet<string> = new Set([

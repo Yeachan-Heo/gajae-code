@@ -28,12 +28,12 @@ describe("Codex GPT-5.6 discovery context cap", () => {
 			clientVersion: "0.99.0",
 			fetchFn: fetchResponse(undefined),
 		});
-		expect(result?.models[0]?.contextWindow).toBe(272_000);
+		expect(result?.models[0]?.contextWindow).toBe(372_000);
 	});
 
 	it("caps larger live metadata but preserves a smaller live cap", async () => {
 		for (const [observed, expected] of [
-			[373_000, 272_000],
+			[373_000, 372_000],
 			[200_000, 200_000],
 		] as const) {
 			const result = await fetchCodexModels({

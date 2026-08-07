@@ -23,10 +23,10 @@ function model(overrides: Partial<Model<Api>> = {}): Model<Api> {
 }
 
 describe("Codex GPT-5.6 context cap policy", () => {
-	it("uses the conservative fallback and preserves smaller live limits", () => {
+	it("uses the 372K fallback and preserves smaller live limits", () => {
 		const identity = model();
-		expect(resolveCodexGpt56DiscoveryContext(identity, undefined)).toBe(272_000);
-		expect(resolveCodexGpt56DiscoveryContext(identity, 373_000)).toBe(272_000);
+		expect(resolveCodexGpt56DiscoveryContext(identity, undefined)).toBe(372_000);
+		expect(resolveCodexGpt56DiscoveryContext(identity, 373_000)).toBe(372_000);
 		expect(resolveCodexGpt56DiscoveryContext(identity, 200_000)).toBe(200_000);
 	});
 
@@ -41,20 +41,20 @@ describe("Codex GPT-5.6 context cap policy", () => {
 			model({ id: "gpt-5.6-codex" }),
 		]);
 		expect(capped.map(entry => entry.contextWindow)).toEqual([
-			272_000, 272_000, 272_000, 272_000, 373_000, 373_000, 373_000,
+			372_000, 372_000, 372_000, 372_000, 373_000, 373_000, 373_000,
 		]);
 	});
 
-	it("supports a future authority increase without promoting stale smaller observations", () => {
-		const futurePolicy = { ...CODEX_GPT_5_6_CONTEXT_CAP, fallback: 372_000, ceiling: 372_000 };
+	it("does not promote stale smaller observations when authority rises", () => {
+		const futurePolicy = { ...CODEX_GPT_5_6_CONTEXT_CAP, fallback: 400_000, ceiling: 400_000 };
 		const identity = model();
-		expect(resolveCodexGpt56DiscoveryContext(identity, undefined, futurePolicy)).toBe(372_000);
-		expect(resolveCodexGpt56DiscoveryContext(identity, 372_000, futurePolicy)).toBe(372_000);
+		expect(resolveCodexGpt56DiscoveryContext(identity, undefined, futurePolicy)).toBe(400_000);
+		expect(resolveCodexGpt56DiscoveryContext(identity, 400_000, futurePolicy)).toBe(400_000);
 		expect(applyFinalCodexGpt56ContextCap([model({ contextWindow: 272_000 })], futurePolicy)[0]?.contextWindow).toBe(
 			272_000,
 		);
-		expect(applyFinalCodexGpt56ContextCap([model({ contextWindow: 373_000 })], futurePolicy)[0]?.contextWindow).toBe(
-			372_000,
+		expect(applyFinalCodexGpt56ContextCap([model({ contextWindow: 500_000 })], futurePolicy)[0]?.contextWindow).toBe(
+			400_000,
 		);
 	});
 });

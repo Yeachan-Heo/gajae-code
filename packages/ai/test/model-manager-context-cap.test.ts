@@ -47,7 +47,7 @@ describe("model manager Codex GPT-5.6 cap", () => {
 			},
 			"online",
 		);
-		expect(result.models[0]?.contextWindow).toBe(272_000);
+		expect(result.models[0]?.contextWindow).toBe(372_000);
 	});
 
 	it("prefers a newly observed smaller live cap over stale larger cache metadata", async () => {

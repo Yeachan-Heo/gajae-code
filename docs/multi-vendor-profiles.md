@@ -60,7 +60,7 @@ profiles:
       architect: google-antigravity/gemini-3.1-pro-low
       critic:    google-antigravity/gemini-3.5-flash
 
-  monorepo:              # huge codebases (openai-codex excluded: 272k context cap)
+  monorepo:              # huge codebases (openai-codex excluded: 372k context cap)
     required_providers: [anthropic, google-antigravity, opencode-go]
     model_mapping:
       default:   anthropic/claude-opus-5:medium
