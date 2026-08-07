@@ -69,6 +69,15 @@ const MAX_ACP_REPLAY_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 /**
+ * A cancelled prompt must still settle. The SDK acknowledges `turn.abort` before the
+ * aborted run publishes its normalized terminal, and agent-owned async work that
+ * outlives the turn can keep that terminal from ever arriving. A real terminal still
+ * wins inside this grace; past it ACP's mandated `cancelled` stop reason is published,
+ * so the client is never left holding a turn it cannot resolve or replace.
+ * Injectable in tests, never a user setting.
+ */
+const CANCEL_SETTLEMENT_GRACE_MS = 5_000;
+/**
  * Mirrors `REQUEST_FRAME_BYTES` in `crates/gjc-sdk/src/query.rs`: the SDK WebSocket
  * server sets `max_message_size`/`max_frame_size` to 256 KiB and closes the socket on
  * an oversize frame, so an over-limit prompt must be refused before it is sent.
@@ -869,17 +878,23 @@ export class AcpAgent implements Agent {
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
+	readonly #cancelSettlementGraceMs: number;
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
 	constructor(
 		connection: AgentSideConnection,
-		options?: { agentDir?: string; startupOptions?: AcpStartupOptions } | unknown,
+		options?: { agentDir?: string; startupOptions?: AcpStartupOptions; cancelSettlementGraceMs?: number } | unknown,
 	) {
 		this.#connection = connection;
 		const candidate = object(options);
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
 		this.#startupOptions = parseAcpStartupOptions(candidate?.startupOptions);
+		this.#cancelSettlementGraceMs =
+			typeof candidate?.cancelSettlementGraceMs === "number" &&
+			Number.isSafeInteger(candidate.cancelSettlementGraceMs)
+				? candidate.cancelSettlementGraceMs
+				: CANCEL_SETTLEMENT_GRACE_MS;
 		queueMicrotask(() => {
 			if (connection.signal.aborted) {
 				this.#beginDispose();
@@ -1277,6 +1292,43 @@ export class AcpAgent implements Agent {
 				"abort_unacknowledged",
 				"SDK did not acknowledge cancellation of the active prompt.",
 			);
+		// The acknowledgement proves the run was aborted, not that its terminal was
+		// published. Arm the bounded settlement so the turn cannot outlive the cancel.
+		this.#scheduleCancelSettlement(params.sessionId, record);
+	}
+
+	/**
+	 * `aborted: true` means the run is gone, so the pending prompt is already over even
+	 * if no normalized terminal follows. Without this the waiter stays pending forever:
+	 * the client's turn never resolves, its composer stays in the running phase, and
+	 * every later `session/prompt` is refused with `conflict`.
+	 */
+	#scheduleCancelSettlement(id: string, record: SessionRecord): void {
+		const waiter = record.activePrompt;
+		if (!waiter || waiter.settled) return;
+		setTimeout(() => {
+			void this.#settleCancelledPrompt(id, record, waiter);
+		}, this.#cancelSettlementGraceMs).unref?.();
+	}
+
+	async #settleCancelledPrompt(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
+		// The authoritative terminal wins whenever it arrives in time; this only runs
+		// when nothing settled the prompt the client already asked to cancel.
+		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
+		record.activePrompt = undefined;
+		record.cancelRequested = false;
+		waiter.settled = true;
+		waiter.deferredFrames.length = 0;
+		waiter.terminal = undefined;
+		// A late terminal for this turn must stay closed rather than publish over a
+		// prompt the client has already been told is cancelled.
+		if (hasCompleteCorrelation(waiter.correlation)) {
+			record.settledPromptCorrelations.push(waiter.correlation);
+			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+				record.settledPromptCorrelations.shift();
+		}
+		await this.#publishPromptPhaseIdle(id, record.adapter);
+		waiter.resolve({ stopReason: "cancelled" });
 	}
 
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
@@ -1804,8 +1856,9 @@ export class AcpAgent implements Agent {
 					typeof (event as { error?: { message?: unknown } }).error?.message === "string"
 						? (event as { error: { message: string } }).error.message
 						: "the prompt terminal omitted a valid normalized outcome";
-				this.#rejectPrompt(
+				await this.#rejectPrompt(
 					record,
+					id,
 					activePrompt,
 					new AcpSdkAdapterError("connection_closed", `ACP prompt terminal was invalid: ${detail}`),
 				);
@@ -1907,7 +1960,12 @@ export class AcpAgent implements Agent {
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
 	}
 
-	#rejectPrompt(record: SessionRecord, waiter: PromptWaiter, error: AcpSdkAdapterError): void {
+	async #rejectPrompt(
+		record: SessionRecord,
+		id: string,
+		waiter: PromptWaiter,
+		error: AcpSdkAdapterError,
+	): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
 		waiter.settled = true;
@@ -1918,7 +1976,33 @@ export class AcpAgent implements Agent {
 			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
 				record.settledPromptCorrelations.shift();
 		}
+		// The turn is over even though it ended badly, so the client's running phase has
+		// to be released. Skipping it here is what leaves a client composer spinning on a
+		// turn that will never produce another frame.
+		await this.#publishPromptPhaseIdle(id, record.adapter);
 		waiter.reject(error);
+	}
+
+	/**
+	 * Publishes only the phase transition — no `context.get`/`session.metadata` queries —
+	 * because an abnormal settlement has no trustworthy usage or title to report. Publish
+	 * failures are swallowed: the turn is already settled, and escalating to session
+	 * failure here would tear down a session the client can still use.
+	 */
+	async #publishPromptPhaseIdle(id: string, adapter: AcpSdkAdapter): Promise<void> {
+		const record = this.#sessions.get(id);
+		if (!record || record.adapter !== adapter) return;
+		try {
+			await this.#connection.sessionUpdate({
+				sessionId: id,
+				update: {
+					sessionUpdate: "session_info_update",
+					_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
+				},
+			});
+		} catch {
+			// The client transport is gone; there is no phase left to restore.
+		}
 	}
 
 	#settlePrompt(record: SessionRecord, waiter: PromptWaiter): void {
