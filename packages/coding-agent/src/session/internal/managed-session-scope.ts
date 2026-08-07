@@ -962,6 +962,32 @@ function assertOwnerOnlyApplied(pathname: string, kind: "directory" | "file"): v
 }
 
 /**
+ * Mode-only walk for managed-scope prepare self-heal.
+ * Throws `mode_mismatch` when any non-symlink descendant has group/other bits.
+ * Avoids snapshotManagedTree("") which races concurrent session writers (#3906).
+ */
+function assertOwnerOnlyModesRecursive(directory: string): void {
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(directory);
+	} catch {
+		return;
+	}
+	if (stat.isSymbolicLink()) return;
+	if ((stat.mode & 0o077) !== 0) throw new Error("mode_mismatch");
+	if (!stat.isDirectory()) return;
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(directory, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		assertOwnerOnlyModesRecursive(path.join(directory, entry.name));
+	}
+}
+
+/**
  * True when a managed setup error reflects a fixable owner-only *mode* drift
  * (group/other permission bits) rather than an ownership or identity change.
  * Only mode drift can be self-healed by re-applying owner-only permissions.
@@ -1029,13 +1055,13 @@ export function prepareManagedSessionScopeForWriteSync(
 		let store: ManagedSessionDescendantStore;
 		const openManagedStore = (): ManagedSessionDescendantStore => {
 			const next = buildStore();
-			// #3951 root-store identity binding no longer walks the full managed tree
-			// on construct. Explicitly snapshot so group/other-readable descendants
-			// still surface mode_mismatch and trigger self-heal instead of reporting
-			// resolved while modes like 0o036 remain on disk.
+			// #3951 root-store identity binding no longer walks the managed tree on
+			// construct, so mode drift no longer surfaces as mode_mismatch there.
+			// Detect group/other-readable descendants with a mode-only walk — do NOT
+			// call snapshotManagedTree("") here: that reintroduces concurrent-writer
+			// identity_mismatch races (#3906) that break SessionManager.moveTo /move.
 			if (retainedAuthority) {
-				const tree = retainedAuthority.snapshotManagedTree("");
-				if (!tree.ok) throw new Error(tree.code ?? "unsafe_artifacts");
+				assertOwnerOnlyModesRecursive(scope.directoryPath);
 			}
 			return next;
 		};
