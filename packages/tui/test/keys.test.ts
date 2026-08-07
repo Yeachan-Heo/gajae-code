@@ -39,6 +39,16 @@ describe("matchesKey", () => {
 		expect(matchesKey(dvorakCtrlK, "ctrl+v")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+	it("matches modified Korean Dubeolsik keys when Kitty omits the base-layout key", () => {
+		setKittyProtocolActive(true);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+v")).toBe(true);
+		expect(matchesKey("\x1b[12621;9u", "super+v")).toBe(true);
+		expect(matchesKey("\x1b[12621;3u", "alt+v")).toBe(true);
+		expect(matchesKey("\x1b[12621u", "v")).toBe(false);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+b")).toBe(false);
+		expect(matchesKey("\x1b[12621;5:3u", "ctrl+v")).toBe(false);
+		setKittyProtocolActive(false);
+	});
 
 	it("should prefer codepoint for symbol keys even when base layout differs", () => {
 		setKittyProtocolActive(true);

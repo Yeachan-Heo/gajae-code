@@ -179,7 +179,7 @@ cd ../my-task-worktree && gjc --tmux
 GJC accepts images in two ways:
 
 - **CLI startup**: prefix a local image path with `@`, for example `gjc @screenshot.png "What should I change?"`.
-- **Interactive TUI**: copy an image to the system clipboard and use the configured **Paste image from clipboard** key (Ctrl+V on Linux/macOS, Alt+V on Windows), or type `#paste-image` and choose the prompt action. When the clipboard is unavailable, paste or pass the image file path with `@path/to/image.png` instead.
+- **Interactive TUI**: copy an image to the system clipboard and use the configured **Paste image from clipboard** key (Command+V or Ctrl+V on macOS, Ctrl+V on Linux, Ctrl+V or Alt+V on Windows), or type `#paste-image` and choose the prompt action. Korean Dubeolsik input is normalized to the corresponding shortcut when a terminal reports modified keys through the Kitty keyboard protocol, even if it omits base-layout metadata. When the clipboard is unavailable, paste or pass the image file path with `@path/to/image.png` instead.
 
 Type `#` in the interactive editor to open prompt actions. In a tmux-backed session, choose **Scroll to previous user input** (for example via `#prev`) to enter tmux copy-mode at the previous rendered user message.
 

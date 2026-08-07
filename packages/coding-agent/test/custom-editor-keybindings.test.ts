@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { type AutocompleteProvider, parseKey } from "@gajae-code/tui";
+import { type AutocompleteProvider, parseKey, setKittyProtocolActive } from "@gajae-code/tui";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
-import { defaultMessageQueueKeysForPlatform, KEYBINDINGS } from "../src/config/keybindings";
+import {
+	defaultClipboardPasteImageKeysForPlatform,
+	defaultMessageQueueKeysForPlatform,
+	KEYBINDINGS,
+} from "../src/config/keybindings";
 import { CustomEditor } from "../src/modes/components/custom-editor";
 
 function ctrl(key: string): string {
@@ -25,6 +29,7 @@ function createEditor() {
 
 afterEach(() => {
 	vi.useRealTimers();
+	setKittyProtocolActive(false);
 });
 
 describe("CustomEditor command palette keybinding", () => {
@@ -295,19 +300,41 @@ describe("CustomEditor viewport paging", () => {
 	});
 });
 
-describe("CustomEditor pasteImage default sourced from KEYBINDINGS", () => {
-	it("intercepts the registry's platform-aware pasteImage default (single source of truth)", () => {
+describe("CustomEditor pasteImage platform defaults", () => {
+	it.each([
+		["darwin", "super+v", "\x1b[118;9u"],
+		["darwin", "ctrl+v", ctrl("v")],
+		["win32", "ctrl+v", ctrl("v")],
+		["win32", "alt+v", "\x1bv"],
+	] as const)("intercepts %s %s as image paste", (platform, _key, data) => {
 		const editor = createEditor();
 		const onPasteImage = vi.fn();
 		editor.onPasteImage = onPasteImage;
-
-		const def = KEYBINDINGS["app.clipboard.pasteImage"].defaultKeys;
-		const key = Array.isArray(def) ? def[0]! : def;
-		// ctrl+v on most platforms, alt+v on win32 — both come from the registry now.
-		const data = key === "alt+v" ? "\x1bv" : ctrl("v");
+		editor.setActionKeys("app.clipboard.pasteImage", defaultClipboardPasteImageKeysForPlatform(platform));
+		setKittyProtocolActive(data.startsWith("\x1b["));
 
 		editor.handleInput(data);
+
 		expect(onPasteImage).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+
+	it.each([
+		["darwin", "super+v", "\x1b[12621;9u"],
+		["darwin", "ctrl+v", "\x1b[12621;5u"],
+		["win32", "ctrl+v", "\x1b[12621;5u"],
+		["win32", "alt+v", "\x1b[12621;3u"],
+	] as const)("maps the Korean Dubeolsik V key for %s %s", (platform, _key, data) => {
+		const editor = createEditor();
+		const onPasteImage = vi.fn();
+		editor.onPasteImage = onPasteImage;
+		editor.setActionKeys("app.clipboard.pasteImage", defaultClipboardPasteImageKeysForPlatform(platform));
+		setKittyProtocolActive(true);
+
+		editor.handleInput(data);
+
+		expect(onPasteImage).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
 	});
 });
 

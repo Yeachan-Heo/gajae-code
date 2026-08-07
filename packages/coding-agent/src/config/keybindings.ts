@@ -74,8 +74,10 @@ export function defaultMessageQueueKeysForPlatform(platform: NodeJS.Platform = p
 	return platform === "win32" || platform === "darwin" ? "alt+q" : "alt+enter";
 }
 
-export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
-	return platform === "win32" ? "alt+v" : "ctrl+v";
+export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId[] {
+	if (platform === "darwin") return ["super+v", "ctrl+v"];
+	if (platform === "win32") return ["ctrl+v", "alt+v"];
+	return ["ctrl+v"];
 }
 
 /**
