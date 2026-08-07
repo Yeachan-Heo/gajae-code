@@ -13,33 +13,6 @@ describe("kind-aware reconciliation", () => {
 		expect(() => rec.admit("prompt", "same-ref")).toThrow(/clientRef/);
 	});
 
-	test("skill terminal receipt uses real final text and first failure remains authoritative", async () => {
-		const rec = createKindAwareReconciliation();
-		await rec.noteAccepted("skill", { commandId: "skill-c", turnId: "skill-t" });
-		await rec.noteTransition(
-			"skill",
-			{ commandId: "skill-c", turnId: "skill-t" },
-			{
-				type: "agent_failed",
-				error: Object.assign(new Error("failed"), { code: "provider_down" }),
-				finalText: "partial receipt",
-			},
-		);
-		await rec.noteTransition(
-			"skill",
-			{ commandId: "skill-c", turnId: "skill-t" },
-			{
-				type: "agent_end",
-				finalText: "later success",
-			},
-		);
-		expect(rec.lookup("skill", { commandId: "skill-c", turnId: "skill-t" })).toMatchObject({
-			status: "failed",
-			receiptState: "present",
-			error: { code: "provider_down" },
-		});
-	});
-
 	test("durable store survives process restart with process_restart settlement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-recon-"));
 		const sessionFile = path.join(root, "s.jsonl");

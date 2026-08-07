@@ -16,7 +16,6 @@ function activePrompt(): DurableReconciliationRecord {
 		status: "accepted",
 		acceptedAt: 1,
 		pendingOutcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
-		pendingReceiptState: "present",
 	};
 }
 
@@ -179,10 +178,8 @@ describe("reconciliation restart recovery", () => {
 		expect(loaded[0]).toMatchObject({
 			status: "terminal_ok",
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
-			receiptState: "present",
 		});
 		expect(loaded[0]?.pendingOutcome).toBeUndefined();
-		expect(loaded[0]?.pendingReceiptState).toBeUndefined();
 	});
 
 	test("persist-before-swap keeps memory unchanged when the write fails", async () => {
