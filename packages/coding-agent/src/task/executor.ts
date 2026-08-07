@@ -1847,8 +1847,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						setThinkingLevelForControl: (level, persist) => session.setThinkingLevelForControl(level, persist),
 						setThinkingVisibilityForControl: (visibility, persist) =>
 							session.setThinkingVisibilityForControl(visibility, persist),
-						setModelTemporaryForControl: (model, expectedSessionId) =>
-							session.setModelTemporaryForControl(model, expectedSessionId),
+						setModelTemporaryForControl: (model, expectedSessionId, thinkingLevel) =>
+							session.setModelTemporaryForControl(model, expectedSessionId, thinkingLevel),
 						fetchUsageReportsForControl: () => session.fetchUsageReportsForControl(),
 						getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 						getSessionName: () => session.sessionManager.getSessionName(),

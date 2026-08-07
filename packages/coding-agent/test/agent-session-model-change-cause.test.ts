@@ -81,10 +81,15 @@ describe("AgentSession model-change causes", () => {
 	test("runExtensionSetModel passes user-selection cause", async () => {
 		const model = { provider: "p", id: "m" } as unknown as Model;
 		const calls: Array<{ role?: string; cause?: string }> = [];
+		const materialized: Model[] = [];
 		const session = {
 			modelRegistry: { getApiKey: async () => "key" },
 			setModel: async (_model: Model, role?: string, options?: { cause?: string }) => {
 				calls.push({ role, cause: options?.cause });
+			},
+			materializeActiveDefaultModelProfileAssignment: (selected: Model) => {
+				materialized.push(selected);
+				return true;
 			},
 		};
 
@@ -93,6 +98,7 @@ describe("AgentSession model-change causes", () => {
 		expect(ok).toBe(true);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]).toEqual({ role: "default", cause: "user-selection" });
+		expect(materialized).toEqual([model]);
 	});
 
 	test("runExtensionSetModel returns false without an API key and does not set the model", async () => {

@@ -17,6 +17,16 @@ export class ModelBindingsApplier {
 	#lastAppliedRoles = new Map<string, ModelSelectorValue>();
 	#lastAppliedAgentOverrides = new Map<string, ModelSelectorValue>();
 
+	/** The currently configured bindings (as installed at startup), for baseline lookup. */
+	getBindings(): ConfiguredModelBindings | undefined {
+		return (
+			this.#bindings && {
+				modelRoles: this.#cloneBindings(this.#bindings.modelRoles),
+				agentModelOverrides: this.#cloneBindings(this.#bindings.agentModelOverrides),
+			}
+		);
+	}
+
 	setBindings(bindings: ConfiguredModelBindings | undefined): void {
 		this.#bindings = bindings && {
 			modelRoles: this.#cloneBindings(bindings.modelRoles),
@@ -31,6 +41,56 @@ export class ModelBindingsApplier {
 		}
 		this.#targetSettings = targetSettings;
 		this.apply();
+	}
+
+	/**
+	 * Re-assert configured bindings into the target override slots, bypassing
+	 * the user-edit-preservation heuristic. Used after a session-scoped profile
+	 * reset removes profile-installed keys, so configured role/agent routing is
+	 * restored exactly as it was installed at startup.
+	 */
+	forceApplyTo(targetSettings: Settings): void {
+		if (this.#targetSettings && this.#targetSettings !== targetSettings) {
+			this.#restoreTarget(this.#targetSettings);
+			this.#clearTargetLifecycle();
+		}
+		this.#targetSettings = targetSettings;
+		const bindings = this.#bindings;
+		if (!targetSettings) return;
+		const modelRoles = { ...(targetSettings.get("modelRoles") ?? {}) };
+		this.#forceSync(
+			modelRoles,
+			bindings?.modelRoles ?? {},
+			this.#appliedRoles,
+			this.#roleBaselines,
+			this.#lastAppliedRoles,
+		);
+		targetSettings.override("modelRoles", modelRoles);
+		const agentOverrides = { ...(targetSettings.get("task.agentModelOverrides") ?? {}) };
+		this.#forceSync(
+			agentOverrides,
+			bindings?.agentModelOverrides ?? {},
+			this.#appliedAgentOverrides,
+			this.#agentBaselines,
+			this.#lastAppliedAgentOverrides,
+		);
+		targetSettings.override("task.agentModelOverrides", agentOverrides);
+	}
+
+	#forceSync(
+		target: Record<string, ModelSelectorValue>,
+		configured: Record<string, ModelSelectorValue>,
+		applied: Set<string>,
+		baselines: Map<string, ModelSelectorValue | undefined>,
+		lastApplied: Map<string, ModelSelectorValue>,
+	): void {
+		for (const [key, value] of Object.entries(configured)) {
+			if (!baselines.has(key)) baselines.set(key, this.#clone(target[key]));
+			target[key] = this.#clone(value)!;
+			lastApplied.set(key, this.#clone(value)!);
+		}
+		applied.clear();
+		for (const key of Object.keys(configured)) applied.add(key);
 	}
 
 	apply(): void {

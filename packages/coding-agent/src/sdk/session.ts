@@ -2110,6 +2110,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const { createSdkWebSocketTransport } = await import("../sdk/host/websocket-transport");
 						createSdkSessionRuntimeExtension(api, {
 							createTransport: input => createSdkWebSocketTransport(input),
+							settings,
+							configOverrides: new Map(),
 						});
 					}
 				} catch (error) {

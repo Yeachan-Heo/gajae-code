@@ -26,7 +26,17 @@ describe("correlated steer production dispatch", () => {
 				ok: true,
 				result: { sessionId: host.sessionId, clientRef: "logical-steer-1", status: "accepted" },
 			});
-			const accepted = (first as { result: { commandId: string; turnId: string } }).result;
+			const accepted = (
+				first as {
+					result: {
+						clientRef: string;
+						commandId: string;
+						turnId: string;
+						status: string;
+						acceptedAt: string;
+					};
+				}
+			).result;
 			expect(accepted.commandId).toEqual(expect.any(String));
 			expect(accepted.turnId).toEqual(expect.any(String));
 			expect(host.dispatches.filter(dispatch => dispatch.deliverAs === "steer")).toHaveLength(1);
@@ -42,8 +52,17 @@ describe("correlated steer production dispatch", () => {
 				commandId: accepted.commandId,
 				turnId: accepted.turnId,
 			});
-			expect(byRef).toMatchObject({ ok: true, result: accepted });
-			expect(byCanonical).toMatchObject({ ok: true, result: accepted });
+			const durableStatus = {
+				clientRef: accepted.clientRef,
+				commandId: accepted.commandId,
+				turnId: accepted.turnId,
+				status: accepted.status,
+				acceptedAt: accepted.acceptedAt,
+			};
+			expect(byRef).toMatchObject({ ok: true, result: durableStatus });
+			expect(byCanonical).toMatchObject({ ok: true, result: durableStatus });
+			expect((byRef as { result: Record<string, unknown> }).result).not.toHaveProperty("sessionId");
+			expect((byCanonical as { result: Record<string, unknown> }).result).not.toHaveProperty("sessionId");
 			const sessionFile = host.session.sessionManager.getSessionFile();
 			expect(sessionFile).toEqual(expect.any(String));
 			const state = fs.readFileSync(

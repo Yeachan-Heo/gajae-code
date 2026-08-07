@@ -47,6 +47,7 @@ import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
+import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-model";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import {
 	buildToolCallStartUpdate,
@@ -497,7 +498,15 @@ function modelConfigOptions(
 	for (const item of pageItems(query)) {
 		const model = object(item);
 		if (!model || typeof model.provider !== "string" || typeof model.id !== "string") continue;
-		if (activeProviders !== undefined && !activeProviders.has(model.provider)) continue;
+		// The reserved `gajae-code` namespace is a logical facade, not a real
+		// active provider: the Q10 projection already availability-filters the
+		// synthetic rows, so the Q29 provider filter must not drop them.
+		if (
+			activeProviders !== undefined &&
+			model.provider !== SYNTHETIC_PROVIDER_ID &&
+			!activeProviders.has(model.provider)
+		)
+			continue;
 		const value = `${model.provider}/${model.id}`;
 		options.set(value, typeof model.name === "string" ? model.name : value);
 	}

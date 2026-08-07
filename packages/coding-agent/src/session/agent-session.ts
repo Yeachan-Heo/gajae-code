@@ -190,7 +190,12 @@ import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager, type OwnerS
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
-import { activateModelProfile } from "../config/model-profile-activation";
+import { activateModelProfile, materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
+import {
+	ModelProfileRegistryError,
+	UnknownModelProfileError,
+	validateModelProfileName,
+} from "../config/model-profile-contract";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
@@ -209,7 +214,7 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
-import { normalizeModelSelectorValue } from "../config/model-selector-value";
+import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/model-selector-value";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
@@ -325,6 +330,7 @@ import type { NetworkPrewarmRuntime } from "../runtime/network-prewarm-service";
 import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
 import { MCPManager } from "../runtime-mcp/manager";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
+import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
 import {
@@ -1813,6 +1819,9 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
+	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
+	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
 	#sessionAdmissionClosed = false;
@@ -7733,10 +7742,22 @@ export class AgentSession {
 	/** Live SDK configuration values exposed through the session query surface. */
 	getSdkConfigItems(): Record<string, string> {
 		const model = this.model;
-		const modelPreset = this.getActiveModelProfile() ?? this.settings.get("modelProfile.default");
+		const activeProfile = this.getActiveModelProfile();
+		const syntheticNamespaceAvailable = !syntheticNamespaceCollision(
+			this.#modelRegistry.getAll(),
+			this.#modelRegistry.getConfiguredProviderIds(),
+		);
+		const modelPreset = activeProfile ?? this.settings.get("modelProfile.default");
 		return {
 			mode: this.#planModeState?.enabled ? "plan" : "default",
-			...(model ? { model: `${model.provider}/${model.id}` } : {}),
+			...(model
+				? {
+						model:
+							activeProfile && syntheticNamespaceAvailable
+								? buildSyntheticModelId(activeProfile)
+								: `${model.provider}/${model.id}`,
+					}
+				: {}),
 			...(modelPreset ? { modelPreset } : {}),
 			thinking: this.#thinkingLevel ?? "off",
 			steeringMode: this.steeringMode,
@@ -9101,6 +9122,9 @@ export class AgentSession {
 			},
 			cycleModel: () => this.cycleModel(),
 			setModelProfile: name => this.activateModelProfileForControl(name),
+			setDefaultModelProfile: (name, options) => this.setDefaultModelProfileForControl(name, options),
+			getActiveModelProfile: () => this.getActiveModelProfile(),
+			withSdkControlMutation: body => this.withSdkControlMutation(body),
 			cycleThinkingLevel: () => this.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {
@@ -9129,6 +9153,8 @@ export class AgentSession {
 			sdkBindings: () => [
 				"cycleModel",
 				"setModelProfile",
+				"setDefaultModelProfile",
+				"getActiveModelProfile",
 				"cycleThinkingLevel",
 				"setQueueMode",
 				"getSkillState",
@@ -10548,6 +10574,25 @@ export class AgentSession {
 		nextDiscoverySessionToolNames: string[] | undefined,
 		previousSessionFile: string | undefined,
 	): Promise<void> {
+		// The successor session must not inherit the predecessor's profile marker
+		// or its runtime role overrides; a durable `modelProfile.default` is
+		// reapplied by the startup policy on a fresh launch instead.
+		const droppingSessionOnlyProfile =
+			this.getActiveModelProfile() !== undefined &&
+			this.settings.get("modelProfile.default") !== this.getActiveModelProfile();
+		const preProfileModel = this.#preProfileModel;
+		this.#resetSessionScopedModelProfileState();
+		// A dropped session-only profile must not leak its concrete model into
+		// the successor: restore the configured global default model before it is
+		// recorded as the new session's model.
+		if (droppingSessionOnlyProfile) {
+			// A session-only profile has no durable default, so its pre-activation
+			// model is the only correct restore target.
+			const restoredDefault = this.resolveConfiguredDefaultModel() ?? preProfileModel;
+			if (restoredDefault && (!this.model || !modelsAreEqual(this.model, restoredDefault))) {
+				this.#setModelAuthoritatively(restoredDefault, "restore");
+			}
+		}
 		this.#clearConstructorToolSelectionAuthority();
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevelMutationRevision++;
@@ -10769,7 +10814,116 @@ export class AgentSession {
 		return this.#activeModelProfile;
 	}
 
-	/** Activate a complete model profile through a nonvisual session control. */
+	/**
+	 * Drop the in-session profile marker and the runtime settings overrides a
+	 * session-only profile activation installed. Session transitions
+	 * (new/switch/resume) reuse the same `AgentSession`; without this reset, Q10
+	 * would report the predecessor's synthetic profile as current in the
+	 * successor session and the profile's role overrides would leak into its
+	 * turns.
+	 *
+	 * A durable profile (the active marker matching the persisted
+	 * `modelProfile.default`) stays configured for the successor: the startup
+	 * policy reapplies it on the next launch, so its marker and runtime role
+	 * overrides must survive the in-process transition.
+	 *
+	 * Only override keys a profile activation actually installed are removed:
+	 * configured `modelBindings` (also installed into these two override slots
+	 * once at startup) are not profile-owned and must survive the transition.
+	 */
+	#resetSessionScopedModelProfileState(): void {
+		const persistedProfile = this.settings.get("modelProfile.default");
+		if (persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile()) return;
+		const hadInstalledKeys =
+			this.#activeProfileInstalledRoles.size > 0 || this.#activeProfileInstalledAgentOverrides.size > 0;
+		if (hadInstalledKeys) {
+			const modelRoles = { ...this.settings.get("modelRoles") };
+			const agentOverrides = { ...this.settings.get("task.agentModelOverrides") };
+			for (const [role, baseline] of this.#activeProfileInstalledRoles) {
+				// The `default` role is rewritten durably by concrete picks and
+				// transitions; never shadow the newer durable value with a stale
+				// pre-profile override.
+				if (role === "default" || baseline === undefined) delete modelRoles[role];
+				else modelRoles[role] = baseline;
+			}
+			for (const [role, baseline] of this.#activeProfileInstalledAgentOverrides) {
+				if (baseline === undefined) delete agentOverrides[role];
+				else agentOverrides[role] = baseline;
+			}
+			this.settings.override("modelRoles", modelRoles);
+			this.settings.override("task.agentModelOverrides", agentOverrides);
+			this.#activeProfileInstalledRoles.clear();
+			this.#activeProfileInstalledAgentOverrides.clear();
+		}
+		// Configured modelBindings share these override slots with profile
+		// activations and must survive the drop even when the profile contributed
+		// no role keys; a profile-free transition leaves them untouched.
+		if (hadInstalledKeys || this.getActiveModelProfile() !== undefined) {
+			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
+		}
+		// A dropped profile may have installed a fallback chain; clear it so
+		// retry/resume does not reconstruct the stale profile chain.
+		const defaultChain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains.default;
+		if (defaultChain && defaultChain.identity !== undefined) {
+			this.setConfiguredModelChain("default", [], "user-selection");
+		}
+		this.setActiveModelProfile(undefined);
+		this.#preProfileModel = undefined;
+	}
+
+	/**
+	 * Record which runtime override keys a profile activation installed together
+	 * with their pre-profile effective baseline (durable/project value or a
+	 * configured `modelBindings` value). First activation for a key wins, so a
+	 * profile switch never captures the previous profile's roles as the
+	 * baseline. The session-scoped reset restores exactly these keys.
+	 */
+	noteProfileInstalledOverrides(
+		modelRoles: readonly string[],
+		agentModelOverrides: readonly string[],
+		preProfileModel: Model | undefined,
+	): void {
+		const bindings = this.#modelRegistry.getConfiguredModelBindings?.();
+		// Captured by the caller before activation replaced the runtime model; reading
+		// `this.model` here would record the profile's own model. First activation wins,
+		// so a chain of session-only profiles still restores the original selection.
+		if (this.#preProfileModel === undefined) this.#preProfileModel = preProfileModel;
+		for (const role of modelRoles) {
+			if (this.#activeProfileInstalledRoles.has(role)) continue;
+			const bindingValue = bindings?.modelRoles?.[role];
+			this.#activeProfileInstalledRoles.set(
+				role,
+				bindingValue ?? this.settings.getGlobal("modelRoles")?.[role as never],
+			);
+		}
+		for (const role of agentModelOverrides) {
+			if (this.#activeProfileInstalledAgentOverrides.has(role)) continue;
+			const bindingValue = bindings?.agentModelOverrides?.[role];
+			this.#activeProfileInstalledAgentOverrides.set(
+				role,
+				bindingValue ?? this.settings.getGlobal("task.agentModelOverrides")?.[role as never],
+			);
+		}
+	}
+
+	/** Drop the recorded profile-installed override keys (after materialization). */
+	clearProfileInstalledOverrides(): void {
+		this.#activeProfileInstalledRoles.clear();
+		this.#activeProfileInstalledAgentOverrides.clear();
+	}
+
+	/** Current profile-installed override keys, for deriving the activation base. */
+	getProfileInstalledOverrideKeys(): { modelRoles: readonly string[]; agentModelOverrides: readonly string[] } {
+		return {
+			modelRoles: [...this.#activeProfileInstalledRoles.keys()],
+			agentModelOverrides: [...this.#activeProfileInstalledAgentOverrides.keys()],
+		};
+	}
+
+	/**
+	 * Activate a complete model profile through a nonvisual session control.
+	 * Session-scoped only: does not persist `modelProfile.default`.
+	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
 		await activateModelProfile({
 			session: this,
@@ -10778,6 +10932,136 @@ export class AgentSession {
 			profileName,
 		});
 		return this.getActiveModelProfile() === profileName;
+	}
+
+	/**
+	 * Activate a model profile from a control surface.
+	 *
+	 * Control selections are session-scoped unless the caller explicitly opts
+	 * into persistence. The transaction canonicalizes the profile, performs
+	 * credential preflight, and serializes against other session admissions.
+	 * Unknown/registry profile failures are surfaced as SDK `invalid_input` so
+	 * the ACP adapter maps them to invalid params.
+	 */
+	/** Persist effective roles only when the active profile is a durable default. */
+	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
+		// A merged read could let a project-scoped value authorize durable global writes.
+		const persistedProfile = this.settings.getGlobal("modelProfile.default");
+		if (persistedProfile === undefined || persistedProfile !== this.getActiveModelProfile()) return false;
+		return materializeActiveModelProfileAssignment({
+			session: this,
+			settings: this.settings,
+			role: "default",
+			selector: formatModelSelectorValue(`${model.provider}/${model.id}`, this.thinkingLevel),
+		});
+	}
+
+	async setDefaultModelProfileForControl(
+		profileName: string,
+		options?: {
+			persistDefault?: boolean;
+			thinkingLevelOverride?: ThinkingLevel;
+			onBeforeActivation?: () => void;
+			onAfterActivation?: () => void;
+		},
+	): Promise<{ changed: boolean; id: string }> {
+		const canonicalName = await this.#withSessionAdmission("selection", async () => {
+			// A model-picker action must not alter an in-flight generation: wait
+			// for the current run to settle inside the admission before applying
+			// the profile, matching `setDefaultModelSelection`.
+			await this.waitForIdle();
+			const profiles = this.#modelRegistry.getModelProfiles();
+			let canonical: string;
+			try {
+				canonical = validateModelProfileName(profileName, profiles, this.#modelRegistry.getError?.());
+			} catch (error) {
+				if (error instanceof UnknownModelProfileError || error instanceof ModelProfileRegistryError)
+					throw Object.assign(new Error(error.message), { code: "invalid_input" });
+				throw error;
+			}
+			const priorModel = this.model;
+			options?.onBeforeActivation?.();
+			await activateModelProfile(
+				{
+					session: this,
+					modelRegistry: this.#modelRegistry,
+					settings: this.settings,
+					profileName: canonical,
+				},
+				{
+					persistDefault: options?.persistDefault ?? false,
+					thinkingLevelOverride: options?.thinkingLevelOverride,
+				},
+			);
+			options?.onAfterActivation?.();
+			// A role-only profile has no default model, so the activation never
+			// calls `setModelTemporary` — the only place that consumes the
+			// thinking override. Apply the override to the existing model so the
+			// typed synthetic result (e.g. `off`) is honest.
+			if (options?.thinkingLevelOverride !== undefined && this.model === priorModel) {
+				this.setThinkingLevel(options.thinkingLevelOverride);
+			}
+			return canonical;
+		});
+		return { changed: this.getActiveModelProfile() === canonicalName, id: canonicalName };
+	}
+
+	/**
+	 * Clear the active-profile marker after a successful concrete
+	 * materialization that persists as the session default with a
+	 * user-selection or startup-override cause. Internal temporary/fallback/
+	 * restore/rollback switches and the activation transaction itself (cause
+	 * `profile-activation`) never clear the marker.
+	 */
+	#clearActiveModelProfileForConcreteDefault(cause: ModelChangeCause | undefined): void {
+		if (cause !== "user-selection" && cause !== "startup-override") return;
+		// A persisted default profile is replaced by materializing its effective
+		// assignments into the durable layer first. A session-only marker is
+		// dropped together with the runtime role overrides the profile activation
+		// installed, so the concrete default takes effect for every role without
+		// writing the profile's role mappings globally.
+		if (this.model && this.settings.get("modelProfile.default") !== undefined) {
+			if (this.materializeActiveDefaultModelProfileAssignment(this.model)) return;
+		}
+		// A persisted default that no longer matches the dropped session-only
+		// marker is superseded: the concrete selection is now the durable
+		// default, so the next launch must not reapply the stale profile.
+		const persistedProfile = this.settings.get("modelProfile.default");
+		if (persistedProfile !== undefined && persistedProfile !== this.getActiveModelProfile()) {
+			this.settings.unset("modelProfile.default");
+			this.settings.clearOverride("modelProfile.default");
+		}
+		this.#resetSessionScopedModelProfileState();
+	}
+
+	/**
+	 * Drop a session-only profile marker and the runtime role overrides its
+	 * activation installed. Exposed for the extension `setModel` seam so a
+	 * concrete pick clears session-only profiles without materializing them
+	 * globally. A stale persisted default that no longer matches the dropped
+	 * marker is superseded by the concrete selection and removed.
+	 */
+	clearSessionOnlyModelProfileState(): void {
+		const persistedProfile = this.settings.get("modelProfile.default");
+		if (persistedProfile !== undefined && persistedProfile !== this.getActiveModelProfile()) {
+			this.settings.unset("modelProfile.default");
+			this.settings.clearOverride("modelProfile.default");
+		}
+		this.#resetSessionScopedModelProfileState();
+	}
+
+	/**
+	 * Run a control-surface mutation inside the session admission boundary so
+	 * SDK `config.patch` and other host mutations serialize against synthetic
+	 * profile activation and default-model selection.
+	 */
+	async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+		return this.#withSessionAdmission("selection", async () => {
+			// A config mutation can change the active model-role assignment. Do not
+			// alter an in-flight turn after its prompt admission lease has released.
+			await this.waitForIdle();
+			return await body();
+		});
 	}
 
 	/** Return the persisted configured fallback selectors for a model role. */
@@ -10931,6 +11215,7 @@ export class AgentSession {
 			// Apply explicit thinking level if given; otherwise prefer the model's
 			// configured defaultLevel; otherwise re-clamp the current level.
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
 			if (ownsScope) this.restoreTemporaryProviderSessionScope(scope);
@@ -11035,10 +11320,14 @@ export class AgentSession {
 	}
 
 	/** Set a durable per-session model from a control surface without exposing credential errors. */
-	async setModelTemporaryForControl(model: Model, expectedSessionId: string = this.sessionId): Promise<boolean> {
+	async setModelTemporaryForControl(
+		model: Model,
+		expectedSessionId: string = this.sessionId,
+		thinkingLevel?: ThinkingLevel,
+	): Promise<boolean> {
 		if (expectedSessionId !== this.sessionId) return false;
 		try {
-			await this.setModelTemporary(model, undefined, {
+			await this.setModelTemporary(model, thinkingLevel, {
 				persistAsSessionDefault: true,
 				cause: "user-selection",
 			});
@@ -11051,8 +11340,15 @@ export class AgentSession {
 	async setDefaultModelSelection(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
+		options?: {
+			/** Run inside the selection admission before the durable mutation. */
+			onBeforeMutation?: () => void;
+			/** Run inside the selection admission after the durable mutation. */
+			onAfterMutation?: () => void;
+		},
 	): Promise<DefaultModelSelectionResult> {
 		return this.#withSessionAdmission("selection", async () => {
+			options?.onBeforeMutation?.();
 			const expectedSessionId = this.sessionId;
 
 			if (thinkingLevel === ThinkingLevel.Inherit) {
@@ -11136,6 +11432,8 @@ export class AgentSession {
 					});
 				}
 			}
+			this.#clearActiveModelProfileForConcreteDefault("user-selection");
+			options?.onAfterMutation?.();
 			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 		});
 	}
@@ -11225,6 +11523,9 @@ export class AgentSession {
 			if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
 				this.setThinkingLevel(next.thinkingLevel);
 			}
+			// Materialize only after applying the selected explicit level so the
+			// durable selector matches the live cycle result after restart.
+			this.#clearActiveModelProfileForConcreteDefault("user-selection");
 		}
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
@@ -11265,9 +11566,10 @@ export class AgentSession {
 		const next = scopedModels[nextIndex];
 
 		await this.setModel(next.model, "default", { cause: "user-selection" });
-
-		// Apply the scoped model's configured thinking level
+		// Apply the scoped model's configured thinking level before persisting
+		// the materialized selector.
 		this.setThinkingLevel(next.thinkingLevel);
+		this.#clearActiveModelProfileForConcreteDefault("user-selection");
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
@@ -11290,6 +11592,9 @@ export class AgentSession {
 		}
 
 		await this.setModel(nextModel, "default", { cause: "user-selection" });
+		// Cycling is a concrete default materialization with no TUI
+		// materialization step; clear the active-profile marker.
+		this.#clearActiveModelProfileForConcreteDefault("user-selection");
 		// Re-apply the current thinking level for the newly selected model
 		this.setThinkingLevel(this.thinkingLevel);
 
@@ -16919,6 +17224,10 @@ export class AgentSession {
 					: configuredServiceTier === "none"
 						? undefined
 						: configuredServiceTier;
+				// Switching to another session file must not carry the predecessor's
+				// profile marker or role overrides into the successor; the successor's
+				// own configured model is restored above.
+				if (switchingToDifferentSession) this.#resetSessionScopedModelProfileState();
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
