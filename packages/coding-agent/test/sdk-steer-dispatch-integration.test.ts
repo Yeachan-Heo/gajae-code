@@ -15,29 +15,43 @@ afterEach(async () => {
 });
 
 describe("correlated steer production dispatch", () => {
-	it("durably reserves before dispatch and replays the same clientRef without a second effect", async () => {
+	it("persists normalized canonical correlation before one dispatch, replays, conflicts, and resolves both Q30 selectors", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-steer-production-"));
 		roots.push(root);
 		host = await startProductionSdkHost(root);
 		const client = await SdkClient.connect(host.endpoint.url, host.endpoint.token);
 		try {
-			const first = await client.control("turn.steer", { text: "one steer", clientRef: "logical-steer-1" });
-			const replay = await client.control("turn.steer", { text: "one steer", clientRef: "logical-steer-1" });
+			const first = await client.control("turn.steer", { text: "one steer", clientRef: " logical-steer-1 " });
 			expect(first).toMatchObject({
 				ok: true,
 				result: { sessionId: host.sessionId, clientRef: "logical-steer-1", status: "accepted" },
 			});
-			expect(replay).toMatchObject({
-				ok: true,
-				result: { sessionId: host.sessionId, clientRef: "logical-steer-1", status: "accepted" },
-			});
-			expect(host.observed.filter(row => row.operation === "turn.steer")).toHaveLength(2);
-			expect(host.session.getQueuedMessages().steering).toEqual(["one steer"]);
-			const status = await client.query("turn.steer_status", { clientRef: "logical-steer-1" });
-			expect(status).toMatchObject({
-				ok: true,
-				result: { clientRef: "logical-steer-1", status: "accepted" },
-			});
+			const accepted = (first as { result: { commandId: string; turnId: string } }).result;
+			expect(accepted.commandId).toEqual(expect.any(String));
+			expect(accepted.turnId).toEqual(expect.any(String));
+			expect(host.dispatches.filter(dispatch => dispatch.deliverAs === "steer")).toHaveLength(1);
+			const replay = await client.control("turn.steer", { text: "one steer", clientRef: "logical-steer-1" });
+			expect(replay).toMatchObject({ ok: true, result: accepted });
+			expect(host.dispatches.filter(dispatch => dispatch.deliverAs === "steer")).toHaveLength(1);
+			const conflict = await client.control("turn.steer", { text: "different steer", clientRef: "logical-steer-1" });
+			expect(conflict).toMatchObject({ ok: false, error: { code: "conflict" } });
+			expect(host.dispatches.filter(dispatch => dispatch.deliverAs === "steer")).toHaveLength(1);
+			const byRef = await client.query("turn.steer_status", { clientRef: "logical-steer-1" });
+			const byCanonical = await client.query("turn.steer_status", accepted);
+			expect(byRef).toMatchObject({ ok: true, result: accepted });
+			expect(byCanonical).toMatchObject({ ok: true, result: accepted });
+			const sessionFile = host.session.sessionManager.getSessionFile();
+			expect(sessionFile).toEqual(expect.any(String));
+			const state = fs.readFileSync(
+				path.join(path.dirname(sessionFile!), ".sdk-reconciliation", `${host.sessionId}.json`),
+				"utf8",
+			);
+			expect(state).not.toContain("one steer");
+			const uncorrelated = await client.control("turn.steer", { text: "compatibility steer" });
+			expect(uncorrelated).toMatchObject({ ok: true, result: { accepted: true } });
+			const uncorrelatedResult = (uncorrelated as { result: { commandId?: string; turnId?: string } }).result;
+			expect(uncorrelatedResult.commandId).toEqual(expect.any(String));
+			expect(uncorrelatedResult.turnId).toEqual(expect.any(String));
 		} finally {
 			await client.close();
 		}

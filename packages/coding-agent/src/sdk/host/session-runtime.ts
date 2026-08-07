@@ -641,8 +641,8 @@ function createControlSurface(
 	api: ExtensionAPI,
 	reconciliation: InvocationReconciliation,
 	onAccepted: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
+	steerReconciliation: KindAwareReconciliation,
 	policy?: SdkSurfacePolicy,
-	steerReconciliation?: KindAwareReconciliation,
 ): ControlSurface {
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -755,10 +755,11 @@ function createControlSurface(
 		steer: async (text, clientRef) => {
 			const retainedClientRef = normalizeClientRef(clientRef);
 			if (retainedClientRef === undefined) {
+				const correlation = newCorrelation();
 				await api.sendUserMessage(text, { deliverAs: "steer" });
-				return { accepted: true, commandId: crypto.randomUUID() };
+				return { accepted: true, ...correlation };
 			}
-			const durable = steerReconciliation ?? (reconciliation as unknown as KindAwareReconciliation);
+			const durable = steerReconciliation;
 			const reservation = await durable.reserveSteer(retainedClientRef, text);
 			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
 			try {
@@ -977,8 +978,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(kind, correlation) => {
 				pending.push({ kind, correlation });
 			},
-			surfaceFactory.policy,
 			steerReconciliation,
+			surfaceFactory.policy,
 		);
 		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {

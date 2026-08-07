@@ -2386,9 +2386,10 @@ function sdkControlSurface(
 		return "unknown";
 	};
 	const sendSteer = async (text: string, clientRef?: string) => {
-		if (!clientRef) {
+		if (clientRef === undefined) {
+			const correlation = { commandId: crypto.randomUUID(), turnId: crypto.randomUUID() };
 			await api.sendUserMessage(text, { deliverAs: "steer" });
-			return { commandId: crypto.randomUUID(), accepted: true };
+			return { ...correlation, accepted: true };
 		}
 		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
 			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });

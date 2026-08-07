@@ -24,6 +24,7 @@ export async function startProductionSdkHost(
 	session: Awaited<ReturnType<typeof createAgentSession>>["session"];
 	endpointMtimeMs: number;
 	observed: Array<{ kind: "control" | "query"; operation: string }>;
+	dispatches: Array<{ deliverAs?: string }>;
 	triggerAsk: (
 		question: string,
 		options: string[],
@@ -38,6 +39,7 @@ export async function startProductionSdkHost(
 	stop: () => Promise<void>;
 }> {
 	const observed: Array<{ kind: "control" | "query"; operation: string }> = [];
+	const dispatches: Array<{ deliverAs?: string }> = [];
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const fixtureEnv = createFixtureBrokerEnvironment(agentDir, agentDir);
 	return withFixtureBrokerEnvironment(async () => {
@@ -91,6 +93,11 @@ export async function startProductionSdkHost(
 				},
 				dispose: () => session.dispose(),
 			});
+			const originalSendUserMessage = session.sendUserMessage.bind(session);
+			session.sendUserMessage = async (content, options) => {
+				dispatches.push({ deliverAs: options?.deliverAs });
+				return await originalSendUserMessage(content, options);
+			};
 			if (options.acceptPromptPreflightWithoutExecution) {
 				session.sendUserMessage = async (_content, promptOptions) => {
 					if (promptOptions?.onPreflightAcceptCommit) await promptOptions.onPreflightAcceptCommit();
@@ -136,6 +143,7 @@ export async function startProductionSdkHost(
 				sessionId: session.sessionId,
 				session,
 				observed,
+				dispatches,
 				triggerAsk,
 				triggerGate,
 				stop: () => cleanupFixtureRoot(cleanup),
