@@ -22,6 +22,7 @@ import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/type
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
 import type { SessionContext } from "@gajae-code/coding-agent/session/session-manager";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { Container } from "@gajae-code/tui";
 
 beforeAll(() => {
 	initTheme();
@@ -59,7 +60,7 @@ function makeCtx(sessionManager?: Pick<SessionManager, "buildSessionContext" | "
 
 	const ctx = {
 		chatContainer: { clear: vi.fn(), addChild: vi.fn() },
-		pendingMessagesContainer: { clear: vi.fn() },
+		pendingMessagesContainer: new Container(),
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
 		sessionManager: sm,
