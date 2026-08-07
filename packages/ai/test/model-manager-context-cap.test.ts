@@ -50,7 +50,7 @@ describe("model manager Codex GPT-5.6 cap", () => {
 		expect(result.models[0]?.contextWindow).toBe(372_000);
 	});
 
-	it("prefers a newly observed smaller live cap over stale larger cache metadata", async () => {
+	it("forces the 372K window over stale larger cache metadata and smaller live observations", async () => {
 		const now = () => 1_800_000_000_000;
 		writeModelCache("openai-codex", now(), [codexModel(373_000)], true, "empty", cacheDbPath);
 		const result = await resolveProviderModels<Api>(
@@ -63,7 +63,7 @@ describe("model manager Codex GPT-5.6 cap", () => {
 			},
 			"online",
 		);
-		expect(result.models[0]?.contextWindow).toBe(200_000);
+		expect(result.models[0]?.contextWindow).toBe(372_000);
 	});
 
 	it("applies GPT-5.6 pricing to dynamically discovered models without a static entry", async () => {

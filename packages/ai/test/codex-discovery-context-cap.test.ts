@@ -34,19 +34,20 @@ const GPT_5_6_TIER_IDS = ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-lu
 const NON_TIER_CODEX_IDS = ["gpt-5.5", "gpt-5.6-codex"] as const;
 
 describe("Codex GPT-5.6 discovery context cap", () => {
-	it("applies the 372K fallback and ceiling to every GPT-5.6 tier id", async () => {
+	it("forces the 372K window for every GPT-5.6 tier id", async () => {
 		for (const id of GPT_5_6_TIER_IDS) {
 			expect(await discover(id, undefined)).toBe(372_000);
 			expect(await discover(id, 373_000)).toBe(372_000);
 			expect(await discover(id, 1_050_000)).toBe(372_000);
-			expect(await discover(id, 200_000)).toBe(200_000);
+			// Even smaller live metadata is overridden — the tier is forced to 372K.
+			expect(await discover(id, 200_000)).toBe(372_000);
 		}
 	});
 
 	it("keeps the generic 272K fallback for non-5.6 Codex rows and passes live values through", async () => {
 		for (const id of NON_TIER_CODEX_IDS) {
 			// The 272K pin for these ids is applied by the generated-catalog policy
-			// (model-thinking), so raw discovery must not advertise the 372K authority.
+			// (model-thinking), so raw discovery must not advertise the 372K window.
 			expect(await discover(id, undefined)).toBe(272_000);
 			expect(await discover(id, 373_000)).toBe(373_000);
 		}

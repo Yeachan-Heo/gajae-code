@@ -7,7 +7,7 @@
 
 ### Changed
 
-- Raised the enforced OpenAI code (Codex) GPT-5.6 family prompt budget from 272K to 372K input tokens: `CODEX_GPT_5_6_CONTEXT_CAP` fallback/ceiling is now 372K, live `openai-codex` discovery metadata above 372K is capped to it, and the bundled `openai-codex` GPT-5.6 Sol/Terra/Luna catalog entries now advertise 372K context. Smaller observed live limits remain authoritative, first-party OpenAI and non-5.6 codex variants (e.g. `gpt-5.4-codex`, `gpt-5.6-codex`) are untouched, and the 272K long-context pricing threshold is unchanged.
+- Forced the OpenAI code (Codex) GPT-5.6 family prompt budget to 372K input tokens: `CODEX_GPT_5_6_CONTEXT_CAP.enforced` is 372K and is applied as a hard override at discovery (`resolveCodexGpt56DiscoveryContext`), generated-catalog policy (`applyGpt56ContextWindow`), and final model-manager cap (`applyFinalCodexGpt56ContextCap`). The live backend metadata still reports the old 272K budget for the tier, so smaller observations are overridden rather than preserved. The bundled `openai-codex` GPT-5.6 Sol/Terra/Luna catalog entries now advertise 372K context (matching `bun run generate-models` output). Non-5.6 codex variants (`gpt-5.5`, `gpt-5.4-codex`, `gpt-5.6-codex`, GPT-5.4 mini/nano) keep the generic 272K budget via the shared `CODEX_GENERIC_CONTEXT_WINDOW`, first-party OpenAI is untouched, and the 272K long-context pricing threshold is unchanged.
 
 ### Fixed
 

@@ -545,9 +545,10 @@ function applyGpt56ContextWindow(model: ApiModel<Api>): boolean {
 	if (!isCodexGpt56Tier(model) || !isCodexProductTransport(model)) {
 		return false;
 	}
-	// Codex product metadata is bounded by the currently enforced prompt cap.
-	// Smaller observed limits remain authoritative; first-party OpenAI is untouched.
-	model.contextWindow = Math.min(model.contextWindow, CODEX_GPT_5_6_CONTEXT_CAP.ceiling);
+	// Force the enforced 372K window: the OpenAI code backend metadata still
+	// under-reports the GPT-5.6 tier budget, and smaller observed values would
+	// otherwise keep the tier at the old 272K cap. First-party OpenAI is untouched.
+	model.contextWindow = CODEX_GPT_5_6_CONTEXT_CAP.enforced;
 	return true;
 }
 
