@@ -377,13 +377,36 @@ async function replaceWithExpectedIdentity(
 	if (!destination) {
 		if (expectedExists)
 			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
-		const published = options.noReplace
-			? await options.noReplace(tempPath, configPath)
-			: ((await runNativeAtomicYamlWorker({
-					operation: "no-replace",
-					sourcePath: tempPath,
-					destinationPath: configPath,
-				})) as NativeNoReplaceResult);
+		const publishOnce = async (): Promise<NativeNoReplaceResult> =>
+			options.noReplace
+				? await options.noReplace(tempPath, configPath)
+				: ((await runNativeAtomicYamlWorker({
+						operation: "no-replace",
+						sourcePath: tempPath,
+						destinationPath: configPath,
+					})) as NativeNoReplaceResult);
+		const publishOnceWithLink = async (): Promise<NativeNoReplaceResult> =>
+			options.noReplace
+				? await options.noReplace(tempPath, configPath)
+				: ((await runNativeAtomicYamlWorker({
+						operation: "no-replace-link",
+						sourcePath: tempPath,
+						destinationPath: configPath,
+					})) as NativeNoReplaceResult);
+		let published = await publishOnce();
+		if (
+			!published.ok &&
+			(published.reason === "invalid_request" || published.reason === "atomic_unavailable") &&
+			published.mutationState === "not_committed" &&
+			published.durabilityState === "not_attempted"
+		) {
+			// RENAME_NOREPLACE is unsupported (NFS, kernels before 3.15): the native
+			// linkat fallback keeps the no-overwrite guarantee (EEXIST on an
+			// occupied destination) and is safe because the rename reported a
+			// pre-mutation refusal. The staged name survives a link, so the caller
+			// still unlinks it after publication.
+			published = await publishOnceWithLink();
+		}
 		if (published.ok) return;
 		if (published.reason === "destination_exists") {
 			const actual = await currentYamlFileState(configPath);

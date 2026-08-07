@@ -1,6 +1,6 @@
 import { parentPort } from "node:worker_threads";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
-import { exactReplacePath, renameNoReplacePath } from "@gajae-code/natives";
+import { exactReplacePath, linkNoReplacePath, renameNoReplacePath } from "@gajae-code/natives";
 
 export type AtomicYamlNativeWorkerRequest =
 	| {
@@ -12,6 +12,11 @@ export type AtomicYamlNativeWorkerRequest =
 	  }
 	| {
 			operation: "no-replace";
+			sourcePath: string;
+			destinationPath: string;
+	  }
+	| {
+			operation: "no-replace-link";
 			sourcePath: string;
 			destinationPath: string;
 	  };
@@ -33,7 +38,9 @@ port.once("message", (request: AtomicYamlNativeWorkerRequest) => {
 						request.expectedSource,
 						request.expectedDestination,
 					)
-				: renameNoReplacePath(request.sourcePath, request.destinationPath);
+				: request.operation === "no-replace-link"
+					? linkNoReplacePath(request.sourcePath, request.destinationPath)
+					: renameNoReplacePath(request.sourcePath, request.destinationPath);
 		port.postMessage({ type: "result", result } satisfies AtomicYamlNativeWorkerResponse);
 	} catch (error) {
 		const failure = error instanceof Error ? error : new Error(String(error));

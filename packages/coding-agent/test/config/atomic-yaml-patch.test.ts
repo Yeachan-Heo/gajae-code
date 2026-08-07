@@ -391,6 +391,47 @@ describe("atomic YAML patches", () => {
 		expect((await fs.readdir(path.dirname(configPath))).filter(entry => entry.endsWith(".tmp"))).toHaveLength(1);
 	});
 
+	test("retries an unsupported no-replace publish with the link fallback", async () => {
+		const configPath = await configPathForTest();
+		let calls = 0;
+
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			await tx.applyPatches([{ path: "durable.value", op: "set", value: "new" }], {
+				noReplace: async (_sourcePath, destinationPath) => {
+					calls++;
+					if (calls === 1) {
+						// RENAME_NOREPLACE unsupported (NFS / kernel < 3.15): a clean
+						// pre-mutation refusal that permits the linkat fallback.
+						return {
+							ok: false,
+							reason: "atomic_unavailable",
+							code: "ENOSYS",
+							mutationState: "not_committed",
+							durabilityState: "not_attempted",
+							primitive: "renameat2",
+							phase: "publish",
+							diagnostic: { schemaVersion: 1, collectionState: "not_committed" },
+						};
+					}
+					// linkat publishes without consuming the staging name.
+					await fs.writeFile(destinationPath, YAML.stringify({ durable: { value: "new" } }, null, 2));
+					return {
+						ok: true,
+						reason: "ok",
+						mutationState: "committed",
+						durabilityState: "proven",
+						primitive: "linkat_noreplace",
+						phase: "complete",
+						diagnostic: { schemaVersion: 1, collectionState: "committed" },
+					};
+				},
+			});
+		});
+
+		expect(calls).toBe(2);
+		expect(await readYaml(configPath)).toEqual({ durable: { value: "new" } });
+	});
+
 	test("retains staging after an ambiguous no-replace publication", async () => {
 		const configPath = await configPathForTest();
 

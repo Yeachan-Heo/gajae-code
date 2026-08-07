@@ -196,6 +196,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: path.join(agentDir, "config.yml"),
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -245,6 +247,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: path.join(agentDir, "config.yml"),
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -327,6 +331,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: path.join(agentDir, "config.yml"),
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -563,6 +569,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -615,6 +623,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -647,6 +657,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ultragoal.nudgeBudget"], // NOT maxIterations
 				startedAt: new Date().toISOString(),
@@ -676,6 +688,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ultragoal.nudgeBudget"],
 				startedAt: new Date().toISOString(),
@@ -713,6 +727,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -755,6 +771,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.deepInterview.ambiguityThreshold", "gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -796,6 +814,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ralplan.autoHandoff"],
 				startedAt: new Date().toISOString(),
@@ -831,6 +851,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -979,6 +1001,43 @@ describe("config-root workflow settings migration", () => {
 		// SECOND edit still has a comparison basis.
 		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":12}');
 		expect((await runProbe(cwd, { home, configDir: ".myconfig" })).targetValue).toBe(12);
+	});
+
+	test("the refreshed reconcile backup stays owner-only", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source, agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		const target = path.join(agentDir, "config.yml");
+		const oldRaw = '{"gjc.ralplan.maxIterations":7}';
+		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
+		await fs.writeFile(`${source}.bak`, oldRaw);
+		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":9}');
+		const oldSourceHash = createHash("sha256").update(oldRaw).digest("hex");
+		const agentIdentity = await fs.stat(agentDir);
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "complete",
+				sourcePath: source,
+				backupPath: `${source}.bak`,
+				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${agentIdentity.dev}:${agentIdentity.ino}`,
+				sourceSha256: oldSourceHash,
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+				completedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(result.targetValue).toBe(9);
+		// The refreshed backup holds the FULL legacy document; a 022 umask must
+		// never make it world-readable (0o600, not 0o644).
+		const backupMode = (await fs.stat(`${source}.bak`)).mode & 0o777;
+		expect(backupMode).toBe(0o600);
 	});
 
 	test("reconciled completion binds to the directory that received the repairs", async () => {
@@ -1204,6 +1263,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ralplan.maxIterations", "gjc.ultragoal.nudgeBudget"],
 				startedAt: new Date().toISOString(),
@@ -1242,6 +1303,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: oldSourceHash,
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -1274,6 +1337,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: createHash("sha256").update(sourceRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
@@ -1291,6 +1356,41 @@ describe("config-root workflow settings migration", () => {
 		await fs.rm(source, { force: true });
 		const afterDelete = await runProbe(cwd, { home, configDir: ".myconfig" });
 		expect(afterDelete.targetValue).toBe(9);
+	});
+
+	test("an identity-less pending marker never applies recovery claims", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source, agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		const target = path.join(agentDir, "config.yml");
+		const oldRaw = '{"gjc.ralplan.maxIterations":7}';
+		// A (possibly replaced) profile holds a genuine value matching the old
+		// backup; an identity-less pending marker from an older build cannot
+		// prove this value is migration-owned, so recovery must refuse its claims.
+		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
+		await fs.writeFile(`${source}.bak`, oldRaw);
+		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":9}'); // edited legacy source
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "pending",
+				sourcePath: source,
+				backupPath: `${source}.bak`,
+				targetPath: target,
+				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		// Claims refused: the genuine override is never unset, and the recovery
+		// artifacts are left untouched for diagnosis.
+		expect(result.targetValue).toBe(7);
+		expect(result.backupExists).toBe(true);
+		expect(result.markerStatus).toBe("pending");
 	});
 
 	test("a pending marker for a replaced agent directory never claims the new profile", async () => {
@@ -1442,6 +1542,8 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
 				sourceSha256: createHash("sha256").update(proposedRaw).digest("hex"),
 				priorSourceSha256: createHash("sha256").update(originalRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],

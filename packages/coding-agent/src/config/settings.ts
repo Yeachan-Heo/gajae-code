@@ -1590,13 +1590,25 @@ export class Settings implements NotificationSettingsReader {
 				// for a PENDING marker (claims never completed) and for a COMPLETE
 				// marker (deletion recovery or reconcile would otherwise overwrite
 				// or unset a genuine value in the new profile).
-				if (
-					(marker?.status === "pending" || marker?.status === "complete") &&
+				if (marker?.status === "pending") {
+					const pendingMarkerIdentity = marker.canonicalTargetIdentity;
+					if (
+						typeof pendingMarkerIdentity !== "string" ||
+						pendingMarkerIdentity.length === 0 ||
+						(await this.#statIdentity(path.dirname(target))) !== pendingMarkerIdentity
+					) {
+						this.#warnLegacyFallbackMigration(
+							`Settings: config-root workflow migration pending marker at ${markerPath} lacks or mismatches the target directory identity; treating it as invalid so recovery never applies its claims to the current profile`,
+						);
+						marker = null;
+					}
+				} else if (
+					marker?.status === "complete" &&
 					typeof marker.canonicalTargetIdentity === "string" &&
 					(await this.#statIdentity(path.dirname(target))) !== marker.canonicalTargetIdentity
 				) {
 					this.#warnLegacyFallbackMigration(
-						`Settings: config-root workflow migration ${marker?.status} marker at ${markerPath} targets a replaced agent directory; treating it as invalid so the migration re-runs into the current profile`,
+						`Settings: config-root workflow migration complete marker at ${markerPath} targets a replaced agent directory; treating it as invalid so the migration re-runs into the current profile`,
 					);
 					marker = null;
 				}
@@ -2819,12 +2831,15 @@ export class Settings implements NotificationSettingsReader {
 		const backupDir = path.dirname(backup);
 		const backupTemp = path.join(backupDir, `.${path.basename(backup)}.${process.pid}.${randomUUID()}.tmp`);
 		try {
-			await Bun.write(backupTemp, currentSourceText);
-			// Durable before the rename: a host crash or power loss after the
-			// complete marker must not leave a marker pointing at a missing or
-			// stale backup.
-			const backupTempHandle = await fs.promises.open(backupTemp, "r");
+			// Owner-only (0o600): the refreshed backup holds the FULL legacy
+			// settings document, and a 022 umask would otherwise give the renamed
+			// .bak world-readable permissions even when the source was 0600.
+			const backupTempHandle = await fs.promises.open(backupTemp, "w", 0o600);
 			try {
+				await backupTempHandle.writeFile(currentSourceText, "utf8");
+				// Durable before the rename: a host crash or power loss after the
+				// complete marker must not leave a marker pointing at a missing or
+				// stale backup.
 				await backupTempHandle.sync();
 			} finally {
 				await backupTempHandle.close();
