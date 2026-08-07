@@ -39,7 +39,11 @@ describe("SDK steer reconciliation", () => {
 		expect((store.snapshot()[0] as { textDigest: string }).textDigest).toMatch(/^[0-9a-f]{64}$/);
 		await reconciliation.settleSteer("logical-1", "accepted");
 		const replay = await reconciliation.reserveSteer("logical-1", "secret steer body");
-		expect(replay).toEqual({ replay: true, result: { clientRef: "logical-1", status: "accepted", acceptedAt: 10 } });
+		expect(replay).toMatchObject({
+			replay: true,
+			result: { clientRef: "logical-1", status: "accepted", acceptedAt: 10 },
+		});
+		expect(replay.result).toMatchObject({ commandId: expect.any(String), turnId: expect.any(String) });
 	});
 
 	test("same reference with another digest conflicts", async () => {

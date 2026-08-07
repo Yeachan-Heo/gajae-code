@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 /**
  * Kind-aware invocation reconciliation (prompt | skill) with optional durable store.
  * Preserves Q26 admit/first-terminal/capacity/TTL semantics; indexes and caps are per-kind.
@@ -26,9 +26,11 @@ export interface KindCorrelation extends PromptCorrelation {
 }
 
 export interface SteerReconciliationResult {
+	commandId: string;
+	turnId: string;
 	clientRef: string;
 	status: "accepted" | "rejected" | "uncertain";
-	acceptedAt?: number;
+	acceptedAt: number;
 	terminalAt?: number;
 	error?: { code: string; message: string };
 }
@@ -71,7 +73,9 @@ export interface KindAwareReconciliation {
 		status: "accepted" | "rejected" | "uncertain",
 		error?: unknown,
 	): Promise<SteerReconciliationResult>;
-	lookupSteer(clientRef: string): SteerReconciliationResult | { clientRef: string; status: "unknown" };
+	lookupSteer(
+		selector: string | { commandId?: string; turnId?: string; clientRef?: string },
+	): SteerReconciliationResult | { clientRef?: string; status: "unknown" };
 	cleanup(): void;
 	activeCount(kind: ReconciliationKind): number;
 	/** Hydrate from durable store (call once at session host start). */
@@ -94,10 +98,12 @@ export function createKindAwareReconciliation(
 	const refKey = (kind: ReconciliationKind, clientRef: string) => `${kind}\0${clientRef}`;
 	const steerKey = (clientRef: string) => `steer:${clientRef}`;
 	const steerResult = (record: DurableSteerReconciliationRecord): SteerReconciliationResult => ({
+		commandId: record.commandId,
+		turnId: record.turnId,
 		clientRef: record.clientRef,
 		status: record.status === "dispatching" ? "uncertain" : record.status,
-		...(record.status === "accepted" ? { acceptedAt: record.settledAt } : {}),
-		...(record.status !== "accepted" ? { terminalAt: record.settledAt } : {}),
+		acceptedAt: record.acceptedAt,
+		...(record.status !== "dispatching" && record.status !== "accepted" ? { terminalAt: record.settledAt } : {}),
 		...(record.error
 			? { error: record.error }
 			: record.status === "dispatching"
@@ -175,11 +181,14 @@ export function createKindAwareReconciliation(
 					});
 				return { value: { replay: true, result: steerResult(existing) }, changed: false };
 			}
+			const correlation = { commandId: randomUUID(), turnId: randomUUID() };
 			const record: DurableSteerReconciliationRecord = {
 				kind: "steer",
+				...correlation,
 				clientRef,
 				textDigest,
 				createdAt: now(),
+				acceptedAt: now(),
 				status: "dispatching",
 			};
 			candidate.set(steerKey(clientRef), record);
@@ -200,9 +209,25 @@ export function createKindAwareReconciliation(
 			return { value: steerResult(record), changed: true };
 		});
 
-	const lookupSteer = (clientRef: string) => {
-		const record = records.get(steerKey(clientRef));
-		return record?.kind === "steer" ? steerResult(record) : { clientRef, status: "unknown" as const };
+	const lookupSteer = (selector: string | { commandId?: string; turnId?: string; clientRef?: string }) => {
+		const record =
+			typeof selector === "string"
+				? records.get(steerKey(selector))
+				: selector.clientRef !== undefined
+					? records.get(steerKey(selector.clientRef))
+					: selector.commandId !== undefined && selector.turnId !== undefined
+						? [...records.values()].find(
+							candidate =>
+								candidate.kind === "steer" &&
+								candidate.commandId === selector.commandId &&
+								candidate.turnId === selector.turnId,
+						)
+						: undefined;
+		return record?.kind === "steer"
+			? steerResult(record)
+			: typeof selector === "string"
+				? { clientRef: selector, status: "unknown" as const }
+				: { status: "unknown" as const };
 	};
 
 	const reservedFor = (kind: ReconciliationKind) => {

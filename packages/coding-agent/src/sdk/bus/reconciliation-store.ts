@@ -45,9 +45,9 @@ export interface DurableSteerReconciliationRecord {
 	status: "dispatching" | "accepted" | "rejected" | "uncertain";
 	settledAt?: number;
 	error?: { code: string; message: string };
-	commandId?: never;
-	turnId?: never;
-	acceptedAt?: never;
+	commandId: string;
+	turnId: string;
+	acceptedAt: number;
 	startedAt?: never;
 	terminalAt?: never;
 	outcome?: never;
@@ -115,6 +115,9 @@ function isValidRecord(value: unknown): boolean {
 		if (typeof value.clientRef !== "string" || !value.clientRef) return false;
 		if (typeof value.textDigest !== "string" || !/^[0-9a-f]{64}$/.test(value.textDigest)) return false;
 		if (typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt)) return false;
+		if (typeof value.commandId !== "string" || !value.commandId || typeof value.turnId !== "string" || !value.turnId)
+			return false;
+		if (typeof value.acceptedAt !== "number" || !Number.isFinite(value.acceptedAt)) return false;
 		if (!["dispatching", "accepted", "rejected", "uncertain"].includes(value.status as string)) return false;
 		const settled = value.status !== "dispatching";
 		if (settled !== (typeof value.settledAt === "number" && Number.isFinite(value.settledAt))) return false;
@@ -124,12 +127,7 @@ function isValidRecord(value: unknown): boolean {
 			(!isRecord(value.error) || typeof value.error.code !== "string" || typeof value.error.message !== "string")
 		)
 			return false;
-		return (
-			value.commandId === undefined &&
-			value.turnId === undefined &&
-			value.receiptState === undefined &&
-			value.outcome === undefined
-		);
+		return value.receiptState === undefined && value.outcome === undefined;
 	}
 	if (kind !== "prompt" && kind !== "skill") return false;
 	const {

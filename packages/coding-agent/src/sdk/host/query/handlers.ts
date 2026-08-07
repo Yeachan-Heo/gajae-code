@@ -550,18 +550,28 @@ export class QueryHandlers {
 		if (request.cursor)
 			return this.#error(request, "invalid_request", false, "turn.steer_status does not support cursors.");
 		const input = request.input ?? {};
-		const rawClientRef = input.clientRef;
-		const clientRef = typeof rawClientRef === "string" ? rawClientRef.trim() : "";
-		if (Object.keys(input).length !== 1 || !clientRef || clientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH)
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"turn.steer_status requires exactly one valid clientRef.",
-			);
+		for (const key of Object.keys(input))
+			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
+				return this.#error(request, "invalid_request", false, `turn.steer_status does not accept selector field "${key}".`);
+		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
+		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
+		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
+		const clientRef = rawClientRef?.trim() || undefined;
+		if (rawClientRef !== undefined && (!clientRef || clientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
+			return this.#error(request, "invalid_request", false, "clientRef must be a non-empty string of at most 128 characters.");
+		if ((commandId === undefined) !== (turnId === undefined))
+			return this.#error(request, "invalid_request", false, "commandId and turnId must be provided together.");
+		if (commandId !== undefined && clientRef !== undefined)
+			return this.#error(request, "invalid_request", false, "Provide exactly one selector: a commandId/turnId pair or a clientRef.");
+		if (commandId === undefined && clientRef === undefined)
+			return this.#error(request, "invalid_request", false, "turn.steer_status requires a commandId/turnId pair or a clientRef.");
 		if (typeof this.surface.getSteerStatus !== "function")
 			return this.#error(request, "unavailable", false, "turn.steer_status is unavailable for this session.");
-		return { id: request.id, ok: true, result: await this.surface.getSteerStatus({ clientRef }) };
+		return {
+			id: request.id,
+			ok: true,
+			result: await this.surface.getSteerStatus(clientRef !== undefined ? { clientRef } : { commandId: commandId!, turnId: turnId! }),
+		};
 	}
 	async #skillInvokeStatus(request: QueryRequest): Promise<QueryResponse> {
 		if (request.cursor)

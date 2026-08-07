@@ -4400,7 +4400,7 @@ export function createNotificationsExtension(
 				configOverrides,
 				lookupPromptStatus,
 				selector => kindReconciliation.lookup("skill", selector),
-				clientRef => kindReconciliation.lookupSteer(clientRef),
+				selector => kindReconciliation.lookupSteer(selector),
 			),
 			id,
 			revisions,
