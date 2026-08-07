@@ -30,7 +30,7 @@ import {
 	neutralizeReservedControlTokens,
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
-import { sanitizeText } from "@gajae-code/utils";
+import { logger, sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
@@ -2552,6 +2552,40 @@ function findToolCallNameAliases(
 }
 
 /**
+ * Active tool a call name dispatches to. Tools emitted via OpenAI's custom-tool
+ * path (e.g. `apply_patch` on GPT-5) come back under their wire-level name,
+ * which may differ from the harness-internal `name`. Match on either, preferring
+ * `name` for determinism if both somehow collide.
+ */
+function findActiveTool<T extends { name: string; customWireName?: string }>(
+	tools: ReadonlyArray<T> | undefined,
+	callName: string,
+): T | undefined {
+	return (
+		tools?.find(tool => tool.name === callName) ??
+		tools?.find(tool => tool.customWireName !== undefined && tool.customWireName === callName)
+	);
+}
+
+/**
+ * The single active tool an unresolvable call name denotes, when there is
+ * exactly one. Such a name is not a hallucination: proxied bridges rotate the
+ * per-session instance segment, so a name replayed from earlier context differs
+ * from the live registry only there. One candidate is a rename and is safe to
+ * dispatch; zero or several stay a not-found error, because routing the model at
+ * the wrong server's tool is worse than a dead end.
+ */
+function resolveSoleToolCallNameAlias<T extends { name: string; customWireName?: string }>(
+	callName: string,
+	tools: ReadonlyArray<T> | undefined,
+): { tool: T; callName: string } | undefined {
+	const aliases = findToolCallNameAliases(callName, tools, 2);
+	if (aliases.length !== 1) return undefined;
+	const tool = findActiveTool(tools, aliases[0]);
+	return tool === undefined ? undefined : { tool, callName: aliases[0] };
+}
+
+/**
  * Resolve how tool discovery is actually callable in this session. Assuming the
  * bare `search_tool_bm25` literal both drops the hint when the discovery tool is
  * bridged and, worse, would name a second non-callable tool if emitted anyway.
@@ -2598,6 +2632,24 @@ async function executeToolCalls(
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 	const toolCalls = assistantMessage.content.filter((c): c is ToolCallContent => c.type === "toolCall");
+	// A call name the registry does not expose can still denote exactly one
+	// active tool — bridges rotate their per-session instance segment, so names
+	// the model replayed from earlier context go stale in that segment alone.
+	// Rename the call to the tool it unambiguously means, before anything else
+	// reads the name, so argument validation, hooks, permissions and telemetry
+	// all run against the resolved tool as if it had been called correctly.
+	// Ambiguous and unmatched names fall through to the not-found error below.
+	for (const toolCall of toolCalls) {
+		if (findActiveTool(tools, toolCall.name) !== undefined) continue;
+		const resolved = resolveSoleToolCallNameAlias(toolCall.name, tools);
+		if (resolved === undefined) continue;
+		logger.info("Tool call renamed to its single active alias", {
+			toolCallId: toolCall.id,
+			requestedName: toolCall.name,
+			resolvedName: resolved.callName,
+		});
+		toolCall.name = resolved.callName;
+	}
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
@@ -2615,13 +2667,7 @@ async function executeToolCalls(
 
 	const records = toolCalls.map(toolCall => ({
 		toolCall,
-		// Tools emitted via OpenAI's custom-tool path (e.g. `apply_patch` on GPT-5)
-		// come back under their wire-level name, which may differ from the
-		// harness-internal `name`. Match on either, preferring `name` for
-		// determinism if both somehow collide.
-		tool:
-			tools?.find(t => t.name === toolCall.name) ??
-			tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name),
+		tool: findActiveTool(tools, toolCall.name),
 		args: toolCall.arguments as Record<string, unknown>,
 		started: false,
 		result: undefined as AgentToolResult<any> | undefined,

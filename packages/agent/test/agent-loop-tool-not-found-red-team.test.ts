@@ -137,35 +137,68 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 
 	// Issue #3917, captured sessions 019fd580/019fd583/019fd595: the model called
 	// `mcp__<server>__<instance>_search` while plain `search` was active, five
-	// times across three sessions, and the bare not-found named no way back.
-	it("names the active tool when the call carries an MCP bridge namespace", async () => {
-		const toolName = "mcp__jzi2uzmxd57z__wbg7pcrl46bd_search";
-		const toolResults = await collectToolResults([makeTool("search"), makeTool("read")], toolName);
+	// times across three sessions, and each bare not-found burned a whole turn.
+	// One active match is a rename, not a dead end, so the call is dispatched.
+	it("dispatches a call carrying a stale MCP bridge namespace to the one tool it denotes", async () => {
+		let searchRuns = 0;
+		let readRuns = 0;
+		const toolResults = await collectToolResults(
+			[makeTool("search", { onExecute: () => searchRuns++ }), makeTool("read", { onExecute: () => readRuns++ })],
+			"mcp__jzi2uzmxd57z__wbg7pcrl46bd_search",
+		);
 
+		expect(searchRuns).toBe(1);
+		expect(readRuns).toBe(0);
 		expect(toolResults).toHaveLength(1);
-		expectBaseNotFound(toolResults[0], toolName);
-		expect(toolResults[0].text).toContain("It is active as `search`");
-		expect(toolResults[0].text).not.toContain("`read`");
+		expect(toolResults[0].isError).toBe(false);
+		expect(toolResults[0].text).toBe("executed");
 	});
 
-	// Bridges mint the instance segment per session, so a name replayed from
+	// Bridges mint a fresh instance segment per session, so a name replayed from
 	// earlier context differs from the live registry only in that segment.
-	it("names the live alias when only the bridge instance segment went stale", async () => {
-		const toolName = "mcp__jzi2uzmxd57z__jgspauo3hmi5_subagent";
-		const toolResults = await collectToolResults([makeTool("mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent")], toolName);
+	it("dispatches when only the bridge instance segment went stale", async () => {
+		let runs = 0;
+		const toolResults = await collectToolResults(
+			[makeTool("mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent", { onExecute: () => runs++ })],
+			"mcp__jzi2uzmxd57z__jgspauo3hmi5_subagent",
+		);
 
+		expect(runs).toBe(1);
 		expect(toolResults).toHaveLength(1);
-		expectBaseNotFound(toolResults[0], toolName);
-		expect(toolResults[0].text).toContain("It is active as `mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent`");
+		expect(toolResults[0].isError).toBe(false);
+		expect(toolResults[0].text).toBe("executed");
 	});
 
-	it("resolves an alias reachable only through customWireName", async () => {
-		const toolName = "mcp__srv__stale_apply_patch";
-		const toolResults = await collectToolResults([makeTool("edit", { customWireName: "apply_patch" })], toolName);
+	it("dispatches to an alias reachable only through customWireName", async () => {
+		let runs = 0;
+		const toolResults = await collectToolResults(
+			[makeTool("edit", { customWireName: "apply_patch", onExecute: () => runs++ })],
+			"mcp__srv__stale_apply_patch",
+		);
 
+		expect(runs).toBe(1);
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].isError).toBe(false);
+		expect(toolResults[0].text).toBe("executed");
+	});
+
+	// Two candidates stay a not-found error naming both: picking one would route
+	// the model at a tool it did not ask for.
+	it("keeps the not-found error and lists both names when two tools match", async () => {
+		let runs = 0;
+		const toolName = "mcp__srv__stale_search";
+		const toolResults = await collectToolResults(
+			[
+				makeTool("mcp__srv__abc_search", { onExecute: () => runs++ }),
+				makeTool("mcp__srv__xyz_search", { onExecute: () => runs++ }),
+			],
+			toolName,
+		);
+
+		expect(runs).toBe(0);
 		expect(toolResults).toHaveLength(1);
 		expectBaseNotFound(toolResults[0], toolName);
-		expect(toolResults[0].text).toContain("It is active as `apply_patch`");
+		expect(toolResults[0].text).toContain("It is active as `mcp__srv__abc_search` or `mcp__srv__xyz_search`");
 	});
 
 	it("does not invent an alias when no active tool shares the base name", async () => {
