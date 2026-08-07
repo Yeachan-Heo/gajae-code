@@ -39,7 +39,7 @@ import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
-import { prepareTranscriptRebuild } from "../utils/ui-helpers";
+import { addChatChild, prepareTranscriptRebuild } from "../utils/ui-helpers";
 
 type HindsightModule = typeof import("../../hindsight");
 let hindsightModulePromise: Promise<HindsightModule> | undefined;
@@ -1182,8 +1182,15 @@ export class CommandController {
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
 		const bashComponent = this.ctx.bashComponent;
-		if (isDeferred && bashComponent && this.ctx.pendingBashComponents.includes(bashComponent)) {
-			this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+		if (isDeferred && bashComponent) {
+			const parkedIndex = this.ctx.pendingBashComponents.indexOf(bashComponent);
+			// A parked component is only ours to move while it is still parked: a
+			// non-streaming submit may already have flushed it into the transcript.
+			if (parkedIndex !== -1) {
+				this.ctx.pendingBashComponents.splice(parkedIndex, 1);
+				this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+				addChatChild(this.ctx, bashComponent);
+			}
 		}
 
 		this.ctx.bashComponent = undefined;
