@@ -4,11 +4,19 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { logger } from "@gajae-code/utils";
+import { AsyncJobManager } from "../../async";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
+import {
+	boundCompletedTerminalScopeRows,
+	collectEvictedTerminalKeys,
+	findOwnedRegistrationsForTurn,
+	isOwnedAttemptRegistrationIncomplete,
+	settleOwnedWork,
+} from "../../session/terminal-abort";
 import { type ControlSurface, dispatchControl } from "./control";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
@@ -38,6 +46,13 @@ class SdkOnlyIdempotencyConflictError extends Error {
 		super("Idempotency key was reused with different input.");
 	}
 }
+
+/** Bounded completed-row retention for the SDK-only terminal reconciliation
+ *  document, mirroring the bus terminal-abort implementation (review thread
+ *  P2): no-active/idle aborts with unique keys and repeated active-turn
+ *  markers must not grow the document without limit. */
+const SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS = 256;
+const SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
 
 class DiffQueryError extends Error {
 	constructor(
@@ -928,30 +943,37 @@ function createControlSurface(
 					const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
 					if (conflicting && conflicting.idempotencyInputHash !== inputHash)
 						throw new SdkOnlyIdempotencyConflictError();
-					return {
-				scopes: [
-					...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
-					{
-						selection: scope,
-						...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
-						turnDisposition: "no_effect",
-						ownedWorkDisposition: "not_requested",
-						automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
-						resumeOnOwnedCompletion: scope === "turn",
-						turnContinuationFence: {
-							state: "retained",
-							abortedAttemptEpoch: 0,
-							blockedContinuationIds: [],
-							predecessorTombstones: [],
-							ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
+					const preBound: SdkOnlyTerminalScopeRecord[] = [
+						...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
+						{
+							selection: scope,
+							...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
+							turnDisposition: "no_effect",
+							ownedWorkDisposition: "not_requested",
+							automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
+							resumeOnOwnedCompletion: scope === "turn",
+							turnContinuationFence: {
+								state: "retained",
+								abortedAttemptEpoch: 0,
+								blockedContinuationIds: [],
+								predecessorTombstones: [],
+								ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
+							},
+							responseState: "pending",
+							responsePayloadHash: inputHash,
+							acceptedAt: Date.now(),
 						},
-						responseState: "pending",
-						responsePayloadHash: inputHash,
-						acceptedAt: Date.now(),
-					},
-				],
-				keys: state.keys,
-					};
+					];
+					const bounded = boundCompletedTerminalScopeRows(
+						preBound,
+						SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS,
+					);
+					const evicted = collectEvictedTerminalKeys(preBound, bounded);
+					const combined = [...state.keys, ...evicted];
+					if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
+						throw new Error("terminal key tombstone capacity reached");
+					}
+					return { scopes: bounded, keys: combined };
 				});
 				return "ok";
 			} catch (error) {
@@ -989,8 +1011,7 @@ function createControlSurface(
 				const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
 				if (conflicting && conflicting.idempotencyInputHash !== inputHash)
 					throw new SdkOnlyIdempotencyConflictError();
-				return {
-				scopes: [
+				const preBound: SdkOnlyTerminalScopeRecord[] = [
 					...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
 					{
 						selection: scope,
@@ -1011,9 +1032,17 @@ function createControlSurface(
 						responsePayloadHash: inputHash,
 						acceptedAt: Date.now(),
 					},
-				],
-				keys: state.keys,
-				};
+				];
+				const bounded = boundCompletedTerminalScopeRows(
+					preBound,
+					SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS,
+				);
+				const evicted = collectEvictedTerminalKeys(preBound, bounded);
+				const combined = [...state.keys, ...evicted];
+				if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
+					throw new Error("terminal key tombstone capacity reached");
+				}
+				return { scopes: bounded, keys: combined };
 			});
 		} catch (error) {
 			if (error instanceof SdkOnlyIdempotencyConflictError) {
@@ -1086,13 +1115,72 @@ function createControlSurface(
 				reason: "worker_unsettled",
 			};
 		}
+		// scope:"owned" must generation-verify and CANCEL the exact owned work
+		// before reporting it stopped: abortPromptAndWaitWithTerminal only aborts
+		// the foreground run and registers the disabled-delivery scope — a
+		// background Bash/task/detached subagent would otherwise keep running
+		// while the client receives stopped_owned (review thread P1).
+		let ownedStopped = true;
+		if (scope === "owned") {
+			const terminalScope = proof.terminalScope as
+				| { abortedAttemptEpoch?: number; lineageIdHash?: string }
+				| undefined;
+			const failOwnedUncertain = async (): Promise<unknown> => {
+				await store.transactTerminalScopes(scopes =>
+					scopes.map(record =>
+						(keyHash ? record.idempotencyKeyHash === keyHash : record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+						record.turnDisposition === "pending"
+							? { ...record, turnDisposition: "uncertain", ownedWorkDisposition: "uncertain", terminalAt: Date.now() }
+							: record,
+					),
+				);
+				return {
+					ok: true,
+					selection: scope,
+					turn: "uncertain",
+					ownedWork: "uncertain",
+					automaticDelivery: "none",
+					resumeOnOwnedCompletion: false,
+					reason: "owned_unsettled",
+				};
+			};
+			if (
+				!terminalScope ||
+				terminalScope.abortedAttemptEpoch === undefined ||
+				!terminalScope.lineageIdHash ||
+				isOwnedAttemptRegistrationIncomplete(
+					terminalScope.lineageIdHash,
+					terminalScope.abortedAttemptEpoch,
+				)
+			) {
+				// The attempt's registration set may be KNOWN incomplete (registry
+				// saturation or an evicted in-flight binding): never claim
+				// stopped_owned over an incomplete causal set.
+				return await failOwnedUncertain();
+			}
+			const exactJobs = findOwnedRegistrationsForTurn(
+				terminalScope.lineageIdHash,
+				terminalScope.abortedAttemptEpoch,
+			);
+			if (exactJobs.length > 0) {
+				// Resolve the manager from the ABORTING ENDPOINT captured on the
+				// registrations — never the process-global last-created session,
+				// which could cancel a foreign same-id job and report stopped_owned
+				// while the aborting session's job keeps running (review thread P1).
+				const endpointId = exactJobs[0]?.endpointId;
+				const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
+				if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped") {
+					return await failOwnedUncertain();
+				}
+			}
+		}
 		const result = {
 			ok: true,
 			selection: scope,
 			turn: "stopped",
 			...(scope === "turn"
 				? { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }
-				: { ownedWork: "stopped", automaticDelivery: "none", resumeOnOwnedCompletion: false }),
+				: { ownedWork: ownedStopped ? "stopped" : "uncertain", automaticDelivery: "none", resumeOnOwnedCompletion: false }),
 		};
 		const payloadHash = crypto.createHash("sha256").update(JSON.stringify(result)).digest("hex");
 		await store.transactTerminalScopes(scopes =>
@@ -1103,7 +1191,7 @@ function createControlSurface(
 							...record,
 							turnDisposition: "stopped",
 							terminalPublished: true,
-							ownedWorkDisposition: scope === "turn" ? "left_running" : "stopped",
+							ownedWorkDisposition: scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain",
 							responsePayloadHash: payloadHash,
 							terminalAt: Date.now(),
 						}
