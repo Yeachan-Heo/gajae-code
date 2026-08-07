@@ -2093,8 +2093,8 @@ export class Editor implements Component, Focusable {
 		this.#undoStack.length = 0;
 		this.#wrappedLineCache.length = 0;
 
-		if (this.onChange) this.onChange("");
 		if (this.onSubmit) this.onSubmit(result);
+		if (this.onChange) this.onChange("");
 	}
 
 	#handleBackspace(): void {

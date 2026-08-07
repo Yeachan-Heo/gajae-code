@@ -1359,4 +1359,43 @@ describe("InputController shell mode cues", () => {
 		expect(ctx.isBashMode).toBe(false);
 		expect(ctx.isBashNoContext).toBe(false);
 	});
+
+	it("executes a command typed after entering shell mode", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		ctx.isBashMode = true;
+		await editor.onSubmit?.("pwd");
+
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", false);
+		expect(ctx.isBashMode).toBe(false);
+		expect(ctx.isBashNoContext).toBe(false);
+	});
+	it("preserves explicit single-bang parsing in no-context mode", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		ctx.isBashMode = true;
+		ctx.isBashNoContext = true;
+		await editor.onSubmit?.("!pwd");
+
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", false);
+	});
+
+	it("keeps prefix-less shell history replayable", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		ctx.isBashMode = true;
+		await editor.onSubmit?.("pwd");
+
+		expect(editor.addToHistory).toHaveBeenCalledWith("!pwd");
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", false);
+	});
 });

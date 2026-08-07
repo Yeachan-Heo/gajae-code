@@ -775,6 +775,19 @@ describe("Editor component", () => {
 				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 			}
 		});
+		it("preserves the submitted text for onSubmit before clearing onChange state", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const events: string[] = [];
+			editor.onChange = text => events.push(`change:${text}`);
+			editor.onSubmit = text => events.push(`submit:${text}`);
+
+			editor.handleInput("!pwd");
+			events.length = 0;
+			editor.handleInput("\r");
+
+			expect(events).toEqual(["submit:!pwd", "change:"]);
+			expect(editor.getText()).toBe("");
+		});
 
 		it("deletes single-code-unit unicode characters (umlauts) with Backspace", () => {
 			const editor = new Editor(defaultEditorTheme);

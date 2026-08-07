@@ -771,6 +771,8 @@ export class InputController {
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		text = text.trim();
+		const submittedBashMode = this.ctx.isBashMode;
+		const submittedBashNoContext = this.ctx.isBashNoContext;
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 		if (this.ctx.hasActiveBtw()) {
 			if (!text) return;
@@ -873,19 +875,32 @@ export class InputController {
 		}
 
 		// Handle bash command (! for normal, !! for excluded from context)
-		if (text.startsWith("!")) {
-			const isExcluded = text.startsWith("!!");
-			const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+		const hasExplicitShellPrefix = text.startsWith("!");
+		const hasExplicitNoContextPrefix = text.startsWith("!!");
+		const shellMode = submittedBashMode || hasExplicitShellPrefix;
+		if (shellMode) {
+			const isExcluded = hasExplicitNoContextPrefix || (!hasExplicitShellPrefix && submittedBashNoContext);
+			const command = hasExplicitNoContextPrefix
+				? text.slice(2).trim()
+				: hasExplicitShellPrefix
+					? text.slice(1).trim()
+					: text.trim();
+			const historyText = hasExplicitShellPrefix ? text : `${isExcluded ? "!!" : "!"}${text}`;
 			if (command) {
 				if (this.ctx.session.isBashRunning) {
 					this.ctx.showWarning("A bash command is already running. Press Esc to cancel it first.");
 					if (this.#canModifyComposer(composer)) {
+						const isBashMode = hasExplicitShellPrefix || submittedBashMode;
+						const isBashNoContext = hasExplicitShellPrefix ? hasExplicitNoContextPrefix : submittedBashNoContext;
 						this.ctx.editor.setText(text);
+						this.ctx.isBashMode = isBashMode;
+						this.ctx.isBashNoContext = isBashNoContext;
+						this.ctx.updateEditorBorderColor();
 					}
 					return;
 				}
 				if (this.#canModifyComposer(composer)) {
-					this.ctx.editor.addToHistory(text);
+					this.ctx.editor.addToHistory(historyText);
 				}
 				await this.ctx.handleBashCommand(command, isExcluded);
 				this.ctx.isBashMode = false;
@@ -1759,9 +1774,8 @@ export class InputController {
 		if (this.ctx.pendingImages.length === 0 || IMAGE_PLACEHOLDER_PRESENT_PATTERN.test(text)) {
 			return;
 		}
-		// Editor submit resets the composer and emits onChange("") before onSubmit(result).
-		// Defer the empty-buffer clear so the submit handler can still resolve image
-		// placeholders against pendingImages, while manual clears still drop stale images.
+		// Editor clears its internal buffer before invoking onSubmit and emits
+		// onChange("") afterward; defer the empty-buffer clear for that callback.
 		if (text.length === 0) {
 			const pendingImages = this.ctx.pendingImages;
 			const pendingImageCount = pendingImages.length;
