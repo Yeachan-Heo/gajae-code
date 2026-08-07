@@ -178,6 +178,7 @@ process.exitCode = await child.exited;`;
 			"plugin",
 			"completion",
 			"launch",
+			"quick-lane",
 		]);
 	});
 
