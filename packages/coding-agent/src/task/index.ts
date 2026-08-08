@@ -21,6 +21,7 @@ import type { Model, Usage } from "@gajae-code/ai/core";
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
 import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner, type SubagentRunOutcome } from "../async";
+import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -1648,6 +1649,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const parentActiveModelProfile = (
 			this.session as { getActiveModelProfile?: () => string | undefined }
 		).getActiveModelProfile?.();
+		const parentProfileDefinition = parentActiveModelProfile
+			? this.session.modelRegistry?.getModelProfile?.(parentActiveModelProfile)
+			: undefined;
+		const parentOwnedModelProfile =
+			parentProfileDefinition &&
+			Object.hasOwn(resolveProfileBindings(parentProfileDefinition).agentModelOverrides, agentName)
+				? parentActiveModelProfile
+				: undefined;
 		const modelOverride = resolveAgentModelPatterns({
 			settingsOverride: settingsModelOverride,
 			agentModel: effectiveAgent.model,
@@ -1991,7 +2000,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
-						parentActiveModelProfile,
+						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
@@ -2067,7 +2076,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
-						parentActiveModelProfile,
+						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,

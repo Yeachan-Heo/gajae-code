@@ -397,6 +397,30 @@ describe("fork context policy surface", () => {
 		expect(seedBuilder).not.toHaveBeenCalled();
 		expect(getOptions()?.forkContextSeed).toBeUndefined();
 	});
+	test("does not apply profile alias intent to a manual override outside a partial profile", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const { getOptions } = mockCreateAgentSession();
+		const parent = createSession({
+			"task.agentModelOverrides": { executor: "shared-model" },
+		});
+		Object.assign(parent, { getActiveModelProfile: () => "planner-only" });
+		Object.assign(parent.modelRegistry!, {
+			getModelProfile: () => ({
+				name: "planner-only",
+				requiredProviders: [],
+				modelMapping: { planner: "planner-alias" },
+				source: "user" as const,
+			}),
+		});
+		const tool = await TaskTool.create(parent);
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [{ id: "ManualExecutor", description: "manual", assignment: "Keep manual override exact." }],
+		});
+
+		expect(getOptions()?.activeModelProfile).toBeUndefined();
+	});
 
 	test("passes a sanitized fork seed and cache identity without sharing provider state", async () => {
 		mockAgents([createAgent("executor", "allowed")]);

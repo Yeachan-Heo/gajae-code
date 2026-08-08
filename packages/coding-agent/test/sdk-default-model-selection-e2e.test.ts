@@ -402,6 +402,14 @@ test("selecting a synthetic gajae-code profile remains session-scoped across con
 					default: "runtime-provider/initial-model",
 				},
 			},
+			"missing-bare-role": {
+				display_name: "Missing Bare Role",
+				required_providers: ["runtime-provider"],
+				model_mapping: {
+					default: "runtime-provider/initial-model",
+					executor: "missing-role-alias",
+				},
+			},
 		},
 		// Configured modelBindings share the modelRoles/task.agentModelOverrides
 		// runtime override slots with profile activations and must survive
@@ -544,6 +552,9 @@ test("selecting a synthetic gajae-code profile remains session-scoped across con
 			thinking: { validLevels: ["off"] },
 			current: false,
 		});
+		expect(catalog.page?.items.some(row => row.provider === "gajae-code" && row.id === "missing-bare-role")).toBe(
+			false,
+		);
 
 		const selection = await client.control("model.set", { id: "gajae-code/custom-eco" });
 		// Q27 remains the full profile catalog and agrees with the Q10
@@ -553,6 +564,8 @@ test("selecting a synthetic gajae-code profile remains session-scoped across con
 		};
 		const customEcoProfile = profiles.page?.items.find(item => item.id === "custom-eco");
 		expect(customEcoProfile).toMatchObject({ id: "custom-eco", available: true });
+		const missingBareRoleProfile = profiles.page?.items.find(item => item.id === "missing-bare-role");
+		expect(missingBareRoleProfile).toMatchObject({ id: "missing-bare-role", available: false });
 		expect((selection as { ok?: boolean; result?: unknown }).ok).toBe(true);
 		expect((selection as { result?: unknown }).result).toEqual({ changed: true });
 
