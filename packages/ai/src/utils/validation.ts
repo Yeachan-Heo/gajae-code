@@ -25,7 +25,7 @@
 import { structuredCloneJSON } from "@gajae-code/utils";
 import type { ZodType } from "zod/v4";
 import type { $ZodIssue as ZodIssue } from "zod/v4/core";
-import type { RawArgumentRejectionCode, Tool, ToolCall } from "../types";
+import type { RawArgumentRejectionCode, RawArgumentRejectionDetail, Tool, ToolCall } from "../types";
 import { upgradeJsonSchemaTo202012 } from "./schema/draft";
 import {
 	isJsonSchemaValueValid,
@@ -972,6 +972,33 @@ const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> 
 	"todo-write-unknown-init-entry-key": "todo_write init list entries accept only phase and items keys",
 };
 
+/** Bounds on model-supplied text echoed back into a rejection message. */
+const MAX_REJECTED_KEYS = 8;
+const MAX_REJECTED_KEY_LENGTH = 64;
+const MAX_REJECTION_HINT_LENGTH = 200;
+
+function clamp(value: string, limit: number): string {
+	return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+/**
+ * Renders the offending keys (and an exact correction, when the rejecting
+ * contract supplied one) as a clause appended to the fixed per-code guidance.
+ * Returns undefined when there is nothing concrete to name.
+ */
+function formatRejectionDetail(detail: RawArgumentRejectionDetail): string | undefined {
+	const keys = Array.isArray(detail.rejectedKeys)
+		? detail.rejectedKeys.filter(key => typeof key === "string" && key.length > 0).slice(0, MAX_REJECTED_KEYS)
+		: [];
+	const hint = typeof detail.hint === "string" && detail.hint.length > 0 ? detail.hint : undefined;
+	if (keys.length === 0) return hint ? clamp(hint, MAX_REJECTION_HINT_LENGTH) : undefined;
+
+	const label = keys.length === 1 ? "rejected key" : "rejected keys";
+	const rendered = keys.map(key => `"${clamp(key, MAX_REJECTED_KEY_LENGTH)}"`).join(", ");
+	const suffix = hint ? ` (${clamp(hint, MAX_REJECTION_HINT_LENGTH)})` : "";
+	return `${label}: ${rendered}${suffix}`;
+}
+
 /**
  * Validates tool call arguments against the tool's schema (Zod or plain JSON
  * Schema). Applies LLM-quirk coercions (numeric strings, JSON-string
@@ -989,7 +1016,11 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 			typeof code === "string" && Object.hasOwn(RAW_ARGUMENT_REJECTION_MESSAGES, code)
 				? RAW_ARGUMENT_REJECTION_MESSAGES[code as RawArgumentRejectionCode]
 				: undefined;
-		throw new Error(correction ? `${base}; ${correction}` : base);
+		if (!correction) throw new Error(base);
+		// Detail is only echoed alongside authority-controlled guidance, and only
+		// after clamping — the keys themselves come from the rejected payload.
+		const detail = rawValidation.detail ? formatRejectionDetail(rawValidation.detail) : undefined;
+		throw new Error(detail ? `${base}; ${correction}; ${detail}` : `${base}; ${correction}`);
 	}
 	const rawArgs = rawValidation?.outcome === "accept" ? rawValidation.arguments : originalArgs;
 	const ctx = getValidationContext(tool);
