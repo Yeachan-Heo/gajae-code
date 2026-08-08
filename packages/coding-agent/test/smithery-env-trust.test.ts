@@ -20,7 +20,6 @@ import * as path from "node:path";
  */
 
 const PROBE = path.join(import.meta.dir, "fixtures", "smithery-env-probe.ts");
-const KEYS = ["SMITHERY_URL", "SMITHERY_API_URL", "SMITHERY_API_KEY"] as const;
 
 interface Resolved {
 	url: string;
