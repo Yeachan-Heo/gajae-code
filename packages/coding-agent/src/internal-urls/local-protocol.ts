@@ -45,6 +45,7 @@ export interface LocalProtocolOptions {
 	getArtifactsDir?: () => string | null;
 	isManagedDestination?: () => boolean;
 	getManagedLegacyLocalMigrationSource?: () => ManagedLegacyLocalMigrationSource | null;
+	getCredentialSessionId?: () => string | null;
 	getSessionId?: () => string | null;
 }
 

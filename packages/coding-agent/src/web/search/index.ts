@@ -379,7 +379,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 		signal?: AbortSignal,
 	) {
 		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
-		const sessionId = ctx.sessionManager.getSessionId();
+		const sessionId = ctx.credentialSessionId ?? ctx.sessionManager.getSessionId();
 		return executeSearch(toolCallId, params, {
 			authStorage,
 			sessionId,

@@ -23,7 +23,8 @@ export async function runExtensionCompact(
 }
 
 interface SetModelCapableSession {
-	modelRegistry: { getApiKey(model: Model): Promise<string | undefined> };
+	credentialSessionId?: string;
+	modelRegistry: { getApiKey(model: Model, sessionId?: string): Promise<string | undefined> };
 	setModel(model: Model, role?: string, options?: { cause?: string }): Promise<unknown>;
 	/** Persist effective profile roles and clear its marker for a concrete default selection. */
 	materializeActiveDefaultModelProfileAssignment?(model: Model): boolean;
@@ -39,7 +40,7 @@ interface SetModelCapableSession {
  * Returns false when no API key is available for the requested model.
  */
 export async function runExtensionSetModel(session: SetModelCapableSession, model: Model): Promise<boolean> {
-	const key = await session.modelRegistry.getApiKey(model);
+	const key = await session.modelRegistry.getApiKey(model, session.credentialSessionId);
 	if (!key) return false;
 	await session.setModel(model, "default", { cause: "user-selection" });
 	// A durable profile is replaced by materializing its effective assignments

@@ -427,7 +427,9 @@ describe("fork context policy surface", () => {
 		const seed = createSeed();
 		const seedBuilder = vi.fn(async () => seed);
 		const { getOptions } = mockCreateAgentSession();
-		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+		const parent = createSession({ "task.forkContext.enabled": true }, seedBuilder);
+		Object.assign(parent, { getCredentialSessionId: () => "credential-pool" });
+		const tool = await TaskTool.create(parent);
 
 		await executeDetached(tool, {
 			agent: "executor",
@@ -439,7 +441,7 @@ describe("fork context policy surface", () => {
 		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 8000, signal: undefined });
 		expect(getOptions()?.forkContextSeed).toBe(seed);
 		expect(getOptions()?.providerSessionId).toBeUndefined();
-		expect(getOptions()?.credentialSessionId).toBe("parent-session");
+		expect(getOptions()?.credentialSessionId).toBe("credential-pool");
 		expect(getOptions()?.providerSessionState).toBeUndefined();
 		expect(getOptions()?.toolNames).toEqual(["read"]);
 		const systemPromptOption = getOptions()?.systemPrompt;

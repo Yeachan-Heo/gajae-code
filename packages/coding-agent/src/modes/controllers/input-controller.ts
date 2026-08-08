@@ -989,7 +989,7 @@ export class InputController {
 				text,
 				registry,
 				this.ctx.settings,
-				this.ctx.session.sessionId,
+				this.ctx.session.credentialSessionId,
 				this.ctx.session.model,
 				provider => this.ctx.session.agent.metadataForProvider(provider),
 			)

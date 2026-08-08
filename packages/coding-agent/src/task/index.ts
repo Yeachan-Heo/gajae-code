@@ -2002,6 +2002,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
+						parentCredentialSessionId:
+							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -2078,6 +2080,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
+						parentCredentialSessionId:
+							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -2134,7 +2138,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 												diff,
 												this.session.modelRegistry!,
 												this.session.settings,
-												this.session.getSessionId?.() ?? undefined,
+												this.session.getCredentialSessionId?.() ??
+													this.session.getSessionId?.() ??
+													undefined,
 											);
 										}
 									: undefined;

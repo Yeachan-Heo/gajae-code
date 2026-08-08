@@ -5632,6 +5632,7 @@ export class AgentSession {
 			getManagedLegacyLocalMigrationSource: () =>
 				prepared?.managedLegacyLocalMigrationSource ?? this.sessionManager.getManagedLegacyLocalMigrationSource(),
 			getSessionId: () => prepared?.sessionId ?? this.sessionManager.getSessionId(),
+			getCredentialSessionId: () => this.credentialSessionId,
 		};
 	}
 
@@ -7316,6 +7317,7 @@ export class AgentSession {
 		const getCustomToolContext = (): CustomToolContext => ({
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
+			credentialSessionId: this.credentialSessionId,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
 			hasQueuedMessages: () => this.queuedMessageCount > 0,
@@ -7359,6 +7361,7 @@ export class AgentSession {
 		return {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
+			credentialSessionId: this.credentialSessionId,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
 			hasQueuedMessages: () => this.queuedMessageCount > 0,
@@ -9119,6 +9122,7 @@ export class AgentSession {
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
+			credentialSessionId: this.credentialSessionId,
 			model: this.model ?? undefined,
 			getActivePromptHandle: () => this.activePromptHandle,
 			isIdle: () => !this.isStreaming,
@@ -16896,7 +16900,7 @@ export class AgentSession {
 						ephemeralSessionId,
 						model.provider,
 						this.#modelRegistry.authStorage,
-						this.sessionId,
+						this.credentialSessionId,
 					),
 					reasoning: toReasoningEffort(this.thinkingLevel),
 					hideThinkingSummary: this.agent.hideThinkingSummary,

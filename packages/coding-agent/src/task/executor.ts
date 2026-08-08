@@ -219,6 +219,7 @@ export interface ExecutorOptions {
 	 */
 	parentActiveModelProfile?: string;
 	parentSessionId?: string;
+	parentCredentialSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
@@ -1516,7 +1517,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
-					options.parentSessionId,
+					options.parentCredentialSessionId ?? options.parentSessionId,
 					{
 						managedFallback: true,
 						...(options.parentActiveModelProfile ? { aliasIntent: "preset-equivalent" } : {}),
@@ -1662,7 +1663,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					model,
 					thinkingLevel: effectiveThinkingLevel,
 					activeModelProfile: options.parentActiveModelProfile,
-					credentialSessionId: options.parentSessionId,
+					credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
 					modelSubstitution:
 						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
 							? { requestedModel, reason: modelSubstitutionWarning.reason }

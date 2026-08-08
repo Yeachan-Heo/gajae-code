@@ -70,6 +70,8 @@ export interface CustomToolContext {
 	sessionManager: ReadonlySessionManager;
 	/** Model registry - use for API key resolution and model retrieval */
 	modelRegistry: ModelRegistry;
+	/** Credential-selection identity for provider authentication. */
+	credentialSessionId?: string;
 	/** Current model (may be undefined if no model is selected yet) */
 	model: Model | undefined;
 	/** Whether the agent is idle (not streaming) */

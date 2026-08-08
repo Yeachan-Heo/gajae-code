@@ -1246,13 +1246,24 @@ export class ModelSelectorComponent extends Container {
 			];
 			return values.every(value =>
 				normalizeModelSelectorValue(value).some(selector => {
+					const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+						settings: this.#settings,
+						modelRegistry: this.#modelRegistry,
+						aliasIntent: "preset-equivalent",
+						credentialSessionId: this.#authSessionId,
+					}).model;
+					if (!resolved) return false;
+					const authStorage = this.#modelRegistry.authStorage as
+						| {
+								getEffectiveCredentialType?: (provider: string, sessionId?: string) => unknown;
+								hasUsableAuth?: (provider: string) => boolean;
+						  }
+						| undefined;
+					if (!authStorage) return true;
+					if (!authStorage.getEffectiveCredentialType && !authStorage.hasUsableAuth) return true;
 					return (
-						resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
-							settings: this.#settings,
-							modelRegistry: this.#modelRegistry,
-							aliasIntent: "preset-equivalent",
-							credentialSessionId: this.#authSessionId,
-						}).model !== undefined
+						authStorage.getEffectiveCredentialType?.(resolved.provider, this.#authSessionId) !== undefined ||
+						authStorage.hasUsableAuth?.(resolved.provider) === true
 					);
 				}),
 			);

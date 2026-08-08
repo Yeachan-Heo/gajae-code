@@ -166,6 +166,8 @@ export interface MaterializeModelProfileAssignmentOptions {
 		ModelProfileActivationSession,
 		| "model"
 		| "thinkingLevel"
+		| "sessionId"
+		| "credentialSessionId"
 		| "getConfiguredModelChain"
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
@@ -186,6 +188,8 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		ModelProfileActivationSession,
 		| "model"
 		| "thinkingLevel"
+		| "sessionId"
+		| "credentialSessionId"
 		| "getConfiguredModelChain"
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
@@ -232,6 +236,7 @@ function concretizeMaterializedAssignmentValues(
 ): Record<string, ModelSelectorValue> {
 	const modelRegistry = options.session.modelRegistry;
 	const sessionId = (options.session as { sessionId?: string }).sessionId;
+	const credentialSessionId = options.session.credentialSessionId ?? sessionId;
 	if (!modelRegistry || !sessionId) return assignments;
 	const availableModels = modelRegistry.getAvailable();
 	return Object.fromEntries(
@@ -242,6 +247,7 @@ function concretizeMaterializedAssignmentValues(
 					settings: options.settings as Settings,
 					modelRegistry,
 					sessionId,
+					credentialSessionId,
 					aliasIntent: "preset-equivalent",
 				});
 				if (!resolved.model) {

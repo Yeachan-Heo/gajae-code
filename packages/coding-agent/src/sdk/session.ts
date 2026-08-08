@@ -2331,6 +2331,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const getSessionContext = () => ({
 			sessionManager: createReadonlySessionManager(sessionManager),
 			modelRegistry,
+			credentialSessionId,
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
 			hasQueuedMessages: () => session.queuedMessageCount > 0,
@@ -2360,6 +2361,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const customToolContext = (): CustomToolContext => ({
 				sessionManager: createReadonlySessionManager(sessionManager),
 				modelRegistry,
+				credentialSessionId,
 				model: agent?.state.model,
 				isIdle: () => !session?.isStreaming,
 				hasQueuedMessages: () => (session?.queuedMessageCount ?? 0) > 0,
