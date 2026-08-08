@@ -11538,10 +11538,13 @@ export class AgentSession {
 
 	/** Number of configured role-model candidates that can be cycled. */
 	getRoleModelCycleCandidateCount(roleOrder: readonly string[] = this.settings.get("cycleOrder")): number {
-		return this.#getRoleModelCycleCandidates(roleOrder).length;
+		return this.#getRoleModelCycleCandidates(roleOrder, undefined).length;
 	}
 
-	#getRoleModelCycleCandidates(roleOrder: readonly string[]): RoleModelCycleCandidate[] {
+	#getRoleModelCycleCandidates(
+		roleOrder: readonly string[],
+		canonicalSessionId: string | undefined,
+	): RoleModelCycleCandidate[] {
 		const availableModels = this.#modelRegistry.getAvailable();
 		const currentModel = this.model;
 		if (availableModels.length === 0 || !currentModel) return [];
@@ -11559,8 +11562,9 @@ export class AgentSession {
 				settings: this.settings,
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
-				sessionId: this.sessionId,
+				...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
 				...(this.#persistedModelProfileAliasIntent() ?? {}),
+				credentialSessionId: this.sessionId,
 			});
 			if (!resolved.model) continue;
 
@@ -11585,7 +11589,7 @@ export class AgentSession {
 		roleOrder: readonly string[],
 		options?: { temporary?: boolean },
 	): Promise<RoleModelCycleResult | undefined> {
-		const roleModels = this.#getRoleModelCycleCandidates(roleOrder);
+		const roleModels = this.#getRoleModelCycleCandidates(roleOrder, this.sessionId);
 		if (roleModels.length <= 1) return undefined;
 
 		const currentModel = this.model!;

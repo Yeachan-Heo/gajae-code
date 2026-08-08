@@ -1,7 +1,7 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
-import { formatClampedModelSelector } from "../thinking";
+import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
 import {
 	aggregateModelProfileRequiredProviders,
@@ -508,6 +508,13 @@ function rewriteBindingsProviders(
 }
 
 function formatMaterializedSelector(selector: string, model: Model<Api>): string {
+	const suffix = splitSelectorThinkingSuffix(selector);
+	if (!suffix.selector.includes("/") && suffix.thinkingLevel && model.thinking) {
+		const clamped = clampExplicitThinkingLevelForModel(model, suffix.thinkingLevel);
+		return clamped && clamped !== ThinkingLevel.Inherit
+			? formatModelSelectorValue(suffix.selector, clamped)
+			: suffix.selector;
+	}
 	const clampedSelector = formatClampedModelSelector(selector, model);
 	const explicitThinkingLevel = parseModelString(selector)?.thinkingLevel;
 	if (!explicitThinkingLevel || parseModelString(clampedSelector)?.thinkingLevel) return clampedSelector;

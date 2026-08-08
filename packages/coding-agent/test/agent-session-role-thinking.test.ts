@@ -13,6 +13,7 @@ describe("AgentSession role model thinking behavior", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
 	let sessionSettings: Settings;
+	let modelRegistry: ModelRegistry;
 	const authStorages: AuthStorage[] = [];
 
 	beforeEach(() => {
@@ -53,7 +54,7 @@ describe("AgentSession role model thinking behavior", () => {
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
 		sessionSettings = Settings.isolated();
 		for (const [role, modelRoleValue] of Object.entries(options.modelRoles)) {
@@ -66,6 +67,24 @@ describe("AgentSession role model thinking behavior", () => {
 			modelRegistry,
 		});
 	}
+
+	it("counts provider-agnostic cycle roles without changing canonical affinity", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: {
+				default: "claude-sonnet-4-5",
+				slow: "claude-sonnet-4-6",
+			},
+		});
+		session.setActiveModelProfile("provider-agnostic-profile");
+		modelRegistry.seedCanonicalVariant(session.sessionId, defaultModel);
+		const before = modelRegistry.getSessionCanonicalVariant(session.sessionId);
+
+		expect(session.getRoleModelCycleCandidateCount(["default", "slow"])).toBe(2);
+		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
+	});
 
 	it("re-applies explicit role thinking each time that role is selected", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");

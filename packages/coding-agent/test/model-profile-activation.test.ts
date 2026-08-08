@@ -287,6 +287,39 @@ describe("model profile activation", () => {
 		expect(prepared.agentModelOverrides.executor).toBe("glm-5.2:low");
 	});
 
+	test("clamps bare alias thinking suffixes to the resolved model", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "clamped-open-weight",
+			requiredProviders: [],
+			modelMapping: { default: "glm-5.2:max", executor: "glm-5.2:max" },
+			source: "user",
+		};
+		const glm = model("custom-router", "zai/glm-5.2", {
+			mode: "effort",
+			minLevel: ThinkingLevel.Low,
+			maxLevel: ThinkingLevel.XHigh,
+		});
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getAll: () => [glm],
+			getAvailable: () => [glm],
+			lookupAliasExists: (alias: string) => alias === "glm-5.2",
+			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
+				options?.candidates?.[0],
+		};
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultChain).toEqual(["glm-5.2:xhigh"]);
+		expect(prepared.agentModelOverrides.executor).toBe("glm-5.2:xhigh");
+	});
+
 	test("retries another provider variant when the preferred bare alias fails authentication", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "open-weights-glm",
