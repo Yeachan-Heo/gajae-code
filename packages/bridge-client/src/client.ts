@@ -221,18 +221,41 @@ function uncertain(
 	return { kind, identity, prohibitResubmission: true };
 }
 
-function replayReady(replay: Record<string, unknown>, events: readonly Frame[]): boolean {
-	if (replay.gap === true || !Array.isArray(replay.events)) return false;
-	if (typeof replay.generation !== "number" || !Number.isSafeInteger(replay.generation) || replay.generation < 0)
+function replayReady(
+	replay: Record<string, unknown>,
+	liveEvents: readonly Frame[],
+	sinceGeneration: number,
+	sinceSeq: number,
+): boolean {
+	if (replay.gap !== undefined || !Array.isArray(replay.events)) return false;
+	if (
+		typeof replay.generation !== "number" ||
+		!Number.isSafeInteger(replay.generation) ||
+		replay.generation < 0 ||
+		replay.generation !== sinceGeneration ||
+		typeof replay.lastSeq !== "number" ||
+		!Number.isSafeInteger(replay.lastSeq) ||
+		replay.lastSeq < sinceSeq
+	)
 		return false;
-	const replayEvents = replay.events as Frame[];
 	const sequences = new Set<number>();
-	for (const event of [...events, ...replayEvents]) {
-		if (typeof event.generation !== "number" || event.generation !== replay.generation) continue;
-		if (typeof event.seq !== "number" || !Number.isSafeInteger(event.seq) || event.seq < 0) return false;
+	for (const event of [...(replay.events as Frame[]), ...liveEvents]) {
+		if (
+			event.type !== "event" ||
+			typeof event.generation !== "number" ||
+			event.generation !== replay.generation ||
+			typeof event.seq !== "number" ||
+			!Number.isSafeInteger(event.seq) ||
+			event.seq <= sinceSeq
+		)
+			return false;
 		sequences.add(event.seq);
 	}
-	return sequences.size >= 0;
+	const highestSeq = Math.max(replay.lastSeq, ...sequences);
+	for (let sequence = sinceSeq + 1; sequence <= highestSeq; sequence++) {
+		if (!sequences.has(sequence)) return false;
+	}
+	return true;
 }
 
 function isConnectionFailure(error: unknown): boolean {
@@ -246,6 +269,12 @@ function endpointGeneration(endpoint: Record<string, unknown>): number | undefin
 	const generation = endpoint.generation ?? endpoint.endpointGeneration;
 	return typeof generation === "number" && Number.isSafeInteger(generation) && generation >= 0
 		? generation
+		: undefined;
+}
+
+function endpointIncarnation(endpoint: Record<string, unknown>): string | undefined {
+	return typeof endpoint.endpointIncarnation === "string" && /^[a-f0-9]{64}$/.test(endpoint.endpointIncarnation)
+		? endpoint.endpointIncarnation
 		: undefined;
 }
 
@@ -400,11 +429,24 @@ export class SdkClient {
 			...identity,
 			sessionId,
 			...(endpointGeneration(created) === undefined ? {} : { endpointGeneration: endpointGeneration(created) }),
+			...(endpointIncarnation(created) === undefined ? {} : { endpointIncarnation: endpointIncarnation(created) }),
 		};
 		let endpoint: Record<string, unknown>;
 		try {
 			endpoint = responseResult(
-				await this.global("session.get_endpoint", { sessionId }, { timeoutMs: input.timeoutMs }),
+				await this.global(
+					"session.get_endpoint",
+					{
+						sessionId,
+						...(identity.endpointGeneration === undefined
+							? {}
+							: { endpointGeneration: identity.endpointGeneration }),
+						...(identity.endpointIncarnation === undefined
+							? {}
+							: { endpointIncarnation: identity.endpointIncarnation }),
+					},
+					{ timeoutMs: input.timeoutMs },
+				),
 			);
 		} catch (error) {
 			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
@@ -417,6 +459,7 @@ export class SdkClient {
 		identity = {
 			...identity,
 			...(endpointGeneration(endpoint) === undefined ? {} : { endpointGeneration: endpointGeneration(endpoint) }),
+			...(endpointIncarnation(endpoint) === undefined ? {} : { endpointIncarnation: endpointIncarnation(endpoint) }),
 		};
 		const endpointClient = new SdkClient(url, token, {
 			timeoutMs: input.timeoutMs,
@@ -425,8 +468,7 @@ export class SdkClient {
 		});
 		const liveEvents: Frame[] = [];
 		const detach = endpointClient.onFrame(frame => {
-			if (frame.type !== "event_replay_result" && frame.type !== "hello" && frame.type !== "server_hello")
-				liveEvents.push(frame);
+			if (frame.type === "event") liveEvents.push(frame);
 		});
 		let submissionStarted = false;
 		try {
@@ -440,7 +482,15 @@ export class SdkClient {
 				incarnation,
 				{ timeoutMs: input.timeoutMs },
 			);
-			if (!replayReady(responseResult(replay), liveEvents)) return uncertain("subscription_uncertain", identity);
+			if (
+				!replayReady(
+					responseResult(replay),
+					liveEvents,
+					input.replaySinceGeneration ?? 1,
+					input.replaySinceSeq ?? 0,
+				)
+			)
+				return uncertain("subscription_uncertain", identity);
 			const operation = input.submission.kind === "prompt" ? "turn.prompt" : "skill.invoke";
 			const controlInput =
 				input.submission.kind === "prompt"
@@ -466,8 +516,8 @@ export class SdkClient {
 			identity = { ...identity, ...(commandId ? { commandId } : {}), ...(turnId ? { turnId } : {}) };
 			return { kind: "accepted", sessionId, identity, receipt: response };
 		} catch (error) {
-			if (error instanceof SdkClientError && isKnownLifecycleFailure(error)) return atomicFailure(error, identity);
 			if (submissionStarted) return uncertain("submission_uncertain", identity);
+			if (error instanceof SdkClientError && isKnownLifecycleFailure(error)) return atomicFailure(error, identity);
 			return uncertain(isConnectionFailure(error) ? "attachment_uncertain" : "subscription_uncertain", identity);
 		} finally {
 			detach();
@@ -492,7 +542,16 @@ export class SdkClient {
 				);
 				const sessionId = stringField(created, "sessionId");
 				if (!sessionId) return uncertain("create_uncertain", recovered);
-				recovered = { ...recovered, sessionId };
+				recovered = {
+					...recovered,
+					sessionId,
+					...(endpointGeneration(created) === undefined
+						? {}
+						: { endpointGeneration: endpointGeneration(created) }),
+					...(endpointIncarnation(created) === undefined
+						? {}
+						: { endpointIncarnation: endpointIncarnation(created) }),
+				};
 			} catch (error) {
 				return error instanceof SdkClientError && isKnownLifecycleFailure(error)
 					? atomicFailure(error, recovered)
@@ -501,11 +560,30 @@ export class SdkClient {
 		}
 		try {
 			const endpoint = responseResult(
-				await this.global("session.get_endpoint", { sessionId: recovered.sessionId }, options),
+				await this.global(
+					"session.get_endpoint",
+					{
+						sessionId: recovered.sessionId,
+						...(recovered.endpointGeneration === undefined
+							? {}
+							: { endpointGeneration: recovered.endpointGeneration }),
+						...(recovered.endpointIncarnation === undefined
+							? {}
+							: { endpointIncarnation: recovered.endpointIncarnation }),
+					},
+					options,
+				),
 			);
 			const url = stringField(endpoint, "url");
 			const token = stringField(endpoint, "token");
 			if (!url || !token) return uncertain("attachment_uncertain", recovered);
+			recovered = {
+				...recovered,
+				...(endpointGeneration(endpoint) === undefined ? {} : { endpointGeneration: endpointGeneration(endpoint) }),
+				...(endpointIncarnation(endpoint) === undefined
+					? {}
+					: { endpointIncarnation: endpointIncarnation(endpoint) }),
+			};
 			const client = new SdkClient(url, token, { timeoutMs: options.timeoutMs, reconnectAttempts: 0 });
 			try {
 				const incarnation = await client.#connect();
@@ -514,7 +592,8 @@ export class SdkClient {
 					incarnation,
 					options,
 				);
-				if (!replayReady(responseResult(replay), [])) return uncertain("subscription_uncertain", recovered);
+				if (!replayReady(responseResult(replay), [], recovered.endpointGeneration ?? 1, 0))
+					return uncertain("subscription_uncertain", recovered);
 				const query = recovered.submission.kind === "prompt" ? "turn.prompt_status" : "skill.invoke_status";
 				const status = responseResult(
 					await client.#requestOnIncarnation(
