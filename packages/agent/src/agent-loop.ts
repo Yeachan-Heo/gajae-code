@@ -2568,21 +2568,64 @@ function findActiveTool<T extends { name: string; customWireName?: string }>(
 }
 
 /**
- * The single active tool an unresolvable call name denotes, when there is
- * exactly one. Such a name is not a hallucination: proxied bridges rotate the
+ * Server segment of `qualified` when it is the bridge-qualified form of `base`:
+ * `mcp__<server>_<base>`, or `mcp__<server>__<instance>_<base>` once a proxied
+ * bridge stamped its per-session instance segment. Both strings come from the
+ * registry, so the split is read off a base name the tool is really reachable
+ * under instead of being guessed: guessing turns `mcp__brave__web_search` into
+ * a call for a local `search`, and `mcp__github__close_issue` into `create_issue`.
+ */
+function bridgeServerFor(qualified: string, base: string): string | undefined {
+	const suffix = `_${base}`;
+	if (!qualified.startsWith("mcp__") || !qualified.endsWith(suffix)) return undefined;
+	const head = qualified.slice("mcp__".length, qualified.length - suffix.length);
+	const boundary = head.indexOf("__");
+	if (boundary === -1) return head.length > 0 ? head : undefined;
+	const server = head.slice(0, boundary);
+	const instance = head.slice(boundary + 2);
+	// The instance is exactly one segment; anything else belongs to a tool name.
+	if (server.length === 0 || instance.length === 0 || instance.includes("_")) return undefined;
+	return server;
+}
+
+/**
+ * Whether `callName` differs from a name this tool is reachable under only in
+ * the bridge instance segment. Identity has to be provable from the registry:
+ * the tool must expose both a bridge-qualified name and the base that name
+ * qualifies, which is what fixes where the tool name starts.
+ */
+function callNameDenotesTool(callName: string, tool: { name: string; customWireName?: string }): boolean {
+	const names = toolCallNames(tool);
+	for (const qualified of names) {
+		for (const base of names) {
+			if (base === qualified) continue;
+			const server = bridgeServerFor(qualified, base);
+			if (server !== undefined && bridgeServerFor(callName, base) === server) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The single active tool an unresolvable call name provably denotes, when there
+ * is exactly one. Such a name is not a hallucination: proxied bridges rotate the
  * per-session instance segment, so a name replayed from earlier context differs
- * from the live registry only there. One candidate is a rename and is safe to
+ * from the live registry only there. One tool is a rename and is safe to
  * dispatch; zero or several stay a not-found error, because routing the model at
- * the wrong server's tool is worse than a dead end.
+ * another server's tool is worse than a dead end. Candidates are the tools
+ * themselves, so one tool reachable under two names is one candidate.
  */
 function resolveSoleToolCallNameAlias<T extends { name: string; customWireName?: string }>(
 	callName: string,
 	tools: ReadonlyArray<T> | undefined,
 ): { tool: T; callName: string } | undefined {
-	const aliases = findToolCallNameAliases(callName, tools, 2);
-	if (aliases.length !== 1) return undefined;
-	const tool = findActiveTool(tools, aliases[0]);
-	return tool === undefined ? undefined : { tool, callName: aliases[0] };
+	let resolved: T | undefined;
+	for (const tool of tools ?? []) {
+		if (!callNameDenotesTool(callName, tool)) continue;
+		if (resolved !== undefined && resolved !== tool) return undefined;
+		resolved = tool;
+	}
+	return resolved === undefined ? undefined : { tool: resolved, callName: resolved.name };
 }
 
 /**

@@ -136,14 +136,23 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 	});
 
 	// Issue #3917, captured sessions 019fd580/019fd583/019fd595: the model called
-	// `mcp__<server>__<instance>_search` while plain `search` was active, five
-	// times across three sessions, and each bare not-found burned a whole turn.
-	// One active match is a rename, not a dead end, so the call is dispatched.
+	// `mcp__<server>__<instance>_search` while `search` was active, five times
+	// across three sessions, and each bare not-found burned a whole turn.
+	// The registry exposes the tool under both its bare name and the bridge form
+	// the live session mints, so only the instance segment is stale: the call is a
+	// rename, not a dead end, and is dispatched. Without that pair the split would
+	// be a guess — `mcp__brave__web_search` looks exactly the same.
 	it("dispatches a call carrying a stale MCP bridge namespace to the one tool it denotes", async () => {
 		let searchRuns = 0;
 		let readRuns = 0;
 		const toolResults = await collectToolResults(
-			[makeTool("search", { onExecute: () => searchRuns++ }), makeTool("read", { onExecute: () => readRuns++ })],
+			[
+				makeTool("search", {
+					customWireName: "mcp__jzi2uzmxd57z__mr6er53iidr3_search",
+					onExecute: () => searchRuns++,
+				}),
+				makeTool("read", { onExecute: () => readRuns++ }),
+			],
 			"mcp__jzi2uzmxd57z__wbg7pcrl46bd_search",
 		);
 
@@ -159,7 +168,12 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 	it("dispatches when only the bridge instance segment went stale", async () => {
 		let runs = 0;
 		const toolResults = await collectToolResults(
-			[makeTool("mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent", { onExecute: () => runs++ })],
+			[
+				makeTool("mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent", {
+					customWireName: "subagent",
+					onExecute: () => runs++,
+				}),
+			],
 			"mcp__jzi2uzmxd57z__jgspauo3hmi5_subagent",
 		);
 
@@ -169,11 +183,13 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 		expect(toolResults[0].text).toBe("executed");
 	});
 
-	it("dispatches to an alias reachable only through customWireName", async () => {
+	// The bridge-qualified form the registry knows may be the customWireName; the
+	// dispatcher resolves through it exactly as it does through `name`.
+	it("dispatches an alias reachable only through customWireName", async () => {
 		let runs = 0;
 		const toolResults = await collectToolResults(
-			[makeTool("edit", { customWireName: "apply_patch", onExecute: () => runs++ })],
-			"mcp__srv__stale_apply_patch",
+			[makeTool("edit", { customWireName: "mcp__srv__abc_edit", onExecute: () => runs++ })],
+			"mcp__srv__stale_edit",
 		);
 
 		expect(runs).toBe(1);

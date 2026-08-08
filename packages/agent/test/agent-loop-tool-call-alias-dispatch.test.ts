@@ -17,8 +17,20 @@ import { createUserMessage } from "./helpers";
 type QuerySchema = z.ZodObject<{ query: z.ZodString }>;
 type QueryTool = AgentTool<QuerySchema, Record<string, never>>;
 
+/**
+ * A proxied bridge exposes the session's tools under `mcp__<server>__<instance>_<tool>`
+ * and mints a fresh instance segment per session. The registry knows both names a
+ * tool is reachable under — the harness-internal one and the bridge-qualified one —
+ * and that pair is what proves where the instance segment ends and the tool name
+ * begins. Without it `mcp__brave__web_search` is indistinguishable from a stale
+ * `search`, so it is not dispatched at all.
+ */
+function bridgeForm(base: string, instance = "wbg7pcrl46bd"): string {
+	return `mcp__jzi2uzmxd57z__${instance}_${base}`;
+}
+
 /** Stale name a model replays after the bridge minted a new instance segment. */
-const STALE_SEARCH_CALL = "mcp__jzi2uzmxd57z__mr6er53iidr3_search";
+const STALE_SEARCH_CALL = bridgeForm("search", "mr6er53iidr3");
 
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
@@ -84,7 +96,13 @@ describe("agentLoop: unresolvable tool call names with exactly one active match"
 	it("executes the resolved tool instead of rejecting the call", async () => {
 		const executed: Array<{ query: string }> = [];
 		const results = await runToolCall(
-			[makeQueryTool("search", { onExecute: args => executed.push(args) }), makeQueryTool("read")],
+			[
+				makeQueryTool("search", {
+					customWireName: bridgeForm("search"),
+					onExecute: args => executed.push(args),
+				}),
+				makeQueryTool("read"),
+			],
 			{ name: STALE_SEARCH_CALL, arguments: { query: "alpha" } },
 		);
 
@@ -99,10 +117,18 @@ describe("agentLoop: unresolvable tool call names with exactly one active match"
 	// separator, so only the bridge prefix may be stripped.
 	it("resolves a base name that contains underscores", async () => {
 		const executed: Array<{ query: string }> = [];
-		const results = await runToolCall([makeQueryTool("todo_write", { onExecute: args => executed.push(args) })], {
-			name: "mcp__jzi2uzmxd57z__mr6er53iidr3_todo_write",
-			arguments: { query: "init" },
-		});
+		const results = await runToolCall(
+			[
+				makeQueryTool("todo_write", {
+					customWireName: bridgeForm("todo_write"),
+					onExecute: args => executed.push(args),
+				}),
+			],
+			{
+				name: bridgeForm("todo_write", "mr6er53iidr3"),
+				arguments: { query: "init" },
+			},
+		);
 
 		expect(executed).toEqual([{ query: "init" }]);
 		expect(results).toHaveLength(1);
@@ -114,7 +140,10 @@ describe("agentLoop: unresolvable tool call names with exactly one active match"
 	it("logs the redirect with the requested and resolved names", async () => {
 		const info = vi.spyOn(logger, "info").mockImplementation(() => {});
 
-		await runToolCall([makeQueryTool("search")], { name: STALE_SEARCH_CALL, arguments: { query: "beta" } });
+		await runToolCall([makeQueryTool("search", { customWireName: bridgeForm("search") })], {
+			name: STALE_SEARCH_CALL,
+			arguments: { query: "beta" },
+		});
 
 		const redirects = info.mock.calls.filter(call => call[0] === "Tool call renamed to its single active alias");
 		expect(redirects).toHaveLength(1);
@@ -141,10 +170,18 @@ describe("agentLoop: unresolvable tool call names with exactly one active match"
 
 	it("validates arguments against the resolved tool's schema", async () => {
 		const executed: Array<{ query: string }> = [];
-		const results = await runToolCall([makeQueryTool("search", { onExecute: args => executed.push(args) })], {
-			name: STALE_SEARCH_CALL,
-			arguments: { query: 42 },
-		});
+		const results = await runToolCall(
+			[
+				makeQueryTool("search", {
+					customWireName: bridgeForm("search"),
+					onExecute: args => executed.push(args),
+				}),
+			],
+			{
+				name: STALE_SEARCH_CALL,
+				arguments: { query: 42 },
+			},
+		);
 
 		expect(executed).toEqual([]);
 		expect(results).toHaveLength(1);
@@ -157,7 +194,12 @@ describe("agentLoop: unresolvable tool call names with exactly one active match"
 		const executed: Array<{ query: string }> = [];
 		const seen: Array<{ name: string; args: unknown }> = [];
 		const results = await runToolCall(
-			[makeQueryTool("search", { onExecute: args => executed.push(args) })],
+			[
+				makeQueryTool("search", {
+					customWireName: bridgeForm("search"),
+					onExecute: args => executed.push(args),
+				}),
+			],
 			{ name: STALE_SEARCH_CALL, arguments: { query: "delta" } },
 			context => {
 				seen.push({ name: context.toolCall.name, args: context.args });
@@ -172,11 +214,18 @@ describe("agentLoop: unresolvable tool call names with exactly one active match"
 		expect(results[0].text).toContain("denied by policy");
 	});
 
-	it("dispatches a stale call name to a tool reachable only via customWireName", async () => {
+	// The bridge-qualified form the registry knows can be the customWireName: the
+	// pair still proves that only the instance segment went stale.
+	it("dispatches a stale call name via a bridge form exposed as customWireName", async () => {
 		const executed: Array<{ query: string }> = [];
 		const results = await runToolCall(
-			[makeQueryTool("internal_edit", { customWireName: "apply_patch", onExecute: args => executed.push(args) })],
-			{ name: "mcp__srv__stale_apply_patch", arguments: { query: "epsilon" } },
+			[
+				makeQueryTool("internal_edit", {
+					customWireName: "mcp__srv__abc_internal_edit",
+					onExecute: args => executed.push(args),
+				}),
+			],
+			{ name: "mcp__srv__stale_internal_edit", arguments: { query: "epsilon" } },
 		);
 
 		expect(executed).toEqual([{ query: "epsilon" }]);
