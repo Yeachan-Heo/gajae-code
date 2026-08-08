@@ -2986,7 +2986,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 51 strict archive settlement", () => {
+	test("keeps wire protocol 3 through generation 52 strict archive settlement", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3007,8 +3007,8 @@ describe("telegram daemon", () => {
 		// generation 50 resolves intermediate notifications-directory symlinks before
 		// native exact unlink while keeping final-component file symlinks fail-closed;
 		// generation 51 adds shared durable topic authority and archive recovery and
-		// binds idempotent archive settlement to Telegram error code 400.
-		expect(DAEMON_GENERATION).toBe(51);
+		// generation 52 adds shared durable topic authority and archive recovery and
+		expect(DAEMON_GENERATION).toBe(52);
 	});
 	test.each([
 		"1",

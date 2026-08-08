@@ -77,7 +77,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * topic authority, archive recovery, and requires Telegram's documented error
  * code for idempotent archive settlement.
  */
-export const DAEMON_GENERATION = 51;
+export const DAEMON_GENERATION = 52;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
