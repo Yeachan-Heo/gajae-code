@@ -2986,7 +2986,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 50 durable topic authority", () => {
+	test("keeps wire protocol 3 through generation 57 durable topic authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3005,7 +3005,7 @@ describe("telegram daemon", () => {
 		// crash-durable, aliases legacy-disjoint, and topic authority exact; generation
 		// 49 drains admitted session handlers before final persistence and ownership release;
 		// generation 50 adds shared durable topic authority and archive recovery.
-		expect(DAEMON_GENERATION).toBe(50);
+		expect(DAEMON_GENERATION).toBe(57);
 	});
 	test.each([
 		"1",

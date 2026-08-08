@@ -72,7 +72,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 49 drains every admitted session-message handler before final
  * durable persistence and ownership release.
  */
-export const DAEMON_GENERATION = 50;
+export const DAEMON_GENERATION = 57;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
