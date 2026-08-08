@@ -186,21 +186,25 @@ function responseResult(value: unknown): Record<string, unknown> {
 	return result && typeof result === "object" && !Array.isArray(result) ? (result as Record<string, unknown>) : frame;
 }
 
-function validRef(value: unknown): value is string {
+function validClientRef(value: unknown): value is string {
 	return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 128;
+}
+
+function validNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
 }
 
 function atomicIdentity(input: SdkAtomicCreateConnectSubmitInput): SdkAtomicLookupIdentity {
 	if (!input.create || typeof input.create !== "object" || Array.isArray(input.create))
 		throw new SdkClientError("invalid_input", "Atomic create input must be an object.");
-	if (!validRef(input.createIdempotencyKey))
+	if (!validClientRef(input.createIdempotencyKey))
 		throw new SdkClientError("invalid_input", "createIdempotencyKey must be a trimmed non-empty string.");
 	const submission = input.submission;
-	if (!submission || !validRef(submission.clientRef))
+	if (!submission || !validClientRef(submission.clientRef))
 		throw new SdkClientError("invalid_input", "clientRef must be a trimmed 1..128 character string.");
 	if (
-		(submission.kind === "prompt" && !validRef(submission.text)) ||
-		(submission.kind === "skill" && !validRef(submission.name)) ||
+		(submission.kind === "prompt" && !validNonEmptyString(submission.text)) ||
+		(submission.kind === "skill" && !validNonEmptyString(submission.name)) ||
 		(submission.kind !== "prompt" && submission.kind !== "skill")
 	)
 		throw new SdkClientError("invalid_input", "Atomic submission is invalid.");
@@ -217,8 +221,8 @@ function validAtomicIdentity(identity: SdkAtomicLookupIdentity): boolean {
 	return (
 		identity.version === 1 &&
 		identity.operation === "session.create" &&
-		validRef(identity.createIdempotencyKey) &&
-		validRef(identity.submission.clientRef) &&
+		validNonEmptyString(identity.createIdempotencyKey) &&
+		validClientRef(identity.submission.clientRef) &&
 		!!identity.create &&
 		typeof identity.create === "object" &&
 		!Array.isArray(identity.create)
@@ -499,23 +503,18 @@ export class SdkClient {
 		let submissionStarted = false;
 		try {
 			const incarnation = await endpointClient.#connect();
+			const replayGeneration = input.replaySinceGeneration ?? identity.endpointGeneration ?? 1;
+			const replaySeq = input.replaySinceSeq ?? 0;
 			const replay = await endpointClient.#requestOnIncarnation(
 				{
 					type: "event_replay",
-					sinceGeneration: input.replaySinceGeneration ?? 1,
-					sinceSeq: input.replaySinceSeq ?? 0,
+					sinceGeneration: replayGeneration,
+					sinceSeq: replaySeq,
 				},
 				incarnation,
 				{ timeoutMs: input.timeoutMs },
 			);
-			if (
-				!replayReady(
-					responseResult(replay),
-					liveEvents,
-					input.replaySinceGeneration ?? 1,
-					input.replaySinceSeq ?? 0,
-				)
-			)
+			if (!replayReady(responseResult(replay), liveEvents, replayGeneration, replaySeq))
 				return uncertain("subscription_uncertain", identity);
 			const operation = input.submission.kind === "prompt" ? "turn.prompt" : "skill.invoke";
 			const controlInput =
@@ -613,20 +612,23 @@ export class SdkClient {
 			const client = new SdkClient(url, token, { timeoutMs: options.timeoutMs, reconnectAttempts: 0 });
 			try {
 				const incarnation = await client.#connect();
-				const replay = await client.#requestOnIncarnation(
-					{ type: "event_replay", sinceGeneration: recovered.endpointGeneration ?? 1, sinceSeq: 0 },
-					incarnation,
-					options,
-				);
-				if (!replayReady(responseResult(replay), [], recovered.endpointGeneration ?? 1, 0))
-					return uncertain("subscription_uncertain", recovered);
-				const query = recovered.submission.kind === "prompt" ? "turn.prompt_status" : "skill.invoke_status";
-				const status = responseResult(
-					await client.#requestOnIncarnation(
-						{ type: "query_request", query, input: { clientRef: recovered.submission.clientRef } },
+				const replayGeneration = recovered.endpointGeneration ?? 1;
+				await client
+					.#requestOnIncarnation(
+						{ type: "event_replay", sinceGeneration: replayGeneration, sinceSeq: 0 },
 						incarnation,
 						options,
-					),
+					)
+					.catch(() => undefined);
+				const query = recovered.submission.kind === "prompt" ? "turn.prompt_status" : "skill.invoke_status";
+				const status = responseResult(
+					await (client.#isActive(incarnation) && incarnation.socket.readyState === WebSocket.OPEN
+						? client.#requestOnIncarnation(
+								{ type: "query_request", query, input: { clientRef: recovered.submission.clientRef } },
+								incarnation,
+								options,
+							)
+						: client.query(query, { clientRef: recovered.submission.clientRef }, undefined, options)),
 				);
 				return statusIsKnown(status)
 					? { kind: "reconciled", identity: recovered, status }
