@@ -418,9 +418,13 @@ test("a normal agent_end settles the prompt once and disarms the watchdog", asyn
 		const { pending } = await startTurn(fixture);
 		// The turn is being watched, so the disarm assertion below cannot pass vacuously.
 		expect(fixture.clock.pending).toBe(1);
+		const idleBeforeTerminal = idleUpdates(fixture.updates);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
 
+		// The prompt settles on its terminal frame, ahead of the advisory end-of-turn
+		// queries, so the phase publication is snapshotted once those have flushed.
+		await waitFor(() => idleUpdates(fixture.updates) > idleBeforeTerminal, "end-of-turn idle update");
 		const updatesAfterSettle = fixture.updates.length;
 		const idleAfterSettle = idleUpdates(fixture.updates);
 		expect(fixture.clock.pending).toBe(0);
