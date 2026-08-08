@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- SDK snapshot spill writes no longer fail after a successful write and `fsync` when Bun reports `EBADF` while closing an already-released file descriptor under heavily contended CI teardown. The atomic writer preserves any primary write/sync failure, ignores only the proven already-closed descriptor case, and keeps every other close error fatal.
+- SDK snapshot spill writes now retry once with a fresh temporary file when Bun reports `EBADF` during write or `fsync` under heavily contended descriptor teardown, and no longer fail when `close()` reports `EBADF` after a successful write and sync. The atomic writer removes the abandoned attempt before retrying, preserves primary I/O failures, accepts only the proven already-closed close case, and keeps every non-`EBADF` error or repeated descriptor failure fatal.
 
 ## [0.12.16] - 2026-08-08
 
