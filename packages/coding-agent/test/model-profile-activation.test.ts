@@ -409,6 +409,39 @@ describe("model profile activation", () => {
 		});
 	});
 
+	test("reports an unknown bare alias as a profile configuration error", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unknown-bare-only",
+			requiredProviders: [],
+			modelMapping: { default: "typo-model" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getAll: () => [],
+			getAvailable: () => [],
+			lookupAliasExists: () => false,
+			resolveModelByLookupAlias: () => undefined,
+		};
+		let error: unknown;
+		try {
+			await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(Error);
+		expect(error).not.toBeInstanceOf(ModelProfileCredentialError);
+		expect((error as Error).message).toBe(
+			'Model profile "unknown-bare-only" default selector "typo-model" does not match any catalog model',
+		);
+	});
+
 	test("preserves a fully unresolved executor chain and skips it without request attempts", async () => {
 		const executorChain = ["provider-a/unknown-executor", "provider-b/unknown-executor"];
 		const profile: ModelProfileDefinition = {

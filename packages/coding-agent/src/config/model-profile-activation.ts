@@ -537,7 +537,6 @@ async function resolveAndClampSelectorValue(
 	for (const selector of selectors) {
 		const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
 		let resolved = resolveModelRoleValue(selector, availableModels, options);
-		const initiallyResolvedProvider = resolved.model?.provider;
 		if (bareAlias) {
 			const authenticated = await resolveModelChainWithAuth(
 				[selector],
@@ -569,13 +568,16 @@ async function resolveAndClampSelectorValue(
 			if (bareAlias && selectors.length === 1) {
 				const providers = getBareSelectorCredentialProviders(selector, options.modelRegistry);
 				const bareSelector = splitSelectorThinkingSuffix(selector).selector;
+				const aliasKnown =
+					options.modelRegistry.lookupAliasExists?.(bareSelector.toLowerCase()) ?? providers.length > 0;
+				if (!aliasKnown) {
+					throw new Error(
+						`Model profile "${profileLabel}" ${role} selector "${bareSelector}" does not match any catalog model`,
+					);
+				}
 				throw new ModelProfileCredentialError(
 					profileLabel,
-					providers.length > 0
-						? providers
-						: initiallyResolvedProvider
-							? [initiallyResolvedProvider]
-							: [bareSelector],
+					providers.length > 0 ? providers : [bareSelector],
 					role,
 				);
 			}
