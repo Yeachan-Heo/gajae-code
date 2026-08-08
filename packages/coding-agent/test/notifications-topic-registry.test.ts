@@ -373,6 +373,18 @@ describe("TopicRegistry", () => {
 		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
 		expect(reg.get("s1")?.topicId).toBe("1");
 	});
+	test("clears disconnect grace before persisting an archive fence", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "1");
+		expect(reg.markOrphaned("s1", 1_000)).toBe(true);
+
+		reg.beginArchive("s1", undefined, 2_000);
+		const snapshot = reg.serialize();
+
+		expect(snapshot.topics.s1).toMatchObject({ authorityState: "archive_pending", orphanedAt: 1_000 });
+		expect(snapshot.topics.s1.disconnectGraceExpiresAt).toBeUndefined();
+		expect(parseTopicRegistryState(snapshot)).toBeDefined();
+	});
 	test.each([
 		["empty", ""],
 		["non-decimal", "1e2"],
@@ -562,10 +574,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generation 56 at serving epoch 5", () => {
+test("publishes generation 57 at serving epoch 5", () => {
 	// Generation 55: shared-topic-authority outage hardening (#3974).
 	// Generation 56: lazy native authority for startup-cost cut (#3846).
-	expect(DAEMON_GENERATION).toBe(56);
+	// Generation 57: parser-valid archive transitions after disconnect grace.
+	expect(DAEMON_GENERATION).toBe(57);
 	expect(SERVING_EPOCH).toBe(5);
 });
 test("archives pending topics into retained inactive records", async () => {

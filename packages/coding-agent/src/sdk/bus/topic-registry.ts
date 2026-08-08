@@ -1202,11 +1202,14 @@ export class TopicRegistry {
 				authorityEpoch: deleteEpoch,
 				authorityState: "archive_pending",
 			});
+			const restored = this.topics.get(snapshot.sessionId);
+			if (restored) delete restored.disconnectGraceExpiresAt;
 		} else if (record.topicId !== snapshot.topicId) {
 			return false;
 		} else {
 			record.authorityEpoch = deleteEpoch;
 			record.authorityState = "archive_pending";
+			delete record.disconnectGraceExpiresAt;
 			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
 		}
 		this.epochs.set(snapshot.sessionId, deleteEpoch);
@@ -1230,6 +1233,7 @@ export class TopicRegistry {
 			if (record) {
 				record.authorityEpoch = Number.MAX_SAFE_INTEGER;
 				record.authorityState = "archive_exhausted";
+				delete record.disconnectGraceExpiresAt;
 				if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 			}
 			return undefined;
@@ -1239,6 +1243,7 @@ export class TopicRegistry {
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
 		record.authorityState = "archive_pending";
+		delete record.disconnectGraceExpiresAt;
 		if (hostId) record.archiveHostId = hostId;
 		record.archiveLeaseEpoch = epoch;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
@@ -1368,6 +1373,7 @@ export class TopicRegistry {
 		)
 			return false;
 		record.authorityState = "inactive";
+		delete record.disconnectGraceExpiresAt;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		this.archiveJobs.delete(sessionId);
 		return true;
@@ -1383,6 +1389,7 @@ export class TopicRegistry {
 					record.authorityEpoch = epoch;
 					record.archiveLeaseEpoch = epoch;
 					record.authorityState = "archive_pending";
+					delete record.disconnectGraceExpiresAt;
 				}
 			}
 			return (record.authorityState === "archive_pending" || record.authorityState === "archive_exhausted") &&
@@ -1420,6 +1427,7 @@ export class TopicRegistry {
 			...(exhausted ? { safeDiagnostic: "archive retry remains discoverable after retry budget" } : {}),
 		};
 		record.authorityState = "archive_pending";
+		delete record.disconnectGraceExpiresAt;
 		this.archiveJobs.set(sessionId, job);
 		return job;
 	}

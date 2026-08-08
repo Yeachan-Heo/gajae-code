@@ -3015,8 +3015,9 @@ describe("telegram daemon", () => {
 		// process cannot keep advertising itself as the ready owner (#3965).
 		// generation 55 hardens the shared topic authority outage path (#3974).
 		// generation 56 moves exact unlink and process-incarnation authority behind
-		// lazy native bindings (#3846).
-		expect(DAEMON_GENERATION).toBe(56);
+		// lazy native bindings (#3846); generation 57 preserves parser-valid archive
+		// transitions after disconnect grace.
+		expect(DAEMON_GENERATION).toBe(57);
 	});
 	test.each([
 		"1",
