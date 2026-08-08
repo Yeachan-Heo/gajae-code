@@ -476,7 +476,7 @@ export class DiscordNotificationDaemon {
 	): Promise<DiscordInboundClaim | "invalid" | undefined> {
 		if (record.state !== "active" || closingIntent(record)) return "invalid";
 		const route = event.interaction ? decodeCustomId(event.interaction.customId) : undefined;
-		const command = !event.interaction && event.content?.startsWith("/sdk ");
+		const command = !event.interaction && typeof event.content === "string" && event.content.trim().length > 0;
 		if (!command && (!route || !event.interaction || route.generation !== record.endpointGeneration))
 			return "invalid";
 		const key = discordConversationKey({

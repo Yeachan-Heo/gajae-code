@@ -71,6 +71,12 @@ function frameText(event: Extract<NotificationEvent, { type: "frame" }>): string
 	return lines.join("\n");
 }
 
+function discordFrameText(event: Extract<NotificationEvent, { type: "frame" }>): string | undefined {
+	const frame = event.frame;
+	if (frame.type !== "turn_stream" || frame.phase === "live") return undefined;
+	return text(frame.text) ?? text(frame.lastMessage) ?? text(frame.caption);
+}
+
 function routeFromInbound(input: unknown): NotificationReplyRoute | undefined {
 	const raw = input as InboundShape;
 	if (!raw || typeof raw !== "object") return undefined;
@@ -87,8 +93,8 @@ class DiscordNotificationAdapter implements NotificationPresentationAdapter {
 	constructor(private readonly opts: ChatAdapterOptions) {}
 
 	render(event: NotificationEvent): NotificationAdapterPayload[] {
-		if (event.type === "action_resolved") return [];
-		const content = event.type === "action_needed" ? actionText(event, "discord") : frameText(event);
+		if (event.type === "action_resolved" || (event.type === "action_needed" && event.kind === "idle")) return [];
+		const content = event.type === "action_needed" ? actionText(event, "discord") : discordFrameText(event);
 		if (!content) return [];
 		const payload: Record<string, unknown> = {
 			content,

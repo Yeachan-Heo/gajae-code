@@ -62,6 +62,28 @@ describe("Discord and Slack notification adapters", () => {
 		for (const secret of secretCorpus) expect(serialized).not.toContain(secret);
 	});
 
+	test("Discord emits only completed turn text and suppresses lifecycle noise", () => {
+		const engine = new NotificationPresentationEngine([createDiscordAdapter()], {
+			redact: false,
+			sessionTag: () => "abcdef",
+		});
+		for (const frame of [
+			{ type: "agent_start" },
+			{ type: "activity" },
+			{ type: "identity_header", title: "Session" },
+			{ type: "turn_stream", phase: "live", text: "partial" },
+			{ type: "agent_end", lastMessage: "duplicate" },
+		])
+			expect(engine.fanout({ type: "frame", sessionId: "session", frame })).toEqual([]);
+		const payloads = engine.fanout({
+			type: "frame",
+			sessionId: "session",
+			frame: { type: "turn_stream", phase: "completed", text: "final answer" },
+		});
+		expect(payloads).toHaveLength(1);
+		expect(payloads[0]?.body).toEqual(expect.objectContaining({ content: "final answer" }));
+	});
+
 	test("ignore unknown or stale inbound replies", () => {
 		const engine = new NotificationPresentationEngine([createDiscordAdapter()], {
 			redact: false,

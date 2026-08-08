@@ -66,10 +66,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * them against an exact owner tuple, so an owner at an earlier generation may
  * not serve or answer a request captured against this contract. Discord
  * generation 27 / slack generation 26 move shared exact unlink and process-
- * incarnation authority behind lazy native bindings.
+ * incarnation authority behind lazy native bindings. Discord generation 28
+ * admits ordinary thread messages as prompts and normalizes Gateway payloads.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 27,
+	discord: 28,
 	slack: 26,
 };
 

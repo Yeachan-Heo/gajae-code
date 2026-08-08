@@ -685,18 +685,29 @@ export class ChatDaemonRuntime {
 		idempotencyKey: string = randomUUID(),
 	): Promise<boolean> {
 		const match = /^\/sdk\s+(control|query|global)\s+([^\s]+)(?:\s+(.+))?\s*$/.exec(content);
-		if (!match) return false;
-		const kind = match[1] as "control" | "query" | "global";
-		let input: unknown = {};
-		if (match[3]) {
-			try {
-				input = JSON.parse(match[3]);
-			} catch {
-				return false;
+		const plainPrompt = match === null;
+		let kind: "control" | "query" | "global";
+		let operation: string;
+		let input: unknown;
+		if (match) {
+			kind = match[1] as "control" | "query" | "global";
+			operation = match[2]!;
+			input = {};
+			if (match[3]) {
+				try {
+					input = JSON.parse(match[3]);
+				} catch {
+					return false;
+				}
 			}
+		} else {
+			const text = content.trim();
+			if (!text) return false;
+			kind = "control";
+			operation = "turn.prompt";
+			input = { text };
 		}
 		if (!input || typeof input !== "object" || Array.isArray(input)) return false;
-		const operation = match[2]!;
 		let outcome: { ok: true; result: unknown } | { ok: false; error: { code: string; message: string } };
 		try {
 			outcome = await sendAuthorizedChatOperation(transport, { kind, operation, input }, async () => {
@@ -722,7 +733,7 @@ export class ChatDaemonRuntime {
 				},
 			};
 		}
-		await this.#postCommandOutcome(transport, sessionId, { kind, operation }, outcome);
+		if (!plainPrompt) await this.#postCommandOutcome(transport, sessionId, { kind, operation }, outcome);
 		return outcome.ok;
 	}
 	async #runGlobalCommand(

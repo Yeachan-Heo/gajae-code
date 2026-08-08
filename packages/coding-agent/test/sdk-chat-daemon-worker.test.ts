@@ -345,11 +345,8 @@ describe("chat daemon worker", () => {
 		);
 		expect(startupQueries).toHaveLength(1);
 		expect(startupQueries[0]).toMatchObject({ type: "query_request", query: "todo.list", input: {} });
-		const turnStreamPosted = provider.waitForMessage(message => message.content === "GJC turn stream\noutbound");
-		expect(provider.messages).toContainEqual({
-			threadId: "thread-1",
-			content: "GJC identity header\ntitle: Replay identity\nrepo: replay-repo\nbranch: replay-branch",
-		});
+		const turnStreamPosted = provider.waitForMessage(message => message.content === "outbound");
+		expect(provider.messages.some(message => message.content.includes("Replay identity"))).toBe(false);
 		client.handler?.({ type: "turn_stream", phase: "live", sessionId: "session", text: "direct live" });
 		client.handler?.({
 			type: "event",
@@ -360,15 +357,11 @@ describe("chat daemon worker", () => {
 		expect(provider.messages.some(message => /(?:replayed|direct|wrapped) live/.test(message.content))).toBe(false);
 		client.handler?.({ type: "turn_stream", sessionId: "session", text: "outbound" });
 		await turnStreamPosted;
-		expect(provider.messages).toContainEqual({ threadId: "thread-1", content: "GJC turn stream\noutbound" });
-		const finalizedTurnStreamPosted = provider.waitForMessage(
-			message => message.content === "GJC turn stream\nfinalized",
-		);
+		expect(provider.messages).toContainEqual({ threadId: "thread-1", content: "outbound" });
+		const finalizedTurnStreamPosted = provider.waitForMessage(message => message.content === "finalized");
 		client.handler?.({ type: "turn_stream", phase: "finalized", sessionId: "session", text: "finalized" });
 		await finalizedTurnStreamPosted;
-		const wrappedMissingPhasePosted = provider.waitForMessage(
-			message => message.content === "GJC turn stream\nwrapped missing phase",
-		);
+		const wrappedMissingPhasePosted = provider.waitForMessage(message => message.content === "wrapped missing phase");
 		client.handler?.({
 			type: "event",
 			name: "turn_stream",
@@ -425,6 +418,23 @@ describe("chat daemon worker", () => {
 		expect(provider.messages.filter(message => message.content === queryResultBody)).toHaveLength(
 			queryResultBaseline + 1,
 		);
+		const promptKey = "discord:app:guild:parent:thread-1:prompt";
+		const promptRequest = client.waitForRequest(
+			request =>
+				request.type === "control_request" &&
+				request.operation === "turn.prompt" &&
+				(request.input as Record<string, unknown>)?.text === "plain Discord instruction" &&
+				request.idempotencyKey === promptKey,
+		);
+		await provider.handler?.({
+			id: "prompt",
+			guildId: "guild",
+			parentId: "parent",
+			threadId: "thread-1",
+			authorId: "human",
+			content: "plain Discord instruction",
+		});
+		await promptRequest;
 		expect(JSON.stringify(provider.messages)).not.toContain("daemon-result-secret");
 		const prohibitedResult = provider.waitForMessage(
 			message =>
