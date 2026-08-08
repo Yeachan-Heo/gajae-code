@@ -7,7 +7,11 @@ import {
 	THINKING_CONTROL_MODES,
 	THINKING_EFFORTS,
 	type ThinkingControlMode,
+	UNK_CONTEXT_WINDOW,
+	UNK_MAX_TOKENS,
 } from "@gajae-code/ai/core";
+import { formatModelProfileDisplayLabel, type ModelProfileDefinition } from "../config/model-profiles";
+import { SYNTHETIC_PROVIDER_ID } from "./model-profile-model";
 
 export type Q10ThinkingEffort = Effort;
 export type Q10SettableThinkingLevel = typeof ThinkingLevel.Off | Q10ThinkingEffort;
@@ -71,6 +75,19 @@ export interface Q10ModelProjectionInput {
 	currentModel?: Model<Api>;
 	currentThinkingLevel?: Q10CurrentThinkingLevel;
 	resolveSupportedEfforts?: (model: Model<Api>) => readonly Effort[];
+	/**
+	 * Logical model-profile facade inputs. When supplied, deterministic,
+	 * availability-filtered synthetic rows (`gajae-code/<profile>`) are
+	 * appended after the real rows; the underlying `Model` registry entries
+	 * are never touched.
+	 */
+	profiles?: ReadonlyMap<string, ModelProfileDefinition>;
+	/** Profile ids whose providers are authenticated and therefore selectable. */
+	availableProfileIds?: ReadonlySet<string>;
+	/** Active in-session profile marker; its synthetic row is the logical current. */
+	activeProfile?: string;
+	/** Resolve a profile's default concrete model for display metadata. */
+	resolveProfileDefaultModel?: (profile: ModelProfileDefinition) => Model<Api> | undefined;
 }
 
 /**
@@ -78,8 +95,10 @@ export interface Q10ModelProjectionInput {
  * transport, credentials, pricing, or other registry internals.
  */
 export function projectQ10Models(input: Q10ModelProjectionInput): Q10Model[] {
-	return input.models.map(model => {
-		const current = input.currentModel?.provider === model.provider && input.currentModel.id === model.id;
+	const profileActive = input.activeProfile !== undefined;
+	const concrete = input.models.map(model => {
+		const current =
+			!profileActive && input.currentModel?.provider === model.provider && input.currentModel.id === model.id;
 		const base: Q10Model = {
 			provider: model.provider,
 			id: model.id,
@@ -100,6 +119,62 @@ export function projectQ10Models(input: Q10ModelProjectionInput): Q10Model[] {
 			thinking: projectThinking(model, input.resolveSupportedEfforts ?? getSupportedEfforts),
 		};
 	});
+	const synthetic = projectSyntheticQ10Models(input);
+	return synthetic.length === 0 ? concrete : [...concrete, ...synthetic];
+}
+
+/**
+ * Project model profiles as logical synthetic model rows. Only profiles that
+ * pass the authenticated-provider availability join (plus the active profile,
+ * which remains visible as the current logical readback even when its
+ * providers are no longer authenticated or the profile is absent from the
+ * registry map) are included. An absent availability set fails closed: without
+ * a verified join, non-current profiles are never advertised as selectable.
+ * Rows are appended sorted by profile id so placement across paginated Q10
+ * responses stays deterministic.
+ */
+function projectSyntheticQ10Models(input: Q10ModelProjectionInput): Q10Model[] {
+	if (!input.profiles) return [];
+	const rows: Q10Model[] = [];
+	let activeRowEmitted = false;
+	for (const [name, profile] of [...input.profiles.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+		const isActive = input.activeProfile === name;
+		if (isActive) activeRowEmitted = true;
+		// Fail closed on an unknown availability join: never advertise a
+		// non-current profile as selectable without verified credentials.
+		if (!isActive && input.availableProfileIds === undefined) continue;
+		if (!isActive && input.availableProfileIds !== undefined && !input.availableProfileIds.has(name)) continue;
+		const defaultModel = input.resolveProfileDefaultModel?.(profile);
+		rows.push({
+			provider: SYNTHETIC_PROVIDER_ID,
+			id: name,
+			name: formatModelProfileDisplayLabel(profile),
+			contextWindow: defaultModel?.contextWindow ?? UNK_CONTEXT_WINDOW,
+			maxTokens: defaultModel?.maxTokens ?? UNK_MAX_TOKENS,
+			reasoning: false,
+			thinking: { validLevels: [ThinkingLevel.Off] },
+			current: isActive,
+			...(isActive ? { currentThinkingLevel: ThinkingLevel.Inherit } : {}),
+		});
+	}
+	// Bounded current readback for an active marker whose profile is absent
+	// from the registry map (or whose availability is unknown): exactly one
+	// current row must exist while the marker is set, so concrete current
+	// suppression stays truthful.
+	if (input.activeProfile !== undefined && !activeRowEmitted) {
+		rows.push({
+			provider: SYNTHETIC_PROVIDER_ID,
+			id: input.activeProfile,
+			name: input.activeProfile,
+			contextWindow: UNK_CONTEXT_WINDOW,
+			maxTokens: UNK_MAX_TOKENS,
+			reasoning: false,
+			thinking: { validLevels: [ThinkingLevel.Off] },
+			current: true,
+			currentThinkingLevel: ThinkingLevel.Inherit,
+		});
+	}
+	return rows;
 }
 
 function projectThinking(

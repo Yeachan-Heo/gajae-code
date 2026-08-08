@@ -34,6 +34,16 @@ type ModelProfileActivationSession = Pick<
 	setModelTemporary?: AgentSession["setModelTemporary"];
 	setActiveModelProfile?: (name: string | undefined) => void;
 	getActiveModelProfile?: () => string | undefined;
+	/** Record which runtime override keys this activation installed (session-scoped). */
+	noteProfileInstalledOverrides?: (
+		modelRoles: readonly string[],
+		agentModelOverrides: readonly string[],
+		preProfileModel: Model<Api> | undefined,
+	) => void;
+	/** Drop the recorded profile-installed override keys (e.g. after materialization). */
+	clearProfileInstalledOverrides?: () => void;
+	/** Current profile-installed override keys, for deriving the activation base. */
+	getProfileInstalledOverrideKeys?: () => { modelRoles: readonly string[]; agentModelOverrides: readonly string[] };
 	getSessionDefaultModelSelector?: () => string | undefined;
 	recordResumeDefaultModel?: (selector: string) => void;
 	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
@@ -52,7 +62,7 @@ export interface PrepareModelProfileActivationOptions {
 		| "getCanonicalVariants"
 		| "getCanonicalId"
 	> & { getError?: ModelRegistry["getError"] };
-	settings: Pick<Settings, "get">;
+	settings: Pick<Settings, "get" | "getGlobal">;
 	profileName: string;
 }
 export interface ApplyModelProfileActivationOptions {
@@ -67,6 +77,8 @@ export interface PreparedModelProfileActivation {
 	previousThinkingLevel: ThinkingLevel | undefined;
 	previousAgentModelOverrides: Record<string, ModelSelectorValue>;
 	previousModelRoles: Record<string, ModelSelectorValue>;
+	baseAgentModelOverrides: Record<string, ModelSelectorValue>;
+	baseModelRoles: Record<string, ModelSelectorValue>;
 	previousDefaultChain: readonly string[] | undefined;
 	defaultModel: Model<Api> | undefined;
 	defaultThinkingLevel: ThinkingLevel | undefined;
@@ -92,7 +104,7 @@ export interface MaterializeModelProfileAssignmentOptions {
 	session: Pick<
 		ModelProfileActivationSession,
 		"model" | "thinkingLevel" | "getConfiguredModelChain" | "setActiveModelProfile" | "getActiveModelProfile"
-	>;
+	> & { clearProfileInstalledOverrides?: () => void };
 	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set" | "unset">;
 	role: GjcModelAssignmentTargetId;
 	selector: string;
@@ -102,7 +114,7 @@ export interface MaterializeModelProfileAssignmentsOptions {
 	session: Pick<
 		ModelProfileActivationSession,
 		"model" | "thinkingLevel" | "getConfiguredModelChain" | "setActiveModelProfile" | "getActiveModelProfile"
-	>;
+	> & { clearProfileInstalledOverrides?: () => void };
 	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set" | "unset">;
 	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>;
 }
@@ -183,6 +195,7 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 	options.settings.override("modelRoles", nextModelRoles);
 	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
 	options.session.setActiveModelProfile?.(undefined);
+	options.session.clearProfileInstalledOverrides?.();
 	return true;
 }
 
@@ -218,6 +231,7 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 	options.settings.override("modelRoles", nextModelRoles);
 	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
 	options.session.setActiveModelProfile?.(undefined);
+	options.session.clearProfileInstalledOverrides?.();
 	return true;
 }
 
@@ -448,6 +462,20 @@ export async function prepareModelProfileActivation(
 		previousThinkingLevel: options.session.thinkingLevel,
 		previousAgentModelOverrides: { ...options.settings.get("task.agentModelOverrides") },
 		previousModelRoles: { ...options.settings.get("modelRoles") },
+		// The activation replaces only the previously installed profile-owned
+		// keys: derive the base from the effective map (durable + project +
+		// bindings + non-profile overrides) minus those keys, so project- or
+		// globally-scoped role overrides the new profile omits are preserved.
+		baseAgentModelOverrides: Object.fromEntries(
+			Object.entries(options.settings.get("task.agentModelOverrides") ?? {}).filter(
+				([key]) => !(options.session.getProfileInstalledOverrideKeys?.().agentModelOverrides ?? []).includes(key),
+			),
+		),
+		baseModelRoles: Object.fromEntries(
+			Object.entries(options.settings.get("modelRoles") ?? {}).filter(
+				([key]) => !(options.session.getProfileInstalledOverrideKeys?.().modelRoles ?? []).includes(key),
+			),
+		),
 		previousDefaultChain: options.session.getConfiguredModelChain("default"),
 
 		defaultModel,
@@ -470,7 +498,7 @@ export async function applyPreparedModelProfileActivation(
 	const previousThinkingLevel = prepared.previousThinkingLevel;
 	const previousAgentModelOverrides = prepared.previousAgentModelOverrides;
 	const previousModelRoles = prepared.previousModelRoles;
-	const previousPersistedDefault = prepared.settings.get("modelProfile.default");
+	const previousPersistedDefault = prepared.settings.getGlobal("modelProfile.default");
 	const previousDefaultThinkingLevel = prepared.settings.get("defaultThinkingLevel");
 	const previousActiveModelProfile = prepared.previousActiveModelProfile;
 	const previousSessionDefaultModel = prepared.previousSessionDefaultModel;
@@ -511,16 +539,17 @@ export async function applyPreparedModelProfileActivation(
 			modelChanged = true;
 		}
 		if (Object.keys(prepared.modelRoles).length > 0) {
-			prepared.settings.override("modelRoles", { ...previousModelRoles, ...prepared.modelRoles });
+			prepared.settings.override("modelRoles", { ...prepared.baseModelRoles, ...prepared.modelRoles });
 			modelRolesChanged = true;
 		}
-		if (Object.keys(prepared.agentModelOverrides).length > 0) {
-			prepared.settings.override("task.agentModelOverrides", {
-				...previousAgentModelOverrides,
-				...prepared.agentModelOverrides,
-			});
-			overridesChanged = true;
-		}
+		// Always reinstall the agent role layer from the durable base plus the
+		// new profile's roles: a default-only or role-free successor must drop
+		// the previous profile's role-agent mappings rather than inheriting them.
+		prepared.settings.override("task.agentModelOverrides", {
+			...prepared.baseAgentModelOverrides,
+			...prepared.agentModelOverrides,
+		});
+		overridesChanged = true;
 		if (options.persistDefault) {
 			prepared.settings.set("modelRoles", {});
 			prepared.settings.set("task.agentModelOverrides", {});
@@ -533,6 +562,12 @@ export async function applyPreparedModelProfileActivation(
 			await prepared.settings.flush();
 		}
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
+		prepared.session.noteProfileInstalledOverrides?.(
+			Object.keys(prepared.modelRoles),
+			Object.keys(prepared.agentModelOverrides),
+			// Snapshotted before this activation replaced the runtime model.
+			previousModel,
+		);
 	} catch (error) {
 		if (defaultChanged) {
 			prepared.settings.set("modelProfile.default", previousPersistedDefault);

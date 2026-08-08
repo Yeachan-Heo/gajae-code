@@ -1,4 +1,9 @@
-import { CODEX_GPT_5_6_CONTEXT_CAP, isCodexGpt56Tier, isCodexProductTransport } from "./context-cap-policy";
+import {
+	CODEX_GENERIC_CONTEXT_WINDOW,
+	CODEX_GPT_5_6_CONTEXT_CAP,
+	isCodexGpt56Tier,
+	isCodexProductTransport,
+} from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
 import { resolveOpenAICompat } from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
@@ -535,7 +540,9 @@ function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel)
 		// marketing total window; using 1M here delays compaction and makes the UI
 		// promise space that `/responses/compact`/agent turns cannot actually use.
 		model.contextWindow =
-			model.provider === "openai-codex" || model.api === "openai-codex-responses" ? 272_000 : 1_000_000;
+			model.provider === "openai-codex" || model.api === "openai-codex-responses"
+				? CODEX_GENERIC_CONTEXT_WINDOW
+				: 1_000_000;
 		return true;
 	}
 	return false;
@@ -544,9 +551,10 @@ function applyGpt56ContextWindow(model: ApiModel<Api>): boolean {
 	if (!isCodexGpt56Tier(model) || !isCodexProductTransport(model)) {
 		return false;
 	}
-	// Codex product metadata is bounded by the currently enforced prompt cap.
-	// Smaller observed limits remain authoritative; first-party OpenAI is untouched.
-	model.contextWindow = Math.min(model.contextWindow, CODEX_GPT_5_6_CONTEXT_CAP.ceiling);
+	// Force the enforced 372K window: the OpenAI code backend metadata still
+	// under-reports the GPT-5.6 tier budget, and smaller observed values would
+	// otherwise keep the tier at the old 272K cap. First-party OpenAI is untouched.
+	model.contextWindow = CODEX_GPT_5_6_CONTEXT_CAP.enforced;
 	return true;
 }
 
@@ -559,7 +567,7 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 	}
 	// OpenAI code backend models: 400K figure includes output budget; input window is 272K.
 	if (parsedModel.variant.startsWith("codex") && parsedModel.variant !== "codex-spark") {
-		model.contextWindow = 272000;
+		model.contextWindow = CODEX_GENERIC_CONTEXT_WINDOW;
 		return;
 	}
 	// GPT-5.4 mini/nano use plain OpenAI IDs on the OpenAI code backend transport, but OpenAI code backend still
@@ -572,7 +580,7 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 			model.priority = normalizedPriority;
 		}
 		if (parsedModel.variant === "mini" || parsedModel.variant === "nano") {
-			model.contextWindow = 272000;
+			model.contextWindow = CODEX_GENERIC_CONTEXT_WINDOW;
 		}
 	}
 }

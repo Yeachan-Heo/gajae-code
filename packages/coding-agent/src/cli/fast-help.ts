@@ -7,6 +7,8 @@ export function getExtraHelpText(): string {
   ${APP_NAME} setup                - Install GJC defaults or optional dependencies
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
   ${APP_NAME} state                - Inspect or manage persisted GJC state
+  ${APP_NAME} auth-broker         - Manage the auth-broker (credential vault)
+  ${APP_NAME} auth-gateway        - Run an auth-gateway forward proxy
   ${APP_NAME} harness              - Run harness control-plane commands
   ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
   ${APP_NAME} team                 - Run tmux-backed coordinated execution

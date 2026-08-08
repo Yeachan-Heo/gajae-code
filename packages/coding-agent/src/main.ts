@@ -1474,6 +1474,21 @@ export async function runRootCommand(
 			...(roleOverrides.plan ? { plan: roleOverrides.plan } : {}),
 		});
 	}
+	// Apply --clipboard-transport / --clipboard-ssh-host as ephemeral runtime
+	// overrides (CLI > persisted config > "auto" default). Not persisted —
+	// mirrors the role-override precedence above.
+	if (parsedArgs.clipboardTransport) {
+		settingsInstance.override("clipboard.transport", parsedArgs.clipboardTransport);
+	}
+	if (parsedArgs.clipboardSshHost) {
+		settingsInstance.override("clipboard.sshHost", parsedArgs.clipboardSshHost);
+	}
+	if (parsedArgs.clipboardTransport === "ssh" && !settingsInstance.get("clipboard.sshHost")) {
+		process.stderr.write(
+			`${chalk.red("Error: --clipboard-transport ssh requires --clipboard-ssh-host <alias> (or clipboard.sshHost in config)")}\n`,
+		);
+		process.exit(1);
+	}
 
 	await logger.time(
 		"initTheme:final",

@@ -18,6 +18,7 @@ import { SessionIndex } from "../sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 
 import { buildGcReportText } from "./gc-render";
+import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
 
 export type GcStore =
 	| "harness_leases"
@@ -152,6 +153,8 @@ export interface GcReport {
 	/** Partial-result notices that do not fail the run (e.g. walk caps). */
 	warnings: GcWarning[];
 	session_index?: GcSessionIndexHealth;
+	/** Managed-scope capacity, reported only when it is near or past the budget. */
+	session_scope?: GcSessionScopeUsage;
 }
 
 export interface GcRunResult {
@@ -384,6 +387,24 @@ function resolveGcAgentDir(env: NodeJS.ProcessEnv): string {
 	return env.GJC_CODING_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || getAgentDir();
 }
 
+/**
+ * Locate and measure the managed scope for `cwd`.
+ *
+ * Resolution is read-only (it never prepares or writes a scope), and any
+ * failure yields `undefined` so a capacity probe cannot fail a gc run.
+ */
+async function collectGcSessionScope(cwd: string, agentDir: string): Promise<GcSessionScopeUsage | undefined> {
+	try {
+		const { resolveManagedScope } = await import("../session/internal/managed-session-scope");
+		const { getSessionsDir } = await import("@gajae-code/utils");
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot: getSessionsDir(agentDir) });
+		if (resolved.kind !== "resolved") return undefined;
+		return await collectSessionScopeUsage(resolved.scope.directoryPath);
+	} catch {
+		return undefined;
+	}
+}
+
 async function collectSessionIndexHealth(repair: boolean, agentDir: string): Promise<GcSessionIndexHealth> {
 	const index = new SessionIndex(agentDir);
 	try {
@@ -437,6 +458,8 @@ export async function runGjcGcCommand(
 	const report = await collectGcReport(resolvedAdapters, ctx, parsed.prune);
 	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
 	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, resolveGcAgentDir(env));
+	const scopeUsage = await collectGcSessionScope(cwd, resolveGcAgentDir(env));
+	if (scopeUsage && shouldReportSessionScope(scopeUsage)) report.session_scope = scopeUsage;
 	const sessionIndexFailed =
 		report.session_index?.status === "corrupt" ||
 		report.session_index?.status === "unsupported" ||

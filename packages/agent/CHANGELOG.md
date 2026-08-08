@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Forked-session restore no longer crashes when the seeded append-only prefix includes a tool whose `intent` policy is a deferred function (e.g. `eval`, `bisect`, `checkpoint`, `rewind`). `StablePrefix.importSnapshot` re-normalized the cloned tool JSON, which loses function-valued `intent` fields, so those tools flipped from `omit` to `optional` intent injection and the recomputed fingerprint diverged from the stored one (`StablePrefix.importSnapshot() fingerprint mismatch`). Import now verifies against the stored, already-normalized tools instead of re-normalizing.
+
 ## [0.12.15] - 2026-08-06
 
 ## [0.12.14] - 2026-08-06

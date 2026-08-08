@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { commands } from "../src/cli";
+import { commands, routeRootArgv } from "../src/cli";
 
 describe("CLI command registry", () => {
 	it("registers the `plugin` command so `gjc plugin …` resolves instead of routing to launch", () => {
@@ -48,5 +48,46 @@ describe("CLI command registry", () => {
 		const cmd = (await entry?.load()) as { description?: string } | undefined;
 		expect(cmd).toBeDefined();
 		expect(cmd?.description ?? "").toMatch(/usage statistics/i);
+	});
+	it("registers `auth-broker` so documented verbs resolve instead of routing to launch", () => {
+		// Regression (#3975): `src/commands/auth-broker.ts` and its handlers in
+		// `src/cli/auth-broker-cli.ts` existed, but the entry was never added to
+		// the `commands` registry in cli.ts. `isSubcommand()` therefore returned
+		// false for "auth-broker", so `gjc auth-broker serve|token|login|…` was
+		// rewritten to `launch` and billed a chat turn instead of executing the
+		// credential action. docs/auth-broker-gateway.md documents the verbs.
+		const entry = commands.find(c => c.name === "auth-broker");
+		expect(entry).toBeDefined();
+		expect(routeRootArgv(["auth-broker", "serve"])).toEqual(["auth-broker", "serve"]);
+		expect(routeRootArgv(["auth-broker", "token"])).toEqual(["auth-broker", "token"]);
+		expect(routeRootArgv(["auth-broker", "login", "anthropic"])).toEqual(["auth-broker", "login", "anthropic"]);
+	});
+
+	it("lazily resolves the registered `auth-broker` entry to the AuthBroker command class", async () => {
+		const entry = commands.find(c => c.name === "auth-broker");
+		const cmd = (await entry?.load()) as { description?: string } | undefined;
+		expect(cmd).toBeDefined();
+		expect(cmd?.description ?? "").toMatch(/auth-broker/i);
+	});
+
+	it("registers `auth-gateway` so documented verbs resolve instead of routing to launch", () => {
+		// Regression (#3975): same missing-registry-entry pattern as auth-broker.
+		// `gjc auth-gateway serve|token|status|check` fell through to launch.
+		const entry = commands.find(c => c.name === "auth-gateway");
+		expect(entry).toBeDefined();
+		expect(routeRootArgv(["auth-gateway", "serve"])).toEqual(["auth-gateway", "serve"]);
+		expect(routeRootArgv(["auth-gateway", "check"])).toEqual(["auth-gateway", "check"]);
+		expect(routeRootArgv(["auth-gateway", "token", "--regenerate"])).toEqual([
+			"auth-gateway",
+			"token",
+			"--regenerate",
+		]);
+	});
+
+	it("lazily resolves the registered `auth-gateway` entry to the AuthGateway command class", async () => {
+		const entry = commands.find(c => c.name === "auth-gateway");
+		const cmd = (await entry?.load()) as { description?: string } | undefined;
+		expect(cmd).toBeDefined();
+		expect(cmd?.description ?? "").toMatch(/auth-gateway/i);
 	});
 });

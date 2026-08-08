@@ -65,8 +65,17 @@ export class StablePrefix {
 	}
 
 	importSnapshot(snapshot: StablePrefixSnapshot, options: BuildOptions): void {
+		// The snapshot tools were already normalized by `takeSnapshot()` at export
+		// time. Re-normalizing the cloned JSON would apply `normalizeTools` a
+		// second time, which is not idempotent: a tool whose `intent` policy is a
+		// function resolves as "omit" at export (no `_i` injected), but the
+		// function value is dropped by `cloneJson`, so a second pass resolves the
+		// missing field as "optional" and injects `_i` — changing `parameters` and
+		// diverging the recomputed fingerprint from the stored one. Verify against
+		// the stored tools as-is; the deep clone still keeps `toContext()` results
+		// isolated from later mutation.
 		const systemPrompt = cloneJson(snapshot.systemPrompt);
-		const tools = normalizeImportedTools(snapshot.tools, options);
+		const tools = cloneJson(snapshot.tools);
 		const fingerprint = computeFingerprint(systemPrompt, tools, options);
 		this.#sourceSystemPrompt = null;
 		this.#sourceTools = null;
@@ -426,12 +435,6 @@ function takeSnapshot(context: AgentContext, options: BuildOptions): StablePrefi
 		tools,
 		fingerprint: computeFingerprint(systemPrompt, tools, options),
 	};
-}
-
-function normalizeImportedTools(tools: readonly Tool[], options: BuildOptions): Tool[] {
-	const clonedTools = cloneJson(tools);
-	const normalizedTools = normalizeTools(clonedTools as AgentContext["tools"], options.intentTracing) ?? [];
-	return cloneJson(normalizedTools);
 }
 
 export function cloneJson<T>(value: T): T {

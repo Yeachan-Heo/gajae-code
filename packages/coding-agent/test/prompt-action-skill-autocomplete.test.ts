@@ -21,6 +21,7 @@ function createProvider() {
 		copyCurrentLine: () => {},
 		copyPrompt: () => {},
 		pasteImage: () => {},
+		pasteText: () => {},
 		newSession: () => {},
 		showHelp: () => {},
 		scrollTmuxToPreviousUserInput: () => {},

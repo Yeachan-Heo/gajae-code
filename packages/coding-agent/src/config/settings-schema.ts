@@ -2662,6 +2662,28 @@ export const SETTINGS_SCHEMA = {
 				"Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
 		},
 	},
+	"clipboard.transport": {
+		type: "enum",
+		values: ["auto", "native", "osc52", "ssh"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			label: "Clipboard Transport",
+			description:
+				"auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+		},
+	},
+	"clipboard.sshHost": {
+		type: "string",
+		default: "",
+		validate: (value: string) => value === "" || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value),
+		ui: {
+			tab: "tools",
+			label: "Clipboard SSH Host",
+			description:
+				"SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
+		},
+	},
 
 	"web_search.enabled": {
 		type: "boolean",
@@ -3840,6 +3862,67 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 			validArraySettingValue(value, "items" in definition ? definition.items?.enum : undefined)) ||
 		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
 	);
+}
+
+/**
+ * Validate an external (SDK `config.patch`) path/value set against the
+ * settings schema before any durable write. Dotted sub-paths of record
+ * settings (e.g. `modelRoles.default`) are validated against the record's
+ * value schema. Returns the offending entries so the caller can reject the
+ * whole patch without durable side effects.
+ */
+export function validateSettingPatch(patch: Record<string, unknown>): Array<{ path: string; detail: string }> {
+	const issues: Array<{ path: string; detail: string }> = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const [path, value] of Object.entries(patch)) {
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		if (!definition) {
+			const recordParent = [...knownPaths].find(known => known !== path && path.startsWith(`${known}.`));
+			if (!recordParent) {
+				issues.push({ path, detail: "Setting is not recognized by this version." });
+				continue;
+			}
+			const parentDef = SETTINGS_SCHEMA[recordParent as SettingPath];
+			if (parentDef.type !== "record" || !("valueSchema" in parentDef) || !parentDef.valueSchema) {
+				issues.push({ path, detail: "Setting is not a valid record sub-path." });
+				continue;
+			}
+			if (
+				parentDef.valueSchema.type === "model-selector-value" &&
+				!(typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string")))
+			) {
+				issues.push({ path, detail: "Expected model-selector-value." });
+			}
+			continue;
+		}
+		if (!validSettingValue(definition, value)) {
+			// `Expected array.` is wrong for a real array carrying bad elements, and an
+			// SDK client reaching this through `config.patch` cannot act on it. Name the
+			// element constraint that actually failed.
+			const arrayItemEnum =
+				definition.type === "array" && Array.isArray(value) && "items" in definition
+					? definition.items?.enum
+					: undefined;
+			const detail = arrayItemEnum
+				? `Expected array items to be one of: ${arrayItemEnum.join(", ")}.`
+				: definition.type === "array" && Array.isArray(value)
+					? "Expected array items to be strings."
+					: `Expected ${definition.type}.`;
+			issues.push({ path, detail });
+			continue;
+		}
+		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {
+			for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+				if (
+					definition.valueSchema.type === "model-selector-value" &&
+					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
+				) {
+					issues.push({ path: `${path}.${key}`, detail: "Expected model-selector-value." });
+				}
+			}
+		}
+	}
+	return issues;
 }
 
 /** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */

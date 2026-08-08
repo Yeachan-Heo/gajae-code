@@ -21,4 +21,13 @@ describe("OpenAI Codex defaults", () => {
 		// safe request cap instead of promising a window that overflows upstream.
 		expect(model.contextWindow).toBe(272_000);
 	});
+
+	it("advertises the 372K prompt budget for bundled GPT-5.6 tiers", () => {
+		for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+			const model = getBundledModel("openai-codex", id);
+			expect(model.contextWindow).toBe(372_000);
+			expect(model.maxTokens).toBe(128_000);
+			expect(model.longContextPricing?.threshold).toBe(272_000);
+		}
+	});
 });

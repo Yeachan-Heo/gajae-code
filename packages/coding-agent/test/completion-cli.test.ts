@@ -128,6 +128,17 @@ describe("GJC inshellisense completion spec", () => {
 			"max",
 		]);
 		expect(findOption(spec.options, "--tmux")).toBeDefined();
+		// Regression guard for a canary-found gap: --clipboard-transport/--clipboard-ssh-host
+		// were registered in commands/launch.ts's parsing Command but missed in RootHelpCommand,
+		// the fast-help/completion mirror this spec builds from, so `gjc --help` and shell
+		// completion silently omitted both flags even though parsing worked correctly.
+		expect(findOption(spec.options, "--clipboard-transport")?.args?.suggestions).toEqual([
+			"auto",
+			"native",
+			"osc52",
+			"ssh",
+		]);
+		expect(findOption(spec.options, "--clipboard-ssh-host")).toBeDefined();
 		expect(findOption(spec.options, "--model")?.args).toEqual({ name: "value" });
 		expect(findOption(spec.options, "--resume")?.args).toEqual({ name: "value" });
 		expect(findOption(spec.options, "-p")?.description).toContain("Non-interactive");

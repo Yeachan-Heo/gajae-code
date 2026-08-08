@@ -34,6 +34,7 @@ interface PromptActionAutocompleteOptions {
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
 	pasteImage: () => void;
+	pasteText: () => void;
 	newSession: () => void;
 	showHelp: () => void;
 	scrollTmuxToPreviousUserInput: () => void;
@@ -432,6 +433,13 @@ export function createPromptActionAutocompleteProvider(
 			description: options.keybindings.getDisplayString("app.clipboard.pasteImage"),
 			keywords: ["paste", "image", "clipboard", "screenshot", "attach", "vision"],
 			execute: options.pasteImage,
+		},
+		{
+			id: "paste-text",
+			label: "Paste text from configured clipboard",
+			description: "requires --clipboard-transport ssh",
+			keywords: ["paste", "text", "clipboard", "ssh", "pbpaste", "mac"],
+			execute: options.pasteText,
 		},
 		{
 			id: "tmux-previous-user-input",

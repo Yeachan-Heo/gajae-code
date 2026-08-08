@@ -47,7 +47,7 @@ import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
-import { ModelBindingsApplier } from "./model-bindings-applier";
+import { type ConfiguredModelBindings, ModelBindingsApplier } from "./model-bindings-applier";
 import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-discovery-manager";
 
 export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
@@ -1979,6 +1979,20 @@ export class ModelRegistry {
 		this.#modelBindingsApplier.applyTo(targetSettings);
 	}
 
+	/**
+	 * Re-assert configured modelBindings into the target override slots after a
+	 * session-scoped profile reset removed profile-installed keys. Bypasses the
+	 * user-edit heuristic so the startup role/agent routing is restored.
+	 */
+	reapplyConfiguredModelBindings(targetSettings: Settings): void {
+		this.#modelBindingsApplier.forceApplyTo(targetSettings);
+	}
+
+	/** The currently configured modelBindings, for pre-profile baseline lookup. */
+	getConfiguredModelBindings(): ConfiguredModelBindings | undefined {
+		return this.#modelBindingsApplier.getBindings();
+	}
+
 	async #refreshRuntimeDiscoveries(
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
@@ -3202,6 +3216,11 @@ export class ModelRegistry {
 	 */
 	getAll(): Model<Api>[] {
 		return this.#models;
+	}
+
+	/** Provider ids declared in models.yml, including override-only providers. */
+	getConfiguredProviderIds(): readonly string[] {
+		return [...this.#configuredProviderIds];
 	}
 
 	#isModelAvailable(model: Model<Api>, disabledProviders = getDisabledProviderIdsFromSettings()): boolean {

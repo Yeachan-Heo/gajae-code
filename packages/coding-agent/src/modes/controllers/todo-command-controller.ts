@@ -205,12 +205,10 @@ export class TodoCommandController {
 			this.ctx.showWarning("No todos to copy.");
 			return;
 		}
-		try {
-			copyToClipboard(phasesToMarkdown(phases));
-			this.ctx.showStatus("Copied todos as Markdown to clipboard.");
-		} catch (error) {
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
-		}
+		copyToClipboard(phasesToMarkdown(phases)).then(
+			() => this.ctx.showStatus("Copied todos as Markdown to clipboard."),
+			(error: unknown) => this.ctx.showError(error instanceof Error ? error.message : String(error)),
+		);
 	}
 
 	#resolveTodoPath(rest: string): string {
