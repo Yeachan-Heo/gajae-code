@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.16] - 2026-08-08
+
 ### Changed
 
 - Process-tree and native process helpers now defer native binding access until the operation is invoked.

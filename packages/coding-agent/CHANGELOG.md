@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- SDK snapshot spill writes no longer fail after a successful write and `fsync` when Bun reports `EBADF` while closing an already-released file descriptor under heavily contended CI teardown. The atomic writer preserves any primary write/sync failure, ignores only the proven already-closed descriptor case, and keeps every other close error fatal.
+
+## [0.12.16] - 2026-08-08
+
 ### Added
 
 - Added provider-agnostic model presets that resolve bare model-family aliases across authenticated bundled and custom providers while preserving concrete provider/model identity, session stickiness, and exact provider pins. Settings now includes a durable global Provider Priority Order editor, and the preset catalog includes a curated Open Weight Models group for GLM, DeepSeek, Kimi, Luna, and mixed-role combinations.

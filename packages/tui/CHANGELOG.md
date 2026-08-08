@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.16] - 2026-08-08
+
 ### Changed
 
 - Native fuzzy matching and image encoding bindings now load only when their TUI feature is used instead of at module startup.

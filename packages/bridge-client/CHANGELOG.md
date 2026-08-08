@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.16] - 2026-08-08
+
 ### Added
 
 - `SdkClientOptions.reconnectMaxBackoffMs` caps each exponential reconnect sleep (default 2s). A client configured with a long reconnect budget now keeps probing every couple of seconds instead of sleeping for tens of seconds on its final attempts. The `reconnectAttempts`/`reconnectBackoffMs` defaults (3 attempts, 25ms base, 100ms maximum sleep) are unchanged and stay below the new cap, so no existing caller changes behavior.
