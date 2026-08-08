@@ -183,6 +183,19 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 	});
 });
 
+test("createConnectSubscribeSubmit rejects invalid logical identities before broker traffic", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const result = await client.createConnectSubscribeSubmit({
+			create: {},
+			createIdempotencyKey: "create-key",
+			submission: { kind: "prompt", text: "hello", clientRef: " invalid " },
+		});
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		expect(FakeWebSocket.instances).toHaveLength(0);
+	});
+});
+
 test("SdkClient accepts hello that races ahead of the open handler", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token");

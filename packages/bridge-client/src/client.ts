@@ -56,6 +56,42 @@ export type SdkFrameHandler = (frame: SdkFrame) => void;
 export type SdkReconnectHandler = () => void;
 export type SdkReconnectFailedHandler = (error: SdkClientError) => void;
 
+export type SdkAtomicSubmission =
+	| { kind: "prompt"; text: string; images?: unknown; clientRef: string }
+	| { kind: "skill"; name: string; args?: unknown; clientRef: string };
+
+export interface SdkAtomicCreateConnectSubmitInput {
+	create: Record<string, unknown>;
+	createIdempotencyKey: string;
+	submission: SdkAtomicSubmission;
+	timeoutMs?: number;
+	replaySinceGeneration?: number;
+	replaySinceSeq?: number;
+}
+
+export interface SdkAtomicLookupIdentity {
+	version: 1;
+	operation: "session.create";
+	createIdempotencyKey: string;
+	create: Record<string, unknown>;
+	sessionId?: string;
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+	submission: { kind: SdkAtomicSubmission["kind"]; clientRef: string };
+	commandId?: string;
+	turnId?: string;
+}
+
+export type SdkAtomicResult =
+	| { kind: "accepted"; sessionId: string; identity: SdkAtomicLookupIdentity; receipt: Record<string, unknown> }
+	| { kind: "reconciled"; identity: SdkAtomicLookupIdentity; status: Record<string, unknown> }
+	| {
+			kind: "create_uncertain" | "attachment_uncertain" | "subscription_uncertain" | "submission_uncertain";
+			identity: SdkAtomicLookupIdentity;
+			prohibitResubmission: true;
+	  }
+	| { kind: "failed"; error: { code: SdkErrorCode; message: string }; identity?: SdkAtomicLookupIdentity };
+
 type Frame = SdkFrame;
 type Cycle = {
 	readonly generation: number;
@@ -135,6 +171,81 @@ function canonicalJson(value: unknown): string {
 
 function lifecycleFingerprint(operation: string, input: unknown): string {
 	return JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
+}
+
+function stringField(value: Record<string, unknown>, field: string): string | undefined {
+	const candidate = value[field];
+	return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+function responseResult(value: unknown): Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new SdkClientError("protocol_error", "SDK response is malformed.");
+	const frame = value as Record<string, unknown>;
+	const result = frame.result;
+	return result && typeof result === "object" && !Array.isArray(result) ? (result as Record<string, unknown>) : frame;
+}
+
+function validRef(value: unknown): value is string {
+	return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 128;
+}
+
+function atomicIdentity(input: SdkAtomicCreateConnectSubmitInput): SdkAtomicLookupIdentity {
+	if (!input.create || typeof input.create !== "object" || Array.isArray(input.create))
+		throw new SdkClientError("invalid_input", "Atomic create input must be an object.");
+	if (!validRef(input.createIdempotencyKey))
+		throw new SdkClientError("invalid_input", "createIdempotencyKey must be a trimmed non-empty string.");
+	const submission = input.submission;
+	if (!submission || !validRef(submission.clientRef))
+		throw new SdkClientError("invalid_input", "clientRef must be a trimmed 1..128 character string.");
+	if (
+		(submission.kind === "prompt" && !validRef(submission.text)) ||
+		(submission.kind === "skill" && !validRef(submission.name)) ||
+		(submission.kind !== "prompt" && submission.kind !== "skill")
+	)
+		throw new SdkClientError("invalid_input", "Atomic submission is invalid.");
+	return {
+		version: 1,
+		operation: "session.create",
+		createIdempotencyKey: input.createIdempotencyKey,
+		create: structuredClone(input.create),
+		submission: { kind: submission.kind, clientRef: submission.clientRef },
+	};
+}
+
+function validAtomicIdentity(identity: SdkAtomicLookupIdentity): boolean {
+	return (
+		identity.version === 1 &&
+		identity.operation === "session.create" &&
+		validRef(identity.createIdempotencyKey) &&
+		validRef(identity.submission.clientRef) &&
+		!!identity.create &&
+		typeof identity.create === "object" &&
+		!Array.isArray(identity.create)
+	);
+}
+
+function isKnownLifecycleFailure(error: SdkClientError): boolean {
+	return ["invalid_input", "idempotency_conflict", "endpoint_stale", "resource_gone", "not_found"].includes(
+		error.code,
+	);
+}
+
+function atomicFailure(error: unknown, identity?: SdkAtomicLookupIdentity): SdkAtomicResult {
+	const typed =
+		error instanceof SdkClientError ? error : new SdkClientError("invalid_input", "Atomic input is invalid.");
+	return { kind: "failed", error: { code: typed.code, message: typed.message }, ...(identity ? { identity } : {}) };
+}
+
+function uncertain(
+	kind: Extract<SdkAtomicResult, { prohibitResubmission: true }>["kind"],
+	identity: SdkAtomicLookupIdentity,
+): SdkAtomicResult {
+	return { kind, identity, prohibitResubmission: true };
+}
+
+function replayReady(replay: Record<string, unknown>): boolean {
+	return replay.gap !== true && (replay.events === undefined || Array.isArray(replay.events));
 }
 
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */
@@ -259,6 +370,121 @@ export class SdkClient {
 			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"));
 		await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
 		this.#sentRecords.clear();
+	}
+
+	async createConnectSubscribeSubmit(input: SdkAtomicCreateConnectSubmitInput): Promise<SdkAtomicResult> {
+		let identity: SdkAtomicLookupIdentity;
+		try {
+			identity = atomicIdentity(input);
+		} catch (error) {
+			return atomicFailure(error);
+		}
+		let created: Record<string, unknown>;
+		try {
+			created = responseResult(
+				await this.global("session.create", input.create, {
+					idempotencyKey: input.createIdempotencyKey,
+					timeoutMs: input.timeoutMs,
+				}),
+			);
+		} catch (error) {
+			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
+				? atomicFailure(error, identity)
+				: uncertain("create_uncertain", identity);
+		}
+		const sessionId = stringField(created, "sessionId");
+		if (!sessionId) return uncertain("create_uncertain", identity);
+		identity = { ...identity, sessionId };
+		let endpoint: Record<string, unknown>;
+		try {
+			endpoint = responseResult(
+				await this.global("session.get_endpoint", { sessionId }, { timeoutMs: input.timeoutMs }),
+			);
+		} catch (error) {
+			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
+				? atomicFailure(error, identity)
+				: uncertain("attachment_uncertain", identity);
+		}
+		const url = stringField(endpoint, "url");
+		const token = stringField(endpoint, "token");
+		if (!url || !token) return uncertain("attachment_uncertain", identity);
+		const endpointClient = new SdkClient(url, token, {
+			timeoutMs: input.timeoutMs,
+			deadline: this.#deadline,
+			reconnectAttempts: 0,
+		});
+		try {
+			const incarnation = await endpointClient.#connect();
+			const replay = await endpointClient.#requestOnIncarnation(
+				{
+					type: "event_replay",
+					sinceGeneration: input.replaySinceGeneration ?? 1,
+					sinceSeq: input.replaySinceSeq ?? 0,
+				},
+				incarnation,
+				{ timeoutMs: input.timeoutMs },
+			);
+			if (!replayReady(responseResult(replay))) return uncertain("subscription_uncertain", identity);
+			const operation = input.submission.kind === "prompt" ? "turn.prompt" : "skill.invoke";
+			const controlInput =
+				input.submission.kind === "prompt"
+					? {
+							text: input.submission.text,
+							...(input.submission.images === undefined ? {} : { images: input.submission.images }),
+							clientRef: input.submission.clientRef,
+						}
+					: {
+							name: input.submission.name,
+							...(input.submission.args === undefined ? {} : { args: input.submission.args }),
+							clientRef: input.submission.clientRef,
+						};
+			const response = responseResult(
+				await endpointClient.#requestOnIncarnation(
+					{ type: "control_request", operation, input: controlInput },
+					incarnation,
+					{ timeoutMs: input.timeoutMs },
+				),
+			);
+			const commandId = stringField(response, "commandId");
+			const turnId = stringField(response, "turnId");
+			identity = { ...identity, ...(commandId ? { commandId } : {}), ...(turnId ? { turnId } : {}) };
+			return { kind: "accepted", sessionId, identity, receipt: response };
+		} catch (error) {
+			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
+				? atomicFailure(error, identity)
+				: uncertain("submission_uncertain", identity);
+		} finally {
+			await endpointClient.close().catch(() => undefined);
+		}
+	}
+
+	async reconcileCreateConnectSubmit(
+		identity: SdkAtomicLookupIdentity,
+		options: SdkRequestOptions = {},
+	): Promise<SdkAtomicResult> {
+		if (!validAtomicIdentity(identity))
+			return atomicFailure(new SdkClientError("invalid_input", "Invalid atomic lookup identity."));
+		if (!identity.sessionId) return uncertain("create_uncertain", identity);
+		try {
+			const endpoint = responseResult(
+				await this.global("session.get_endpoint", { sessionId: identity.sessionId }, options),
+			);
+			const url = stringField(endpoint, "url");
+			const token = stringField(endpoint, "token");
+			if (!url || !token) return uncertain("attachment_uncertain", identity);
+			const client = new SdkClient(url, token, { timeoutMs: options.timeoutMs, reconnectAttempts: 0 });
+			try {
+				const query = identity.submission.kind === "prompt" ? "turn.prompt_status" : "skill.invoke_status";
+				const status = responseResult(
+					await client.query(query, { clientRef: identity.submission.clientRef }, undefined, options),
+				);
+				return { kind: "reconciled", identity, status };
+			} finally {
+				await client.close().catch(() => undefined);
+			}
+		} catch {
+			return uncertain("submission_uncertain", identity);
+		}
 	}
 
 	async control(
@@ -387,6 +613,52 @@ export class SdkClient {
 				);
 			}
 		});
+	}
+
+	#requestOnIncarnation(frame: Frame, incarnation: Incarnation, options: SdkRequestOptions): Promise<SdkFrame> {
+		if (this.#closed || !this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN)
+			return Promise.reject(
+				new SdkClientError("connection_closed", "SDK WebSocket incarnation is no longer active"),
+			);
+		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
+		if (timeoutMs <= 0) return Promise.reject(this.#deadlineError());
+		const id = randomUUID();
+		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+		const pending: Pending = {
+			incarnation,
+			resolve,
+			reject,
+			timer: setTimeout(
+				() =>
+					this.#settlePending(
+						id,
+						pending,
+						new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`),
+					),
+				timeoutMs,
+			),
+		};
+		this.#pending.set(id, pending);
+		if (!this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN) {
+			this.#settlePending(
+				id,
+				pending,
+				new SdkClientError("connection_closed", "SDK WebSocket incarnation is no longer active"),
+			);
+			return promise as Promise<SdkFrame>;
+		}
+		try {
+			incarnation.socket.send(
+				JSON.stringify({
+					...frame,
+					id,
+					...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+				}),
+			);
+		} catch (error) {
+			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket send failed", error));
+		}
+		return promise as Promise<SdkFrame>;
 	}
 
 	#deadlineError(): SdkClientError {
