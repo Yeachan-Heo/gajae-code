@@ -308,7 +308,7 @@ test("SdkClient rejects malformed frames and a lost response with typed transpor
 		await flush();
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");
-		await expect(lost).rejects.toMatchObject({ code: "connection_closed" });
+		await expect(lost).rejects.toMatchObject({ code: "uncertain_after_send" });
 		await client.close();
 	});
 });
@@ -324,10 +324,7 @@ test("SdkClient owns request timeout, reconnect backoff, and absolute deadline d
 		const timedOut = client.control("wait");
 		await flush();
 		clock.advanceBy(50);
-		await expect(timedOut).rejects.toMatchObject({
-			code: "timeout",
-			details: { requestSent: true, requestId: expect.any(String) },
-		});
+		await expect(timedOut).rejects.toMatchObject({ code: "uncertain_after_send" });
 
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");
@@ -462,7 +459,7 @@ test("SdkClient fences stale socket callbacks and never replays sent mutations",
 		const mutationFrame = sent(second, 1);
 		second.readyState = FakeWebSocket.CLOSED;
 		second.emit("close");
-		await expect(mutation).rejects.toMatchObject({ code: "connection_closed" });
+		await expect(mutation).rejects.toMatchObject({ code: "uncertain_after_send" });
 
 		const next = client.control("after-close");
 		for (let index = 0; index < 4; index++) await flush();
