@@ -973,6 +973,38 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
+	test("materializing one profile assignment concretizes every remaining bare alias before clearing ownership", () => {
+		const selected = model("provider-b", "shared-model");
+		const registry = {
+			getAvailable: () => [selected],
+			lookupAliasExists: (alias: string) => alias === "shared-model",
+			resolveModelByLookupAlias: (alias: string) => (alias === "shared-model" ? selected : undefined),
+		} as unknown as ModelRegistry;
+		const session = Object.assign(fakeSession(), { modelRegistry: registry });
+		session.setActiveModelProfile("provider-agnostic-profile");
+		const settings = Settings.isolated({ "modelProfile.default": "provider-agnostic-profile" });
+		settings.override("modelRoles", { default: "shared-model" });
+		settings.override("task.agentModelOverrides", {
+			executor: "shared-model",
+			architect: ["shared-model", "provider-c/architect"],
+		});
+
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor",
+		});
+
+		expect(materialized).toBe(true);
+		expect(settings.get("modelRoles")).toEqual({ default: "provider-b/shared-model" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor",
+			architect: ["provider-b/shared-model", "provider-c/architect"],
+		});
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
 	test("materialization restores settings and ownership when chain persistence fails", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });

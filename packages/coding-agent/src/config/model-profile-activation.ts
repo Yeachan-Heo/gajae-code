@@ -54,7 +54,12 @@ type ModelProfileActivationSession = Pick<
 	restoreModelSelectionForRollback?: AgentSession["restoreModelSelectionForRollback"];
 	modelRegistry?: Pick<
 		ModelRegistry,
-		"getSessionCanonicalVariant" | "restoreSessionCanonicalVariant" | "clearCanonicalVariant"
+		| "getSessionCanonicalVariant"
+		| "restoreSessionCanonicalVariant"
+		| "clearCanonicalVariant"
+		| "getAvailable"
+		| "lookupAliasExists"
+		| "resolveModelByLookupAlias"
 	>;
 	getConfiguredModelChainState?: (role: string) => ConfiguredModelChainState | undefined;
 };
@@ -220,11 +225,44 @@ function materializeConfiguredDefaultChain(
 	return formatModelSelectorValue(`${session.model.provider}/${session.model.id}`, session.thinkingLevel);
 }
 
+function concretizeMaterializedAssignmentValues(
+	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
+	assignments: Record<string, ModelSelectorValue>,
+): Record<string, ModelSelectorValue> {
+	const modelRegistry = options.session.modelRegistry;
+	const sessionId = (options.session as { sessionId?: string }).sessionId;
+	if (!modelRegistry || !sessionId) return assignments;
+	const availableModels = modelRegistry.getAvailable();
+	return Object.fromEntries(
+		Object.entries(assignments).map(([role, selectorValue]) => {
+			const concrete = normalizeModelSelectorValue(selectorValue).map(selector => {
+				if (splitSelectorThinkingSuffix(selector).selector.includes("/")) return selector;
+				const resolved = resolveModelRoleValue(selector, availableModels, {
+					settings: options.settings as Settings,
+					modelRegistry,
+					sessionId,
+					aliasIntent: "preset-equivalent",
+				});
+				if (!resolved.model) {
+					throw new Error(`Active model profile assignment ${role} could not be concretized: ${selector}`);
+				}
+				const concreteSelector = `${resolved.model.provider}/${resolved.model.id}`;
+				return resolved.explicitThinkingLevel && resolved.thinkingLevel
+					? formatModelSelectorValue(concreteSelector, resolved.thinkingLevel)
+					: concreteSelector;
+			});
+			return [role, concrete.length === 1 && typeof selectorValue === "string" ? concrete[0] : concrete];
+		}),
+	);
+}
+
 function commitMaterializedProfileAssignments(
 	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
-	nextModelRoles: Record<string, ModelSelectorValue>,
-	nextAgentModelOverrides: Record<string, ModelSelectorValue>,
+	modelRoles: Record<string, ModelSelectorValue>,
+	agentModelOverrides: Record<string, ModelSelectorValue>,
 ): boolean {
+	const nextModelRoles = concretizeMaterializedAssignmentValues(options, modelRoles);
+	const nextAgentModelOverrides = concretizeMaterializedAssignmentValues(options, agentModelOverrides);
 	const previousPersistedModelRoles = options.settings.getGlobal("modelRoles");
 	const previousPersistedAgentModelOverrides = options.settings.getGlobal("task.agentModelOverrides");
 	const previousPersistedDefaultProfile = options.settings.getGlobal("modelProfile.default");
