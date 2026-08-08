@@ -1111,7 +1111,6 @@ export class ModelSelectorComponent extends Container {
 					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 					modelRegistry: this.#modelRegistry,
 					aliasIntent: this.#activeModelProfile ? "preset-equivalent" : undefined,
-					sessionId: this.#authSessionId,
 					credentialSessionId: this.#authSessionId,
 				});
 				if (resolved.model) {

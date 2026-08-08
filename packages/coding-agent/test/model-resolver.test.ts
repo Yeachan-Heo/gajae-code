@@ -80,6 +80,46 @@ test("uses provider credential session separately from canonical stickiness", as
 	expect(resolution.model).toBe(beta);
 });
 
+test("resolves preset aliases with credential context but without canonical mutation", async () => {
+	const alpha = { ...mockModels[1], provider: "alpha", id: "shared-model" } as Model;
+	const beta = { ...mockModels[1], provider: "beta", id: "vendor/shared-model" } as Model;
+	let observedCanonicalSessionId: string | undefined;
+	let observedCredentialSessionId: string | undefined;
+	let observedApiKeySessionId: string | undefined;
+	const resolution = await resolveModelChainWithAuth(
+		["shared-model"],
+		{
+			getAvailable: () => [alpha, beta],
+			lookupAliasExists: () => true,
+			resolveModelByLookupAlias: (
+				_alias: string,
+				options?: { sessionId?: string; credentialSessionId?: string; candidates?: readonly Model[] },
+			) => {
+				observedCanonicalSessionId = options?.sessionId;
+				observedCredentialSessionId = options?.credentialSessionId;
+				return options?.candidates?.find(candidate => candidate === beta);
+			},
+			getApiKey: async (candidate: Model, sessionId?: string) => {
+				observedApiKeySessionId = sessionId;
+				return candidate === beta ? "key" : undefined;
+			},
+		} as never,
+		undefined,
+		"live-session",
+		{
+			managedFallback: true,
+			aliasIntent: "preset-equivalent",
+			canonicalSessionId: null,
+			credentialSessionId: "live-session",
+		},
+	);
+
+	expect(resolution.model).toBe(beta);
+	expect(observedCanonicalSessionId).toBeUndefined();
+	expect(observedCredentialSessionId).toBe("live-session");
+	expect(observedApiKeySessionId).toBe("live-session");
+});
+
 test("retries an equivalent alias provider after the preferred candidate fails authentication", async () => {
 	const alpha = { ...mockModels[1], provider: "alpha", id: "org/shared-model" } as Model;
 	const beta = { ...mockModels[1], provider: "beta", id: "org/shared-model" } as Model;

@@ -1013,7 +1013,8 @@ export function resolveModelOverride(
 export interface ModelChainResolutionOptions {
 	managedFallback?: boolean;
 	aliasIntent?: "preset-equivalent" | "reject";
-	canonicalSessionId?: string;
+	canonicalSessionId?: string | null;
+	credentialSessionId?: string;
 }
 
 export async function resolveModelChainWithAuth(
@@ -1033,6 +1034,9 @@ export async function resolveModelChainWithAuth(
 	const matchPreferences = { usageOrder: settings?.getStorage()?.getModelUsageOrder() };
 	const skips: Array<{ selector: string; reason: string }> = [];
 	const authFailedModels = new Set<string>();
+	const canonicalSessionId =
+		options?.canonicalSessionId === null ? undefined : (options?.canonicalSessionId ?? sessionId);
+	const credentialSessionId = options?.credentialSessionId ?? sessionId;
 	for (let activeIndex = 0; activeIndex < modelPatterns.length; activeIndex += 1) {
 		const selector = modelPatterns[activeIndex];
 		const suffix = splitSelectorThinkingSuffix(selector);
@@ -1050,8 +1054,8 @@ export async function resolveModelChainWithAuth(
 				settings,
 				matchPreferences,
 				modelRegistry,
-				sessionId: options?.canonicalSessionId ?? sessionId,
-				credentialSessionId: sessionId,
+				sessionId: canonicalSessionId,
+				credentialSessionId,
 				aliasIntent: options?.aliasIntent,
 			});
 			if (!candidate.model) {
@@ -1065,7 +1069,7 @@ export async function resolveModelChainWithAuth(
 					break;
 				}
 			}
-			const key = await modelRegistry.getApiKey(candidate.model, sessionId);
+			const key = await modelRegistry.getApiKey(candidate.model, credentialSessionId);
 			if (isAuthenticatedOrKeyless(key)) {
 				return { ...candidate, activeIndex, skips };
 			}
@@ -1073,7 +1077,7 @@ export async function resolveModelChainWithAuth(
 			attemptedCandidate = true;
 			authFailedModels.add(`${candidate.model.provider}\u0000${candidate.model.id}`);
 			if (!retryEquivalentAlias) break;
-			const stickySessionId = options?.canonicalSessionId ?? sessionId;
+			const stickySessionId = canonicalSessionId;
 			if (stickySessionId) modelRegistry.clearCanonicalVariant?.(stickySessionId);
 		}
 	}

@@ -268,14 +268,10 @@ describe("model selector profiles", () => {
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("EXECUTOR: provider-b/org/flare-alias");
-		expect(
-			registry.resolveModelByLookupAlias.mock.calls.some(
-				([alias, options]) =>
-					alias === "flare-alias" &&
-					options?.sessionId === undefined &&
-					options?.credentialSessionId === "profile-session",
-			),
-		).toBe(true);
+		const aliasCalls = registry.resolveModelByLookupAlias.mock.calls.filter(([alias]) => alias === "flare-alias");
+		expect(aliasCalls.length).toBeGreaterThan(0);
+		expect(aliasCalls.every(([, options]) => options?.sessionId === undefined)).toBe(true);
+		expect(aliasCalls.some(([, options]) => options?.credentialSessionId === "profile-session")).toBe(true);
 	});
 
 	test("landing header reflects the active fallback model snapshot", async () => {

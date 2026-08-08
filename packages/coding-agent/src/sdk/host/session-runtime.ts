@@ -652,7 +652,12 @@ function createQuerySurface(
 							},
 							options.settings,
 							id,
-							{ managedFallback: true },
+							{
+								managedFallback: true,
+								aliasIntent: "preset-equivalent",
+								canonicalSessionId: null,
+								credentialSessionId: id,
+							},
 						);
 						if (resolution.model) resolvedDefaultModels.set(name, resolution.model);
 					} catch {
