@@ -8,6 +8,7 @@ export type SdkErrorCode =
 	| "timeout"
 	| "connection_closed"
 	| "endpoint_credential_forbidden"
+	| "uncertain_after_send"
 	| (string & {});
 
 export class SdkClientError extends Error {
@@ -44,6 +45,14 @@ export interface SdkRequestOptions {
 }
 
 export type SdkFrame = Record<string, unknown>;
+
+export interface SdkSentRecord {
+	readonly id: string;
+	readonly operation?: string;
+	readonly idempotencyKey?: string;
+	readonly fingerprint: string;
+	readonly brokerSelector?: unknown;
+}
 export type SdkFrameHandler = (frame: SdkFrame) => void;
 export type SdkReconnectHandler = () => void;
 export type SdkReconnectFailedHandler = (error: SdkClientError) => void;
@@ -133,6 +142,7 @@ export class SdkClient {
 	#opening: Cycle | null = null;
 	#cycleGeneration = 0;
 	#incarnationGeneration = 0;
+	#sentRecords = new Map<string, SdkSentRecord>();
 	#pending = new Map<string, Pending>();
 	#frameHandlers = new Set<SdkFrameHandler>();
 	#reconnectHandlers = new Set<SdkReconnectHandler>();
@@ -212,6 +222,7 @@ export class SdkClient {
 	}
 	async #close(): Promise<void> {
 		this.#closed = true;
+
 		const transports = new Set<Incarnation>();
 		const cycle = this.#opening;
 		if (cycle) {
@@ -280,6 +291,27 @@ export class SdkClient {
 		);
 	}
 
+	getSentRecord(id: string): SdkSentRecord | undefined {
+		return this.#sentRecords.get(id);
+	}
+
+	async lookupLifecycle(record: SdkSentRecord, timeoutMs?: number): Promise<unknown> {
+		if (!record.operation || !record.idempotencyKey)
+			throw new SdkClientError("invalid_input", "A lifecycle sent record requires operation and idempotencyKey.");
+		return await this.#request(
+			{
+				type: "broker_request",
+				operation: "broker.lookup_lifecycle",
+				input: {
+					operation: record.operation,
+					fingerprint: record.fingerprint,
+					...(record.brokerSelector === undefined ? {} : { selector: record.brokerSelector }),
+				},
+			},
+			{ timeoutMs, idempotencyKey: record.idempotencyKey },
+		);
+	}
+
 	async #request(frame: Frame, options: SdkRequestOptions): Promise<unknown> {
 		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
 		this.#throwIfDeadlineElapsed();
@@ -287,6 +319,11 @@ export class SdkClient {
 		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
 		if (timeoutMs <= 0) throw this.#deadlineError();
 		const id = randomUUID();
+		const requestFrame = {
+			...frame,
+			id,
+			...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+		};
 		return await new Promise<unknown>((resolve, reject) => {
 			const pending: Pending = {
 				incarnation,
@@ -312,14 +349,18 @@ export class SdkClient {
 				return;
 			}
 			try {
-				incarnation.socket.send(
-					JSON.stringify({
-						...frame,
-						id,
-						...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-					}),
-				);
+				incarnation.socket.send(JSON.stringify(requestFrame));
 				pending.sent = true;
+				this.#sentRecords.set(id, {
+					id,
+					operation: typeof frame.operation === "string" ? frame.operation : undefined,
+					idempotencyKey: options.idempotencyKey,
+					fingerprint: JSON.stringify(frame.input ?? {}),
+					brokerSelector:
+						typeof frame.input === "object" && frame.input !== null
+							? (frame.input as Record<string, unknown>).selector
+							: undefined,
+				});
 			} catch (error) {
 				this.#settlePending(
 					id,
@@ -575,6 +616,7 @@ export class SdkClient {
 				return;
 			this.connectionId = frame.connectionId;
 			this.#notifyReconnectHandlers();
+			this.#notifyReconnectHandlers();
 		}
 		if (!this.#isActive(incarnation)) return;
 		const id =
@@ -643,8 +685,24 @@ export class SdkClient {
 		if (this.#pending.get(id) !== pending) return;
 		this.#pending.delete(id);
 		clearTimeout(pending.timer);
-		if (result instanceof Error) pending.reject(result);
-		else pending.resolve(result);
+		if (result instanceof Error) {
+			if (
+				pending.sent &&
+				result instanceof SdkClientError &&
+				(result.code === "timeout" || result.code === "connection_closed" || result.code === "unavailable")
+			)
+				pending.reject(
+					new SdkClientError(
+						"uncertain_after_send",
+						"SDK request outcome is uncertain after the frame was sent.",
+						this.#sentRecords.get(id),
+					),
+				);
+			else pending.reject(result);
+		} else {
+			this.#sentRecords.delete(id);
+			pending.resolve(result);
+		}
 	}
 	#rejectPendingFor(incarnation: Incarnation, error: SdkClientError): void {
 		for (const [id, pending] of this.#pending)
