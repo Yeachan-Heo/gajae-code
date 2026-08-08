@@ -3460,6 +3460,41 @@ export async function releaseDaemonOwnership(input: {
 	}
 }
 
+export async function markDaemonOwnerStopped(input: {
+	settings: Pick<Settings, "getAgentDir">;
+	ownerId: string;
+	acquisitionId?: string;
+	pid?: number;
+	generation?: number;
+	pidIncarnation?: (pid: number) => string | undefined;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	try {
+		const state = await readJson<DaemonState>(fsImpl, paths.state);
+		if (!hasSafeDaemonStateShape(state) || state.stoppedAt !== undefined) return false;
+		const acquisitionId = input.acquisitionId ?? input.ownerId;
+		const pid = input.pid ?? state.pid;
+		const incarnation = (input.pidIncarnation ?? defaultPidIncarnation)(pid);
+		if (
+			state.ownerId !== input.ownerId ||
+			state.acquisitionId !== acquisitionId ||
+			state.pid !== pid ||
+			(input.generation !== undefined && state.generation !== input.generation) ||
+			state.incarnation !== incarnation ||
+			!isProcessIncarnation(incarnation)
+		)
+			return false;
+		const lock = await readOwnershipLock(fsImpl, paths.lock);
+		if (!ownershipLockMatchesState(lock, state)) return false;
+		await writeJsonAtomic(fsImpl, paths.state, { ...state, stoppedAt: (input.now ?? Date.now)() });
+		return true;
+	} catch {
+		return false;
+	}
+}
 /** Read the persisted daemon ownership state (or undefined when absent). */
 export async function readDaemonState(
 	settings: Pick<Settings, "getAgentDir">,
