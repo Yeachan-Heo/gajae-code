@@ -281,6 +281,20 @@ export function addChatChild(ctx: InteractiveModeContext, component: Component):
 	trimChatChildren(ctx);
 }
 
+/**
+ * Parked `!`/`$` execution components are listed in `pendingBashComponents` /
+ * `pendingPythonComponents`, but `pendingMessagesContainer` is the only
+ * authority on parentage: `/clear`, `/context-clear`, extension redraws and the
+ * selector all call `pendingMessagesContainer.clear()`, which disposes and
+ * evicts parked components without touching those arrays. Drop every entry the
+ * container no longer holds so nothing downstream can move a dead component.
+ */
+export function syncPendingExecutionComponents(ctx: InteractiveModeContext): void {
+	const container = ctx.pendingMessagesContainer;
+	ctx.pendingBashComponents = ctx.pendingBashComponents.filter(component => container.hasLiveChild(component));
+	ctx.pendingPythonComponents = ctx.pendingPythonComponents.filter(component => container.hasLiveChild(component));
+}
+
 export function trimChatChildren(ctx: InteractiveModeContext): void {
 	const children = ctx.chatContainer.children;
 
@@ -1000,6 +1014,7 @@ export class UiHelpers {
 	 * caller re-attaches (pending area or chat transcript).
 	 */
 	#detachPendingMessages(retain: (component: Component) => boolean): Component[] {
+		syncPendingExecutionComponents(this.ctx);
 		const parked = new Set<Component>([...this.ctx.pendingBashComponents, ...this.ctx.pendingPythonComponents]);
 		const retained: Component[] = [];
 		for (const child of this.ctx.pendingMessagesContainer.children) {
@@ -1276,20 +1291,21 @@ export class UiHelpers {
 		}
 	}
 
-	/** Move pending bash components from pending area to chat */
+	/** Move pending bash/python components from the pending area to chat */
 	flushPendingBashComponents(): void {
 		// Move (detach, not dispose) the live execution components from the pending
 		// area into the chat transcript — they are reused instances, so a disposing
-		// removeChild() would tear them down before re-adding.
-		for (const component of this.ctx.pendingBashComponents) {
+		// removeChild() would tear them down before re-adding. Walk the container so
+		// the transcript keeps the order the pending area rendered, and so a
+		// component the container no longer holds can never be re-parented.
+		syncPendingExecutionComponents(this.ctx);
+		const parked = new Set<Component>([...this.ctx.pendingBashComponents, ...this.ctx.pendingPythonComponents]);
+		for (const component of [...this.ctx.pendingMessagesContainer.children]) {
+			if (!parked.has(component)) continue;
 			this.ctx.pendingMessagesContainer.detachChild(component);
 			addChatChild(this.ctx, component);
 		}
 		this.ctx.pendingBashComponents = [];
-		for (const component of this.ctx.pendingPythonComponents) {
-			this.ctx.pendingMessagesContainer.detachChild(component);
-			addChatChild(this.ctx, component);
-		}
 		this.ctx.pendingPythonComponents = [];
 	}
 

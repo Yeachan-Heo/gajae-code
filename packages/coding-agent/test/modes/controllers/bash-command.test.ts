@@ -60,7 +60,11 @@ interface Harness {
 function createHarness(options: { isStreaming: boolean }): Harness {
 	const chatContainer = new Container();
 	const pendingMessagesContainer = new Container();
-	const ui = { requestRender: () => {} } as unknown as TUI;
+	const ui = {
+		requestRender: () => {},
+		resetViewportAnchorIntent: () => {},
+		prepareViewportAnchorForTranscriptRebuild: () => {},
+	} as unknown as TUI;
 	const bashGate = Promise.withResolvers<ExecutionResult>();
 	const evalGate = Promise.withResolvers<ExecutionResult>();
 	const queuedFollowUps: string[] = [];
@@ -80,11 +84,15 @@ function createHarness(options: { isStreaming: boolean }): Harness {
 				return evalGate.promise;
 			},
 			getQueuedMessages: () => ({ steering: [], followUp: queuedFollowUps }),
+			isCompacting: false,
+			newSession: async () => true,
+			clearContext: async () => true,
 		},
 		sessionManager: {
 			buildSessionContext: () => emptySessionContext(),
 			getEntries: () => [],
 			getCwd: () => "/tmp",
+			getSessionName: () => "harness session",
 		},
 		renderSessionContext: () => {
 			for (const row of rebuiltTranscriptRows) {
@@ -104,6 +112,13 @@ function createHarness(options: { isStreaming: boolean }): Harness {
 		streamingComponent: undefined,
 		showError: () => {},
 		showStatus: () => {},
+		statusLine: { invalidate: () => {}, setSessionStartTime: () => {} },
+		updateEditorTopBorder: () => {},
+		updateEditorBorderColor: () => {},
+		resetIrcSidebarSession: () => {},
+		resetObserverRegistry: () => {},
+		reloadTodos: async () => {},
+		isStopped: () => false,
 	} as unknown as InteractiveModeContext;
 
 	return {
@@ -301,5 +316,155 @@ describe("deferred shell command display", () => {
 		helpers.flushPendingBashComponents();
 		expect(harness.chatContainer.children).toEqual([liveComponent]);
 		expect(harness.ctx.pendingPythonComponents).toHaveLength(0);
+	});
+});
+
+/**
+ * Regression coverage for the parentage guard: array membership in
+ * `pendingBashComponents` proves nothing about who owns the component. Every
+ * transcript-clearing path calls `pendingMessagesContainer.clear()`, which
+ * disposes and evicts the parked block without touching the array.
+ */
+describe("deferred shell command parentage after the transcript is cleared", () => {
+	it("re-parents nothing when /clear disposes an in-flight bash block", async () => {
+		const harness = createHarness({ isStreaming: true });
+		const controller = new CommandController(harness.ctx);
+		const run = controller.handleBashCommand("sleep 5");
+		await settle();
+
+		const parked = harness.ctx.pendingBashComponents[0];
+		expect(harness.pendingMessagesContainer.children).toContain(parked);
+
+		expect(await controller.handleClearCommand()).toBe(true);
+		expect(harness.pendingMessagesContainer.hasLiveChild(parked)).toBe(false);
+		const chatChildrenAfterClear = harness.chatContainer.children.length;
+
+		harness.bashGate.resolve({ exitCode: 0, cancelled: false, output: "late", truncated: false });
+		await run;
+
+		expect(harness.chatContainer.children).not.toContain(parked);
+		expect(harness.chatContainer.children).toHaveLength(chatChildrenAfterClear);
+		expect(harness.ctx.pendingBashComponents).toHaveLength(0);
+		expect(harness.pendingMessagesContainer.children).toHaveLength(0);
+	});
+
+	it("re-parents nothing when /context-clear disposes an in-flight bash block", async () => {
+		const harness = createHarness({ isStreaming: true });
+		const controller = new CommandController(harness.ctx);
+		const run = controller.handleBashCommand("sleep 5");
+		await settle();
+
+		const parked = harness.ctx.pendingBashComponents[0];
+		await controller.handleContextClearCommand();
+		expect(harness.pendingMessagesContainer.hasLiveChild(parked)).toBe(false);
+		const chatChildrenAfterClear = harness.chatContainer.children.length;
+
+		harness.bashGate.resolve({ exitCode: 0, cancelled: false, output: "late", truncated: false });
+		await run;
+
+		expect(harness.chatContainer.children).not.toContain(parked);
+		expect(harness.chatContainer.children).toHaveLength(chatChildrenAfterClear);
+		expect(harness.ctx.pendingBashComponents).toHaveLength(0);
+	});
+
+	it("re-parents nothing after a bare pending-area clear, and a later flush cannot resurrect it", async () => {
+		// Shape shared by extension-ui-controller.ts:679/993 and selector-controller.ts:2681.
+		const harness = createHarness({ isStreaming: true });
+		const run = new CommandController(harness.ctx).handleBashCommand("sleep 5");
+		await settle();
+
+		const parked = harness.ctx.pendingBashComponents[0];
+		harness.chatContainer.clear();
+		harness.pendingMessagesContainer.clear();
+
+		harness.bashGate.resolve({ exitCode: 0, cancelled: false, output: "late", truncated: false });
+		await run;
+
+		expect(harness.chatContainer.children).toHaveLength(0);
+		expect(harness.ctx.pendingBashComponents).toHaveLength(0);
+
+		new UiHelpers(harness.ctx).flushPendingBashComponents();
+		expect(harness.chatContainer.children).toHaveLength(0);
+		expect(harness.chatContainer.children).not.toContain(parked);
+	});
+
+	it("keeps a cleared python block out of the transcript on the next flush", async () => {
+		const harness = createHarness({ isStreaming: true });
+		const run = new CommandController(harness.ctx).handlePythonCommand("print('py')");
+		await settle();
+
+		const parked = harness.ctx.pendingPythonComponents[0];
+		harness.chatContainer.clear();
+		harness.pendingMessagesContainer.clear();
+
+		harness.evalGate.resolve({ exitCode: 0, cancelled: false, output: "py", truncated: false });
+		await run;
+
+		new UiHelpers(harness.ctx).flushPendingBashComponents();
+		expect(harness.chatContainer.children).toHaveLength(0);
+		expect(harness.chatContainer.children).not.toContain(parked);
+		expect(harness.ctx.pendingPythonComponents).toHaveLength(0);
+	});
+
+	it("drops stale entries on a pending-queue refresh without disposing a live block", async () => {
+		const harness = createHarness({ isStreaming: true });
+		const run = new CommandController(harness.ctx).handleBashCommand("printf mid");
+		await settle();
+		harness.emitBashChunk("mid");
+		const live = harness.ctx.pendingBashComponents[0];
+
+		// What a transcript clear leaves behind: an entry the container no longer holds.
+		harness.ctx.pendingBashComponents.push(new BashExecutionComponent("stale", harness.ctx.ui));
+
+		harness.queuedFollowUps.push("queued prompt");
+		new UiHelpers(harness.ctx).updatePendingMessagesDisplay();
+
+		expect(harness.ctx.pendingBashComponents).toEqual([live]);
+		expect(harness.pendingMessagesContainer.children).toContain(live);
+		expect(harness.pendingMessagesContainer.render(80).join("\n")).toContain("$ printf mid");
+
+		harness.bashGate.resolve({ exitCode: 0, cancelled: false, output: "mid", truncated: false });
+		await run;
+		expect(harness.chatContainer.children).toEqual([live]);
+	});
+
+	it("lands a normally completing deferred bash block in the transcript exactly once", async () => {
+		const harness = createHarness({ isStreaming: true });
+		const run = new CommandController(harness.ctx).handleBashCommand("printf once");
+		await settle();
+		const parked = harness.ctx.pendingBashComponents[0];
+
+		harness.bashGate.resolve({ exitCode: 0, cancelled: false, output: "once", truncated: false });
+		await run;
+
+		expect(harness.chatContainer.children.filter(child => child === parked)).toHaveLength(1);
+		expect(harness.pendingMessagesContainer.children).toHaveLength(0);
+		expect(harness.ctx.pendingBashComponents).toHaveLength(0);
+
+		// A later flush must not append a second copy.
+		new UiHelpers(harness.ctx).flushPendingBashComponents();
+		expect(harness.chatContainer.children.filter(child => child === parked)).toHaveLength(1);
+	});
+
+	it("flushes parked blocks into the transcript in pending render order", async () => {
+		const harness = createHarness({ isStreaming: true });
+		const pythonRun = new CommandController(harness.ctx).handlePythonCommand("print('first')");
+		await settle();
+		harness.evalGate.resolve({ exitCode: 0, cancelled: false, output: "first", truncated: false });
+		await pythonRun;
+
+		const bashRun = new CommandController(harness.ctx).handleBashCommand("printf second");
+		await settle();
+
+		const parkedPython = harness.ctx.pendingPythonComponents[0];
+		const parkedBash = harness.ctx.pendingBashComponents[0];
+		expect(harness.pendingMessagesContainer.children).toEqual([parkedPython, parkedBash]);
+
+		new UiHelpers(harness.ctx).flushPendingBashComponents();
+		expect(harness.chatContainer.children).toEqual([parkedPython, parkedBash]);
+
+		harness.bashGate.resolve({ exitCode: 0, cancelled: false, output: "second", truncated: false });
+		await bashRun;
+		expect(harness.chatContainer.children).toEqual([parkedPython, parkedBash]);
 	});
 });
