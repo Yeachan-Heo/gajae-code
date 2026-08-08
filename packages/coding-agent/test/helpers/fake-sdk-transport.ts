@@ -30,7 +30,36 @@ export class FakeWebSocket {
 		this.readyState = FakeWebSocket.CLOSED;
 	}
 
-	send(): void {}
+	/** Frames the client handed to this socket, in order, as sent JSON. */
+	readonly sent: string[] = [];
+	/** Answers a frame this socket carried out, the way a live peer would. */
+	onSend: ((data: string) => void) | undefined;
+
+	send(data?: string): void {
+		if (typeof data !== "string") return;
+		this.sent.push(data);
+		this.onSend?.(data);
+	}
+
+	/** Completes the dial: the client speaks only once its socket is open. */
+	open(): void {
+		this.readyState = FakeWebSocket.OPEN;
+		this.emit("open");
+	}
+
+	/** Delivers one server frame to the client. */
+	deliver(frame: Record<string, unknown>): void {
+		this.emit("message", new MessageEvent("message", { data: JSON.stringify(frame) }));
+	}
+
+	/**
+	 * Loses an already-open socket the way a dropped connection does: the peer is
+	 * gone and the client is told, but nothing about the session ended.
+	 */
+	drop(): void {
+		this.readyState = FakeWebSocket.CLOSED;
+		this.emit("close");
+	}
 
 	emit(type: string, event = new Event(type)): void {
 		for (const [listener, options] of [...(this.listeners.get(type) ?? [])]) {

@@ -37,6 +37,14 @@ export interface ChatDaemonRuntimeConfig {
 
 export interface ChatDaemonSdkClient {
 	onFrame(handler: (frame: Record<string, unknown>) => void): () => void;
+	/**
+	 * Announces that a replacement socket is live. Optional because command-scoped
+	 * clients (the broker client, one-shot doubles) never outlive one socket, while
+	 * every long-lived attachment's client carries it.
+	 */
+	onReconnect?(handler: () => void): () => void;
+	/** Re-dials a retired socket; a no-op on a live one. */
+	connect?(): Promise<void>;
 	request(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
 	close(): Promise<void>;
 	send(frame: Record<string, unknown>): void;
@@ -84,6 +92,12 @@ type AttachedSession = Readonly<{
 	endpoint: SdkSessionEndpoint;
 	generation: number;
 	client: ChatDaemonSdkClient;
+	/**
+	 * How far this attachment has consumed its session's event stream. The record is
+	 * frozen; this cursor is the one thing that must keep moving with delivery,
+	 * because a reconnect resumes from exactly here.
+	 */
+	cursor: { seq: number };
 	dispose: () => void;
 }>;
 
@@ -293,6 +307,7 @@ export class ChatDaemonRuntime {
 	#stopTimer: (() => void) | undefined;
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
+	readonly #reviving = new Set<string>();
 	#reconcileTail: Promise<void> = Promise.resolve();
 
 	#discord: DiscordNotificationDaemon | undefined;
@@ -479,8 +494,13 @@ export class ChatDaemonRuntime {
 			existing.endpoint.url === endpoint.url &&
 			existing.endpoint.token === endpoint.token &&
 			existing.generation === indexed.endpointGeneration
-		)
+		) {
+			// The attachment is current, so reconcile's remaining job is keeping its socket
+			// dialed: `SdkClient` retires a closed socket and re-dials only on the next
+			// request, and a passive subscription issues none.
+			this.#reviveTransport(existing);
 			return;
+		}
 		if (existing) {
 			this.#sessions.delete(indexed.sessionId);
 			existing.dispose();
@@ -488,8 +508,14 @@ export class ChatDaemonRuntime {
 		}
 		const client = await (this.deps.createClient ?? connectAttachedSession)(endpoint);
 		let attached: AttachedSession | undefined;
-		const dispose = client.onFrame(frame => {
+		const disposeFrames = client.onFrame(frame => {
 			if (attached) this.schedule(this.enqueueFrame(attached, frame));
+		});
+		// The frame subscription is client-scoped and survives the socket, but a
+		// replacement socket resumes delivery where the stream stands then. Only a replay
+		// from this attachment's cursor closes the gap the drop left behind.
+		const disposeReconnect = client.onReconnect?.(() => {
+			if (attached) this.schedule(this.#resumeAttachment(attached));
 		});
 		attached = Object.freeze({
 			id: randomUUID(),
@@ -497,7 +523,11 @@ export class ChatDaemonRuntime {
 			endpoint,
 			generation: indexed.endpointGeneration,
 			client,
-			dispose,
+			cursor: { seq: 0 },
+			dispose: () => {
+				disposeFrames();
+				disposeReconnect?.();
+			},
 		});
 		this.#sessions.set(indexed.sessionId, attached);
 		this.#presentation?.connectSession(indexed.sessionId, {
@@ -516,6 +546,57 @@ export class ChatDaemonRuntime {
 			for (const event of replay.events)
 				if (event && typeof event === "object" && !Array.isArray(event))
 					await this.enqueueFrame(attached, event as Record<string, unknown>);
+	}
+
+	/**
+	 * Keep an established attachment's socket dialed.
+	 *
+	 * `SdkClient` never opens a replacement socket on its own: it retires the closed
+	 * incarnation and re-dials on the next `connect`/`request`. A chat attachment is
+	 * purely passive, so without this probe a transient drop would silently end
+	 * delivery for good. `connect()` resolves immediately on a live socket, spends the
+	 * session reconnect budget on a dead one, and — because reconcile only reaches
+	 * here for an endpoint it has just re-read as current at this generation — never
+	 * revives an attachment the index has moved on from.
+	 */
+	#reviveTransport(attached: AttachedSession): void {
+		const connect = attached.client.connect?.bind(attached.client);
+		if (!connect || this.#reviving.has(attached.id)) return;
+		this.#reviving.add(attached.id);
+		// Deliberately outside `#pending`: the reconnect budget outlives the heartbeat
+		// TTL, and `stop()` must not wait for it. Closing the client aborts it instead.
+		void connect()
+			.catch(() => undefined)
+			.finally(() => this.#reviving.delete(attached.id));
+	}
+
+	/**
+	 * Close the delivery gap a replacement socket left behind.
+	 *
+	 * The replay is fenced exactly like `attach()`: it is issued for the attachment's
+	 * own endpoint generation and from its own cursor, and it is dropped whole if the
+	 * runtime has since detached, rolled, or superseded this attachment — so a stale
+	 * incarnation can never resurrect its events onto a newer one's root.
+	 */
+	async #resumeAttachment(attached: AttachedSession): Promise<void> {
+		if (this.#sessions.get(attached.sessionId) !== attached) return;
+		let replay: Record<string, unknown>;
+		try {
+			replay = await attached.client.request({
+				type: "event_replay",
+				sinceGeneration: attached.generation,
+				sinceSeq: attached.cursor.seq,
+			});
+		} catch {
+			// An unanswered replay is a transport failure, not a delivery decision: the
+			// cursor stands, so the next reconnect re-issues it from the same place.
+			return;
+		}
+		if (this.#sessions.get(attached.sessionId) !== attached) return;
+		if (!Array.isArray(replay.events)) return;
+		for (const event of replay.events)
+			if (event && typeof event === "object" && !Array.isArray(event))
+				await this.enqueueFrame(attached, event as Record<string, unknown>);
 	}
 
 	private async resolveEndpoint(sessionId: string): Promise<SlackEndpoint | null> {
@@ -612,6 +693,21 @@ export class ChatDaemonRuntime {
 		// root, or mapping mutation — on the replay path and the live path alike.
 		const correlated = correlateFrame(frame);
 		if (!correlated) return;
+		// Every event delivered under this attachment's identity advances its replay
+		// cursor, including the ones the filters below drop: a reconnect resumes from
+		// exactly here, and a cursor left behind by dropped-but-delivered frames would
+		// re-deliver every notification interleaved with them. The fences are the two
+		// `attach()` already applies — this session, this endpoint generation — so a
+		// foreign or superseded frame can never move it.
+		const seq = frame.seq;
+		if (
+			typeof seq === "number" &&
+			Number.isSafeInteger(seq) &&
+			seq > attached.cursor.seq &&
+			correlated.generation === attached.generation &&
+			(correlated.sessionId === undefined || correlated.sessionId === attached.sessionId)
+		)
+			attached.cursor.seq = seq;
 		const normalizedFrame = correlated.body;
 		// The SDK's own request/response traffic arrives on this same observer:
 		// `SdkClient` settles a pending request and still forwards that frame to

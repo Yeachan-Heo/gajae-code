@@ -13,24 +13,113 @@ const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
 
 class FakeSlackProvider implements SlackProviderClient {
+	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
 	readonly transportHealthy = true;
+
 	async start(): Promise<void> {}
 	async stop(): Promise<void> {}
 	async ack(): Promise<void> {}
+
 	async postMessage(input: {
 		channel: string;
 		text: string;
 		threadTs?: string;
 		clientMsgId: string;
 	}): Promise<{ channel: string; ts: string; client_msg_id: string }> {
-		return { channel: input.channel, ts: "7.1", client_msg_id: input.clientMsgId };
+		this.posts.push(input);
+		return { channel: input.channel, ts: `7.${this.posts.length}`, client_msg_id: input.clientMsgId };
 	}
+
 	async findMessageByClientMsgId(): Promise<null> {
 		return null;
 	}
+
 	async findMessageByTimestamp(): Promise<null> {
 		return null;
 	}
+}
+
+/**
+ * The session host as `SdkClient` sees it: one socket at a time, a fresh
+ * connection id per socket, a monotonic event log, and `event_replay` answered
+ * from whatever cursor the client asked for.
+ */
+class FakeSessionHost {
+	/** Every replay the client asked for, in order, exactly as it was framed. */
+	readonly replayRequests: Array<{ sinceGeneration: unknown; sinceSeq: unknown }> = [];
+	#generation = GENERATION;
+	#log: Array<Record<string, unknown>> = [];
+	#connections = 0;
+	#socket: FakeWebSocket | undefined;
+
+	/** Brings up the socket the client just dialed: open, then hello. */
+	accept(socket: FakeWebSocket): void {
+		this.#socket = socket;
+		socket.onSend = data => this.#answer(socket, data);
+		socket.open();
+		socket.deliver({ type: "hello", connectionId: `connection-${++this.#connections}` });
+	}
+
+	/**
+	 * Records one event and delivers it to the attached socket. With no socket
+	 * attached the event still enters the log — that is the gap a reconnect owes.
+	 */
+	emit(text: string): Record<string, unknown> {
+		const event = {
+			type: "event",
+			kind: "notice",
+			sessionId: SESSION_ID,
+			generation: this.#generation,
+			seq: this.#log.length + 1,
+			payload: { type: "notice", text },
+		};
+		this.#log.push(event);
+		this.#socket?.deliver(event);
+		return event;
+	}
+
+	/** Loses the open socket. The session keeps running; only the transport is gone. */
+	drop(): void {
+		const socket = this.#socket;
+		this.#socket = undefined;
+		socket?.drop();
+	}
+
+	/** Restarts the event stream at the next generation, exactly as the host does. */
+	roll(): void {
+		this.#generation += 1;
+		this.#log = [];
+	}
+
+	#answer(socket: FakeWebSocket, data: string): void {
+		const frame = JSON.parse(data) as Record<string, unknown>;
+		if (frame.type !== "event_replay") return;
+		this.replayRequests.push({ sinceGeneration: frame.sinceGeneration, sinceSeq: frame.sinceSeq });
+		const sinceSeq = typeof frame.sinceSeq === "number" ? frame.sinceSeq : 0;
+		const events =
+			frame.sinceGeneration === this.#generation
+				? this.#log.filter(event => Number(event.seq) > sinceSeq)
+				: [...this.#log];
+		queueMicrotask(() =>
+			socket.deliver({
+				type: "event_replay_result",
+				id: frame.id,
+				ok: true,
+				events,
+				generation: this.#generation,
+				lastSeq: this.#log.length,
+			}),
+		);
+	}
+}
+
+interface AttachedRuntimeHarness {
+	runtime: ChatDaemonRuntime;
+	provider: FakeSlackProvider;
+	/** Fires one reconcile pass, exactly as the runtime's own interval does. */
+	reconcile: () => void;
+	/** Supersedes the indexed attachment with a newer endpoint generation. */
+	supersede: () => Promise<void>;
 }
 
 /**
@@ -38,7 +127,7 @@ class FakeSlackProvider implements SlackProviderClient {
  * discovery endpoint, and no `createClient` override, so the runtime connects its
  * attached-session client itself.
  */
-async function withAttachedSessionRuntime(run: (runtime: ChatDaemonRuntime) => Promise<void>): Promise<void> {
+async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness) => Promise<void>): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconnect-"));
 	let runtime: ChatDaemonRuntime | undefined;
 	try {
@@ -60,6 +149,8 @@ async function withAttachedSessionRuntime(run: (runtime: ChatDaemonRuntime) => P
 			endpointMtimeMs,
 		});
 
+		const provider = new FakeSlackProvider();
+		let reconcileTick: (() => void) | undefined;
 		runtime = new ChatDaemonRuntime(
 			{
 				kind: "slack",
@@ -77,12 +168,29 @@ async function withAttachedSessionRuntime(run: (runtime: ChatDaemonRuntime) => P
 				},
 			},
 			{
-				createSlackProvider: () => new FakeSlackProvider(),
-				setInterval: (() => 0) as unknown as typeof setInterval,
+				createSlackProvider: () => provider,
+				setInterval: ((callback: () => void) => {
+					reconcileTick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
 				clearInterval: (() => undefined) as unknown as typeof clearInterval,
 			},
 		);
-		await run(runtime);
+		await run({
+			runtime,
+			provider,
+			reconcile: () => reconcileTick?.(),
+			supersede: async () => {
+				await index.append({
+					type: "host_registered",
+					sessionId: SESSION_ID,
+					locator: { repo: agentDir, stateRoot },
+					endpointGeneration: GENERATION + 1,
+					pid: process.pid,
+					endpointMtimeMs,
+				});
+			},
+		});
 	} finally {
 		await runtime?.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -90,16 +198,23 @@ async function withAttachedSessionRuntime(run: (runtime: ChatDaemonRuntime) => P
 }
 
 /** The runtime does its index and endpoint IO before it dials, so wait for the dial. */
-async function awaitFirstSocket(): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && FakeWebSocket.instances.length === 0; attempt++) await Bun.sleep(1);
-	expect(FakeWebSocket.instances).toHaveLength(1);
+async function awaitSocket(count: number): Promise<FakeWebSocket> {
+	for (let attempt = 0; attempt < 2_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
+	expect(FakeWebSocket.instances).toHaveLength(count);
+	return FakeWebSocket.instances[count - 1]!;
+}
+
+/** Delivery is observable only where it lands, so settle on the publications themselves. */
+async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+	expect(provider.posts).toHaveLength(count);
 }
 
 test("an attached chat session reconnects on a budget that outlives the host heartbeat TTL", async () => {
-	await withAttachedSessionRuntime(async runtime => {
+	await withAttachedSessionRuntime(async ({ runtime }) => {
 		await withFakeTransport(async clock => {
 			const starting = runtime.start();
-			await awaitFirstSocket();
+			await awaitSocket(1);
 			const observed = await drainReconnects(clock);
 			await expect(starting).rejects.toMatchObject({ code: "reconnect_exhausted" });
 
@@ -115,6 +230,78 @@ test("an attached chat session reconnects on a budget that outlives the host hea
 			const totalBudgetMs = observed.reduce((total, backoff) => total + backoff, 0);
 			expect(totalBudgetMs).toBeGreaterThanOrEqual(2 * HEARTBEAT_TTL_MS);
 			expect(observed.length).toBeGreaterThan(3);
+		});
+	});
+}, 20_000);
+
+test("an established chat attachment that loses its open socket resumes from its last acknowledged event", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("before the drop");
+			await awaitPosts(provider, 1);
+
+			// Drop the already-attached, already-active socket, then keep the session
+			// producing: these events exist only in the host's log until delivery resumes.
+			host.drop();
+			host.emit("during the outage");
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitPosts(provider, 2);
+
+			// The resume is a replay from the last acknowledged sequence, fenced on the
+			// attachment's own endpoint generation — not a fresh attach from zero.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+			// The frame the outage swallowed is delivered exactly once, and the frame that
+			// was already acknowledged before the drop is not delivered twice.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nbefore the drop",
+				"GJC notice\nduring the outage",
+			]);
+		});
+	});
+}, 20_000);
+
+test("a superseded endpoint generation disposes the old attachment instead of resuming it", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("before the roll");
+			await awaitPosts(provider, 1);
+
+			// The socket drops and the endpoint rolls before anything reattaches, so the
+			// attachment that owned the cursor is stale by the time reconcile runs.
+			host.drop();
+			await supersede();
+			host.roll();
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			host.emit("after the roll");
+			await awaitPosts(provider, 2);
+
+			// The superseded attachment was disposed, not resumed: the second replay is a
+			// fresh attach at the new generation, never a resume from the old cursor.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+			]);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nbefore the roll",
+				"GJC notice\nafter the roll",
+			]);
 		});
 	});
 }, 20_000);
