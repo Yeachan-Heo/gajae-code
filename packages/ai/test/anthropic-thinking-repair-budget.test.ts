@@ -233,7 +233,92 @@ describe("Anthropic thinking-replay repair budget (issue #4011)", () => {
 		expect(second.stopReason).toBe("error");
 		expect(second.errorMessage).toContain("An error occurred while processing the request.");
 		expect(requestBodies).toHaveLength(4);
-		// The degradation the first call converged on is still applied.
+		// The degradation the first call converged on is still applied: nothing
+		// completed, so nothing released the escalation.
 		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual([]);
+	});
+
+	it("stays bounded across three turns that never complete a stream", async () => {
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return rejectingRequest(MASKED_REJECTION) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		for (let turn = 0; turn < 3; turn++) {
+			const result = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
+			expect(result.stopReason).toBe("error");
+		}
+
+		// Two repairs on the first turn, then one bare request per later turn.
+		expect(requestBodies).toHaveLength(5);
+	});
+});
+
+/**
+ * Issue #4038: the repair branch also fires on the proxy-masked generic
+ * `api_error`, which nothing can classify and which may simply be transient.
+ * Persisting an escalation triggered by it stripped native thinking replay from
+ * every remaining turn of the session. A stream that completes releases the
+ * escalation and the budget it consumed; a session that never completes one
+ * keeps the #4011 ceiling.
+ */
+describe("Anthropic thinking-replay repair scope release (issue #4038)", () => {
+	it("replays native thinking again on the next turn after a transient masked api_error", async () => {
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt <= 2 ? rejectingRequest(MASKED_REJECTION) : successfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const first = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
+
+		expect(first.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(3);
+		expect(replayedThinkingBlockTypes(requestBodies[0])).toEqual(["thinking", "thinking"]);
+		expect(replayedThinkingBlockTypes(requestBodies[1])).toEqual(["thinking"]);
+		expect(replayedThinkingBlockTypes(requestBodies[2])).toEqual([]);
+
+		const second = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
+
+		expect(second.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(4);
+		// The blip is over and nothing ever proved the replay was at fault, so the
+		// next turn ships the signed blocks instead of staying degraded forever.
+		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual(["thinking", "thinking"]);
+		expect(JSON.stringify(requestBodies[3])).toContain("sig_early");
+		expect(JSON.stringify(requestBodies[3])).toContain("sig_late");
+	});
+
+	it("re-arms the repair budget for the next turn once a stream completes", async () => {
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			// Turn 1 spends both repairs, then completes. Turn 2 is rejected once more.
+			const rejects = attempt <= 2 || attempt === 4;
+			return (rejects ? rejectingRequest(MASKED_REJECTION) : successfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const first = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
+		expect(first.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(3);
+
+		const second = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
+
+		// A spent budget would have surfaced the rejection instead of repairing it.
+		expect(second.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(5);
+		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual(["thinking", "thinking"]);
+		expect(replayedThinkingBlockTypes(requestBodies[4])).toEqual(["thinking"]);
 	});
 });

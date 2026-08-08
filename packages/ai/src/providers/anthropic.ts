@@ -319,16 +319,21 @@ const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 /**
  * Scope of the replayed-thinking repair currently applied to this session:
  * `latest` drops native thinking from the newest assistant turn, `all` stops
- * replaying native thinking entirely. Persisted so a repair that already
- * converged is not undone (and not re-attempted) when the stream is
- * re-invoked for the same session.
+ * replaying native thinking entirely. Persisted across stream re-invocations so
+ * a repair that keeps being rejected is not re-attempted from scratch on every
+ * turn (issue #4011), and released again by the first stream that completes: the
+ * masked `api_error` that can trigger a repair is unclassifiable and may have
+ * been transient, so an escalation that no completed request ever confirmed must
+ * not pin the rest of the session to a degraded replay.
  */
 type AnthropicThinkingReplayRepairScope = "none" | "latest" | "all";
 
 /**
  * Repairs are bounded independently of `PROVIDER_MAX_RETRIES` because they do
  * not consume the provider retry budget: without their own ceiling an
- * unacceptable request shape retries forever (issue #4011).
+ * unacceptable request shape retries forever (issue #4011). The ceiling spans
+ * the session rather than a single stream, and only a completed stream re-arms
+ * it — an unacceptable shape never completes, so it can never buy more repairs.
  */
 const ANTHROPIC_MAX_THINKING_REPAIRS = 2;
 
@@ -1903,6 +1908,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 
 					if (output.stopReason === "aborted" || output.stopReason === "error") {
 						throw new Error(output.errorMessage ?? "An unknown error occurred");
+					}
+					// The first stream that completes is the only evidence available that this
+					// session is not the #4011 loop, which never produced one. Release the
+					// repair escalation and the budget it consumed: the masked `api_error`
+					// branch above fires on an error nobody can classify, so keeping its
+					// guess would silently strip native thinking replay from every later
+					// turn of the session over what may have been one transient blip.
+					if (providerSessionState && (thinkingReplayRepairScope !== "none" || thinkingReplayRepairAttempts > 0)) {
+						providerSessionState.thinkingReplayRepairScope = "none";
+						providerSessionState.thinkingReplayRepairAttempts = 0;
 					}
 					break;
 				} catch (streamError) {
