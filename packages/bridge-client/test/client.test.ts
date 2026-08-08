@@ -136,7 +136,10 @@ async function withFakeTransport(run: (clock: FakeClock) => Promise<void>): Prom
 	}
 }
 
-const flush = () => new Promise<void>(resolve => queueMicrotask(resolve));
+const flush = async () => {
+	await new Promise<void>(resolve => queueMicrotask(resolve));
+	await new Promise<void>(resolve => queueMicrotask(resolve));
+};
 
 async function connect(client: SdkClient, connectionId = "connection"): Promise<FakeWebSocket> {
 	const pending = client.connect();
@@ -193,6 +196,104 @@ test("createConnectSubscribeSubmit rejects invalid logical identities before bro
 		});
 		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
 		expect(FakeWebSocket.instances).toHaveLength(0);
+	});
+});
+
+test("createConnectSubscribeSubmit replays and writes one prompt on the validated endpoint incarnation", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo" },
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		expect(create).toMatchObject({
+			type: "broker_request",
+			operation: "session.create",
+			idempotencyKey: "create-identity",
+		});
+		broker.message({ type: "broker_response", id: create.id, ok: true, result: { sessionId: "session-1" } });
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({
+			type: "broker_response",
+			id: endpointRequest.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token", generation: 1 },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		expect(replay).toMatchObject({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 });
+		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
+		await flush();
+		const control = sent(endpoint, 1);
+		expect(control).toMatchObject({
+			type: "control_request",
+			operation: "turn.prompt",
+			input: { text: "hello", clientRef: "prompt-work" },
+		});
+		endpoint.message({
+			type: "control_response",
+			id: control.id,
+			ok: true,
+			result: { commandId: "command-1", turnId: "turn-1" },
+		});
+		await expect(pending).resolves.toMatchObject({
+			kind: "accepted",
+			sessionId: "session-1",
+			identity: {
+				createIdempotencyKey: "create-identity",
+				submission: { kind: "prompt", clientRef: "prompt-work" },
+			},
+		});
+		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(1);
+		await client.close();
+	});
+});
+
+test("createConnectSubscribeSubmit never sends after replay incarnation closes before control write", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo" },
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "skill", name: "review", clientRef: "skill-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({ type: "broker_response", id: create.id, ok: true, result: { sessionId: "session-1" } });
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({
+			type: "broker_response",
+			id: endpointRequest.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token" },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
+		endpoint.readyState = FakeWebSocket.CLOSED;
+		endpoint.emit("close");
+		await expect(pending).resolves.toMatchObject({ kind: "attachment_uncertain", prohibitResubmission: true });
+		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(0);
+		await client.close();
 	});
 });
 
