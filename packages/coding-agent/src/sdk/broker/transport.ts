@@ -18,6 +18,7 @@ const BROKER_OPERATIONS = new Set([
 	"elevation.issue",
 	"elevation.status",
 	"session.control",
+	"broker.lookup_lifecycle",
 ]);
 type RequestInput = Record<string, unknown>;
 type BrokerRequest = {

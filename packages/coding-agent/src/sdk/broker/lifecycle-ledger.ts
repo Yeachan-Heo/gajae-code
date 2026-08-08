@@ -66,6 +66,8 @@ export interface LifecycleDurableEffectsReceipt {
 }
 
 export interface LifecycleLedgerEntry {
+	operationKey?: string;
+	fingerprint?: string;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -153,7 +155,9 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 			entry.state === "terminal_error" ||
 			entry.state === "terminal_uncertain") &&
 		typeof entry.ts === "number" &&
-		Number.isSafeInteger(entry.ts)
+		Number.isSafeInteger(entry.ts) &&
+		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
+		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
 	);
 }
 function canonicalJson(value: unknown): string {
@@ -687,11 +691,11 @@ export class LifecycleLedger {
 		this.#byteCount += line.length;
 		return entry;
 	}
-	async begin(identity: string, requestHash: string): Promise<BeginResult> {
-		return this.#mutate(async () => this.#begin(identity, requestHash));
+	async begin(identity: string, requestHash: string, metadata: { operationKey?: string } = {}): Promise<BeginResult> {
+		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
 
-	async #begin(identity: string, requestHash: string): Promise<BeginResult> {
+	async #begin(identity: string, requestHash: string, metadata: { operationKey?: string }): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
 			return {
@@ -700,11 +704,17 @@ export class LifecycleLedger {
 					version: SDK_STATE_VERSION,
 					identity,
 					requestHash,
+					operationKey: metadata.operationKey,
+					fingerprint: requestHash,
 					state: "accepted",
 					ts: Date.now(),
 				}),
 			};
-		if (prior.requestHash !== requestHash) return { kind: "idempotency_conflict" };
+		if (
+			prior.requestHash !== requestHash ||
+			(metadata.operationKey !== undefined && prior.operationKey !== metadata.operationKey)
+		)
+			return { kind: "idempotency_conflict" };
 		if (terminal(prior.state) || (prior.state === "effect_started" && this.#isCleanupPending(prior)))
 			return { kind: "replay", entry: prior };
 		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };

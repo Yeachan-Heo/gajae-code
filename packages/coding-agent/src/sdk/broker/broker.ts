@@ -457,7 +457,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 		case "session.resume":
 		case "session.close":
 		case "session.delete":
-			return { sessionId: id };
+			return { root, sessionId: id };
 		default:
 			return { operation, root, sessionId: id };
 	}
@@ -1454,6 +1454,27 @@ export class Broker {
 		if (operation === "elevation.issue") return this.#elevationIssueRequest(input);
 		if (operation === "elevation.status") return this.#elevationStatusRequest(input);
 		if (operation === "session.control") return this.#sessionControlRequest(input);
+		if (operation === "broker.lookup_lifecycle") {
+			const requestedOperation = typeof input.operation === "string" ? input.operation : undefined;
+			const fingerprint = typeof input.fingerprint === "string" ? input.fingerprint : undefined;
+			if (!idempotencyKey || !requestedOperation || !fingerprint)
+				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
+			const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
+			const entry = this.ledger.get(identity);
+			if (!entry) return error("not_found", "lifecycle operation was not found");
+			if (entry.requestHash !== fingerprint)
+				return error("idempotency_conflict", "lifecycle request fingerprint differs");
+			return {
+				ok: true,
+				result: {
+					operation: requestedOperation,
+					state: entry.state,
+					reconciliation: { operation: requestedOperation },
+					response: entry.response,
+					durableEffects: entry.durableEffects,
+				},
+			};
+		}
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
 		// Elevation gate (F1.3): allowlisted raw operations execute only behind a
 		// broker-owned single-use grant. Validation is fail-closed and happens
@@ -1570,7 +1591,9 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash);
+			const begun = await this.ledger.begin(identity, requestHash, {
+				operationKey: `${operation}\0${idempotencyKey}`,
+			});
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
