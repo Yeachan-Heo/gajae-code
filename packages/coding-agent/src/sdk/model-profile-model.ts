@@ -6,17 +6,9 @@ import {
 } from "../config/model-profile-contract";
 import type { ModelProfileDefinition } from "../config/model-profiles";
 import { isAuthenticated, kNoAuth } from "../config/model-registry";
+import { SYNTHETIC_PROVIDER_ID } from "./model-profile-namespace";
 
-/**
- * Reserved logical provider namespace for the preset-as-model facade.
- *
- * `gajae-code/<profile>` is not a real API provider: rows under this namespace
- * exist only in the SDK Q10 projection and `model.set` selection routes to a
- * session-scoped model-profile activation transaction. The namespace is
- * reserved so a user-defined `models.yml` provider of the same name cannot
- * silently shadow the facade (see {@link syntheticNamespaceCollision}).
- */
-export const SYNTHETIC_PROVIDER_ID = "gajae-code";
+export { SYNTHETIC_PROVIDER_ID } from "./model-profile-namespace";
 
 /**
  * Display metadata used for synthetic rows whose profile default model cannot
