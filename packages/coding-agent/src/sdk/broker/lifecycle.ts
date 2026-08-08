@@ -4393,30 +4393,83 @@ export async function executeLifecycle(
  */
 export type SessionHostAttachmentReader = () => number;
 
-let sessionHostAttachmentReader: SessionHostAttachmentReader | undefined;
+/** What one serving runtime reports about itself while its transport is up. */
+export interface SessionHostRuntimeEvidence {
+	/** This runtime's own live SDK client/socket subscription count. */
+	attachedClients: SessionHostAttachmentReader;
+	/** Whether this runtime currently has agent work in flight. */
+	workInFlight: () => boolean;
+}
 
-/**
- * Publishes (or, with `undefined`, retracts) this process's SDK client-count
- * reader. Called by the SDK session runtime around its transport lifetime.
- */
-export function publishSessionHostAttachmentReader(reader: SessionHostAttachmentReader | undefined): void {
-	sessionHostAttachmentReader = reader;
+/** One runtime's live publication, retractable only by its owner. */
+export interface SessionHostRuntimePublication {
+	/**
+	 * Withdraws the evidence this handle published. Idempotent, and never able
+	 * to touch a sibling runtime's evidence.
+	 */
+	retract(): void;
 }
 
 /**
- * This process's currently attached SDK client count, or `undefined` when no
- * SDK endpoint is serving (before startup, after teardown, or when the reader
- * itself fails). Never guesses: absence of a reader is absence of evidence.
+ * Every runtime in this process that currently serves an SDK endpoint.
+ *
+ * A process can serve more than one at a time: an identity-rotating control op
+ * starts the successor before the predecessor's deferred stop runs. A single
+ * global slot let that predecessor's teardown retract the live successor's
+ * reader and manufacture "no evidence" for a host with clients attached, so
+ * publications are held per runtime and retracted only through their own handle.
+ */
+const sessionHostRuntimes = new Set<SessionHostRuntimeEvidence>();
+
+/**
+ * Publishes this runtime's own liveness evidence for the lifetime of its
+ * transport. Retraction goes through the returned handle, so a runtime can only
+ * ever withdraw evidence it owns.
+ */
+export function publishSessionHostRuntimeEvidence(evidence: SessionHostRuntimeEvidence): SessionHostRuntimePublication {
+	const published: SessionHostRuntimeEvidence = { ...evidence };
+	sessionHostRuntimes.add(published);
+	return {
+		retract(): void {
+			sessionHostRuntimes.delete(published);
+		},
+	};
+}
+
+/**
+ * This process's currently attached SDK client count, summed across every
+ * serving runtime, or `undefined` when no runtime publishes a readable count
+ * (before startup, after teardown, or when every reader itself fails). Never
+ * guesses: absence of a reader is absence of evidence.
  */
 export function sessionHostAttachedClients(): number | undefined {
-	const reader = sessionHostAttachmentReader;
-	if (!reader) return undefined;
-	try {
-		const count = reader();
-		return Number.isSafeInteger(count) && count >= 0 ? count : undefined;
-	} catch {
-		return undefined;
+	let total: number | undefined;
+	for (const { attachedClients } of sessionHostRuntimes) {
+		let count: number;
+		try {
+			count = attachedClients();
+		} catch {
+			continue;
+		}
+		if (!Number.isSafeInteger(count) || count < 0) continue;
+		total = (total ?? 0) + count;
 	}
+	return total;
+}
+
+/**
+ * Whether any runtime in this process has agent work in flight right now.
+ *
+ * Positive evidence only: a runtime that publishes nothing, or whose reader
+ * fails, reports no work, so this can never keep an abandoned host alive.
+ */
+export function sessionHostWorkInFlight(): boolean {
+	for (const { workInFlight } of sessionHostRuntimes) {
+		try {
+			if (workInFlight()) return true;
+		} catch {}
+	}
+	return false;
 }
 
 /**

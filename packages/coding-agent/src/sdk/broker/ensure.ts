@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import path from "node:path";
@@ -30,36 +31,46 @@ const REAP_SIGKILL_CAP_MS = 2_000;
  * file instead of a pipe because the child is detached and outlives this
  * process: a pipe would break under it the moment the parent exits.
  */
-const BROKER_SPAWN_LOG_TAIL_BYTES = 4_096;
+export const BROKER_SPAWN_LOG_TAIL_BYTES = 4_096;
 
-function brokerSpawnLogPath(agentDir: string): string {
-	return path.join(agentDir, "sdk", "broker-spawn.log");
+export interface BrokerSpawnLog {
+	path: string;
+	handle: FileHandle;
 }
 
-/**
- * Open the diagnostic sink for one spawn. Truncating on every open bounds the
- * file to a single broker's output, so the sink cannot become the next
- * unbounded artifact.
- */
-async function openBrokerSpawnLog(agentDir: string): Promise<FileHandle | undefined> {
+function brokerSpawnLogPath(agentDir: string): string {
+	return path.join(agentDir, "sdk", `broker-spawn.${randomUUID()}.log`);
+}
+
+/** Opens an isolated, bounded-lifetime diagnostic sink for one broker spawn. */
+export async function openBrokerSpawnLog(agentDir: string): Promise<BrokerSpawnLog | undefined> {
 	try {
 		await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true, mode: 0o700 });
-		return await fs.open(brokerSpawnLogPath(agentDir), "w", 0o600);
+		const spawnLogPath = brokerSpawnLogPath(agentDir);
+		return { path: spawnLogPath, handle: await fs.open(spawnLogPath, "w", 0o600) };
 	} catch {
 		// Diagnostics are never allowed to block a broker spawn.
 		return undefined;
 	}
 }
 
-async function readBrokerSpawnLogTail(agentDir: string): Promise<string> {
+export async function readBrokerSpawnLogTail(spawnLogPath: string): Promise<string> {
 	try {
-		const file = Bun.file(brokerSpawnLogPath(agentDir));
+		const file = Bun.file(spawnLogPath);
 		const size = file.size;
 		if (!Number.isFinite(size) || size <= 0) return "";
 		const tail = size > BROKER_SPAWN_LOG_TAIL_BYTES ? file.slice(size - BROKER_SPAWN_LOG_TAIL_BYTES) : file;
 		return (await tail.text()).trim();
 	} catch {
 		return "";
+	}
+}
+
+async function removeBrokerSpawnLog(spawnLogPath: string): Promise<void> {
+	try {
+		await fs.unlink(spawnLogPath);
+	} catch {
+		// Diagnostics are best-effort and must not affect broker ownership.
 	}
 }
 export interface FixtureBrokerLease {
@@ -290,81 +301,88 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
 	const spawnLog = await openBrokerSpawnLog(settings.agentDir);
-	const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
-		detached: true,
-		stdio: ["ignore", "ignore", spawnLog ? spawnLog.fd : "ignore"],
-		env: brokerSpawnEnvironment(command, settings.env),
-		...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
-	});
-	// The child holds its own duplicate of the descriptor; this one is done.
-	await spawnLog?.close();
-	child.unref();
-	let spawnError: Error | undefined;
-	child.once("error", error => {
-		spawnError = error;
-	});
-	const owner = registerBrokerOwner(settings.agentDir, child);
-	const discoveryTimeoutMs = initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS;
-	const deadline = Date.now() + discoveryTimeoutMs;
-	let discoveryError: unknown;
-	while (Date.now() < deadline) {
-		if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
-		try {
-			const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-			if (discovered) {
-				if (owner.markReady(discovered)) {
-					return initiator === "fixture-lease"
-						? { kind: "local-started-fixture", discovery: discovered, owner, child }
-						: { kind: "local-started-discovery", discovery: discovered };
-				}
-				await owner.stop();
-				return { kind: "external-discovery", discovery: discovered };
-			}
-		} catch (error) {
-			discoveryError = error;
-		}
-		await sleep(50);
-	}
-	const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
-	if (exitedBeforeDiscovery && child.exitCode === 0) {
-		// A clean exit means another broker won the ownership lock (two ACP
-		// processes racing a cold broker state, e.g. a provider probe and an
-		// agent launch). The winner may publish its discovery right after our
-		// last poll; reuse it instead of failing the caller. Transient discovery
-		// read failures fall through to the common cleanup + failure path below.
-		try {
-			for (let retry = 0; retry < 20; retry++) {
-				const winner = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-				if (winner) {
-					await owner.stop();
-					return { kind: "external-discovery", discovery: winner };
-				}
-				await sleep(50);
-			}
-		} catch {
-			// fall through to cleanup + failure
-		}
-	}
-	const spawnLogTail = exitedBeforeDiscovery ? await readBrokerSpawnLogTail(settings.agentDir) : "";
-	const failure = spawnError
-		? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
-		: exitedBeforeDiscovery
-			? new Error(
-					`Detached SDK broker exited before discovery (code=${child.exitCode}, signal=${child.signalCode}).${
-						spawnLogTail
-							? ` Broker stderr: ${spawnLogTail}`
-							: " The broker wrote no stderr; see the gjc log for its lock-contention diagnostic."
-					}`,
-				)
-			: discoveryError
-				? discoveryError
-				: new Error("Timed out waiting for detached SDK broker discovery.");
 	try {
-		await owner.stop();
-	} catch (cleanupError) {
-		throw new AggregateError([failure, cleanupError], "SDK broker discovery and spawned broker cleanup both failed.");
+		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
+			detached: true,
+			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
+			env: brokerSpawnEnvironment(command, settings.env),
+			...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
+		});
+		// The child holds its own duplicate of the descriptor; this one is done.
+		await spawnLog?.handle.close();
+		child.unref();
+		let spawnError: Error | undefined;
+		child.once("error", error => {
+			spawnError = error;
+		});
+		const owner = registerBrokerOwner(settings.agentDir, child);
+		const discoveryTimeoutMs = initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS;
+		const deadline = Date.now() + discoveryTimeoutMs;
+		let discoveryError: unknown;
+		while (Date.now() < deadline) {
+			if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
+			try {
+				const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+				if (discovered) {
+					if (owner.markReady(discovered)) {
+						return initiator === "fixture-lease"
+							? { kind: "local-started-fixture", discovery: discovered, owner, child }
+							: { kind: "local-started-discovery", discovery: discovered };
+					}
+					await owner.stop();
+					return { kind: "external-discovery", discovery: discovered };
+				}
+			} catch (error) {
+				discoveryError = error;
+			}
+			await sleep(50);
+		}
+		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
+		if (exitedBeforeDiscovery && child.exitCode === 0) {
+			// A clean exit means another broker won the ownership lock (two ACP
+			// processes racing a cold broker state, e.g. a provider probe and an
+			// agent launch). The winner may publish its discovery right after our
+			// last poll; reuse it instead of failing the caller. Transient discovery
+			// read failures fall through to the common cleanup + failure path below.
+			try {
+				for (let retry = 0; retry < 20; retry++) {
+					const winner = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+					if (winner) {
+						await owner.stop();
+						return { kind: "external-discovery", discovery: winner };
+					}
+					await sleep(50);
+				}
+			} catch {
+				// fall through to cleanup + failure
+			}
+		}
+		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";
+		const failure = spawnError
+			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
+			: exitedBeforeDiscovery
+				? new Error(
+						`Detached SDK broker exited before discovery (code=${child.exitCode}, signal=${child.signalCode}).${
+							spawnLogTail
+								? ` Broker stderr: ${spawnLogTail}`
+								: " The broker wrote no stderr; see the gjc log for its lock-contention diagnostic."
+						}`,
+					)
+				: discoveryError
+					? discoveryError
+					: new Error("Timed out waiting for detached SDK broker discovery.");
+		try {
+			await owner.stop();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[failure, cleanupError],
+				"SDK broker discovery and spawned broker cleanup both failed.",
+			);
+		}
+		throw failure;
+	} finally {
+		if (spawnLog) await removeBrokerSpawnLog(spawnLog.path);
 	}
-	throw failure;
 }
 
 function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator): EnsureInFlight {

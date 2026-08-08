@@ -5,9 +5,10 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { watchSessionHostClientAttachment } from "../src/commands/sdk";
 import {
-	publishSessionHostAttachmentReader,
+	publishSessionHostRuntimeEvidence,
 	reapDeadSessionRegistrations,
 	sessionHostAttachedClients,
+	sessionHostWorkInFlight,
 } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
@@ -134,19 +135,130 @@ test("a host whose SDK endpoint never publishes attachment evidence still exits 
 	expect(nowMs).toBe(40);
 });
 
-test("the published attachment reader is the host's own client count and retracts to no-evidence", () => {
+test("a host with clients attached but never observed attached is not reaped while work is in flight", async () => {
+	const clock = { nowMs: 0 };
+	// The client connected, prompted and dropped its socket between two polls, so
+	// the count is never observed above zero — but the turn it asked for is running.
+	const outcome = await runUntilStable(
+		{
+			readAttachedClients: () => undefined,
+			readWorkInFlight: () => true,
+			idleGraceMs: 20,
+			firstAttachGraceMs: 40,
+			pollMs: 10,
+		},
+		200,
+		clock,
+	);
+	expect(outcome).toBe("still-running");
+	expect(clock.nowMs).toBe(2_000);
+});
+
+test("work in flight defers the first-attach bound to the end of the work, it does not remove it", async () => {
+	let nowMs = 0;
+	await watchSessionHostClientAttachment({
+		readAttachedClients: () => undefined,
+		readWorkInFlight: () => nowMs < 20,
+		now: () => nowMs,
+		sleep: async ms => {
+			nowMs += ms;
+		},
+		idleGraceMs: 20,
+		firstAttachGraceMs: 40,
+		pollMs: 10,
+	});
+	// Last work seen at 10ms; the full first-attach grace runs from there, not from start.
+	expect(nowMs).toBe(50);
+});
+
+test("a host whose SDK runtime never came up reports no work and still exits at the first-attach bound", async () => {
+	let nowMs = 0;
+	await watchSessionHostClientAttachment({
+		readAttachedClients: () => undefined,
+		readWorkInFlight: () => false,
+		now: () => nowMs,
+		sleep: async ms => {
+			nowMs += ms;
+		},
+		idleGraceMs: 20,
+		firstAttachGraceMs: 40,
+		pollMs: 10,
+	});
+	expect(nowMs).toBe(40);
+});
+
+test("published runtime evidence is the host's own client count and work, and retracts to no-evidence", () => {
 	let clients = 3;
-	publishSessionHostAttachmentReader(() => clients);
+	let busy = false;
+	const publication = publishSessionHostRuntimeEvidence({
+		attachedClients: () => clients,
+		workInFlight: () => busy,
+	});
 	try {
 		expect(sessionHostAttachedClients()).toBe(3);
+		expect(sessionHostWorkInFlight()).toBe(false);
 		clients = 0;
+		busy = true;
 		expect(sessionHostAttachedClients()).toBe(0);
-		publishSessionHostAttachmentReader(() => {
-			throw new Error("native server is gone");
-		});
-		expect(sessionHostAttachedClients()).toBeUndefined();
+		expect(sessionHostWorkInFlight()).toBe(true);
 	} finally {
-		publishSessionHostAttachmentReader(undefined);
+		publication.retract();
+	}
+	expect(sessionHostAttachedClients()).toBeUndefined();
+	expect(sessionHostWorkInFlight()).toBe(false);
+	// Retraction is idempotent and still owns nothing else.
+	publication.retract();
+	expect(sessionHostAttachedClients()).toBeUndefined();
+});
+
+test("a retracting runtime cannot clear the evidence of the runtime that succeeded it", () => {
+	const predecessor = publishSessionHostRuntimeEvidence({
+		attachedClients: () => 2,
+		workInFlight: () => false,
+	});
+	const successor = publishSessionHostRuntimeEvidence({
+		attachedClients: () => 1,
+		workInFlight: () => true,
+	});
+	try {
+		expect(sessionHostAttachedClients()).toBe(3);
+		// The predecessor's deferred teardown runs late, while the successor serves.
+		predecessor.retract();
+		expect(sessionHostAttachedClients()).toBe(1);
+		expect(sessionHostWorkInFlight()).toBe(true);
+		predecessor.retract();
+		expect(sessionHostAttachedClients()).toBe(1);
+	} finally {
+		successor.retract();
+	}
+	expect(sessionHostAttachedClients()).toBeUndefined();
+	expect(sessionHostWorkInFlight()).toBe(false);
+});
+
+test("a reader that fails is no evidence, and never fakes attachment or work for a sibling", () => {
+	const broken = publishSessionHostRuntimeEvidence({
+		attachedClients: () => {
+			throw new Error("native server is gone");
+		},
+		workInFlight: () => {
+			throw new Error("native server is gone");
+		},
+	});
+	try {
+		expect(sessionHostAttachedClients()).toBeUndefined();
+		expect(sessionHostWorkInFlight()).toBe(false);
+		const healthy = publishSessionHostRuntimeEvidence({
+			attachedClients: () => 4,
+			workInFlight: () => true,
+		});
+		try {
+			expect(sessionHostAttachedClients()).toBe(4);
+			expect(sessionHostWorkInFlight()).toBe(true);
+		} finally {
+			healthy.retract();
+		}
+	} finally {
+		broken.retract();
 	}
 	expect(sessionHostAttachedClients()).toBeUndefined();
 });

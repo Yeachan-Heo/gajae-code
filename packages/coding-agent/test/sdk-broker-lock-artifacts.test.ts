@@ -320,10 +320,17 @@ describe("detached broker spawn diagnostics", () => {
 		await fs.mkdir(path.join(agentDir, "sdk", "sessions"), { recursive: true });
 		await Bun.write(path.join(agentDir, "sdk", "sessions", "index.snapshot.json"), JSON.stringify({ version: 99 }));
 
-		await expect(ensureBroker({ agentDir })).rejects.toThrow(/exited before discovery[\s\S]*Broker stderr:/);
+		const failure = await ensureBroker({ agentDir }).then(
+			() => undefined,
+			(error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+		);
+		expect(failure?.message).toMatch(/exited before discovery[\s\S]*Broker stderr:/);
+		expect(failure?.message).toContain("index.snapshot.json");
 
-		const captured = await Bun.file(path.join(agentDir, "sdk", "broker-spawn.log")).text();
-		expect(captured).toContain("index.snapshot.json");
+		// The sink is per-spawn and removed once folded into the failure, so the
+		// diagnostic lives in the error and leaves no retained artifact behind.
+		const retained = await fs.readdir(path.join(agentDir, "sdk"));
+		expect(retained.filter(name => name.startsWith("broker-spawn"))).toEqual([]);
 	}, 20_000);
 });
 

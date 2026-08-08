@@ -199,6 +199,19 @@ function installProcessStdoutWriteClassifier(): void {
  * left. Serialize own properties instead, and stay defensive: a throwing
  * `toString`/`toJSON` or a cycle must never mask the original fatal.
  */
+function isErrorLike(reason: unknown): reason is { name: string; message: string; stack?: string } {
+	if (typeof reason !== "object" || reason === null) return false;
+	try {
+		const error = reason as { name?: unknown; message?: unknown; stack?: unknown };
+		return (
+			typeof error.name === "string" &&
+			typeof error.message === "string" &&
+			(typeof error.stack === "string" || Object.prototype.toString.call(reason) === "[object Error]")
+		);
+	} catch {
+		return false;
+	}
+}
 function describeThrowable(reason: unknown): string {
 	if (typeof reason === "object" && reason !== null) {
 		try {
@@ -216,7 +229,13 @@ function describeThrowable(reason: unknown): string {
 }
 
 function errorForDiagnostic(reason: unknown): Error {
-	return reason instanceof Error ? reason : new Error(describeThrowable(reason));
+	if (reason instanceof Error) return reason;
+	if (!isErrorLike(reason)) return new Error(describeThrowable(reason));
+
+	const error = new Error(reason.message);
+	error.name = reason.name;
+	if (typeof reason.stack === "string") error.stack = reason.stack;
+	return error;
 }
 
 // Register signal and error event handlers to trigger cleanup before exit.

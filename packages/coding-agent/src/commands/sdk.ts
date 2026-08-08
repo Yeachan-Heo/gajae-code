@@ -18,6 +18,7 @@ import {
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
 	sessionHostAttachedClients,
+	sessionHostWorkInFlight,
 	startBrokerDeadRegistrationSweep,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
@@ -141,16 +142,28 @@ const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
 
 /**
  * Resolves once this host is provably abandoned: either it has been detached
- * from every client for the full idle grace, or it was never attached at all
+ * from every client for the full idle grace, or nobody has come for it at all
  * for the full first-attach grace.
  *
  * `readAttachedClients` reports the host's own live client/socket subscription
  * count; `undefined` means the SDK endpoint publishes no such evidence yet and
  * is deliberately *not* treated as detachment, so a host can never be reaped on
  * missing evidence — only on observed absence of clients.
+ *
+ * `readWorkInFlight` reports whether the host is running agent work right now.
+ * Work is positive proof that a client did come for this host: a prompt can
+ * only arrive over the endpoint a client dialed. So for a host that has never
+ * been *observed* attached — a client that connected, prompted and dropped
+ * between two 30s polls, or a client count that is momentarily unreadable — the
+ * first-attach window is measured from the last moment work was in flight
+ * rather than from process start. That still bounds a host whose SDK runtime
+ * never came up: with no transport it can never receive a prompt, so it never
+ * reports work and its window keeps running from start. And any real turn ends,
+ * after which the window resumes; live work defers the bound, never removes it.
  */
 export async function watchSessionHostClientAttachment(deps: {
 	readAttachedClients: () => number | undefined;
+	readWorkInFlight?: () => boolean;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	idleGraceMs?: number;
@@ -159,26 +172,29 @@ export async function watchSessionHostClientAttachment(deps: {
 }): Promise<void> {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
+	const readWorkInFlight = deps.readWorkInFlight ?? (() => false);
 	const idleGraceMs = deps.idleGraceMs ?? SESSION_HOST_DETACHED_IDLE_GRACE_MS;
 	const firstAttachGraceMs = deps.firstAttachGraceMs ?? SESSION_HOST_FIRST_ATTACH_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_ATTACHMENT_POLL_MS;
-	const startedAt = now();
 	let everAttached = false;
 	let detachedSince: number | null = null;
+	/** Start of the current window in which nobody has been shown to want this host. */
+	let unattendedSince = now();
 	for (;;) {
 		const attached = deps.readAttachedClients();
+		if (readWorkInFlight()) unattendedSince = now();
 		if (attached === undefined) {
 			// No endpoint evidence at all is ambiguity, not abandonment; it still
 			// accrues against the first-attach bound so a host whose SDK runtime
 			// never came up cannot outlive that bound either.
-			if (!everAttached && now() - startedAt >= firstAttachGraceMs) return;
+			if (!everAttached && now() - unattendedSince >= firstAttachGraceMs) return;
 		} else if (attached > 0) {
 			everAttached = true;
 			detachedSince = null;
 		} else if (everAttached) {
 			detachedSince ??= now();
 			if (now() - detachedSince >= idleGraceMs) return;
-		} else if (now() - startedAt >= firstAttachGraceMs) {
+		} else if (now() - unattendedSince >= firstAttachGraceMs) {
 			return;
 		}
 		await sleep(pollMs);
@@ -660,7 +676,10 @@ export async function runSessionHost(
 	// `session.close` will ever arrive.
 	await Promise.race([
 		watchSessionHostBrokerLiveness({ agentDir }),
-		watchSessionHostClientAttachment({ readAttachedClients: sessionHostAttachedClients }),
+		watchSessionHostClientAttachment({
+			readAttachedClients: sessionHostAttachedClients,
+			readWorkInFlight: sessionHostWorkInFlight,
+		}),
 	]);
 	stop();
 	await new Promise<void>(() => {});
