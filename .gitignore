@@ -89,3 +89,4 @@ packages/coding-agent/binaries/
 
 # Python SDK build output
 python/gjc-sdk/build/
+*.py[cod]

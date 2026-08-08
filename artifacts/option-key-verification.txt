@@ -1,0 +1,20 @@
+iTerm2 profile Default: left=1, right=1
+iTerm2 profile tmux: left=1, right=1
+PASS: Default and tmux send both Option keys as +Esc with no Option+Q/I overrides
+PASS: ABC is the active macOS keyboard layout
+Bun: 1.3.14
+GJC: gjc/0.12.16
+smoke-test: ok
+PASS: Option/Alt environment checks passed; perform the physical-key test in fresh iTerm2 sessions.
+
+Focused checks:
+PASS: sh -n scripts/verify-option-key.sh
+PASS: python3 -m py_compile scripts/capture-option-key.py
+PASS: gjc --smoke-test
+PASS: PTY capture emitted ESC q and ESC i, then stopped on raw 0x03 with exit 0
+PASS: missing tmux fixture rejected
+PASS: wrong active layout fixture rejected even when selected list contains ABC
+PASS: physical-keycode Option+Q conflict fixture rejected
+PASS: character-code Option+Q conflict fixture rejected
+PASS: missing bun/gjc fixture rejected
+Manual scope: physical Option+Q/I delivery in fresh Default and tmux iTerm2 sessions remains manual.
