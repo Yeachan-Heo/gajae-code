@@ -39,12 +39,12 @@ describe("Google stream response framing", () => {
 		"application/ndjson",
 		"application/jsonl",
 		"application/x-jsonl",
-	] as const)("reads newline-delimited JSON responses with content type %s", async contentType => {
+	] as const)("reads newline-delimited JSON responses without reporting blank separators for content type %s", async contentType => {
 		const rawLines = chunks.map((chunk, index) => {
 			const json = JSON.stringify(chunk);
 			return index === 0 ? `  ${json} ` : `\t${json}`;
 		});
-		const response = new Response(rawLines.join("\n"), {
+		const response = new Response(rawLines.join("\n\n"), {
 			headers: { "content-type": contentType },
 		});
 		const rawEvents: RawSseEvent[] = [];

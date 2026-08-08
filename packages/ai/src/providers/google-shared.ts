@@ -926,7 +926,10 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 						response.body,
 						options?.signal,
 						rawEventObserver
-							? raw => rawEventObserver({ event: null, data: raw, raw: [raw] }, model, options?.attemptScope)
+							? raw => {
+									if (raw.trim().length === 0) return;
+									rawEventObserver({ event: null, data: raw, raw: [raw] }, model, options?.attemptScope);
+								}
 							: undefined,
 					)
 				: readSseJson<GenerateContentResponse>(
