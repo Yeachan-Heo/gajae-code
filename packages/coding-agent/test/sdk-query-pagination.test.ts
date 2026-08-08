@@ -397,7 +397,7 @@ describe("SDK query pagination", () => {
 			const store = new RevisionStore(`close-race-${index}`, Date.now, { storageDir: stateRoot });
 			const write = store.createRevision("large", "id", { body: "x".repeat(8 * 1024 * 1024) });
 			const close = store.close();
-			await expect(write).resolves.toBe("1");
+			expect(await write).toBe("1");
 			await expect(close).resolves.toBeUndefined();
 		}
 	});
