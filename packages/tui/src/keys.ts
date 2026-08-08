@@ -472,8 +472,7 @@ function matchesKoreanDubeolsikKittySequence(data: string, keyId: KeyId): boolea
 
 	const expected = parseKeyId(keyId);
 	if (
-		!expected ||
-		!expected.modifiers.some(modifier => modifier === "alt" || modifier === "ctrl" || modifier === "super") ||
+		!expected?.modifiers.some(modifier => modifier === "alt" || modifier === "ctrl" || modifier === "super") ||
 		expected.baseKey !== baseKey
 	)
 		return false;
