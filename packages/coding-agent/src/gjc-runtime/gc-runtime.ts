@@ -29,7 +29,7 @@ import {
 	listCanonicalBlobs,
 	removeCanonicalBlob,
 } from "../session/blob-store";
-import { FileSessionStorage, retireSessionTranscript } from "../session/session-storage";
+import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } from "../session/session-storage";
 
 import { buildGcReportText } from "./gc-render";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
@@ -597,6 +597,18 @@ export interface GcDiskRecord {
 	error?: string;
 	/** Set when `bytes` is a floor because a walk was capped or partially unreadable. */
 	partial?: true;
+	/** Set when this entry was a reclaim candidate that its surface withheld on incomplete evidence. */
+	withheld?: true;
+}
+
+/**
+ * Why a surface refused to reclaim anything, and how much it withheld to stay
+ * fail-closed. Present only when the surface declined.
+ */
+export interface GcDiskDeclined {
+	reason: string;
+	withheld: number;
+	withheld_bytes: number;
 }
 
 export interface GcDiskSurfaceReport {
@@ -611,6 +623,8 @@ export interface GcDiskSurfaceReport {
 	kept: number;
 	kept_bytes: number;
 	failed: number;
+	/** Set when the surface declined to reclaim anything because its evidence was incomplete. */
+	declined?: GcDiskDeclined;
 	records: GcDiskRecord[];
 }
 
@@ -845,6 +859,21 @@ async function collectGcSessionReferences(agentDir: string, env: NodeJS.ProcessE
 	return { ids, complete, notes };
 }
 
+/**
+ * Whether a reference scan saw every file its conclusions depend on.
+ * `complete: false` is a hard veto on reclamation for any surface whose evidence
+ * lives in a file the scan could not open.
+ */
+interface GcDiskEvidence {
+	complete: boolean;
+	notes: string[];
+}
+
+function markGcDiskEvidenceIncomplete(evidence: GcDiskEvidence, note: string): void {
+	evidence.complete = false;
+	if (!evidence.notes.includes(note)) evidence.notes.push(note);
+}
+
 /** One managed session transcript plus its sibling artifact directory. */
 interface GcDiskTranscript {
 	sessionId: string;
@@ -855,13 +884,32 @@ interface GcDiskTranscript {
 	partial: boolean;
 }
 
-async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskError[]): Promise<GcDiskTranscript[]> {
+/**
+ * Every managed transcript, plus whether that enumeration is complete evidence.
+ *
+ * A transcript that could not be enumerated or stat'd is absent from
+ * `transcripts`, which leaves the session surface fail-closed by construction
+ * (an unseen transcript is never retired). It does NOT leave the blob sweep
+ * safe: a blob referenced only by an unseen transcript would look unreferenced,
+ * so `evidence` is threaded to every surface that marks across all transcripts.
+ */
+interface GcDiskTranscriptScan {
+	transcripts: GcDiskTranscript[];
+	evidence: GcDiskEvidence;
+}
+
+async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskError[]): Promise<GcDiskTranscriptScan> {
+	const evidence: GcDiskEvidence = { complete: true, notes: [] };
 	let projectDirs: Dirent[];
 	try {
 		projectDirs = await fsp.readdir(sessionsRoot, { withFileTypes: true });
 	} catch (error) {
-		if (!isEnoent(error)) errors.push({ surface: "sessions", scope: sessionsRoot, message: gcDiskErrorText(error) });
-		return [];
+		// A missing sessions root is complete evidence: there are no transcripts.
+		if (!isEnoent(error)) {
+			errors.push({ surface: "sessions", scope: sessionsRoot, message: gcDiskErrorText(error) });
+			markGcDiskEvidenceIncomplete(evidence, "sessions_root_unreadable");
+		}
+		return { transcripts: [], evidence };
 	}
 
 	const transcripts: GcDiskTranscript[] = [];
@@ -873,6 +921,7 @@ async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskErr
 			files = await fsp.readdir(directory, { withFileTypes: true });
 		} catch (error) {
 			errors.push({ surface: "sessions", scope: directory, message: gcDiskErrorText(error) });
+			markGcDiskEvidenceIncomplete(evidence, "session_project_dir_unreadable");
 			continue;
 		}
 		for (const file of files) {
@@ -883,6 +932,7 @@ async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskErr
 				stat = await fsp.lstat(transcriptPath);
 			} catch (error) {
 				errors.push({ surface: "sessions", scope: transcriptPath, message: gcDiskErrorText(error) });
+				markGcDiskEvidenceIncomplete(evidence, "transcript_unstattable");
 				continue;
 			}
 			const artifacts = await measureGcDiskTree(transcriptPath.slice(0, -".jsonl".length));
@@ -896,7 +946,7 @@ async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskErr
 			});
 		}
 	}
-	return transcripts;
+	return { transcripts, evidence };
 }
 
 /**
@@ -980,12 +1030,25 @@ async function runGcDiskSessions(input: {
 		}
 	}
 
-	if (!prune) return classified.filter(item => item.record.action !== "would_reclaim").map(item => item.transcript);
+	const storage = new FileSessionStorage();
+	if (!prune) {
+		// Dry run must project the prune verdict, not just the policy verdict: the
+		// retention pass re-checks its own preconditions before it may call the
+		// delete authority, and a candidate that fails them is never removable.
+		for (const item of classified) {
+			if (item.record.action !== "would_reclaim") continue;
+			const probe = probeSessionRetirement(storage, surface.root, item.transcript.path);
+			if (probe.kind === "retirable") continue;
+			item.record.action = "keep";
+			item.record.reason = `retention_declined: ${probe.reason}`;
+		}
+		return classified.filter(item => item.record.action !== "would_reclaim").map(item => item.transcript);
+	}
 
 	// Retirement goes through the identity-bound verified delete authority, which
 	// re-reads and re-verifies the transcript. A declined retirement is a KEEP,
-	// not a failure — the same posture the pid probe takes on EPERM/unknown.
-	const storage = new FileSessionStorage();
+	// not a failure — the same posture the pid probe takes on EPERM/unknown. A
+	// half-completed one is a failure: bytes are already gone.
 	const survivors: GcDiskTranscript[] = [];
 	for (const item of classified) {
 		if (item.record.action !== "would_reclaim") {
@@ -995,6 +1058,16 @@ async function runGcDiskSessions(input: {
 		const outcome = await retireSessionTranscript(storage, surface.root, item.transcript.path);
 		if (outcome.kind === "retired") {
 			item.record.action = "reclaimed";
+			continue;
+		}
+		if (outcome.kind === "cleanup_pending") {
+			// The transcript survives but its artifact tree was already detached or
+			// partially removed. Reporting that as a plain keep would hide a
+			// destructive partial failure behind a green exit code.
+			item.record.action = "reclaim_failed";
+			item.record.reason = `retention_incomplete: ${outcome.reason}`;
+			item.record.error = outcome.reason;
+			survivors.push(item.transcript);
 			continue;
 		}
 		item.record.action = "keep";
@@ -1022,14 +1095,26 @@ async function markGcDiskBlobReferences(transcriptPath: string, into: Set<string
 	}
 }
 
+/**
+ * Mark and sweep the content-addressed blob store.
+ *
+ * A blob's only evidence of being referenced lives inside session transcripts,
+ * so the sweep is sound only when every transcript was enumerated AND read.
+ * `discovery` carries that verdict from the session walk; a transcript that
+ * fails to stream here degrades it further. On incomplete evidence the sweep
+ * still reports what it would have reclaimed and reclaims nothing, even under
+ * `--prune`: an unproven reference is treated as a real one.
+ */
 async function runGcDiskBlobs(input: {
 	surface: GcDiskSurfaceReport;
 	survivors: GcDiskTranscript[];
+	discovery: GcDiskEvidence;
 	now: number;
 	prune: boolean;
 	errors: GcDiskError[];
 }): Promise<void> {
-	const { surface, survivors, now, prune, errors } = input;
+	const { surface, survivors, discovery, now, prune, errors } = input;
+	const evidence: GcDiskEvidence = { complete: discovery.complete, notes: [...discovery.notes] };
 	let blobs: CanonicalBlobEntry[];
 	try {
 		blobs = await listCanonicalBlobs(surface.root);
@@ -1040,13 +1125,14 @@ async function runGcDiskBlobs(input: {
 	if (blobs.length === 0) return;
 
 	const referenced = new Set<string>();
-	let markComplete = true;
 	for (const transcript of survivors) {
 		if (await markGcDiskBlobReferences(transcript.path, referenced)) continue;
-		markComplete = false;
+		markGcDiskEvidenceIncomplete(evidence, "transcript_unreadable_during_mark");
 		errors.push({ surface: "blobs", scope: transcript.path, message: "transcript_unreadable_during_mark" });
 	}
 
+	let withheld = 0;
+	let withheldBytes = 0;
 	for (const blob of blobs) {
 		const record: GcDiskRecord = {
 			surface: "blobs",
@@ -1057,10 +1143,14 @@ async function runGcDiskBlobs(input: {
 			action: "keep",
 			reason: "",
 		};
-		if (!markComplete) record.reason = "mark_scan_incomplete";
-		else if (referenced.has(blob.hash)) record.reason = "referenced_by_surviving_session";
+		if (referenced.has(blob.hash)) record.reason = "referenced_by_surviving_session";
 		else if (now - blob.mtimeMs < GC_DISK_BLOB_GRACE_MS) record.reason = "within_write_grace_window";
-		else {
+		else if (!evidence.complete) {
+			record.reason = `withheld_evidence_incomplete: ${evidence.notes.join(", ")}`;
+			record.withheld = true;
+			withheld++;
+			withheldBytes += blob.bytes;
+		} else {
 			record.action = "would_reclaim";
 			record.reason = "unreferenced_by_any_surviving_session";
 		}
@@ -1078,6 +1168,14 @@ async function runGcDiskBlobs(input: {
 			record.action = "keep";
 			record.reason = removal.reason;
 		}
+	}
+
+	if (!evidence.complete) {
+		surface.declined = {
+			reason: `evidence_incomplete: ${evidence.notes.join(", ")}`,
+			withheld,
+			withheld_bytes: withheldBytes,
+		};
 	}
 }
 
@@ -1305,17 +1403,17 @@ export async function collectGcDiskReport(input: {
 		backups: emptyGcDiskSurface("backups", path.join(gjcRoot, "backups")),
 	};
 
-	const transcripts = await discoverGcDiskTranscripts(surfaces.sessions.root, errors);
+	const scan = await discoverGcDiskTranscripts(surfaces.sessions.root, errors);
 	const references = await collectGcSessionReferences(agentDir, env);
 	const survivors = await runGcDiskSessions({
 		surface: surfaces.sessions,
-		transcripts,
+		transcripts: scan.transcripts,
 		references,
 		policy,
 		now,
 		prune,
 	});
-	await runGcDiskBlobs({ surface: surfaces.blobs, survivors, now, prune, errors });
+	await runGcDiskBlobs({ surface: surfaces.blobs, survivors, discovery: scan.evidence, now, prune, errors });
 	await runGcDiskNatives({
 		surface: surfaces.natives,
 		policy,
@@ -1397,6 +1495,12 @@ export function buildGcDiskReportText(disk: GcDiskReport): string {
 					: `reclaimed=${surface.reclaimed} (${formatGcDiskBytes(surface.reclaimed_bytes)}) failed=${surface.failed} `) +
 				`kept=${surface.kept} (${formatGcDiskBytes(surface.kept_bytes)})`,
 		);
+		if (surface.declined) {
+			lines.push(
+				`  declined: reclaimed nothing — ${surface.declined.reason} ` +
+					`(withheld=${surface.declined.withheld} (${formatGcDiskBytes(surface.declined.withheld_bytes)}))`,
+			);
+		}
 		// Reclaim decisions first: they are what an operator has to audit.
 		const ranked = [...surface.records].sort(
 			(a, b) => Number(a.action === "keep") - Number(b.action === "keep") || b.bytes - a.bytes,

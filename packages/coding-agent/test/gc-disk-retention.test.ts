@@ -61,18 +61,33 @@ async function backdate(target: string, ageDays: number): Promise<void> {
 	await fsp.utimes(target, when, when);
 }
 
+/** Restore write permission on every directory so a fixture can always be removed. */
+async function unlockTree(root: string): Promise<void> {
+	await fsp.chmod(root, 0o700).catch(() => {});
+	let entries: string[];
+	try {
+		entries = await fsp.readdir(root);
+	} catch {
+		return;
+	}
+	for (const name of entries) {
+		const child = path.join(root, name);
+		if ((await fsp.lstat(child)).isDirectory()) await unlockTree(child);
+	}
+}
+
 async function writeSession(
 	fixture: TestRoot,
 	project: string,
 	id: string,
-	options: { ageDays: number; blobRefs?: string[] },
+	options: { ageDays: number; blobRefs?: string[]; brokenHeader?: boolean },
 ): Promise<string> {
 	const directory = path.join(fixture.sessionsRoot, project);
 	await fsp.mkdir(directory, { recursive: true });
 	const file = path.join(directory, `${id}.jsonl`);
-	const lines = [
-		JSON.stringify({ type: "session", version: 3, id, timestamp: "2025-01-01T00:00:00Z", cwd: fixture.root }),
-	];
+	const lines = options.brokenHeader
+		? [JSON.stringify({ type: "message", role: "user", content: "no session header here" })]
+		: [JSON.stringify({ type: "session", version: 3, id, timestamp: "2025-01-01T00:00:00Z", cwd: fixture.root })];
 	for (const ref of options.blobRefs ?? []) {
 		lines.push(JSON.stringify({ type: "message", role: "user", content: `blob:sha256:${ref}` }));
 	}
@@ -323,9 +338,231 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 			const disk = requireDisk(await runDisk(fixture, ["--disk", "--json"]));
 			await fsp.chmod(transcript, 0o600);
 
-			expect(reasonById(disk, "blobs").get(orphan)).toBe("keep:mark_scan_incomplete");
+			expect(reasonById(disk, "blobs").get(orphan)).toBe(
+				"keep:withheld_evidence_incomplete: transcript_unreadable_during_mark",
+			);
+			expect(disk.surfaces.blobs.declined).toEqual({
+				reason: "evidence_incomplete: transcript_unreadable_during_mark",
+				withheld: 1,
+				withheld_bytes: "orphan attachment".length,
+			});
 			expect(disk.surfaces.blobs.reclaimable).toBe(0);
 			expect(disk.errors.some(error => error.surface === "blobs")).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("gjc gc --disk --prune (blob sweep on incomplete evidence)", () => {
+	test("keeps a blob whose only reference lives in an unreadable project directory", async () => {
+		const fixture = await makeTestRoot();
+		const projectDir = path.join(fixture.sessionsRoot, "repo-a");
+		try {
+			// Older than the write grace window, so only the reference held by the
+			// live transcript stands between this blob and the sweep.
+			const hash = await writeBlob(fixture, "precious user payload", 3);
+			const transcript = await writeSession(fixture, "repo-a", "live-session", { ageDays: 0, blobRefs: [hash] });
+			await fsp.chmod(projectDir, 0o000);
+
+			const report = await runDisk(fixture, ["--disk", "--prune", "--json"]);
+			await fsp.chmod(projectDir, 0o700);
+			const disk = requireDisk(report);
+
+			expect(await Bun.file(path.join(fixture.blobsDir, hash)).exists()).toBe(true);
+			expect(await Bun.file(transcript).exists()).toBe(true);
+			expect(disk.surfaces.blobs.reclaimed).toBe(0);
+			expect(reasonById(disk, "blobs").get(hash)).toBe(
+				"keep:withheld_evidence_incomplete: session_project_dir_unreadable",
+			);
+			expect(disk.surfaces.blobs.records.find(record => record.id === hash)?.withheld).toBe(true);
+			expect(disk.surfaces.blobs.declined).toEqual({
+				reason: "evidence_incomplete: session_project_dir_unreadable",
+				withheld: 1,
+				withheld_bytes: "precious user payload".length,
+			});
+		} finally {
+			await fsp.chmod(projectDir, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("reclaims nothing and names the reason when the sessions root cannot be read", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const hash = await writeBlob(fixture, "payload past the age bound", 3);
+			await writeSession(fixture, "repo-a", "live-session", { ageDays: 0, blobRefs: [hash] });
+			await fsp.chmod(fixture.sessionsRoot, 0o000);
+
+			const report = await runDisk(fixture, ["--disk", "--prune", "--json"]);
+			await fsp.chmod(fixture.sessionsRoot, 0o700);
+			const disk = requireDisk(report);
+
+			expect(await Bun.file(path.join(fixture.blobsDir, hash)).exists()).toBe(true);
+			expect(disk.surfaces.blobs.reclaimed).toBe(0);
+			expect(disk.surfaces.blobs.declined?.reason).toBe("evidence_incomplete: sessions_root_unreadable");
+			expect(disk.surfaces.blobs.declined?.withheld).toBe(1);
+			expect(disk.errors.some(error => error.surface === "sessions")).toBe(true);
+		} finally {
+			await fsp.chmod(fixture.sessionsRoot, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("the text report states that the blob surface declined and what it withheld", async () => {
+		const fixture = await makeTestRoot();
+		const projectDir = path.join(fixture.sessionsRoot, "repo-a");
+		try {
+			const hash = await writeBlob(fixture, "withheld payload", 3);
+			await writeSession(fixture, "repo-a", "live-session", { ageDays: 0, blobRefs: [hash] });
+			await fsp.chmod(projectDir, 0o000);
+
+			const result = await runGjcGcCommand(["--disk", "--prune"], fixture.root, fixture.env, [], policy());
+			await fsp.chmod(projectDir, 0o700);
+
+			expect(result.stdout).toContain(
+				"declined: reclaimed nothing — evidence_incomplete: session_project_dir_unreadable (withheld=1",
+			);
+			expect(await Bun.file(path.join(fixture.blobsDir, hash)).exists()).toBe(true);
+		} finally {
+			await fsp.chmod(projectDir, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("gjc gc --disk dry-run parity", () => {
+	for (const evidence of ["complete", "incomplete"] as const) {
+		test(`--disk reports exactly what --disk --prune removes (${evidence} evidence)`, async () => {
+			// Two identical state roots: one is only reported on, the other pruned.
+			const dry = await makeTestRoot();
+			const wet = await makeTestRoot();
+			const orphans: string[] = [];
+			try {
+				for (const fixture of [dry, wet]) {
+					const referenced = await writeBlob(fixture, "referenced payload", 10);
+					orphans.push(await writeBlob(fixture, "orphan payload", 10));
+					await writeSession(fixture, "repo-a", "live-session", { ageDays: 0, blobRefs: [referenced] });
+					if (evidence === "incomplete") await fsp.chmod(path.join(fixture.sessionsRoot, "repo-a"), 0o000);
+				}
+
+				const dryReport = await runDisk(dry, ["--disk", "--json"]);
+				const wetReport = await runDisk(wet, ["--disk", "--prune", "--json"]);
+				for (const fixture of [dry, wet]) {
+					await fsp.chmod(path.join(fixture.sessionsRoot, "repo-a"), 0o700).catch(() => {});
+				}
+				const dryDisk = requireDisk(dryReport);
+				const wetDisk = requireDisk(wetReport);
+
+				for (const surface of ["sessions", "blobs", "natives", "backups"] as const) {
+					expect(wetDisk.surfaces[surface].reclaimed).toBe(dryDisk.surfaces[surface].reclaimable);
+					expect(wetDisk.surfaces[surface].reclaimed_bytes).toBe(dryDisk.surfaces[surface].reclaimable_bytes);
+					expect(wetDisk.surfaces[surface].declined).toEqual(dryDisk.surfaces[surface].declined);
+				}
+
+				// Complete evidence still sweeps; incomplete evidence sweeps nothing.
+				expect(dryDisk.surfaces.blobs.reclaimable).toBe(evidence === "complete" ? 1 : 0);
+				expect(await Bun.file(path.join(wet.blobsDir, orphans[1]!)).exists()).toBe(evidence !== "complete");
+				expect(await Bun.file(path.join(dry.blobsDir, orphans[0]!)).exists()).toBe(true);
+			} finally {
+				for (const fixture of [dry, wet]) {
+					await fsp.chmod(path.join(fixture.sessionsRoot, "repo-a"), 0o700).catch(() => {});
+					await fsp.rm(fixture.root, { recursive: true, force: true });
+				}
+			}
+		});
+	}
+
+	test("a transcript the delete authority will refuse is never reported as reclaimable", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const corrupt = await writeSession(fixture, "repo-a", "corrupt-old", { ageDays: 120, brokenHeader: true });
+			await writeSession(fixture, "repo-a", "newest", { ageDays: 0 });
+
+			const dryDisk = requireDisk(await runDisk(fixture, ["--disk", "--json"]));
+			expect(reasonById(dryDisk, "sessions").get("corrupt-old")).toBe(
+				"keep:retention_declined: transcript_header_unusable",
+			);
+			expect(dryDisk.surfaces.sessions.reclaimable).toBe(0);
+
+			const wetDisk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			expect(wetDisk.surfaces.sessions.reclaimed).toBe(dryDisk.surfaces.sessions.reclaimable);
+			expect(await Bun.file(corrupt).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("gjc gc --disk --prune (half-completed retirement)", () => {
+	test("a session whose artifacts were destroyed is reported as failed, not kept", async () => {
+		const fixture = await makeTestRoot();
+		const transcript = await writeSession(fixture, "repo-a", "old-session", { ageDays: 120 });
+		const artifactsDir = transcript.slice(0, -".jsonl".length);
+		const locked = path.join(artifactsDir, "locked");
+		try {
+			await fsp.mkdir(locked, { recursive: true });
+			await Bun.write(path.join(artifactsDir, "tool-output.txt"), "tool output");
+			await Bun.write(path.join(locked, "inner.txt"), "inner payload");
+			// Read-only directory: the recursive artifact removal cannot empty it,
+			// so retirement stops after the artifact tree has already been detached.
+			await fsp.chmod(locked, 0o500);
+			await writeSession(fixture, "repo-a", "newest", { ageDays: 0 });
+
+			const result = await runGjcGcCommand(["--disk", "--prune", "--json"], fixture.root, fixture.env, [], policy());
+			await fsp.chmod(locked, 0o700).catch(() => {});
+			const disk = requireDisk(JSON.parse(result.stdout) as GcReport);
+			const record = disk.surfaces.sessions.records.find(entry => entry.id === "old-session");
+
+			expect(await Bun.file(transcript).exists()).toBe(true);
+			expect(await Bun.file(path.join(artifactsDir, "tool-output.txt")).exists()).toBe(false);
+			expect(record?.action).toBe("reclaim_failed");
+			expect(record?.reason.startsWith("retention_incomplete: cleanup_pending_")).toBe(true);
+			expect(disk.totals.failed).toBe(1);
+			expect(result.status).toBe(1);
+		} finally {
+			await unlockTree(fixture.root);
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("gjc gc --disk (path containment)", () => {
+	test("never follows a symlinked project directory or transcript out of the state root", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const outside = path.join(fixture.root, "outside");
+			await fsp.mkdir(outside, { recursive: true });
+			const outsideTranscript = path.join(outside, "escapee.jsonl");
+			await Bun.write(
+				outsideTranscript,
+				`${JSON.stringify({ type: "session", version: 3, id: "escapee", timestamp: "2025-01-01T00:00:00Z", cwd: fixture.root })}\n`,
+			);
+			await backdate(outsideTranscript, 900);
+
+			await writeSession(fixture, "repo-a", "newest", { ageDays: 0 });
+			// A session id that tries to traverse, a symlinked project directory and
+			// a symlinked transcript: none of them may reach outside the root.
+			const traversal = path.join(fixture.sessionsRoot, "repo-a", "..escape.jsonl");
+			await Bun.write(
+				traversal,
+				`${JSON.stringify({ type: "session", version: 3, id: "../../escape", timestamp: "2025-01-01T00:00:00Z", cwd: fixture.root })}\n`,
+			);
+			await backdate(traversal, 900);
+			await fsp.symlink(outside, path.join(fixture.sessionsRoot, "linked-project"));
+			await fsp.symlink(outsideTranscript, path.join(fixture.sessionsRoot, "repo-a", "linked.jsonl"));
+
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+
+			for (const record of disk.surfaces.sessions.records) {
+				expect(record.path.startsWith(`${fixture.sessionsRoot}${path.sep}`)).toBe(true);
+			}
+			expect(disk.surfaces.sessions.records.map(record => record.id).sort()).toEqual(["..escape", "newest"]);
+			expect(await Bun.file(outsideTranscript).exists()).toBe(true);
+			expect((await fsp.lstat(path.join(fixture.sessionsRoot, "linked-project"))).isSymbolicLink()).toBe(true);
+			expect((await fsp.lstat(path.join(fixture.sessionsRoot, "repo-a", "linked.jsonl"))).isSymbolicLink()).toBe(
+				true,
+			);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
