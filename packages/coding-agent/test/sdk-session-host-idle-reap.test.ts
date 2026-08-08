@@ -188,6 +188,11 @@ test("a host whose SDK runtime never came up reports no work and still exits at 
 });
 
 test("published runtime evidence is the host's own client count and work, and retracts to no-evidence", () => {
+	// Shard peers may legitimately hold their own publications; every assertion is
+	// relative to that baseline, since a foreign publication is exactly what the
+	// identity-scoped registry must leave untouched.
+	const baseClients = sessionHostAttachedClients();
+	const baseWork = sessionHostWorkInFlight();
 	let clients = 3;
 	let busy = false;
 	const publication = publishSessionHostRuntimeEvidence({
@@ -195,23 +200,24 @@ test("published runtime evidence is the host's own client count and work, and re
 		workInFlight: () => busy,
 	});
 	try {
-		expect(sessionHostAttachedClients()).toBe(3);
-		expect(sessionHostWorkInFlight()).toBe(false);
+		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 3);
+		expect(sessionHostWorkInFlight()).toBe(baseWork || false);
 		clients = 0;
 		busy = true;
-		expect(sessionHostAttachedClients()).toBe(0);
+		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 0);
 		expect(sessionHostWorkInFlight()).toBe(true);
 	} finally {
 		publication.retract();
 	}
-	expect(sessionHostAttachedClients()).toBeUndefined();
-	expect(sessionHostWorkInFlight()).toBe(false);
+	expect(sessionHostAttachedClients()).toEqual(baseClients);
+	expect(sessionHostWorkInFlight()).toBe(baseWork);
 	// Retraction is idempotent and still owns nothing else.
 	publication.retract();
-	expect(sessionHostAttachedClients()).toBeUndefined();
+	expect(sessionHostAttachedClients()).toEqual(baseClients);
 });
 
 test("a retracting runtime cannot clear the evidence of the runtime that succeeded it", () => {
+	const baseClients = sessionHostAttachedClients();
 	const predecessor = publishSessionHostRuntimeEvidence({
 		attachedClients: () => 2,
 		workInFlight: () => false,
@@ -221,21 +227,22 @@ test("a retracting runtime cannot clear the evidence of the runtime that succeed
 		workInFlight: () => true,
 	});
 	try {
-		expect(sessionHostAttachedClients()).toBe(3);
+		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 3);
 		// The predecessor's deferred teardown runs late, while the successor serves.
 		predecessor.retract();
-		expect(sessionHostAttachedClients()).toBe(1);
+		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 1);
 		expect(sessionHostWorkInFlight()).toBe(true);
 		predecessor.retract();
-		expect(sessionHostAttachedClients()).toBe(1);
+		expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 1);
 	} finally {
 		successor.retract();
 	}
-	expect(sessionHostAttachedClients()).toBeUndefined();
-	expect(sessionHostWorkInFlight()).toBe(false);
+	expect(sessionHostAttachedClients()).toEqual(baseClients);
 });
 
 test("a reader that fails is no evidence, and never fakes attachment or work for a sibling", () => {
+	const baseClients = sessionHostAttachedClients();
+	const baseWork = sessionHostWorkInFlight();
 	const broken = publishSessionHostRuntimeEvidence({
 		attachedClients: () => {
 			throw new Error("native server is gone");
@@ -245,14 +252,14 @@ test("a reader that fails is no evidence, and never fakes attachment or work for
 		},
 	});
 	try {
-		expect(sessionHostAttachedClients()).toBeUndefined();
-		expect(sessionHostWorkInFlight()).toBe(false);
+		expect(sessionHostAttachedClients()).toEqual(baseClients);
+		expect(sessionHostWorkInFlight()).toBe(baseWork);
 		const healthy = publishSessionHostRuntimeEvidence({
 			attachedClients: () => 4,
 			workInFlight: () => true,
 		});
 		try {
-			expect(sessionHostAttachedClients()).toBe(4);
+			expect(sessionHostAttachedClients()).toBe((baseClients ?? 0) + 4);
 			expect(sessionHostWorkInFlight()).toBe(true);
 		} finally {
 			healthy.retract();
@@ -260,7 +267,7 @@ test("a reader that fails is no evidence, and never fakes attachment or work for
 	} finally {
 		broken.retract();
 	}
-	expect(sessionHostAttachedClients()).toBeUndefined();
+	expect(sessionHostAttachedClients()).toEqual(baseClients);
 });
 
 test("the broker drops registrations whose host process is gone, keeps live ones, and logs each reap", async () => {
