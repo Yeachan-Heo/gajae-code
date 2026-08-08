@@ -1,5 +1,33 @@
 import type { Api, Model } from "./types";
 
+/**
+ * Codex GPT-5.6 OAuth context-window policy.
+ *
+ * Authoritative source and ownership path
+ * ---------------------------------------
+ * The authenticated Codex backend discovery endpoint (`GET {base}/codex/models`
+ * with an OAuth bearer token) is the authoritative runtime source of Codex OAuth
+ * model context-window metadata (`models[].context_window`). OpenAI owns that
+ * value; GJC consumes it read-only via `fetchCodexModels` and must not silently
+ * invent a larger limit without upstream evidence.
+ *
+ * This bundled policy is a client-side conservative guard, not a primary source.
+ * It exists because OpenAI temporarily reverted the GPT-5.6 Sol product context
+ * limit from 372K to 272K on 2026-07-13 (staff announcement quoted in
+ * gajae-code issues #2240 / #2260), while planning to restore 372K later.
+ * `ceiling` must only be raised with an upstream evidence citation; an
+ * unverified report that "372K is live again" is not sufficient.
+ *
+ * Precedence (highest -> lowest)
+ * ------------------------------
+ * 1. Explicit user per-model override (`contextWindow` in `modelOverrides`).
+ *    The model registry merges it into `model.contextWindow` before this cap and
+ *    passes it here; it is honored when a positive finite number, with
+ *    diagnostics emitted at the registry. Never silently discarded.
+ * 2. Live OAuth discovery metadata (`context_window`), capped at `ceiling`.
+ * 3. Bundled conservative `fallback`, used when discovery metadata is
+ *    absent or invalid.
+ */
 export interface CodexGpt56ContextCapPolicy {
 	/**
 	 * Usable prompt budget forced for the GPT-5.6 tier on the Codex product
@@ -54,12 +82,28 @@ export function resolveCodexGpt56DiscoveryContext(
 	return policy.enforced;
 }
 
+/**
+ * Applies the final Codex GPT-5.6 context ceiling, honoring explicit user
+ * overrides.
+ *
+ * `userContextWindowOverrides` maps lowercased model ids to the user's explicit
+ * `contextWindow` value (already merged into `model.contextWindow` by the model
+ * registry). A tier model present with a positive finite value keeps its value
+ * even above `enforced` — the user's explicit, diagnosed choice. Every other tier
+ * model is forced to `enforced`, so a stale larger live/cached observation
+ * (e.g. a pre-rollback 373K cache) cannot resurface without an override.
+ */
 export function applyFinalCodexGpt56ContextCap<TApi extends Api>(
 	models: readonly Model<TApi>[],
 	policy: CodexGpt56ContextCapPolicy = CODEX_GPT_5_6_CONTEXT_CAP,
+	userContextWindowOverrides: ReadonlyMap<string, number> = new Map(),
 ): Model<TApi>[] {
 	return models.map(model => {
 		if (!isCodexGpt56Tier(model as Model<Api>) || !isCodexProductTransport(model as Model<Api>)) {
+			return model;
+		}
+		const userOverride = userContextWindowOverrides.get(model.id.toLowerCase());
+		if (userOverride !== undefined && isPositiveFiniteNumber(userOverride)) {
 			return model;
 		}
 		return { ...model, contextWindow: policy.enforced };

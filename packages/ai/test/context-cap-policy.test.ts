@@ -81,4 +81,32 @@ describe("Codex GPT-5.6 context cap policy", () => {
 		// Non-tier rows are untouched by the policy entirely.
 		expect(resolveCodexGpt56DiscoveryContext(model({ id: "gpt-5.5" }), undefined, customPolicy)).toBe(272_000);
 	});
+
+	it("honors an explicit user override above the ceiling and caps sibling tiers", () => {
+		const overrides = new Map([["gpt-5.6-sol", 373_000]]);
+		const capped = applyFinalCodexGpt56ContextCap([model(), model({ id: "gpt-5.6-terra" })], undefined, overrides);
+		expect(capped.map(entry => entry.contextWindow)).toEqual([373_000, 372_000]);
+	});
+
+	it("leaves non-tier and first-party OpenAI transports untouched by the override path", () => {
+		const overrides = new Map([["gpt-5.6-sol", 373_000]]);
+		const capped = applyFinalCodexGpt56ContextCap(
+			[model({ id: "gpt-5.5" }), model({ id: "gpt-5.6-sol", api: "openai-responses", provider: "openai" })],
+			undefined,
+			overrides,
+		);
+		expect(capped.map(entry => entry.contextWindow)).toEqual([373_000, 373_000]);
+	});
+
+	it("ignores non-positive overrides so the stale-cap guard still applies", () => {
+		const capped = applyFinalCodexGpt56ContextCap(
+			[model(), model({ id: "gpt-5.6-terra" })],
+			undefined,
+			new Map([
+				["gpt-5.6-sol", -5],
+				["gpt-5.6-terra", Number.NaN],
+			]),
+		);
+		expect(capped.map(entry => entry.contextWindow)).toEqual([372_000, 372_000]);
+	});
 });

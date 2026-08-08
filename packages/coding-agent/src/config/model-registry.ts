@@ -6,6 +6,7 @@ import {
 	type AuthCredentialSelector,
 	applyFinalCodexGpt56ContextCap,
 	type CacheRetention,
+	CODEX_GPT_5_6_CONTEXT_CAP,
 	type Context,
 	createModelManager,
 	enrichModelThinking,
@@ -13,6 +14,7 @@ import {
 	getBundledProviders,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
+	isCodexGpt56Tier,
 	isKnownProvider,
 	type Model,
 	type ModelManagerOptions,
@@ -860,7 +862,8 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.output !== undefined) result.output = override.output as ("text" | "image")[];
 	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
-	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
+	const contextWindowOverride = toPositiveNumberOrUndefined(override.contextWindow);
+	if (contextWindowOverride !== undefined) result.contextWindow = contextWindowOverride;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
 	if (override.contextPromotionTarget !== undefined) result.contextPromotionTarget = override.contextPromotionTarget;
 	if (override.wireModelId !== undefined) result.wireModelId = override.wireModelId;
@@ -1220,6 +1223,7 @@ export class ModelRegistry {
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
+	#codexContextWindowOverrides: Map<string, number> = new Map();
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
 	#modelBindingsApplier = new ModelBindingsApplier();
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
@@ -1406,6 +1410,7 @@ export class ModelRegistry {
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
 		this.#modelOverrides = modelOverrides;
+		this.#codexContextWindowOverrides = this.#collectCodexContextWindowOverrides();
 		this.#equivalenceConfig = equivalence;
 		this.#modelBindingsApplier.setBindings(modelBindings);
 		this.#modelProfiles = mergeModelProfiles(profiles);
@@ -1422,7 +1427,11 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#models = applyFinalCodexGpt56ContextCap(
+			this.#applyRuntimeProviderOverrides(withModelOverrides),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
@@ -2179,7 +2188,11 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#models = applyFinalCodexGpt56ContextCap(
+			this.#applyRuntimeProviderOverrides(withModelOverrides),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -3129,6 +3142,46 @@ export class ModelRegistry {
 			return this.#applyRuntimeProviderOverride(model, override);
 		});
 	}
+	/**
+	 * Collects explicit user `contextWindow` overrides keyed by lowercased model
+	 * id, and surfaces diagnostics when one applies to a Codex GPT-5.6 tier
+	 * model. The map is computed once per config load and feeds the final
+	 * context cap so an explicit override is never silently re-clamped.
+	 */
+	#collectCodexContextWindowOverrides(): Map<string, number> {
+		const result = new Map<string, number>();
+		for (const [provider, providerOverrides] of this.#modelOverrides) {
+			for (const [modelId, override] of providerOverrides) {
+				if (override.contextWindow === undefined) {
+					continue;
+				}
+				const normalizedId = modelId.toLowerCase();
+				const value = toPositiveNumberOrUndefined(override.contextWindow);
+				if (value === undefined) {
+					if (isCodexGpt56Tier({ id: normalizedId })) {
+						logger.warn("codex gpt-5.6 context-window override ignored: value must be a positive finite number", {
+							model: modelId,
+							provider,
+							override: override.contextWindow,
+						});
+					}
+					continue;
+				}
+				result.set(normalizedId, value);
+				if (!isCodexGpt56Tier({ id: normalizedId })) {
+					continue;
+				}
+				logger.warn("codex gpt-5.6 context-window override active; verify it against the live product limit", {
+					model: modelId,
+					provider,
+					override: override.contextWindow,
+					ceiling: CODEX_GPT_5_6_CONTEXT_CAP.ceiling,
+					fallback: CODEX_GPT_5_6_CONTEXT_CAP.fallback,
+				});
+			}
+		}
+		return result;
+	}
 	#applyModelOverrides(models: Model<Api>[], overrides: Map<string, Map<string, ModelOverride>>): Model<Api>[] {
 		if (overrides.size === 0) return models;
 		return models.map(model => {
@@ -4012,6 +4065,8 @@ export class ModelRegistry {
 				if (credential) {
 					this.#models = applyFinalCodexGpt56ContextCap(
 						config.oauth.modifyModels(withRuntimeTransportOverride, credential),
+						undefined,
+						this.#codexContextWindowOverrides,
 					);
 					this.#rebuildCanonicalIndex();
 					this.#rebuildProviderActivity();
@@ -4019,7 +4074,11 @@ export class ModelRegistry {
 				}
 			}
 
-			this.#models = applyFinalCodexGpt56ContextCap(withRuntimeTransportOverride);
+			this.#models = applyFinalCodexGpt56ContextCap(
+				withRuntimeTransportOverride,
+				undefined,
+				this.#codexContextWindowOverrides,
+			);
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 			return;

@@ -297,6 +297,24 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("user contextWindow override survives the Codex GPT-5.6 cap; invalid values are ignored", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+						"gpt-5.6-terra": { contextWindow: -5 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const sol = codexModels.find(model => model.id === "gpt-5.6-sol");
+			const terra = codexModels.find(model => model.id === "gpt-5.6-terra");
+
+			expect(sol?.contextWindow).toBe(373_000);
+			expect(terra?.contextWindow).toBe(372_000);
+		});
 		test("keeps models config baseUrl ahead of provider base URL env vars", () => {
 			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-env.example.com/v1");
 			try {

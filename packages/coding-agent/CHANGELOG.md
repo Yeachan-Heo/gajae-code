@@ -106,6 +106,7 @@
 - Added plugin registry v2 as the single execution authority for plugin tools, subskills, and prompt appendices, with digest verification at final use.
 - Added module-trace and process-tree RSS verification harnesses for startup-memory regressions.
 - Added `bun run clean` / `bun run clean:native` (`scripts/clean.ts`) to remove build output — `dist/`, `binaries/`, `coverage/`, stray `*.bun-build`, `*.tsbuildinfo`, and with `--native` compiled `.node` addons. Sources, `node_modules/`, `.gjc/` runtime state, and `artifacts/` test evidence are refused as targets rather than silently skipped, and `--dry-run` lists targets without deleting.
+- Codex GPT-5.6 OAuth context-window overrides are honored instead of silently re-clamped: explicit `modelOverrides.<id>.contextWindow` values survive the bundled 372K cap when positive and finite, non-positive values are ignored with a warning, and the precedence/fallback contract is codified in the Codex context-cap policy (#3987).
 
 ### Changed
 
