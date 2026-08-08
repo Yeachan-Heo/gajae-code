@@ -954,7 +954,7 @@ describe("ModelRegistry", () => {
 
 				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
 				const available = registry.getAvailable();
-				expect(available).not.toBe(afterFirst);
+				expect(available).toBe(afterFirst);
 				expect(available.some(model => model.provider === "xai")).toBe(true);
 				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
 			} finally {
@@ -981,9 +981,9 @@ describe("ModelRegistry", () => {
 
 				const registry = new ModelRegistry(authStorage, modelsJsonPath);
 				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
-				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
+				await expect(authStorage.peekApiKey("xai")).resolves.toBe("selected-access");
 				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
-				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
+				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(true);
 
 				authStorage.setRuntimeCredentialSelector("xai", {
 					kind: "email",
@@ -1642,6 +1642,69 @@ describe("ModelRegistry", () => {
 					sessionId: "key-session",
 				}),
 			).toBe(alphaModel);
+		});
+
+		test("ranks a provider by OAuth after its stored command key resolves unusable", async () => {
+			const restoreAnthropicKey = unsetEnvForTest("ANTHROPIC_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				writeRawModelsJson({
+					alpha: providerConfig("https://alpha.example.com/v1", [{ id: "org/conflict-model" }]),
+					anthropic: {
+						baseUrl: "https://api.anthropic.com",
+						api: "anthropic-messages",
+						apiKeyEnv: "ANTHROPIC_API_KEY",
+						models: [{ id: "team/conflict-model" }],
+					},
+				});
+				await authStorage.set("anthropic", [
+					{ type: "api_key", key: "!missing-anthropic-key" },
+					{
+						type: "oauth",
+						access: "anthropic-oauth-access",
+						refresh: "anthropic-oauth-refresh",
+						expires: Date.now() + 60 * 60_000,
+					},
+				]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const alphaModel = registry.find("alpha", "org/conflict-model")!;
+				const anthropicModel = registry.find("anthropic", "team/conflict-model")!;
+
+				await expect(registry.getApiKeyForProvider("anthropic")).resolves.toBe("anthropic-oauth-access");
+				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("oauth");
+				expect(
+					registry.resolveModelByLookupAlias("conflict-model", {
+						availableOnly: true,
+						candidates: [alphaModel, anthropicModel],
+					}),
+				).toBe(anthropicModel);
+			} finally {
+				restoreAnthropicKey();
+			}
+		});
+
+		test("ranks an environment key ahead of expired OAuth", async () => {
+			const restoreAnthropicKey = setEnvForTest("ANTHROPIC_API_KEY", "environment-anthropic-key");
+			try {
+				await authStorage.set("anthropic", [
+					{
+						type: "oauth",
+						access: "expired-oauth-access",
+						refresh: "expired-oauth-refresh",
+						expires: Date.now() - 1,
+					},
+				]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await expect(authStorage.peekApiKey("anthropic")).resolves.toBe("environment-anthropic-key");
+				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("key");
+			} finally {
+				restoreAnthropicKey();
+			}
 		});
 		test("ranks a mixed manual+OAuth provider in the non-OAuth band by default", async () => {
 			writeRawModelsJson({

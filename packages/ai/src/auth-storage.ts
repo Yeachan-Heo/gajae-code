@@ -1631,7 +1631,7 @@ export class AuthStorage {
 		provider: string,
 		type: T,
 		sessionId?: string,
-		isUsable?: (credential: Extract<AuthCredential, { type: T }>, index: number) => boolean,
+		isUsable?: (credential: Extract<AuthCredential, { type: T }>, index: number) => boolean | undefined,
 	): { credential: Extract<AuthCredential, { type: T }>; index: number } | undefined {
 		const credentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
@@ -1641,23 +1641,48 @@ export class AuthStorage {
 			);
 
 		if (credentials.length === 0) return undefined;
-		if (credentials.length === 1) return credentials[0];
 
 		const providerKey = this.#getProviderTypeKey(provider, type);
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
-		const fallback = credentials[order[0]];
-
 		for (const idx of order) {
 			const candidate = credentials[idx];
 			if (
 				!this.#isCredentialBlocked(providerKey, candidate.index) &&
-				(isUsable === undefined || isUsable(candidate.credential, candidate.index))
+				(isUsable === undefined || isUsable(candidate.credential, candidate.index) !== false)
 			) {
 				return candidate;
 			}
 		}
 
-		return fallback;
+		return order
+			.map(idx => credentials[idx])
+			.find(candidate => isUsable === undefined || isUsable(candidate.credential, candidate.index) !== false);
+	}
+
+	#selectApiKeyCredential(
+		provider: string,
+		sessionId?: string,
+		excludedIndices: ReadonlySet<number> = new Set(),
+	): { credential: ApiKeyCredential; index: number } | undefined {
+		const credentials = this.#getCredentialsForProvider(provider)
+			.map((credential, index) => ({ credential, index }))
+			.filter(
+				(entry): entry is { credential: ApiKeyCredential; index: number } => entry.credential.type === "api_key",
+			);
+		if (credentials.length === 0) return undefined;
+
+		const providerKey = this.#getProviderTypeKey(provider, "api_key");
+		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		const ordered = order.map(index => credentials[index]).filter(entry => !excludedIndices.has(entry.index));
+		const unblocked = ordered.filter(entry => !this.#isCredentialBlocked(providerKey, entry.index));
+		const candidates = unblocked.length > 0 ? unblocked : ordered;
+		return candidates.sort((left, right) => {
+			const usabilityRank = (credential: ApiKeyCredential): number => {
+				const usability = this.#storedApiKeyUsability(provider, credential.key);
+				return usability === true ? 0 : usability === undefined ? 1 : 2;
+			};
+			return usabilityRank(left.credential) - usabilityRank(right.credential);
+		})[0];
 	}
 
 	/**
@@ -1940,6 +1965,87 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Credential type that a provider/session can select without performing I/O.
+	 * Mirrors getApiKey precedence using cached command-key usability and current
+	 * backoff/expiry state so provider ranking reflects the credential that can
+	 * actually authenticate rather than merely configured credential types.
+	 */
+	getEffectiveCredentialType(provider: string, sessionId?: string): AuthCredential["type"] | undefined {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.hasRuntimeApiKey(storageProvider) || this.#configOverrides.has(storageProvider)) return "api_key";
+
+		try {
+			const selected = this.#resolveSelectedStoredCredential(storageProvider);
+			if (selected) {
+				const providerKey = this.#getProviderTypeKey(storageProvider, selected.credential.type);
+				if (this.#isCredentialBlocked(providerKey, selected.index)) return undefined;
+				if (selected.credential.type === "api_key") {
+					return this.#storedApiKeyUsability(storageProvider, selected.credential.key) === false
+						? undefined
+						: "api_key";
+				}
+				return "oauth";
+			}
+		} catch {
+			return undefined;
+		}
+
+		const credentials = this.#getCredentialsForProvider(storageProvider);
+		const sessionCredential = this.#getSessionCredential(storageProvider, sessionId);
+		if (sessionCredential) {
+			const credential = credentials[sessionCredential.index];
+			if (credential?.type === sessionCredential.type) {
+				const providerKey = this.#getProviderTypeKey(storageProvider, credential.type);
+				if (!this.#isCredentialBlocked(providerKey, sessionCredential.index)) {
+					if (credential.type === "oauth") return "oauth";
+					if (this.#storedApiKeyUsability(storageProvider, credential.key) !== false) return "api_key";
+				}
+			}
+		}
+
+		const apiKeyProviderKey = this.#getProviderTypeKey(storageProvider, "api_key");
+		const apiKeys = credentials
+			.map((credential, index) => ({ credential, index }))
+			.filter(
+				(entry): entry is { credential: ApiKeyCredential; index: number } => entry.credential.type === "api_key",
+			);
+		if (
+			apiKeys.some(
+				entry =>
+					!this.#isCredentialBlocked(apiKeyProviderKey, entry.index) &&
+					this.#storedApiKeyUsability(storageProvider, entry.credential.key) !== false,
+			)
+		) {
+			return "api_key";
+		}
+		if (
+			apiKeys.length > 0 &&
+			apiKeys.every(entry => this.#isCredentialBlocked(apiKeyProviderKey, entry.index)) &&
+			apiKeys.some(entry => this.#storedApiKeyUsability(storageProvider, entry.credential.key) !== false)
+		) {
+			return "api_key";
+		}
+
+		const oauthProviderKey = this.#getProviderTypeKey(storageProvider, "oauth");
+		const oauth = credentials
+			.map((credential, index) => ({ credential, index }))
+			.filter((entry): entry is { credential: OAuthCredential; index: number } => entry.credential.type === "oauth");
+		if (
+			oauth.some(
+				entry =>
+					!this.#isCredentialBlocked(oauthProviderKey, entry.index) &&
+					Number.isFinite(entry.credential.expires) &&
+					entry.credential.expires > Date.now(),
+			)
+		) {
+			return "oauth";
+		}
+		if (getEnvApiKey(storageProvider) || this.#fallbackResolver?.(storageProvider)) return "api_key";
+		if (oauth.some(entry => !this.#isCredentialBlocked(oauthProviderKey, entry.index))) return "oauth";
+		return undefined;
+	}
+
+	/**
 	 * Check whether configured auth is currently usable without resolving credentials.
 	 */
 	hasUsableAuth(provider: string): boolean {
@@ -1965,16 +2071,17 @@ export class AuthStorage {
 
 			const credentials = this.#getCredentialsForProvider(storageProvider);
 			let hasStoredApiKey = false;
-			let hasSelectableApiKey = false;
+			let hasUnblockedApiKey = false;
 			let hasUsableApiKey = false;
 			for (const [index, credential] of credentials.entries()) {
 				if (credential.type !== "api_key") continue;
 				hasStoredApiKey = true;
 				if (this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, credential.type), index)) continue;
-				hasSelectableApiKey = true;
+				hasUnblockedApiKey = true;
 				hasUsableApiKey ||= this.#hasUsableResolvedStoredApiKey(storageProvider, credential.key);
 			}
-			if (hasStoredApiKey) return hasSelectableApiKey && hasUsableApiKey;
+			if (hasUsableApiKey) return true;
+			if (hasStoredApiKey && !hasUnblockedApiKey) return false;
 			if (
 				this.#getCredentialsForProvider(storageProvider).some(
 					(credential, index) =>
@@ -3913,9 +4020,13 @@ export class AuthStorage {
 		})();
 		return promise;
 	}
+	#storedApiKeyUsability(provider: string, key: string): boolean | undefined {
+		if (!key.startsWith("!")) return true;
+		return this.#resolvedStoredApiKeyValues.get(resolveOAuthStorageProvider(provider))?.get(key)?.usable;
+	}
+
 	#hasUsableResolvedStoredApiKey(provider: string, key: string): boolean {
-		const resolved = this.#resolvedStoredApiKeyValues.get(resolveOAuthStorageProvider(provider))?.get(key);
-		return key.startsWith("!") ? resolved?.usable === true : true;
+		return this.#storedApiKeyUsability(provider, key) === true;
 	}
 
 	/**
@@ -3951,11 +4062,13 @@ export class AuthStorage {
 			return undefined;
 		}
 
-		const apiKeySelection = this.#selectCredentialByType(provider, "api_key", undefined, credential =>
-			this.#hasUsableResolvedStoredApiKey(provider, credential.key),
-		);
-		if (apiKeySelection) {
-			return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+		const attemptedApiKeyIndices = new Set<number>();
+		for (;;) {
+			const apiKeySelection = this.#selectApiKeyCredential(provider, undefined, attemptedApiKeyIndices);
+			if (!apiKeySelection) break;
+			attemptedApiKeyIndices.add(apiKeySelection.index);
+			const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+			if (resolved) return resolved;
 		}
 
 		const oauthSelection = this.#selectCredentialByType(provider, "oauth");
@@ -4010,12 +4123,16 @@ export class AuthStorage {
 		}
 
 		if (!selectedCredential) {
-			const apiKeySelection = this.#selectCredentialByType(provider, "api_key", sessionId, credential =>
-				this.#hasUsableResolvedStoredApiKey(provider, credential.key),
-			);
-			if (apiKeySelection) {
-				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
-				return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+			const attemptedApiKeyIndices = new Set<number>();
+			for (;;) {
+				const apiKeySelection = this.#selectApiKeyCredential(provider, sessionId, attemptedApiKeyIndices);
+				if (!apiKeySelection) break;
+				attemptedApiKeyIndices.add(apiKeySelection.index);
+				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+				if (resolved) {
+					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					return resolved;
+				}
 			}
 		}
 

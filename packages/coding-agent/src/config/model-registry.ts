@@ -3277,19 +3277,9 @@ export class ModelRegistry {
 	 * 6. Unknown (no credential surface)
 	 */
 	#effectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
-		if (this.authStorage.hasRuntimeApiKey(provider) || this.authStorage.hasConfigApiKey(provider)) return "key";
-
-		const sessionType = this.authStorage.getSessionCredentialType(provider, sessionId);
-		if (sessionType === "oauth") return "oauth";
-		if (sessionType === "api_key") return "key";
-
-		const stored = this.authStorage.getAll()[provider];
-		const entries = Array.isArray(stored) ? stored : stored ? [stored] : [];
-		if (entries.some(entry => entry.type === "api_key")) return "key";
-		if (this.#customProviderApiKeys.has(provider)) return "key";
-		if (this.authStorage.hasOAuth(provider)) return "oauth";
-
-		if (this.authStorage.hasAuth(provider)) return "key";
+		const credentialType = this.authStorage.getEffectiveCredentialType(provider, sessionId);
+		if (credentialType === "api_key") return "key";
+		if (credentialType === "oauth") return "oauth";
 		if (this.#keylessProviders.has(provider)) return "keyless";
 		return "unknown";
 	}
