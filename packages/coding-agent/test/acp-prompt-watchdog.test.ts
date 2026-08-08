@@ -39,6 +39,12 @@ class VirtualClock {
 		return this.#timers.size;
 	}
 
+	/** The single armed watchdog timer; every re-arm replaces it, so the id changes with it. */
+	get armed(): { id: number; at: number } | undefined {
+		for (const [id, timer] of this.#timers) return { id, at: timer.at };
+		return undefined;
+	}
+
 	advance(ms: number): void {
 		const target = this.#now + ms;
 		for (;;) {
@@ -66,6 +72,8 @@ type Fixture = {
 	clock: VirtualClock;
 	/** Correlation the fixture host acknowledged for the turn currently in flight. */
 	correlation(): { commandId: string; turnId: string };
+	/** Sends one raw frame down the session socket, correlation included or omitted verbatim. */
+	send(frame: Record<string, unknown>): void;
 	sendAssistantText(text: string): void;
 	sendStopped(reason: StoppedReason): void;
 	sendToolStart(toolCallId: string): void;
@@ -299,6 +307,7 @@ async function createFixture(): Promise<Fixture> {
 		updates,
 		clock,
 		correlation: () => ({ commandId, turnId }),
+		send,
 		sendAssistantText,
 		sendStopped,
 		sendToolStart,
@@ -652,6 +661,168 @@ test("a turn with no tool running and no model call pending is still held to the
 		expect(message).toContain("ACP prompt was abandoned");
 		expect(message).toContain(`${Math.round(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 1_000)}s of silence`);
 		expect(message).toContain("the SDK session host stopped producing frames");
+		expect(message).toContain('"message_end"');
+	} finally {
+		fixture.dispose();
+	}
+});
+
+/**
+ * Abandons one turn and starts a second one, then hands back the settled turn's correlation.
+ * This is the supported recovery flow: the watchdog rejects a turn, the client re-prompts, and
+ * the slow-but-alive host then flushes the abandoned turn's frames onto the live turn's socket.
+ */
+async function abandonTurnThenStartAnother(
+	fixture: Fixture,
+): Promise<{ stale: { commandId: string; turnId: string }; pending: Promise<{ stopReason: StoppedReason }> }> {
+	const { pending: abandoned } = await startTurn(fixture);
+	const stale = fixture.correlation();
+	fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
+	await bounded(
+		abandoned.then(
+			() => undefined,
+			() => undefined,
+		),
+		"watchdog rejection",
+	);
+	const { pending } = await startTurn(fixture);
+	expect(fixture.correlation().turnId).not.toBe(stale.turnId);
+	return { stale, pending };
+}
+
+function staleEventFrame(
+	stale: { commandId: string; turnId: string },
+	eventType: string,
+	event: Record<string, unknown>,
+): Record<string, unknown> {
+	return {
+		type: "event",
+		commandId: stale.commandId,
+		turnId: stale.turnId,
+		payload: { event_type: eventType, event },
+	};
+}
+
+test("a settled turn's stale message frame does not narrow the live turn off the inference bound", async () => {
+	const fixture = await createFixture();
+	try {
+		const { stale, pending } = await abandonTurnThenStartAnother(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		const armedBefore = fixture.clock.armed;
+		fixture.send(
+			staleEventFrame(stale, "message_update", {
+				type: "message_update",
+				message: { role: "assistant", content: [{ type: "text", text: "flushed from the abandoned turn" }] },
+			}),
+		);
+		await waitFor(() => fixture.clock.armed?.id !== armedBefore?.id, "stale frame ingress");
+
+		// The live turn has emitted only `agent_start`: its own model call is still unanswered, so
+		// the inference bound owns it. A frame belonging to a settled turn cannot clear that.
+		expect(fixture.clock.armed?.at).toBe(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a settled turn's stale tool start does not pin the live turn to the tool bound", async () => {
+	const fixture = await createFixture();
+	try {
+		const { stale, pending } = await abandonTurnThenStartAnother(fixture);
+
+		const armedBefore = fixture.clock.armed;
+		fixture.send(
+			staleEventFrame(stale, "tool_execution_start", {
+				type: "tool_execution_start",
+				toolCallId: "stale-turn-tool",
+				toolName: "bash",
+				args: { command: "sleep 100000" },
+			}),
+		);
+		await waitFor(() => fixture.clock.armed?.id !== armedBefore?.id, "stale frame ingress");
+
+		// Nothing is executing on the live turn, so the hour-wide tool bound must stay retired:
+		// borrowing it from a settled turn would blind the safety net to a dead producer.
+		expect(fixture.clock.armed?.at).toBe(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain("ACP prompt was abandoned");
+		expect(message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a correlationless frame refreshes liveness without moving the turn's bound", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		// Heartbeats and session-scoped events carry no command/turn identity. They prove the
+		// producer lives, so they refresh the baseline, but they own no activity transition —
+		// an assistant message that belongs to nobody must not retire this turn's inference bound.
+		const chunks = textChunks(fixture.updates);
+		fixture.send({
+			type: "event",
+			payload: {
+				event_type: "message_end",
+				event: {
+					type: "message_end",
+					message: { role: "assistant", content: [{ type: "text", text: "unowned" }] },
+				},
+			},
+		});
+		await waitFor(() => textChunks(fixture.updates) > chunks, "correlationless frame ingress");
+
+		expect(fixture.clock.armed?.at).toBe(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		// The baseline did move with that frame: the expiry is measured from it, and reports it.
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
 		expect(message).toContain('"message_end"');
 	} finally {
 		fixture.dispose();

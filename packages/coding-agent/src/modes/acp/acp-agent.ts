@@ -1878,7 +1878,12 @@ export class AcpAgent implements Agent {
 		}, delayMs);
 	}
 
-	/** Any frame proves the producer is alive, so every one of them restarts the bound. */
+	/**
+	 * Any frame proves the producer is alive, so every one of them restarts the bound: liveness
+	 * is a property of the session host process, not of one turn, and a host still flushing an
+	 * abandoned turn's backlog is exactly a producer that has not stopped producing. Which bound
+	 * is restarted is a different question, and that one is correlation-owned; see below.
+	 */
 	#refreshPromptWatchdog(id: string, record: SessionRecord, frame: JsonObject): void {
 		const waiter = record.activePrompt;
 		if (!waiter || waiter.settled) return;
@@ -1886,14 +1891,21 @@ export class AcpAgent implements Agent {
 		waiter.lastFrameAt = this.#promptWatchdogClock.now();
 		waiter.lastFrameType =
 			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
-		// Lifecycle frames also decide which bound the next gap gets: silence while a tool is
-		// observably executing, or while a dispatched model call has not answered yet, is
-		// expected; silence with nothing running and nobody thinking is not.
-		waiter.activity.observe(
-			typeof event?.type === "string" ? event.type : undefined,
-			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
-			frameMessageRole(event),
-		);
+		// Which bound applies is per-turn state, so it is fenced by the same identity that gates
+		// settlement: only a frame carrying exactly the acknowledged prompt's command/turn may
+		// start, clear, or extend a bound. Without this fence an already-settled turn's flushed
+		// frames mutate the live turn — a stale `message_update` clears `awaitingModel` and
+		// narrows it off the inference bound, a stale `tool_execution_start` pins it to the tool
+		// bound with no tool running. Frames with no correlation at all (heartbeats,
+		// session-scoped events) are refresh-only for the same reason: they prove the producer
+		// lives but say nothing about what this turn is doing, so they leave the bound as is.
+		// Before acknowledgement the prompt has no identity, so nothing is provably its own yet.
+		if (correlationsExactlyMatch(waiter.correlation, correlationFrom(frame, event)))
+			waiter.activity.observe(
+				typeof event?.type === "string" ? event.type : undefined,
+				typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
+				frameMessageRole(event),
+			);
 		this.#armPromptWatchdog(id, record, waiter);
 	}
 
