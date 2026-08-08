@@ -29,6 +29,7 @@
 - A transient Windows `io_error` while detaching a managed replacement cleanup receipt now defers that receipt for later reconciliation instead of aborting the current session mutation. Invalid receipt and non-I/O cleanup failures remain fail-closed.
 
 - Attached image placeholders such as `[image 1]`, including the `[image N] source="…"` pasted-path reference form, are now deleted atomically with Backspace when the cursor sits at the placeholder boundary or the end of the full reference, instead of being erased one character at a time.
+- Root CLI help and shell completion now share the launch flag table instead of maintaining divergent copies, advertise the working `--fork` and `--worktree` options, omit retired extension/skill flags, and reject unknown options instead of silently dropping typos (#4023).
 
 ### Added
 
@@ -47,7 +48,6 @@
 
 ### Fixed
 - Repeated provider idle-stream stalls now stop after `retry.maxRetries` instead of inheriting the unbounded transient-error retry path. A one-off stall still retries normally, while a persistently silent stream surfaces its error rather than resubmitting the same billable context indefinitely.
-
 - SDK snapshot spill writes now retry once with a fresh temporary file when Bun reports `EBADF` during write or `fsync` under heavily contended descriptor teardown, and no longer fail when `close()` reports `EBADF` after a successful write and sync. The atomic writer removes the abandoned attempt before retrying, preserves primary I/O failures, accepts only the proven already-closed close case, and keeps every non-`EBADF` error or repeated descriptor failure fatal.
 - Discord Gateway ingestion now decodes text and binary WebSocket payloads, resolves a thread's missing parent-channel metadata through Discord's REST API, and stops reconnecting after terminal authentication, sharding, version, or intent close codes.
 

@@ -74,7 +74,7 @@ describe("default launch worktrees", () => {
 		});
 		expect(parseLaunchWorktreeMode(["--worktree", "--", "hello"])).toEqual({
 			mode: { enabled: true, detached: true, name: null },
-			remainingArgs: ["hello"],
+			remainingArgs: ["--", "hello"],
 		});
 		expect(parseLaunchWorktreeMode(["--worktree", "--model", "opus"]).mode).toEqual({
 			enabled: true,
@@ -91,11 +91,15 @@ describe("default launch worktrees", () => {
 		});
 		expect(parseLaunchWorktreeMode(["-w", "--", "hello"])).toEqual({
 			mode: { enabled: true, detached: true, name: null },
-			remainingArgs: ["hello"],
+			remainingArgs: ["--", "hello"],
 		});
 		expect(parseLaunchWorktreeMode(["-w=feature/demo", "hello"])).toEqual({
 			mode: { enabled: true, detached: false, name: "feature/demo" },
 			remainingArgs: ["hello"],
+		});
+		expect(parseLaunchWorktreeMode(["--", "--worktree", "feature/demo"])).toEqual({
+			mode: { enabled: false },
+			remainingArgs: ["--", "--worktree", "feature/demo"],
 		});
 	});
 
@@ -108,7 +112,7 @@ describe("default launch worktrees", () => {
 		const expectedPath = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`, branchSlug);
 
 		expect(await fs.realpath(first.cwd)).toBe(await fs.realpath(expectedPath));
-		expect(first.args).toEqual(["hello"]);
+		expect(first.args).toEqual(["--", "hello"]);
 		expect(first.worktree.enabled && first.worktree.created).toBe(true);
 		expect(first.worktree.enabled && first.worktree.detached).toBe(true);
 		expect(await Bun.file(path.join(expectedPath, ".git")).exists()).toBe(true);

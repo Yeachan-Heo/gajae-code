@@ -139,8 +139,14 @@ describe("GJC inshellisense completion spec", () => {
 			"ssh",
 		]);
 		expect(findOption(spec.options, "--clipboard-ssh-host")).toBeDefined();
+		expect(findOption(spec.options, "--fork")).toBeDefined();
+		expect(findOption(spec.options, "--worktree")).toBeDefined();
+		for (const retired of ["--hook", "--extension", "--no-extensions", "--skills", "--no-skills"]) {
+			expect(findOption(spec.options, retired), retired).toBeUndefined();
+		}
 		expect(findOption(spec.options, "--model")?.args).toEqual({ name: "value" });
-		expect(findOption(spec.options, "--resume")?.args).toEqual({ name: "value" });
+		expect(findOption(spec.options, "--resume")?.args).toEqual({ name: "value", isOptional: true });
+		expect(findOption(spec.options, "--list-models")?.args).toEqual({ name: "value", isOptional: true });
 		expect(findOption(spec.options, "-p")?.description).toContain("Non-interactive");
 		expect(renderFigSpecModule(spec)).toContain("export default completionSpec");
 	});

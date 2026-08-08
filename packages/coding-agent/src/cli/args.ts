@@ -7,6 +7,29 @@ import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseEffort } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
+import { ROOT_LAUNCH_FLAGS } from "./root-flags";
+
+const ROOT_FLAG_TOKENS = new Set<string>();
+for (const [name, descriptor] of Object.entries(ROOT_LAUNCH_FLAGS)) {
+	ROOT_FLAG_TOKENS.add(`--${name}`);
+	if (descriptor.char) ROOT_FLAG_TOKENS.add(`-${descriptor.char}`);
+}
+
+const INTERNAL_ROOT_FLAG_TOKENS = new Set(["--help", "-h", "--version", "-v", "--session", "--provider-session-id"]);
+
+function isExternallyParsedRootFlagToken(arg: string): boolean {
+	return (
+		arg === "--acp-terminal-auth" ||
+		arg === "--worktree" ||
+		arg === "-w" ||
+		arg.startsWith("-w=") ||
+		arg.startsWith("-w")
+	);
+}
+
+function isKnownRootFlagToken(arg: string): boolean {
+	return ROOT_FLAG_TOKENS.has(arg) || INTERNAL_ROOT_FLAG_TOKENS.has(arg) || isExternallyParsedRootFlagToken(arg);
+}
 
 export type Mode = "text" | "json" | "acp";
 
@@ -120,6 +143,13 @@ export function parseArgs(args: string[]): Args {
 			result.messages.push(args.slice(i).join(" "));
 			break;
 		}
+		if (arg === "--") {
+			for (const positional of args.slice(i + 1)) {
+				if (positional.startsWith("@")) result.fileArgs.push(positional.slice(1));
+				else result.messages.push(positional);
+			}
+			break;
+		}
 
 		// Support --flag=value syntax (e.g. --tools=ask,read)
 		if (arg.startsWith("--") && arg.includes("=")) {
@@ -129,6 +159,9 @@ export function parseArgs(args: string[]): Args {
 			hasInlineValue = true;
 			// Insert the value so the existing "args[++i]" logic picks it up
 			args.splice(i + 1, 0, value);
+		}
+		if (arg.startsWith("-") && !isKnownRootFlagToken(arg)) {
+			throw new CliParseError(`Unknown option: ${arg}`);
 		}
 
 		if (arg === "--help" || arg === "-h") {
@@ -302,10 +335,10 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg.startsWith("@")) {
 			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
-		} else if (arg.startsWith("-")) {
-			result.unknownFlags.set(arg, true);
-		} else {
+		} else if (!arg.startsWith("-")) {
 			result.messages.push(arg);
+		} else if (!isExternallyParsedRootFlagToken(arg)) {
+			throw new CliParseError(`Root option is declared but not parsed: ${arg}`);
 		}
 	}
 

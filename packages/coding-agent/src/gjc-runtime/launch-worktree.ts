@@ -274,7 +274,7 @@ function isWorktreeDirty(worktreePath: string): boolean {
 function resolveOptionalWorktreeName(args: string[], index: number): { name: string | null; nextIndex: number } {
 	const next = args[index + 1];
 	if (!next) return { name: null, nextIndex: index };
-	if (next === "--") return { name: null, nextIndex: index + 1 };
+	if (next === "--") return { name: null, nextIndex: index };
 	if (next.startsWith("-")) return { name: null, nextIndex: index };
 	return { name: next.trim() || null, nextIndex: index + 1 };
 }
@@ -285,6 +285,10 @@ export function parseLaunchWorktreeMode(args: string[]): ParsedLaunchWorktreeMod
 
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index] ?? "";
+		if (arg === "--") {
+			remainingArgs.push(...args.slice(index));
+			break;
+		}
 		if (arg === "--worktree" || arg === "-w") {
 			const parsed = resolveOptionalWorktreeName(args, index);
 			mode = parsed.name
