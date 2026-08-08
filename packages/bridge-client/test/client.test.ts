@@ -198,6 +198,23 @@ test("createConnectSubscribeSubmit rejects invalid logical identities before bro
 		expect(FakeWebSocket.instances).toHaveLength(0);
 	});
 });
+test("createConnectSubscribeSubmit accepts long and trailing-newline prompt text", async () => {
+	await withFakeTransport(async () => {
+		for (const text of ["x".repeat(129), "realistic prompt text\n"]) {
+			const client = new SdkClient("ws://sdk.test", "token");
+			const pending = client.createConnectSubscribeSubmit({
+				create: {},
+				createIdempotencyKey: "create-key",
+				submission: { kind: "prompt", text, clientRef: "prompt-work" },
+			});
+			await flush();
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			await client.close();
+			await expect(pending).resolves.toMatchObject({ kind: "create_uncertain" });
+			FakeWebSocket.instances = [];
+		}
+	});
+});
 
 test("createConnectSubscribeSubmit replays and writes one prompt on the validated endpoint incarnation", async () => {
 	await withFakeTransport(async () => {
@@ -381,7 +398,7 @@ test("createConnectSubscribeSubmit rejects interleaved live replay sequence gaps
 	});
 });
 
-test("reconcileCreateConnectSubmit recovers the create identity and queries only the matching submission kind", async () => {
+test("reconcileCreateConnectSubmit queries status despite a replay gap and never submits ordered work", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
 		const pending = client.reconcileCreateConnectSubmit({
@@ -426,7 +443,15 @@ test("reconcileCreateConnectSubmit recovers the create identity and queries only
 		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
 		await flush();
 		const replay = sent(endpoint);
-		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
+		endpoint.message({
+			type: "event_replay_result",
+			id: replay.id,
+			ok: true,
+			generation: 1,
+			lastSeq: 2,
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 2 },
+			events: [],
+		});
 		await flush();
 		const status = sent(endpoint, 1);
 		expect(status).toMatchObject({
