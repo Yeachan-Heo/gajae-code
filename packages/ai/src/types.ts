@@ -759,10 +759,27 @@ export type RawArgumentRejectionCode =
 	| "todo-write-done-drop-requires-target"
 	| "todo-write-unknown-init-entry-key";
 
+/**
+ * Optional structured detail attached to a raw-argument rejection. The fixed
+ * per-code guidance in `RAW_ARGUMENT_REJECTION_MESSAGES` explains the shape;
+ * this names what the caller actually sent that was wrong, so a retry can
+ * differ from the failed call.
+ */
+export interface RawArgumentRejectionDetail {
+	/** Offending keys, in payload order. */
+	readonly rejectedKeys?: readonly string[];
+	/**
+	 * Correction for a rejected key whose replacement is exact and
+	 * unambiguous. Never populate this from fuzzy or edit-distance matching:
+	 * a wrong suggestion costs more turns than no suggestion.
+	 */
+	readonly hint?: string;
+}
+
 export type RawArgumentValidationResult =
 	| { outcome: "passthrough" }
 	| { outcome: "accept"; arguments: ToolCall["arguments"] }
-	| { outcome: "reject"; code?: RawArgumentRejectionCode };
+	| { outcome: "reject"; code?: RawArgumentRejectionCode; detail?: RawArgumentRejectionDetail };
 
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
