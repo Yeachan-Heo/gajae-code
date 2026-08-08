@@ -791,7 +791,12 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(outcome).toBe("pruned");
 		expect(appendOnly.log.toMessages().slice(0, seededPrefix.length)).toEqual(seededPrefix);
 		expect(appendOnly.log.toMessages()).not.toContainEqual(pruneLocal);
-	});
+		// Each session created by this test races the workspace-tree scan's 5s
+		// startup deadline, so on slower runners the two harness sessions plus the
+		// maintenance can exceed bun's 5s default. The CI failure this guards was
+		// the StablePrefix fingerprint crash (fast); the generous bound only
+		// prevents environment-speed false timeouts.
+	}, 30_000);
 
 	it("spawns bundled executor and architect via TaskTool with inheritContext: bounded through the production path", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));

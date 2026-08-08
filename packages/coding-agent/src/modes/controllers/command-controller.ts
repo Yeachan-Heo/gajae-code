@@ -123,17 +123,17 @@ export class CommandController {
 	}
 
 	handleDumpCommand() {
-		try {
-			const formatted = this.ctx.session.formatSessionAsText();
-			if (!formatted) {
-				this.ctx.showError("No messages to dump yet.");
-				return;
-			}
-			copyToClipboard(formatted);
-			this.ctx.showStatus("Session copied to clipboard");
-		} catch (error: unknown) {
-			this.ctx.showError(`Failed to copy session: ${error instanceof Error ? error.message : "Unknown error"}`);
+		const formatted = this.ctx.session.formatSessionAsText();
+		if (!formatted) {
+			this.ctx.showError("No messages to dump yet.");
+			return;
 		}
+		copyToClipboard(formatted).then(
+			() => this.ctx.showStatus("Session copied to clipboard"),
+			(error: unknown) => {
+				this.ctx.showError(`Failed to copy session: ${error instanceof Error ? error.message : "Unknown error"}`);
+			},
+		);
 	}
 
 	async handleDebugTranscriptCommand(): Promise<void> {
@@ -415,12 +415,10 @@ export class CommandController {
 	}
 
 	#doCopy(content: string, label: string) {
-		try {
-			copyToClipboard(content);
-			this.ctx.showStatus(label);
-		} catch (error) {
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
-		}
+		copyToClipboard(content).then(
+			() => this.ctx.showStatus(label),
+			(error: unknown) => this.ctx.showError(error instanceof Error ? error.message : String(error)),
+		);
 	}
 
 	async handleSessionCommand(): Promise<void> {

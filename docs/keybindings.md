@@ -59,6 +59,7 @@ Set an action to an empty array to disable it:
 | `app.message.dequeue` | `alt+up`, `alt+down` | Open the queue and select a queued message to edit |
 
 | `app.clipboard.copyLine` | `alt+shift+l` | Copy the current line |
+| `app.clipboard.pasteText` | _(none)_ | Paste text from configured clipboard transport (`clipboard.transport: ssh`); command palette only |
 | `app.clipboard.copyPrompt` | `alt+shift+c` | Copy the whole prompt |
 | `app.stt.toggle` | `alt+h` | Toggle speech-to-text recording |
 | `app.irc.sidebar.toggle` | `alt+i` | Toggle IRC sidebar |
@@ -157,6 +158,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.message.queue` | alt+q (darwin/win32) / alt+enter (linux) | composer |
 | `app.message.dequeue` | alt+up, alt+down | composer |
 | `app.clipboard.pasteImage` | ctrl+v (darwin/linux) / alt+v (win32) | composer |
+| `app.clipboard.pasteText` | _(none)_ | composer |
 | `app.clipboard.copyLine` | alt+shift+l | composer |
 | `app.clipboard.copyPrompt` | alt+shift+c | composer |
 | `app.session.new` | ctrl+n | composer |

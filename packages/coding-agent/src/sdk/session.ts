@@ -951,8 +951,22 @@ function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	return [...byName.values()];
 }
 
-export function resolveIntentTracingEnabled(intentTracingSetting: boolean | undefined, hasUI: boolean): boolean {
-	return (!!intentTracingSetting || $flag("PI_INTENT_TRACING")) && hasUI;
+/**
+ * Intent tracing (`_i`) is a model-facing reasoning aid, not a UI feature: it
+ * makes the model state a tool call's purpose before the call executes, and the
+ * loop turns that string into `tool_execution_start.intent` for every consumer
+ * (TUI transcript, ACP `tool_call.title`, telemetry, session dumps).
+ *
+ * The per-call token cost is only worth forcing on the operator-facing session,
+ * so canonical sub-sessions (role agents spawned through `task`) stay omitted.
+ * Surface shape must not decide this — an ACP or print-mode top-level session is
+ * the same conversation the operator would have run in the TUI.
+ */
+export function resolveIntentTracingEnabled(
+	intentTracingSetting: boolean | undefined,
+	options: { subSession: boolean },
+): boolean {
+	return (!!intentTracingSetting || $flag("PI_INTENT_TRACING")) && !options.subSession;
 }
 
 const MCP_CONFIG_PATH_AND_MANAGER_ERROR = "mcpConfigPath and mcpManager are mutually exclusive";
@@ -2392,10 +2406,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
 		const eagerTasks = settings.get("task.eager");
-		const intentTracingEnabled = resolveIntentTracingEnabled(
-			settings.get("tools.intentTracing"),
-			options.hasUI ?? false,
-		);
+		const intentTracingEnabled = resolveIntentTracingEnabled(settings.get("tools.intentTracing"), {
+			subSession: isCanonicalSubSession,
+		});
 		const emittedContextFileWarnings = new Set(discoveredContextFileWarnings);
 		const contextFileWarnings = [...discoveredContextFileWarnings];
 		for (const warning of discoveredContextFileWarnings) {

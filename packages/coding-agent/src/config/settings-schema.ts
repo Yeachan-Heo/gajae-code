@@ -2662,6 +2662,28 @@ export const SETTINGS_SCHEMA = {
 				"Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
 		},
 	},
+	"clipboard.transport": {
+		type: "enum",
+		values: ["auto", "native", "osc52", "ssh"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			label: "Clipboard Transport",
+			description:
+				"auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+		},
+	},
+	"clipboard.sshHost": {
+		type: "string",
+		default: "",
+		validate: (value: string) => value === "" || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value),
+		ui: {
+			tab: "tools",
+			label: "Clipboard SSH Host",
+			description:
+				"SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
+		},
+	},
 
 	"web_search.enabled": {
 		type: "boolean",

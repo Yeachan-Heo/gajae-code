@@ -479,3 +479,43 @@ test("SdkClient fences stale socket callbacks and never replays sent mutations",
 		await client.close();
 	});
 });
+
+test("SdkClient clamps reconnect backoff to the configured per-attempt ceiling", async () => {
+	await withFakeTransport(async clock => {
+		const reconnectAttempts = 5;
+		const reconnectBackoffMs = 100;
+		const reconnectMaxBackoffMs = 200;
+		const client = new SdkClient("ws://sdk.test", "token", {
+			reconnectAttempts,
+			reconnectBackoffMs,
+			reconnectMaxBackoffMs,
+		});
+		const uncapped = Array.from({ length: reconnectAttempts }, (_, attempt) => reconnectBackoffMs * 2 ** attempt);
+		const expected = uncapped.map(backoff => Math.min(backoff, reconnectMaxBackoffMs));
+
+		const start = clock.now;
+		const connecting = client.connect();
+		const observed: number[] = [];
+		for (let attempt = 0; attempt <= reconnectAttempts; attempt++) {
+			const socket = FakeWebSocket.instances[attempt];
+			if (!socket) throw new Error(`missing socket for attempt ${attempt}`);
+			socket.emit("error");
+			for (let index = 0; index < 4; index++) await flush();
+			if (attempt === reconnectAttempts) break;
+			// The failed incarnation clears its open timer, so only the backoff sleep is pending.
+			const pending = [...clock.tasks.values()].map(task => task.due - clock.now);
+			expect(pending).toHaveLength(1);
+			observed.push(pending[0]);
+			clock.advanceBy(pending[0]);
+			for (let index = 0; index < 4; index++) await flush();
+		}
+
+		await expect(connecting).rejects.toMatchObject({ code: "reconnect_exhausted" });
+		expect(FakeWebSocket.instances).toHaveLength(reconnectAttempts + 1);
+		expect(observed).toEqual(expected);
+		expect(Math.max(...observed)).toBe(reconnectMaxBackoffMs);
+		expect(clock.now - start).toBe(expected.reduce((total, backoff) => total + backoff, 0));
+		expect(clock.now - start).toBeLessThan(uncapped.reduce((total, backoff) => total + backoff, 0));
+		await client.close();
+	});
+});

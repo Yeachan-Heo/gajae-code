@@ -152,6 +152,8 @@ process.exitCode = await child.exited;`;
 			"state",
 			"setup",
 			"acp",
+			"auth-broker",
+			"auth-gateway",
 			"skills",
 			"session",
 			"harness",

@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Codex named-tool fallback now keeps its downgraded request body across later same-turn provider retries and uses an independent one-shot budget, so retries cannot reintroduce `tool_choice` or suppress a later capability downgrade (#3669).
 - Anthropic requests rejected with `A maximum of 4 blocks with cache_control may be provided. Found N.` now step their generated breakpoints down instead of dying on the first attempt (#3934, supersedes #3943). An Anthropic-compatible gateway may attach its own block-level cache markers before forwarding, and those never appear in the params we serialize, so the total is unpredictable locally and the rejection itself is the only usable signal. Because that rejection says "too many", not "none allowed", recovery gives up one breakpoint at a time: explicit mode normally emits two (a conversation-prefix anchor plus a current-turn refresh point), so the first retry keeps the prefix anchor — the higher-value marker — and only a second rejection disables generated caching entirely. The reduced budget persists for the provider session so later turns neither re-trigger the 400 nor lose more caching than the endpoint requires. Only a genuine breakpoint-overflow `invalid_request_error` is claimed — other `cache_control` complaints, unrelated 400s, non-400 statuses, and our own pre-flight validation failure still surface immediately. The classifier is exported as `isAnthropicCacheBreakpointOverflowError`.
 ## [0.12.15] - 2026-08-06
 

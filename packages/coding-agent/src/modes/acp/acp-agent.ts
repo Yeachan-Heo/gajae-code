@@ -38,6 +38,7 @@ import {
 import { getAgentDir, logger } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import {
+	ACP_SESSION_RECONNECT,
 	type AcpProviderRegistration,
 	type AcpReverseConnection,
 	AcpSdkAdapter,
@@ -1743,7 +1744,7 @@ export class AcpAgent implements Agent {
 				await ensureBroker({ agentDir: this.#agentDir });
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
-				const client = await SdkClient.connect(discovery.url, discovery.token);
+				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
 				const adapter = new AcpSdkAdapter({ url: discovery.url, token: discovery.token, client });
 				adapter.onReconnectFailed(() => {
 					if (this.#broker === pending) this.#broker = undefined;
