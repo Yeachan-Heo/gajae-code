@@ -47,6 +47,10 @@ class FakeSlackProvider implements SlackProviderClient {
 class FakeSessionHost {
 	/** Every replay the client asked for, in order, exactly as it was framed. */
 	readonly replayRequests: Array<{ sinceGeneration: unknown; sinceSeq: unknown }> = [];
+	/** Answers this many sequences below the cursor asked for, re-offering acknowledged events. */
+	replayRewind = 0;
+	/** Accepts replay requests and never answers them, the way a wedged host would. */
+	stallReplay = false;
 	#generation = GENERATION;
 	#log: Array<Record<string, unknown>> = [];
 	#connections = 0;
@@ -95,7 +99,9 @@ class FakeSessionHost {
 		const frame = JSON.parse(data) as Record<string, unknown>;
 		if (frame.type !== "event_replay") return;
 		this.replayRequests.push({ sinceGeneration: frame.sinceGeneration, sinceSeq: frame.sinceSeq });
-		const sinceSeq = typeof frame.sinceSeq === "number" ? frame.sinceSeq : 0;
+		if (this.stallReplay) return;
+		const asked = typeof frame.sinceSeq === "number" ? frame.sinceSeq : 0;
+		const sinceSeq = Math.max(0, asked - this.replayRewind);
 		const events =
 			frame.sinceGeneration === this.#generation
 				? this.#log.filter(event => Number(event.seq) > sinceSeq)
@@ -210,6 +216,12 @@ async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<v
 	expect(provider.posts).toHaveLength(count);
 }
 
+/** The replay rides the socket, so settle on the request the host itself observed. */
+async function awaitReplayRequests(host: FakeSessionHost, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 2_000 && host.replayRequests.length < count; attempt++) await Bun.sleep(1);
+	expect(host.replayRequests).toHaveLength(count);
+}
+
 test("an attached chat session reconnects on a budget that outlives the host heartbeat TTL", async () => {
 	await withAttachedSessionRuntime(async ({ runtime }) => {
 		await withFakeTransport(async clock => {
@@ -301,6 +313,143 @@ test("a superseded endpoint generation disposes the old attachment instead of re
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\nbefore the roll",
 				"GJC notice\nafter the roll",
+			]);
+		});
+	});
+}, 20_000);
+
+test("a live frame delivered before the resume replay answers is published in sequence, once", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+
+			reconcile();
+			// The replacement hello starts the replay, and this frame is delivered on the
+			// replacement socket before that replay can answer: two producers, one stream.
+			// Nothing here waits for the replay, which is exactly the window the barrier owns.
+			host.accept(await awaitSocket(2));
+			host.emit("three");
+
+			await awaitPosts(provider, 3);
+			// Settle first: a late duplicate lands after the third publication, so asserting
+			// on the count alone would read the stream before it can go wrong.
+			await Bun.sleep(20);
+			// The socket carried "three" and the replay carried "two" and "three": ordering
+			// follows the sequence, not the arrival, and the frame both producers carried is
+			// published exactly once.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nthree",
+			]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+		});
+	});
+}, 20_000);
+
+test("a replayed frame at or below the cursor is dropped instead of published a second time", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+			// A host that answers from one sequence too far back re-offers an event this
+			// attachment already acknowledged. The cursor settles delivery, so it is dropped.
+			host.replayRewind = 1;
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
+		});
+	});
+}, 20_000);
+
+test("stopping the runtime while a replay is pending neither hangs nor publishes what is held", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+			host.stallReplay = true;
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			host.emit("three");
+			await awaitReplayRequests(host, 2);
+
+			// `stop()` must not wait on a replay that never answers, and the frames the
+			// barrier is holding belong to an attachment that no longer exists.
+			await runtime.stop();
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
+		});
+	});
+}, 20_000);
+
+test("a supersession while a replay is pending discards it instead of replaying onto the new attachment", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+			host.stallReplay = true;
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			host.emit("three");
+			await awaitReplayRequests(host, 2);
+
+			// The endpoint rolls while that replay is still outstanding: the superseded
+			// attachment's held frames and its answer are dead work at the new generation.
+			await supersede();
+			host.roll();
+			host.stallReplay = false;
+
+			reconcile();
+			host.accept(await awaitSocket(3));
+			host.emit("after the roll");
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nafter the roll"]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
 			]);
 		});
 	});
