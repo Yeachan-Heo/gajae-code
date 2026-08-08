@@ -13777,11 +13777,6 @@ export class AgentSession {
 			`(Reminder ${this.#todoReminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
 
-		logger.debug("Todo completion: sending reminder", {
-			incomplete: incomplete.length,
-			attempt: this.#todoReminderCount,
-		});
-
 		// Emit event for UI to render notification
 		await this.#emitSessionEvent({
 			type: "todo_reminder",
@@ -13790,7 +13785,27 @@ export class AgentSession {
 			maxAttempts: remindersMax,
 		});
 
-		// Inject reminder and continue the conversation
+		// Consumers that cannot represent a server-initiated turn (ACP v1 clients, SDK
+		// hosts) keep reporting the prompt as running until the terminal `agent_end` is
+		// published. Injecting here would park that terminal behind a continuation hold
+		// (`#scheduleAgentContinue` -> `#reserveDeferredAgentEndForContinuation`), so a
+		// turn that already delivered its final answer would never settle — and there is
+		// no interactive consumer to act on the nudge. Those hosts get the advisory
+		// event above and nothing else.
+		if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+			logger.debug("Todo completion: advisory reminder only", {
+				incomplete: incomplete.length,
+				attempt: this.#todoReminderCount,
+			});
+			return;
+		}
+
+		logger.debug("Todo completion: sending reminder", {
+			incomplete: incomplete.length,
+			attempt: this.#todoReminderCount,
+		});
+
+		// Inject reminder and continue conversation
 		this.agent.appendMessage({
 			role: "developer",
 			content: [{ type: "text", text: reminder }],
