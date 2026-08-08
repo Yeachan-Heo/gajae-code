@@ -86,6 +86,21 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
 	});
 
+	it("resolves profile role metadata without changing canonical affinity", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: "claude-sonnet-4-5", slow: "claude-sonnet-4-6" },
+		});
+		session.setActiveModelProfile("provider-agnostic-profile");
+		modelRegistry.seedCanonicalVariant(session.sessionId, defaultModel);
+		const before = modelRegistry.getSessionCanonicalVariant(session.sessionId);
+
+		expect(session.resolveRoleModelWithThinking("slow").model?.id).toBe("claude-sonnet-4-6");
+		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
+	});
+
 	it("re-applies explicit role thinking each time that role is selected", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const slowModel = getAnthropicModelOrThrow("claude-sonnet-4-6");

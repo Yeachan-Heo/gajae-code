@@ -14339,7 +14339,7 @@ export class AgentSession {
 			settings: this.settings,
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry: this.#modelRegistry,
-			sessionId: this.sessionId,
+			credentialSessionId: this.sessionId,
 			...(this.#persistedModelProfileAliasIntent() ?? {}),
 		});
 	}
