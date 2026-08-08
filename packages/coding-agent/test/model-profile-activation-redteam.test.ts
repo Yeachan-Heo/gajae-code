@@ -109,7 +109,7 @@ describe("model profile activation red-team", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-b/missing" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
-		expect(calls.overrideCalls).toEqual(["task.agentModelOverrides"]);
+		expect(calls.overrideCalls).toEqual(["modelRoles", "task.agentModelOverrides"]);
 		expect(calls.flushCount).toBe(0);
 	});
 
@@ -228,7 +228,7 @@ describe("model profile activation red-team", () => {
 		});
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
-		expect(calls.overrideCalls).toEqual(["task.agentModelOverrides"]);
+		expect(calls.overrideCalls).toEqual(["modelRoles", "task.agentModelOverrides"]);
 		expect(calls.flushCount).toBe(0);
 	});
 

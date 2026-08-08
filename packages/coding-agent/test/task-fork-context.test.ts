@@ -91,6 +91,7 @@ function createSession(
 		settings: Settings.isolated({ "async.enabled": false, ...overrides }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		getSessionId: () => "parent-session",
 		model: { contextWindow: 1_000 } as Model,
 		buildForkContextSeed,
 		modelRegistry: {
@@ -414,6 +415,7 @@ describe("fork context policy surface", () => {
 		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 8000, signal: undefined });
 		expect(getOptions()?.forkContextSeed).toBe(seed);
 		expect(getOptions()?.providerSessionId).toBeUndefined();
+		expect(getOptions()?.credentialSessionId).toBe("parent-session");
 		expect(getOptions()?.providerSessionState).toBeUndefined();
 		expect(getOptions()?.toolNames).toEqual(["read"]);
 		const systemPromptOption = getOptions()?.systemPrompt;

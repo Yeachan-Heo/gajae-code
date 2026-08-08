@@ -1662,6 +1662,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					model,
 					thinkingLevel: effectiveThinkingLevel,
 					activeModelProfile: options.parentActiveModelProfile,
+					credentialSessionId: options.parentSessionId,
 					modelSubstitution:
 						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
 							? { requestedModel, reason: modelSubstitutionWarning.reason }

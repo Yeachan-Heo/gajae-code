@@ -261,8 +261,6 @@ function commitMaterializedProfileAssignments(
 	modelRoles: Record<string, ModelSelectorValue>,
 	agentModelOverrides: Record<string, ModelSelectorValue>,
 ): boolean {
-	const nextModelRoles = concretizeMaterializedAssignmentValues(options, modelRoles);
-	const nextAgentModelOverrides = concretizeMaterializedAssignmentValues(options, agentModelOverrides);
 	const previousPersistedModelRoles = options.settings.getGlobal("modelRoles");
 	const previousPersistedAgentModelOverrides = options.settings.getGlobal("task.agentModelOverrides");
 	const previousPersistedDefaultProfile = options.settings.getGlobal("modelProfile.default");
@@ -276,6 +274,8 @@ function commitMaterializedProfileAssignments(
 		(options.session as { sessionId?: string }).sessionId ?? "",
 	);
 	try {
+		const nextModelRoles = concretizeMaterializedAssignmentValues(options, modelRoles);
+		const nextAgentModelOverrides = concretizeMaterializedAssignmentValues(options, agentModelOverrides);
 		options.settings.set("modelRoles", nextModelRoles);
 		options.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
 		options.settings.unset("modelProfile.default");
@@ -521,7 +521,8 @@ function formatMaterializedSelector(selector: string, model: Model<Api>): string
 	return formatModelSelectorValue(clampedSelector, explicitThinkingLevel);
 }
 function getBareSelectorCredentialProviders(selector: string, modelRegistry: ModelRegistry): string[] {
-	const alias = splitSelectorThinkingSuffix(selector).selector.trim().toLowerCase();
+	const suffix = splitSelectorThinkingSuffix(selector);
+	const alias = (suffix.thinkingLevel ? suffix.selector : selector).trim().toLowerCase();
 	const providers = modelRegistry
 		.getAll()
 		.filter(model => {
@@ -541,6 +542,9 @@ async function resolveAndClampSelectorValue(
 ): Promise<ModelSelectorValue> {
 	const selectors = normalizeModelSelectorValue(selectorValue);
 	const clamped: string[] = [];
+	const unresolvedKnownBareProviders = new Set<string>();
+	let everySelectorIsKnownBare = selectors.length > 1;
+	let resolvedAny = false;
 	for (const selector of selectors) {
 		const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
 		let resolved = resolveModelRoleValue(selector, availableModels, options);
@@ -572,26 +576,42 @@ async function resolveAndClampSelectorValue(
 			};
 		}
 		if (!resolved.model) {
-			if (bareAlias && selectors.length === 1) {
+			if (bareAlias) {
 				const providers = getBareSelectorCredentialProviders(selector, options.modelRegistry);
-				const bareSelector = splitSelectorThinkingSuffix(selector).selector;
+				const selectorSuffix = splitSelectorThinkingSuffix(selector);
+				const bareSelector = selectorSuffix.thinkingLevel ? selectorSuffix.selector : selector;
 				const aliasKnown =
 					options.modelRegistry.lookupAliasExists?.(bareSelector.toLowerCase()) ?? providers.length > 0;
-				if (!aliasKnown) {
-					throw new Error(
-						`Model profile "${profileLabel}" ${role} selector "${bareSelector}" does not match any catalog model`,
+				if (selectors.length === 1) {
+					if (!aliasKnown) {
+						throw new Error(
+							`Model profile "${profileLabel}" ${role} selector "${bareSelector}" does not match any catalog model`,
+						);
+					}
+					throw new ModelProfileCredentialError(
+						profileLabel,
+						providers.length > 0 ? providers : [bareSelector],
+						role,
 					);
 				}
-				throw new ModelProfileCredentialError(
-					profileLabel,
-					providers.length > 0 ? providers : [bareSelector],
-					role,
-				);
+				if (aliasKnown) {
+					for (const provider of providers.length > 0 ? providers : [bareSelector]) {
+						unresolvedKnownBareProviders.add(provider);
+					}
+				} else {
+					everySelectorIsKnownBare = false;
+				}
+			} else {
+				everySelectorIsKnownBare = false;
 			}
 			clamped.push(selector);
 			continue;
 		}
+		resolvedAny = true;
 		clamped.push(formatMaterializedSelector(selector, resolved.model));
+	}
+	if (!resolvedAny && everySelectorIsKnownBare && unresolvedKnownBareProviders.size > 0) {
+		throw new ModelProfileCredentialError(profileLabel, [...unresolvedKnownBareProviders].sort(), role);
 	}
 	return clamped.length === 1 && typeof selectorValue === "string" ? clamped[0] : clamped;
 }
@@ -762,6 +782,12 @@ export async function prepareModelProfileActivation(
 		const defaultActiveIndex = defaultModel ? defaultResolution.activeIndex : undefined;
 		const defaultResolutionSkips = defaultResolution.skips;
 		if (bindings.defaultSelector && !defaultModel) {
+			const configuredDefaults = normalizeModelSelectorValue(bindings.defaultSelector);
+			if (configuredDefaults.length === 1) {
+				throw new Error(
+					`Model profile "${profileLabel}" default selector did not resolve: ${configuredDefaults[0]}`,
+				);
+			}
 			throw new Error(`Model profile "${profileLabel}" default selectors did not resolve to an authenticated model`);
 		}
 

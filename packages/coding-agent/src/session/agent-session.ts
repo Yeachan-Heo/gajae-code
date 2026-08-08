@@ -716,6 +716,8 @@ export interface AgentSessionConfig {
 	 * so that credential sticky selection is consistent with the session's streaming calls.
 	 */
 	providerSessionId?: string;
+	/** Optional auth-selection identity, distinct from logical/canonical and provider-cache identity. */
+	credentialSessionId?: string;
 	/** Optional provider-facing cache identity, distinct from logical session identity. */
 	providerCacheSessionId?: string;
 }
@@ -2054,6 +2056,7 @@ export class AgentSession {
 	#ircRosterEpoch = 0;
 	#ircRosterClaim: IrcRosterClaim | null = null;
 	#providerSessionId: string | undefined;
+	#credentialSessionId: string | undefined;
 	#providerCacheSessionId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
@@ -2880,6 +2883,7 @@ export class AgentSession {
 		});
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
+		this.#credentialSessionId = config.credentialSessionId;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => this.#ttsrAfterToolCall(ctx);
@@ -7732,6 +7736,11 @@ export class AgentSession {
 		return this.#providerSessionId ?? this.sessionManager.getSessionId();
 	}
 
+	/** Credential selection identity; defaults to the provider-facing session identity. */
+	get credentialSessionId(): string {
+		return this.#credentialSessionId ?? this.sessionId;
+	}
+
 	/** Current session display name, if set */
 	get sessionName(): string | undefined {
 		return this.sessionManager.getSessionName();
@@ -8824,7 +8833,7 @@ export class AgentSession {
 			const apiKey = await this.#awaitPromptPreflight(
 				generation,
 				preflightSignal,
-				this.#modelRegistry.getApiKey(this.model, this.sessionId, { signal: preflightSignal }),
+				this.#modelRegistry.getApiKey(this.model, this.credentialSessionId, { signal: preflightSignal }),
 			);
 			if (!apiKey) {
 				throw new Error(formatNoCredentialOnboardingError(this.model.provider));
@@ -10787,7 +10796,7 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
-		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
@@ -11440,7 +11449,7 @@ export class AgentSession {
 			if (thinkingLevel === ThinkingLevel.Inherit) {
 				throw new Error("Default model selection cannot inherit a thinking level");
 			}
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}/${model.id}`);
 			}
@@ -11564,7 +11573,7 @@ export class AgentSession {
 				modelRegistry: this.#modelRegistry,
 				...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
 				...(this.#persistedModelProfileAliasIntent() ?? {}),
-				credentialSessionId: this.sessionId,
+				credentialSessionId: this.credentialSessionId,
 			});
 			if (!resolved.model) continue;
 
@@ -11632,7 +11641,7 @@ export class AgentSession {
 			if (apiKeysByProvider.has(provider)) {
 				apiKey = apiKeysByProvider.get(provider);
 			} else {
-				apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.sessionId);
+				apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.credentialSessionId);
 				apiKeysByProvider.set(provider, apiKey);
 			}
 
@@ -11677,7 +11686,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const nextModel = availableModels[nextIndex];
 
-		const apiKey = await this.#modelRegistry.getApiKey(nextModel, this.sessionId);
+		const apiKey = await this.#modelRegistry.getApiKey(nextModel, this.credentialSessionId);
 		if (!apiKey) {
 			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
 		}
@@ -12867,7 +12876,7 @@ export class AgentSession {
 			if (!model) {
 				throw new Error("No model selected for handoff");
 			}
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}`);
 			}
@@ -13949,7 +13958,7 @@ export class AgentSession {
 		if (!candidate) return undefined;
 		if (modelsAreEqual(candidate, currentModel)) return undefined;
 		if (candidate.contextWindow <= contextWindow) return undefined;
-		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
+		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
 		if (!apiKey || signal?.aborted) return undefined;
 		return candidate;
 	}
@@ -14339,7 +14348,7 @@ export class AgentSession {
 			settings: this.settings,
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry: this.#modelRegistry,
-			credentialSessionId: this.sessionId,
+			credentialSessionId: this.credentialSessionId,
 			...(this.#persistedModelProfileAliasIntent() ?? {}),
 		});
 	}
@@ -14436,7 +14445,7 @@ export class AgentSession {
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
+			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
 			if (!apiKey) continue;
 
 			try {
@@ -14446,7 +14455,10 @@ export class AgentSession {
 					metadata: this.agent.metadataForProvider(candidate.provider),
 					convertToLlm,
 					telemetry,
-					authCredentialType: this.#modelRegistry.getSessionCredentialType(candidate.provider, this.sessionId),
+					authCredentialType: this.#modelRegistry.getSessionCredentialType(
+						candidate.provider,
+						this.credentialSessionId,
+					),
 				});
 			} catch (error) {
 				if (!this.#isCompactionAuthFailure(error)) {
@@ -14826,7 +14838,7 @@ export class AgentSession {
 				let lastError: unknown;
 
 				for (const candidate of candidates) {
-					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
+					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
 					if (!apiKey) continue;
 
 					let attempt = 0;
@@ -15398,8 +15410,12 @@ export class AgentSession {
 			controller.chain.entries.slice(resolutionStart),
 			this.#modelRegistry,
 			this.settings,
-			this.sessionId,
-			{ managedFallback: true, ...(this.#persistedModelProfileAliasIntent() ?? {}) },
+			this.credentialSessionId,
+			{
+				managedFallback: true,
+				canonicalSessionId: this.sessionId,
+				...(this.#persistedModelProfileAliasIntent() ?? {}),
+			},
 		);
 		const activeIndex = resolutionStart + resolution.activeIndex;
 		if (activeIndex > resolutionStart) {
@@ -15574,6 +15590,7 @@ export class AgentSession {
 				modelRegistry: this.#modelRegistry,
 				sessionId: this.sessionId,
 				...(this.#persistedModelProfileAliasIntent() ?? {}),
+				credentialSessionId: this.credentialSessionId,
 			});
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
@@ -15584,7 +15601,7 @@ export class AgentSession {
 				controller.onResolutionSkip(managedCursorUnavailable);
 				continue;
 			}
-			const key = await this.#modelRegistry.getApiKey(resolved.model, this.sessionId);
+			const key = await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId);
 			if (!isAuthenticated(key) && key !== kNoAuth) {
 				controller.onResolutionSkip("unauthenticated");
 				continue;
@@ -16843,7 +16860,10 @@ export class AgentSession {
 		try {
 			const model = this.model;
 			if (!model) throw new Error("No active model on session");
-			const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, this.sessionId), args.signal);
+			const apiKey = await awaitEphemeralAbort(
+				this.#modelRegistry.getApiKey(model, this.credentialSessionId),
+				args.signal,
+			);
 			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 			sideAttempt = this.agent.mintSideAttemptScope();
 			const sideScope = sideAttempt.scope;
@@ -17311,8 +17331,12 @@ export class AgentSession {
 						defaultEntries,
 						this.#modelRegistry,
 						this.settings,
-						this.sessionId,
-						{ managedFallback: true, ...(this.#persistedModelProfileAliasIntent() ?? {}) },
+						this.credentialSessionId,
+						{
+							managedFallback: true,
+							canonicalSessionId: this.sessionId,
+							...(this.#persistedModelProfileAliasIntent() ?? {}),
+						},
 					);
 					const controller = this.#defaultFallbackChain();
 					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
@@ -17685,7 +17709,7 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
 				const model = this.model!;
-				const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+				const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 				if (!apiKey) {
 					throw new Error(`No API key for ${model.provider}`);
 				}

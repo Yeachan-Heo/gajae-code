@@ -1040,7 +1040,8 @@ export async function resolveModelChainWithAuth(
 	for (let activeIndex = 0; activeIndex < modelPatterns.length; activeIndex += 1) {
 		const selector = modelPatterns[activeIndex];
 		const suffix = splitSelectorThinkingSuffix(selector);
-		const aliasKey = suffix.selector.includes("/") ? undefined : getFinalSlashSegmentAliasKey(suffix.selector);
+		const aliasSelector = suffix.thinkingLevel ? suffix.selector : selector;
+		const aliasKey = aliasSelector.includes("/") ? undefined : getFinalSlashSegmentAliasKey(aliasSelector);
 		const retryEquivalentAlias =
 			options?.aliasIntent === "preset-equivalent" &&
 			aliasKey !== undefined &&

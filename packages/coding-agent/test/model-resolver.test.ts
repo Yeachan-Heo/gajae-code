@@ -150,6 +150,31 @@ test("retries an equivalent alias provider after the preferred candidate fails a
 	expect(cleared).toEqual(["logical-session"]);
 });
 
+test("retries colon-bearing equivalent aliases without treating route text as thinking", async () => {
+	const alpha = { ...mockModels[1], provider: "alpha", id: "org/shared:exacto" } as Model;
+	const beta = { ...mockModels[1], provider: "beta", id: "org/shared:exacto" } as Model;
+	const observedAliases: string[] = [];
+	const resolution = await resolveModelChainWithAuth(
+		["shared:exacto"],
+		{
+			getAvailable: () => [alpha, beta],
+			lookupAliasExists: (alias: string) => alias === "shared:exacto",
+			resolveModelByLookupAlias: (alias: string, options?: { candidates?: readonly Model[] }) => {
+				observedAliases.push(alias);
+				return options?.candidates?.[0];
+			},
+			clearCanonicalVariant: () => true,
+			getApiKey: async (candidate: Model) => (candidate.provider === "beta" ? "key" : undefined),
+		} as never,
+		undefined,
+		"credential-session",
+		{ canonicalSessionId: "canonical-session", aliasIntent: "preset-equivalent" },
+	);
+
+	expect(resolution.model).toBe(beta);
+	expect(observedAliases).toEqual(["shared:exacto", "shared:exacto"]);
+});
+
 // Mock models for testing
 const mockModels: Model<"anthropic-messages">[] = [
 	{

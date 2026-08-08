@@ -340,6 +340,8 @@ export interface CreateAgentSessionOptions {
 	/** Optional provider-facing session identifier for prompt caches and sticky auth selection.
 	 * Keeps persisted session files isolated while reusing provider-side caches. */
 	providerSessionId?: string;
+	/** Optional credential-selection session identity, distinct from provider transport/cache identity. */
+	credentialSessionId?: string;
 	/** Runtime credential selector for multi-account auth pools. */
 	credentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
 
@@ -1326,6 +1328,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session_id upstream, where session-owning transports reject the extra
 		// downstreams (owner_busy) and degrade those turns to uncached HTTP.
 		const providerSessionId = options.providerSessionId ?? logicalSessionId;
+		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
@@ -1348,7 +1351,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return false;
 			}
 			const key = await modelRegistry
-				.getApiKey(candidate, providerSessionId, { credentialSelector })
+				.getApiKey(candidate, credentialSessionId, { credentialSelector })
 				.catch(error => {
 					if (credentialSelector) {
 						logger.debug("Credential selector did not match model availability candidate", {
@@ -1455,7 +1458,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					defaultModelEntries,
 					modelRegistry,
 					settings,
-					providerSessionId,
+					credentialSessionId,
 					{
 						managedFallback: defaultModelEntries.length > 1,
 						canonicalSessionId: logicalSessionId,
@@ -2882,14 +2885,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getApiKey: async provider => {
 				// Read agent.sessionId at call time so credential selection stays aligned
 				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(provider, agent.providerSessionId ?? agent.sessionId);
+				const key = await modelRegistry.getApiKeyForProvider(
+					provider,
+					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
+				);
 				if (!key) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
 				return key;
 			},
 			getAuthCredentialType: provider =>
-				modelRegistry.getSessionCredentialType(provider, agent.providerSessionId ?? agent.sessionId),
+				modelRegistry.getSessionCredentialType(
+					provider,
+					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
+				),
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
@@ -3067,6 +3076,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentId: resolvedAgentId,
 			agentRegistry,
 			providerSessionId: options.providerSessionId,
+			credentialSessionId: options.credentialSessionId,
 			providerCacheSessionId: providerSessionId,
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
@@ -3121,7 +3131,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (codexTransport.websocketPreferred) {
 				void (async () => {
 					try {
-						const codexPrewarmApiKey = await modelRegistry.getApiKey(codexModel, providerSessionId);
+						const codexPrewarmApiKey = await modelRegistry.getApiKey(codexModel, credentialSessionId);
 						if (!codexPrewarmApiKey) return;
 						await logger.time("prewarmOpenAICodexResponses", prewarmOpenAICodexResponses, codexModel, {
 							apiKey: codexPrewarmApiKey,

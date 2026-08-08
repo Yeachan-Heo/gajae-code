@@ -442,6 +442,33 @@ describe("model profile activation", () => {
 		});
 	});
 
+	test("reports an exhausted known bare alias array as a recoverable credential error", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-bare-fallbacks",
+			requiredProviders: [],
+			modelMapping: { default: ["default", "executor"] },
+			source: "user",
+		};
+
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: fakeRegistry({
+					missingProviders: ["provider-a", "provider-b", "provider-c"],
+					profiles: [profile],
+				}),
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			code: "authentication_failed",
+			profileLabel: profile.name,
+			providers: ["provider-a", "provider-b", "provider-c"],
+			role: "default",
+		});
+	});
+
 	test("reports an unknown bare alias as a profile configuration error", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "unknown-bare-only",
@@ -1097,6 +1124,48 @@ describe("model profile activation", () => {
 		expect(settings.get("modelRoles")).toEqual(previousRoles);
 		expect(settings.get("task.agentModelOverrides")).toEqual(previousOverrides);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+	});
+
+	test("materialization restores canonical affinity when concretization mutates before persistence fails", () => {
+		const selected = model("provider-b", "shared-model");
+		const session = fakeSession();
+		const sticky = new Map([[session.sessionId, "provider-a/shared-model"]]);
+		const registry = {
+			getAvailable: () => [selected],
+			lookupAliasExists: (alias: string) => alias === "shared-model",
+			resolveModelByLookupAlias: (_alias: string, options?: { sessionId?: string }) => {
+				if (options?.sessionId) sticky.set(options.sessionId, "provider-b/shared-model");
+				return selected;
+			},
+			getSessionCanonicalVariant: (id: string) => sticky.get(id),
+			clearCanonicalVariant: (id: string) => sticky.delete(id),
+			restoreSessionCanonicalVariant: (id: string, selector: string) => {
+				sticky.set(id, selector);
+				return true;
+			},
+		} as unknown as ModelRegistry;
+		Object.assign(session, { modelRegistry: registry });
+		session.setActiveModelProfile("profile-a");
+		const setConfiguredModelChain = session.setConfiguredModelChain.bind(session);
+		let chainWrites = 0;
+		session.setConfiguredModelChain = (role: string, entries: readonly string[]) => {
+			chainWrites++;
+			if (chainWrites === 1) throw new Error("persist failed");
+			setConfiguredModelChain(role, entries);
+		};
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		settings.override("modelRoles", { default: "shared-model" });
+		settings.override("task.agentModelOverrides", { executor: "shared-model" });
+
+		expect(() =>
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-c/executor",
+			}),
+		).toThrow("persist failed");
+		expect(sticky.get(session.sessionId)).toBe("provider-a/shared-model");
 	});
 
 	test("materializing a non-default role persists only the concrete active default", async () => {
