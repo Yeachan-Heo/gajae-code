@@ -190,8 +190,7 @@ describe("prompt action autocomplete", () => {
 	it.each([
 		"please /he",
 		"please/hel",
-		"open /",
-	])("does not offer slash or path suggestions after prompt text: %s", async line => {
+	])("does not offer slash-command suggestions after prompt text: %s", async line => {
 		const provider = createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]);
 
 		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();

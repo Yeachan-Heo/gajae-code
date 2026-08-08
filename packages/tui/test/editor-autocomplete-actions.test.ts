@@ -389,6 +389,33 @@ describe("Editor Enter handler sync slash completion", () => {
 
 		expect(submitted).toBe("explain with /skill-te");
 	});
+	it("does not synchronously rewrite a slash skill token on a later prompt line", () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		let submitted = "";
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.setText("explain this\n/skill-te");
+		editor.handleInput("\r");
+
+		expect(submitted).toBe("explain this\n/skill-te");
+		expect(provider.syncCallCount).toBe(0);
+	});
+	it.each(["\n/m", "  /m"])("shows command completion for prompt-start whitespace: %s", async initialText => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider([{ name: "model", description: "Switch model", value: "model" }], "/tmp"),
+		);
+		editor.setText(initialText);
+
+		editor.handleInput("o");
+		await Bun.sleep(20);
+
+		expect(editor.isShowingAutocomplete()).toBe(true);
+	});
 	it("submits an inline-code skill token without synchronous Enter completion", () => {
 		const provider = new InlineSkillProvider();
 		const editor = new Editor(defaultEditorTheme);

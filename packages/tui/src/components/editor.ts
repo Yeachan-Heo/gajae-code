@@ -5,6 +5,7 @@ import {
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	isInsideInlineCodeSpan,
+	isSlashCommandPromptStart,
 } from "../autocomplete";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { getKeybindings, type KeybindingsManager } from "../keybindings";
@@ -2838,13 +2839,14 @@ export class Editor implements Component, Focusable {
 	#isInSubmittedSlashCommandContext(): boolean {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-		return this.#hasOnlyWhitespaceBeforeCursorLine() && beforeCursor.trimStart().startsWith("/");
+		return isSlashCommandPromptStart(this.#state.lines, this.#state.cursorLine, beforeCursor);
 	}
 
 	#getSlashTokenBeforeCursor(): string | null {
+		if (!this.#hasOnlyWhitespaceBeforeCursorLine()) return null;
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-		return extractSlashCommandTokenPrefix(beforeCursor);
+		return extractSlashCommandTokenPrefix(beforeCursor.trimStart());
 	}
 
 	#isInSlashTokenContext(): boolean {
@@ -2856,7 +2858,7 @@ export class Editor implements Component, Focusable {
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 		if (!textBeforeCursor.endsWith(this.#autocompletePrefix)) return false;
 		if (this.#autocompleteState !== "regular" || !this.#autocompletePrefix.startsWith("/")) return true;
-		return extractSlashCommandTokenPrefix(textBeforeCursor) === this.#autocompletePrefix;
+		return this.#getSlashTokenBeforeCursor() === this.#autocompletePrefix;
 	}
 	#captureAutocompleteOrigin(): { docVersion: number; cursorLine: number; cursorCol: number } {
 		return {

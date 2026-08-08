@@ -225,9 +225,7 @@ describe("slash command suggestion position", () => {
 	it.each([
 		"explain this /mo",
 		"explain this/hel",
-		"open /",
-		"open /tmp",
-	])("does not open automatic slash or path suggestions after prompt text: %s", async line => {
+	])("does not open automatic slash-command suggestions after prompt text: %s", async line => {
 		const provider = new CombinedAutocompleteProvider(
 			[
 				{ name: "model", description: "Switch AI model", value: "model" },
@@ -237,6 +235,37 @@ describe("slash command suggestion position", () => {
 		);
 
 		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+	});
+
+	it("preserves inline file-path suggestions after prompt text", async () => {
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-inline-path-test-"));
+		try {
+			fs.mkdirSync(path.join(baseDir, "src", "foo"), { recursive: true });
+			fs.writeFileSync(path.join(baseDir, "src", "foo", "bar.ts"), "export {};\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "read src/foo/";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe("src/foo/");
+			expect(result?.items.map(item => item.value)).toContain("src/foo/bar.ts");
+		} finally {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		[["", "/mo"], 1, 3],
+		[["  /mo"], 0, 5],
+	])("offers command suggestions after only leading whitespace", async (lines, cursorLine, cursorCol) => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "model", description: "Switch AI model", value: "model" }],
+			"/tmp",
+		);
+		const result = await provider.getSuggestions(lines, cursorLine, cursorCol);
+
+		expect(result?.kind).toBe("slash-command");
+		expect(result?.prefix).toBe("/mo");
+		expect(result?.items.map(item => item.value)).toContain("model");
 	});
 
 	it("does not offer slash commands at the start of a later prompt line", async () => {
