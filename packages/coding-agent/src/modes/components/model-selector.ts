@@ -518,7 +518,6 @@ export class ModelSelectorComponent extends Container {
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
 				aliasIntent: this.#activeModelProfile ? "preset-equivalent" : undefined,
-				sessionId: this.#authSessionId,
 				credentialSessionId: this.#authSessionId,
 			});
 			return resolved.model !== undefined && modelsAreEqual(resolved.model, this.#currentModel);
@@ -541,7 +540,6 @@ export class ModelSelectorComponent extends Container {
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
 				aliasIntent: this.#activeModelProfile ? "preset-equivalent" : undefined,
-				sessionId: this.#authSessionId,
 				credentialSessionId: this.#authSessionId,
 			});
 			if (resolved.model) {

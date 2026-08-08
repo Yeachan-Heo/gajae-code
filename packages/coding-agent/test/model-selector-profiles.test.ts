@@ -251,7 +251,7 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("(current)");
 	});
 
-	test("active profile role badges resolve provider-agnostic bare aliases", async () => {
+	test("active profile role badges resolve bare aliases without mutating canonical session affinity", async () => {
 		installTestTheme();
 		const registry = createRegistry();
 		const selector = createSelector(() => {}, {
@@ -270,8 +270,10 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("EXECUTOR: provider-b/org/flare-alias");
 		expect(
 			registry.resolveModelByLookupAlias.mock.calls.some(
-				([, options]) =>
-					options?.sessionId === "profile-session" && options.credentialSessionId === "profile-session",
+				([alias, options]) =>
+					alias === "flare-alias" &&
+					options?.sessionId === undefined &&
+					options?.credentialSessionId === "profile-session",
 			),
 		).toBe(true);
 	});

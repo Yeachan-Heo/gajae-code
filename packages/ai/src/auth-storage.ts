@@ -4152,6 +4152,7 @@ export class AuthStorage {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthAccess | undefined> {
+		provider = resolveOAuthStorageProvider(provider);
 		// Runtime / config overrides intentionally short-circuit OAuth: when the
 		// user has pinned an API key, they expect the OAuth identity to be
 		// suppressed (same contract as `getOAuthAccountId`).
