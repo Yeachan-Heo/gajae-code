@@ -2095,11 +2095,15 @@ export class AcpAgent implements Agent {
 					});
 				}
 			}
-			await this.#emitEndOfTurnUpdates(id, adapter);
-		} else if (event.type === "agent_failed") {
-			await this.#emitEndOfTurnUpdates(id, adapter);
 		}
+		// The terminal frame is the turn's end, so it settles the prompt before anything
+		// else is asked of the session host. `#emitEndOfTurnUpdates` queries `context.get`
+		// and `session.metadata`, and a host that stops producing the moment it publishes
+		// its terminal answers neither: sequencing settlement behind those advisory
+		// queries is what left a finished turn reported as running until the inactivity
+		// watchdog rescued it.
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
+		if (event.type === "agent_end" || event.type === "agent_failed") await this.#emitEndOfTurnUpdates(id, adapter);
 	}
 
 	async #rejectPrompt(
@@ -2191,6 +2195,9 @@ export class AcpAgent implements Agent {
 		} catch {
 			// Session naming is advisory; prompt completion remains authoritative.
 		}
+		// The prompt settled before these queries were asked, so a host that answers late
+		// must not report the session idle after the next turn has already started.
+		if (this.#sessions.get(id)?.activePrompt) return;
 		if (typeof usage?.tokens === "number" && typeof usage.contextWindow === "number") {
 			await this.#publishSessionUpdate(
 				id,
