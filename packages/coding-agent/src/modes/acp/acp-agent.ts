@@ -50,11 +50,7 @@ import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-model";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
-import {
-	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
-	type PromptWatchdogClock,
-	systemPromptWatchdogClock,
-} from "../../sdk/prompt-watchdog";
+import { PromptToolActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -115,6 +111,8 @@ interface PromptWaiter {
 	lastFrameType: string;
 	/** Cancels the armed inactivity watchdog; re-armed by every inbound frame for this prompt. */
 	cancelWatchdog?: () => void;
+	/** Tool calls the host started but has not ended; widens the bound while one is running. */
+	toolActivity: PromptToolActivity;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -1263,6 +1261,7 @@ export class AcpAgent implements Agent {
 				deferredFrames: [],
 				lastFrameAt: this.#promptWatchdogClock.now(),
 				lastFrameType: "prompt_dispatch",
+				toolActivity: new PromptToolActivity(),
 				resolve,
 				reject,
 			};
@@ -1863,7 +1862,7 @@ export class AcpAgent implements Agent {
 		waiter.cancelWatchdog?.();
 		// No frame can still arrive once the transport is known to be gone, so waiting out
 		// the full bound would only add dead time to an outcome that is already decided.
-		const delayMs = this.#promptTransportGone(id, record) ? 0 : ACP_PROMPT_INACTIVITY_TIMEOUT_MS;
+		const delayMs = this.#promptTransportGone(id, record) ? 0 : waiter.toolActivity.inactivityBoundMs;
 		waiter.cancelWatchdog = this.#promptWatchdogClock.schedule(() => {
 			void this.#expirePromptWatchdog(id, record, waiter);
 		}, delayMs);
@@ -1877,6 +1876,12 @@ export class AcpAgent implements Agent {
 		waiter.lastFrameAt = this.#promptWatchdogClock.now();
 		waiter.lastFrameType =
 			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
+		// Tool lifecycle frames also decide which bound the next gap gets: silence while a
+		// tool is observably executing is expected, silence with nothing running is not.
+		waiter.toolActivity.observe(
+			typeof event?.type === "string" ? event.type : undefined,
+			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
+		);
 		this.#armPromptWatchdog(id, record, waiter);
 	}
 
@@ -1900,7 +1905,8 @@ export class AcpAgent implements Agent {
 			cause,
 			silenceMs,
 			lastFrameType: waiter.lastFrameType,
-			inactivityBoundMs: ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+			inactivityBoundMs: waiter.toolActivity.inactivityBoundMs,
+			toolRunning: waiter.toolActivity.running,
 			...(waiter.correlation.commandId ? { commandId: waiter.correlation.commandId } : {}),
 			...(waiter.correlation.turnId ? { turnId: waiter.correlation.turnId } : {}),
 		});
