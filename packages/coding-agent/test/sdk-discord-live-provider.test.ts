@@ -11,9 +11,9 @@ class FakeSocket implements DiscordGatewaySocket {
 	send(data: string): void {
 		this.sent.push(data);
 	}
-	close(): void {
+	close(code = 1_000, reason = ""): void {
 		this.readyState = 3;
-		this.emit("close", new Event("close"));
+		this.emit("close", new CloseEvent("close", { code, reason }));
 	}
 	addEventListener(type: "open" | "message" | "close" | "error", listener: Listener): void {
 		this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
@@ -23,6 +23,9 @@ class FakeSocket implements DiscordGatewaySocket {
 	}
 	message(frame: Record<string, unknown>): void {
 		this.emit("message", new MessageEvent("message", { data: JSON.stringify(frame) }));
+	}
+	binary(frame: Record<string, unknown>): void {
+		this.emit("message", new MessageEvent("message", { data: Buffer.from(JSON.stringify(frame)) }));
 	}
 }
 
@@ -298,7 +301,7 @@ describe("DiscordLiveProvider protocol", () => {
 		expect(socket.sent.map(value => JSON.parse(value))).toContainEqual(
 			expect.objectContaining({ op: 2, d: expect.objectContaining({ token: "discord-secret-token" }) }),
 		);
-		socket.message({
+		socket.binary({
 			op: 0,
 			t: "MESSAGE_CREATE",
 			s: 4,
@@ -306,7 +309,6 @@ describe("DiscordLiveProvider protocol", () => {
 				id: "message",
 				guild_id: "guild",
 				channel_id: "thread",
-				thread: { parent_id: "parent" },
 				author: { id: "member", bot: false },
 				content: "reply",
 			},
@@ -325,8 +327,9 @@ describe("DiscordLiveProvider protocol", () => {
 				data: { custom_id: "gjc:1:ask", value: "yes" },
 			},
 		});
-		await Promise.resolve();
-		expect(events).toEqual(["message", "interaction"]);
+		await Bun.sleep(10);
+		expect(events.sort()).toEqual(["interaction", "message"]);
+		expect(requests.map(request => request.path)).toContain("https://discord.test/api/channels/thread");
 		socket.close();
 		expect(sockets).toHaveLength(2);
 		await live.stop();
@@ -469,6 +472,17 @@ describe("DiscordLiveProvider protocol", () => {
 			op: 6,
 			d: { token: "discord-secret-token", session_id: "resume-me", seq: 7 },
 		});
+		await live.stop();
+	});
+	test("does not reconnect after a terminal Gateway close code", async () => {
+		const requests: Array<{ path: string; init: RequestInit }> = [];
+		const sockets: FakeSocket[] = [];
+		const live = provider(requests, sockets);
+		await live.start(async () => {});
+		sockets[0]!.close(4_014, "disallowed intents");
+		expect(sockets).toHaveLength(1);
+		expect(live.gatewayError?.message).toContain("4014");
+		expect(live.transportHealthy).toBe(false);
 		await live.stop();
 	});
 	test("requires READY or RESUMED plus a heartbeat ACK before reporting a healthy transport", async () => {

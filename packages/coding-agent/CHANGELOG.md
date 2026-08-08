@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Discord threads now accept ordinary non-empty messages as agent prompts while preserving explicit `/sdk` commands. Gateway messages decode both text and binary payloads, resolve missing thread-parent metadata through Discord's REST API, and stop reconnecting after terminal close codes. Discord output now contains only completed turn text and actionable questions instead of lifecycle, identity, activity, idle, partial-stream, duplicate, and plain-prompt acknowledgement noise.
+
 ## [0.12.16] - 2026-08-08
 
 ### Added
