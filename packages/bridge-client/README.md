@@ -29,3 +29,11 @@ This package is transport-only. It does not import, instantiate, dispatch to, or
 It is SDK v3 only. The historical BridgeClient/backend-bridge protocol, RPC ingress, and compatibility behavior are intentionally unsupported and must not be restored. Use the documented SDK v3 WebSocket endpoint and frames instead.
 
 `@gajae-code/coding-agent/sdk` re-exports this package for compatibility; both entrypoints expose the same `SdkClient` class identity.
+
+## Atomic create, attach, and submit
+
+`SdkClient.createConnectSubscribeSubmit()` is a recovery-oriented convenience operation over broker create and endpoint controls. It requires a fresh `createIdempotencyKey` and a fresh, kind-scoped 1–128 character `clientRef`. It retains both identities before crossing the transport boundary and returns a `SdkAtomicLookupIdentity` without endpoint credentials.
+
+The operation creates, opens an operation-owned endpoint socket, completes event replay on that exact socket incarnation, then writes at most one `turn.prompt` or `skill.invoke`. Ordered work is never retried. A transport failure after the write returns `submission_uncertain`, not a successful or non-executed result.
+
+Use `reconcileCreateConnectSubmit(identity)` for recovery. It may replay the durable create request with the same key and queries the matching prompt or skill status, but never sends an ordered control. `unknown` means the reconciliation authority or retention cannot establish the outcome; it is not proof that the work did not execute.
