@@ -105,6 +105,8 @@ interface PromptWaiter {
 	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
 	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
 	deferredFrames: JsonObject[];
+	/** Activity frames held until acknowledgement establishes exact prompt ownership. */
+	deferredActivityFrames: JsonObject[];
 	/** Clock reading of the last inbound frame for this prompt; baseline of the inactivity watchdog. */
 	lastFrameAt: number;
 	/** Frame (or wire event) type of that last frame, reported when the watchdog expires. */
@@ -1269,6 +1271,7 @@ export class AcpAgent implements Agent {
 				emittedAssistantText: "",
 				settled: false,
 				deferredFrames: [],
+				deferredActivityFrames: [],
 				lastFrameAt: this.#promptWatchdogClock.now(),
 				lastFrameType: "prompt_dispatch",
 				activity: new PromptActivity(),
@@ -1314,6 +1317,13 @@ export class AcpAgent implements Agent {
 			waiter.acknowledged = true;
 			// Frames held while ownership was unknown belong to this prompt only when the
 			// acknowledgement proves their complete correlation matches exactly.
+			const deferredActivityFrames = waiter.deferredActivityFrames.splice(0);
+			for (const deferredFrame of deferredActivityFrames) {
+				const deferredEvent = receivedSdkEvent(deferredFrame)?.event;
+				if (correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame, deferredEvent)))
+					this.#observePromptActivity(waiter, deferredFrame);
+			}
+			if (deferredActivityFrames.length > 0) this.#armPromptWatchdog(params.sessionId, record, waiter);
 			const deferred = waiter.deferredFrames.splice(0);
 			for (const deferredFrame of deferred)
 				if (correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame)))
@@ -1323,6 +1333,7 @@ export class AcpAgent implements Agent {
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
 			waiter.deferredFrames.length = 0;
+			waiter.deferredActivityFrames.length = 0;
 			clearPromptWatchdog(waiter);
 			waiter.terminal = undefined;
 			waiter.settled = true;
@@ -1382,6 +1393,7 @@ export class AcpAgent implements Agent {
 		record.cancelRequested = false;
 		waiter.settled = true;
 		waiter.deferredFrames.length = 0;
+		waiter.deferredActivityFrames.length = 0;
 		waiter.terminal = undefined;
 		// A late terminal for this turn must stay closed rather than publish over a
 		// prompt the client has already been told is cancelled.
@@ -1899,14 +1911,23 @@ export class AcpAgent implements Agent {
 		// bound with no tool running. Frames with no correlation at all (heartbeats,
 		// session-scoped events) are refresh-only for the same reason: they prove the producer
 		// lives but say nothing about what this turn is doing, so they leave the bound as is.
-		// Before acknowledgement the prompt has no identity, so nothing is provably its own yet.
-		if (correlationsExactlyMatch(waiter.correlation, correlationFrom(frame, event)))
-			waiter.activity.observe(
-				typeof event?.type === "string" ? event.type : undefined,
-				typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
-				frameMessageRole(event),
-			);
+		// Before acknowledgement the prompt has no identity, so correlated activity is retained
+		// and folded in only after the acknowledgement proves exact ownership.
+		if (!waiter.acknowledged) {
+			if (hasCorrelation(correlationFrom(frame, event))) waiter.deferredActivityFrames.push(frame);
+		} else if (correlationsExactlyMatch(waiter.correlation, correlationFrom(frame, event))) {
+			this.#observePromptActivity(waiter, frame);
+		}
 		this.#armPromptWatchdog(id, record, waiter);
+	}
+
+	#observePromptActivity(waiter: PromptWaiter, frame: JsonObject): void {
+		const event = receivedSdkEvent(frame)?.event;
+		waiter.activity.observe(
+			typeof event?.type === "string" ? event.type : undefined,
+			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
+			frameMessageRole(event),
+		);
 	}
 
 	/** Names why the prompt can be settled at once instead of waiting out the inactivity bound. */
@@ -2131,6 +2152,7 @@ export class AcpAgent implements Agent {
 		clearPromptWatchdog(waiter);
 		waiter.settled = true;
 		waiter.deferredFrames.length = 0;
+		waiter.deferredActivityFrames.length = 0;
 		waiter.terminal = undefined;
 		if (hasCompleteCorrelation(waiter.correlation)) {
 			record.settledPromptCorrelations.push(waiter.correlation);

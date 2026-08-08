@@ -129,7 +129,11 @@ function toolCallUpdates(updates: SessionNotification[]): number {
 	return updates.filter(update => update.update.sessionUpdate === "tool_call_update").length;
 }
 
-async function createFixture(): Promise<Fixture> {
+type FixtureOptions = {
+	agentStartBeforeAcknowledgement?: boolean;
+};
+
+async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@acp-prompt-watchdog-");
 	const agentDir = path.join(tempDir.path(), "agent");
 	const cwd = path.join(tempDir.path(), "workspace");
@@ -255,6 +259,8 @@ async function createFixture(): Promise<Fixture> {
 					commandId = `watchdog-command-${turnCount}`;
 					turnId = `watchdog-turn-${turnCount}`;
 				}
+				if (frame.operation === "turn.prompt" && options.agentStartBeforeAcknowledgement)
+					socket.send(JSON.stringify({ type: "agent_start", sessionId, commandId, turnId }));
 				socket.send(
 					JSON.stringify({
 						type: "control_response",
@@ -268,10 +274,11 @@ async function createFixture(): Promise<Fixture> {
 									: {},
 					}),
 				);
-				// Frames are FIFO on the socket, so the client records the acknowledged
-				// correlation before this start frame reaches the session record.
-				if (frame.operation === "turn.prompt")
+				if (frame.operation === "turn.prompt" && !options.agentStartBeforeAcknowledgement) {
+					// Frames are FIFO on the socket, so the client records the acknowledged
+					// correlation before this start frame reaches the session record.
 					socket.send(JSON.stringify({ type: "agent_start", sessionId, commandId, turnId }));
+				}
 			},
 		},
 	});
@@ -824,6 +831,38 @@ test("a correlationless frame refreshes liveness without moving the turn's bound
 		const message = (error as Error).message;
 		expect(message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
 		expect(message).toContain('"message_end"');
+	} finally {
+		fixture.dispose();
+	}
+});
+test("a pre-ack agent_start keeps the live prompt on the inference bound", async () => {
+	const fixture = await createFixture({ agentStartBeforeAcknowledgement: true });
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
 	} finally {
 		fixture.dispose();
 	}
