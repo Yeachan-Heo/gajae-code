@@ -1294,6 +1294,16 @@ describe("preset-equivalent alias resolution", () => {
 		expect(result.warning).toBeUndefined();
 	});
 
+	test("unknown bare preset aliases with thinking fail closed before fuzzy matching", () => {
+		const glm: Model<"anthropic-messages"> = { ...aliasVariantModels[0]!, id: "glm-5.2", name: "GLM 5.2" };
+		const result = parseModelPattern("glm-5:high", [glm], undefined, {
+			aliasIntent: "preset-equivalent",
+			modelRegistry: makeAliasRegistry(new Map()),
+		});
+
+		expect(result.model).toBeUndefined();
+	});
+
 	test("forwards the active session id to preset alias lookup", () => {
 		let receivedSessionId: string | undefined;
 		const result = parseModelPattern("opus", aliasVariantModels, undefined, {

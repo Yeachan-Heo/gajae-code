@@ -639,7 +639,12 @@ export function resolveSelector(
 		return { model: undefined, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
 	}
 
+	const suffixExact = findStrictExactModelMatch(suffix.selector, candidates, context, options);
+	if (options?.aliasIntent === "preset-equivalent" && !suffix.selector.includes("/") && !suffixExact) {
+		return { model: undefined, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
+	}
 	const model =
+		suffixExact ??
 		tryMatchModel(suffix.selector, candidates, context, options) ??
 		findGlobMatch(suffix.selector, candidates, context);
 	if (!model) return { model: undefined, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };

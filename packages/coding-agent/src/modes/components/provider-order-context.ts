@@ -61,15 +61,17 @@ export class ProviderOrderContext {
 	#settings: Settings;
 	#authStorage: AuthStorage;
 	#onChange: (() => void) | undefined;
+	#credentialSessionId: string | undefined;
 	#disposed = false;
 	#unsubscribeSettings: () => void;
 	#unsubscribeAuthGeneration: () => void;
 
-	constructor(registry: ModelRegistry, settings: Settings, onChange?: () => void) {
+	constructor(registry: ModelRegistry, settings: Settings, onChange?: () => void, credentialSessionId?: string) {
 		this.#registry = registry;
 		this.#settings = settings;
 		this.#authStorage = registry.authStorage;
 		this.#onChange = onChange;
+		this.#credentialSessionId = credentialSessionId;
 		this.#unsubscribeSettings = settings.onChanged(path => {
 			// Only `modelProviderOrder` mutations matter to this editor; the
 			// listener takes the single path argument and filters inside.
@@ -175,9 +177,18 @@ export class ProviderOrderContext {
 	}
 
 	#isAuthenticated(providerId: string): boolean {
+		const effectiveCredentialType = (this.#authStorage as Partial<Pick<AuthStorage, "getEffectiveCredentialType">>)
+			.getEffectiveCredentialType;
 		const health = getProviderAuthHealth(this.#authStorage, providerId);
-		if (health) return health === "valid";
-		return this.#registry.hasConfiguredProviderAuth(providerId);
+		if (!effectiveCredentialType)
+			return health ? health === "valid" : this.#registry.hasConfiguredProviderAuth(providerId);
+		const credentialType = effectiveCredentialType.call(this.#authStorage, providerId, this.#credentialSessionId);
+		return (
+			(credentialType !== undefined &&
+				health !== "invalid" &&
+				(this.#authStorage.hasUsableAuth?.(providerId) ?? true)) ||
+			this.#registry.isCredentiallessProvider?.(providerId) === true
+		);
 	}
 
 	#emit(): void {

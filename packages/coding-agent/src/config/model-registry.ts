@@ -3705,6 +3705,10 @@ export class ModelRegistry {
 		return this.#keylessProviders.has(provider) || this.authStorage.hasAuth(provider);
 	}
 
+	isCredentiallessProvider(provider: string): boolean {
+		return this.#isCredentiallessProvider(provider);
+	}
+
 	getDiscoverableProviders(): string[] {
 		const disabledProviders = getDisabledProviderIdsFromSettings();
 		return this.#discoveryManager.providers

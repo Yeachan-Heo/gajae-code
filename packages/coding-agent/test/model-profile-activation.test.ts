@@ -18,7 +18,6 @@ import {
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, type ModelRegistry } from "../src/config/model-registry";
-import { resolveModelChainWithAuth } from "../src/config/model-resolver";
 import { Settings } from "../src/config/settings";
 import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
@@ -502,7 +501,7 @@ describe("model profile activation", () => {
 		);
 	});
 
-	test("preserves a fully unresolved executor chain and skips it without request attempts", async () => {
+	test("rejects a fully unresolved qualified executor chain", async () => {
 		const executorChain = ["provider-a/unknown-executor", "provider-b/unknown-executor"];
 		const profile: ModelProfileDefinition = {
 			name: "unresolved-executor",
@@ -511,34 +510,16 @@ describe("model profile activation", () => {
 			source: "user",
 		};
 		const settings = Settings.isolated();
-		await activateModelProfile({
-			session: fakeSession(),
-			modelRegistry: fakeRegistry({ profiles: [profile] }),
-			settings,
-			profileName: profile.name,
-		});
 
-		expect(settings.get("task.agentModelOverrides").executor).toEqual(executorChain);
-		let credentialLookups = 0;
-		const resolution = await resolveModelChainWithAuth(
-			executorChain,
-			{
-				getAvailable: () => [],
-				getApiKey: async () => {
-					credentialLookups += 1;
-					return kNoAuth;
-				},
-			},
-			settings,
-			"session-1",
-			{ managedFallback: true },
-		);
-		expect(resolution.model).toBeUndefined();
-		expect(resolution).toMatchObject({
-			activeIndex: executorChain.length,
-			skips: executorChain.map(selector => ({ selector, reason: "unknown_model" })),
-		});
-		expect(credentialLookups).toBe(0);
+		await expect(
+			activateModelProfile({
+				session: fakeSession(),
+				modelRegistry: fakeRegistry({ profiles: [profile] }),
+				settings,
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
+		expect(settings.get("task.agentModelOverrides")).toEqual({});
 	});
 
 	test("persists profile ownership when a partial profile has no default mapping", async () => {
@@ -1241,7 +1222,7 @@ describe("model profile activation", () => {
 		const profile: ModelProfileDefinition = {
 			name: "delete-partial-alias-profile",
 			requiredProviders: [],
-			modelMapping: { executor: "glm-5.2:low" },
+			modelMapping: { executor: ["glm-5.2:low", "kimi-k3"] },
 			source: "user",
 		};
 		const unavailable = model("alpha", "zai/glm-5.2");
@@ -1252,9 +1233,9 @@ describe("model profile activation", () => {
 			getAll: () => [unavailable, available],
 			getAvailable: () => [available],
 			getApiKeyForProvider: async (provider: string) => (provider === "beta" ? "key-beta" : undefined),
-			lookupAliasExists: (alias: string) => alias === "glm-5.2",
-			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
-				options?.candidates?.[0],
+			lookupAliasExists: (alias: string) => alias === "glm-5.2" || alias === "kimi-k3",
+			resolveModelByLookupAlias: (alias: string, options?: { candidates?: readonly Model[] }) =>
+				alias === "glm-5.2" ? options?.candidates?.[0] : undefined,
 		};
 		const session = fakeSession();
 		session.configuredModelChains.set("default", ["provider-c/default"]);
@@ -1270,7 +1251,7 @@ describe("model profile activation", () => {
 			profileName: profile.name,
 		});
 
-		expect(settings.get("task.agentModelOverrides").executor).toBe("beta/zai/glm-5.2:low");
+		expect(settings.get("task.agentModelOverrides").executor).toEqual(["beta/zai/glm-5.2:low"]);
 		expect(settings.get("modelRoles").default).toBe("provider-c/default");
 		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
 	});

@@ -241,23 +241,28 @@ function concretizeMaterializedAssignmentValues(
 	const availableModels = modelRegistry.getAvailable();
 	return Object.fromEntries(
 		Object.entries(assignments).map(([role, selectorValue]) => {
-			const concrete = normalizeModelSelectorValue(selectorValue).map(selector => {
-				if (splitSelectorThinkingSuffix(selector).selector.includes("/")) return selector;
-				const resolved = resolveModelRoleValue(selector, availableModels, {
-					settings: options.settings as Settings,
-					modelRegistry,
-					sessionId,
-					credentialSessionId,
-					aliasIntent: "preset-equivalent",
-				});
-				if (!resolved.model) {
-					throw new Error(`Active model profile assignment ${role} could not be concretized: ${selector}`);
-				}
-				const concreteSelector = `${resolved.model.provider}/${resolved.model.id}`;
-				return resolved.explicitThinkingLevel && resolved.thinkingLevel
-					? formatModelSelectorValue(concreteSelector, resolved.thinkingLevel)
-					: concreteSelector;
-			});
+			const concrete = normalizeModelSelectorValue(selectorValue)
+				.map(selector => {
+					if (splitSelectorThinkingSuffix(selector).selector.includes("/")) return selector;
+					const resolved = resolveModelRoleValue(selector, availableModels, {
+						settings: options.settings as Settings,
+						modelRegistry,
+						sessionId,
+						credentialSessionId,
+						aliasIntent: "preset-equivalent",
+					});
+					if (!resolved.model) return undefined;
+					const concreteSelector = `${resolved.model.provider}/${resolved.model.id}`;
+					return resolved.explicitThinkingLevel && resolved.thinkingLevel
+						? formatModelSelectorValue(concreteSelector, resolved.thinkingLevel)
+						: concreteSelector;
+				})
+				.filter((selector): selector is string => selector !== undefined);
+			if (concrete.length === 0) {
+				throw new Error(
+					`Active model profile assignment ${role} could not be concretized: ${normalizeModelSelectorValue(selectorValue).join(", ")}`,
+				);
+			}
 			return [role, concrete.length === 1 && typeof selectorValue === "string" ? concrete[0] : concrete];
 		}),
 	);
@@ -549,6 +554,7 @@ async function resolveAndClampSelectorValue(
 		sessionId: string;
 		credentialSessionId: string;
 		aliasIntent: "preset-equivalent";
+		requireQualifiedResolution?: boolean;
 	},
 	profileLabel: string,
 	role: string,
@@ -556,6 +562,7 @@ async function resolveAndClampSelectorValue(
 	const selectors = normalizeModelSelectorValue(selectorValue);
 	const clamped: string[] = [];
 	const unresolvedKnownBareProviders = new Set<string>();
+	const unresolvedQualifiedSelectors: string[] = [];
 	let everySelectorIsKnownBare = selectors.length > 1;
 	let resolvedAny = false;
 	for (const selector of selectors) {
@@ -620,6 +627,7 @@ async function resolveAndClampSelectorValue(
 					everySelectorIsKnownBare = false;
 				}
 			} else {
+				unresolvedQualifiedSelectors.push(selector);
 				everySelectorIsKnownBare = false;
 			}
 			clamped.push(selector);
@@ -630,6 +638,11 @@ async function resolveAndClampSelectorValue(
 	}
 	if (!resolvedAny && everySelectorIsKnownBare && unresolvedKnownBareProviders.size > 0) {
 		throw new ModelProfileCredentialError(profileLabel, [...unresolvedKnownBareProviders].sort(), role);
+	}
+	if (options.requireQualifiedResolution && !resolvedAny && unresolvedQualifiedSelectors.length > 0) {
+		throw new Error(
+			`Model profile "${profileLabel}" ${role} selectors do not match any catalog model: ${unresolvedQualifiedSelectors.join(", ")}`,
+		);
 	}
 	return clamped.length === 1 && typeof selectorValue === "string" ? clamped[0] : clamped;
 }
@@ -674,9 +687,7 @@ async function concretizeProfileSelectorValue(
 						aliasIntent: "preset-equivalent",
 					});
 			if (!resolved.model) {
-				if (bareAlias) {
-					throw new Error(`Model profile deletion could not concretize authenticated selector: ${selector}`);
-				}
+				if (bareAlias) return undefined;
 				return selector;
 			}
 			const concreteSelector = `${resolved.model.provider}/${resolved.model.id}`;
@@ -685,7 +696,13 @@ async function concretizeProfileSelectorValue(
 				: concreteSelector;
 		}),
 	);
-	return concrete.length === 1 && typeof selectorValue === "string" ? concrete[0]! : concrete;
+	const resolvedConcrete = concrete.filter((selector): selector is string => selector !== undefined);
+	if (resolvedConcrete.length === 0) {
+		throw new Error(
+			`Model profile deletion could not concretize authenticated selector: ${normalizeModelSelectorValue(selectorValue)[0]}`,
+		);
+	}
+	return resolvedConcrete.length === 1 && typeof selectorValue === "string" ? resolvedConcrete[0]! : resolvedConcrete;
 }
 
 /**
@@ -829,6 +846,7 @@ export async function prepareModelProfileActivation(
 					sessionId: options.session.sessionId,
 					credentialSessionId,
 					aliasIntent: "preset-equivalent",
+					requireQualifiedResolution: profile.source !== "builtin",
 				},
 				profileLabel,
 				role,
@@ -849,6 +867,7 @@ export async function prepareModelProfileActivation(
 					sessionId: options.session.sessionId,
 					credentialSessionId,
 					aliasIntent: "preset-equivalent",
+					requireQualifiedResolution: profile.source !== "builtin",
 				},
 				profileLabel,
 				role,
@@ -1130,11 +1149,10 @@ export async function materializeModelProfileForDeletion(
 			throw error;
 		}
 	};
-	const concreteDefaultChain: string[] = [];
-	for (const selector of prepared.defaultChain) {
-		const concrete = await concretizeForDeletion(selector);
-		concreteDefaultChain.push(typeof concrete === "string" ? concrete : (concrete[0] ?? selector));
-	}
+	const concreteDefaultChain =
+		prepared.defaultChain.length > 0
+			? normalizeModelSelectorValue(await concretizeForDeletion(prepared.defaultChain))
+			: [];
 	const concreteModelRoles: Record<string, ModelSelectorValue> = {};
 	for (const [role, selector] of Object.entries(prepared.modelRoles)) {
 		concreteModelRoles[role] = await concretizeForDeletion(selector);

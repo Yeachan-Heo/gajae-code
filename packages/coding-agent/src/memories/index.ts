@@ -1091,6 +1091,8 @@ async function resolveMemoryModel(options: {
 			settings: session.settings,
 			matchPreferences: { usageOrder: session.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry,
+			sessionId: session.sessionId,
+			credentialSessionId: session.credentialSessionId,
 		});
 		if (resolved.model) return resolved.model;
 	}

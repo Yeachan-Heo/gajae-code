@@ -1276,7 +1276,7 @@
 								{
 									"type": "string",
 									"minLength": 1,
-									"pattern": "^(?:[^,/]+\\/[^,:]+|[^/,:]+)(?::(?:minimal|low|medium|high|xhigh|max))?$"
+									"pattern": "^(?:[^,/]+\\/[^,]+|[^/,]+)$"
 								},
 								{
 									"minItems": 1,
@@ -1284,7 +1284,7 @@
 									"items": {
 										"type": "string",
 										"minLength": 1,
-										"pattern": "^(?:[^,/]+\\/[^,:]+|[^/,:]+)(?::(?:minimal|low|medium|high|xhigh|max))?$"
+										"pattern": "^(?:[^,/]+\\/[^,]+|[^/,]+)$"
 									}
 								}
 							]

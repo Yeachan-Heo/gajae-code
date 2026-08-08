@@ -1877,10 +1877,15 @@ export class SelectorController {
 							// close or external teardown releases the subscriptions,
 							// so the controller only wires change repaints here.
 							let editor: ProviderOrderEditorComponent | undefined;
-							const context = new ProviderOrderContext(this.ctx.session.modelRegistry, this.ctx.settings, () => {
-								editor?.refresh();
-								this.ctx.ui.requestRender();
-							});
+							const context = new ProviderOrderContext(
+								this.ctx.session.modelRegistry,
+								this.ctx.settings,
+								() => {
+									editor?.refresh();
+									this.ctx.ui.requestRender();
+								},
+								this.ctx.session.credentialSessionId,
+							);
 							try {
 								editor = new ProviderOrderEditorComponent(
 									context,

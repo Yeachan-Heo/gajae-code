@@ -26,10 +26,12 @@ import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
+	kNoAuth,
 } from "../../config/model-registry";
 import {
 	formatModelSelectorValue,
 	resolveConfiguredModelPatterns,
+	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../../config/model-resolver";
@@ -385,6 +387,7 @@ export class ModelSelectorComponent extends Container {
 	#presetScopeMenuOpen: boolean = false;
 	#presetScopeIndex: number = 0;
 	#providerAuthById = new Map<string, boolean>();
+	#bareProfileAuthByName = new Map<string, boolean>();
 	#providerAuthPending: boolean = false;
 	#presetLoginHint?: string;
 	#authSessionId?: string;
@@ -529,17 +532,27 @@ export class ModelSelectorComponent extends Container {
 		const allModels = this.#modelRegistry.getAll();
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		const agentModelOverrides = this.#settings.get("task.agentModelOverrides");
+		const activeProfile = this.#activeModelProfile
+			? this.#modelRegistry.getModelProfile(this.#activeModelProfile)
+			: undefined;
+		const activeProfileBindings = activeProfile ? resolveProfileBindings(activeProfile) : undefined;
 		for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 			const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 			const roleValue =
 				target.settingsPath === "modelRoles" ? this.#settings.getModelRole(role) : agentModelOverrides[role];
 			if (!roleValue) continue;
+			const profileOwnsRole =
+				role === "default"
+					? activeProfileBindings?.defaultSelector !== undefined
+					: target.settingsPath === "modelRoles"
+						? Object.hasOwn(activeProfileBindings?.modelRoles ?? {}, role)
+						: Object.hasOwn(activeProfileBindings?.agentModelOverrides ?? {}, role);
 
 			const resolved = resolveModelRoleValue(roleValue, allModels, {
 				settings: this.#settings,
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
-				aliasIntent: this.#activeModelProfile ? "preset-equivalent" : undefined,
+				aliasIntent: profileOwnsRole ? "preset-equivalent" : undefined,
 				credentialSessionId: this.#authSessionId,
 			});
 			if (resolved.model) {
@@ -1244,8 +1257,10 @@ export class ModelSelectorComponent extends Container {
 				...Object.values(bindings.modelRoles),
 				...Object.values(bindings.agentModelOverrides),
 			];
+			const bareAssignmentsAvailable = this.#bareProfileAuthByName.get(profile.name) ?? true;
 			return values.every(value =>
 				normalizeModelSelectorValue(value).some(selector => {
+					if (!selector.includes("/")) return bareAssignmentsAvailable;
 					const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
 						settings: this.#settings,
 						modelRegistry: this.#modelRegistry,
@@ -1253,17 +1268,30 @@ export class ModelSelectorComponent extends Container {
 						credentialSessionId: this.#authSessionId,
 					}).model;
 					if (!resolved) return false;
-					const authStorage = this.#modelRegistry.authStorage as
-						| {
-								getEffectiveCredentialType?: (provider: string, sessionId?: string) => unknown;
-								hasUsableAuth?: (provider: string) => boolean;
-						  }
-						| undefined;
-					if (!authStorage) return true;
-					if (!authStorage.getEffectiveCredentialType && !authStorage.hasUsableAuth) return true;
+					if (this.#providerAuthById.get(resolved.provider) === true) return true;
+					const alternativeGroup = profile.alternativeProviderGroups?.find(group =>
+						group.includes(resolved.provider),
+					);
 					return (
-						authStorage.getEffectiveCredentialType?.(resolved.provider, this.#authSessionId) !== undefined ||
-						authStorage.hasUsableAuth?.(resolved.provider) === true
+						alternativeGroup?.some(provider => {
+							if (this.#providerAuthById.get(provider) !== true) return false;
+							const providerPrefix = `${resolved.provider}/`;
+							const replacementSelector = selector.startsWith(providerPrefix)
+								? `${provider}/${selector.slice(providerPrefix.length)}`
+								: selector;
+							return (
+								resolveModelRoleValue(
+									replacementSelector,
+									this.#modelRegistry.getAvailable().filter(model => model.provider === provider),
+									{
+										settings: this.#settings,
+										modelRegistry: this.#modelRegistry,
+										aliasIntent: "preset-equivalent",
+										credentialSessionId: this.#authSessionId,
+									},
+								).model !== undefined
+							);
+						}) ?? false
 					);
 				}),
 			);
@@ -1282,21 +1310,82 @@ export class ModelSelectorComponent extends Container {
 	async #refreshProviderAuth(): Promise<void> {
 		const providers = new Set<string>();
 		for (const profiles of this.#getPresetGroups().values()) {
-			for (const profile of profiles)
+			for (const profile of profiles) {
 				for (const provider of profileRequiredProviders(profile)) providers.add(provider);
+				const bindings = resolveProfileBindings(profile);
+				const values = [
+					...(bindings.defaultSelector ? [bindings.defaultSelector] : []),
+					...Object.values(bindings.modelRoles),
+					...Object.values(bindings.agentModelOverrides),
+				];
+				for (const value of values) {
+					for (const selector of normalizeModelSelectorValue(value)) {
+						const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+							settings: this.#settings,
+							modelRegistry: this.#modelRegistry,
+							aliasIntent: "preset-equivalent",
+							credentialSessionId: this.#authSessionId,
+						}).model;
+						if (resolved) providers.add(resolved.provider);
+					}
+				}
+			}
 		}
 		this.#providerAuthPending = providers.size > 0;
 		this.#renderPresetLanding();
-		const entries = await Promise.all(
-			[...providers].map(async provider => {
-				const apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.#authSessionId);
-				return [provider, isAuthenticated(apiKey)] as const;
-			}),
-		);
-		this.#providerAuthById = new Map(entries);
-		this.#providerAuthPending = false;
-		this.#renderPresetLanding();
-		this.#tui.requestRender();
+		try {
+			const entries = await Promise.all(
+				[...providers].map(async provider => {
+					try {
+						const apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.#authSessionId);
+						return [provider, apiKey === kNoAuth || isAuthenticated(apiKey)] as const;
+					} catch {
+						return [provider, false] as const;
+					}
+				}),
+			);
+			this.#providerAuthById = new Map(entries);
+			const profileAuthEntries = await Promise.all(
+				[...this.#getPresetGroups().values()].flat().map(async profile => {
+					const bindings = resolveProfileBindings(profile);
+					const values = [
+						...(bindings.defaultSelector ? [bindings.defaultSelector] : []),
+						...Object.values(bindings.modelRoles),
+						...Object.values(bindings.agentModelOverrides),
+					];
+					const bareValues = values.filter(value =>
+						normalizeModelSelectorValue(value).some(selector => !selector.includes("/")),
+					);
+					const available = await Promise.all(
+						bareValues.map(async value => {
+							try {
+								const resolution = await resolveModelChainWithAuth(
+									normalizeModelSelectorValue(value),
+									this.#modelRegistry,
+									this.#settings,
+									this.#authSessionId,
+									{
+										managedFallback: true,
+										aliasIntent: "preset-equivalent",
+										canonicalSessionId: null,
+										credentialSessionId: this.#authSessionId,
+									},
+								);
+								return resolution.model !== undefined;
+							} catch {
+								return false;
+							}
+						}),
+					);
+					return [profile.name, available.every(Boolean)] as const;
+				}),
+			);
+			this.#bareProfileAuthByName = new Map(profileAuthEntries);
+		} finally {
+			this.#providerAuthPending = false;
+			this.#renderPresetLanding();
+			this.#tui.requestRender();
+		}
 	}
 
 	#clampPresetCursor(): void {

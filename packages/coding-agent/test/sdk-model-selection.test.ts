@@ -463,6 +463,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			modelPattern: undefined,
 			settings: Settings.isolated({ "modelProfile.default": profileName }),
 			sessionManager: resumedManager,
+			providerSessionId: "provider-affinity",
 		});
 
 		try {
@@ -472,6 +473,10 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(lookupAliasSpy).toHaveBeenCalled();
 			expect(resolveAliasSpy).toHaveBeenCalled();
 			expect(session.getActiveModelProfile()).toBe(profileName);
+			expect(modelRegistry.getSessionCanonicalVariant("provider-affinity")).toBe(
+				"alias-provider/synthetic/flare-alias",
+			);
+			expect(modelRegistry.getSessionCanonicalVariant(resumedManager.getSessionId())).toBeUndefined();
 		} finally {
 			await session.dispose();
 		}

@@ -1425,7 +1425,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				matchPreferences: modelMatchPreferences,
 				modelRegistry,
 				...(settingsProfileAliasIntent ?? {}),
-				sessionId: logicalSessionId,
+				sessionId: providerSessionId,
 				credentialSessionId,
 			}),
 		);
@@ -1453,6 +1453,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			resumeModelBehavior !== "useCurrentDefault"
 				? resolvedPersistedProfileName
 				: undefined;
+		const persistedProfileOwnsDefault = acceptedPersistedProfileName
+			? resolveProfileBindings(persistedProfiles.get(acceptedPersistedProfileName)!).defaultSelector !== undefined
+			: false;
 		const startupActiveModelProfile =
 			acceptedInheritedProfileName ??
 			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
@@ -1467,8 +1470,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					credentialSessionId,
 					{
 						managedFallback: defaultModelEntries.length > 1,
-						canonicalSessionId: logicalSessionId,
-						...(acceptedPersistedProfileName ? { aliasIntent: "preset-equivalent" as const } : {}),
+						canonicalSessionId: providerSessionId,
+						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 					},
 				);
 				model = restoredDefaultResolution.model;
@@ -1714,6 +1717,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
 			getActiveSkillState: () => session?.getActiveSkillState(),
@@ -1814,6 +1818,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			isManagedDestination: () => sessionManager.isManagedDestination(),
 			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
 			getSessionId: () => sessionManager.getSessionId(),
+			getCredentialSessionId: () => credentialSessionId,
 		};
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
@@ -2244,6 +2249,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			};
 			const { model: resolved } = parseModelPattern(options.modelPattern, availableModels, matchPreferences, {
 				modelRegistry,
+				sessionId: logicalSessionId,
+				credentialSessionId,
 			});
 			if (resolved) {
 				model = resolved;
@@ -2331,7 +2338,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const getSessionContext = () => ({
 			sessionManager: createReadonlySessionManager(sessionManager),
 			modelRegistry,
-			credentialSessionId,
+			get credentialSessionId() {
+				return session.credentialSessionId;
+			},
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
 			hasQueuedMessages: () => session.queuedMessageCount > 0,
@@ -2361,7 +2370,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const customToolContext = (): CustomToolContext => ({
 				sessionManager: createReadonlySessionManager(sessionManager),
 				modelRegistry,
-				credentialSessionId,
+				get credentialSessionId() {
+					return session?.credentialSessionId ?? credentialSessionId;
+				},
 				model: agent?.state.model,
 				isIdle: () => !session?.isStreaming,
 				hasQueuedMessages: () => (session?.queuedMessageCount ?? 0) > 0,

@@ -599,6 +599,7 @@ export class ExtensionRunner {
 
 	createContext(): ExtensionContext {
 		const getModel = this.#getModel;
+		const getCredentialSessionId = this.#getCredentialSessionId;
 		return {
 			ui: this.#uiContext,
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -608,7 +609,9 @@ export class ExtensionRunner {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
-			credentialSessionId: this.#getCredentialSessionId(),
+			get credentialSessionId() {
+				return getCredentialSessionId();
+			},
 			get model() {
 				return getModel();
 			},

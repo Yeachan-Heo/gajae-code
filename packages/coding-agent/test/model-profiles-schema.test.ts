@@ -89,7 +89,7 @@ describe("model profile schema", () => {
 		}
 	});
 
-	test("bare aliases and nested qualified selectors are accepted while bad effort is rejected", () => {
+	test("bare, routed, and colon-bearing selectors are accepted", () => {
 		const bareAlias = ModelsConfigSchema.safeParse({
 			profiles: { agnostic: { required_providers: [], model_mapping: { default: "gpt-5.4" } } },
 		});
@@ -101,17 +101,16 @@ describe("model profile schema", () => {
 				},
 			},
 		});
+		const colonRoute = ModelsConfigSchema.safeParse({
+			profiles: { routed: { required_providers: [], model_mapping: { default: "shared:exacto:high" } } },
+		});
 		const badEffort = ModelsConfigSchema.safeParse({
 			profiles: { bad: { required_providers: ["x"], model_mapping: { default: "x/model:ultra" } } },
 		});
 		expect(bareAlias.success).toBe(true);
 		expect(nestedQualified.success).toBe(true);
-		expect(badEffort.success).toBe(false);
-		if (!badEffort.success) {
-			expect(badEffort.error.issues[0]?.message).toBe(
-				"Expected modelId or provider/modelId with optional :effort suffix",
-			);
-		}
+		expect(badEffort.success).toBe(true);
+		expect(colonRoute.success).toBe(true);
 	});
 
 	test("comma-chain selectors are rejected with model_mapping path", () => {
@@ -135,9 +134,9 @@ describe("model profile schema", () => {
 		});
 
 		expect(commaChain.success).toBe(false);
-		expect(badEffort.success).toBe(false);
+		expect(badEffort.success).toBe(true);
 		expect(badProvider.success).toBe(false);
-		for (const result of [commaChain, badEffort, badProvider]) {
+		for (const result of [commaChain, badProvider]) {
 			if (!result.success) {
 				expect(issuePaths(result.error)).toContain("profiles.bad.model_mapping.default");
 				expect(result.error.issues[0]?.message).toBe(

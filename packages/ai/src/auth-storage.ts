@@ -4207,11 +4207,12 @@ export class AuthStorage {
 	): Promise<boolean> {
 		const signal = isAbortSignalOption(optionsOrSignal) ? optionsOrSignal : optionsOrSignal?.signal;
 		const sessionId = isAbortSignalOption(optionsOrSignal) ? undefined : optionsOrSignal?.sessionId;
-		const stored = this.#getStoredCredentials(provider);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const stored = this.#getStoredCredentials(storageProvider);
 		let matched: { id: number; type: AuthCredential["type"]; index: number } | undefined;
 		for (let index = 0; index < stored.length; index++) {
 			const entry = stored[index];
-			if (entry && (await this.#credentialMatchesApiKey(provider, entry.credential, apiKey))) {
+			if (entry && (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey))) {
 				matched = { id: entry.id, type: entry.credential.type, index };
 				break;
 			}
@@ -4222,9 +4223,9 @@ export class AuthStorage {
 			return false;
 		}
 
-		this.#clearSessionCredential(provider, sessionId);
+		this.#clearSessionCredential(storageProvider, sessionId);
 		this.#markCredentialBlocked(
-			this.#getProviderTypeKey(provider, matched.type),
+			this.#getProviderTypeKey(storageProvider, matched.type),
 			matched.index,
 			Date.now() + AuthStorage.#defaultBackoffMs,
 		);
@@ -4236,9 +4237,9 @@ export class AuthStorage {
 			await this.reload();
 		}
 
-		const latestRows = this.#store.listAuthCredentials(provider);
+		const latestRows = this.#store.listAuthCredentials(storageProvider);
 		this.#setStoredCredentials(
-			provider,
+			storageProvider,
 			latestRows.map(row => ({ id: row.id, credential: row.credential })),
 		);
 		return true;

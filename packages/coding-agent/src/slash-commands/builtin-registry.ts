@@ -280,6 +280,8 @@ function resolveModelCommandSelectionFromAvailable(
 	const matchPreferences = { usageOrder: runtime.settings.getStorage()?.getModelUsageOrder() };
 	const resolved = parseModelPattern(selector, availableModels, matchPreferences, {
 		modelRegistry: runtime.session.modelRegistry,
+		sessionId: runtime.session.sessionId,
+		credentialSessionId: runtime.session.credentialSessionId,
 	});
 	if (!resolved.model) {
 		return undefined;
