@@ -93,7 +93,7 @@ describe("editToolRenderer", () => {
 					.join("\n"),
 			);
 			expect(collapsed).toContain("a.ts");
-			expect(collapsed).toContain("외 1개");
+			expect(collapsed).toContain("(+1 more)");
 			expect(collapsed).not.toContain(expectedDetail);
 			expect(expanded).toContain(expectedDetail);
 		}
@@ -135,6 +135,23 @@ describe("editToolRenderer", () => {
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 		expect(rendered).toContain("packages/coding-agent/src/edit/renderer.ts");
 		expect(rendered).not.toContain("The first line of the patch must be");
+	});
+	it("suppresses only the missing end marker while apply_patch arguments are partial", async () => {
+		const uiTheme = await getUiTheme();
+		const args = { input: "*** Begin Patch\n*** Add File: a.ts\n+preview" };
+		const partial = editToolRenderer.renderCall(
+			args,
+			{ expanded: true, isPartial: true, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+		const complete = editToolRenderer.renderCall(
+			args,
+			{ expanded: true, isPartial: false, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+
+		expect(Bun.stripANSI(partial.render(160).join("\n"))).not.toContain("*** End Patch");
+		expect(Bun.stripANSI(complete.render(160).join("\n"))).toContain("*** End Patch");
 	});
 
 	it("hides hashline envelope input while the live card is collapsed", async () => {
@@ -404,6 +421,26 @@ describe("editToolRenderer", () => {
 		expect(bLine).not.toContain("wrong.ts");
 		expect(rendered).toContain("b failed");
 		expect(rendered).toContain("1 more file pending");
+	});
+	it("does not render pending rows for completed multi-file results", async () => {
+		const uiTheme = await getUiTheme();
+		const component = editToolRenderer.renderResult(
+			{
+				content: [],
+				details: {
+					diff: "",
+					perFileResults: [
+						{ path: "a.ts", diff: "+ok", op: "create" },
+						{ path: "b.ts", diff: "+ok", op: "update" },
+					],
+				},
+			},
+			{ expanded: false, isPartial: false, renderContext: { editMode: "patch" } },
+			uiTheme,
+			{ edits: [{ path: "a.ts" }, { path: "b.ts" }, { path: "c.ts" }] },
+		);
+
+		expect(Bun.stripANSI(component.render(160).join("\n"))).not.toContain("pending");
 	});
 
 	it("preserves Vim renderer delegation", async () => {

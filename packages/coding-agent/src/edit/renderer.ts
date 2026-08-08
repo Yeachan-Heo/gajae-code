@@ -363,7 +363,7 @@ export const editToolRenderer = {
 			options?.spinnerFrame !== undefined ? formatStatusIcon("running", uiTheme, options.spinnerFrame) : "";
 		let text = `${formatTitle(getOperationTitle(op), uiTheme)} ${spinner ? `${spinner} ` : ""}${description}`;
 		if (inventory.paths.length > 1) {
-			text += uiTheme.fg("dim", ` (외 ${inventory.paths.length - 1}개)`);
+			text += uiTheme.fg("dim", ` (+${inventory.paths.length - 1} more)`);
 		}
 		if (!options.expanded) return new Text(text, 0, 0);
 
@@ -412,17 +412,15 @@ function resolveCompletedEditIdentity(
 	args: EditRenderArgs | undefined,
 	editMode: EditMode | undefined,
 	isPartial: boolean,
-	preview: DiffResult | DiffError | undefined,
 ): { path: string; op: Operation | undefined; move: string | undefined; firstChangedLine: number | undefined } {
 	const firstEdit = args?.edits?.[0];
 	const inventory = getEditRequestTargetInventory(args, editMode, { isPartial });
 	const detailsPath = details && "path" in details ? details.path : undefined;
-	const previewLine = preview && "firstChangedLine" in preview ? preview.firstChangedLine : undefined;
 	return {
 		path: detailsPath ?? args?.file_path ?? args?.path ?? firstEdit?.path ?? inventory.paths[0] ?? "",
 		op: details?.op ?? args?.op ?? firstEdit?.op,
 		move: details?.move ?? args?.rename ?? firstEdit?.rename ?? firstEdit?.move,
-		firstChangedLine: details?.firstChangedLine ?? firstEdit?.firstChangedLine ?? previewLine,
+		firstChangedLine: details?.firstChangedLine ?? firstEdit?.firstChangedLine,
 	};
 }
 
@@ -494,19 +492,18 @@ function renderSingleFileResult(
 			(details && "errorText" in details && details.errorText) ||
 			(result.content?.find(c => c.type === "text")?.text ?? "")
 		: "";
+	const baseIdentity = resolveCompletedEditIdentity(details, args, options.renderContext?.editMode, options.isPartial);
 	let cached: RenderCache | undefined;
 
 	return {
 		render(width) {
 			const { expanded, renderContext } = options;
 			const preview = renderContext?.editDiffPreview;
-			const identity = resolveCompletedEditIdentity(
-				details,
-				args,
-				renderContext?.editMode,
-				options.isPartial,
-				preview,
-			);
+			const previewLine = preview && "firstChangedLine" in preview ? preview.firstChangedLine : undefined;
+			const identity = {
+				...baseIdentity,
+				firstChangedLine: baseIdentity.firstChangedLine ?? previewLine,
+			};
 			const { description } = formatEditDescription(identity.path, uiTheme, {
 				rename: identity.move,
 				firstChangedLine: identity.firstChangedLine,
@@ -591,7 +588,7 @@ function renderMultiFileResult(
 			fileArgs,
 		);
 	});
-	const remaining = Math.max(0, totalFiles - representedFiles);
+	const remaining = options.isPartial ? Math.max(0, totalFiles - representedFiles) : 0;
 
 	let cached: RenderCache | undefined;
 
