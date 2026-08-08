@@ -99,6 +99,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		// ExtensionContextActions
 		{
 			getModel: () => session.model,
+			getCredentialSessionId: () => session.credentialSessionId,
 			isIdle: () => !session.isStreaming,
 			getActivePromptHandle: () => session.activePromptHandle,
 			abort: () => session.abort(),

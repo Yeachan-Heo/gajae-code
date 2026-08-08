@@ -33,6 +33,7 @@ type ModelProfileActivationSession = Pick<
 	AgentSession,
 	"model" | "thinkingLevel" | "sessionId" | "getConfiguredModelChain" | "setConfiguredModelChain"
 > & {
+	credentialSessionId?: string;
 	setModelTemporary?: AgentSession["setModelTemporary"];
 	setActiveModelProfile?: (name: string | undefined) => void;
 	getActiveModelProfile?: () => string | undefined;
@@ -536,7 +537,13 @@ function getBareSelectorCredentialProviders(selector: string, modelRegistry: Mod
 async function resolveAndClampSelectorValue(
 	selectorValue: ModelSelectorValue,
 	availableModels: Model<Api>[],
-	options: { settings: Settings; modelRegistry: ModelRegistry; sessionId: string; aliasIntent: "preset-equivalent" },
+	options: {
+		settings: Settings;
+		modelRegistry: ModelRegistry;
+		sessionId: string;
+		credentialSessionId: string;
+		aliasIntent: "preset-equivalent";
+	},
 	profileLabel: string,
 	role: string,
 ): Promise<ModelSelectorValue> {
@@ -554,18 +561,23 @@ async function resolveAndClampSelectorValue(
 				{
 					getAvailable: () => availableModels,
 					getApiKey: model =>
-						options.modelRegistry.getApiKeyForProvider(model.provider, options.sessionId, model.baseUrl),
+						options.modelRegistry.getApiKeyForProvider(
+							model.provider,
+							options.credentialSessionId,
+							model.baseUrl,
+						),
 					resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel.bind(options.modelRegistry),
 					resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
 					lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 					clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
 				},
 				options.settings,
-				options.sessionId,
+				options.credentialSessionId,
 				{
 					managedFallback: true,
 					aliasIntent: options.aliasIntent,
 					canonicalSessionId: options.sessionId,
+					credentialSessionId: options.credentialSessionId,
 				},
 			);
 			resolved = {
@@ -621,6 +633,7 @@ async function concretizeProfileSelectorValue(
 	prepared: PreparedModelProfileActivation,
 ): Promise<ModelSelectorValue> {
 	const candidates = prepared.modelRegistry.getAvailable?.() ?? prepared.modelRegistry.getAll();
+	const credentialSessionId = prepared.session.credentialSessionId ?? prepared.session.sessionId;
 	const concrete = await Promise.all(
 		normalizeModelSelectorValue(selectorValue).map(async selector => {
 			const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
@@ -630,11 +643,7 @@ async function concretizeProfileSelectorValue(
 						{
 							getAvailable: () => candidates,
 							getApiKey: model =>
-								prepared.modelRegistry.getApiKeyForProvider(
-									model.provider,
-									prepared.session.sessionId,
-									model.baseUrl,
-								),
+								prepared.modelRegistry.getApiKeyForProvider(model.provider, credentialSessionId, model.baseUrl),
 							resolveCanonicalModel: prepared.modelRegistry.resolveCanonicalModel.bind(prepared.modelRegistry),
 							resolveModelByLookupAlias: prepared.modelRegistry.resolveModelByLookupAlias?.bind(
 								prepared.modelRegistry,
@@ -643,17 +652,19 @@ async function concretizeProfileSelectorValue(
 							clearCanonicalVariant: prepared.modelRegistry.clearCanonicalVariant?.bind(prepared.modelRegistry),
 						},
 						prepared.settings as Settings,
-						prepared.session.sessionId,
+						credentialSessionId,
 						{
 							managedFallback: true,
 							aliasIntent: "preset-equivalent",
 							canonicalSessionId: prepared.session.sessionId,
+							credentialSessionId,
 						},
 					)
 				: resolveModelRoleValue(selector, candidates, {
 						settings: prepared.settings as Settings,
 						modelRegistry: prepared.modelRegistry,
 						sessionId: prepared.session.sessionId,
+						credentialSessionId,
 						aliasIntent: "preset-equivalent",
 					});
 			if (!resolved.model) {
@@ -701,6 +712,7 @@ export async function prepareModelProfileActivation(
 	// Snapshot the exact pre-clear sticky selector (verbatim, not re-derived from
 	// the live model) so a failed prepare/apply/materialize rollback restores the
 	// genuinely-sticky provider even when the live model is a transient switch.
+	const credentialSessionId = options.session.credentialSessionId ?? options.session.sessionId;
 	const previousCanonicalVariant = options.modelRegistry.getSessionCanonicalVariant?.(options.session.sessionId);
 
 	// Explicit profile activation/reselection invalidates the session's sticky
@@ -716,7 +728,7 @@ export async function prepareModelProfileActivation(
 		const missingProviders: string[] = [];
 		const authenticatedProviders: string[] = [];
 		for (const provider of requiredProviders) {
-			const apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.session.sessionId);
+			const apiKey = await options.modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
 			if (apiKey !== kNoAuth && !isAuthenticated(apiKey)) {
 				missingProviders.push(provider);
 			} else {
@@ -753,6 +765,7 @@ export async function prepareModelProfileActivation(
 								settings: options.settings as Settings,
 								modelRegistry: options.modelRegistry as ModelRegistry,
 								sessionId: options.session.sessionId,
+								credentialSessionId,
 								aliasIntent: "preset-equivalent",
 							},
 							profileLabel,
@@ -774,8 +787,13 @@ export async function prepareModelProfileActivation(
 				clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
 			} as ModelRegistry,
 			options.settings as Settings,
-			options.session.sessionId,
-			{ managedFallback: true, aliasIntent: "preset-equivalent" },
+			credentialSessionId,
+			{
+				managedFallback: true,
+				aliasIntent: "preset-equivalent",
+				canonicalSessionId: options.session.sessionId,
+				credentialSessionId,
+			},
 		);
 		const defaultModel = defaultResolution.model;
 		const defaultThinkingLevel = defaultResolution.thinkingLevel;
@@ -803,6 +821,7 @@ export async function prepareModelProfileActivation(
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
 					sessionId: options.session.sessionId,
+					credentialSessionId,
 					aliasIntent: "preset-equivalent",
 				},
 				profileLabel,
@@ -822,6 +841,7 @@ export async function prepareModelProfileActivation(
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
 					sessionId: options.session.sessionId,
+					credentialSessionId,
 					aliasIntent: "preset-equivalent",
 				},
 				profileLabel,

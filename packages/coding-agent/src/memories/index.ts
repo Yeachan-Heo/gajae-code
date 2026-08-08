@@ -238,7 +238,7 @@ async function runPhase1(options: {
 			logger.debug("Phase1 skipped: no model available");
 			return;
 		}
-		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.sessionId);
+		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.credentialSessionId);
 		if (!phase1ApiKey) {
 			logger.debug("Phase1 skipped: no API key for phase1 model", {
 				provider: phase1Model.provider,
@@ -401,7 +401,7 @@ async function runPhase2(options: {
 			});
 			return;
 		}
-		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
+		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.credentialSessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {
 				claim,

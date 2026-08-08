@@ -756,7 +756,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					if (includesRoleAgent) {
 						const apiKey = await runtime.session.modelRegistry.getApiKey(
 							selection.model,
-							runtime.session.sessionId,
+							runtime.session.credentialSessionId,
 						);
 						if (!apiKey) {
 							throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);

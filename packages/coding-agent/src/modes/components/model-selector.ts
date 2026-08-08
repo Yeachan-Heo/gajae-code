@@ -1251,6 +1251,7 @@ export class ModelSelectorComponent extends Container {
 							settings: this.#settings,
 							modelRegistry: this.#modelRegistry,
 							aliasIntent: "preset-equivalent",
+							credentialSessionId: this.#authSessionId,
 						}).model !== undefined
 					);
 				}),
@@ -1482,6 +1483,8 @@ export class ModelSelectorComponent extends Container {
 				settings: this.#settings,
 				matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,
+				aliasIntent: "preset-equivalent",
+				credentialSessionId: this.#authSessionId,
 			});
 			const label = GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase();
 			this.#listContainer.addChild(

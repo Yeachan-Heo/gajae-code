@@ -518,7 +518,7 @@ function createQuerySurface(
 		}
 		return undefined;
 	};
-	const profileCredentialSessionId = (ctx as { credentialSessionId?: string }).credentialSessionId ?? id;
+	const profileCredentialSessionId = ctx.credentialSessionId ?? id;
 	const resolveProfileAvailability = async (
 		profile: ModelProfileDefinition,
 		authenticatedProviders: ReadonlySet<string>,

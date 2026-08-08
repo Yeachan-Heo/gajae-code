@@ -360,6 +360,8 @@ export interface ExtensionContext {
 	sessionMetadata?: ExtensionSessionMetadata;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
+	/** Credential-selection identity, distinct from logical/provider cache identity. */
+	credentialSessionId?: string;
 	/** Current model (may be undefined) */
 	model: Model | undefined;
 	/** Whether the agent is idle (not streaming) */
@@ -1479,6 +1481,7 @@ export interface ExtensionActions {
 /** Actions for ExtensionContext (ctx.* in event handlers). */
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
+	getCredentialSessionId?: () => string;
 	isIdle: () => boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle?: () => string | undefined;

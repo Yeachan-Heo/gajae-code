@@ -1353,7 +1353,7 @@ export class SelectorController {
 		await Promise.all(
 			oauthProviders.map(provider =>
 				this.ctx.session.modelRegistry
-					.getApiKeyForProvider(provider.id, this.ctx.session.sessionId)
+					.getApiKeyForProvider(provider.id, this.ctx.session.credentialSessionId)
 					.catch(() => undefined),
 			),
 		);
@@ -2388,7 +2388,7 @@ export class SelectorController {
 							if (includesRoleAgent) {
 								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
 									model,
-									this.ctx.session.sessionId,
+									this.ctx.session.credentialSessionId,
 								);
 								if (!apiKey) {
 									throw new Error(`No API key for ${model.provider}/${model.id}`);
@@ -2397,7 +2397,7 @@ export class SelectorController {
 							if (includesDefault && !includesRoleAgent) {
 								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
 									model,
-									this.ctx.session.sessionId,
+									this.ctx.session.credentialSessionId,
 								);
 								if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 							}
@@ -2474,7 +2474,10 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
 							// Default: update agent state and persist as the active default model.
-							const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
+							const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+								model,
+								this.ctx.session.credentialSessionId,
+							);
 							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
@@ -2519,7 +2522,10 @@ export class SelectorController {
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
 							this.ctx.ui.requestRender();
 						} else {
-							const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
+							const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+								model,
+								this.ctx.session.credentialSessionId,
+							);
 							if (!apiKey) {
 								throw new Error(`No API key for ${model.provider}/${model.id}`);
 							}
@@ -2562,7 +2568,7 @@ export class SelectorController {
 				},
 				{
 					...options,
-					sessionId: this.ctx.session.sessionId,
+					sessionId: this.ctx.session.credentialSessionId,
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
 						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
@@ -3431,7 +3437,7 @@ export class SelectorController {
 					validateAuth: async (selectedProviderId: string) => {
 						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
 							selectedProviderId,
-							this.ctx.session.sessionId,
+							this.ctx.session.credentialSessionId,
 						);
 						return !!apiKey;
 					},

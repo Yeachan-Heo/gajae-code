@@ -1860,6 +1860,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 					{
 						getModel: () => session.model,
+						getCredentialSessionId: () => session.credentialSessionId,
 						isIdle: () => !session.isStreaming,
 						getActivePromptHandle: () => session.activePromptHandle,
 						abort: () => session.abort(),

@@ -197,6 +197,7 @@ export class ExtensionRunner {
 	#attemptRecordStore: AttemptRecordStore | undefined;
 
 	#getModel: () => Model | undefined = () => undefined;
+	#getCredentialSessionId: () => string = () => "";
 	#isIdleFn: () => boolean = () => true;
 	#getActivePromptHandleFn: () => string | undefined = () => undefined;
 	#waitForIdleFn: () => Promise<void> = async () => {};
@@ -323,6 +324,7 @@ export class ExtensionRunner {
 
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
+		this.#getCredentialSessionId = contextActions.getCredentialSessionId ?? (() => "");
 		this.#isIdleFn = contextActions.isIdle;
 		this.#getActivePromptHandleFn = contextActions.getActivePromptHandle ?? (() => undefined);
 		this.#abortFn = contextActions.abort;
@@ -606,6 +608,7 @@ export class ExtensionRunner {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
+			credentialSessionId: this.#getCredentialSessionId(),
 			get model() {
 				return getModel();
 			},

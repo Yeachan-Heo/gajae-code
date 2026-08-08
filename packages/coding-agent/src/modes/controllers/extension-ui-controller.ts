@@ -575,6 +575,7 @@ export class ExtensionUiController {
 		};
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
+			getCredentialSessionId: () => this.ctx.session.credentialSessionId,
 			isIdle: () => !this.ctx.session.isStreaming,
 			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
 			abort: () => this.ctx.session.abort(),
@@ -892,6 +893,7 @@ export class ExtensionUiController {
 		};
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
+			getCredentialSessionId: () => this.ctx.session.credentialSessionId,
 			isIdle: () => !this.ctx.session.isStreaming,
 			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
 			abort: () => this.ctx.session.abort(),
