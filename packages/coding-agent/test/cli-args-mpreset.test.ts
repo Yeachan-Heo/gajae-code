@@ -576,6 +576,43 @@ test("root startup recovers a missing credential only for an input-free interact
 	]);
 });
 
+test("root startup recovers when a persisted bare alias loses its last credential", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "bare-default" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "bare-default",
+				requiredProviders: [],
+				modelMapping: { default: "default" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async () => undefined,
+		resolveCanonicalModel: () => undefined,
+		getCanonicalVariants: () => [],
+		getCanonicalId: () => undefined,
+	} as never;
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry,
+		parsedArgs: {},
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(result.recoverableErrors).toEqual([
+		expect.stringContaining('Model profile "bare-default" requires credentials for: profile-provider'),
+	]);
+});
+
 test.each([
 	["redirected terminal", true, false, undefined, [], undefined],
 	["print or text", false, true, undefined, [], undefined],

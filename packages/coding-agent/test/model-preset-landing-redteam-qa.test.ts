@@ -342,6 +342,25 @@ describe("preset landing adversarial QA", () => {
 		expect(text).toContain("Preset preview: Alias Fallback Profile");
 		expect(text).not.toContain("No available model matches this preset");
 	});
+	test("provider-qualified selectors require an available catalog model", async () => {
+		const unavailablePinnedProfile: ModelProfileDefinition = {
+			name: "unavailable-pinned-profile",
+			displayName: "Unavailable Pinned Profile",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/missing" },
+			source: "builtin",
+		};
+		const selector = createSelector({
+			authenticatedProviders: ["provider-a"],
+			profiles: [unavailablePinnedProfile],
+		});
+		await rendered(selector);
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("No available model matches this preset");
+		expect(text).not.toContain("Preset preview: Unavailable Pinned Profile");
+	});
 
 	test("preview clamps codex eco executor to low and omits suffix for suffixless selector", async () => {
 		const selector = createSelector();

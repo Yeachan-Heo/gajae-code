@@ -386,12 +386,14 @@ export class ModelProfileCredentialError extends Error {
 	readonly code = "authentication_failed";
 	readonly profileLabel: string;
 	readonly providers: readonly string[];
+	readonly role: string | undefined;
 
-	constructor(profileLabel: string, providers: readonly string[]) {
+	constructor(profileLabel: string, providers: readonly string[], role?: string) {
 		super(formatModelProfileCredentialError(profileLabel, providers));
 		this.name = "ModelProfileCredentialError";
 		this.profileLabel = profileLabel;
 		this.providers = [...providers];
+		this.role = role;
 	}
 }
 
@@ -473,6 +475,17 @@ function formatMaterializedSelector(selector: string, model: Model<Api>): string
 	if (!explicitThinkingLevel || parseModelString(clampedSelector)?.thinkingLevel) return clampedSelector;
 	return formatModelSelectorValue(clampedSelector, explicitThinkingLevel);
 }
+function getBareSelectorCredentialProviders(selector: string, modelRegistry: ModelRegistry): string[] {
+	const alias = splitSelectorThinkingSuffix(selector).selector.trim().toLowerCase();
+	const providers = modelRegistry
+		.getAll()
+		.filter(model => {
+			const modelId = model.id.trim().toLowerCase();
+			return modelId === alias || modelId.slice(modelId.lastIndexOf("/") + 1) === alias;
+		})
+		.map(model => model.provider);
+	return [...new Set(providers)];
+}
 
 async function resolveAndClampSelectorValue(
 	selectorValue: ModelSelectorValue,
@@ -486,6 +499,7 @@ async function resolveAndClampSelectorValue(
 	for (const selector of selectors) {
 		const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
 		let resolved = resolveModelRoleValue(selector, availableModels, options);
+		const initiallyResolvedProvider = resolved.model?.provider;
 		if (bareAlias) {
 			const authenticated = await resolveModelChainWithAuth(
 				[selector],
@@ -515,8 +529,16 @@ async function resolveAndClampSelectorValue(
 		}
 		if (!resolved.model) {
 			if (bareAlias && selectors.length === 1) {
-				throw new Error(
-					`Model profile "${profileLabel}" ${role} selector did not resolve to an authenticated model: ${selector}`,
+				const providers = getBareSelectorCredentialProviders(selector, options.modelRegistry);
+				const bareSelector = splitSelectorThinkingSuffix(selector).selector;
+				throw new ModelProfileCredentialError(
+					profileLabel,
+					providers.length > 0
+						? providers
+						: initiallyResolvedProvider
+							? [initiallyResolvedProvider]
+							: [bareSelector],
+					role,
 				);
 			}
 			clamped.push(selector);

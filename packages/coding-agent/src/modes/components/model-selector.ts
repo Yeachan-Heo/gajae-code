@@ -32,7 +32,6 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
-	splitSelectorThinkingSuffix,
 } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue, selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
@@ -1250,7 +1249,6 @@ export class ModelSelectorComponent extends Container {
 			];
 			return values.every(value =>
 				normalizeModelSelectorValue(value).some(selector => {
-					if (splitSelectorThinkingSuffix(selector).selector.includes("/")) return true;
 					return (
 						resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
 							settings: this.#settings,
@@ -2006,7 +2004,10 @@ export class ModelSelectorComponent extends Container {
 			// navigable so the user can drill in and pick a usable member.
 			if (!this.#isPresetGroupUsable(row.profiles)) {
 				const missing = this.#getMissingProviders(row.profiles);
-				this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
+				this.#presetLoginHint =
+					missing.length > 0
+						? `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`
+						: "No available model matches this preset";
 				this.#renderPresetLanding();
 				return;
 			}

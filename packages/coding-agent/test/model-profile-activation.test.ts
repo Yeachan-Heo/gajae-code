@@ -7,6 +7,7 @@ import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
+	ModelProfileCredentialError,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
@@ -245,7 +246,13 @@ describe("model profile activation", () => {
 				settings,
 				profileName: profile.name,
 			}),
-		).rejects.toThrow("executor selector did not resolve to an authenticated model: deepseek-v4-flash:high");
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			code: "authentication_failed",
+			profileLabel: profile.name,
+			providers: ["deepseek-v4-flash"],
+			role: "executor",
+		});
 		expect(session.model?.id).toBe("initial");
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
 		expect(session.getActiveModelProfile()).toBeUndefined();
@@ -377,6 +384,29 @@ describe("model profile activation", () => {
 		expect(session.seedDefaultFallbackResolutionCalls).toEqual([
 			{ activeIndex: 1, skips: [{ selector: "missing-alias", reason: "unknown_model" }] },
 		]);
+	});
+	test("reports an unavailable single bare alias as a recoverable credential error", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-bare-only",
+			requiredProviders: [],
+			modelMapping: { default: "default" },
+			source: "user",
+		};
+
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: fakeRegistry({ missingProviders: ["provider-a", "provider-c"], profiles: [profile] }),
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			code: "authentication_failed",
+			profileLabel: profile.name,
+			providers: ["provider-a", "provider-c"],
+			role: "default",
+		});
 	});
 
 	test("preserves a fully unresolved executor chain and skips it without request attempts", async () => {

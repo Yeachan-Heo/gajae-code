@@ -31,6 +31,7 @@ function installTestTheme(): void {
 const defaultModel = model("provider-a", "default");
 const alternateModel = model("provider-a", "alternate");
 const aliasModel = model("provider-b", "org/flare-alias");
+const providerBDefault = model("provider-b", "default");
 const profile: ModelProfileDefinition = {
 	name: "profile-a",
 	displayName: "Profile Alpha",
@@ -53,8 +54,8 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 	return {
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
-		getAvailable: () => [defaultModel, alternateModel, aliasModel],
-		getAll: () => [defaultModel, alternateModel, aliasModel],
+		getAvailable: () => [defaultModel, alternateModel, aliasModel, providerBDefault],
+		getAll: () => [defaultModel, alternateModel, aliasModel, providerBDefault],
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
