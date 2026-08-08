@@ -170,6 +170,7 @@ describe("editToolRenderer", () => {
 			uiTheme,
 		);
 
+
 		expect(Bun.stripANSI(partial.render(160).join("\n"))).not.toContain("*** End Patch");
 		expect(Bun.stripANSI(complete.render(160).join("\n"))).toContain("*** End Patch");
 	});
