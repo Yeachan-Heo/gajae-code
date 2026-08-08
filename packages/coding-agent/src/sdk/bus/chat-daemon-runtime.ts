@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { type IndexedSession, SessionIndex } from "../broker/session-index";
 import { SdkClient, SdkClientError } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
@@ -110,17 +111,39 @@ type FrameOrigin = "live" | "ordered";
 type ReplayBarrier = {
 	held: HeldFrame[] | undefined;
 	detached: boolean;
+	/**
+	 * Set when a round could not close the gap it fenced — the replay went
+	 * unanswered, or the hold buffer overflowed. The attachment stops delivering
+	 * from that point on, because lifting the fence instead would let the next live
+	 * frame drag the cursor over sequences nobody ever delivered.
+	 */
+	failed: boolean;
 };
 
 /**
  * How many live frames one attachment holds while its replay is outstanding.
  *
- * The window is a single round trip on an open socket, so the bound is only there to
- * keep a flooding session from growing the buffer without limit. Overflow drops from
- * the front, because the replay is issued from the cursor — below every held frame —
- * and so is likeliest to carry the oldest of them anyway.
+ * The window is a single round trip on an open socket, so the bound is only there
+ * to keep a flooding session from growing the buffer without limit. Overflow is
+ * barrier failure rather than an eviction: the oldest held frame is the one the
+ * cursor needs next, and dropping the newest still leaves a hole no drain can
+ * close, so the attachment is rebuilt from its cursor and its replay re-fetches
+ * the whole gap instead.
  */
 const REPLAY_BARRIER_LIMIT = 1_024;
+
+/**
+ * How many times one round re-issues a refused replay, and the backoff it doubles
+ * from.
+ *
+ * A socket that never dropped sends no hello, so nothing but this round can
+ * re-issue the replay it owes — `client.onReconnect` fires only for a new
+ * connection id. The retry therefore rides the same live socket, and the budget is
+ * bounded so a host that never serves the gap ends in a rebuild rather than a
+ * barrier that fences ingress forever.
+ */
+const REPLAY_RETRY_ATTEMPTS = 3;
+const REPLAY_RETRY_BACKOFF_MS = 100;
 
 type AttachedSession = Readonly<{
 	id: string;
@@ -530,18 +553,24 @@ export class ChatDaemonRuntime {
 		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
 		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return;
 		const existing = this.#sessions.get(indexed.sessionId);
-		if (
-			existing &&
+		const resumable =
+			existing !== undefined &&
 			existing.endpoint.url === endpoint.url &&
 			existing.endpoint.token === endpoint.token &&
-			existing.generation === indexed.endpointGeneration
-		) {
+			existing.generation === indexed.endpointGeneration;
+		if (existing && resumable && !existing.barrier.failed) {
 			// The attachment is current, so reconcile's remaining job is keeping its socket
 			// dialed: `SdkClient` retires a closed socket and re-dials only on the next
 			// request, and a passive subscription issues none.
 			this.#reviveTransport(existing);
 			return;
 		}
+		// A failed barrier is rebuilt rather than revived, and its cursor travels into the
+		// replacement: same endpoint, same generation, same stream, so the replay this
+		// attach issues asks for exactly the gap the failed round left open, and every
+		// sequence already published stays below the cursor that drops it. A rolled
+		// generation is a different stream, so that fence resets the cursor to zero.
+		const resumeSeq = existing && resumable ? existing.cursor.seq : 0;
 		if (existing) {
 			this.#sessions.delete(indexed.sessionId);
 			existing.dispose();
@@ -549,7 +578,7 @@ export class ChatDaemonRuntime {
 		}
 		const client = await (this.deps.createClient ?? connectAttachedSession)(endpoint);
 		let attached: AttachedSession | undefined;
-		const barrier: ReplayBarrier = { held: undefined, detached: false };
+		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
 		const disposeFrames = client.onFrame(frame => {
 			if (attached) this.schedule(this.enqueueFrame(attached, frame, "live"));
 		});
@@ -571,7 +600,7 @@ export class ChatDaemonRuntime {
 			endpoint,
 			generation: indexed.endpointGeneration,
 			client,
-			cursor: { seq: 0 },
+			cursor: { seq: resumeSeq },
 			barrier,
 			dispose: () => {
 				disposeFrames();
@@ -590,7 +619,7 @@ export class ChatDaemonRuntime {
 				attached.client.send({ type: "reply", id: route.actionId, answer: route.answer });
 			},
 		});
-		await this.#replayAttachment(attached, 0);
+		await this.#replayAttachment(attached, resumeSeq);
 	}
 
 	/**
@@ -632,29 +661,47 @@ export class ChatDaemonRuntime {
 	 * own endpoint generation and from its own cursor, and it is dropped whole if the
 	 * runtime has since detached, rolled, or superseded this attachment — so a stale
 	 * incarnation can never resurrect its events onto a newer one's root.
+	 *
+	 * A refused replay loses nothing either: the cursor stays where the request was
+	 * issued from, the held frames stay held, and the round re-issues on the socket
+	 * it already has. When that budget runs out the barrier fails whole and the
+	 * attachment is rebuilt from its cursor, so the gap stays re-fetchable and no
+	 * live frame can step over it in the meantime.
 	 */
 	async #replayAttachment(attached: AttachedSession, sinceSeq: number): Promise<void> {
-		if (attached.barrier.detached || this.#sessions.get(attached.sessionId) !== attached) return;
+		if (!this.#attachmentLive(attached)) return;
 		const held: HeldFrame[] = [];
 		attached.barrier.held = held;
 		try {
 			let replay: Record<string, unknown>;
-			try {
-				replay = await attached.client.request({
-					type: "event_replay",
-					sinceGeneration: attached.generation,
-					sinceSeq,
-				});
-			} catch {
-				// An unanswered replay is a transport failure, not a delivery decision: the
-				// cursor stands, so the next reconnect re-issues it from the same place. The
-				// held frames are discarded for that same reason — publishing past the gap
-				// this replay owed would drag the cursor over events that were never
-				// delivered and leave that re-issue nothing left to close.
-				return;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					replay = await attached.client.request({
+						type: "event_replay",
+						sinceGeneration: attached.generation,
+						sinceSeq,
+					});
+					break;
+				} catch {
+					// An unanswered replay is a transport failure, not a delivery decision, and
+					// the gap it owed is still owed: the cursor stays at `sinceSeq` and the held
+					// frames stay held, so the retry asks for exactly the same gap. It is issued
+					// on this attachment's own live socket, which is the only producer that can
+					// close the gap when no hello is coming.
+					if (attempt >= REPLAY_RETRY_ATTEMPTS) {
+						this.#failBarrier(attached, "replay went unanswered");
+						return;
+					}
+					await Bun.sleep(REPLAY_RETRY_BACKOFF_MS * 2 ** attempt);
+					// A later round or a disposal may have taken this attachment's ingress over
+					// while the retry waited. That round owes the same gap from the same cursor,
+					// so this one stands down instead of asking for it twice.
+					if (attached.barrier.held !== held) return;
+					if (!this.#attachmentLive(attached)) return;
+				}
 			}
 			if (attached.barrier.held !== held) return;
-			if (attached.barrier.detached || this.#sessions.get(attached.sessionId) !== attached) return;
+			if (!this.#attachmentLive(attached)) return;
 			if (Array.isArray(replay.events))
 				for (const event of replay.events)
 					if (event && typeof event === "object" && !Array.isArray(event))
@@ -665,6 +712,40 @@ export class ChatDaemonRuntime {
 			// installed its own, and clearing that one would strand the frames it holds.
 			if (attached.barrier.held === held) attached.barrier.held = undefined;
 		}
+	}
+
+	/**
+	 * Whether `attached` is still the incarnation this runtime publishes through.
+	 *
+	 * Detachment, supersession, and a barrier that could not close its gap all retire
+	 * an attachment the same way: whatever it still carries is dead work, and
+	 * publishing any of it would either resurrect a stale incarnation or step the
+	 * cursor over a sequence nobody delivered.
+	 */
+	#attachmentLive(attached: AttachedSession): boolean {
+		return (
+			!attached.barrier.detached && !attached.barrier.failed && this.#sessions.get(attached.sessionId) === attached
+		);
+	}
+
+	/**
+	 * Retire one attachment whose barrier could not close the gap it fenced.
+	 *
+	 * The cursor is left at the last contiguously published sequence and delivery
+	 * stops there, so nothing can carry it over the gap. Reconcile then rebuilds the
+	 * attachment against the same endpoint generation and hands that cursor to the
+	 * replacement, whose replay re-fetches exactly what this round could not close —
+	 * held frames are dropped only because that replay re-issues every one of them.
+	 * Loud, because a barrier that cannot close is a transport fault rather than a
+	 * delivery decision.
+	 */
+	#failBarrier(attached: AttachedSession, reason: string): void {
+		if (attached.barrier.detached || attached.barrier.failed) return;
+		attached.barrier.failed = true;
+		attached.barrier.held = undefined;
+		logger.warn(
+			`chat daemon replay barrier failed (${reason}); rebuilding session ${attached.sessionId} at generation ${attached.generation} from seq ${attached.cursor.seq}.`,
+		);
 	}
 
 	/**
@@ -679,7 +760,7 @@ export class ChatDaemonRuntime {
 	async #drainHeldFrames(attached: AttachedSession, held: HeldFrame[]): Promise<void> {
 		for (;;) {
 			if (attached.barrier.held !== held) return;
-			if (attached.barrier.detached || this.#sessions.get(attached.sessionId) !== attached) return;
+			if (!this.#attachmentLive(attached)) return;
 			if (held.length === 0) {
 				attached.barrier.held = undefined;
 				return;
@@ -780,7 +861,7 @@ export class ChatDaemonRuntime {
 		frame: Record<string, unknown>,
 		origin: FrameOrigin,
 	): Promise<void> {
-		if (attached.barrier.detached || this.#sessions.get(attached.sessionId) !== attached) return;
+		if (!this.#attachmentLive(attached)) return;
 		// Correlate before anything is acted on. A frame whose envelope and payload
 		// disagree on session, lifecycle identity, or lifecycle generation is not a
 		// usable event, so it is dropped whole — no close, resume, notify, resolve,
@@ -808,8 +889,15 @@ export class ChatDaemonRuntime {
 			if (held && origin === "live") {
 				// A replay is outstanding, so where this frame sits in the stream is not
 				// settled yet: hold it, and let the drain place it after the answer.
+				if (held.length >= REPLAY_BARRIER_LIMIT) {
+					// Overflow is not a choice between frames: evicting the oldest silently
+					// skips the sequence the cursor needs next, and evicting the newest leaves
+					// a hole no drain can close. So the barrier fails whole instead, and the
+					// rebuild re-fetches the gap from this attachment's own cursor.
+					this.#failBarrier(attached, `hold buffer overflowed at ${REPLAY_BARRIER_LIMIT} frames`);
+					return;
+				}
 				held.push({ seq, frame });
-				if (held.length > REPLAY_BARRIER_LIMIT) held.shift();
 				return;
 			}
 			attached.cursor.seq = seq;

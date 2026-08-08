@@ -11,6 +11,12 @@ import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } f
 
 const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
+/**
+ * Mirrors `REPLAY_BARRIER_LIMIT`: how many live frames one attachment holds behind an
+ * outstanding replay. Too low a mirror still overflows the real barrier; too high a real
+ * limit leaves the flood below it, and the test fails on the frames that never arrive.
+ */
+const HOLD_LIMIT = 1_024;
 
 class FakeSlackProvider implements SlackProviderClient {
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
@@ -51,6 +57,8 @@ class FakeSessionHost {
 	replayRewind = 0;
 	/** Accepts replay requests and never answers them, the way a wedged host would. */
 	stallReplay = false;
+	/** Refuses this many replays with a typed error, leaving the socket that carried them open. */
+	rejectReplays = 0;
 	#generation = GENERATION;
 	#log: Array<Record<string, unknown>> = [];
 	#connections = 0;
@@ -69,13 +77,25 @@ class FakeSessionHost {
 	 * attached the event still enters the log — that is the gap a reconnect owes.
 	 */
 	emit(text: string): Record<string, unknown> {
+		return this.#record("notice", { type: "notice", text });
+	}
+
+	/**
+	 * Records one live turn-stream event. It owns a sequence, so the barrier orders it
+	 * like any other, but presentation drops it — it costs a hold slot and nothing else.
+	 */
+	emitStream(): Record<string, unknown> {
+		return this.#record("turn_stream", { type: "turn_stream", phase: "live" });
+	}
+
+	#record(kind: string, payload: Record<string, unknown>): Record<string, unknown> {
 		const event = {
 			type: "event",
-			kind: "notice",
+			kind,
 			sessionId: SESSION_ID,
 			generation: this.#generation,
 			seq: this.#log.length + 1,
-			payload: { type: "notice", text },
+			payload,
 		};
 		this.#log.push(event);
 		this.#socket?.deliver(event);
@@ -100,6 +120,18 @@ class FakeSessionHost {
 		if (frame.type !== "event_replay") return;
 		this.replayRequests.push({ sinceGeneration: frame.sinceGeneration, sinceSeq: frame.sinceSeq });
 		if (this.stallReplay) return;
+		if (this.rejectReplays > 0) {
+			this.rejectReplays -= 1;
+			queueMicrotask(() =>
+				socket.deliver({
+					type: "event_replay_result",
+					id: frame.id,
+					ok: false,
+					error: { code: "replay_unavailable", message: "replay log unavailable" },
+				}),
+			);
+			return;
+		}
 		const asked = typeof frame.sinceSeq === "number" ? frame.sinceSeq : 0;
 		const sinceSeq = Math.max(0, asked - this.replayRewind);
 		const events =
@@ -454,3 +486,146 @@ test("a supersession while a replay is pending discards it instead of replaying 
 		});
 	});
 }, 20_000);
+
+test("a replay refused on a live socket loses no event and leaves the cursor below the gap", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+			// The host refuses the resume replay on a socket that stays open. No hello can
+			// follow a socket that never dropped, so nothing but this round will ever
+			// re-issue the replay that owes the gap.
+			host.rejectReplays = 1;
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			// Delivered on the live socket after the refusal, while the gap is still open.
+			host.emit("three");
+
+			await awaitPosts(provider, 3);
+			await Bun.sleep(20);
+			// The refusal costs the stream nothing: every sequence, exactly once, in order.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nthree",
+			]);
+			// The cursor never moved over the un-replayed gap: the retry asks from the same
+			// acknowledged sequence, and it rides the socket that is already open rather
+			// than waiting for a reconnect that is not coming.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+			expect(FakeWebSocket.instances).toHaveLength(2);
+		});
+	});
+}, 20_000);
+
+test("a replay refused past its retry budget rebuilds the attachment from its cursor", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+			// Refuses the resume replay and every retry it is allowed, so the round runs out
+			// of budget with the gap still open.
+			host.rejectReplays = 4;
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 5);
+			// The barrier has failed by now, so this frame is not published on the fenced
+			// attachment — but it is in the host log, so the rebuild owes it too.
+			host.emit("three");
+
+			reconcile();
+			host.accept(await awaitSocket(3));
+			await awaitPosts(provider, 3);
+			await Bun.sleep(20);
+			// The rebuild resumes the same stream instead of restarting it: nothing above the
+			// cursor is skipped, and nothing at or below it is published twice.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nthree",
+			]);
+			// Every request after the initial attach asks from the last acknowledged
+			// sequence, including the one the rebuilt attachment issues.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+		});
+	});
+}, 30_000);
+
+test("a hold buffer that overflows re-fetches the gap instead of skipping the frame the cursor needs next", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+			host.stallReplay = true;
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+
+			// One frame more than the barrier may hold, all on the live socket, while the
+			// replay they are fenced behind never answers. The oldest and the newest carry
+			// text so both ends of the buffer are observable; the rest only take slots.
+			host.emit("flood head");
+			for (let index = 0; index < HOLD_LIMIT - 1; index++) host.emitStream();
+			host.emit("flood tail");
+
+			host.stallReplay = false;
+			reconcile();
+			host.accept(await awaitSocket(3));
+			await awaitPosts(provider, 4);
+			await Bun.sleep(20);
+			// Overflow re-fetches the gap from the cursor rather than evicting inside it:
+			// "flood head" is the oldest held frame and the one the cursor needs first, and
+			// it is still published, in sequence, ahead of the frame that overflowed it.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nflood head",
+				"GJC notice\nflood tail",
+			]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+		});
+	});
+}, 30_000);
