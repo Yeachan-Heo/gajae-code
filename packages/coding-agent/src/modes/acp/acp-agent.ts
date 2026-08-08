@@ -387,7 +387,7 @@ export interface TranscriptReplayContent {
 }
 
 /** Machine-readable reason replay could not restore a transcript entry. */
-export type TranscriptReplaySkipReason = "transcript_body_unavailable";
+export type TranscriptReplaySkipReason = "transcript_body_unavailable" | "transcript_tool_call_unavailable";
 
 /**
  * Replay decides per entry. An entry whose production body is missing is not
@@ -408,6 +408,55 @@ export function transcriptReplayContent(entry: unknown): TranscriptReplayEntry {
 			images: { available: false, reason: "historical_transcript_images_unavailable" },
 		},
 	};
+}
+
+/**
+ * `transcript.list` answers an entry larger than one page with a body-less row
+ * `{ id, error: { code: "item_too_large" }, continuations }`. Each continuation is a
+ * `Q23` (`resource.body`) descriptor for one indexed string field of that entry, so
+ * the row is a pointer to the largest message in the session rather than a broken
+ * entry. Replay follows it instead of dropping the message.
+ */
+export interface TranscriptContinuation {
+	query: string;
+	resourceKind: string;
+	resourceId: string;
+	revision: string;
+	itemId: string;
+	field: string;
+}
+
+/** Fields replay consumes; `textSummary` and the rest stay unread so recovery costs one query per used field. */
+const RECOVERABLE_TRANSCRIPT_FIELDS = ["role", "body", "toolCallId", "toolName"] as const;
+
+/** Stands in for a tool result whose transcript entry replay could not restore. */
+const TRANSCRIPT_TOOL_RESULT_UNAVAILABLE = "The transcript entry holding this tool result could not be replayed.";
+
+export function transcriptContinuations(entry: unknown): TranscriptContinuation[] {
+	const record = object(entry);
+	if (!Array.isArray(record?.continuations)) return [];
+	const descriptors: TranscriptContinuation[] = [];
+	for (const value of record.continuations) {
+		const candidate = object(value);
+		if (
+			typeof candidate?.query !== "string" ||
+			typeof candidate.resourceKind !== "string" ||
+			typeof candidate.resourceId !== "string" ||
+			typeof candidate.revision !== "string" ||
+			typeof candidate.itemId !== "string" ||
+			typeof candidate.field !== "string"
+		)
+			continue;
+		descriptors.push({
+			query: candidate.query,
+			resourceKind: candidate.resourceKind,
+			resourceId: candidate.resourceId,
+			revision: candidate.revision,
+			itemId: candidate.itemId,
+			field: candidate.field,
+		});
+	}
+	return descriptors;
 }
 
 type ReceivedSdkEvent = {
@@ -2168,6 +2217,90 @@ export class AcpAgent implements Agent {
 		);
 	}
 
+	/**
+	 * Reassembles a body-less `item_too_large` entry from the `continuations` the
+	 * producer already published, reading each field replay consumes through the same
+	 * `resource.body` query the descriptor names. Returns undefined only when the entry
+	 * is genuinely unrecoverable: no readable body, or no role to place it with.
+	 */
+	async #recoverTranscriptEntry(adapter: AcpSdkAdapter, entry: JsonObject): Promise<JsonObject | undefined> {
+		const continuations = transcriptContinuations(entry);
+		if (continuations.length === 0) return undefined;
+		const recovered: JsonObject = { ...entry };
+		for (const field of RECOVERABLE_TRANSCRIPT_FIELDS) {
+			const continuation = continuations.find(candidate => candidate.field === field);
+			if (!continuation) continue;
+			const value = await this.#readContinuation(adapter, continuation);
+			if (value !== undefined) recovered[field] = value;
+		}
+		return typeof recovered.body === "string" && typeof recovered.role === "string" ? recovered : undefined;
+	}
+
+	/** Follows one continuation to its end, joining every page of that field's bytes. */
+	async #readContinuation(adapter: AcpSdkAdapter, continuation: TranscriptContinuation): Promise<string | undefined> {
+		const chunks: string[] = [];
+		let cursor: string | undefined;
+		for (let pageCount = 0; pageCount < MAX_ACP_REPLAY_PAGES; pageCount++) {
+			let response: JsonObject | undefined;
+			try {
+				response = object(
+					await adapter.query(
+						continuation.query,
+						cursor
+							? {}
+							: {
+									resourceKind: continuation.resourceKind,
+									resourceId: continuation.resourceId,
+									revision: continuation.revision,
+									itemId: continuation.itemId,
+									field: continuation.field,
+								},
+						cursor,
+					),
+				);
+			} catch {
+				// A continuation that cannot be read costs one entry, never the whole
+				// `session/load`; the caller reports the boundary instead.
+				return undefined;
+			}
+			const result = object(response?.result) ?? response;
+			const page = object(result?.page);
+			const chunk = object(Array.isArray(page?.items) ? page.items[0] : undefined);
+			if (typeof chunk?.body !== "string") return undefined;
+			chunks.push(chunk.body);
+			cursor = typeof page?.continuationCursor === "string" ? page.continuationCursor : undefined;
+			if (!cursor) return chunks.join("");
+		}
+		return undefined;
+	}
+
+	/**
+	 * A skipped `toolResult` would leave its already-published `tool_call` at
+	 * `status: "pending"` forever, so replay closes it with the same
+	 * `tool_execution_end` shape a real result uses. Replay cannot know the outcome, so
+	 * it reports failure rather than claiming a success it cannot prove.
+	 */
+	async #closeUnresolvedReplayToolCall(
+		id: string,
+		adapter: AcpSdkAdapter,
+		cwd: string,
+		toolCallId: string,
+		tool: { name: string; args: unknown },
+	): Promise<void> {
+		for (const notification of mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId,
+				toolName: tool.name,
+				result: { content: [{ type: "text", text: TRANSCRIPT_TOOL_RESULT_UNAVAILABLE }] },
+				isError: true,
+			} as never,
+			id,
+			{ cwd, getToolArgs: () => tool.args },
+		))
+			await this.#publishSessionUpdate(id, notification, adapter);
+	}
+
 	async #replaySession(id: string): Promise<void> {
 		const adapter = this.#adapter(id);
 		const record = this.#sessions.get(id);
@@ -2182,12 +2315,23 @@ export class AcpAgent implements Agent {
 			const result = object(response?.result) ?? response;
 			const page = object(result?.page);
 			for (const item of Array.isArray(page?.items) ? page.items : []) {
-				const message = object(item);
-				if (!message) continue;
+				const raw = object(item);
+				if (!raw) continue;
+				// A body-less row is usually an oversized message, not a malformed entry:
+				// its `continuations` say exactly how to read it back, so replay follows
+				// them instead of dropping the largest message in the session.
+				const message =
+					typeof raw.body === "string" ? raw : ((await this.#recoverTranscriptEntry(adapter, raw)) ?? raw);
 				const replay = transcriptReplayContent(message);
 				if (!replay.replayable) {
 					unreplayableEntries++;
 					unreplayableReason ??= replay.reason;
+					const unresolvedId = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
+					const unresolved = unresolvedId === undefined ? undefined : replayTools.get(unresolvedId);
+					if (unresolvedId !== undefined && unresolved) {
+						replayTools.delete(unresolvedId);
+						await this.#closeUnresolvedReplayToolCall(id, adapter, record.cwd, unresolvedId, unresolved);
+					}
 					continue;
 				}
 				const content = replay.content;
@@ -2270,7 +2414,13 @@ export class AcpAgent implements Agent {
 				if (message.role === "toolResult" && typeof message.toolCallId === "string") {
 					const replayTool = replayTools.get(message.toolCallId);
 					const toolName = typeof message.toolName === "string" ? message.toolName : replayTool?.name;
-					if (!toolName) continue;
+					// Pairing outranks content: publishing a result whose `tool_call` start
+					// never reached the client renders an update for a call it never saw begin.
+					if (!toolName || !replayTool) {
+						unreplayableEntries++;
+						unreplayableReason ??= "transcript_tool_call_unavailable";
+						continue;
+					}
 					const resultContent = richContent
 						?.map(object)
 						.filter(
