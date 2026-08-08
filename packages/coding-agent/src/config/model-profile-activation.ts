@@ -889,6 +889,7 @@ export async function applyPreparedModelProfileActivation(
 	let modelRolesChanged = false;
 	let persistentMutationStarted = false;
 	let defaultChainChanged = false;
+	let resumeDefaultChanged = false;
 
 	try {
 		const ownedDefaultChain =
@@ -948,6 +949,7 @@ export async function applyPreparedModelProfileActivation(
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
 		if (prepared.defaultModel) {
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
+			resumeDefaultChanged = true;
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
 		}
 		prepared.session.noteProfileInstalledOverrides?.(
@@ -1017,6 +1019,9 @@ export async function applyPreparedModelProfileActivation(
 			} catch (rollbackError) {
 				rollbackErrors.push(rollbackError);
 			}
+		}
+		if (resumeDefaultChanged) {
+			restore(() => prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel));
 		}
 		if (defaultChainChanged) {
 			const previousChain = prepared.previousDefaultChainState;

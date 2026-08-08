@@ -518,6 +518,7 @@ function createQuerySurface(
 		}
 		return undefined;
 	};
+	const profileCredentialSessionId = (ctx as { credentialSessionId?: string }).credentialSessionId ?? id;
 	const resolveProfileAvailability = async (
 		profile: ModelProfileDefinition,
 		authenticatedProviders: ReadonlySet<string>,
@@ -553,17 +554,17 @@ function createQuerySurface(
 					selectors,
 					{
 						...ctx.modelRegistry,
-						getAvailable: () => ctx.modelRegistry.getAll(),
+						getAvailable: () => ctx.modelRegistry.getAvailable(),
 						getApiKey: (model: Model<Api>, sessionId?: string) =>
 							ctx.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
 					},
 					options.settings,
-					id,
+					profileCredentialSessionId,
 					{
 						managedFallback: true,
 						aliasIntent: "preset-equivalent",
 						canonicalSessionId: null,
-						credentialSessionId: id,
+						credentialSessionId: profileCredentialSessionId,
 					},
 				);
 				if (!resolution.model) return { available: false };
@@ -666,7 +667,7 @@ function createQuerySurface(
 			let authenticatedProviders: ReadonlySet<string>;
 			try {
 				authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
-					ctx.modelRegistry.getApiKeyForProvider(provider, id),
+					ctx.modelRegistry.getApiKeyForProvider(provider, profileCredentialSessionId),
 				);
 			} catch {
 				// Availability join failed: degrade only the synthetic facade,
@@ -749,7 +750,7 @@ function createQuerySurface(
 		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
 			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
-				ctx.modelRegistry.getApiKeyForProvider(provider, id),
+				ctx.modelRegistry.getApiKeyForProvider(provider, profileCredentialSessionId),
 			);
 			return (await Promise.all(
 				projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(async item => ({

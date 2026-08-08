@@ -6141,7 +6141,7 @@ export class AgentSession {
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
 		this.agent.setMetadataResolver((provider: string) =>
-			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage),
+			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage, this.credentialSessionId),
 		);
 	}
 
@@ -11249,7 +11249,7 @@ export class AgentSession {
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 		const previousEditMode = this.#resolveActiveEditMode();
 		const expectedSessionId = this.sessionId;
-		const apiKey = await this.#modelRegistry.getApiKey(model, expectedSessionId);
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (options?.signal?.aborted) return;
 		if (this.sessionId !== expectedSessionId) {
 			throw new Error("Session changed while selecting model");
@@ -14859,7 +14859,7 @@ export class AgentSession {
 								telemetry,
 								authCredentialType: this.#modelRegistry.getSessionCredentialType(
 									candidate.provider,
-									this.sessionId,
+									this.credentialSessionId,
 								),
 							});
 							break;
@@ -15704,24 +15704,24 @@ export class AgentSession {
 		// (1) Pin guard, before any mutation and for every branch.
 		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) return false;
 
-		const providerAffinitySessionId = this.agent.providerSessionId ?? this.agent.sessionId ?? this.sessionId;
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId);
+		const credentialSessionId = this.credentialSessionId;
+		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
 		let mutated: boolean;
 		if (trigger.class === "auth") {
 			if (!isAuthenticated(activeApiKey)) return false;
 			mutated = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
-				sessionId: providerAffinitySessionId,
+				sessionId: credentialSessionId,
 			});
 		} else {
-			mutated = await authStorage.markUsageLimitReached(provider, providerAffinitySessionId, {
+			mutated = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				retryAfterMs: trigger.retryAfterMs,
 			});
 		}
 		if (!mutated) return false;
 
 		// (3) Distinct-row proof.
-		return (await this.#modelRegistry.getApiKey(this.model, providerAffinitySessionId)) !== activeApiKey;
+		return (await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey;
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -16799,7 +16799,7 @@ export class AgentSession {
 			thinkingLevel: this.thinkingLevel ?? ThinkingLevel.Off,
 			hideThinkingSummary: this.agent.hideThinkingSummary ?? false,
 			serviceTier: this.serviceTier,
-			credentialSessionId: providerAffinitySessionId,
+			credentialSessionId: this.credentialSessionId,
 			providerAffinitySessionId,
 			sideSessionId: `${providerAffinitySessionId}:btw:${crypto.randomUUID()}`,
 		};

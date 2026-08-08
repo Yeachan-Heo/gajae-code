@@ -86,18 +86,30 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
 	});
 
-	it("resolves profile role metadata without changing canonical affinity", async () => {
+	it("resolves a profile-owned role without changing canonical affinity", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const executorModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
 		await createSession({
 			initialModelId: defaultModel.id,
 			initialThinkingLevel: Effort.High,
-			modelRoles: { default: "claude-sonnet-4-5", slow: "claude-sonnet-4-6" },
+			modelRoles: {},
 		});
-		session.setActiveModelProfile("provider-agnostic-profile");
+		sessionSettings.set("task.agentModelOverrides", { executor: "profile-alias" });
+		vi.spyOn(modelRegistry, "getModelProfile").mockReturnValue({
+			name: "executor-profile",
+			requiredProviders: [],
+			modelMapping: { executor: "profile-alias" },
+			source: "user",
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([executorModel]);
+		vi.spyOn(modelRegistry, "lookupAliasExists").mockReturnValue(true);
+		const aliasLookup = vi.spyOn(modelRegistry, "resolveModelByLookupAlias").mockReturnValue(executorModel);
+		session.setActiveModelProfile("executor-profile");
 		modelRegistry.seedCanonicalVariant(session.sessionId, defaultModel);
 		const before = modelRegistry.getSessionCanonicalVariant(session.sessionId);
 
-		expect(session.resolveRoleModelWithThinking("slow").model?.id).toBe("claude-sonnet-4-6");
+		expect(session.resolveRoleModelWithThinking("executor").model?.id).toBe(executorModel.id);
+		expect(aliasLookup).toHaveBeenCalled();
 		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
 	});
 
@@ -120,6 +132,27 @@ describe("AgentSession role model thinking behavior", () => {
 		session.setActiveModelProfile("planner-only");
 
 		expect(session.resolveRoleModelWithThinking("executor").model?.id).toBe("claude-sonnet-4-6");
+		expect(aliasLookup).not.toHaveBeenCalled();
+	});
+
+	it("keeps a manual default exact when a partial profile does not own default", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: "claude-sonnet-4-5" },
+		});
+		vi.spyOn(modelRegistry, "getModelProfile").mockReturnValue({
+			name: "planner-only",
+			requiredProviders: [],
+			modelMapping: { planner: "claude-sonnet-4-6" },
+			source: "user",
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([defaultModel]);
+		const aliasLookup = vi.spyOn(modelRegistry, "resolveModelByLookupAlias");
+		session.setActiveModelProfile("planner-only");
+
+		expect(session.resolveConfiguredDefaultModel()?.id).toBe(defaultModel.id);
 		expect(aliasLookup).not.toHaveBeenCalled();
 	});
 

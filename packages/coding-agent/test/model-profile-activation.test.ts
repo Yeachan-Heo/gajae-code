@@ -150,7 +150,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			activeIndex: number;
 			skips: Array<{ selector: string; reason: string }>;
 		}>,
-		resumeDefaultSelectors: [] as string[],
+		resumeDefaultSelectors: [] as Array<string | undefined>,
 		getConfiguredModelChain(role: string) {
 			return this.configuredModelChains.get(role);
 		},
@@ -180,7 +180,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			this.thinkingLevel = thinkingLevel;
 		},
 		recordResumeDefaultModel(selector: string | undefined) {
-			if (selector !== undefined) this.resumeDefaultSelectors.push(selector);
+			this.resumeDefaultSelectors.push(selector);
 		},
 		getSessionDefaultModelSelector() {
 			return this.resumeDefaultSelectors.at(-1);
@@ -1904,6 +1904,7 @@ describe("preset-equivalent profile activation", () => {
 		const session = fakeSession(priorModel);
 		const settings = Settings.isolated();
 		sticky.set(session.sessionId, "provider-a/opus-real");
+		session.recordResumeDefaultModel("provider-a/opus-real");
 
 		const prepared = await prepareModelProfileActivation({
 			session,
@@ -1915,14 +1916,17 @@ describe("preset-equivalent profile activation", () => {
 		expect(clearCanonicalVariant).toHaveBeenCalledWith(session.sessionId);
 		expect(sticky.has(session.sessionId)).toBe(false);
 
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
-		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
-		);
+		Object.assign(session, {
+			noteProfileInstalledOverrides: () => {
+				throw new Error("note failed");
+			},
+		});
+		await expect(applyPreparedModelProfileActivation(prepared)).rejects.toThrow("note failed");
 
 		// Rollback re-seeded the prior model's canonical variant.
 		expect(session.model).toBe(priorModel);
 		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
+		expect(session.getSessionDefaultModelSelector()).toBe("provider-a/opus-real");
 	});
 
 	// A transient live-model switch (no canonical identity, unrelated to the

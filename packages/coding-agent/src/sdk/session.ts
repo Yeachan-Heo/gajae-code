@@ -42,6 +42,7 @@ import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElaps
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import { resolveModelProfileName } from "../config/model-profile-contract";
+import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -1409,7 +1410,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			resolvedInheritedProfileName && persistedProfiles.has(resolvedInheritedProfileName)
 				? resolvedInheritedProfileName
 				: undefined;
-		const settingsProfileAliasIntent: { aliasIntent: "preset-equivalent" } | undefined = acceptedInheritedProfileName
+		const inheritedProfileOwnsDefault = acceptedInheritedProfileName
+			? resolveProfileBindings(persistedProfiles.get(acceptedInheritedProfileName)!).defaultSelector !== undefined
+			: false;
+		const settingsProfileAliasIntent: { aliasIntent: "preset-equivalent" } | undefined = inheritedProfileOwnsDefault
 			? { aliasIntent: "preset-equivalent" }
 			: undefined;
 		const allowedModels = await logger.time("resolveAllowedModels", () =>
@@ -1421,6 +1425,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				matchPreferences: modelMatchPreferences,
 				modelRegistry,
 				...(settingsProfileAliasIntent ?? {}),
+				sessionId: logicalSessionId,
+				credentialSessionId,
 			}),
 		);
 		let model = options.model;
@@ -2906,15 +2912,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
 						onAuthError: async (provider, oldKey, error) => {
+							const credentialSessionId =
+								options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId;
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
-								sessionId: agent.sessionId,
+								sessionId: credentialSessionId,
 							});
 							logger.debug("Retrying provider request after credential invalidation", {
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							return modelRegistry.getApiKeyForProvider(provider, agent.sessionId);
+							return modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
 						},
 					});
 				} catch (error) {

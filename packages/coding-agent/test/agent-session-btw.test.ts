@@ -115,6 +115,7 @@ interface HarnessOptions {
 	onSseEvent?: () => void;
 	providerSessionId?: string;
 	providerCacheSessionId?: string;
+	credentialSessionId?: string;
 }
 
 function userMessage(text: string): UserMessage {
@@ -174,6 +175,7 @@ function createHarness(options: HarnessOptions = {}): {
 		onSseEvent: options.onSseEvent,
 		providerSessionId: options.providerSessionId,
 		providerCacheSessionId: options.providerCacheSessionId,
+		credentialSessionId: options.credentialSessionId,
 	});
 	sessions.push(session);
 	return { session, model, committed, live, getApiKey, sessionManager };
@@ -244,9 +246,7 @@ describe("AgentSession /btw isolation", () => {
 		expect(call?.options?.requestMaxRetries).toBe(0);
 		expect(call?.options?.streamMaxRetries).toBe(0);
 		expect(call?.options?.streamFirstEventTimeoutMs).toBe(0);
-		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe(
-			harness.session.agent.providerSessionId ?? harness.session.agent.sessionId ?? harness.session.sessionId,
-		);
+		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe(harness.session.credentialSessionId);
 		expect(call?.options?.sessionId).toContain(":btw:");
 		expect(call?.options?.sessionId).not.toBe(harness.session.sessionId);
 		expect(call?.options?.metadata).toBeUndefined();
@@ -296,10 +296,11 @@ describe("AgentSession /btw isolation", () => {
 		expect(replacement.calls).toHaveLength(0);
 	});
 
-	it("uses the main provider cache identity for credentials and account metadata", async () => {
+	it("uses credential identity independently from the main provider cache identity", async () => {
 		const harness = createHarness({
 			providerSessionId: "logical-provider-session",
 			providerCacheSessionId: "main-cache-affinity",
+			credentialSessionId: "credential-pool",
 		});
 
 		await harness.session.runEphemeralTurn({
@@ -310,7 +311,7 @@ describe("AgentSession /btw isolation", () => {
 			},
 		});
 
-		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe("main-cache-affinity");
+		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe("credential-pool");
 		expect(harness.model.calls[0]?.options?.metadata).toBeUndefined();
 		expect(harness.model.calls[0]?.options?.sessionId).toStartWith("main-cache-affinity:btw:");
 	});
