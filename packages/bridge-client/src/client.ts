@@ -221,8 +221,36 @@ function uncertain(
 	return { kind, identity, prohibitResubmission: true };
 }
 
-function replayReady(replay: Record<string, unknown>): boolean {
-	return replay.gap !== true && (replay.events === undefined || Array.isArray(replay.events));
+function replayReady(replay: Record<string, unknown>, events: readonly Frame[]): boolean {
+	if (replay.gap === true || !Array.isArray(replay.events)) return false;
+	if (typeof replay.generation !== "number" || !Number.isSafeInteger(replay.generation) || replay.generation < 0)
+		return false;
+	const replayEvents = replay.events as Frame[];
+	const sequences = new Set<number>();
+	for (const event of [...events, ...replayEvents]) {
+		if (typeof event.generation !== "number" || event.generation !== replay.generation) continue;
+		if (typeof event.seq !== "number" || !Number.isSafeInteger(event.seq) || event.seq < 0) return false;
+		sequences.add(event.seq);
+	}
+	return sequences.size >= 0;
+}
+
+function isConnectionFailure(error: unknown): boolean {
+	return (
+		error instanceof SdkClientError &&
+		["connection_closed", "unavailable", "timeout", "reconnect_exhausted"].includes(error.code)
+	);
+}
+
+function endpointGeneration(endpoint: Record<string, unknown>): number | undefined {
+	const generation = endpoint.generation ?? endpoint.endpointGeneration;
+	return typeof generation === "number" && Number.isSafeInteger(generation) && generation >= 0
+		? generation
+		: undefined;
+}
+
+function statusIsKnown(status: Record<string, unknown>): boolean {
+	return ["accepted", "in_flight", "terminal_ok", "failed", "unknown"].includes(String(status.status));
 }
 
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */
@@ -368,7 +396,11 @@ export class SdkClient {
 		}
 		const sessionId = stringField(created, "sessionId");
 		if (!sessionId) return uncertain("create_uncertain", identity);
-		identity = { ...identity, sessionId };
+		identity = {
+			...identity,
+			sessionId,
+			...(endpointGeneration(created) === undefined ? {} : { endpointGeneration: endpointGeneration(created) }),
+		};
 		let endpoint: Record<string, unknown>;
 		try {
 			endpoint = responseResult(
@@ -382,11 +414,21 @@ export class SdkClient {
 		const url = stringField(endpoint, "url");
 		const token = stringField(endpoint, "token");
 		if (!url || !token) return uncertain("attachment_uncertain", identity);
+		identity = {
+			...identity,
+			...(endpointGeneration(endpoint) === undefined ? {} : { endpointGeneration: endpointGeneration(endpoint) }),
+		};
 		const endpointClient = new SdkClient(url, token, {
 			timeoutMs: input.timeoutMs,
 			deadline: this.#deadline,
 			reconnectAttempts: 0,
 		});
+		const liveEvents: Frame[] = [];
+		const detach = endpointClient.onFrame(frame => {
+			if (frame.type !== "event_replay_result" && frame.type !== "hello" && frame.type !== "server_hello")
+				liveEvents.push(frame);
+		});
+		let submissionStarted = false;
 		try {
 			const incarnation = await endpointClient.#connect();
 			const replay = await endpointClient.#requestOnIncarnation(
@@ -398,7 +440,7 @@ export class SdkClient {
 				incarnation,
 				{ timeoutMs: input.timeoutMs },
 			);
-			if (!replayReady(responseResult(replay))) return uncertain("subscription_uncertain", identity);
+			if (!replayReady(responseResult(replay), liveEvents)) return uncertain("subscription_uncertain", identity);
 			const operation = input.submission.kind === "prompt" ? "turn.prompt" : "skill.invoke";
 			const controlInput =
 				input.submission.kind === "prompt"
@@ -416,7 +458,7 @@ export class SdkClient {
 				await endpointClient.#requestOnIncarnation(
 					{ type: "control_request", operation, input: controlInput },
 					incarnation,
-					{ timeoutMs: input.timeoutMs },
+					{ timeoutMs: input.timeoutMs, onWrite: () => (submissionStarted = true) },
 				),
 			);
 			const commandId = stringField(response, "commandId");
@@ -424,10 +466,11 @@ export class SdkClient {
 			identity = { ...identity, ...(commandId ? { commandId } : {}), ...(turnId ? { turnId } : {}) };
 			return { kind: "accepted", sessionId, identity, receipt: response };
 		} catch (error) {
-			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
-				? atomicFailure(error, identity)
-				: uncertain("submission_uncertain", identity);
+			if (error instanceof SdkClientError && isKnownLifecycleFailure(error)) return atomicFailure(error, identity);
+			if (submissionStarted) return uncertain("submission_uncertain", identity);
+			return uncertain(isConnectionFailure(error) ? "attachment_uncertain" : "subscription_uncertain", identity);
 		} finally {
+			detach();
 			await endpointClient.close().catch(() => undefined);
 		}
 	}
@@ -438,26 +481,56 @@ export class SdkClient {
 	): Promise<SdkAtomicResult> {
 		if (!validAtomicIdentity(identity))
 			return atomicFailure(new SdkClientError("invalid_input", "Invalid atomic lookup identity."));
-		if (!identity.sessionId) return uncertain("create_uncertain", identity);
+		let recovered = identity;
+		if (!recovered.sessionId) {
+			try {
+				const created = responseResult(
+					await this.global("session.create", recovered.create, {
+						idempotencyKey: recovered.createIdempotencyKey,
+						timeoutMs: options.timeoutMs,
+					}),
+				);
+				const sessionId = stringField(created, "sessionId");
+				if (!sessionId) return uncertain("create_uncertain", recovered);
+				recovered = { ...recovered, sessionId };
+			} catch (error) {
+				return error instanceof SdkClientError && isKnownLifecycleFailure(error)
+					? atomicFailure(error, recovered)
+					: uncertain("create_uncertain", recovered);
+			}
+		}
 		try {
 			const endpoint = responseResult(
-				await this.global("session.get_endpoint", { sessionId: identity.sessionId }, options),
+				await this.global("session.get_endpoint", { sessionId: recovered.sessionId }, options),
 			);
 			const url = stringField(endpoint, "url");
 			const token = stringField(endpoint, "token");
-			if (!url || !token) return uncertain("attachment_uncertain", identity);
+			if (!url || !token) return uncertain("attachment_uncertain", recovered);
 			const client = new SdkClient(url, token, { timeoutMs: options.timeoutMs, reconnectAttempts: 0 });
 			try {
-				const query = identity.submission.kind === "prompt" ? "turn.prompt_status" : "skill.invoke_status";
-				const status = responseResult(
-					await client.query(query, { clientRef: identity.submission.clientRef }, undefined, options),
+				const incarnation = await client.#connect();
+				const replay = await client.#requestOnIncarnation(
+					{ type: "event_replay", sinceGeneration: recovered.endpointGeneration ?? 1, sinceSeq: 0 },
+					incarnation,
+					options,
 				);
-				return { kind: "reconciled", identity, status };
+				if (!replayReady(responseResult(replay), [])) return uncertain("subscription_uncertain", recovered);
+				const query = recovered.submission.kind === "prompt" ? "turn.prompt_status" : "skill.invoke_status";
+				const status = responseResult(
+					await client.#requestOnIncarnation(
+						{ type: "query_request", query, input: { clientRef: recovered.submission.clientRef } },
+						incarnation,
+						options,
+					),
+				);
+				return statusIsKnown(status)
+					? { kind: "reconciled", identity: recovered, status }
+					: uncertain("submission_uncertain", recovered);
 			} finally {
 				await client.close().catch(() => undefined);
 			}
-		} catch {
-			return uncertain("submission_uncertain", identity);
+		} catch (error) {
+			return uncertain(isConnectionFailure(error) ? "attachment_uncertain" : "submission_uncertain", recovered);
 		}
 	}
 
@@ -558,7 +631,11 @@ export class SdkClient {
 		});
 	}
 
-	#requestOnIncarnation(frame: Frame, incarnation: Incarnation, options: SdkRequestOptions): Promise<SdkFrame> {
+	#requestOnIncarnation(
+		frame: Frame,
+		incarnation: Incarnation,
+		options: SdkRequestOptions & { onWrite?: () => void },
+	): Promise<SdkFrame> {
 		if (this.#closed || !this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN)
 			return Promise.reject(
 				new SdkClientError("connection_closed", "SDK WebSocket incarnation is no longer active"),
@@ -598,6 +675,7 @@ export class SdkClient {
 					...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
 				}),
 			);
+			options.onWrite?.();
 		} catch (error) {
 			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket send failed", error));
 		}
