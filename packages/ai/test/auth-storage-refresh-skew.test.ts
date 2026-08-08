@@ -431,5 +431,11 @@ describe("AuthStorage OAuth refresh skew", () => {
 		await expect(authStorage.getApiKey("openai-codex-device")).resolves.toBe("device-runtime-key");
 		authStorage.removeRuntimeApiKey("openai-codex");
 		expect(authStorage.hasRuntimeApiKey("openai-codex-device")).toBeFalse();
+		await authStorage.set("openai-codex", [{ type: "api_key", key: "stored-device-key" }]);
+		await expect(authStorage.getApiKey("openai-codex-device", "device-session")).resolves.toBe("stored-device-key");
+		expect(authStorage.getSessionCredentialType("openai-codex-device", "device-session")).toBe("api_key");
+		expect(authStorage.getSessionCredentialRowId("openai-codex-device", "device-session")).toBeDefined();
+		await expect(authStorage.markUsageLimitReached("openai-codex-device", "device-session")).resolves.toBeFalse();
+		expect(authStorage.getEffectiveCredentialType("openai-codex-device", "device-session")).toBe("api_key");
 	});
 });

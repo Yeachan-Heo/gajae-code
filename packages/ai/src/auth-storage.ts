@@ -1279,9 +1279,10 @@ export class AuthStorage {
 	 * resolver rather than a stored row.
 	 */
 	getSessionCredentialRowId(provider: string, sessionId?: string): number | undefined {
-		const session = this.#getSessionCredential(provider, sessionId);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const session = this.#getSessionCredential(storageProvider, sessionId);
 		if (!session) return undefined;
-		return this.#getStoredCredentials(provider)[session.index]?.id;
+		return this.#getStoredCredentials(storageProvider)[session.index]?.id;
 	}
 
 	/**
@@ -1547,7 +1548,7 @@ export class AuthStorage {
 
 	/** Returns the credential type selected for a provider/session, if one has been recorded. */
 	getSessionCredentialType(provider: string, sessionId?: string): AuthCredential["type"] | undefined {
-		return this.#getSessionCredential(provider, sessionId)?.type;
+		return this.#getSessionCredential(resolveOAuthStorageProvider(provider), sessionId)?.type;
 	}
 
 	/** Clears the last credential used by a session for a provider. */
@@ -2079,6 +2080,7 @@ export class AuthStorage {
 	 * Returns `undefined` when no OAuth credential carries an `accountId`.
 	 */
 	getOAuthAccountId(provider: string, sessionId?: string): string | undefined {
+		provider = resolveOAuthStorageProvider(provider);
 		const allCredentials = this.#getCredentialsForProvider(provider);
 		const oauthCredentials = allCredentials.filter((c): c is OAuthCredential => c.type === "oauth");
 		if (oauthCredentials.length === 0) return undefined;
@@ -3233,6 +3235,7 @@ export class AuthStorage {
 		sessionId: string | undefined,
 		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal },
 	): Promise<boolean> {
+		provider = resolveOAuthStorageProvider(provider);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		if (!sessionCredential) return false;
 
