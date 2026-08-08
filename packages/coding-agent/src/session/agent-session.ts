@@ -16692,11 +16692,16 @@ export class AgentSession {
 				const persistedProfileIdentity = configuredDefaultChain?.identity
 					? resolveModelProfileName(configuredDefaultChain.identity, profileDefinitions)
 					: undefined;
+				const liveProfileIdentity = previousActiveModelProfile
+					? resolveModelProfileName(previousActiveModelProfile, profileDefinitions)
+					: undefined;
 				this.#activeModelProfile =
 					resumeModelBehavior === "useCurrentDefault"
-						? configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
-							? configuredProfileIdentity
-							: undefined
+						? liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
+							? liveProfileIdentity
+							: configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
+								? configuredProfileIdentity
+								: undefined
 						: configuredDefaultChain?.origin === "profile-activation" &&
 								persistedProfileIdentity &&
 								profileDefinitions.has(persistedProfileIdentity)

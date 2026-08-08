@@ -174,6 +174,25 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(controller.attemptsUsed).toBe(0);
 	});
 
+	test("retains authenticated override tails for request-time fallback", async () => {
+		const fallbackModel = { ...parentModel, id: "deepseek-v4-fallback", name: "DeepSeek V4 Fallback" };
+		const patterns = ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-fallback"];
+		const registry = createMockRegistry({
+			models: [parentModel, fallbackModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+		const result = await resolveModelOverrideWithAuthFallback(patterns, undefined, registry);
+		const controller = new FallbackChainController(
+			{ role: "default", entries: patterns, origin: "subagent", explicitHead: true },
+			1,
+		);
+		controller.seedResolution(result.activeIndex ?? 0, result.skips);
+
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-pro");
+		expect(controller.onAttemptFailure("server", "500")).toBe("advance");
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-fallback");
+	});
+
 	test("rebases to the parent when every override selector is unknown", async () => {
 		const registry = createMockRegistry({
 			models: [parentModel],

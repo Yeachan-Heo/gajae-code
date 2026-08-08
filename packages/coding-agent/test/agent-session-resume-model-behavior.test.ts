@@ -72,4 +72,26 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(opus.id);
 	});
+
+	it("retains a session-only active profile when useCurrentDefault reloads its runtime defaults", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const agent = new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } });
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+
+		await session.setModel(sonnet);
+		const sessionFile = session.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		await session.sessionManager.flush();
+
+		settings.override("modelRoles", { default: "anthropic/claude-opus-4-8" });
+		settings.set("session.resumeModelBehavior", "useCurrentDefault");
+		session.setActiveModelProfile("codex-medium");
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.id).toBe(opus.id);
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+	});
 });

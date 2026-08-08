@@ -1502,6 +1502,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				authFallbackUsed,
 				requestedModel,
 				fallbackReason,
+				activeIndex,
+				parentFallbackSelector,
+				skips,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -1722,17 +1725,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 
 			activeSession = session;
-			// Persist the concrete child binding selected by auth-aware resolution.
-			// Child resume must retain provider/cache affinity without requiring the
-			// parent's live profile alias intent.
-			if (session.model) {
-				session.setConfiguredModelChain(
-					"default",
-					[formatModelString(session.model)],
-					"subagent",
-					agent.name,
-					true,
-				);
+			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
+			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
+			if (!parentFallbackSelector) {
+				session.seedDefaultFallbackResolution(activeIndex ?? 0, skips);
 			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = AsyncJobManager.instance();
