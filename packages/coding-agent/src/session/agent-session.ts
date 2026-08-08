@@ -197,6 +197,7 @@ import {
 	UnknownModelProfileError,
 	validateModelProfileName,
 } from "../config/model-profile-contract";
+import { resolveProfileBindings } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
@@ -10850,16 +10851,17 @@ export class AgentSession {
 		return this.#activeModelProfile;
 	}
 
-	/**
-	 * Resolver intent for persisted chain consumers (profile roles/agent
-	 * overrides, default fallback, resume) that are owned by an active model
-	 * profile. A bare profile alias may re-resolve to an equivalent provider
-	 * variant; provider-qualified pins stay exact. Returns undefined (exact
-	 * behavior) when no active profile claims those persisted assignments, so
-	 * direct/CLI/manual chains are never affected.
-	 */
-	#persistedModelProfileAliasIntent(): { aliasIntent: "preset-equivalent" } | undefined {
-		return this.#activeModelProfile ? { aliasIntent: "preset-equivalent" } : undefined;
+	/** Resolver intent only for assignments owned by the active profile. */
+	#persistedModelProfileAliasIntent(role: string): { aliasIntent: "preset-equivalent" } | undefined {
+		if (!this.#activeModelProfile) return undefined;
+		const profile = this.#modelRegistry.getModelProfile?.(this.#activeModelProfile);
+		if (!profile) return undefined;
+		const bindings = resolveProfileBindings(profile);
+		const owned =
+			role === "default"
+				? bindings.defaultSelector !== undefined
+				: Object.hasOwn(bindings.modelRoles, role) || Object.hasOwn(bindings.agentModelOverrides, role);
+		return owned ? { aliasIntent: "preset-equivalent" } : undefined;
 	}
 
 	/**
@@ -11572,7 +11574,7 @@ export class AgentSession {
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
 				...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
-				...(this.#persistedModelProfileAliasIntent() ?? {}),
+				...(this.#persistedModelProfileAliasIntent(role) ?? {}),
 				credentialSessionId: this.credentialSessionId,
 			});
 			if (!resolved.model) continue;
@@ -14349,7 +14351,7 @@ export class AgentSession {
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry: this.#modelRegistry,
 			credentialSessionId: this.credentialSessionId,
-			...(this.#persistedModelProfileAliasIntent() ?? {}),
+			...(this.#persistedModelProfileAliasIntent(role) ?? {}),
 		});
 	}
 
@@ -15414,7 +15416,7 @@ export class AgentSession {
 			{
 				managedFallback: true,
 				canonicalSessionId: this.sessionId,
-				...(this.#persistedModelProfileAliasIntent() ?? {}),
+				...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 			},
 		);
 		const activeIndex = resolutionStart + resolution.activeIndex;
@@ -15589,7 +15591,7 @@ export class AgentSession {
 				matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,
 				sessionId: this.sessionId,
-				...(this.#persistedModelProfileAliasIntent() ?? {}),
+				...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 				credentialSessionId: this.credentialSessionId,
 			});
 			if (!resolved.model) {
@@ -17335,7 +17337,7 @@ export class AgentSession {
 						{
 							managedFallback: true,
 							canonicalSessionId: this.sessionId,
-							...(this.#persistedModelProfileAliasIntent() ?? {}),
+							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
 					const controller = this.#defaultFallbackChain();

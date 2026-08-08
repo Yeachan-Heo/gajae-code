@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
@@ -99,6 +99,28 @@ describe("AgentSession role model thinking behavior", () => {
 
 		expect(session.resolveRoleModelWithThinking("slow").model?.id).toBe("claude-sonnet-4-6");
 		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
+	});
+
+	it("keeps manual role aliases exact when a partial profile does not own the role", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { executor: "claude-sonnet-4-6" },
+		});
+		sessionSettings.set("task.agentModelOverrides", { executor: "claude-sonnet-4-6" });
+		vi.spyOn(modelRegistry, "getModelProfile").mockReturnValue({
+			name: "planner-only",
+			requiredProviders: [],
+			modelMapping: { planner: "claude-sonnet-4-5" },
+			source: "user",
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([getAnthropicModelOrThrow("claude-sonnet-4-6")]);
+		const aliasLookup = vi.spyOn(modelRegistry, "resolveModelByLookupAlias");
+		session.setActiveModelProfile("planner-only");
+
+		expect(session.resolveRoleModelWithThinking("executor").model?.id).toBe("claude-sonnet-4-6");
+		expect(aliasLookup).not.toHaveBeenCalled();
 	});
 
 	it("re-applies explicit role thinking each time that role is selected", async () => {
