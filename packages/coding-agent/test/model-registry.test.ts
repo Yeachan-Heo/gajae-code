@@ -1687,7 +1687,7 @@ describe("ModelRegistry", () => {
 			}
 		});
 
-		test("ranks an environment key ahead of expired OAuth", async () => {
+		test("ranks expired OAuth ahead of an environment key because requests refresh OAuth first", async () => {
 			const restoreAnthropicKey = setEnvForTest("ANTHROPIC_API_KEY", "environment-anthropic-key");
 			try {
 				await authStorage.set("anthropic", [
@@ -1701,7 +1701,7 @@ describe("ModelRegistry", () => {
 				const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
 				await expect(authStorage.peekApiKey("anthropic")).resolves.toBe("environment-anthropic-key");
-				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("key");
+				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("oauth");
 			} finally {
 				restoreAnthropicKey();
 			}
