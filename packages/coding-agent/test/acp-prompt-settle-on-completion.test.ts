@@ -4,7 +4,7 @@ import type { AgentSideConnection, PromptRequest, SessionNotification } from "@a
 import { TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { ACP_PROMPT_INACTIVITY_TIMEOUT_MS } from "../src/sdk/prompt-watchdog";
+import { ACP_PROMPT_INFERENCE_TIMEOUT_MS } from "../src/sdk/prompt-watchdog";
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -310,7 +310,9 @@ test("a producer that never publishes a terminal is still settled by the inactiv
 	const fixture = await createFixture();
 	try {
 		const { settled } = await startTurn(fixture, "dead producer");
-		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+		// The turn died right after `agent_start`, i.e. while awaiting the model, so the
+		// inference bound is the one that has to catch it.
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS);
 		expect(await bounded(settled, "watchdog settlement")).toMatchObject({
 			rejected: { code: "prompt_abandoned" },
 		});

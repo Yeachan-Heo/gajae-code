@@ -59,18 +59,73 @@ export const ACP_PROMPT_INACTIVITY_TIMEOUT_MS = DEFAULT_TOOL_RUNTIME_MS + SDK_RE
 export const ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS = MAX_TOOL_RUNTIME_MS + SDK_RECONNECT_BUDGET_MS;
 
 /**
- * Per-prompt view of which tool calls the session host has started but not finished.
- * Inbound frames are the only evidence the ACP side has, so "a tool is running" means
- * exactly "a start was observed and its end was not".
+ * Widest frame-free window a single provider call may legitimately occupy before the
+ * agent's own stream watchdog aborts it. Mirrors `ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS`
+ * in `packages/ai/src/utils/idle-iterator.ts` (600s), the largest per-provider first-event
+ * fallback of any built-in provider — `DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS` is 100s and
+ * `kimi-code` gets 300s. That constant is module-private there, so it is mirrored here and
+ * pinned against `getProviderFirstEventTimeoutFallbackMs` in the watchdog test: a change on
+ * either side fails loudly instead of silently inflating this bound.
  */
-export class PromptToolActivity {
-	readonly #running = new Set<string>();
+const MAX_PROVIDER_FIRST_EVENT_TIMEOUT_MS = 600_000;
 
-	/** Folds one inbound frame's tool lifecycle event into the in-flight set. */
-	observe(eventType: string | undefined, toolCallId: string | undefined): void {
+/**
+ * Inactivity bound that applies while a prompt is awaiting the model: a provider call is in
+ * flight and has not produced the first frame of its response yet.
+ *
+ * Tool execution had evidence and model inference did not, so a turn thinking after
+ * `agent_start` looked exactly like a dead producer and was killed at
+ * {@link ACP_PROMPT_INACTIVITY_TIMEOUT_MS}. Inference gets the same evidence-based
+ * tolerance: the wide bound stands only as long as a model call is observably unanswered.
+ *
+ * It still terminates. A provider stream that yields nothing within
+ * {@link MAX_PROVIDER_FIRST_EVENT_TIMEOUT_MS} is aborted by the agent's own stream watchdog,
+ * which republishes as an error/retry frame, so a host that dies mid-inference is still
+ * reported one reconnect budget later.
+ */
+export const ACP_PROMPT_INFERENCE_TIMEOUT_MS = MAX_PROVIDER_FIRST_EVENT_TIMEOUT_MS + SDK_RECONNECT_BUDGET_MS;
+
+/**
+ * Per-prompt view of what the session host is observably doing: which tool calls it has
+ * started but not finished, and whether it is waiting on a model call. Inbound frames are
+ * the only evidence the ACP side has, so "a tool is running" means exactly "a start was
+ * observed and its end was not", and "awaiting the model" means exactly "a model call was
+ * dispatched and nothing from its response has been observed".
+ */
+export class PromptActivity {
+	readonly #running = new Set<string>();
+	#awaitingModel = false;
+
+	/** Folds one inbound frame's lifecycle event into the in-flight tool and model state. */
+	observe(eventType: string | undefined, toolCallId: string | undefined, messageRole: string | undefined): void {
+		this.#observeInference(eventType, messageRole);
 		if (toolCallId === undefined) return;
 		if (eventType === "tool_execution_start" || eventType === "tool_execution_update") this.#running.add(toolCallId);
 		else if (eventType === "tool_execution_end") this.#running.delete(toolCallId);
+	}
+
+	/**
+	 * A turn is awaiting the model from every point where the host dispatches a provider
+	 * call — `agent_start` for the turn's first call, `tool_execution_end` for the
+	 * re-invocation that carries a tool result back — until the first frame of that
+	 * response proves the model answered.
+	 */
+	#observeInference(eventType: string | undefined, messageRole: string | undefined): void {
+		if (eventType === "agent_start" || eventType === "tool_execution_end") {
+			this.#awaitingModel = true;
+			return;
+		}
+		// Streamed content/thinking/tool-call deltas, and the tool call the model asked for,
+		// are only ever produced by an answering model.
+		if (eventType === "message_update" || eventType === "tool_execution_start") {
+			this.#awaitingModel = false;
+			return;
+		}
+		// Providers that do not stream emit no `message_update`, so the assistant message
+		// itself is the first proof. `message_start`/`message_end` also carry the user and
+		// tool-result messages the host echoes back, which prove nothing about the model.
+		if ((eventType === "message_start" || eventType === "message_end") && messageRole === "assistant")
+			this.#awaitingModel = false;
 	}
 
 	/** True while at least one started tool call has not reported an end. */
@@ -78,9 +133,15 @@ export class PromptToolActivity {
 		return this.#running.size > 0;
 	}
 
+	/** True while a dispatched model call has not produced the first frame of its response. */
+	get awaitingModel(): boolean {
+		return this.#awaitingModel;
+	}
+
 	/** Bound that applies to the next frame-free gap, given what is observably executing. */
 	get inactivityBoundMs(): number {
-		return this.running ? ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS : ACP_PROMPT_INACTIVITY_TIMEOUT_MS;
+		if (this.running) return ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS;
+		return this.#awaitingModel ? ACP_PROMPT_INFERENCE_TIMEOUT_MS : ACP_PROMPT_INACTIVITY_TIMEOUT_MS;
 	}
 }
 

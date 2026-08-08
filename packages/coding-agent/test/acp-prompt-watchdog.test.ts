@@ -1,10 +1,15 @@
 import { expect, test } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
+import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
 import { TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { ACP_PROMPT_INACTIVITY_TIMEOUT_MS, ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS } from "../src/sdk/prompt-watchdog";
+import {
+	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
+	ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS,
+} from "../src/sdk/prompt-watchdog";
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -325,14 +330,14 @@ async function startTurn(fixture: Fixture): Promise<{ pending: Promise<{ stopRea
 	return { pending };
 }
 
-test("a prompt that goes silent past the inactivity bound is rejected instead of hanging", async () => {
+test("a prompt awaiting the model past the inference bound is rejected instead of hanging", async () => {
 	const fixture = await createFixture();
 	try {
 		const { pending } = await startTurn(fixture);
 		const { commandId, turnId } = fixture.correlation();
 		const idleBefore = idleUpdates(fixture.updates);
 
-		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
 
 		const error = await bounded(
 			pending.then(
@@ -344,7 +349,7 @@ test("a prompt that goes silent past the inactivity bound is rejected instead of
 		expect(error).toBeInstanceOf(Error);
 		const message = (error as Error).message;
 		expect(message).toContain("ACP prompt was abandoned");
-		expect(message).toContain(`${Math.round(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 1_000)}s of silence`);
+		expect(message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
 		expect(message).toContain("the SDK session host stopped producing frames");
 		expect(message).toContain('"agent_start"');
 		expect(message).toContain(`commandId=${commandId}`);
@@ -394,7 +399,7 @@ test("a session accepts a new prompt after a watchdog rejection", async () => {
 	try {
 		const { pending: abandoned } = await startTurn(fixture);
 		const firstCommandId = fixture.correlation().commandId;
-		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
 		await bounded(
 			abandoned.then(
 				() => undefined,
@@ -444,12 +449,22 @@ test("a normal agent_end settles the prompt once and disarms the watchdog", asyn
 test("the watchdog bounds stay pinned to their derivation", () => {
 	// Slowest tool default (`bash`, 300s) + one SDK reconnect budget (2 x 20s heartbeat).
 	expect(ACP_PROMPT_INACTIVITY_TIMEOUT_MS).toBe(340_000);
+	// Widest per-provider first-event window (`alibaba-token-plan`, 600s) + the same budget.
+	expect(ACP_PROMPT_INFERENCE_TIMEOUT_MS).toBe(640_000);
 	// Slowest per-tool ceiling (`bash`/`ssh`, 3600s) + the same reconnect budget.
 	expect(ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS).toBe(3_640_000);
 	// A frame-free gap with nothing running must stay operationally useful; the wide
 	// bound is only ever reachable while a tool call is observably in flight.
 	expect(ACP_PROMPT_INACTIVITY_TIMEOUT_MS).toBeLessThan(10 * 60_000);
 	expect(ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS).toBeGreaterThan(3_600_000);
+	// Each bound is strictly wider than the evidence-free one it replaces, and the
+	// inference bound stays far below the tool ceiling: thinking is not executing.
+	expect(ACP_PROMPT_INFERENCE_TIMEOUT_MS).toBeGreaterThan(ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+	expect(ACP_PROMPT_INFERENCE_TIMEOUT_MS).toBeLessThan(ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS);
+	// The inference bound mirrors a constant that lives in another package. If that
+	// widens or narrows, this fails instead of silently drifting.
+	expect(getProviderFirstEventTimeoutFallbackMs("alibaba-token-plan")).toBe(600_000);
+	expect(getProviderFirstEventTimeoutFallbackMs("kimi-code")).toBe(300_000);
 });
 
 test("a tool call running past the idle bound is protected while it runs, not after it ends", async () => {
@@ -480,8 +495,9 @@ test("a tool call running past the idle bound is protected while it runs, not af
 		fixture.sendToolEnd("watchdog-tool-1");
 		await waitFor(() => toolCallUpdates(fixture.updates) > ended, "tool call end");
 
-		// Evidence is gone: the next frame-free gap is bounded by the idle bound again.
-		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		// Tool evidence is gone, but returning a tool result re-invokes the model, so the
+		// gap that follows is an inference gap — the idle bound no longer governs it.
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
 		const error = await bounded(
 			pending.then(
 				() => undefined,
@@ -528,6 +544,115 @@ test("a tool call still in flight keeps the wide bound armed across silent gaps"
 
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a turn silent after agent_start is not killed while the model is still answering", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		// 49 of the 65 production expiries looked exactly like this: the host went quiet
+		// right after `agent_start` because the provider was still reasoning. Nothing is
+		// executing, but a dispatched model call has not answered, so the evidence-free
+		// bound is the wrong one to apply.
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		// Still one tick short of the inference bound after the whole gap.
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS - 2);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		const chunks = textChunks(fixture.updates);
+		fixture.sendAssistantText("done thinking");
+		await waitFor(() => textChunks(fixture.updates) > chunks, "assistant chunk");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a turn silent after tool_execution_end is not killed while the model is re-invoked", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		const started = toolCalls(fixture.updates);
+		fixture.sendToolStart("watchdog-inference-tool");
+		await waitFor(() => toolCalls(fixture.updates) > started, "tool call start");
+		const ended = toolCallUpdates(fixture.updates);
+		fixture.sendToolEnd("watchdog-inference-tool");
+		await waitFor(() => toolCallUpdates(fixture.updates) > ended, "tool call end");
+
+		// The other 15 expiries: the tool result went back to the model and the next
+		// provider call had not answered yet. No tool is running, so the wide tool bound is
+		// correctly retired — but the turn is still legitimately silent.
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS - 2);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		const chunks = textChunks(fixture.updates);
+		fixture.sendAssistantText("after the tool");
+		await waitFor(() => textChunks(fixture.updates) > chunks, "assistant chunk");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a turn with no tool running and no model call pending is still held to the narrow bound", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		// The model answered, so no inference is pending; no tool ever started, so nothing
+		// is executing. Nobody is working — this is the state the narrow bound exists for,
+		// and widening it for inference must not have blinded it here.
+		const chunks = textChunks(fixture.updates);
+		fixture.sendAssistantText("answered, then died");
+		await waitFor(() => textChunks(fixture.updates) > chunks, "assistant chunk");
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain("ACP prompt was abandoned");
+		expect(message).toContain(`${Math.round(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 1_000)}s of silence`);
+		expect(message).toContain("the SDK session host stopped producing frames");
+		expect(message).toContain('"message_end"');
 	} finally {
 		fixture.dispose();
 	}

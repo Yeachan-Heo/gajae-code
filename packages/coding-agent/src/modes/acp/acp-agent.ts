@@ -50,7 +50,7 @@ import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-model";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
-import { PromptToolActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
+import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -111,8 +111,8 @@ interface PromptWaiter {
 	lastFrameType: string;
 	/** Cancels the armed inactivity watchdog; re-armed by every inbound frame for this prompt. */
 	cancelWatchdog?: () => void;
-	/** Tool calls the host started but has not ended; widens the bound while one is running. */
-	toolActivity: PromptToolActivity;
+	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
+	activity: PromptActivity;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -450,6 +450,16 @@ function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
 		event,
 		...(object(payload.event) ? { wirePayload: payload } : {}),
 	};
+}
+
+/**
+ * Author of the message a `message_start`/`message_end` frame carries. The host echoes the
+ * user prompt and every tool result back through the same events, so only `"assistant"`
+ * proves a model call answered.
+ */
+function frameMessageRole(event: JsonObject | undefined): string | undefined {
+	const role = object(event?.message)?.role;
+	return typeof role === "string" ? role : undefined;
 }
 
 const ACP_CONFIG_OPTIONS = [
@@ -1261,7 +1271,7 @@ export class AcpAgent implements Agent {
 				deferredFrames: [],
 				lastFrameAt: this.#promptWatchdogClock.now(),
 				lastFrameType: "prompt_dispatch",
-				toolActivity: new PromptToolActivity(),
+				activity: new PromptActivity(),
 				resolve,
 				reject,
 			};
@@ -1862,7 +1872,7 @@ export class AcpAgent implements Agent {
 		waiter.cancelWatchdog?.();
 		// No frame can still arrive once the transport is known to be gone, so waiting out
 		// the full bound would only add dead time to an outcome that is already decided.
-		const delayMs = this.#promptTransportGone(id, record) ? 0 : waiter.toolActivity.inactivityBoundMs;
+		const delayMs = this.#promptTransportGone(id, record) ? 0 : waiter.activity.inactivityBoundMs;
 		waiter.cancelWatchdog = this.#promptWatchdogClock.schedule(() => {
 			void this.#expirePromptWatchdog(id, record, waiter);
 		}, delayMs);
@@ -1876,11 +1886,13 @@ export class AcpAgent implements Agent {
 		waiter.lastFrameAt = this.#promptWatchdogClock.now();
 		waiter.lastFrameType =
 			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
-		// Tool lifecycle frames also decide which bound the next gap gets: silence while a
-		// tool is observably executing is expected, silence with nothing running is not.
-		waiter.toolActivity.observe(
+		// Lifecycle frames also decide which bound the next gap gets: silence while a tool is
+		// observably executing, or while a dispatched model call has not answered yet, is
+		// expected; silence with nothing running and nobody thinking is not.
+		waiter.activity.observe(
 			typeof event?.type === "string" ? event.type : undefined,
 			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
+			frameMessageRole(event),
 		);
 		this.#armPromptWatchdog(id, record, waiter);
 	}
@@ -1905,8 +1917,9 @@ export class AcpAgent implements Agent {
 			cause,
 			silenceMs,
 			lastFrameType: waiter.lastFrameType,
-			inactivityBoundMs: waiter.toolActivity.inactivityBoundMs,
-			toolRunning: waiter.toolActivity.running,
+			inactivityBoundMs: waiter.activity.inactivityBoundMs,
+			toolRunning: waiter.activity.running,
+			awaitingModel: waiter.activity.awaitingModel,
 			...(waiter.correlation.commandId ? { commandId: waiter.correlation.commandId } : {}),
 			...(waiter.correlation.turnId ? { turnId: waiter.correlation.turnId } : {}),
 		});
