@@ -14,6 +14,7 @@ import {
 	truncateToWidth,
 } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
+import { isModelProfileProviderAvailable } from "../../config/model-profile-contract";
 import {
 	getModelProfilePresentation,
 	groupModelProfilesForPresetLanding,
@@ -1218,11 +1219,23 @@ export class ModelSelectorComponent extends Container {
 
 	#getMissingProviders(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): string[] {
 		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
-		const providers = new Set<string>();
-		for (const profile of profiles) for (const provider of profileRequiredProviders(profile)) providers.add(provider);
-		return [...providers]
-			.filter(provider => this.#isProviderAuthenticated(provider) !== true)
-			.sort((a, b) => a.localeCompare(b));
+		const missing = new Set<string>();
+		for (const profile of profiles) {
+			const authenticated = new Set(
+				profileRequiredProviders(profile).filter(provider => this.#isProviderAuthenticated(provider) === true),
+			);
+			if (isModelProfileProviderAvailable(profile, authenticated)) continue;
+			const alternativeGroups = profile.alternativeProviderGroups ?? [];
+			const alternativeProviders = new Set(alternativeGroups.flat());
+			for (const provider of profileRequiredProviders(profile)) {
+				if (!alternativeProviders.has(provider) && !authenticated.has(provider)) missing.add(provider);
+			}
+			for (const group of alternativeGroups) {
+				if (!group.some(provider => authenticated.has(provider)))
+					for (const provider of group) missing.add(provider);
+			}
+		}
+		return [...missing].sort((a, b) => a.localeCompare(b));
 	}
 
 	#isPresetAuthenticated(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
@@ -1236,7 +1249,7 @@ export class ModelSelectorComponent extends Container {
 				...Object.values(bindings.agentModelOverrides),
 			];
 			return values.every(value =>
-				normalizeModelSelectorValue(value).every(selector => {
+				normalizeModelSelectorValue(value).some(selector => {
 					if (splitSelectorThinkingSuffix(selector).selector.includes("/")) return true;
 					return (
 						resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
@@ -1948,6 +1961,11 @@ export class ModelSelectorComponent extends Container {
 				this.#renderPresetLanding();
 				return;
 			}
+			if (!this.#isPresetAuthenticated(profile)) {
+				this.#presetLoginHint = "No available model matches this preset";
+				this.#renderPresetLanding();
+				return;
+			}
 			this.#onSelectCallback({
 				kind: "profile",
 				profileName: this.#previewProfileName,
@@ -2002,6 +2020,11 @@ export class ModelSelectorComponent extends Container {
 		const missing = this.#getMissingProviders(row.profile);
 		if (missing.length > 0 && !isCustomUserProfile(row.profile)) {
 			this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
+			this.#renderPresetLanding();
+			return;
+		}
+		if (!isCustomUserProfile(row.profile) && !this.#isPresetAuthenticated(row.profile)) {
+			this.#presetLoginHint = "No available model matches this preset";
 			this.#renderPresetLanding();
 			return;
 		}

@@ -20,6 +20,7 @@ import {
 } from "./model-registry";
 import {
 	formatModelSelectorValue,
+	formatModelString,
 	parseModelString,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
@@ -495,7 +496,7 @@ async function resolveAndClampSelectorValue(
 			};
 		}
 		if (!resolved.model) {
-			if (bareAlias) {
+			if (bareAlias && selectors.length === 1) {
 				throw new Error(
 					`Model profile "${profileLabel}" ${role} selector did not resolve to an authenticated model: ${selector}`,
 				);
@@ -768,11 +769,16 @@ export async function applyPreparedModelProfileActivation(
 	let defaultChainChanged = false;
 
 	try {
-		if (prepared.defaultChain.length > 0) {
+		const ownedDefaultChain =
+			prepared.defaultChain.length > 0
+				? prepared.defaultChain
+				: (prepared.previousDefaultChain ??
+					(prepared.previousModel ? [formatModelString(prepared.previousModel)] : []));
+		if (ownedDefaultChain.length > 0) {
 			defaultChainChanged = true;
 			prepared.session.setConfiguredModelChain(
 				"default",
-				prepared.defaultChain,
+				ownedDefaultChain,
 				"profile-activation",
 				prepared.profileName,
 				true,

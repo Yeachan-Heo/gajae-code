@@ -304,6 +304,45 @@ describe("preset landing adversarial QA", () => {
 		expect(text).not.toContain("✗ COMBOS");
 	});
 
+	test("alternative provider groups allow a preset through with one authenticated member", async () => {
+		const alternativeProfile: ModelProfileDefinition = {
+			name: "alternative-profile",
+			displayName: "Alternative Profile",
+			requiredProviders: ["provider-a", "provider-b"],
+			alternativeProviderGroups: [["provider-a", "provider-b"]],
+			modelMapping: { default: "provider-a/default" },
+			source: "builtin",
+		};
+		const selector = createSelector({ authenticatedProviders: ["provider-b"], profiles: [alternativeProfile] });
+		await rendered(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Preset preview: Alternative Profile");
+		expect(text).not.toContain("Run /login");
+	});
+
+	test("a valid bare-alias fallback tail keeps the preset usable", async () => {
+		const fallbackProfile: ModelProfileDefinition = {
+			name: "alias-fallback-profile",
+			displayName: "Alias Fallback Profile",
+			requiredProviders: [],
+			modelMapping: { default: ["missing-alias", "gpt-5.5"] },
+			source: "builtin",
+		};
+		const selector = createSelector({ authenticatedProviders: ["openai-codex"], profiles: [fallbackProfile] });
+		await rendered(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Preset preview: Alias Fallback Profile");
+		expect(text).not.toContain("No available model matches this preset");
+	});
+
 	test("preview clamps codex eco executor to low and omits suffix for suffixless selector", async () => {
 		const selector = createSelector();
 		await rendered(selector);

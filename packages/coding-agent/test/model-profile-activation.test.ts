@@ -141,6 +141,10 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		sessionId: "session-1",
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		configuredModelChains: new Map<string, readonly string[]>(),
+		configuredModelChainStates: new Map<
+			string,
+			{ entries: readonly string[]; origin: string; identity?: string; explicitHead: boolean }
+		>(),
 		seedDefaultFallbackResolutionCalls: [] as Array<{
 			activeIndex: number;
 			skips: Array<{ selector: string; reason: string }>;
@@ -149,8 +153,18 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		getConfiguredModelChain(role: string) {
 			return this.configuredModelChains.get(role);
 		},
-		setConfiguredModelChain(role: string, entries: readonly string[]) {
+		getConfiguredModelChainState(role: string) {
+			return this.configuredModelChainStates.get(role);
+		},
+		setConfiguredModelChain(
+			role: string,
+			entries: readonly string[],
+			origin = "test",
+			identity?: string,
+			explicitHead = true,
+		) {
 			this.configuredModelChains.set(role, [...entries]);
+			this.configuredModelChainStates.set(role, { entries: [...entries], origin, identity, explicitHead });
 		},
 		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
 			this.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
@@ -343,6 +357,28 @@ describe("model profile activation", () => {
 		]);
 	});
 
+	test("preserves an unavailable bare alias and activates a valid fallback tail", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-bare-head",
+			requiredProviders: [],
+			modelMapping: { default: ["missing-alias", "provider-b/executor"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(session.model).toMatchObject({ provider: "provider-b", id: "executor" });
+		expect(session.getConfiguredModelChain("default")).toEqual(["missing-alias", "provider-b/executor"]);
+		expect(session.seedDefaultFallbackResolutionCalls).toEqual([
+			{ activeIndex: 1, skips: [{ selector: "missing-alias", reason: "unknown_model" }] },
+		]);
+	});
+
 	test("preserves a fully unresolved executor chain and skips it without request attempts", async () => {
 		const executorChain = ["provider-a/unknown-executor", "provider-b/unknown-executor"];
 		const profile: ModelProfileDefinition = {
@@ -380,6 +416,30 @@ describe("model profile activation", () => {
 			skips: executorChain.map(selector => ({ selector, reason: "unknown_model" })),
 		});
 		expect(credentialLookups).toBe(0);
+	});
+
+	test("persists profile ownership when a partial profile has no default mapping", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "executor-only-profile",
+			requiredProviders: [],
+			modelMapping: { executor: "provider-b/executor" },
+			source: "user",
+		};
+		const session = fakeSession();
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(session.getConfiguredModelChainState("default")).toEqual({
+			entries: ["provider-a/initial"],
+			origin: "profile-activation",
+			identity: profile.name,
+			explicitHead: true,
+		});
+		expect(session.getActiveModelProfile()).toBe(profile.name);
 	});
 
 	test("preserves unavailable middle and tail entries while resolving the first usable default", async () => {
