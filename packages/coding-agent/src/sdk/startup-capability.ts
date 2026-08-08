@@ -5,7 +5,14 @@ import {
 } from "../config/model-profile-contract";
 export type SdkStartupPhase = "registration" | "startup";
 
-export type SdkStartupReason = "disabled" | "ineligible" | "factory_absent" | "runner_absent" | "pending" | "failed";
+export type SdkStartupReason =
+	| "disabled"
+	| "ineligible"
+	| "factory_absent"
+	| "runner_absent"
+	| "admission_timeout"
+	| "pending"
+	| "failed";
 
 export interface SdkStartupFailure {
 	phase: SdkStartupPhase;
@@ -143,9 +150,11 @@ export function normalizeSdkStartupFailure(
 					? "SDK startup factory is unavailable."
 					: reason === "runner_absent"
 						? "SDK startup extension runner is unavailable."
-						: reason === "pending"
-							? "SDK startup did not complete before readiness cutoff."
-							: FALLBACK_MESSAGE;
+						: reason === "admission_timeout"
+							? "SDK host startup was not admitted before the queue wait cutoff."
+							: reason === "pending"
+								? "SDK startup did not complete before readiness cutoff."
+								: FALLBACK_MESSAGE;
 	const message = sanitizeSdkStartupMessage(error, knownSecrets);
 	const profileError = isModelProfileError(error) ? { code: error.code, details: error.details } : {};
 	return { phase, reason, message: message === FALLBACK_MESSAGE ? fallback : message, ...profileError };
