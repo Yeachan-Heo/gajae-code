@@ -102,6 +102,33 @@ function createAnthropicSignatureInvalid400(): MockAnthropicRequest {
 	};
 }
 
+// Issue #3900: proxies like CLIProxyAPI forward the upstream 400 body as an
+// in-stream SSE `error` event on an HTTP 200 response. The provider throws
+// `new Error(sse.data)` with no HTTP status attached.
+function createStatuslessSseThinkingMutationError(): MockAnthropicRequest {
+	return {
+		async withResponse() {
+			throw new Error(
+				'{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}',
+			);
+		},
+	};
+}
+
+// Issue #3900, live CPA capture (2026-08-06): the proxy does not forward the
+// upstream body at all. The client only sees a generic `api_error` SSE event on
+// an HTTP 200 response, so the rejection carries neither a status nor any hint
+// of the thinking-integrity 400 that CPA logged upstream.
+function createMaskedProxyRejection(): MockAnthropicRequest {
+	return {
+		async withResponse() {
+			throw new Error(
+				'{"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}',
+			);
+		},
+	};
+}
+
 function makeSignedAssistant(suffix: string, text: string): AssistantMessage {
 	return {
 		role: "assistant",
@@ -174,6 +201,156 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(JSON.stringify(requestBodies[1])).not.toContain("synthetic_sig");
 		expect(JSON.stringify(requestBodies[1])).not.toContain("redacted_thinking");
 		expect(JSON.stringify(requestBodies[1])).toContain("visible answer");
+	});
+
+	// Issue #3900: behind CLIProxyAPI the same mutation rejection arrives as a
+	// statusless SSE error event, and the repair path used to reject it because
+	// the classifier required an HTTP 400 status.
+	it("repairs thinking replay when the mutation error arrives statusless via a proxy SSE error event", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("proxied", "proxied answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 1 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt === 1 ? createStatuslessSseThinkingMutationError() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(requestBodies).toHaveLength(2);
+		expect(JSON.stringify(requestBodies[0])).toContain("sig_proxied");
+		expect(JSON.stringify(requestBodies[1])).not.toContain("sig_proxied");
+	});
+
+	// Issue #3900 recurrence: CPA masks the upstream 400 body entirely, so the
+	// message-based matchers cannot fire. The replayed request shape is the only
+	// remaining evidence that a thinking-replay repair is worth one retry.
+	it("repairs thinking replay when the proxy masks the rejection as a generic api_error", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("masked", "masked answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt === 1 ? createMaskedProxyRejection() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(requestBodies).toHaveLength(2);
+		expect(JSON.stringify(requestBodies[0])).toContain("sig_masked");
+		expect(JSON.stringify(requestBodies[1])).not.toContain("sig_masked");
+	});
+
+	it("escalates to a full-history repair when the masked rejection survives the latest-only repair", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("early", "early answer"),
+				{ ...user, content: "second", timestamp: Date.now() + 1 },
+				makeSignedAssistant("late", "late answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 2 },
+			],
+		};
+
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt <= 2 ? createMaskedProxyRejection() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(3);
+		const secondBody = JSON.stringify(requestBodies[1]);
+		expect(secondBody).toContain("sig_early");
+		expect(secondBody).not.toContain("sig_late");
+		const thirdBody = JSON.stringify(requestBodies[2]);
+		expect(thirdBody).not.toContain("sig_early");
+		expect(thirdBody).not.toContain("sig_late");
+	});
+
+	// The masked body says nothing, so the guard must be the request: with no
+	// replayed thinking blocks the failure is somebody else's and retrying would
+	// only hide it behind a second identical request.
+	it("surfaces a masked proxy rejection when the request replays no thinking blocks", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "plain answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [user, assistant, { ...user, content: "next prompt", timestamp: Date.now() + 1 }],
+		};
+
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createMaskedProxyRejection() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("api_error");
+		expect(requestBodies).toHaveLength(1);
 	});
 
 	// Real captured session failure (2026-07-29): the mutation 400 says "latest

@@ -67,9 +67,9 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "opencodego",
 		requiredProviders: ["opencode-go"],
 		mapping: {
-			default: "opencode-go/kimi-k2.6",
+			default: "opencode-go/kimi-k3",
 			executor: "opencode-go/deepseek-v4-flash",
-			planner: "opencode-go/qwen3.7-max",
+			planner: "opencode-go/kimi-k3",
 			critic: "opencode-go/mimo-v2.5-pro",
 			architect: "opencode-go/deepseek-v4-pro",
 		},
@@ -408,33 +408,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "minimax-eco",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:low",
-			executor: "minimax-code/minimax-m3:minimal",
-			planner: "minimax-code/minimax-m3:low",
-			critic: "minimax-code/minimax-m3:medium",
-			architect: "minimax-code/minimax-m3:high",
+			default: "minimax-code/MiniMax-M3:low",
+			executor: "minimax-code/MiniMax-M3:minimal",
+			planner: "minimax-code/MiniMax-M3:low",
+			critic: "minimax-code/MiniMax-M3:medium",
+			architect: "minimax-code/MiniMax-M3:high",
 		},
 	},
 	{
 		name: "minimax-medium",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:medium",
-			executor: "minimax-code/minimax-m3:low",
-			planner: "minimax-code/minimax-m3:medium",
-			critic: "minimax-code/minimax-m3:high",
-			architect: "minimax-code/minimax-m3:xhigh",
+			default: "minimax-code/MiniMax-M3:medium",
+			executor: "minimax-code/MiniMax-M3:low",
+			planner: "minimax-code/MiniMax-M3:medium",
+			critic: "minimax-code/MiniMax-M3:high",
+			architect: "minimax-code/MiniMax-M3:xhigh",
 		},
 	},
 	{
 		name: "minimax-pro",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:xhigh",
-			executor: "minimax-code/minimax-m3:medium",
-			planner: "minimax-code/minimax-m3:high",
-			critic: "minimax-code/minimax-m3:xhigh",
-			architect: "minimax-code/minimax-m3:xhigh",
+			default: "minimax-code/MiniMax-M3:xhigh",
+			executor: "minimax-code/MiniMax-M3:medium",
+			planner: "minimax-code/MiniMax-M3:high",
+			critic: "minimax-code/MiniMax-M3:xhigh",
+			architect: "minimax-code/MiniMax-M3:xhigh",
 		},
 	},
 	{
@@ -474,11 +474,11 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "alibaba-token-plan-qwen-deepseek",
 		requiredProviders: ["alibaba-token-plan"],
 		mapping: {
-			default: "alibaba-token-plan/qwen-3.8-max:high",
+			default: "alibaba-token-plan/qwen3.8-max:high",
 			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
 			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
-			critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
-			architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+			critic: "alibaba-token-plan/qwen3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max:xhigh",
 		},
 	},
 	{
@@ -509,7 +509,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		mapping: {
 			default: "openai-codex/gpt-5.6-sol:low",
 			executor: "opencode-go/deepseek-v4-pro",
-			planner: "opencode-go/kimi-k2.6",
+			planner: "opencode-go/kimi-k3",
 			critic: "opencode-go/mimo-v2.5-pro",
 			architect: "openai-codex/gpt-5.6-sol:high",
 		},
@@ -578,7 +578,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 	},
 	"codex-opencodego": {
 		executor: "opencode-go/deepseek-v4-pro",
-		planner: "opencode-go/kimi-k2.6",
+		planner: "opencode-go/kimi-k3",
 		critic: "opencode-go/mimo-v2.5-pro",
 	},
 	"fable-opus-codex": {
@@ -730,7 +730,7 @@ describe("built-in model profile catalog", () => {
 		}
 		expect(missing).toEqual([]);
 		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.k3).toBeDefined();
-		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["MiniMax-M3"]).toBeDefined();
 		expect(
 			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-flash-0731"],
 		).toBeDefined();
@@ -858,7 +858,7 @@ describe("built-in model profile catalog", () => {
 		}
 	});
 
-	test("built-in minimax profiles resolve to minimax-m3 and never minimax-v3 (issue #656)", () => {
+	test("built-in minimax profiles resolve to the canonical MiniMax-M3 id (issue #3896)", () => {
 		const minimaxProfiles = BUILTIN_MODEL_PROFILES.filter(profile =>
 			profile.requiredProviders.includes("minimax-code"),
 		);
@@ -869,10 +869,11 @@ describe("built-in model profile catalog", () => {
 				expect(selector).toBeDefined();
 				const parsed = parseModelString(selectorHead(selector) ?? "");
 				expect(parsed?.provider).toBe("minimax-code");
-				expect(parsed?.id).toBe("minimax-m3");
+				expect(parsed?.id).toBe("MiniMax-M3");
 			}
 		}
 		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax-v3");
+		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax-m3");
 	});
 
 	test("Alibaba Token Plan profiles route their intended roles", () => {
@@ -898,11 +899,11 @@ describe("built-in model profile catalog", () => {
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 		});
 		expect(builtinMapping("alibaba-token-plan-qwen-deepseek")).toEqual({
-			default: "alibaba-token-plan/qwen-3.8-max:high",
+			default: "alibaba-token-plan/qwen3.8-max:high",
 			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
 			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
-			critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
-			architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+			critic: "alibaba-token-plan/qwen3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max:xhigh",
 		});
 		expect(builtinMapping("alibaba-token-plan-glm-deepseek")).toEqual({
 			default: "alibaba-token-plan/glm-5.2:high",

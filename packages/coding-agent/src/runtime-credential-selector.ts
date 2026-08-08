@@ -1,4 +1,4 @@
-import type { AuthCredentialSelector, AuthCredentialSelectorKind } from "@gajae-code/ai";
+import type { AuthCredentialSelector, AuthCredentialSelectorKind } from "@gajae-code/ai/core";
 
 export interface CliCredentialSelector {
 	provider?: string;

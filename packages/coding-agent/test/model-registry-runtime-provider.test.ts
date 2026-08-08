@@ -200,6 +200,56 @@ describe("ModelRegistry runtime provider registration", () => {
 		registry.clearSourceRegistrations("ext://runtime");
 		expectProviderHeader(registry, providerName, "Authorization", undefined);
 	});
+	test("registerProvider applies provider-only responses affinity compat across refresh", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.registerProvider(
+			"openai",
+			{
+				baseUrl: "https://openai-relay.example.com/v1",
+				api: "openai-responses",
+				compat: { supportsResponsesSessionAffinity: true },
+			},
+			"ext://runtime",
+		);
+
+		const readAffinity = () =>
+			(registry.find("openai", "gpt-4o-mini")?.compat as { supportsResponsesSessionAffinity?: boolean } | undefined)
+				?.supportsResponsesSessionAffinity;
+		expect(readAffinity()).toBe(true);
+		await registry.refresh("offline");
+		expect(readAffinity()).toBe(true);
+	});
+	test("model-level false survives a later runtime provider compat override", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.registerProvider(
+			"relay",
+			{
+				baseUrl: "https://relay.example.com/v1",
+				api: "openai-responses",
+				apiKey: "RUNTIME_KEY",
+				models: [{ ...baseModel, compat: { supportsResponsesSessionAffinity: false } }],
+			},
+			"ext://runtime",
+		);
+		registry.registerProvider(
+			"relay",
+			{
+				// Unknown provider IDs still require a genuinely custom base URL when
+				// enabling affinity, even on a transport-only re-registration.
+				baseUrl: "https://relay.example.com/v1",
+				api: "openai-responses",
+				compat: { supportsResponsesSessionAffinity: true },
+			},
+			"ext://runtime",
+		);
+
+		const readAffinity = () =>
+			(registry.find("relay", "runtime-model")?.compat as { supportsResponsesSessionAffinity?: boolean } | undefined)
+				?.supportsResponsesSessionAffinity;
+		expect(readAffinity()).toBe(false);
+		await registry.refresh("offline");
+		expect(readAffinity()).toBe(false);
+	});
 
 	test("registerProvider preserves explicit thinking on runtime models", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);

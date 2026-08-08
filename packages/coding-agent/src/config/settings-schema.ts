@@ -5,6 +5,7 @@ import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 import type { ModelSelectorValue } from "./model-selector-value";
+import { UPDATE_CHANNELS } from "./update-channel";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
 const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
@@ -274,6 +275,17 @@ export const SETTINGS_SCHEMA = {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
 		default: "copy-retain",
+	},
+	"workspaceTree.mode": {
+		type: "enum",
+		values: ["eager", "lazy"] as const,
+		default: "eager",
+		description: "When to scan the workspace tree used by the first prompt.",
+	},
+	"startup.networkPrewarm": {
+		type: "boolean",
+		default: true,
+		description: "Preconnect the model host during startup before the first request.",
 	},
 	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
 	"sdk.promptDeadlineMs": {
@@ -590,6 +602,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"theme.watchFiles": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Watch Theme Files",
+			description: "Reload custom themes when their files change",
+		},
+	},
+
 	symbolPreset: {
 		type: "enum",
 		values: ["unicode", "nerd", "ascii"] as const,
@@ -606,6 +628,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"syntaxHighlighting.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Syntax Highlighting",
+			description: "Highlight code blocks and diffs when rendering",
+		},
+	},
+
 	colorBlindMode: {
 		type: "boolean",
 		default: false,
@@ -617,6 +649,15 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Status line
+	"statusLine.watchGitHead": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Watch Git HEAD",
+			description: "Refresh status-line git data when HEAD changes",
+		},
+	},
 	"statusLine.preset": {
 		type: "enum",
 		values: ["default", "default-usage", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
@@ -1309,6 +1350,15 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
+	"history.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "History",
+			description: "Persist and search submitted prompts in local history",
+		},
+	},
 	"mouse.enabled": {
 		type: "boolean",
 		default: false,
@@ -1461,6 +1511,21 @@ export const SETTINGS_SCHEMA = {
 			label: "Check for Updates",
 			description:
 				"At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
+		},
+	},
+
+	"startup.updateChannel": {
+		type: "enum",
+		values: UPDATE_CHANNELS,
+		default: "stable",
+		ui: {
+			tab: "interaction",
+			label: "Update Channel",
+			description: "Release channel used by `gjc update` and the startup update check",
+			options: [
+				{ value: "stable", label: "Stable", description: "Track stable releases (npm `latest` dist-tag)" },
+				{ value: "nightly", label: "Nightly", description: "Track nightly prereleases (npm `nightly` dist-tag)" },
+			],
 		},
 	},
 
@@ -2606,6 +2671,28 @@ export const SETTINGS_SCHEMA = {
 				"Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
 		},
 	},
+	"clipboard.transport": {
+		type: "enum",
+		values: ["auto", "native", "osc52", "ssh"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			label: "Clipboard Transport",
+			description:
+				"auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+		},
+	},
+	"clipboard.sshHost": {
+		type: "string",
+		default: "",
+		validate: (value: string) => value === "" || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value),
+		ui: {
+			tab: "tools",
+			label: "Clipboard SSH Host",
+			description:
+				"SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
+		},
+	},
 
 	"web_search.enabled": {
 		type: "boolean",
@@ -2998,6 +3085,11 @@ export const SETTINGS_SCHEMA = {
 	"mcp.notificationDebounceMs": {
 		type: "number",
 		default: 500,
+	},
+
+	"mcp.sharedPoolIdleMs": {
+		type: "number",
+		default: 300_000,
 	},
 
 	// ────────────────────────────────────────────────────────────────────────
@@ -3779,6 +3871,67 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 			validArraySettingValue(value, "items" in definition ? definition.items?.enum : undefined)) ||
 		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
 	);
+}
+
+/**
+ * Validate an external (SDK `config.patch`) path/value set against the
+ * settings schema before any durable write. Dotted sub-paths of record
+ * settings (e.g. `modelRoles.default`) are validated against the record's
+ * value schema. Returns the offending entries so the caller can reject the
+ * whole patch without durable side effects.
+ */
+export function validateSettingPatch(patch: Record<string, unknown>): Array<{ path: string; detail: string }> {
+	const issues: Array<{ path: string; detail: string }> = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const [path, value] of Object.entries(patch)) {
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		if (!definition) {
+			const recordParent = [...knownPaths].find(known => known !== path && path.startsWith(`${known}.`));
+			if (!recordParent) {
+				issues.push({ path, detail: "Setting is not recognized by this version." });
+				continue;
+			}
+			const parentDef = SETTINGS_SCHEMA[recordParent as SettingPath];
+			if (parentDef.type !== "record" || !("valueSchema" in parentDef) || !parentDef.valueSchema) {
+				issues.push({ path, detail: "Setting is not a valid record sub-path." });
+				continue;
+			}
+			if (
+				parentDef.valueSchema.type === "model-selector-value" &&
+				!(typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string")))
+			) {
+				issues.push({ path, detail: "Expected model-selector-value." });
+			}
+			continue;
+		}
+		if (!validSettingValue(definition, value)) {
+			// `Expected array.` is wrong for a real array carrying bad elements, and an
+			// SDK client reaching this through `config.patch` cannot act on it. Name the
+			// element constraint that actually failed.
+			const arrayItemEnum =
+				definition.type === "array" && Array.isArray(value) && "items" in definition
+					? definition.items?.enum
+					: undefined;
+			const detail = arrayItemEnum
+				? `Expected array items to be one of: ${arrayItemEnum.join(", ")}.`
+				: definition.type === "array" && Array.isArray(value)
+					? "Expected array items to be strings."
+					: `Expected ${definition.type}.`;
+			issues.push({ path, detail });
+			continue;
+		}
+		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {
+			for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+				if (
+					definition.valueSchema.type === "model-selector-value" &&
+					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
+				) {
+					issues.push({ path: `${path}.${key}`, detail: "Expected model-selector-value." });
+				}
+			}
+		}
+	}
+	return issues;
 }
 
 /** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */

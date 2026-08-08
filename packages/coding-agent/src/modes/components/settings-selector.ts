@@ -1,5 +1,5 @@
 import { ThinkingLevel, type ThinkingLevel as ThinkingLevelValue } from "@gajae-code/agent-core";
-import type { Effort } from "@gajae-code/ai";
+import type { Effort } from "@gajae-code/ai/core";
 import {
 	type Component,
 	Container,
@@ -597,6 +597,8 @@ class StatusLineCustomEditor extends Container {
 			rightSegments: [...this.#draft.rightSegments],
 			separator: this.#draft.separator,
 			segmentOptions: cloneSegmentOptions(this.#draft.segmentOptions),
+			sessionAccent: settings.get("statusLine.sessionAccent"),
+			maxRows: settings.get("statusLine.maxRows"),
 			previewHighlightSegment: this.#previewHighlightSegment,
 		});
 	}
@@ -609,6 +611,7 @@ class StatusLineCustomEditor extends Container {
 			separator: settings.get("statusLine.separator"),
 			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
 			sessionAccent: settings.get("statusLine.sessionAccent"),
+			maxRows: settings.get("statusLine.maxRows"),
 			previewHighlightSegment: undefined,
 		});
 	}
@@ -1239,8 +1242,25 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	#buildItemsForTab(defs: SettingDef[], tabId: SettingTab): SettingItem[] {
-		const items = this.#buildItemsForDefs(defs);
+		let items = this.#buildItemsForDefs(defs);
 		if (tabId === "appearance") {
+			// Keep the long-standing appearance navigation order stable when new
+			// appearance settings are added. The dedicated status-line editor is a
+			// sibling of the preset row, so keyboard users do not lose it behind
+			// unrelated toggles inserted before the preset.
+			const appearanceAnchorIds = [
+				"theme.dark",
+				"theme.light",
+				"symbolPreset",
+				"colorBlindMode",
+				"statusLine.preset",
+			];
+			const anchorIds = new Set(appearanceAnchorIds);
+			const anchoredItems = appearanceAnchorIds
+				.map(id => items.find(item => item.id === id))
+				.filter((item): item is SettingItem => item !== undefined);
+			items = [...anchoredItems, ...items.filter(item => !anchorIds.has(item.id))];
+
 			const customEditorCallbacks: SettingsCallbacks = {
 				...this.callbacks,
 				onStatusLinePreview: previewSettings => {

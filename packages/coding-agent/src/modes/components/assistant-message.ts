@@ -1,4 +1,4 @@
-import type { AssistantMessage, ImageContent, Usage } from "@gajae-code/ai";
+import type { AssistantMessage, ImageContent, Usage } from "@gajae-code/ai/core";
 import {
 	type Component,
 	Container,

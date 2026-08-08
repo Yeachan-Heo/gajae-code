@@ -57,6 +57,7 @@ describe("gjc mcp CLI helpers", () => {
 			command: "npx",
 			args: ["-y", "@upstash/context7-mcp"],
 			env: { API_TOKEN: "super-secret" },
+			sharing: "per-session",
 		});
 		expect(stdoutText(stdout)).toContain('"API_TOKEN": "<redacted>"');
 		expect(stdoutText(stdout)).not.toContain("super-secret");

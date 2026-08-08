@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { Agent, AgentBusyError } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
@@ -655,6 +656,51 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(debugSpy.mock.calls.some(call => call[0] === "agent.continue busy after scheduling; rescheduling")).toBe(
 			true,
 		);
+	});
+
+	it("bounds a persistently busy AgentBusyError with capped exponential backoff, then gives up", async () => {
+		session.agent.followUp({
+			role: "custom",
+			customType: "test",
+			content: [{ type: "text", text: "Queued" }],
+			display: false,
+			timestamp: Date.now(),
+		});
+		const warnSpy = vi.spyOn(logger, "warn");
+		const debugSpy = vi.spyOn(logger, "debug");
+		// Instant waits: without a cap the reschedule loop never terminates, so this
+		// test hangs instead of passing against the unpatched fixed-100ms spin.
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockRejectedValue(new AgentBusyError());
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+
+		await driveCompaction();
+		await advancePostPrompt(300);
+		await session.waitForIdle();
+
+		// 1 initial attempt + 50 bounded reschedules, then the loop stops for good.
+		expect(continueSpy).toHaveBeenCalledTimes(51);
+		await advancePostPrompt(300);
+		await session.waitForIdle();
+		expect(continueSpy).toHaveBeenCalledTimes(51);
+
+		const busyDebugs = debugSpy.mock.calls.filter(
+			call => call[0] === "agent.continue busy after scheduling; rescheduling",
+		);
+		expect(busyDebugs).toHaveLength(50);
+		// Capped exponential backoff: 100ms base doubling up to a 5s ceiling.
+		const rescheduleDelays = busyDebugs.map(call => (call[1] as { delayMs: number }).delayMs);
+		expect(rescheduleDelays).toEqual([100, 200, 400, 800, 1600, 3200, ...Array(44).fill(5000)]);
+
+		const exhaustedWarns = warnSpy.mock.calls.filter(
+			call => call[0] === "agent.continue busy reschedule budget exhausted; giving up",
+		);
+		expect(exhaustedWarns).toHaveLength(1);
+		expect(exhaustedWarns[0]?.[1]).toMatchObject({ attempts: 50 });
+		// Giving up still routes through the standard failure handlers.
+		expect(warnSpy.mock.calls.some(call => call[0] === "agent.continue failed after scheduling")).toBe(true);
+		expect(warnSpy.mock.calls.some(call => call[0] === "Auto-compaction continuation failed")).toBe(true);
+		expect(promptSpy).not.toHaveBeenCalled();
 	});
 
 	it("preserves synthetic auto-continue prompt delivery across an AgentBusyError", async () => {

@@ -11,7 +11,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Process } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { Settings } from "../../config/settings";
 import type {
 	BuiltInDaemonController,
@@ -120,7 +120,7 @@ export interface DaemonProcessReference {
 
 export function defaultProcessReference(pid: number, platform = os.platform()): DaemonProcessReference | undefined {
 	try {
-		const processRef = Process.fromPid(pid);
+		const processRef = nativeProcessBindings().Process.fromPid(pid);
 		if (!processRef || !isProcessIncarnation(processRef.incarnation)) return undefined;
 		const incarnation = processRef.incarnation;
 		return {
@@ -138,7 +138,7 @@ export function defaultProcessReference(pid: number, platform = os.platform()): 
 				// since capture is never signaled; the residual window is the few
 				// instructions between this recheck and kill(2).
 				if (platform === "darwin") {
-					const current = Process.fromPid(pid) as { incarnation?: unknown } | null;
+					const current = nativeProcessBindings().Process.fromPid(pid) as { incarnation?: unknown } | null;
 					if (!current || current.incarnation !== incarnation) throw new Error("Pinned process is already gone");
 					process.kill(pid, signal);
 					return;

@@ -1,4 +1,4 @@
-import type { ImageContent, TextContent } from "@gajae-code/ai";
+import type { ImageContent, TextContent } from "@gajae-code/ai/core";
 
 export type Transferable = Bun.Transferable;
 

@@ -14,7 +14,7 @@ import { SessionAppendPersistenceError, SessionManager } from "@gajae-code/codin
 import { FileSessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
 import { buildVolatileProjectContext } from "@gajae-code/coding-agent/system-prompt";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { TodoWriteTool } from "@gajae-code/coding-agent/tools";
+import { TodoWriteTool } from "@gajae-code/coding-agent/tools/implementations";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";

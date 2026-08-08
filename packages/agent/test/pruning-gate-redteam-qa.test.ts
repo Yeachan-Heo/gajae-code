@@ -1,11 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/compaction/entries";
-import {
-	estimateToolOutputPruneSavings,
-	type PruneConfig,
-	pruneToolOutputs,
-} from "@gajae-code/agent-core/compaction/pruning";
+import { estimateToolOutputPruneSavings, type PruneConfig } from "@gajae-code/agent-core/compaction/pruning";
 import type { ToolResultMessage } from "@gajae-code/ai/types";
+import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 
 let sequence = 0;
 

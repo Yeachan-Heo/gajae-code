@@ -324,8 +324,8 @@ impl NotificationServer {
 			let mut rx = handle
 				.take_reply_receiver()
 				.ok_or_else(|| Error::from_reason("notification reply receiver unavailable"))?;
-			let task = napi::tokio::spawn(async move {
-				while let Some(reply) = rx.recv().await {
+			let task = napi::tokio::task::spawn_blocking(move || {
+				while let Some(reply) = rx.blocking_recv() {
 					let event = ReplyEvent {
 						id:               reply.reply.id,
 						answer_json:      serde_json::to_string(&reply.reply.answer)
@@ -333,7 +333,9 @@ impl NotificationServer {
 						idempotency_key:  reply.reply.idempotency_key,
 						reply_receipt_id: reply.reply_receipt_id,
 					};
-					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
+					if tsfn.call(Ok(event), ThreadsafeFunctionCallMode::Blocking) != napi::Status::Ok {
+						break;
+					}
 				}
 			});
 			self.pump_tasks.lock().push(task);
@@ -343,9 +345,9 @@ impl NotificationServer {
 		let inbound_tsfn = self.on_inbound.lock().take();
 		let inbound_rx = handle.take_inbound_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (inbound_tsfn, inbound_rx) {
-			let task = napi::tokio::spawn(async move {
+			let task = napi::tokio::task::spawn_blocking(move || {
 				while let Some(gjc_sdk::server::InboundMessage { connection_id, message: msg }) =
-					rx.recv().await
+					rx.blocking_recv()
 				{
 					let event = match msg {
 						ClientMessage::UserMessage(u) => InboundEvent {
@@ -413,7 +415,9 @@ impl NotificationServer {
 						},
 						_ => continue,
 					};
-					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
+					if tsfn.call(Ok(event), ThreadsafeFunctionCallMode::Blocking) != napi::Status::Ok {
+						break;
+					}
 				}
 			});
 			self.pump_tasks.lock().push(task);

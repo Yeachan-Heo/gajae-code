@@ -1,4 +1,4 @@
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import type { Args } from "./args";
 
 export interface InitialMessageInput {

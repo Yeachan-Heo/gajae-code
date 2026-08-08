@@ -1,5 +1,5 @@
 import { INTENT_FIELD, type ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { Markdown } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
 import chalk from "chalk";

@@ -50,7 +50,7 @@ describe("injectAlibabaTokenPlanModels", () => {
 				maxTokens: 384_000,
 			}),
 			expect.objectContaining({
-				id: "qwen-3.8-max",
+				id: "qwen3.8-max",
 				name: "Qwen3.8 Max",
 				api: "openai-responses",
 				provider: "alibaba-token-plan",
@@ -59,5 +59,30 @@ describe("injectAlibabaTokenPlanModels", () => {
 				maxTokens: 65_536,
 			}),
 		]);
+	});
+
+	it("removes every legacy Qwen 3.8 Max alias before restoring the canonical model", () => {
+		const legacy = (): Model<"openai-responses"> => ({
+			id: "qwen-3.8-max",
+			name: "Legacy Qwen",
+			api: "openai-responses",
+			provider: "alibaba-token-plan",
+			baseUrl: "https://example.invalid",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1,
+			maxTokens: 1,
+		});
+		const models: Model[] = [legacy(), legacy(), { ...legacy(), id: "qwen3.8-max" }];
+
+		injectAlibabaTokenPlanModels(models);
+
+		expect(models.filter(model => model.provider === "alibaba-token-plan" && model.id === "qwen-3.8-max")).toEqual(
+			[],
+		);
+		expect(
+			models.filter(model => model.provider === "alibaba-token-plan" && model.id === "qwen3.8-max"),
+		).toHaveLength(1);
 	});
 });

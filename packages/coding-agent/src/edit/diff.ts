@@ -5,7 +5,6 @@
  * used when not in patch mode.
  */
 
-import { createRequire } from "node:module";
 import * as Diff from "diff";
 import { resolveToCwd } from "../tools/path-utils";
 import { DEFAULT_FUZZY_THRESHOLD, EditMatchError, findMatch } from "./modes/replace";
@@ -64,7 +63,6 @@ type DiffLinePart = {
 
 type DiffLinesFn = (oldStr: string, newStr: string) => DiffLinePart[];
 
-const require = createRequire(import.meta.url);
 const DIFF_LINES_TEST_OVERRIDE_UNSET = Symbol("DIFF_LINES_TEST_OVERRIDE_UNSET");
 
 let cachedNativeDiffLines: DiffLinesFn | null | undefined;

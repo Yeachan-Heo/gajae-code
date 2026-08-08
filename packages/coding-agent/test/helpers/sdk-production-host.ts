@@ -21,6 +21,7 @@ export async function startProductionSdkHost(
 ): Promise<{
 	endpoint: { url: string; token: string };
 	sessionId: string;
+	endpointMtimeMs: number;
 	observed: Array<{ kind: "control" | "query"; operation: string }>;
 	triggerAsk: (
 		question: string,
@@ -113,6 +114,7 @@ export async function startProductionSdkHost(
 				await Bun.sleep(10);
 			}
 			const endpoint = JSON.parse(fs.readFileSync(file, "utf8")) as { url: string; token: string };
+			const endpointMtimeMs = fs.statSync(file).mtimeMs;
 			const triggerAsk = (question: string, options: string[]) => {
 				const authority = session.getAskAnswerSource();
 				return authority
@@ -129,6 +131,7 @@ export async function startProductionSdkHost(
 			};
 			return {
 				endpoint,
+				endpointMtimeMs,
 				sessionId: session.sessionId,
 				observed,
 				triggerAsk,

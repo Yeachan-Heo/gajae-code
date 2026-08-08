@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { ToolResultMessage } from "@gajae-code/ai";
 import { DEFAULT_COMPACTION_SETTINGS, prepareCompaction, shouldCompact } from "../src/compaction/compaction";
 import type { SessionEntry } from "../src/compaction/entries";
-import { pruneToolOutputs } from "../src/compaction/pruning";
+import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 
 let sequence = 0;
 const timestamp = "2026-07-16T00:00:00.000Z";

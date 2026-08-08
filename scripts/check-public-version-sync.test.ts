@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { $ } from "bun";
 import { buildDocsIndexOutput, checkLivePublicVersionSync, checkPublicVersionSync } from "./check-public-version-sync";
 import { canonicalJsonBytes, createExpectedEvidence, createFinalEvidence, expectedEvidenceSha256, PUBLIC_PACKAGE_DEFINITIONS } from "./release-evidence";
 
@@ -209,6 +210,50 @@ describe("public docs/site/version sync guard", () => {
 		expect(violations.some(violation => violation.path === "package.json" && violation.message.includes("catalog gajae-code"))).toBe(true);
 		expect(violations.some(violation => violation.path === "README.md" && violation.message.includes("Visible marketing version 1.2.2"))).toBe(true);
 		expect(violations.some(violation => violation.path.includes("docs-index.generated.ts") && violation.message.includes("stale"))).toBe(true);
+	});
+	test("fails when the generated docs index is committed, and passes once it is untracked", async () => {
+		// The file is gitignored, but git only consults .gitignore for untracked
+		// paths -- so an accidental `git add` makes the ignore rule inert and
+		// restores the unmergeable one-line-per-doc artifact to the index.
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+			"README.md": "# Gajae-Code\n",
+			"docs/sdk.md": "# SDK\n\nCurrent docs.\n",
+			".gitignore": "packages/coding-agent/src/internal-urls/docs-index.generated.ts\n",
+		});
+		await addGeneratedDocsIndex(root);
+		await $`git -C ${root} init -q`.quiet();
+		await $`git -C ${root} add -A --force`.quiet();
+
+		const committed = await checkPublicVersionSync(root);
+		expect(
+			committed.some(
+				violation =>
+					violation.path.includes("docs-index.generated.ts") && violation.message.includes("git rm --cached"),
+			),
+		).toBe(true);
+
+		await $`git -C ${root} rm --cached -q -- packages/coding-agent/src/internal-urls/docs-index.generated.ts`.quiet();
+
+		// Untracked but still on disk and still current: nothing left to report.
+		await expect(checkPublicVersionSync(root)).resolves.toEqual([]);
+	});
+
+	test("does not report tracking outside a git work tree", async () => {
+		// An extracted release tarball has no .git; the guard must stay silent
+		// rather than fail on a missing git or a non-repo directory.
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+			"README.md": "# Gajae-Code\n",
+			"docs/sdk.md": "# SDK\n\nCurrent docs.\n",
+		});
+		await addGeneratedDocsIndex(root);
+
+		await expect(checkPublicVersionSync(root)).resolves.toEqual([]);
 	});
 
 	test("live check executes the production final-evidence validator against canonical deployed release state", async () => {

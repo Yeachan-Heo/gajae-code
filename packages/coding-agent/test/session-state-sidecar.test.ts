@@ -2067,4 +2067,77 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await readJson(readinessFile)).toEqual(marker);
 		expect((await readJson(stateFile)).state).toBe("running");
 	});
+	it("accepts a coordinator-seeded payload and preserves current_turn_id (#2549)", async () => {
+		// The coordinator seeds its state file with current_turn_id but without
+		// cwd/workdir/session_file (runtime identity fields). When the runtime writes
+		// to the same coordinator-shared file, assertPreviousRuntimeStateIdentity
+		// must accept the seed (same session_id) and basePayload must preserve the
+		// coordinator's current_turn_id. This is the fencing-compatibility fix that
+		// lets the exact-match terminal predicate work without heuristic inference.
+		const root = await tempRoot();
+		const stateFile = path.join(root, "coordinator-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const sessionId = "broker-session-2549";
+		const coordinatorTurnId = "turn-correlated-2549";
+
+		// Seed the file as the coordinator would: session_id + current_turn_id, no cwd/workdir.
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				ready_for_input: false,
+				current_turn_id: coordinatorTurnId,
+				last_turn_id: null,
+				updated_at: new Date().toISOString(),
+				source: "coordinator",
+				live: null,
+				reason: null,
+			})}\n`,
+		);
+
+		// Runtime writes agent_end to the same file. It must not throw fencing error.
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("FINAL-2549"), {
+			sessionId,
+			cwd: root,
+			sessionFile: path.join(root, "session.jsonl"),
+		});
+
+		const payload = await readPayload(stateFile);
+		// The runtime completed with the coordinator's turn ID preserved.
+		expect(payload.state).toBe("completed");
+		expect(payload.source).toBe("agent_session_event");
+		expect(payload.current_turn_id).toBe(coordinatorTurnId);
+		expect((payload.final_response as Record<string, unknown> | undefined)?.text).toBe("FINAL-2549");
+	});
+
+	it("rejects a foreign session_id in the coordinator-shared file (#2549)", async () => {
+		// A genuinely foreign session_id must still be rejected by identity fencing,
+		// even when the previous payload lacks cwd/workdir/session_file.
+		const root = await tempRoot();
+		const stateFile = path.join(root, "coordinator-state-foreign.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const foreignSessionId = "different-session";
+		const runtimeSessionId = "runtime-session-2549";
+
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: foreignSessionId,
+				state: "running",
+				current_turn_id: "turn-foreign",
+			})}\n`,
+		);
+
+		// The runtime has a different session_id; fencing must throw.
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(assistantEnd("should-not-persist"), {
+				sessionId: runtimeSessionId,
+				cwd: root,
+				sessionFile: path.join(root, "session.jsonl"),
+			}),
+		).rejects.toThrow();
+	});
 });

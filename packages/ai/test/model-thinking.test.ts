@@ -137,6 +137,11 @@ describe("model thinking metadata", () => {
 			api: "anthropic-messages",
 			provider: "anthropic",
 		});
+		const sonnet5Bedrock = createModel({
+			id: "us.anthropic.claude-sonnet-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
 
 		expect(opus45.thinking?.mode).toBe("anthropic-budget-effort");
 		expect(opus46.thinking?.mode).toBe("anthropic-adaptive");
@@ -156,7 +161,7 @@ describe("model thinking metadata", () => {
 		expect(sonnet5.thinking).toEqual({
 			mode: "anthropic-adaptive",
 			minLevel: Effort.Minimal,
-			maxLevel: Effort.High,
+			maxLevel: Effort.Max,
 		});
 		// Older Opus adaptive models expose max but not the newer xhigh literal.
 		expect(() => mapEffortToAnthropicAdaptiveEffort(opus46, Effort.XHigh)).toThrow(/not supported/);
@@ -169,7 +174,22 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(opus47Bedrock, Effort.Max)).toBe("max");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.XHigh)).toThrow(/not supported/);
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.Max)).toThrow(/not supported/);
+		// Sonnet 5 officially exposes both Anthropic's real xhigh and max presets.
 		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.High)).toBe("high");
+		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.Max)).toBe("max");
+		expect(requireSupportedEffort(sonnet5, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(requireSupportedEffort(sonnet5, Effort.Max)).toBe(Effort.Max);
+		expect(clampThinkingLevelForModel(sonnet5, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(clampThinkingLevelForModel(sonnet5, Effort.Max)).toBe(Effort.Max);
+		// Older Sonnet generations stay fail-closed: no xhigh, no max.
+		expect(() => requireSupportedEffort(sonnet46, Effort.XHigh)).toThrow(/not supported/);
+		expect(() => requireSupportedEffort(sonnet46, Effort.Max)).toThrow(/not supported/);
+		// Bedrock Converse lacks the Messages-only xhigh preset, so Bedrock
+		// Sonnet 5 stays clamped to high (no xhigh, no max).
+		expect(sonnet5Bedrock.thinking?.maxLevel).toBe(Effort.High);
+		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet5Bedrock, Effort.XHigh)).toThrow(/not supported/);
+		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet5Bedrock, Effort.Max)).toThrow(/not supported/);
 	});
 
 	it("classifies Fable 5 as adaptive thinking with xhigh support (discovery metadata regression)", () => {
@@ -229,22 +249,26 @@ describe("generated model policies", () => {
 		});
 	});
 
-	it("maps only first-class MiniMax M3 routes to the official 1M context", () => {
+	it("maps only first-class MiniMax M3 routes to the official 1M context (issue #3896)", () => {
 		const models = [
-			createModel({ id: "minimax-m3", api: "anthropic-messages", provider: "minimax" }),
-			createModel({ id: "minimax-m3", api: "anthropic-messages", provider: "minimax-cn" }),
-			createModel({ id: "minimax-m3", api: "openai-completions", provider: "minimax-code" }),
-			createModel({ id: "minimax-m3", api: "openai-completions", provider: "minimax-code-cn" }),
+			createModel({ id: "MiniMax-M3", api: "anthropic-messages", provider: "minimax" }),
+			createModel({ id: "MiniMax-M3[1m]", api: "anthropic-messages", provider: "minimax" }),
+			createModel({ id: "MiniMax-M3[1m]", api: "anthropic-messages", provider: "minimax-cn" }),
+			createModel({ id: "MiniMax-M3", api: "openai-completions", provider: "minimax-code" }),
+			createModel({ id: "MiniMax-M3", api: "openai-completions", provider: "minimax-code-cn" }),
 			createModel({ id: "minimax-m3", api: "openai-completions", provider: "openai-codex" }),
-			createModel({ id: "minimax-m3", api: "openai-completions", provider: "opencode" }),
+			{
+				...createModel({ id: "minimax-m3", api: "openai-completions", provider: "opencode-zen" }),
+				contextWindow: 512_000,
+			},
 		];
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models.slice(0, 4).map(model => model.contextWindow)).toEqual([
-			1_000_000, 1_000_000, 1_000_000, 1_000_000,
+		expect(models.slice(0, 5).map(model => model.contextWindow)).toEqual([
+			1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000,
 		]);
-		expect(models.slice(4).map(model => model.contextWindow)).toEqual([200_000, 200_000]);
+		expect(models.slice(5).map(model => model.contextWindow)).toEqual([200_000, 512_000]);
 	});
 
 	it("refreshes thinking metadata and applies parsed catalog corrections", () => {
@@ -508,7 +532,7 @@ describe("generated model policies", () => {
 		}
 	});
 
-	it("caps only Codex product GPT-5.6 tiers at the 272K prompt budget", () => {
+	it("forces only Codex product GPT-5.6 tiers to the 372K prompt budget", () => {
 		const models: Model<Api>[] = [
 			{
 				...createModel({ id: "gpt-5.6-sol", api: "openai-codex-responses", provider: "openai-codex" }),
@@ -534,9 +558,26 @@ describe("generated model policies", () => {
 
 		applyGeneratedModelPolicies(models);
 
-		expect(models.map(model => model.contextWindow)).toEqual([272_000, 1_050_000, 200_000, 272_000]);
+		expect(models.map(model => model.contextWindow)).toEqual([372_000, 1_050_000, 372_000, 272_000]);
 		expect(models[0]?.applyPatchToolType).toBe("freeform");
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
+	});
+
+	it("forces every GPT-5.6 tier id to 372K through generated policies regardless of observation", () => {
+		const models: Model<Api>[] = [];
+		for (const id of ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const) {
+			for (const contextWindow of [200_000, 272_000, 373_000, 1_050_000]) {
+				models.push({
+					...createModel({ id, api: "openai-codex-responses", provider: "openai-codex" }),
+					contextWindow,
+					maxTokens: 128000,
+				});
+			}
+		}
+		applyGeneratedModelPolicies(models);
+		for (const model of models) {
+			expect(model.contextWindow).toBe(372_000);
+		}
 	});
 });
 

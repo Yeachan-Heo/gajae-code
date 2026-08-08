@@ -63,16 +63,34 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error(`artifact://${id} not found`);
 		}
 
-		// F20: cap the materialized artifact so reading a huge spilled artifact cannot
-		// buffer GBs into memory (the range selector is applied downstream, so without a
-		// cap a `artifact://id:range` over a multi-GB artifact still reads it whole).
-		const MAX_ARTIFACT_READ_BYTES = 16 * 1024 * 1024;
 		const file = Bun.file(foundPath);
 		const fullSize = file.size;
-		const content =
-			fullSize > MAX_ARTIFACT_READ_BYTES
-				? `${await file.slice(0, MAX_ARTIFACT_READ_BYTES).text()}\n\n[Artifact truncated: first ${MAX_ARTIFACT_READ_BYTES} of ${fullSize} bytes shown; use a narrower range or a specialized tool for the full content.]`
-				: await file.text();
+		const range = url.searchParams.get("range");
+		let start = 0;
+		let end = fullSize;
+		if (range !== null) {
+			const match = range.match(/^(\d+)(?:-(\d*))?$/);
+			if (!match) throw new Error(`Invalid artifact range: ${range}`);
+			start = Number(match[1]);
+			end = match[2] ? Number(match[2]) + 1 : fullSize;
+			if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end)
+				throw new Error(`Invalid artifact range: ${range}`);
+		}
+
+		// Explicit ranges are applied before materialization and are not widened by
+		// the default ceiling. Bare reads remain bounded so a large artifact cannot
+		// unexpectedly allocate an unbounded string in the protocol handler.
+		const boundedEnd = Math.min(fullSize, end);
+		const MAX_ARTIFACT_READ_BYTES = 16 * 1024 * 1024;
+		let content: string;
+		if (range !== null) {
+			content = await file.slice(start, boundedEnd).text();
+		} else if (fullSize > MAX_ARTIFACT_READ_BYTES) {
+			const prefix = await file.slice(0, MAX_ARTIFACT_READ_BYTES).text();
+			content = `${prefix}\n\n[Artifact truncated: first ${MAX_ARTIFACT_READ_BYTES} of ${fullSize} bytes shown; use ?range=start-end for a bounded slice.]`;
+		} else {
+			content = await file.text();
+		}
 		return {
 			url: url.href,
 			content,

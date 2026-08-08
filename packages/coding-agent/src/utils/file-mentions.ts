@@ -8,8 +8,8 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { ImageContent } from "@gajae-code/ai";
-import { glob } from "@gajae-code/natives";
+import type { ImageContent } from "@gajae-code/ai/core";
+import type { glob as globFn } from "@gajae-code/natives";
 import { fuzzyMatch } from "@gajae-code/tui";
 import { formatAge, formatBytes, readImageMetadata } from "@gajae-code/utils";
 import { formatHashLines } from "../hashline/hash";
@@ -22,6 +22,13 @@ import {
 } from "../session/streaming-output";
 import { resolveReadPath } from "../tools/path-utils";
 import { formatDimensionNote, resizeImage } from "./image-resize";
+
+let fileMentionGlobLoad: Promise<typeof globFn> | undefined;
+
+async function fileMentionGlob(): Promise<typeof globFn> {
+	fileMentionGlobLoad ??= Promise.resolve((require("@gajae-code/natives") as { glob: typeof globFn }).glob);
+	return await fileMentionGlobLoad;
+}
 
 /** Regex to match @filepath patterns in text */
 const FILE_MENTION_REGEX = /@([^\s@]+)/g;
@@ -92,7 +99,7 @@ async function listMentionCandidates(cwd: string): Promise<MentionCandidate[]> {
 	let entries: string[];
 	try {
 		const discoveryProfile = getMentionCandidateDiscoveryProfile();
-		const result = await glob({
+		const result = await (await fileMentionGlob())({
 			pattern: "**/*",
 			path: cwd,
 			...discoveryProfile,

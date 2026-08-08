@@ -48,6 +48,8 @@ import {
 	buildCompactChoiceGrid,
 	code,
 	markdownToTelegramHtml,
+	SELECTION_MARK_CHECKED,
+	SELECTION_MARK_UNCHECKED,
 	splitTelegramHtml,
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
@@ -367,6 +369,10 @@ const BTW_PENDING_TTL_MS = 300_000;
 const PICKER_CALLBACK_PREFIX = "p:";
 const ADOPTION_INTENT_SWEEP_INTERVAL_MS = 60_000;
 const BTW_MAX_PENDING = 256;
+
+/** How long a compensation fence retries a failed topic-registry persist before giving up (40 × 250ms ≈ 10s). */
+const COMPENSATION_FENCE_MAX_ATTEMPTS = 40;
+const COMPENSATION_FENCE_RETRY_DELAY_MS = 250;
 const BTW_SHUTDOWN_JOIN_MS = 1_000;
 const BTW_USAGE_TEXT = "Usage: /btw <question>";
 const BTW_CAPACITY_TEXT = "Too many /btw questions are pending. Wait for one to finish and try again.";
@@ -383,6 +389,10 @@ const BTW_QUESTION_LIMIT_TEXT = "Question must be at most 4096 Unicode scalar va
 type ParsedBtwCommand = { kind: "question"; question: string } | { kind: "ignored" };
 type TelegramFileDownload = { bytes: Buffer } | { failure: "download_failed" | "too_large" };
 class ThreadedModeCapabilityRefusal extends Error {}
+/** Telegram answered `createForumTopic` with an explicit `ok: false` rejection. */
+class TopicCreationRejected extends Error {}
+/** The transport suppressed `createForumTopic` (no response body to classify). */
+class TopicCreationSuppressed extends Error {}
 
 async function prepareTelegramImageAttachment(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
 	if (frame.type !== "image_attachment") return frame;
@@ -422,7 +432,7 @@ function isThreadedModeCapabilityRefusal(response: unknown): boolean {
 	return (
 		ok === false &&
 		typeof description === "string" &&
-		/(?:threaded mode|forum topics? (?:is|are) (?:disabled|not enabled)|(?:not allowed|not permitted|cannot|can't) create forum topics?)/i.test(
+		/(?:threaded mode|forum topics? (?:is|are) (?:disabled|not enabled)|(?:not allowed|not permitted|cannot|can't) create forum topics?|chat is not a forum)/i.test(
 			description,
 		)
 	);
@@ -3460,6 +3470,62 @@ export async function releaseDaemonOwnership(input: {
 	}
 }
 
+/**
+ * Record that this owner's process is gone, without claiming a clean handoff.
+ *
+ * {@link releaseDaemonOwnership} is the orderly path and runs only when the
+ * daemon quiesced and persisted; it also unlinks the ownership lock, which is
+ * correct for a handoff and wrong for a corpse. Every other way a daemon can
+ * end - an uncaught error, a failed final persist, a signal - previously left
+ * `ownershipPhase: "ready"` and a fresh-looking lock behind forever, so later
+ * readers attached to an owner that had not existed for hours.
+ *
+ * This writes `stoppedAt` and nothing else. The lock is left in place for the
+ * existing reclaim path to adjudicate, because a process on its way out is the
+ * least qualified party to decide who owns what next.
+ *
+ * Fenced on full owner identity: if the state no longer names this exact
+ * owner, acquisition, pid and incarnation, a successor already took over and
+ * marking *their* state stopped would be the same lie in the other direction.
+ */
+export async function markDaemonOwnerStopped(input: {
+	settings: Pick<Settings, "getAgentDir">;
+	ownerId: string;
+	acquisitionId?: string;
+	pid?: number;
+	generation?: number;
+	pidIncarnation?: (pid: number) => string | undefined;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	try {
+		const state = await readJson<DaemonState>(fsImpl, paths.state);
+		if (!hasSafeDaemonStateShape(state)) return false;
+		if (state.stoppedAt !== undefined) return false;
+		const acquisitionId = input.acquisitionId ?? input.ownerId;
+		const pid = input.pid ?? state.pid;
+		const incarnation = (input.pidIncarnation ?? defaultPidIncarnation)(pid);
+		if (
+			state.ownerId !== input.ownerId ||
+			state.acquisitionId !== acquisitionId ||
+			state.pid !== pid ||
+			(input.generation !== undefined && state.generation !== input.generation) ||
+			!isProcessIncarnation(incarnation) ||
+			state.incarnation !== incarnation
+		)
+			return false;
+		const lock = await readOwnershipLock(fsImpl, paths.lock);
+		if (!ownershipLockMatchesState(lock, state)) return false;
+		await writeJsonAtomic(fsImpl, paths.state, { ...state, stoppedAt: (input.now ?? Date.now)() });
+		return true;
+	} catch {
+		// A dying process cannot afford to fail louder than it already is.
+		return false;
+	}
+}
+
 /** Read the persisted daemon ownership state (or undefined when absent). */
 export async function readDaemonState(
 	settings: Pick<Settings, "getAgentDir">,
@@ -5068,6 +5134,8 @@ export class TelegramNotificationDaemon {
 	private readonly flatIdentitySent = new Set<string>();
 	/** Cached delivery boundary for the private owner chat or validation forum. */
 	private pairedChatPrivacy: PairedChatPrivacy | undefined;
+	/** Latched once Telegram confirms this chat cannot host forum topics. */
+	private topicCapabilityRefused = false;
 	/** Bot username from getMe, cached once at owner startup for group/forum command targeting. */
 	private botUsername: string | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
@@ -6259,9 +6327,22 @@ export class TelegramNotificationDaemon {
 			}
 			const logicalSessionId = this.#logicalSessionId(session);
 			if (session.logicalSessionIdTrusted)
-				void this.#renewTopicLease(logicalSessionId).then(renewed => {
-					if (!renewed) this.dropSession(session, "topic_lease_lost");
-				});
+				void this.#renewTopicLease(logicalSessionId).then(
+					renewed => {
+						if (!renewed) this.dropSession(session, "topic_lease_lost");
+					},
+					error => {
+						// A momentarily unavailable shared topic authority must not escape the
+						// heartbeat timer as an unhandled rejection and take the whole daemon
+						// down; report it and let the next heartbeat retry the renewal.
+						logger.warn(
+							`notifications: topic lease renewal failed: ${sanitizeDiagnostic(
+								String(error),
+								this.opts.botToken,
+							)}`,
+						);
+					},
+				);
 			if (session.ws.readyState === WebSocket.OPEN) {
 				const nonce = `${session.sessionId}:${t}:${Math.random().toString(36).slice(2)}`;
 				session.awaitingNonce = nonce;
@@ -7836,8 +7917,6 @@ export class TelegramNotificationDaemon {
 		let acceptedTopicId: string | undefined;
 		let acceptedTopicCompensated = false;
 		let acceptedTopicArchiveAttempted = false;
-		let creationSuppressed = false;
-		let creationRejected = false;
 		let adoptedTopicId: number | undefined;
 		const adoptionIntentCandidate = this.#adoptionIntents.bySession(sessionId);
 		try {
@@ -7876,10 +7955,10 @@ export class TelegramNotificationDaemon {
 					const res = (await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name })) as
 						| { result?: { message_thread_id?: unknown } }
 						| undefined;
-					if (res === undefined) {
-						creationSuppressed = true;
-						return undefined;
-					}
+					// Classification must travel with the rejection, not through
+					// closure flags: `getOrCreateTopic` shares one in-flight create
+					// promise, so every other awaiter observes only the error.
+					if (res === undefined) throw new TopicCreationSuppressed();
 					if (isThreadedModeCapabilityRefusal(res)) throw new ThreadedModeCapabilityRefusal();
 					const response = res as {
 						ok?: unknown;
@@ -7887,8 +7966,8 @@ export class TelegramNotificationDaemon {
 					};
 					const tid = response.result?.message_thread_id;
 					if (typeof tid !== "number" || !Number.isSafeInteger(tid) || tid <= 0) {
-						creationRejected = response.ok === false;
-						if (!creationRejected) this.#malformedTopicCreateEndpoints.set(sessionId, creationEndpointKey);
+						if (response.ok === false) throw new TopicCreationRejected();
+						this.#malformedTopicCreateEndpoints.set(sessionId, creationEndpointKey);
 						throw new Error("createForumTopic: invalid message_thread_id");
 					}
 					acceptedTopicId = String(tid);
@@ -8009,7 +8088,12 @@ export class TelegramNotificationDaemon {
 		} catch (err) {
 			if (adoptedTopicId !== undefined) this.#adoptionIntents.releaseClaim(adoptedTopicId, sessionId);
 			if (adoptionIntentCandidate) this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch);
-			if (creationSuppressed || creationRejected || err instanceof ThreadedModeCapabilityRefusal) {
+			if (
+				err instanceof TopicCreationSuppressed ||
+				err instanceof TopicCreationRejected ||
+				err instanceof ThreadedModeCapabilityRefusal
+			) {
+				if (err instanceof ThreadedModeCapabilityRefusal) this.topicCapabilityRefused = true;
 				if (this.topics.abandonCreateClaim(sessionId, creationLeaseEpoch)) await this.persistTopics();
 				return undefined;
 			}
@@ -8270,8 +8354,8 @@ export class TelegramNotificationDaemon {
 						let accepted = false;
 						try {
 							accepted = await authority.compareAndSet(expectedGeneration, snapshot);
-						} catch {
-							throw new Error("shared topic authority unavailable");
+						} catch (error) {
+							throw new Error("shared topic authority unavailable", { cause: error });
 						}
 						if (accepted) {
 							this.topics.markRegistryPublished(nextGeneration);
@@ -8342,12 +8426,25 @@ export class TelegramNotificationDaemon {
 		if (existing) return await existing;
 		const retry = this.effects.track(
 			(async () => {
-				for (;;) {
+				for (let attempt = 1; ; attempt++) {
 					try {
 						await this.persistTopics();
 						return;
-					} catch {
-						await this.runtime.sleep(250);
+					} catch (error) {
+						if (attempt >= COMPENSATION_FENCE_MAX_ATTEMPTS) {
+							// A shared topic authority that stays unavailable must not keep this
+							// fence spinning every 250ms forever: it churns the registry, and its
+							// pending effect prevents a shutdown from quiescing. Give up and let
+							// the next scan/session pass retry the persist.
+							logger.warn(
+								`notifications: compensation fence gave up after ${attempt} attempts: ${sanitizeDiagnostic(
+									String(error),
+									this.opts.botToken,
+								)}`,
+							);
+							return;
+						}
+						await this.runtime.sleep(COMPENSATION_FENCE_RETRY_DELAY_MS);
 					}
 				}
 			})(),
@@ -8375,15 +8472,15 @@ export class TelegramNotificationDaemon {
 				let accepted = false;
 				try {
 					accepted = await authority.compareAndSet(expectedGeneration, snapshot);
-				} catch {
-					throw new Error("shared topic authority unavailable");
+				} catch (error) {
+					throw new Error("shared topic authority unavailable", { cause: error });
 				}
 				if (!accepted) {
 					let winner: TopicRegistryState | undefined;
 					try {
 						winner = parseTopicRegistryState(await authority.read());
-					} catch {
-						throw new Error("shared topic authority unavailable");
+					} catch (error) {
+						throw new Error("shared topic authority unavailable", { cause: error });
 					}
 					if (!winner) throw new Error("shared topic authority conflict");
 					this.#replaceTopicAuthority(winner);
@@ -8456,8 +8553,8 @@ export class TelegramNotificationDaemon {
 		if (this.opts.topicRegistryAuthority) {
 			try {
 				raw = await this.opts.topicRegistryAuthority.read();
-			} catch {
-				throw new Error("shared topic authority unavailable");
+			} catch (error) {
+				throw new Error("shared topic authority unavailable", { cause: error });
 			}
 			if (!raw) throw new Error("shared topic authority unavailable");
 		}
@@ -9515,6 +9612,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async pairedChatAllowsTopics(): Promise<boolean> {
+		if (this.topicCapabilityRefused) return false;
 		const privacy = await this.resolvePairedChatPrivacy();
 		return privacy === "private" || privacy === "validation-forum";
 	}
@@ -9556,7 +9654,11 @@ export class TelegramNotificationDaemon {
 	private startFlushTimer(): void {
 		this.runtime.startInterval("telegram-flush", RATE_LIMIT_FLUSH_INTERVAL_MS, () => {
 			if (!this.running || this.pool.pending === 0) return;
-			void this.flushPool();
+			// `flushPool` only swallows failures for the shared chain; the promise it
+			// returns still rejects, and an unhandled rejection here exits the daemon.
+			void this.flushPool().catch(error => {
+				logger.warn(`notifications: queue flush failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`);
+			});
 		});
 	}
 
@@ -9596,11 +9698,27 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-owner-heartbeat");
 	}
 
-	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
+	/**
+	 * Run a root scan, guarding against overlapping scans from the timer + loop.
+	 *
+	 * A reconciliation pass is retried every scan interval, so a failed one must
+	 * never tear the owner down. Both callers are fatal boundaries: the timer
+	 * fires and forgets, and the run loop awaits without a handler. A rejection
+	 * escaping either one (a shared topic authority whose lock or compare-and-set
+	 * is momentarily unavailable is the observed case) reaches the process-level
+	 * handler, which exits the daemon: every session topic is then left as an
+	 * unarchived shell that answers nothing, and the sessions that were still
+	 * live lose notifications too. Report the failure and let the next scan
+	 * retry instead.
+	 */
 	private async runScan(): Promise<void> {
-		await this.runtime.runExclusive("telegram-scan", async () => {
-			await this.scanRoots();
-		});
+		try {
+			await this.runtime.runExclusive("telegram-scan", async () => {
+				await this.scanRoots();
+			});
+		} catch (error) {
+			logger.warn(`notifications: session scan failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`);
+		}
 	}
 
 	private startScanTimer(): void {
@@ -10376,7 +10494,9 @@ export class TelegramNotificationDaemon {
 					: [],
 			);
 			const displayOptions = options.map((option, index) =>
-				multiSelect ? `${selectedOptionIndices.has(index) ? "☑" : "☐"} ${option}` : option,
+				multiSelect
+					? `${selectedOptionIndices.has(index) ? SELECTION_MARK_CHECKED : SELECTION_MARK_UNCHECKED} ${option}`
+					: option,
 			);
 			const rendered = buildActionMessage({
 				kind: msg.kind ?? "ask",
@@ -12191,7 +12311,21 @@ export class TelegramNotificationDaemon {
 				await this.refreshBotIdentity();
 				await this.registerBotCommands();
 			}
-			await this.loadTopics();
+			try {
+				await this.loadTopics();
+			} catch (error) {
+				// A shared topic authority that is momentarily unavailable at startup must
+				// not kill the daemon before it starts serving: report the failure and
+				// continue with an empty in-memory registry. Connected sessions re-create
+				// their topics through ensureTopic, and later persist passes read the
+				// winner back from the authority (same philosophy as runScan's retry).
+				logger.warn(
+					`notifications: topic registry load failed; continuing with empty registry: ${sanitizeDiagnostic(
+						String(error),
+						this.opts.botToken,
+					)}`,
+				);
+			}
 			if (!this.validationMode()) {
 				await this.loadAdoptionIntents();
 				this.startAdoptionSweepTimer();

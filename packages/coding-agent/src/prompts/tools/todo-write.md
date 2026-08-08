@@ -17,7 +17,7 @@ Allowed `op` values are only `init`, `start`, `done`, `drop`, `rm`, `append`, an
 |`note`|`task`, `text`|Append a note to a task. Reminders for future-you only.|
 
 ## Anatomy
-- **Task content**: 5–10 words, what is being done, not how. Used as the task identifier — unique.
+- **Task content**: 5–10 words, what is being done, not how. This string *is* how you address the task — unique.
 - **Phase name**: short noun phrase (e.g. `Foundation`, `Auth`, `Verification`). Used as the phase identifier — unique. Do not add prefixes like `1.`, `A)`, `Phase 1:`, etc.
 
 ## Rules

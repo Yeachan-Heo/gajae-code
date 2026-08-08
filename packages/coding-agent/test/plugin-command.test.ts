@@ -18,11 +18,12 @@ const agentDirs: string[] = [];
 async function runPluginCommand(
 	args: string[],
 	cwd: string,
+	agentDirOverride?: string,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	// Isolate the user scope: without this the child process reads the real
 	// ~/.gjc/agent registry and inherits whatever the developer has installed.
-	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
-	agentDirs.push(agentDir);
+	const agentDir = agentDirOverride ?? (await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-")));
+	if (!agentDirOverride) agentDirs.push(agentDir);
 	const proc = Bun.spawn({
 		cmd: [process.execPath, path.join(import.meta.dir, "../src/cli.ts"), "plugin", ...args],
 		cwd,
@@ -96,6 +97,109 @@ describe("Plugin command scope parsing", () => {
 		expect(gjcJson).not.toContain("manifestPath");
 		expect(gjcJson).not.toContain(os.homedir());
 		expect(gjcJson).not.toMatch(/"uri"\s*:/);
+	});
+	it("uninstalls a user-scoped GJC bundle instead of invoking npm", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		const install = await runPluginCommand(["install", fixture, "--user"], cwd, agentDir);
+		expect(install.exitCode).toBe(0);
+
+		const uninstall = await runPluginCommand(["uninstall", "valid-six-surface-bundle", "--user"], cwd, agentDir);
+		expect(uninstall.exitCode).toBe(0);
+		expect(uninstall.stderr).toBe("");
+		expect(uninstall.stdout).toContain("Uninstalled valid-six-surface-bundle (user)");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		expect(listed.exitCode).toBe(0);
+		expect(JSON.parse(listed.stdout)).toMatchObject({ gjc: [] });
+	});
+
+	// An unqualified uninstall of a name present in both scopes must refuse
+	// rather than guess, and must not remove either copy.
+	it("refuses an ambiguous uninstall when the bundle is installed in both scopes", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		expect((await runPluginCommand(["install", fixture, "--user"], cwd, agentDir)).exitCode).toBe(0);
+		expect((await runPluginCommand(["install", fixture, "--project"], cwd, agentDir)).exitCode).toBe(0);
+
+		const ambiguous = await runPluginCommand(["uninstall", "valid-six-surface-bundle"], cwd, agentDir);
+		expect(ambiguous.exitCode).toBe(1);
+		expect(ambiguous.stderr).toContain("installed in both scopes");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		const scopes = (JSON.parse(listed.stdout) as { gjc: Array<{ identity: { scope: string } }> }).gjc.map(
+			bundle => bundle.identity.scope,
+		);
+		expect(scopes.toSorted()).toEqual(["project", "user"]);
+	});
+
+	it("scopes an explicit --project uninstall to the project copy", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		expect((await runPluginCommand(["install", fixture, "--user"], cwd, agentDir)).exitCode).toBe(0);
+		expect((await runPluginCommand(["install", fixture, "--project"], cwd, agentDir)).exitCode).toBe(0);
+
+		const uninstall = await runPluginCommand(["uninstall", "valid-six-surface-bundle", "--project"], cwd, agentDir);
+		expect(uninstall.exitCode).toBe(0);
+		expect(uninstall.stdout).toContain("Uninstalled valid-six-surface-bundle (project)");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		expect(
+			(JSON.parse(listed.stdout) as { gjc: Array<{ identity: { scope: string } }> }).gjc.map(
+				bundle => bundle.identity.scope,
+			),
+		).toEqual(["user"]);
+	});
+
+	// The recovery path the whole uninstall command exists for: a user who
+	// uninstalled must be able to install the same bundle again without hitting
+	// `already_installed_use_upgrade` residue.
+	it("reinstalls the same bundle cleanly after an uninstall", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		expect((await runPluginCommand(["install", fixture, "--user"], cwd, agentDir)).exitCode).toBe(0);
+		expect(
+			(await runPluginCommand(["uninstall", "valid-six-surface-bundle", "--user"], cwd, agentDir)).exitCode,
+		).toBe(0);
+
+		const reinstall = await runPluginCommand(["install", fixture, "--user"], cwd, agentDir);
+		expect(reinstall.exitCode).toBe(0);
+		expect(reinstall.stderr).toBe("");
+		expect(`${reinstall.stdout}${reinstall.stderr}`).not.toContain("already_installed");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		expect(JSON.parse(listed.stdout)).toMatchObject({
+			gjc: [
+				expect.objectContaining({
+					identity: { kind: "gjc-bundle", scope: "user", name: "valid-six-surface-bundle" },
+				}),
+			],
+		});
+	});
+	it("falls back to non-GJC uninstall when the GJC registry is corrupt", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const registryRoot = path.join(agentDir, "gjc-plugins");
+		await fs.mkdir(registryRoot, { recursive: true });
+		await fs.writeFile(path.join(registryRoot, "registry.json"), "{");
+
+		const result = await runPluginCommand(["uninstall", "not-a-gjc-bundle"], cwd, agentDir);
+
+		expect(`${result.stdout}${result.stderr}`).toMatch(/Uninstalled|Failed to uninstall/);
+		expect(`${result.stdout}${result.stderr}`).not.toContain("Corrupt GJC plugin registry");
 	});
 
 	it("GJC install and upgrade failures never echo the source or its cause", async () => {

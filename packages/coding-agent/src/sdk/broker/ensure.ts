@@ -279,6 +279,25 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		await sleep(50);
 	}
 	const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
+	if (exitedBeforeDiscovery && child.exitCode === 0) {
+		// A clean exit means another broker won the ownership lock (two ACP
+		// processes racing a cold broker state, e.g. a provider probe and an
+		// agent launch). The winner may publish its discovery right after our
+		// last poll; reuse it instead of failing the caller. Transient discovery
+		// read failures fall through to the common cleanup + failure path below.
+		try {
+			for (let retry = 0; retry < 20; retry++) {
+				const winner = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+				if (winner) {
+					await owner.stop();
+					return { kind: "external-discovery", discovery: winner };
+				}
+				await sleep(50);
+			}
+		} catch {
+			// fall through to cleanup + failure
+		}
+	}
 	const failure = spawnError
 		? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 		: exitedBeforeDiscovery

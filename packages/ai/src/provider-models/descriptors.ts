@@ -51,6 +51,7 @@ import {
 import {
 	cursorModelManagerOptions,
 	glmZcodeModelManagerOptions,
+	jetbrainsJunieModelManagerOptions,
 	openCodexModelManagerOptions,
 	zaiModelManagerOptions,
 } from "./special";
@@ -346,6 +347,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => glmZcodeModelManagerOptions(config),
 		catalog("GLM ZCode (unofficial)", ["GLM_ZCODE_API_KEY"], { oauthProvider: "glm-zcode" }),
 	),
+	descriptor("jetbrains-junie", "claude-sonnet-4-6", config => jetbrainsJunieModelManagerOptions(config)),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),
 	catalogDescriptor(
@@ -365,9 +367,9 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	"google-antigravity": "gemini-3-pro-high",
 	"google-gemini-cli": "gemini-2.5-pro",
 	"google-vertex": "gemini-3-pro-preview",
-	minimax: "minimax-m3",
-	"minimax-code": "minimax-m3",
-	"minimax-code-cn": "minimax-m3",
+	minimax: "MiniMax-M3",
+	"minimax-code": "MiniMax-M3",
+	"minimax-code-cn": "MiniMax-M3",
 	"openai-codex": "gpt-5.5",
 	"gitlab-duo": "duo-chat-sonnet-4-5",
 } as Record<KnownProvider, string>;

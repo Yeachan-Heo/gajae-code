@@ -129,7 +129,7 @@ describe("provider onboarding setup core", () => {
 		expect(result.providerId).toBe("minimax-code");
 		expect(result.api).toBe("openai-completions");
 		expect(result.preset).toBe("minimax");
-		expect(result.modelIds).toEqual(["minimax-m3"]);
+		expect(result.modelIds).toEqual(["MiniMax-M3"]);
 		expect(formatProviderSetupResult(result)).toContain("MiniMax Coding Plan");
 
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
@@ -150,7 +150,7 @@ describe("provider onboarding setup core", () => {
 		expect(parsed.providers["minimax-code"]?.compat?.supportsStore).toBe(false);
 		expect(parsed.providers["minimax-code"]?.compat?.supportsDeveloperRole).toBe(false);
 		expect(parsed.providers["minimax-code"]?.compat?.reasoningContentField).toBe("reasoning_content");
-		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["minimax-m3"]);
+		expect(parsed.providers["minimax-code"]?.models.map(model => model.id)).toEqual(["MiniMax-M3"]);
 	});
 
 	it("adds Alibaba Token Plan through the provider preset with per-model API routing", async () => {
@@ -162,7 +162,7 @@ describe("provider onboarding setup core", () => {
 		expect(result.compatibility).toBe("openai");
 		expect(result.preset).toBe("alibaba-token-plan");
 		expect(result.presetName).toBe("Alibaba Token Plan");
-		expect(result.modelIds).toEqual(["qwen3.8-max-preview", "qwen-3.8-max", "glm-5.2", "deepseek-v4-pro"]);
+		expect(result.modelIds).toEqual(["qwen3.8-max-preview", "qwen3.8-max", "glm-5.2", "deepseek-v4-pro"]);
 		expect(result.credentialSource).toBe("env");
 
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as { providers?: Record<string, unknown> };
@@ -174,7 +174,7 @@ describe("provider onboarding setup core", () => {
 			compat: { supportsDeveloperRole: false },
 			models: [
 				{ id: "qwen3.8-max-preview", api: "openai-responses" },
-				{ id: "qwen-3.8-max", api: "openai-responses" },
+				{ id: "qwen3.8-max", api: "openai-responses" },
 				{ id: "glm-5.2", api: "openai-completions" },
 				{ id: "deepseek-v4-pro", api: "openai-completions" },
 			],
@@ -186,7 +186,57 @@ describe("provider onboarding setup core", () => {
 		expect(Object.keys(parsed.providers ?? {})).toEqual(["alibaba-token-plan"]);
 		await expect(
 			addApiCompatibleProvider({ preset: "alibaba-token-plan", models: ["custom"], modelsPath }),
-		).rejects.toThrow("fixed model ids");
+		).rejects.toThrow("uses fixed model ids");
+	});
+
+	it("adds ClinePass with automatic models.dev catalog discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "clinepass", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{ baseUrl?: string; api?: string; apiKeyEnv?: string; discovery?: unknown; models?: Array<{ id: string }> }
+			>;
+		};
+
+		expect(result.providerId).toBe("cline-pass");
+		expect(result.presetName).toBe("ClinePass");
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(parsed.providers?.["cline-pass"]).toMatchObject({
+			baseUrl: "https://api.cline.bot/api/v1",
+			api: "openai-completions",
+			apiKeyEnv: "CLINE_API_KEY",
+			discovery: { type: "models-dev", modelsDevProvider: "cline-pass" },
+		});
+		expect(parsed.providers?.["cline-pass"]?.models).toBeUndefined();
+		expect(findProviderPreset("cline")?.id).toBe("cline-pass");
+		await expect(addApiCompatibleProvider({ preset: "cline-pass", models: ["custom"], modelsPath })).rejects.toThrow(
+			"discovers models automatically",
+		);
+	});
+
+	it("adds Command Code GOAT with automatic discovery and Claude prefix routing", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "goat", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{ baseUrl?: string; apiKeyEnv?: string; discovery?: unknown; models?: Array<{ id: string; api?: string }> }
+			>;
+		};
+		const provider = parsed.providers?.["commandcode-goat"];
+
+		expect(result.presetName).toBe("Command Code GOAT");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.commandcode.ai/provider/v1",
+			apiKeyEnv: "CMD_API_KEY",
+			discovery: { type: "openai-models-list", apiByModelPrefix: { "claude-": "anthropic-messages" } },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("command-code")?.id).toBe("commandcode-goat");
 	});
 
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {

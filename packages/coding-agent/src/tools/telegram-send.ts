@@ -9,7 +9,7 @@ import type { ToolSession } from "./index";
 const TELEGRAM_SEND_MAX_FILE_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_SEND_MAX_FILE_MIB = TELEGRAM_SEND_MAX_FILE_BYTES / (1024 * 1024);
 
-const telegramSendSchema = z.object({
+export const telegramSendSchema = z.object({
 	path: z
 		.string()
 		.describe("file path (absolute or relative to cwd) to send to Telegram; must resolve inside the workspace"),
@@ -25,16 +25,18 @@ interface TelegramSendDetails {
 	error?: string;
 }
 
+export const TELEGRAM_SEND_DESCRIPTION =
+	"Send a file from the current workspace to the connected Telegram chat. Recognized images are converted to " +
+	"Telegram-compatible photos when possible, including WebP; other files are sent as documents with their MIME " +
+	"type preserved. The path must resolve (after following symlinks) to a regular file inside the project root; " +
+	"paths outside the workspace are rejected.";
+
 export class TelegramSendTool implements AgentTool<typeof telegramSendSchema, TelegramSendDetails> {
 	readonly name = "telegram_send";
 	readonly label = "TelegramSend";
 	readonly summary = "Send a workspace file to Telegram";
 	readonly loadMode = "discoverable";
-	readonly description =
-		"Send a file from the current workspace to the connected Telegram chat. Recognized images are converted to " +
-		"Telegram-compatible photos when possible, including WebP; other files are sent as documents with their MIME " +
-		"type preserved. The path must resolve (after following symlinks) to a regular file inside the project root; " +
-		"paths outside the workspace are rejected.";
+	readonly description = TELEGRAM_SEND_DESCRIPTION;
 	readonly parameters = telegramSendSchema;
 	readonly strict = true;
 

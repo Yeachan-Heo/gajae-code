@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
 import { Settings } from "../src/config/settings";
+import { createMemoryBackendService } from "../src/memory-backend";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
@@ -18,6 +19,7 @@ interface FakeAcpBuiltinSession {
 	sessionName: string;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	thinkingLevel: ThinkingLevel | undefined;
+	memoryBackend: AgentSession["memoryBackend"];
 	thinkingLevelCalls: Array<{ thinkingLevel: ThinkingLevel | undefined; persist: boolean | undefined }>;
 	toggleFastMode(): boolean;
 	setFastMode(enabled: boolean): void;
@@ -88,6 +90,7 @@ function createRuntime() {
 	const output: string[] = [];
 	const settings = Settings.isolated();
 	const session: FakeAcpBuiltinSession = {
+		memoryBackend: createMemoryBackendService(settings),
 		fastMode: false,
 		forcedToolChoice: undefined as string | undefined,
 		isStreaming: false,

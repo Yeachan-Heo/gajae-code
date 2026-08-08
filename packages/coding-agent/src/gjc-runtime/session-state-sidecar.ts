@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { AssistantMessage } from "@gajae-code/ai";
+import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
@@ -406,13 +406,18 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 			payload.state !== "unknown")
 	)
 		return false;
-	if (typeof payload.cwd !== "string" || payload.cwd.trim().length === 0) return false;
-	if (typeof payload.workdir !== "string" || payload.workdir.trim().length === 0) return false;
-	if (
-		!Object.hasOwn(payload, "session_file") ||
-		(payload.session_file !== null && typeof payload.session_file !== "string")
-	)
-		return false;
+	// Coordinator-seeded payloads (#2549) carry session_id and state but not the
+	// runtime identity fields cwd/workdir/session_file. Accept their absence; when
+	// present, validate them as before.
+	if (typeof payload.cwd !== "undefined") {
+		if (typeof payload.cwd !== "string" || payload.cwd.trim().length === 0) return false;
+	}
+	if (typeof payload.workdir !== "undefined") {
+		if (typeof payload.workdir !== "string" || payload.workdir.trim().length === 0) return false;
+	}
+	if (Object.hasOwn(payload, "session_file")) {
+		if (payload.session_file !== null && typeof payload.session_file !== "string") return false;
+	}
 	if (payload.ready_for_input !== undefined && typeof payload.ready_for_input !== "boolean") return false;
 	if (payload.live !== undefined && payload.live !== null && typeof payload.live !== "boolean") return false;
 	if (payload.reason !== undefined && payload.reason !== null && typeof payload.reason !== "string") return false;
@@ -519,20 +524,26 @@ function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload, inp
 
 function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, input: RuntimeStateIdentity): void {
 	if (Object.keys(previous).length === 0) return;
-	if (
-		previous.session_id !== input.sessionId ||
-		typeof previous.cwd !== "string" ||
-		typeof previous.workdir !== "string" ||
-		!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
-		!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
-		(previous.session_file !== input.sessionFile &&
-			!(
-				typeof previous.session_file === "string" &&
-				typeof input.sessionFile === "string" &&
-				sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
-			))
-	)
-		throw new PreviousRuntimeStateReadError();
+	// A coordinator-seeded payload (#2549) carries session_id and current_turn_id
+	// but not cwd/workdir/session_file (those are runtime identity fields). When
+	// the runtime writes to the coordinator-shared file, the seed is from the
+	// same session — the session_id match plus the broker-scoped file path is
+	// sufficient identity. Only refuse a genuinely foreign session_id.
+	if (previous.session_id !== input.sessionId) throw new PreviousRuntimeStateReadError();
+	// If the previous payload has runtime identity fields, verify them fully.
+	if (typeof previous.cwd === "string" && typeof previous.workdir === "string") {
+		if (
+			!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
+			!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
+			(previous.session_file !== input.sessionFile &&
+				!(
+					typeof previous.session_file === "string" &&
+					typeof input.sessionFile === "string" &&
+					sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
+				))
+		)
+			throw new PreviousRuntimeStateReadError();
+	}
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {

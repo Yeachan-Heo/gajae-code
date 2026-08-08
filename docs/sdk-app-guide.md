@@ -182,6 +182,13 @@ Beyond frames, the WS surface exposes typed **control operations**
 `usage.get`, `models.list/current`, `workflow.gates.list`, …). See the
 [SDK wire protocol & machine interfaces](./sdk.md) for the complete catalog.
 
+The `models.list/current` (Q10) catalog also lists model profiles as synthetic
+`gajae-code/<profile>` entries (e.g. `gajae-code/codex-eco`). Treat them as
+logical selections, not API providers: sending the id back through `model.set`
+activates the profile for the live session only. Persisting remains an explicit
+TUI choice. Request Q27 (`models.profiles.list`) when you need the
+full profile catalog including unavailable profiles and their `available`
+status. See [Model profiles as synthetic models](./sdk.md#model-profiles-as-synthetic-models-gajae-codeprofile).
 
 ## Creating and supervising sessions
 

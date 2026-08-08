@@ -1,8 +1,20 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fuzzyFind } from "@gajae-code/natives";
+import type { fuzzyFind as fuzzyFindFn } from "@gajae-code/natives";
 import { getProjectDir } from "@gajae-code/utils";
+
+type NativeFuzzyFind = typeof fuzzyFindFn;
+let nativeFuzzyFind: NativeFuzzyFind | undefined;
+let nativeFuzzyFindLoad: Promise<NativeFuzzyFind> | undefined;
+
+async function fuzzyFindNative(): Promise<NativeFuzzyFind> {
+	if (nativeFuzzyFind) return nativeFuzzyFind;
+	nativeFuzzyFindLoad ??= Promise.resolve(
+		(require("@gajae-code/natives") as { fuzzyFind: NativeFuzzyFind }).fuzzyFind,
+	);
+	return await nativeFuzzyFindLoad;
+}
 
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
 
@@ -242,6 +254,13 @@ export interface AutocompleteItem {
 	/** Dim hint text shown inline after cursor when this item is selected */
 	hint?: string;
 }
+export type AutocompleteSuggestionKind = "slash-command" | "default";
+
+export interface AutocompleteSuggestions {
+	items: AutocompleteItem[];
+	prefix: string;
+	kind?: AutocompleteSuggestionKind;
+}
 
 type Awaitable<T> = T | Promise<T>;
 
@@ -263,14 +282,7 @@ export interface SlashCommand {
 
 export interface AutocompleteProvider {
 	/** Get autocomplete suggestions for current text/cursor position */
-	getSuggestions(
-		lines: string[],
-		cursorLine: number,
-		cursorCol: number,
-	): Promise<{
-		items: AutocompleteItem[];
-		prefix: string; // What we're matching against (e.g., "/" or "src/")
-	} | null>;
+	getSuggestions(lines: string[], cursorLine: number, cursorCol: number): Promise<AutocompleteSuggestions | null>;
 
 	/** Apply the selected item and return new text + cursor position */
 	applyCompletion(
@@ -381,7 +393,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		lines: string[],
 		cursorLine: number,
 		cursorCol: number,
-	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
+	): Promise<AutocompleteSuggestions | null> {
 		const currentLine = lines[cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, cursorCol);
 
@@ -403,6 +415,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			return {
 				items: suggestions,
 				prefix: atPrefix,
+				kind: "default",
 			};
 		}
 
@@ -419,6 +432,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 				return {
 					items: matches,
+					kind: "slash-command",
 					prefix: textBeforeCursor,
 				};
 			}
@@ -439,6 +453,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 			return {
 				items: argumentSuggestions,
+				kind: "default",
 				prefix: argumentText,
 			};
 		}
@@ -452,6 +467,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				if (pathSuggestions.length > 0) {
 					return {
 						items: pathSuggestions,
+						kind: "default",
 						prefix: pathMatch,
 					};
 				}
@@ -461,6 +477,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			if (matches.length > 0) {
 				return {
 					items: matches,
+					kind: "slash-command",
 					prefix: slashPrefix,
 				};
 			}
@@ -479,12 +496,14 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				// We still return it so user can select it and add /
 				return {
 					items: suggestions,
+					kind: "default",
 					prefix: pathMatch,
 				};
 			}
 
 			return {
 				items: suggestions,
+				kind: "default",
 				prefix: pathMatch,
 			};
 		}
@@ -838,7 +857,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const scopedQuery = await this.#resolveScopedFuzzyQuery(query);
 			const searchPath = scopedQuery?.baseDir ?? this.#basePath;
 			const fuzzyQuery = scopedQuery?.query ?? query;
-			const result = await fuzzyFind(buildAutocompleteFuzzyDiscoveryProfile(fuzzyQuery, searchPath));
+			const result = await (await fuzzyFindNative())(buildAutocompleteFuzzyDiscoveryProfile(fuzzyQuery, searchPath));
 			const lowerQuery = fuzzyQuery.toLowerCase();
 			const filteredMatches = result.matches.filter(entry => {
 				const p = entry.path.endsWith("/") ? entry.path.slice(0, -1) : entry.path;

@@ -1,7 +1,7 @@
 /**
  * List available models with optional fuzzy search
  */
-import { type Api, getSupportedEfforts, type Model } from "@gajae-code/ai";
+import { type Api, getSupportedEfforts, type Model } from "@gajae-code/ai/core";
 import { fuzzyFilter } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";

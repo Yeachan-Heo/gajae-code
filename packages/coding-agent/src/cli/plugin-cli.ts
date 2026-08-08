@@ -14,11 +14,15 @@ import {
 	type GjcBundleSummary,
 	GjcPluginLoadError,
 	getGjcBundle,
+	getGjcPluginMigrationStatuses,
 	installGjcBundle,
 	isGjcPluginBundleSource,
 	isGjcPluginSourceShape,
 	listGjcBundles,
+	migrationDoctorCheckMessage,
 	previewGjcBundleUpdate,
+	runGjcPluginMigrationPreflight,
+	uninstallGjcBundle,
 } from "../extensibility/gjc-plugins";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
 import {
@@ -54,6 +58,7 @@ export interface PluginCommandArgs {
 	flags: {
 		json?: boolean;
 		fix?: boolean;
+		migratePlugins?: boolean;
 		force?: boolean;
 		dryRun?: boolean;
 		local?: boolean;
@@ -118,6 +123,8 @@ export function parsePluginArgs(args: string[]): PluginCommandArgs | undefined {
 			result.flags.json = true;
 		} else if (arg === "--fix") {
 			result.flags.fix = true;
+		} else if (arg === "--migrate-plugins") {
+			result.flags.migratePlugins = true;
 		} else if (arg === "--force") {
 			result.flags.force = true;
 		} else if (arg === "--dry-run") {
@@ -155,6 +162,7 @@ export function parsePluginArgs(args: string[]): PluginCommandArgs | undefined {
 }
 
 import { classifyInstallTarget } from "./classify-install-target";
+import { findMarketplacesOffering, isBareInstallName } from "./marketplace-hint";
 
 export { classifyInstallTarget } from "./classify-install-target";
 
@@ -479,6 +487,31 @@ function describeInstallFailure(error: unknown): string {
 	return error instanceof GjcPluginLoadError ? error.code : "install_failed";
 }
 
+function isGjcRegistryShapeFailure(error: unknown): boolean {
+	return (
+		(error instanceof GjcPluginLoadError && error.code === "invalid_manifest") ||
+		(error instanceof TypeError &&
+			/(?:not iterable|localeCompare|reading ['"](?:scope|name|pluginRoot|plugins|map))/.test(error.message))
+	);
+}
+
+async function findGjcBundlesForUninstall(
+	cwd: string,
+	name: string,
+	scope: "user" | "project" | undefined,
+): Promise<GjcBundleSummary[]> {
+	const scopes = scope ? [scope] : (["user", "project"] as const);
+	const matches: GjcBundleSummary[] = [];
+	for (const candidateScope of scopes) {
+		try {
+			const result = await getGjcBundle({ cwd }, bundleIdentity(candidateScope, name));
+			if (result.ok) matches.push(result.value);
+		} catch (error) {
+			if (!isGjcRegistryShapeFailure(error)) throw error;
+		}
+	}
+	return matches;
+}
 async function handleInstall(
 	manager: PluginManager,
 	packages: string[],
@@ -609,6 +642,15 @@ async function handleInstall(
 			// The spec can carry credentials, a query string, or an absolute home
 			// path, so report the failure without echoing it or the raw cause.
 			console.error(chalk.red(`${theme.status.error} Failed to install plugin (${describeInstallFailure(err)})`));
+			// A bare name (no `@scope`, no version, no path separator) is safe to
+			// echo, and it is exactly the shape a user copies out of
+			// `plugin discover`. Point at the qualified spec that would work.
+			if (isBareInstallName(spec)) {
+				const offering = await findMarketplacesOffering(mktMgr, spec).catch(() => []);
+				for (const marketplace of offering) {
+					console.error(chalk.dim(`  Try: ${APP_NAME} plugin install ${spec}@${marketplace}`));
+				}
+			}
 			process.exit(1);
 		}
 	}
@@ -617,21 +659,41 @@ async function handleInstall(
 async function handleUninstall(
 	manager: PluginManager,
 	packages: string[],
-	flags: { json?: boolean; scope?: "user" | "project" },
+	flags: { json?: boolean; scope?: "user" | "project"; user?: boolean; project?: boolean },
 ): Promise<void> {
 	if (packages.length === 0) {
 		console.error(chalk.red(`Usage: ${APP_NAME} plugin uninstall <package> ...`));
 		process.exit(1);
 	}
 
-	// For uninstall, check the installed plugins registry directly.
-	// This works even if the marketplace entry was later removed from marketplaces.json.
+	const scope = flags.scope ?? (flags.user ? "user" : flags.project ? "project" : undefined);
+	const cwd = getProjectDir();
 	const mktMgr = await makeMarketplaceManager();
 	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
 
 	for (const name of packages) {
+		const matches = await findGjcBundlesForUninstall(cwd, name, scope);
+		if (matches.length > 0) {
+			if (matches.length > 1) {
+				console.error(chalk.red(`GJC bundle "${name}" is installed in both scopes; specify --user or --project.`));
+				process.exit(1);
+			}
+			const identity = matches[0].identity;
+			const result = await uninstallGjcBundle({ cwd }, identity);
+			if (!result.ok) {
+				console.error(chalk.red(`${theme.status.error} ${result.error.message}`));
+				if (result.error.recovery) console.error(chalk.dim(`  Try: ${result.error.recovery}`));
+				process.exit(3);
+			}
+			if (flags.json) {
+				console.log(JSON.stringify({ uninstalled: identity }));
+			} else {
+				console.log(chalk.green(`${theme.status.success} Uninstalled ${identity.name} (${identity.scope})`));
+			}
+			continue;
+		}
+
 		if (installedPlugins.has(name)) {
-			// Exact match against installed marketplace plugin IDs (name@marketplace)
 			try {
 				await mktMgr.uninstallPlugin(name, flags.scope);
 				console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
@@ -642,7 +704,6 @@ async function handleUninstall(
 			continue;
 		}
 
-		// npm path
 		try {
 			await manager.uninstall(name);
 			if (flags.json) {
@@ -753,8 +814,29 @@ async function handleLink(manager: PluginManager, paths: string[], flags: { json
 	}
 }
 
-async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix?: boolean }): Promise<void> {
+async function handleDoctor(
+	manager: PluginManager,
+	flags: { json?: boolean; fix?: boolean; migratePlugins?: boolean },
+): Promise<void> {
 	const checks = await manager.doctor({ fix: flags.fix });
+	try {
+		const statuses = flags.migratePlugins
+			? await runGjcPluginMigrationPreflight(getProjectDir())
+			: await getGjcPluginMigrationStatuses(getProjectDir(), { migrate: false });
+		for (const status of statuses) {
+			checks.push({
+				name: `gjc-plugin:${status.scope}:${status.plugin}:migration`,
+				status: status.status === "migrated" ? "ok" : "error",
+				message: `${flags.migratePlugins ? "migration pre-flight: " : ""}${migrationDoctorCheckMessage(status)}`,
+			});
+		}
+	} catch (error) {
+		checks.push({
+			name: "gjc-plugin:migration",
+			status: "error",
+			message: `Unable to inspect GJC plugin migration status: ${error instanceof Error ? error.message : String(error)}`,
+		});
+	}
 
 	if (flags.json) {
 		console.log(JSON.stringify(checks, null, 2));
@@ -785,7 +867,7 @@ async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix
 	console.log(`Summary: ${ok} ok, ${warnings} warnings, ${errors} errors${fixed > 0 ? `, ${fixed} fixed` : ""}`);
 
 	if (errors > 0) {
-		if (!flags.fix) {
+		if (!flags.fix && !flags.migratePlugins) {
 			console.log(chalk.dim("\nRun with --fix to attempt automatic repair"));
 		}
 		process.exit(1);

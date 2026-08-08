@@ -45,6 +45,7 @@ export const APP_ACTION_METADATA: readonly ActionMetadata[] = [
 	action("app.message.queue", "Queue message", "Messages", ["composer"]),
 	action("app.message.dequeue", "Edit queued message", "Messages", ["composer"]),
 	action("app.clipboard.pasteImage", "Paste image", "Clipboard", ["composer"]),
+	action("app.clipboard.pasteText", "Paste text from configured clipboard", "Clipboard", ["composer"]),
 	action("app.clipboard.copyLine", "Copy line", "Clipboard", ["composer"]),
 	action("app.clipboard.copyPrompt", "Copy prompt", "Clipboard", ["composer"]),
 	action("app.session.new", "New session", "Session", ["composer"]),

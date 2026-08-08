@@ -24,6 +24,15 @@ export interface GjcPluginToolManifestEntry {
 	path: string;
 	description?: string;
 	sha256?: string;
+	/** Optional JSON Schema declaration for registry-v2 metadata. */
+	schema?: unknown;
+	/** Aliases accepted when migrating older manifests. */
+	inputSchema?: unknown;
+	input_schema?: unknown;
+	parameters?: unknown;
+	/** Optional sidecar JSON Schema file, resolved within the plugin root. */
+	schemaPath?: string;
+	schema_path?: string;
 	/**
 	 * "always-on" object entries are activated for the whole session; legacy
 	 * string shorthand stays "subskill"-scoped and is only attached to subskill
@@ -98,6 +107,18 @@ export interface LoadedSubskillBinding {
 	toolPaths: string[];
 }
 
+export interface NormalizedSubskillToolSurface {
+	extensionId: string;
+	relativePath: string;
+	implementationHash: string;
+}
+
+export interface LoadedSubskillToolReference {
+	extensionId: string;
+	relativePath: string;
+	expectedDigest: string;
+}
+
 export interface LoadedSubskillActivation {
 	activationArg: string;
 	plugin: string;
@@ -105,8 +126,13 @@ export interface LoadedSubskillActivation {
 	parent: string;
 	bindsTo: string;
 	phase: string;
+	/** Registry identity for v2-only activation. */
+	scope?: GjcPluginScope;
+	extensionId?: string;
+	expectedDigest?: string;
 	filePath: string;
 	toolPaths: string[];
+	toolRefs?: LoadedSubskillToolReference[];
 }
 
 export interface PhaseScopedToolBinding {
@@ -137,6 +163,8 @@ export type GjcPluginLoadErrorCode =
 	| "invalid_phase"
 	| "missing_file"
 	| "hash_mismatch"
+	| "invalid_schema"
+	| "missing_surface"
 	| "invalid_appendix"
 	| "invalid_hook"
 	| "invalid_mcp"
@@ -152,7 +180,8 @@ export type GjcPluginLoadErrorCode =
 	// Session-start / runtime
 	| "session_collision"
 	| "runtime_mismatch"
-	| "quarantined_surface";
+	| "quarantined_surface"
+	| "migration_required";
 
 export class GjcPluginLoadError extends Error {
 	readonly code: GjcPluginLoadErrorCode;
@@ -161,6 +190,29 @@ export class GjcPluginLoadError extends Error {
 		super(message, options);
 		this.name = "GjcPluginLoadError";
 		this.code = code;
+	}
+}
+
+/** Typed refusal raised when an implementation changed after v2 metadata was recorded. */
+export class PluginImplementationHashMismatchError extends GjcPluginLoadError {
+	readonly expected: string;
+	readonly actual: string;
+	readonly path: string;
+
+	constructor(path: string, expected: string, actual: string) {
+		super("hash_mismatch", `GJC plugin implementation hash mismatch for ${path}`);
+		this.name = "PluginImplementationHashMismatchError";
+		this.path = path;
+		this.expected = expected;
+		this.actual = actual;
+	}
+}
+
+/** Typed refusal for a registry entry that could not be migrated to v2 metadata. */
+export class PluginMigrationRequiredError extends GjcPluginLoadError {
+	constructor(plugin: string, surface: string, cause: string) {
+		super("migration_required", `GJC plugin "${plugin}" surface "${surface}" requires migration: ${cause}`);
+		this.name = "PluginMigrationRequiredError";
 	}
 }
 
@@ -183,6 +235,7 @@ export interface NormalizedSubskillSurface {
 	activationArg: string;
 	relativePath: string;
 	sha256: string;
+	toolRefs?: NormalizedSubskillToolSurface[];
 }
 
 export interface NormalizedToolSurface {
@@ -191,6 +244,41 @@ export interface NormalizedToolSurface {
 	relativePath: string;
 	sha256: string;
 	description?: string;
+	/** v2 metadata fields; optional only for in-memory legacy fixtures. */
+	schema?: JsonSchema202012;
+	schemaHash?: string;
+	implementationHash?: string;
+	presentationHash?: string;
+	metadataVersion?: 2;
+}
+
+/** JSON Schema 2020-12 documents are kept as JSON values so migration never needs an implementation import. */
+export type JsonSchema202012 = boolean | Record<string, unknown>;
+
+/**
+ * Registry-v2 tool metadata. The implementation and presentation hashes are
+ * content digests, not executable metadata. `schema` is canonicalized before
+ * `schemaHash` is computed.
+ */
+export interface NormalizedToolSurfaceV2 extends NormalizedToolSurface {
+	schema: JsonSchema202012;
+	schemaHash: string;
+	implementationHash: string;
+	presentationHash?: string;
+	metadataVersion: 2;
+}
+
+export interface GjcPluginMigrationFailure {
+	code: GjcPluginLoadErrorCode;
+	surface: string;
+	cause: string;
+}
+
+export interface GjcPluginMigrationState {
+	status: "migrated" | "failed";
+	metadataVersion: 2;
+	migratedAt?: string;
+	failure?: GjcPluginMigrationFailure;
 }
 
 export interface NormalizedHookSurface {
@@ -201,6 +289,7 @@ export interface NormalizedHookSurface {
 	phase?: "before" | "after";
 	relativePath: string;
 	sha256: string;
+	implementationHash?: string;
 }
 
 export interface NormalizedMcpSurface {
@@ -278,6 +367,8 @@ export interface GjcPluginRegistryEntry {
 	surfaces: NormalizedGjcPluginSurfaces;
 	disabledSurfaceIds: string[];
 	quarantine?: GjcPluginQuarantineEntry[];
+	/** v2 metadata status; absent is accepted for in-memory legacy test fixtures. */
+	migration?: GjcPluginMigrationState;
 }
 
 export interface GjcPluginRegistry {

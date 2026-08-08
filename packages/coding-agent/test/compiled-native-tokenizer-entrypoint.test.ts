@@ -6,14 +6,14 @@ const devBuildScriptPath = path.join(repoRoot, "packages/coding-agent/scripts/bu
 const compileArgsPath = path.join(repoRoot, "packages/coding-agent/scripts/compile-args.ts");
 
 describe("compiled binary entrypoints", () => {
-	it("dev binary build omits native tokenizer entrypoint while preserving minify and worker entrypoints", async () => {
+	it("dev binary build carries the native addon entrypoint with minify and worker entrypoints", async () => {
 		const devSource = await Bun.file(devBuildScriptPath).text();
 		const argsSource = await Bun.file(compileArgsPath).text();
 
-		// Dev entrypoints (shared builder) must not include the native
-		// tokenizer entry — that one is release-only.
+		// No static native importer remains after W5b, so the shared dev bundle must
+		// carry the native module as an explicit entrypoint for compiled-bunfs resolution.
 		expect(devSource).not.toContain("nativeTokenizerEntrypoint");
-		expect(argsSource).not.toContain('"../natives/native/index.js"');
+		expect(argsSource).toContain('"../natives/native/index.js"');
 		// Shared builder carries --minify and the dev worker entrypoints
 		// consumed by build-binary.ts via buildDevCompileArgs. handlebars must
 		// NOT be an extra entrypoint (#1939: --minify silently dropped it).

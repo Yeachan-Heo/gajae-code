@@ -3,10 +3,10 @@ import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/c
 import {
 	estimateToolOutputPruneSavings,
 	type PruneConfig,
-	pruneToolOutputs,
 	shouldRunMaintenancePrune,
 } from "@gajae-code/agent-core/compaction/pruning";
 import type { ToolResultMessage } from "@gajae-code/ai/types";
+import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 
 const timestamp = "2026-06-12T00:00:00.000Z";
 

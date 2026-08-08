@@ -3,8 +3,8 @@
  * Follows the same pattern as title-generator.ts.
  */
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
-import { completeSimple } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
+import { completeSimple } from "@gajae-code/ai/core";
 import { logger, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";

@@ -257,7 +257,7 @@ describe("AgentSession resilient retry", () => {
 			streamFn: (requestedModel, context, opts) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				options.onStreamStart?.(agent);
-				if (options.emitProviderPayload) void opts?.onPayload?.({});
+				if (options.emitProviderPayload) void opts?.onPayload?.({}, undefined, opts.attemptScope);
 				return mock.stream(requestedModel, context, opts);
 			},
 		});
@@ -278,12 +278,14 @@ describe("AgentSession resilient retry", () => {
 		});
 	}
 	function buildBareStreamingSession(options: {
+		model?: Model;
 		tools?: AgentTool[];
 		streamFn: StreamFn;
 		extensionRunner?: ExtensionRunner;
 	}): AgentSession {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const model = options.model ?? getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model to exist");
+		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: options.tools ?? [], messages: [] },
@@ -1790,6 +1792,115 @@ describe("AgentSession resilient retry", () => {
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered" }],
 		});
+	});
+	it("retries message-only first-event timeout prose after an earlier tool execution in the same run", async () => {
+		// Regression: a content-free first-event timeout that arrives WITHOUT typed
+		// transport facts — the wrapped canonical "Error: Provider stream timed out
+		// while waiting for the first event" or the per-provider "Anthropic stream
+		// timed out..." / "OpenAI responses stream timed out..." variants — was
+		// blocked by the scoped bare-default gate once the run had observable
+		// activity (a prior tool execution), so the turn died with the surfaced
+		// timeout. Typed first-event timeouts already retried in this situation
+		// (see the typed-watchdog test above); message-only watchdog prose must
+		// retry the same way because nothing observable was emitted before the
+		// watchdog fired.
+		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const openaiModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!openaiModel) throw new Error("Expected bundled OpenAI test model to exist");
+		const cases = [
+			{ model: anthropicModel, errorMessage: "Error: Provider stream timed out while waiting for the first event" },
+			{ model: anthropicModel, errorMessage: "Anthropic stream timed out while waiting for the first event" },
+			{ model: openaiModel, errorMessage: "OpenAI responses stream timed out while waiting for the first event" },
+		] as const;
+		const toolCall: ToolCall = { type: "toolCall", id: "counted-tool-call", name: "counted", arguments: {} };
+		let toolRuns = 0;
+		let streamCalls = 0;
+		const countedTool: AgentTool = {
+			name: "counted",
+			label: "Counted",
+			description: "Counts real executions for replay-safety coverage",
+			parameters: z.object({}),
+			execute: async () => {
+				toolRuns++;
+				return { content: [{ type: "text" as const, text: "counted result" }] };
+			},
+		};
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		for (const testCase of cases) {
+			toolRuns = 0;
+			streamCalls = 0;
+			session = buildBareStreamingSession({
+				model: testCase.model,
+				tools: [countedTool],
+				streamFn: () => {
+					streamCalls++;
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						if (streamCalls === 1) {
+							const response = assistantMessage(testCase.model, [toolCall], "toolUse");
+							stream.push({ type: "start", partial: response });
+							stream.push({ type: "done", reason: "toolUse", message: response });
+							return;
+						}
+						if (streamCalls === 2) {
+							const failure = assistantMessage(testCase.model, [], "error", testCase.errorMessage);
+							stream.push({ type: "start", partial: failure });
+							stream.push({ type: "error", reason: "error", error: failure });
+							return;
+						}
+						const recovered = assistantMessage(testCase.model, [{ type: "text", text: "recovered" }], "stop");
+						stream.push({ type: "start", partial: recovered });
+						stream.push({ type: "done", reason: "stop", message: recovered });
+					});
+					return stream;
+				},
+				extensionRunner: createExtensionRunner(),
+			});
+			const { retryStartEvents, retryEndEvents } = track(session);
+
+			await session.prompt("tool use then message-only first-event timeout");
+			await session.waitForIdle();
+
+			expect(toolRuns).toBe(1);
+			expect(streamCalls).toBe(3);
+			expect(retryStartEvents).toHaveLength(1);
+			expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+			expect(lastAssistant(session)).toMatchObject({
+				stopReason: "stop",
+				content: [{ type: "text", text: "recovered" }],
+			});
+
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
+	});
+
+	it("retries the wrapped canonical first-event timeout on a clean bare-default epoch", async () => {
+		// The wrapped "Error: Provider stream timed out while waiting for the first
+		// event" form was previously blocked by the bare-default scoped gate even on
+		// a perfectly clean epoch (no prior activity), purely because it lacked
+		// typed transport facts. It is the canonical watchdog message and must
+		// retry like every other content-free first-event timeout.
+		const requestedModels: string[] = [];
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		session = buildBareRetrySession({
+			responses: [
+				{ throw: "Error: Provider stream timed out while waiting for the first event" },
+				{ content: ["recovered"] },
+			],
+			requestedModels,
+		});
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("bare-config wrapped canonical first-event timeout");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "stop" });
 	});
 	it("gives an active cancel-and-submit replacement a clean retry epoch", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;

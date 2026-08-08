@@ -50,6 +50,62 @@
 			},
 			"additionalProperties": false
 		},
+		"workspaceTree": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"type": "string",
+					"enum": [
+						"eager",
+						"lazy"
+					],
+					"description": "When to scan the workspace tree used by the first prompt.",
+					"default": "eager"
+				}
+			},
+			"additionalProperties": false
+		},
+		"startup": {
+			"type": "object",
+			"properties": {
+				"networkPrewarm": {
+					"type": "boolean",
+					"description": "Preconnect the model host during startup before the first request.",
+					"default": true
+				},
+				"quiet": {
+					"type": "boolean",
+					"description": "Skip welcome screen and startup status messages",
+					"default": false
+				},
+				"welcomeBannerMode": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"unicode",
+						"square",
+						"ascii"
+					],
+					"description": "Logo style for the startup welcome screen",
+					"default": "auto"
+				},
+				"checkUpdate": {
+					"type": "boolean",
+					"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
+					"default": true
+				},
+				"updateChannel": {
+					"type": "string",
+					"enum": [
+						"stable",
+						"nightly"
+					],
+					"description": "Release channel used by `gjc update` and the startup update check",
+					"default": "stable"
+				}
+			},
+			"additionalProperties": false
+		},
 		"sdk": {
 			"type": "object",
 			"properties": {
@@ -429,6 +485,11 @@
 					"type": "string",
 					"description": "Theme used when terminal has light background",
 					"default": "blue-crab"
+				},
+				"watchFiles": {
+					"type": "boolean",
+					"description": "Reload custom themes when their files change",
+					"default": true
 				}
 			},
 			"additionalProperties": false
@@ -443,6 +504,17 @@
 			"description": "Icon/symbol style",
 			"default": "unicode"
 		},
+		"syntaxHighlighting": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Highlight code blocks and diffs when rendering",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"colorBlindMode": {
 			"type": "boolean",
 			"description": "Use blue instead of green for diff additions",
@@ -451,6 +523,11 @@
 		"statusLine": {
 			"type": "object",
 			"properties": {
+				"watchGitHead": {
+					"type": "boolean",
+					"description": "Refresh status-line git data when HEAD changes",
+					"default": true
+				},
 				"preset": {
 					"type": "string",
 					"enum": [
@@ -979,6 +1056,17 @@
 			},
 			"additionalProperties": false
 		},
+		"history": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Persist and search submitted prompts in local history",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"mouse": {
 			"type": "object",
 			"properties": {
@@ -1062,33 +1150,6 @@
 			"type": "boolean",
 			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
 			"default": false
-		},
-		"startup": {
-			"type": "object",
-			"properties": {
-				"quiet": {
-					"type": "boolean",
-					"description": "Skip welcome screen and startup status messages",
-					"default": false
-				},
-				"welcomeBannerMode": {
-					"type": "string",
-					"enum": [
-						"auto",
-						"unicode",
-						"square",
-						"ascii"
-					],
-					"description": "Logo style for the startup welcome screen",
-					"default": "auto"
-				},
-				"checkUpdate": {
-					"type": "boolean",
-					"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
-					"default": true
-				}
-			},
-			"additionalProperties": false
 		},
 		"starReminder": {
 			"type": "object",
@@ -2045,6 +2106,28 @@
 			},
 			"additionalProperties": false
 		},
+		"clipboard": {
+			"type": "object",
+			"properties": {
+				"transport": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"native",
+						"osc52",
+						"ssh"
+					],
+					"description": "auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+					"default": "auto"
+				},
+				"sshHost": {
+					"type": "string",
+					"description": "SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
+					"default": ""
+				}
+			},
+			"additionalProperties": false
+		},
 		"web_search": {
 			"type": "object",
 			"properties": {
@@ -2334,6 +2417,10 @@
 				"notificationDebounceMs": {
 					"type": "number",
 					"default": 500
+				},
+				"sharedPoolIdleMs": {
+					"type": "number",
+					"default": 300000
 				}
 			},
 			"additionalProperties": false

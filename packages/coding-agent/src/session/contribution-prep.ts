@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { AssistantMessage, ToolResultMessage, UserMessage } from "@gajae-code/ai";
+import type { AssistantMessage, ToolResultMessage, UserMessage } from "@gajae-code/ai/core";
 import { $ } from "bun";
 import { resolveGjcCommand } from "../task/gjc-command";
 import { shortenPath } from "../tools/render-utils";

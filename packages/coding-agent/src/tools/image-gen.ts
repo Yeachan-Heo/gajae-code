@@ -3,7 +3,7 @@ import * as https from "node:https";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAntigravityUserAgent, getEnvApiKey, type Model } from "@gajae-code/ai";
+import { getEnvApiKey, type Model } from "@gajae-code/ai/core";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -1437,6 +1437,8 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					resolvedImages,
 				);
 
+				const { getAntigravityUserAgent } =
+					require("@gajae-code/ai/providers/google-gemini-headers") as typeof import("@gajae-code/ai/providers/google-gemini-headers");
 				const response = await fetch(`${ANTIGRAVITY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`, {
 					method: "POST",
 					headers: {

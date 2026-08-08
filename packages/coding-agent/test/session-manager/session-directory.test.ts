@@ -30,12 +30,22 @@ import { FileSessionStorage } from "../../src/session/session-storage";
 
 const temporaryDirectories: string[] = [];
 
+async function removeTemporaryDirectory(directory: string): Promise<void> {
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		try {
+			await fs.rm(directory, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EFAULT" || attempt === 2) throw error;
+			await Bun.sleep(25);
+		}
+	}
+}
+
 afterEach(async () => {
 	ManagedSessionScopeTestHooks.beforeVerifiedDelete = undefined;
 	ManagedSessionScopeTestHooks.beforeManagedLockRelease = undefined;
-	await Promise.all(
-		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
-	);
+	await Promise.all(temporaryDirectories.splice(0).map(removeTemporaryDirectory));
 });
 
 function legacyDirectory(sessionsRoot: string, cwd: string): string {
@@ -622,9 +632,9 @@ describe("managed session write protocol", () => {
 		expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const committed = (await fs.readdir(receipts)).find(
-			name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed",
-		);
+		const committed = (await fs.readdir(receipts))
+			.filter(name => !name.startsWith(".") && name.endsWith(".json"))
+			.find(name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed");
 		if (!committed) throw new Error("Missing committed migration receipt");
 		const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
 			artifactManifest?: unknown[];

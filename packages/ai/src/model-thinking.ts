@@ -1,6 +1,11 @@
-import { CODEX_GPT_5_6_CONTEXT_CAP, isCodexGpt56Tier, isCodexProductTransport } from "./context-cap-policy";
+import {
+	CODEX_GENERIC_CONTEXT_WINDOW,
+	CODEX_GPT_5_6_CONTEXT_CAP,
+	isCodexGpt56Tier,
+	isCodexProductTransport,
+} from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
-import { resolveOpenAICompat } from "./providers/openai-completions-compat";
+import { resolveOpenAICompat } from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -379,8 +384,18 @@ export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boole
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {
 	if (model.api !== "anthropic-messages") return false;
 	const parsedModel = parseKnownModel(model.id);
-	if (parsedModel.family !== "anthropic" || parsedModel.kind !== "opus") return false;
-	return semverGte(parsedModel.version, "4.7");
+	if (parsedModel.family !== "anthropic") return false;
+	// Explicit capability predicate instead of a generic `kind === opus` gate:
+	// Sonnet 5 officially exposes Anthropic's real xhigh and max presets on
+	// the Messages API just like Opus 4.7+. Older Sonnet generations do not,
+	// so the predicate stays fail-closed for them.
+	if (parsedModel.kind === "opus") {
+		return semverGte(parsedModel.version, "4.7");
+	}
+	if (parsedModel.kind === "sonnet") {
+		return semverGte(parsedModel.version, "5.0");
+	}
+	return false;
 }
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
@@ -457,10 +472,11 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 		};
 	}
 	// MiniMax-M3's official Token Plan routes expose a 1M context window.
-	// Scope the correction to the four first-class regional MiniMax routes;
-	// unrelated catalog aliases and providers keep their own contracts.
+	// Scope the correction to the four first-class regional MiniMax routes
+	// (canonical id plus the Anthropic Token Plan `[1m]` id); unrelated
+	// catalog aliases and providers keep their own contracts.
 	if (
-		model.id === "minimax-m3" &&
+		(model.id === "MiniMax-M3" || model.id === "MiniMax-M3[1m]") &&
 		(model.provider === "minimax" ||
 			model.provider === "minimax-cn" ||
 			model.provider === "minimax-code" ||
@@ -512,13 +528,21 @@ function inferGeneratedApplyPatchToolType(
 
 function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
 	if (parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
+		// JetBrains AI serves GPT through its own gateway, which enforces a probed
+		// 922K prompt cap for every GPT model regardless of the first-party figure.
+		// Its bundled value is measured, so leave it alone.
+		if (model.provider === "jetbrains-junie") {
+			return true;
+		}
 		// The first-party OpenAI GPT-5.5 model advertises a 1M total window, but
 		// the OpenAI code backend request path still enforces the smaller prompt
 		// budget. GJC's `contextWindow` is the usable prompt/input cap, not the
 		// marketing total window; using 1M here delays compaction and makes the UI
 		// promise space that `/responses/compact`/agent turns cannot actually use.
 		model.contextWindow =
-			model.provider === "openai-codex" || model.api === "openai-codex-responses" ? 272_000 : 1_000_000;
+			model.provider === "openai-codex" || model.api === "openai-codex-responses"
+				? CODEX_GENERIC_CONTEXT_WINDOW
+				: 1_000_000;
 		return true;
 	}
 	return false;
@@ -527,9 +551,10 @@ function applyGpt56ContextWindow(model: ApiModel<Api>): boolean {
 	if (!isCodexGpt56Tier(model) || !isCodexProductTransport(model)) {
 		return false;
 	}
-	// Codex product metadata is bounded by the currently enforced prompt cap.
-	// Smaller observed limits remain authoritative; first-party OpenAI is untouched.
-	model.contextWindow = Math.min(model.contextWindow, CODEX_GPT_5_6_CONTEXT_CAP.ceiling);
+	// Force the enforced 372K window: the OpenAI code backend metadata still
+	// under-reports the GPT-5.6 tier budget, and smaller observed values would
+	// otherwise keep the tier at the old 272K cap. First-party OpenAI is untouched.
+	model.contextWindow = CODEX_GPT_5_6_CONTEXT_CAP.enforced;
 	return true;
 }
 
@@ -542,7 +567,7 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 	}
 	// OpenAI code backend models: 400K figure includes output budget; input window is 272K.
 	if (parsedModel.variant.startsWith("codex") && parsedModel.variant !== "codex-spark") {
-		model.contextWindow = 272000;
+		model.contextWindow = CODEX_GENERIC_CONTEXT_WINDOW;
 		return;
 	}
 	// GPT-5.4 mini/nano use plain OpenAI IDs on the OpenAI code backend transport, but OpenAI code backend still
@@ -555,7 +580,7 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 			model.priority = normalizedPriority;
 		}
 		if (parsedModel.variant === "mini" || parsedModel.variant === "nano") {
-			model.contextWindow = 272000;
+			model.contextWindow = CODEX_GENERIC_CONTEXT_WINDOW;
 		}
 	}
 }
@@ -690,10 +715,16 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 			// Converse lacks it (same split as Opus 4.7+ below).
 			return model.api === "anthropic-messages" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
 		}
-		if (parsedModel.kind !== "opus") return DEFAULT_REASONING_EFFORTS;
-		return anthropicModelHasRealXHighEffort(model)
-			? DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX
-			: DEFAULT_REASONING_EFFORTS_WITH_MAX;
+		if (anthropicModelHasRealXHighEffort(model)) {
+			// Opus 4.7+ and Sonnet 5 expose both Anthropic's real xhigh and
+			// max presets on the Messages API.
+			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
+		}
+		if (parsedModel.kind === "opus") {
+			// Opus 4.6 exposes max but not the newer xhigh literal.
+			return DEFAULT_REASONING_EFFORTS_WITH_MAX;
+		}
+		return DEFAULT_REASONING_EFFORTS;
 	}
 	return inferFallbackEfforts(model);
 }

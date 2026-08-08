@@ -1048,6 +1048,293 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 		expect(fs.existsSync(predecessorPath)).toBe(false);
 	});
 });
+describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
+	let root: string;
+
+	type ReceiptTestSnapshot = {
+		dev: string;
+		ino: string;
+		nlink: string;
+		size: string;
+		mtimeNs: string;
+		ctimeNs: string;
+		sha256: string;
+	};
+	const snapshot = (pathname: string): ReceiptTestSnapshot => {
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		return {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			nlink: stat.nlink.toString(),
+			size: stat.size.toString(),
+			mtimeNs: stat.mtimeNs.toString(),
+			ctimeNs: stat.ctimeNs.toString(),
+			sha256: createHash("sha256").update(fs.readFileSync(pathname)).digest("hex"),
+		};
+	};
+	const canonicalReceiptPath = (predecessor: ReceiptTestSnapshot, receipt: ReceiptTestSnapshot) =>
+		path.join(
+			root,
+			`.gjc-replace-cleanup-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}-receipt-${BigInt(receipt.dev).toString(16)}-${BigInt(receipt.ino).toString(16)}.json`,
+		);
+	const publishCanonicalReceipt = (predecessor: ReceiptTestSnapshot, contents: string) => {
+		const pending = path.join(root, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
+		fs.writeFileSync(pending, contents);
+		const receiptIdentity = snapshot(pending);
+		const receipt = canonicalReceiptPath(predecessor, receiptIdentity);
+		fs.renameSync(pending, receipt);
+		return { receipt, receiptIdentity };
+	};
+	const receiptQuarantine = (receipt: ReceiptTestSnapshot, predecessor: ReceiptTestSnapshot) =>
+		path.join(
+			root,
+			`.gjc-receipt-remove-${BigInt(receipt.dev).toString(16)}-${BigInt(receipt.ino).toString(16)}-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}`,
+		);
+	const legacyReceiptPath = (predecessor: ReceiptTestSnapshot) =>
+		path.join(
+			root,
+			`.gjc-replace-cleanup-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}.json`,
+		);
+	const replay = (name: string) => {
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		store.publishNoReplaceSync(name, Buffer.from("trigger\n"));
+	};
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-replace-toctou-"));
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it("continues reconcile when a canonical receipt disappears between capture and unlink (native not_found)", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt, receiptIdentity } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const secondPredecessorPath = path.join(root, "predecessor-2");
+		fs.writeFileSync(secondPredecessorPath, "predecessor-2\n");
+		const secondPredecessor = snapshot(secondPredecessorPath);
+		const { receipt: secondReceipt, receiptIdentity: secondReceiptIdentity } = publishCanonicalReceipt(
+			secondPredecessor,
+			JSON.stringify({ arbitrary: "second receipt contents are advisory" }),
+		);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			// First receipt: simulate concurrent disappearance — return not_found.
+			if (pathname === receipt) return { ok: false, code: "not_found" };
+			// Second receipt: normal detach.
+			const stat = fs.lstatSync(pathname, { bigint: true });
+			const sha256 = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+			if (
+				expected.directory ||
+				!expected.quarantineName ||
+				!stat.isFile() ||
+				stat.isSymbolicLink() ||
+				stat.dev !== expected.dev ||
+				stat.ino !== expected.ino ||
+				stat.nlink !== expected.nlink ||
+				stat.size !== expected.size ||
+				stat.mtimeNs !== expected.mtimeNs ||
+				sha256 !== expected.sha256
+			)
+				return { ok: false, code: "identity_mismatch" };
+			const detachedPath = path.join(root, expected.quarantineName);
+			fs.renameSync(pathname, detachedPath);
+			return { ok: true, detachedPath };
+		});
+
+		replay("toctou-not-found");
+
+		// First receipt soft-skipped (still on disk, not quarantined — it's just gone from the
+		// native's perspective).
+		expect(fs.existsSync(receiptQuarantine(receiptIdentity, predecessor))).toBe(false);
+		// Second receipt detached cleanly.
+		expect(fs.existsSync(secondReceipt)).toBe(false);
+		expect(fs.readFileSync(receiptQuarantine(secondReceiptIdentity, secondPredecessor), "utf8")).toContain(
+			"second receipt",
+		);
+		expect(fs.existsSync(path.join(root, "toctou-not-found"))).toBe(true);
+	});
+
+	it("continues reconcile when a canonical receipt disappears before first capture (ENOENT)", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const realOpenSync = fs.openSync;
+		let receiptRemoved = false;
+		vi.spyOn(fs, "openSync").mockImplementation(((file, flags, mode) => {
+			if (!receiptRemoved && file === receipt) {
+				receiptRemoved = true;
+				fs.unlinkSync(receipt);
+			}
+			return realOpenSync(file, flags, mode);
+		}) as typeof fs.openSync);
+
+		replay("toctou-canonical-enoent");
+
+		expect(receiptRemoved).toBe(true);
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "toctou-canonical-enoent"))).toBe(true);
+	});
+
+	it("continues reconcile when a legacy receipt disappears before first capture (ENOENT)", () => {
+		const predecessorSeed = path.join(root, ".predecessor");
+		const predecessorContents = "predecessor\n";
+		fs.writeFileSync(predecessorSeed, predecessorContents, { mode: 0o600 });
+		const seedIdentity = snapshot(predecessorSeed);
+		const predecessorPath = path.join(
+			root,
+			`.gjc-exact-replace-destination-${BigInt(seedIdentity.dev).toString(16)}-${BigInt(seedIdentity.ino).toString(16)}`,
+		);
+		fs.renameSync(predecessorSeed, predecessorPath);
+		const predecessor = snapshot(predecessorPath);
+		const receipt = legacyReceiptPath(predecessor);
+		fs.writeFileSync(
+			receipt,
+			JSON.stringify({
+				version: 1,
+				predecessor: predecessorPath,
+				successor: path.join(root, "session.jsonl"),
+				identity: predecessor,
+			}),
+			{ mode: 0o600 },
+		);
+
+		// Second canonical receipt that should detach cleanly.
+		const secondPredecessorPath = path.join(root, "predecessor-2");
+		fs.writeFileSync(secondPredecessorPath, "predecessor-2\n");
+		const secondPredecessor = snapshot(secondPredecessorPath);
+		const { receipt: secondReceipt, receiptIdentity: secondReceiptIdentity } = publishCanonicalReceipt(
+			secondPredecessor,
+			JSON.stringify({ arbitrary: "second receipt contents are advisory" }),
+		);
+
+		// Remove the legacy receipt after readdir returns but before capture opens it.
+		const realOpenSync = fs.openSync;
+		let receiptRemoved = false;
+		vi.spyOn(fs, "openSync").mockImplementation(((file, flags, mode) => {
+			if (!receiptRemoved && file === receipt) {
+				receiptRemoved = true;
+				fs.unlinkSync(receipt);
+			}
+			return realOpenSync(file, flags, mode);
+		}) as typeof fs.openSync);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			const stat = fs.lstatSync(pathname, { bigint: true });
+			const sha256 = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+			if (
+				expected.directory ||
+				!expected.quarantineName ||
+				!stat.isFile() ||
+				stat.isSymbolicLink() ||
+				stat.dev !== expected.dev ||
+				stat.ino !== expected.ino ||
+				stat.nlink !== expected.nlink ||
+				stat.size !== expected.size ||
+				stat.mtimeNs !== expected.mtimeNs ||
+				sha256 !== expected.sha256
+			)
+				return { ok: false, code: "identity_mismatch" };
+			const detachedPath = path.join(root, expected.quarantineName);
+			fs.renameSync(pathname, detachedPath);
+			return { ok: true, detachedPath };
+		});
+
+		replay("toctou-legacy-enoent");
+		expect(receiptRemoved).toBe(true);
+
+		expect(fs.existsSync(path.join(root, "toctou-legacy-enoent"))).toBe(true);
+		expect(fs.existsSync(secondReceipt)).toBe(false);
+		expect(fs.readFileSync(receiptQuarantine(secondReceiptIdentity, secondPredecessor), "utf8")).toContain(
+			"second receipt",
+		);
+	});
+
+	it("continues reconcile when a legacy receipt disappears before re-capture after predecessor retirement", () => {
+		const predecessorSeed = path.join(root, ".predecessor");
+		const predecessorContents = "predecessor\n";
+		fs.writeFileSync(predecessorSeed, predecessorContents, { mode: 0o600 });
+		const seedIdentity = snapshot(predecessorSeed);
+		const predecessorPath = path.join(
+			root,
+			`.gjc-exact-replace-destination-${BigInt(seedIdentity.dev).toString(16)}-${BigInt(seedIdentity.ino).toString(16)}`,
+		);
+		fs.renameSync(predecessorSeed, predecessorPath);
+		const predecessor = snapshot(predecessorPath);
+		const receipt = legacyReceiptPath(predecessor);
+		fs.writeFileSync(
+			receipt,
+			JSON.stringify({
+				version: 1,
+				predecessor: predecessorPath,
+				successor: path.join(root, "session.jsonl"),
+				identity: predecessor,
+			}),
+			{ mode: 0o600 },
+		);
+
+		// Second canonical receipt that should detach cleanly.
+		const secondPredecessorPath = path.join(root, "predecessor-2");
+		fs.writeFileSync(secondPredecessorPath, "predecessor-2\n");
+		const secondPredecessor = snapshot(secondPredecessorPath);
+		const { receipt: secondReceipt, receiptIdentity: secondReceiptIdentity } = publishCanonicalReceipt(
+			secondPredecessor,
+			JSON.stringify({ arbitrary: "second receipt contents are advisory" }),
+		);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			// When retiring the legacy predecessor, simulate concurrent receipt disappearance
+			// as a side-effect — the receipt is gone by the time re-capture runs.
+			if (pathname === predecessorPath) {
+				fs.unlinkSync(receipt);
+				const detachedPath = path.join(root, expected.quarantineName!);
+				fs.renameSync(pathname, detachedPath);
+				return { ok: true, detachedPath };
+			}
+			const stat = fs.lstatSync(pathname, { bigint: true });
+			const sha256 = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+			if (
+				expected.directory ||
+				!expected.quarantineName ||
+				!stat.isFile() ||
+				stat.isSymbolicLink() ||
+				stat.dev !== expected.dev ||
+				stat.ino !== expected.ino ||
+				stat.nlink !== expected.nlink ||
+				stat.size !== expected.size ||
+				stat.mtimeNs !== expected.mtimeNs ||
+				sha256 !== expected.sha256
+			)
+				return { ok: false, code: "identity_mismatch" };
+			const detachedPath = path.join(root, expected.quarantineName);
+			fs.renameSync(pathname, detachedPath);
+			return { ok: true, detachedPath };
+		});
+
+		expect(() => replay("toctou-legacy-recapture")).not.toThrow();
+
+		// Legacy predecessor was retired.
+		expect(fs.existsSync(predecessorPath)).toBe(false);
+		// Legacy receipt was concurrently removed (by our mock side-effect).
+		expect(fs.existsSync(receipt)).toBe(false);
+		// Second receipt detached cleanly.
+		expect(fs.existsSync(secondReceipt)).toBe(false);
+		expect(fs.readFileSync(receiptQuarantine(secondReceiptIdentity, secondPredecessor), "utf8")).toContain(
+			"second receipt",
+		);
+		expect(fs.existsSync(path.join(root, "toctou-legacy-recapture"))).toBe(true);
+	});
+});
 describe.skipIf(process.platform !== "linux")("managed native security result validation", () => {
 	const validApply = {
 		ok: true,
@@ -1163,6 +1450,104 @@ describe.skipIf(process.platform !== "linux")("managed descendant retained bindi
 			} finally {
 				create.mockRestore();
 			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("root retained-authority store does not snapshot mutable descendants (#3906)", () => {
+		// On Linux, retained-authority store construction must use identity() for the
+		// root case (authorityBaseDir === baseDir) rather than snapshotManagedTree(""),
+		// which walks every mutable descendant and returns identity_mismatch under
+		// concurrent writers. #assertBound() already uses identity() for this case;
+		// the constructor must mirror it. Nested descendants still snapshot.
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-root-snapshot-3906-"));
+		try {
+			const rootAuthority = managedDirectoryRoot(root);
+			// Publish a file so the tree is non-empty (a mutable descendant exists).
+			const warmup = new ManagedSessionDescendantStore(rootAuthority, root);
+			warmup.publishNoReplaceSync("session.jsonl", Buffer.from('{"id":"warm"}\n'));
+			warmup.close();
+
+			const retainedAuthority = retainManagedDirectoryAuthority(rootAuthority, root);
+			if (!retainedAuthority) {
+				// Non-Linux: no retained native root authority. Verify construction still
+				// succeeds without a retained authority and skip the snapshot assertion.
+				const fallback = new ManagedSessionDescendantStore(rootAuthority, root);
+				fallback.close();
+				return;
+			}
+
+			// Spy on snapshotManagedTree: it must NOT be called for root construction.
+			const snapshotSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "snapshotManagedTree");
+
+			const store = new ManagedSessionDescendantStore(rootAuthority, root, {
+				authority: retainedAuthority,
+				authorityBaseDir: root,
+			});
+
+			// Root construction must not have snapshotted the tree at all.
+			expect(snapshotSpy).not.toHaveBeenCalled();
+			store.close();
+
+			snapshotSpy.mockRestore();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("root retained-authority store survives concurrent descendant writes (#3906)", () => {
+		// Simulate a concurrent writer appending to a descendant file while the
+		// root store is constructed. Before the fix, snapshotManagedTree("") would
+		// observe the mutable descendant mid-write and return identity_mismatch.
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-concurrent-3906-"));
+		try {
+			const rootAuthority = managedDirectoryRoot(root);
+			// Warm up: create a descendant file that will be concurrently written.
+			const warmup = new ManagedSessionDescendantStore(rootAuthority, root);
+			warmup.publishNoReplaceSync("session.jsonl", Buffer.from('{"id":"base"}\n'));
+			warmup.close();
+
+			const retainedAuthority = retainManagedDirectoryAuthority(rootAuthority, root);
+			if (!retainedAuthority) return; // Non-Linux: no retained authority path.
+
+			// Concurrently append to the descendant while constructing the root store.
+			// This would make snapshotManagedTree("") see a changing tree. The fix
+			// uses identity() which only reads the stable root inode/dev.
+			const append = Buffer.from('{"id":"concurrent"}\n');
+			const writer = new ManagedSessionDescendantStore(rootAuthority, root);
+			const interval = setInterval(() => {
+				try {
+					writer.replaceSync("session.jsonl", Buffer.concat([Buffer.from('{"id":"base"}\n'), append]));
+				} catch {
+					// ignore transient races; the point is to create concurrent mutation
+				}
+			}, 1);
+
+			let constructions = 0;
+			let failures = 0;
+			try {
+				for (let i = 0; i < 20; i++) {
+					try {
+						const store = new ManagedSessionDescendantStore(rootAuthority, root, {
+							authority: retainManagedDirectoryAuthority(rootAuthority, root)!,
+							authorityBaseDir: root,
+						});
+						store.assertBound();
+						store.close();
+						constructions++;
+					} catch {
+						failures++;
+					}
+				}
+			} finally {
+				clearInterval(interval);
+				writer.close();
+			}
+
+			// Every root construction must succeed despite concurrent descendant writes.
+			expect(failures).toBe(0);
+			expect(constructions).toBe(20);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

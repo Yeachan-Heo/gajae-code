@@ -15,10 +15,17 @@ export interface RestartSdkBrokerOptions {
 	closeSessionHosts?: boolean;
 }
 
+export interface UnclosedSessionHost {
+	sessionId: string;
+	reason: string;
+}
+
 export interface RestartSdkBrokerResult {
 	previousPid?: number;
 	pid: number;
 	closedSessionIds?: string[];
+	/** Hosts that survived the close request; the replacement broker still restarts. */
+	unclosedSessionHosts?: UnclosedSessionHost[];
 }
 
 export interface RestartSdkBrokerDeps {
@@ -54,11 +61,34 @@ async function stopPreviousBroker(discovery: BrokerDiscoveryLike, deps: RestartS
  * Session hosts outlive the broker that spawned them, so a broker-only restart keeps
  * serving whatever source those processes started with. Closing them through the live
  * broker reuses its verified-identity teardown instead of signalling pids from here.
+ *
+ * A host that refuses or cannot prove its teardown must not abort the restart: the
+ * broker would keep serving the old source, which is the exact failure this flag
+ * exists to prevent. Every host is attempted, and the survivors are reported so the
+ * caller never mistakes a partial teardown for a clean one.
  */
-async function closeSessionHosts(discovery: BrokerDiscoveryLike, deps: RestartSdkBrokerDeps): Promise<string[]> {
+async function closeSessionHosts(
+	discovery: BrokerDiscoveryLike,
+	deps: RestartSdkBrokerDeps,
+): Promise<{ closed: string[]; unclosed: UnclosedSessionHost[] }> {
 	const sessionIds = await deps.listSessionHosts(discovery);
-	for (const sessionId of sessionIds) await deps.closeSession(discovery, sessionId);
-	return sessionIds;
+	const closed: string[] = [];
+	const unclosed: UnclosedSessionHost[] = [];
+	for (const sessionId of sessionIds) {
+		try {
+			await deps.closeSession(discovery, sessionId);
+			closed.push(sessionId);
+		} catch (error) {
+			unclosed.push({ sessionId, reason: reasonFrom(error) });
+		}
+	}
+	return { closed, unclosed };
+}
+
+function reasonFrom(error: unknown): string {
+	const code = (error as { code?: unknown } | null)?.code;
+	const message = error instanceof Error ? error.message : String(error);
+	return typeof code === "string" && code.length > 0 ? `${code}: ${message}` : message;
 }
 
 export async function restartSdkBroker(
@@ -72,8 +102,13 @@ export async function restartSdkBroker(
 
 	const previous = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
 	let closedSessionIds: string[] | undefined;
+	let unclosedSessionHosts: UnclosedSessionHost[] | undefined;
 	if (previous) {
-		if (options.closeSessionHosts) closedSessionIds = await closeSessionHosts(previous, deps);
+		if (options.closeSessionHosts) {
+			const outcome = await closeSessionHosts(previous, deps);
+			closedSessionIds = outcome.closed;
+			if (outcome.unclosed.length > 0) unclosedSessionHosts = outcome.unclosed;
+		}
 		await stopPreviousBroker(previous, deps);
 		const deadline = Date.now() + gracefulTimeoutMs;
 		while (Date.now() < deadline) {
@@ -95,5 +130,6 @@ export async function restartSdkBroker(
 		...(previous ? { previousPid: previous.pid } : {}),
 		pid: replacement.pid,
 		...(closedSessionIds ? { closedSessionIds } : {}),
+		...(unclosedSessionHosts ? { unclosedSessionHosts } : {}),
 	};
 }

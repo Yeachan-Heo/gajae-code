@@ -319,15 +319,18 @@ const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
 	fastModeDisabled: boolean;
+	generatedCacheBudget: GeneratedCacheBudget;
 };
 
 function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 	const state: AnthropicProviderSessionState = {
 		strictToolsDisabled: false,
 		fastModeDisabled: false,
+		generatedCacheBudget: 2,
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
+			state.generatedCacheBudget = 2;
 		},
 	};
 	return state;
@@ -395,8 +398,20 @@ export function isAnthropicFastModeUnsupportedError(error: unknown): boolean {
 	return false;
 }
 
+/**
+ * Proxies (e.g. CLIProxyAPI) can deliver Anthropic's 400 body as an in-stream
+ * SSE `error` event on an HTTP 200 response; the thrown error then carries no
+ * HTTP status at all (issue #3900). Accept both the direct 400 and the
+ * statusless SSE shape — the strict `invalid_request_error` message checks in
+ * each matcher keep the statusless branch from claiming unrelated failures.
+ */
+function isAnthropicInvalidRequestStatus(error: unknown): boolean {
+	const status = extractHttpStatusFromError(error);
+	return status === 400 || status === undefined;
+}
+
 export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
-	if (extractHttpStatusFromError(error) !== 400) return false;
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	return (
 		/invalid_request_error/i.test(message) &&
@@ -414,13 +429,56 @@ export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
  * than only the latest one.
  */
 export function isAnthropicThinkingSignatureInvalidError(error: unknown): boolean {
-	if (extractHttpStatusFromError(error) !== 400) return false;
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	return (
 		/invalid_request_error/i.test(message) &&
 		/thinking|redacted_thinking/i.test(message) &&
 		/invalid\s+`?signature`?/i.test(message)
 	);
+}
+
+/**
+ * CLIProxyAPI replaces Anthropic's rejection body wholesale instead of forwarding
+ * it: the client only ever sees
+ * `{"type":"error","error":{"type":"api_error","message":"An error occurred while
+ * processing the request."}}`, delivered as an in-stream SSE `error` event on an
+ * HTTP 200 response, so neither the status nor the message survives. Captured CPA
+ * traces for that masked shape carry the thinking-integrity 400 upstream (issue
+ * #3900), and the generic body matches no transient phrase either, so the turn
+ * dies unrecoverably. Nothing in the payload names the cause; callers must pair
+ * this with a request that actually replays signed thinking blocks before
+ * treating it as a thinking-replay rejection.
+ */
+export function isAnthropicMaskedProxyRejection(error: unknown): boolean {
+	const status = extractHttpStatusFromError(error);
+	if (status !== undefined && status !== 400) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	// A body that still names its error type is classified by the strict matchers.
+	if (/invalid_request_error/i.test(message)) return false;
+	return /"type"\s*:\s*"api_error"/.test(message) && /an error occurred while processing/i.test(message);
+}
+
+/**
+ * Anthropic rejects a request carrying more than four `cache_control`
+ * breakpoints. An Anthropic-compatible gateway may attach its own block-level
+ * markers before forwarding, and those never appear in the params we serialize,
+ * so no amount of local counting can predict the total. The rejection is the
+ * only evidence that our generated marker is one too many, and it is worth
+ * exactly one retry with generated caching suppressed.
+ *
+ * Our own pre-flight `validateCacheControls` failure is deliberately not
+ * matched: it carries no `invalid_request_error` wording, so a local bug stays
+ * loud instead of being silently retried.
+ */
+export function isAnthropicCacheBreakpointOverflowError(error: unknown): boolean {
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	if (!/invalid_request_error/i.test(message)) return false;
+	if (!/cache_control/i.test(message)) return false;
+	// Observed: "A maximum of 4 blocks with cache_control may be provided. Found 5."
+	// Stay tolerant of phrasing drift around the limit and the reported total.
+	return /maximum of \d+ blocks/i.test(message) || /at most \d+ blocks/i.test(message);
 }
 
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
@@ -447,12 +505,32 @@ function dropAnthropicStrictTools(params: MessageCreateParamsStreaming): void {
 	}
 }
 
+function isClaudeFamilyModel(model: Model<"anthropic-messages">): boolean {
+	// Classify the same identifier the request body serializes (`params.model =
+	// model.id` in buildParams); a differing `wireModelId` is not dispatched by
+	// this transport, so it must not drive the cache decision either.
+	const id = model.id;
+	const shortId = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+	return shortId.toLowerCase().startsWith("claude-");
+}
+
+/**
+ * How many breakpoints we are still willing to generate after a gateway has
+ * rejected a previous attempt. `explicit` mode normally emits two (a reusable
+ * prefix anchor on the last assistant turn plus a refresh point on the current
+ * user turn), so stepping down to one still caches the prefix, and only the
+ * final step gives caching up entirely.
+ */
+type GeneratedCacheBudget = 2 | 1 | 0;
+
 function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
+	generatedCacheBudget: GeneratedCacheBudget = 2,
 ): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
-	const retention = resolveCacheRetention(cacheRetention, "long");
+	if (generatedCacheBudget === 0) return { mode: "none" };
+	const retention = resolveCacheRetention(cacheRetention ?? model.cacheRetention, "long");
 	if (retention === "none") return { mode: "none" };
 
 	const isCanonicalApi = isAnthropicApiBaseUrl(baseUrl);
@@ -462,9 +540,13 @@ function getCacheControl(
 			? "none"
 			: promptCacheMode === "explicit"
 				? "explicit"
-				: isCanonicalApi
+				: promptCacheMode === "automatic"
 					? "automatic"
-					: "none";
+					: isCanonicalApi
+						? "automatic"
+						: isClaudeFamilyModel(model)
+							? "explicit"
+							: "none";
 	if (mode === "none") return { mode };
 
 	const supportsLongCacheRetention = isCanonicalApi
@@ -1369,16 +1451,23 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let droppedForcedToolChoice = false;
 			let repairLatestAssistantThinking = false;
 			let repairAllAssistantThinking = false;
+			let generatedCacheBudget: GeneratedCacheBudget = providerSessionState?.generatedCacheBudget ?? 2;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				// Degradation state is cumulative: every fallback rebuild must merge all
 				// repairs activated so far. Rebuilding from only the immediate call lets
 				// a later strict/forced-tool/fast-mode fallback reintroduce the rejected
 				// shape (e.g. invalid thinking signatures or forced tool_choice), and
 				// the one-shot thinking-repair guard then blocks recovery.
-				let nextParams = buildParams(model, baseUrl, context, isOAuthToken, options, disableStrictTools, {
-					repairLatestAssistantThinking,
-					repairAllAssistantThinking,
-				});
+				let nextParams = buildParams(
+					model,
+					baseUrl,
+					context,
+					isOAuthToken,
+					options,
+					disableStrictTools,
+					{ repairLatestAssistantThinking, repairAllAssistantThinking },
+					generatedCacheBudget,
+				);
 				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
 				}
@@ -1847,7 +1936,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						!options?.fallbackManaged &&
 						!repairAllAssistantThinking &&
 						firstTokenTime === undefined &&
-						(thinkingSignatureInvalid || isAnthropicThinkingBlockMutationError(streamFailure))
+						(thinkingSignatureInvalid ||
+							isAnthropicThinkingBlockMutationError(streamFailure) ||
+							// Masked proxy rejection: unclassifiable on its own, so the replayed
+							// request shape is the evidence. Without signed thinking blocks in
+							// flight there is nothing to repair and the error must surface.
+							(isAnthropicMaskedProxyRejection(streamFailure) && hasNativeThinkingBlocks(params.messages)))
 					) {
 						// The mutation 400 blames the "latest assistant message", but its cited
 						// `messages.N.content.M` path can point at an EARLIER replayed turn, so the
@@ -1881,6 +1975,34 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							providerSessionState.fastModeDisabled = true;
 						}
 						dropFastMode = true;
+						params = await prepareParams();
+						providerRetryAttempt = 0;
+						resetOutputForRetry();
+						continue;
+					}
+					if (
+						!options?.fallbackManaged &&
+						generatedCacheBudget > 0 &&
+						firstTokenTime === undefined &&
+						isAnthropicCacheBreakpointOverflowError(streamFailure)
+					) {
+						// The gateway's own markers already fill Anthropic's four slots, so
+						// one of ours is the fifth. We cannot see the others, which makes the
+						// rejection the only usable signal — and it says "too many", not
+						// "none allowed". So give up one breakpoint at a time instead of all
+						// caching at once: an endpoint that leaves a single slot free keeps
+						// caching the conversation prefix, which is the marker that matters.
+						const nextBudget: GeneratedCacheBudget = generatedCacheBudget === 2 ? 1 : 0;
+						logger.debug("anthropic: cache breakpoint limit exceeded, reducing generated breakpoints", {
+							model: model.id,
+							from: generatedCacheBudget,
+							to: nextBudget,
+							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+						});
+						if (providerSessionState) {
+							providerSessionState.generatedCacheBudget = nextBudget;
+						}
+						generatedCacheBudget = nextBudget;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
 						resetOutputForRetry();
@@ -2106,6 +2228,25 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		};
 	}
 
+	// JetBrains AI (Ingrazzio) authenticates with a plain `Authorization: Bearer`
+	// token and rejects requests that also carry `X-Api-Key`. `buildAnthropicHeaders`
+	// already emits the bearer for non-Anthropic hosts, so keep the SDK from adding
+	// its own API-key header on top of it.
+	if (model.provider === "jetbrains-junie") {
+		return {
+			isOAuthToken: false,
+			apiKey: null,
+			authToken: null,
+			baseURL: baseUrl,
+			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
+			dangerouslyAllowBrowser: true,
+			defaultHeaders,
+			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
+			fetch: debugFetch,
+			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
+		};
+	}
+
 	return {
 		isOAuthToken: oauthToken,
 		apiKey: oauthToken ? null : apiKey,
@@ -2277,7 +2418,12 @@ function isHumanUserMessage(message: MessageCreateParamsStreaming["messages"][nu
 	return message.content.some(block => block.type !== "tool_result");
 }
 
-function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: AnthropicCacheControl): void {
+function applyExplicitPromptCaching(
+	params: AnthropicCacheParams,
+	cacheControl: AnthropicCacheControl,
+	budget: GeneratedCacheBudget,
+): void {
+	if (budget === 0) return;
 	if (countCacheControlBreakpoints(params) >= 4) return;
 
 	const currentUserIndex = params.messages.findLastIndex(isHumanUserMessage);
@@ -2285,10 +2431,18 @@ function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: 
 	const currentUser = params.messages[currentUserIndex];
 	if (!currentUser) return;
 
-	// A tool result is encoded as role "user" on the wire, but belongs to the
-	// preceding assistant turn. Anchor that assistant turn, not the tool result,
-	// so changing tool output does not invalidate the reusable conversation prefix.
-	for (let index = currentUserIndex - 1; index >= 0; index--) {
+	// Tool results are encoded as role "user" on the wire but belong to the
+	// assistant tool-use turn immediately before them. Anchor the latest completed
+	// assistant turn so the reusable prefix advances during an agent tool loop,
+	// while keeping the newest tool output outside the cache boundary.
+	//
+	// This anchor is the higher-value marker of the two: it covers the whole
+	// conversation prefix, so a reduced budget is spent here first. It only
+	// consumes budget when a marker is actually placed — on a first turn there is
+	// no assistant message yet, and the reduced budget must still reach the
+	// current-turn marker below rather than emitting nothing at all.
+	let remaining: number = budget;
+	for (let index = params.messages.length - 1; index >= 0; index--) {
 		const message = params.messages[index];
 		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
 		if (
@@ -2297,10 +2451,12 @@ function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: 
 				cacheControl,
 			)
 		) {
+			remaining -= 1;
 			break;
 		}
 	}
 
+	if (remaining < 1) return;
 	if (countCacheControlBreakpoints(params) >= 4) return;
 	if (typeof currentUser.content === "string" && currentUser.content.trim()) {
 		currentUser.content = [{ type: "text", text: currentUser.content, cache_control: { ...cacheControl } }];
@@ -2316,14 +2472,17 @@ function applyPromptCaching(
 	params: AnthropicCacheParams,
 	cacheMode: AnthropicCacheMode,
 	cacheControl?: AnthropicCacheControl,
+	budget: GeneratedCacheBudget = 2,
 ): void {
-	if (!cacheControl || cacheMode === "none") return;
+	if (!cacheControl || cacheMode === "none" || budget === 0) return;
 	validateCacheControls(params);
 	if (cacheMode === "automatic") {
+		// Automatic mode only ever emits one marker, so any non-zero budget
+		// covers it; the zero case already returned above.
 		params.cache_control = { ...cacheControl };
 		return;
 	}
-	applyExplicitPromptCaching(params, cacheControl);
+	applyExplicitPromptCaching(params, cacheControl, budget);
 	validateCacheControls(params);
 }
 
@@ -2348,6 +2507,7 @@ function enforceCacheControlLimit(params: MessageCreateParamsStreaming, maxBreak
 	if (maxBreakpoints !== 4) throw new Error("Anthropic supports exactly four cache breakpoints");
 	validateCacheControls(params as AnthropicCacheParams);
 }
+
 function buildParams(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
@@ -2356,8 +2516,14 @@ function buildParams(
 	options?: AnthropicOptions,
 	disableStrictTools = false,
 	thinkingRepair?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
+	generatedCacheBudget: GeneratedCacheBudget = 2,
 ): MessageCreateParamsStreaming {
-	const { mode: cacheMode, cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
+	const { mode: cacheMode, cacheControl } = getCacheControl(
+		model,
+		baseUrl,
+		options?.cacheRetention,
+		generatedCacheBudget,
+	);
 
 	const params: AnthropicSamplingParams = {
 		model: model.id,
@@ -2500,7 +2666,7 @@ function buildParams(
 		params.system = systemBlocks;
 	}
 	ensureMaxTokensForThinking(params, model);
-	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl);
+	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl, generatedCacheBudget);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
 

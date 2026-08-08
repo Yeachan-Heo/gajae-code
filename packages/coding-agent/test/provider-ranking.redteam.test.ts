@@ -323,6 +323,8 @@ describe("/provider preset CLI surface", () => {
 		expect(lines).toEqual(expectedLines);
 		expect(lines.map(line => line.match(/^([a-z0-9][a-z0-9._-]*)/)?.[1])).toEqual([
 			"glm",
+			"cline-pass",
+			"commandcode-goat",
 			"alibaba-token-plan",
 			"minimax",
 			"minimax-cn",

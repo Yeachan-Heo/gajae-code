@@ -20,6 +20,7 @@ import type {
 	ResponseReasoningItem,
 } from "openai/resources/responses/responses";
 import packageJson from "../../package.json" with { type: "json" };
+import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
@@ -93,6 +94,8 @@ import {
 } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
 
+export { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
+
 export interface OpenAICodexResponsesOptions extends StreamOptions {
 	reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "concise" | "detailed" | null;
@@ -138,31 +141,6 @@ const CODEX_WEBSOCKET_FATAL_PATTERNS = ["websocket error:", "websocket closed be
 /** Max total time to spend retrying 429s with server-provided delays (5 minutes). */
 const CODEX_RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
 
-/**
- * Tool names the Codex backend reserves for its own namespaces. Sending a
- * function tool under one of these names is rejected with
- * `Function 'computer.computer' not allowed in namespace 'computer'`.
- * These are renamed on the wire and mapped back on receive so the internal
- * tool name stays canonical everywhere else in the harness.
- */
-const CODEX_RESERVED_TOOL_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
-	["browser", "browser_tool"],
-	["computer", "computer_tool"],
-]);
-const CODEX_CANONICAL_TOOL_NAMES: ReadonlyMap<string, string> = new Map(
-	Array.from(CODEX_RESERVED_TOOL_WIRE_NAMES, ([canonical, wire]) => [wire, canonical]),
-);
-
-/** Maps a canonical tool name to the name Codex accepts on the wire. */
-export function codexToolWireName(name: string): string {
-	return CODEX_RESERVED_TOOL_WIRE_NAMES.get(name) ?? name;
-}
-
-/** Maps a Codex wire tool name back to the canonical harness tool name. */
-export function codexToolCanonicalName(wireName: string): string {
-	return CODEX_CANONICAL_TOOL_NAMES.get(wireName) ?? wireName;
-}
-
 const CODEX_PROGRESS_EVENT_TYPES = new Set([
 	"response.created",
 	"response.output_item.added",
@@ -191,6 +169,12 @@ function isCodexStreamProgressEvent(event: unknown): boolean {
 	return typeof type === "string" && CODEX_PROGRESS_EVENT_TYPES.has(type);
 }
 type CodexTransport = "sse" | "websocket";
+interface CodexInitialTransport {
+	eventStream: AsyncGenerator<Record<string, unknown>>;
+	requestBodyForState: RequestBody;
+	transport: CodexTransport;
+	toolChoiceFallbackApplied?: boolean;
+}
 type CodexEventItem = ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | ResponseCustomToolCall;
 type CodexThinkingBlock = ThinkingContent & { summaryBuffer: string; rawBuffer: string; summaryStarted: boolean };
 type CodexOutputBlock = CodexThinkingBlock | TextContent | (ToolCall & { partialJson: string });
@@ -243,11 +227,11 @@ async function retryCodexInitialTransportWithoutToolChoice(
 	requestContext: CodexRequestContext,
 	stream: AssistantMessageEventStream,
 	error: unknown,
-): Promise<{
-	eventStream: AsyncGenerator<Record<string, unknown>>;
-	requestBodyForState: RequestBody;
-	transport: CodexTransport;
-}> {
+): Promise<
+	CodexInitialTransport & {
+		toolChoiceFallbackApplied: true;
+	}
+> {
 	if (!isCodexForcedToolChoiceUnsupportedError(error, requestContext.transformedBody)) {
 		throw error;
 	}
@@ -272,7 +256,7 @@ async function retryCodexInitialTransportWithoutToolChoice(
 		requestContext.websocketState,
 	);
 	requestContext.rawRequestDump = { ...requestContext.rawRequestDump, body: next.requestBodyForState };
-	return next;
+	return { ...next, toolChoiceFallbackApplied: true };
 }
 
 interface CodexRequestSetup {
@@ -292,6 +276,8 @@ interface CodexStreamRuntime {
 	nativeOutputItems: Array<Record<string, unknown>>;
 	websocketStreamRetries: number;
 	providerRetryAttempt: number;
+	toolChoiceFallbackAttempted: boolean;
+	sseRequestBodyOverride?: RequestBody;
 	sawTerminalEvent: boolean;
 	canSafelyReplayWebsocketOverSse: boolean;
 	/** Ids of tool calls that received their terminal `output_item.done`. */
@@ -773,11 +759,7 @@ async function openInitialCodexEventStream(
 	options: OpenAICodexResponsesOptions | undefined,
 	requestSetup: CodexRequestSetup,
 	requestContext: CodexRequestContext,
-): Promise<{
-	eventStream: AsyncGenerator<Record<string, unknown>>;
-	requestBodyForState: RequestBody;
-	transport: CodexTransport;
-}> {
+): Promise<CodexInitialTransport> {
 	const { transformedBody, websocketState } = requestContext;
 	if (websocketState && shouldUseCodexWebSocket(model, websocketState, options?.preferWebsockets)) {
 		const websocketRetryBudget = getCodexWebSocketRetryBudget(options);
@@ -949,6 +931,7 @@ async function reopenCodexSseRuntimeStream(
 		context.requestSetup,
 		context.options,
 		state,
+		runtime.sseRequestBodyOverride,
 	);
 	runtime.eventStream = next.eventStream;
 	runtime.requestBodyForState = next.requestBodyForState;
@@ -963,6 +946,7 @@ function createCodexStreamRuntime(initial: {
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 	websocketState?: CodexWebSocketSessionState;
+	toolChoiceFallbackApplied?: boolean;
 }): CodexStreamRuntime {
 	return {
 		eventStream: initial.eventStream,
@@ -974,6 +958,10 @@ function createCodexStreamRuntime(initial: {
 		nativeOutputItems: [],
 		websocketStreamRetries: 0,
 		providerRetryAttempt: 0,
+		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
+		sseRequestBodyOverride: initial.toolChoiceFallbackApplied
+			? structuredCloneJSON(initial.requestBodyForState)
+			: undefined,
 		sawTerminalEvent: false,
 		canSafelyReplayWebsocketOverSse: true,
 		finalizedToolCallIds: new Set<string>(),
@@ -1522,7 +1510,7 @@ async function tryRetryWithoutForcedToolChoice(
 ): Promise<boolean> {
 	if (
 		context.options?.fallbackManaged ||
-		runtime.providerRetryAttempt > 0 ||
+		runtime.toolChoiceFallbackAttempted ||
 		context.output.content.length > 0 ||
 		context.firstTokenTime !== undefined ||
 		context.options?.signal?.aborted ||
@@ -1545,7 +1533,7 @@ async function tryRetryWithoutForcedToolChoice(
 		registryKey: resolvedToolChoice.registryKey,
 	});
 
-	runtime.providerRetryAttempt += 1;
+	runtime.toolChoiceFallbackAttempted = true;
 	runtime.currentItem = null;
 	runtime.currentBlock = null;
 	runtime.sawTerminalEvent = false;
@@ -1567,6 +1555,7 @@ async function tryRetryWithoutForcedToolChoice(
 	);
 	runtime.eventStream = next.eventStream;
 	runtime.requestBodyForState = next.requestBodyForState;
+	runtime.sseRequestBodyOverride = next.requestBodyForState;
 	runtime.transport = next.transport;
 	if (websocketState) {
 		websocketState.lastTransport = next.transport;
@@ -1874,7 +1863,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 
 		try {
 			const requestContext = await buildCodexRequestContext(model, context, options, output);
-			let initialTransport: Awaited<ReturnType<typeof openInitialCodexEventStream>>;
+			let initialTransport: CodexInitialTransport;
 			try {
 				initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 			} catch (error) {

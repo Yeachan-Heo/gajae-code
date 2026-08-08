@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { SdkClient, SdkClientError, type SdkFrame } from "../client";
+import { HEARTBEAT_TTL_MS } from "../bus/daemon-paths";
+import { SdkClient, SdkClientError, type SdkClientOptions, type SdkFrame } from "../client";
+import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -46,6 +48,44 @@ type ReverseRequest = {
 	cancelTimer?: NodeJS.Timeout;
 };
 
+type AcpSessionReconnectOptions = Required<
+	Pick<SdkClientOptions, "reconnectAttempts" | "reconnectBackoffMs" | "reconnectMaxBackoffMs">
+>;
+
+const ACP_RECONNECT_BACKOFF_MS = 250;
+const ACP_RECONNECT_MAX_BACKOFF_MS = 2_000;
+/** Cover twice the host heartbeat TTL so a reaped stall still has room to recover. */
+const ACP_RECONNECT_BUDGET_MS = 2 * HEARTBEAT_TTL_MS;
+
+function attemptsCovering(budgetMs: number): number {
+	let elapsed = 0;
+	let attempts = 0;
+	while (elapsed <= budgetMs) {
+		elapsed += Math.min(ACP_RECONNECT_BACKOFF_MS * 2 ** attempts, ACP_RECONNECT_MAX_BACKOFF_MS);
+		attempts++;
+	}
+	return attempts;
+}
+
+/**
+ * Reconnect budget for long-lived ACP sessions.
+ *
+ * Invariant: the client's total reconnect budget must outlive the host heartbeat
+ * TTL ({@link HEARTBEAT_TTL_MS}). The SDK host drops a session whose client has
+ * not ponged within that TTL, so a client that gives up reconnecting sooner turns
+ * every stall the host reaps into a permanently lost session ("SDK WebSocket
+ * reconnect attempts exhausted"). The transport defaults (3 attempts at 25ms base
+ * = 175ms total) are correct only for one-shot request clients.
+ *
+ * Backoff ramps 250 -> 500 -> 1000 and then holds at the 2s cap, so individual
+ * sleeps stay short and recovery is prompt once the host answers again.
+ */
+export const ACP_SESSION_RECONNECT: AcpSessionReconnectOptions = {
+	reconnectAttempts: attemptsCovering(ACP_RECONNECT_BUDGET_MS),
+	reconnectBackoffMs: ACP_RECONNECT_BACKOFF_MS,
+	reconnectMaxBackoffMs: ACP_RECONNECT_MAX_BACKOFF_MS,
+};
+
 const SESSION_GLOBALS: Record<string, string> = {
 	newSession: "session.create",
 	loadSession: "session.resume",
@@ -89,7 +129,7 @@ export class AcpSdkAdapter {
 	#closed = false;
 
 	constructor(options: AcpSdkAdapterOptions) {
-		this.#client = options.client ?? new SdkClient(options.url, options.token);
+		this.#client = options.client ?? new SdkClient(options.url, options.token, { ...ACP_SESSION_RECONNECT });
 		this.#connection = options.connection;
 		this.#providers = options.providers ?? [];
 		for (const [capability, leaseId] of Object.entries(options.expectedLeaseIds ?? {}))
@@ -99,7 +139,8 @@ export class AcpSdkAdapter {
 	}
 
 	static async connect(options: AcpSdkAdapterOptions): Promise<AcpSdkAdapter> {
-		const client = options.client ?? (await SdkClient.connect(options.url, options.token));
+		const client =
+			options.client ?? (await SdkClient.connect(options.url, options.token, { ...ACP_SESSION_RECONNECT }));
 		const adapter = new AcpSdkAdapter({ ...options, client });
 		await adapter.start();
 		return adapter;
@@ -364,17 +405,21 @@ export class AcpSdkAdapter {
 			const result = await this.#forwardReverse(method, payload, controller.signal);
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
-			this.#client.send({ type: "reverse_response", id, connectionId, leaseId, ok: true, result });
+			const response = { type: "reverse_response", id, connectionId, leaseId, ok: true, result };
+			assertReverseResponseFrame(response);
+			this.#client.send(response);
 		} catch (error) {
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
 			const typed =
 				error instanceof AcpSdkAdapterError || error instanceof SdkClientError
 					? error
-					: new AcpSdkAdapterError(
-							"acp_reverse_failed",
-							error instanceof Error ? error.message : "ACP reverse request failed.",
-						);
+					: error instanceof ReverseLeaseError
+						? new AcpSdkAdapterError(error.code, error.message)
+						: new AcpSdkAdapterError(
+								"acp_reverse_failed",
+								error instanceof Error ? error.message : "ACP reverse request failed.",
+							);
 			this.#client.send({
 				type: "reverse_response",
 				id,

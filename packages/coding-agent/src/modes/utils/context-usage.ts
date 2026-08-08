@@ -5,7 +5,7 @@ import {
 	estimateMessageTokensHeuristic,
 	resolveThresholdTokens,
 } from "@gajae-code/agent-core/compaction";
-import type { Model } from "@gajae-code/ai";
+import type { Model } from "@gajae-code/ai/core";
 import { formatNumber } from "@gajae-code/utils";
 import type { AgentSession } from "../../session/agent-session";
 import { computeNonMessageBreakdown } from "../../session/context-estimation";

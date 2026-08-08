@@ -2986,7 +2986,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 51 strict archive settlement", () => {
+	test("keeps wire protocol 3 through generation 55 lazy native authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3007,8 +3007,16 @@ describe("telegram daemon", () => {
 		// generation 50 resolves intermediate notifications-directory symlinks before
 		// native exact unlink while keeping final-component file symlinks fail-closed;
 		// generation 51 adds shared durable topic authority and archive recovery and
-		// binds idempotent archive settlement to Telegram error code 400.
-		expect(DAEMON_GENERATION).toBe(51);
+		// binds idempotent archive settlement to Telegram error code 400; generation
+		// 52 is claimed by the pre-readiness daemon-child exit diagnostics slice;
+		// generation 53 renders multi-select state for ask-tool asks and renumbers
+		// pre-numbered options exactly once around the selection marker;
+		// generation 54 records owner stoppedAt on unclean daemon death so a dead
+		// process cannot keep advertising itself as the ready owner (#3965).
+		// generation 55 hardens the shared topic authority outage path (#3974).
+		// generation 56 moves exact unlink and process-incarnation authority behind
+		// lazy native bindings (#3846).
+		expect(DAEMON_GENERATION).toBe(56);
 	});
 	test.each([
 		"1",
@@ -6174,6 +6182,35 @@ describe("telegram daemon", () => {
 			answer: 1,
 			token: "ts",
 		});
+	});
+
+	test("multi-select state renumbers pre-numbered options exactly once", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as never,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		// Deep-interview options arrive pre-numbered by the ask tool.
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Pick all",
+			options: ["1. Alpha", "2. Beta"],
+			selectedOptionIndices: [0],
+		});
+		const sent = bot.calls.find(call => call.method === "sendMessage")!.body;
+		expect(sent.text).toContain("1. ☑ Alpha");
+		expect(sent.text).toContain("2. ☐ Beta");
+		expect(sent.text).not.toContain("1. Alpha");
 	});
 
 	test("callback alias reply is delivered when Telegram callback ack fails", async () => {
@@ -11172,6 +11209,62 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 	const ask = sends.find(c => String(c.body.text).includes("Proceed?"));
 	expect(ask).toBeTruthy();
 	expect(ask!.body.reply_markup?.inline_keyboard?.length).toBeGreaterThan(0);
+});
+test("private chat without Threaded Mode: concurrent frames all deliver flat", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	// Verbatim Bot API rejection for a paired private chat whose bot has no
+	// Threaded Mode; the slow response makes a second frame join the shared
+	// in-flight create instead of issuing its own.
+	bot.call = (async (method: string, body: unknown) => {
+		bot.calls.push({ method, body: body as never });
+		if (method === "createForumTopic") {
+			await Bun.sleep(30);
+			return { ok: false, error_code: 400, description: "Bad Request: the chat is not a forum" };
+		}
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as never;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		sound: "none",
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await Promise.all([
+		daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+		daemon.handleSessionMessage(session as never, {
+			type: "action_needed",
+			sessionId: "S",
+			id: "ask1",
+			kind: "ask",
+			question: "Proceed?",
+			options: ["Yes", "No"],
+		}),
+	]);
+	// A later frame must not re-attempt the refused capability.
+	await daemon.handleSessionMessage(session as never, {
+		type: "context_update",
+		sessionId: "S",
+		lastMessage: "hello world",
+	});
+
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	const sends = bot.calls.filter(call => call.method === "sendMessage");
+	expect(sends.every(call => call.body.message_thread_id === undefined)).toBe(true);
+	expect(sends.some(call => String(call.body.text).includes("Proceed?"))).toBe(true);
+	expect(sends.some(call => String(call.body.text).includes("hello world"))).toBe(true);
 });
 test("topic creation transport failures fail closed without flat delivery", async () => {
 	const agentDir = tempAgentDir();
@@ -19536,8 +19629,15 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 
 		releaseSend.resolve({ ok: true, result: { message_id: 7 } });
 		await handlerPersistStarted.promise;
+		// `join` counts its deadline in wall-clock from the call, and the statements
+		// between the call and `releaseHandlerPersist` below (the held-state race and
+		// its assertion) run inside that window. A deadline as tight as the released
+		// work itself therefore expires on a loaded runner and reports `false` for a
+		// barrier that did hold. The held half is proven by the race below, not by
+		// the deadline, so bound it generously — the daemon's own shutdown join uses
+		// 1s.
 		const joinedSettled = Promise.withResolvers<boolean>();
-		const joinedEffect = effects.join(100).then(value => {
+		const joinedEffect = effects.join(5_000).then(value => {
 			joinedSettled.resolve(value);
 			return value;
 		});
@@ -22417,4 +22517,176 @@ test("CAS winner advance after accepted create publishes the exact archive fence
 	expect(bot.calls.filter(call => call.method === "closeForumTopic").map(call => call.body.message_thread_id)).toEqual(
 		[2],
 	);
+});
+
+test("a failed root scan is retried on the next tick instead of exiting the daemon owner", async () => {
+	// A dead session's topic is archived by the scan pass, and that pass persists
+	// through the shared topic authority. When the authority is momentarily
+	// unavailable the rejection used to escape the scan timer and the run loop,
+	// reach the process-level fatal handler, and exit the owner: every topic was
+	// then left behind as an unarchived shell that answers nothing.
+	const warn = spyOn(logger, "warn").mockImplementation(() => {});
+	const escaped: unknown[] = [];
+	const onEscape = (reason: any): void => void escaped.push(reason?.stack ?? String(reason));
+	process.on("unhandledRejection", onEscape);
+	const ticks: Array<() => void> = [];
+	let compareAndSetCalls = 0;
+	let armed = false;
+	let state = {
+		version: 2 as const,
+		registryGeneration: 1,
+		topics: {
+			S: {
+				topicId: "700",
+				topicOrigin: "daemon_created" as const,
+				sessionUuid: "dead-session",
+				identitySent: true,
+				createdAt: 1,
+				authorityEpoch: 0,
+				authorityState: "active" as const,
+				chatId: "42",
+				endpointKey: "ws://dead-endpoint|dead-token",
+				endpointDigest: "dead-digest",
+				endpointGeneration: 1,
+			},
+		},
+	};
+	const authority = {
+		read: async () => state,
+		compareAndSet: async (_expectedGeneration: number, next: any) => {
+			if (!armed) {
+				state = next;
+				return true;
+			}
+			compareAndSetCalls++;
+			throw new Error("shared topic authority unavailable");
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "token",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		installationHostId: "local-host",
+		topicRegistryAuthority: authority as never,
+		setIntervalImpl: ((tick: () => void) => {
+			ticks.push(tick);
+			return 0;
+		}) as never,
+		clearIntervalImpl: (() => {}) as never,
+	});
+	try {
+		await daemon.loadTopics();
+		expect((daemon as any).topics.get("S")?.topicId).toBe("700");
+		armed = true;
+		(daemon as any).running = true;
+		(daemon as any).startScanTimer();
+		expect(ticks).toHaveLength(1);
+
+		const settle = async (): Promise<void> => {
+			for (let i = 0; i < 50; i++) await new Promise(resolve => setTimeout(resolve, 1));
+		};
+
+		const scan = spyOn(daemon, "scanRoots");
+		ticks[0]!();
+		await settle();
+		// The pass reached the shared authority, failed, and reported the failure
+		// instead of letting the rejection reach the process-level fatal handler.
+		expect(compareAndSetCalls).toBeGreaterThanOrEqual(1);
+		expect(warn.mock.calls.some(call => String(call[0]).includes("session scan failed"))).toBe(true);
+		expect(escaped).toEqual([]);
+		// The owner is still running, so the next interval retries the same pass.
+		expect((daemon as any).running).toBe(true);
+		ticks[0]!();
+		await settle();
+		expect(scan.mock.calls).toHaveLength(2);
+		expect(escaped).toEqual([]);
+		scan.mockRestore();
+	} finally {
+		process.off("unhandledRejection", onEscape);
+		warn.mockRestore();
+	}
+});
+
+test("a topic lease renewal failure on the liveness heartbeat is reported instead of escaping as an unhandled rejection", async () => {
+	const warn = spyOn(logger, "warn").mockImplementation(() => {});
+	const escaped: unknown[] = [];
+	const onEscape = (reason: any): void => void escaped.push(reason?.stack ?? String(reason));
+	process.on("unhandledRejection", onEscape);
+	FakeWs.instances = [];
+	const liveness: Array<() => void> = [];
+	let armed = false;
+	let state = {
+		version: 2 as const,
+		registryGeneration: 1,
+		topics: {
+			S: {
+				topicId: "700",
+				topicOrigin: "daemon_created" as const,
+				sessionUuid: "s",
+				identitySent: true,
+				createdAt: 1,
+				authorityEpoch: 0,
+				authorityState: "active" as const,
+				chatId: "42",
+				endpointKey: "ws://session|token",
+				endpointDigest: "digest",
+				endpointGeneration: 1,
+			},
+		},
+	};
+	const authority = {
+		read: async () => state,
+		compareAndSet: async (_expectedGeneration: number, next: any) => {
+			if (!armed) {
+				state = next;
+				return true;
+			}
+			throw new Error("shared topic authority unavailable");
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "token",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		WebSocketImpl: FakeWs as any,
+		installationHostId: "local-host",
+		topicRegistryAuthority: authority as never,
+		setIntervalImpl: ((cb: () => void) => {
+			liveness.push(cb);
+			return 0;
+		}) as any,
+		clearIntervalImpl: (() => {}) as any,
+	});
+	try {
+		await (daemon as any).loadTopics();
+		const session = daemon.connectSession("S", "ws://session", "token");
+		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		FakeWs.instances[0]!.emit({
+			type: "event_replay_result",
+			ok: true,
+			id: "telegram-startup-replay:S",
+			generation: 1,
+			lastSeq: 0,
+			events: [],
+		});
+		for (let attempts = 0; attempts < 20 && liveness.length === 0; attempts++) await Bun.sleep(1);
+		expect(liveness).toHaveLength(1);
+		armed = true;
+		liveness[0]!();
+		await new Promise(resolve => setTimeout(resolve, 50));
+		// The heartbeat's lease renewal hits the dead authority. Before the fix the
+		// single-arg .then() let the rejection escape to the process-level fatal
+		// handler; now it is reported and the next heartbeat retries.
+		expect(escaped).toEqual([]);
+		expect(warn.mock.calls.some(call => String(call[0]).includes("topic lease renewal failed"))).toBe(true);
+		expect(session.logicalSessionIdTrusted).toBe(true);
+	} finally {
+		process.off("unhandledRejection", onEscape);
+		warn.mockRestore();
+	}
 });

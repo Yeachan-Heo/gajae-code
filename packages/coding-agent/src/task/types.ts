@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Usage } from "@gajae-code/ai";
+import type { Usage } from "@gajae-code/ai/core";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";

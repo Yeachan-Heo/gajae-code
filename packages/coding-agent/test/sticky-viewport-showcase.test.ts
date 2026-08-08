@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,7 +28,23 @@ const restoreEnvironment = (name: string, value: string | undefined): void => {
 	if (value === undefined) delete process.env[name];
 	else process.env[name] = value;
 };
-async function capture(): Promise<string> {
+/**
+ * Capturing the bundle costs ~9s: it boots a `bun` subprocess that renders all
+ * 20 showcase frames. Nearly every case here wants the SAME pristine bundle and
+ * then corrupts its own copy, so producing one per case spent ~187s of this
+ * file's ~192s re-deriving identical bytes.
+ *
+ * Capture once, then hand out filesystem copies. Reproducibility is not an
+ * assumption: "keeps required metadata escape-free, repo-independent, and
+ * reproducible within and across hosts" captures three times through
+ * `captureWithEnv` and asserts the payloads are byte-identical, so a drift here
+ * fails that case rather than silently sharing stale evidence.
+ *
+ * Callers that need capture to observe mutated process env or worktree state
+ * must use `captureUncached()`; a cached copy would predate the mutation.
+ */
+let pristineBundle: Promise<string> | undefined;
+async function captureUncached(): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-"));
 	roots.push(root);
 	const result = Bun.spawn(
@@ -41,6 +57,24 @@ async function capture(): Promise<string> {
 	);
 	if ((await result.exited) !== 0) throw new Error(await new Response(result.stderr).text());
 	return root;
+}
+async function capture(): Promise<string> {
+	// The pristine bundle outlives `afterEach`, so it is never pushed to `roots`;
+	// `afterAll` owns it. Each caller still gets a disposable copy.
+	pristineBundle ??= (async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-pristine-"));
+		const result = Bun.spawn(
+			["bun", "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts", "--out", root],
+			{ cwd: REPOSITORY_ROOT, stdout: "pipe", stderr: "pipe" },
+		);
+		if ((await result.exited) !== 0) throw new Error(await new Response(result.stderr).text());
+		return root;
+	})();
+	const source = await pristineBundle;
+	const clone = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-"));
+	roots.push(clone);
+	await fs.cp(source, clone, { recursive: true });
+	return clone;
 }
 async function captureWithEnv(overrides: Record<string, string>, drop: readonly string[] = []): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "sticky-viewport-showcase-env-"));
@@ -225,6 +259,11 @@ async function validIndependentReview(root: string): Promise<Record<string, unkn
 }
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
+});
+afterAll(async () => {
+	const pristine = pristineBundle;
+	pristineBundle = undefined;
+	if (pristine) await fs.rm(await pristine, { recursive: true, force: true });
 });
 describe("sticky viewport production evidence verifier", () => {
 	it("derives IRC resize coverage from the production split renderer", () => {
@@ -1160,7 +1199,8 @@ describe("sticky viewport production evidence verifier", () => {
 			expect(await committedBlobSha256(authority, oracle)).not.toBe(running);
 
 			process.env.GJC_STICKY_VIEWPORT_ORACLE_COMMIT = authority;
-			const root = await capture();
+			// Must observe the env var set immediately above, so no cached bundle.
+			const root = await captureUncached();
 			await restampProvenance(root);
 			await expect(verifyStickyViewportShowcase(root)).rejects.toThrow(
 				`oracle integrity: ${oracle} differs from its committed blob at ${authority}`,

@@ -3,7 +3,8 @@ import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Process } from "@gajae-code/natives";
+import type { Process } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
@@ -1221,12 +1222,12 @@ async function readProcessStartTime(pid: number): Promise<string | null> {
 	// callers only ever compare these values for equality against another value
 	// produced here. Returning null off Linux made every owner-identity proof
 	// unverifiable, so no session could be closed there.
-	if (process.platform !== "linux") return Process.fromPid(pid)?.incarnation ?? null;
+	if (process.platform !== "linux") return nativeProcessBindings().Process.fromPid(pid)?.incarnation ?? null;
 	return readLinuxProcStartTime(pid);
 }
 
 function exactManagedOwnerSupervisor(supervisorPid: number, supervisorStartTime: string): Process {
-	const supervisor = Process.fromPid(supervisorPid);
+	const supervisor = nativeProcessBindings().Process.fromPid(supervisorPid);
 	if (!supervisor) throw new Error("managed_owner_supervisor_unverifiable");
 	const expectedIncarnation = process.platform === "linux" ? `linux:${supervisorStartTime}` : supervisorStartTime;
 	if (supervisor.incarnation !== expectedIncarnation) throw new Error("managed_owner_supervisor_incarnation_mismatch");

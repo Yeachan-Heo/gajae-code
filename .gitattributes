@@ -52,9 +52,14 @@ poetry.lock -text
 *.cmd text eol=crlf
 *.bat text eol=crlf
 
-# Changelogs are append-mostly; auto-merge by unioning both sides.
-packages/*/CHANGELOG.md merge=union
-
+# CHANGELOGs are deliberately NOT given `merge=union`. Union never conflicts --
+# it concatenates both sides of an overlapping hunk. Release commits insert
+# `## [X.Y.Z]` directly beneath the surviving `## [Unreleased]` heading, so a
+# branch that added entries under Unreleased overlaps exactly that region and
+# union silently files those entries inside a version that already shipped.
+# GitHub also ignores the driver when computing mergeability, so it reported
+# phantom conflicts on every PR that touched a CHANGELOG. A real conflict that
+# an author resolves is strictly better than a silent misfile.
 
 # Byte-exact render-golden fixtures must never be normalized. Mark them
 # -diff too so `git diff --check` does not flag trailing whitespace on raw

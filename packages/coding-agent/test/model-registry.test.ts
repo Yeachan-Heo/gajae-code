@@ -129,9 +129,9 @@ describe("ModelRegistry", () => {
 	}
 
 	function getOpenAICompat(model: Model | undefined): OpenAICompat | undefined {
-		// All custom-model compat overrides flow through OpenAICompatSchema regardless of
-		// the underlying api ("openai-completions" vs "openai-responses"), so we can read
-		// the field for any model in this fixture.
+		// All custom-model compat overrides flow through ModelCompatSchema regardless of
+		// the underlying API, so OpenAI-specific fields can be read for any model in
+		// this fixture.
 		return model?.compat as OpenAICompat | undefined;
 	}
 
@@ -2253,6 +2253,21 @@ describe("ModelRegistry", () => {
 				expect(getOpenAICompat(model)?.allowsSyntheticReasoningContentForToolCalls).toBe(false);
 			}
 		});
+		test("provider-level responses affinity applies to bundled OpenAI models", async () => {
+			writeRawModelsJson({
+				openai: {
+					baseUrl: "https://openai-relay.example.com/v1",
+					api: "openai-responses",
+					apiKey: "TEST_KEY",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(getOpenAICompat(registry.find("openai", "gpt-4o-mini"))?.supportsResponsesSessionAffinity).toBe(true);
+			await registry.refresh("offline");
+			expect(getOpenAICompat(registry.find("openai", "gpt-4o-mini"))?.supportsResponsesSessionAffinity).toBe(true);
+		});
 
 		test("provider-level compat applies to custom models", () => {
 			writeRawModelsJson({
@@ -2316,6 +2331,32 @@ describe("ModelRegistry", () => {
 			const compat = getOpenAICompat(model);
 			expect(compat?.supportsUsageInStreaming).toBe(true);
 			expect(compat?.maxTokensField).toBe("max_completion_tokens");
+		});
+		test("model-level false overrides provider-level responses affinity", async () => {
+			writeRawModelsJson({
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+					models: [
+						{
+							id: "relay-model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 8192,
+							compat: { supportsResponsesSessionAffinity: false },
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(getOpenAICompat(registry.find("relay", "relay-model"))?.supportsResponsesSessionAffinity).toBe(false);
+			await registry.refresh("offline");
+			expect(getOpenAICompat(registry.find("relay", "relay-model"))?.supportsResponsesSessionAffinity).toBe(false);
 		});
 	});
 
@@ -2669,6 +2710,16 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("https://my-proxy.example.com/v1");
 		});
 
+		test("bundled jetbrains-junie gpt-5.4 keeps its probed 922K window", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			// The generic gpt-5.4 policy raises the window to 1M for everyone except
+			// gateway-fronted providers. JetBrains AI enforces 922K, so the measured
+			// bundled value must survive; raising it would delay compaction past the
+			// point the gateway accepts.
+			expect(registry.find("jetbrains-junie", "gpt-5.4")?.contextWindow).toBe(922_000);
+			expect(registry.find("openai-codex", "gpt-5.4")?.contextWindow).toBe(1_000_000);
+		});
+
 		test("discoverable custom-only gpt-5.4 survives refresh", async () => {
 			writeRawModelsJson({
 				"custom-local": {
@@ -2771,19 +2822,60 @@ describe("ModelRegistry", () => {
 			expect(discovered?.headers?.["X-Model"]).toBeUndefined();
 		});
 
-		test("provider presets load through the model registry with expected OpenAI-compatible settings", async () => {
+		test("provider presets discover ClinePass and Command Code catalogs without hardcoded model rows", async () => {
 			const presetModelsPath = path.join(tempDir, "preset-models.yml");
 			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({ preset: "cline-pass", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({ preset: "commandcode-goat", modelsPath: presetModelsPath });
+			authStorage.setRuntimeApiKey("commandcode-goat", "test-key");
+
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(
+						JSON.stringify({
+							"cline-pass": {
+								models: {
+									"cline-pass/live-coder": {
+										id: "cline-pass/live-coder",
+										name: "Live Coder",
+										tool_call: true,
+										reasoning: true,
+										modalities: { input: ["text", "image"], output: ["text"] },
+										limit: { context: 1_000_000, output: 64_000 },
+										cost: { input: 0.4, output: 1.6, cache_read: 0.04, cache_write: 0.5 },
+									},
+								},
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://api.commandcode.ai/provider/v1/models") {
+					return new Response(JSON.stringify({ data: [{ id: "claude-opus-5.5" }, { id: "Qwen/Qwen3.8-Max" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
 
 			const registry = new ModelRegistry(authStorage, presetModelsPath);
-			const minimax = registry.find("minimax-code", "minimax-m3");
+			expect(registry.find("cline-pass", "cline-pass/live-coder")).toBeUndefined();
+			expect(registry.find("commandcode-goat", "claude-opus-5.5")).toBeUndefined();
+
+			await registry.refreshProvider("cline-pass", "online");
+			await registry.refreshProvider("commandcode-goat", "online");
+
+			const minimax = registry.find("minimax-code", "MiniMax-M3");
 			const glm = registry.find("glm-proxy", "glm-4.6");
+			const clinePass = registry.find("cline-pass", "cline-pass/live-coder");
 
 			expect(minimax?.api).toBe("openai-completions");
 			// #614: preset-onboarded models inherit the bundled canonical display
-			// name (MiniMax-M3) while preserving the lowercase machine id.
-			expect(minimax?.id).toBe("minimax-m3");
+			// name (MiniMax-M3) while preserving the requested machine id.
+			expect(minimax?.id).toBe("MiniMax-M3");
 			expect(minimax?.name).toBe("MiniMax-M3");
 			expect(minimax?.baseUrl).toBe("https://api.minimax.io/v1");
 			expect(getOpenAICompat(minimax)?.supportsStore).toBe(false);
@@ -2792,6 +2884,21 @@ describe("ModelRegistry", () => {
 			expect(glm?.baseUrl).toBe("https://api.z.ai/api/paas/v4");
 			expect(getOpenAICompat(glm)?.thinkingFormat).toBe("zai");
 			expect(getOpenAICompat(glm)?.supportsReasoningEffort).toBe(false);
+			expect(clinePass).toMatchObject({
+				name: "Live Coder",
+				api: "openai-completions",
+				baseUrl: "https://api.cline.bot/api/v1",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 1_000_000,
+				maxTokens: 64_000,
+			});
+			expect(registry.find("commandcode-goat", "claude-opus-5.5")).toMatchObject({
+				api: "anthropic-messages",
+				baseUrl: "https://api.commandcode.ai/provider/v1",
+			});
+			expect(registry.find("commandcode-goat", "claude-opus-5.5")?.headers?.Authorization).toBeUndefined();
+			expect(registry.find("commandcode-goat", "Qwen/Qwen3.8-Max")?.api).toBe("openai-completions");
 		});
 
 		test("#614: custom provider referencing a bundled model id inherits canonical display name", () => {
@@ -2812,6 +2919,90 @@ describe("ModelRegistry", () => {
 			const model = registry.find("minimax-custom", "minimax-m3");
 			expect(model?.id).toBe("minimax-m3");
 			expect(model?.name).toBe("MiniMax-M3");
+		});
+
+		test("#3856: namespaced custom model id inherits canonical leaf metadata when omitted", () => {
+			// Proxy wire IDs often namespace the upstream model (`vendor/model-id`).
+			// When contextWindow/maxTokens are omitted, inherit from the bundled leaf
+			// id while retaining the namespaced wire id for the request.
+			writeRawModelsJson({
+				clinepass: {
+					baseUrl: "https://api.cline.bot/api/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					auth: "apiKey",
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+					},
+					models: [
+						{
+							id: "cline-pass/deepseek-v4-flash",
+							name: "DeepSeek V4 Flash via ClinePass",
+							reasoning: true,
+							input: ["text"],
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("clinepass", "cline-pass/deepseek-v4-flash");
+			expect(model?.id).toBe("cline-pass/deepseek-v4-flash");
+			expect(model?.name).toBe("DeepSeek V4 Flash via ClinePass");
+			expect(model?.contextWindow).toBe(1_000_000);
+			expect(model?.maxTokens).toBe(384_000);
+			expect(model?.reasoning).toBe(true);
+			expect(model?.baseUrl).toBe("https://api.cline.bot/api/v1");
+		});
+
+		test("#3856: true unknown namespaced custom models still use generic defaults", () => {
+			writeRawModelsJson({
+				clinepass: {
+					baseUrl: "https://api.cline.bot/api/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "cline-pass/totally-unknown-model-xyz",
+							name: "Unknown via ClinePass",
+							reasoning: false,
+							input: ["text"],
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("clinepass", "cline-pass/totally-unknown-model-xyz");
+			expect(model?.id).toBe("cline-pass/totally-unknown-model-xyz");
+			expect(model?.contextWindow).toBe(128_000);
+			expect(model?.maxTokens).toBe(16_384);
+		});
+
+		test("#3856: explicit contextWindow on namespaced custom model is preserved", () => {
+			writeRawModelsJson({
+				clinepass: {
+					baseUrl: "https://api.cline.bot/api/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "cline-pass/deepseek-v4-flash",
+							name: "DeepSeek V4 Flash via ClinePass",
+							reasoning: true,
+							input: ["text"],
+							contextWindow: 512_000,
+							maxTokens: 32_000,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("clinepass", "cline-pass/deepseek-v4-flash");
+			expect(model?.contextWindow).toBe(512_000);
+			expect(model?.maxTokens).toBe(32_000);
 		});
 
 		test("same-id replacement uses configured compat without bundled compat leak", () => {
@@ -3805,6 +3996,7 @@ describe("ModelRegistry", () => {
 			await registry.refresh();
 			const llamaModels = getModelsForProvider(registry, "llama.cpp");
 			expect(llamaModels.some(m => m.id === "llama-3.2:3b")).toBe(true);
+			expect(llamaModels.every(model => model.headers?.Authorization === undefined)).toBe(true);
 			const apiKey = await registry.getApiKey(llamaModels[0]);
 			expect(apiKey).toBe("test-llama-key");
 			expect(apiKey).not.toBe(kNoAuth);
@@ -4448,6 +4640,47 @@ describe("ModelRegistry", () => {
 
 			expect(model).toBeDefined();
 			expect((model?.compat as { disableStrictTools?: boolean } | undefined)?.disableStrictTools).toBe(true);
+		});
+	});
+	describe("Anthropic prompt-cache compatibility", () => {
+		test("propagates provider, model, and override prompt-cache settings", () => {
+			writeRawModelsJson({
+				"proxy-anthropic": {
+					baseUrl: "https://proxy.example.com/anthropic",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					compat: { promptCacheMode: "explicit", supportsLongCacheRetention: false },
+					models: [
+						{ id: "claude-inherited" },
+						{
+							id: "claude-model-override",
+							compat: { promptCacheMode: "automatic", supportsLongCacheRetention: true },
+						},
+						{ id: "claude-provider-override" },
+					],
+					modelOverrides: {
+						"claude-provider-override": { compat: { promptCacheMode: "none" } },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const inherited = registry.find("proxy-anthropic", "claude-inherited");
+			const modelOverride = registry.find("proxy-anthropic", "claude-model-override");
+			const providerOverride = registry.find("proxy-anthropic", "claude-provider-override");
+
+			expect(inherited?.compat).toMatchObject({
+				promptCacheMode: "explicit",
+				supportsLongCacheRetention: false,
+			});
+			expect(modelOverride?.compat).toMatchObject({
+				promptCacheMode: "automatic",
+				supportsLongCacheRetention: true,
+			});
+			expect(providerOverride?.compat).toMatchObject({
+				promptCacheMode: "none",
+				supportsLongCacheRetention: false,
+			});
 		});
 	});
 
@@ -5187,6 +5420,84 @@ describe("ModelRegistry", () => {
 
 		expect(model?.wireModelId).toBe("proxy-gpt-4o-mini");
 		expect(model?.requestTransform).toEqual({ extraBody: { routed: true } });
+	});
+	test("rejects responses affinity on known non-target providers", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					baseUrl: "https://relay.example.com/v1",
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("only supported for the openai provider");
+	});
+
+	test.each([
+		"https://api.openai.com",
+		"https://api.openai.com/v1",
+		"https://api.openai.com/",
+	])("rejects unknown-provider responses affinity on a canonical OpenAI base URL %s", baseUrl => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					baseUrl,
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("requires a genuinely custom base URL");
+	});
+	test("rejects unknown-provider responses affinity without a base URL", () => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("requires a genuinely custom base URL");
+	});
+	test("rejects responses affinity on non-Responses APIs", () => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					compat: { supportsResponsesSessionAffinity: true },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("only supported with the openai-responses API");
+	});
+
+	test("rejects provider affinity inherited by a non-Responses model API", () => {
+		writeRawModelsConfig({
+			providers: {
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					api: "openai-responses",
+					apiKey: "TEST_KEY",
+					compat: { supportsResponsesSessionAffinity: true },
+					models: [{ id: "chat-model", api: "openai-completions" }],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("only supported with the openai-responses API");
 	});
 	describe("generic local OpenAI-compatible provider config", () => {
 		test("does not add a generic local provider by default", () => {

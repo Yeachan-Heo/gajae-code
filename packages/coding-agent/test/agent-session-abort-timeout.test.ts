@@ -160,7 +160,7 @@ describe("AgentSession abort timeout", () => {
 		expect(aborted).toBe(true);
 	});
 
-	it("bounds dispose, force-invalidates an abort-ignoring run, and drops its late events", async () => {
+	it("bounds dispose, lets an abort-ignoring run settle cooperatively, and drops its late events", async () => {
 		tempDir = TempDir.createSync("@gjc-dispose-timeout-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const mock = createMockModel();
@@ -248,9 +248,13 @@ describe("AgentSession abort timeout", () => {
 			disposed = true;
 			const elapsed = Date.now() - started;
 
-			expect(elapsed).toBeLessThan(6_000);
-			expect(forcedAbort).toHaveBeenCalledTimes(1);
-			expect(forceAbortResults).toEqual([true]);
+			// Since #3894 the agent loop emits a synthetic aborted result for tool
+			// calls that outlive their signal, so the turn terminates on its own and
+			// `waitForIdle` settles well inside the 2s force-abort budget. Burning
+			// that budget would mean the loop is hanging again.
+			expect(elapsed).toBeLessThan(2_000);
+			expect(forcedAbort).not.toHaveBeenCalled();
+			expect(forceAbortResults).toEqual([]);
 			expect(agent.state.isStreaming).toBe(false);
 
 			const branchIdsAfterDispose = sessionManager.getBranch().map(entry => entry.id);

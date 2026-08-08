@@ -100,10 +100,10 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			}),
 			model("anthropic", "claude-sonnet-5"),
 			model("opencode-go", "deepseek-v4-pro"),
-			model("opencode-go", "kimi-k2.6"),
+			model("opencode-go", "kimi-k3"),
 			model("opencode-go", "mimo-v2.5-pro"),
-			model("minimax-code", "minimax-m3"),
-			model("minimax-code-cn", "minimax-m3"),
+			model("minimax-code", "MiniMax-M3"),
+			model("minimax-code-cn", "MiniMax-M3"),
 			model("kimi-code", "kimi-k2.5"),
 			model("zai", "glm-5.1"),
 			model("alibaba-token-plan", "qwen3.8-max-preview", {
@@ -111,7 +111,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Minimal,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
-			model("alibaba-token-plan", "qwen-3.8-max", {
+			model("alibaba-token-plan", "qwen3.8-max", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Minimal,
 				maxLevel: ThinkingLevel.XHigh,
@@ -810,7 +810,7 @@ describe("model profile activation", () => {
 			{
 				default: "openai-codex/gpt-5.6-sol:low",
 				executor: "opencode-go/deepseek-v4-pro",
-				planner: "opencode-go/kimi-k2.6",
+				planner: "opencode-go/kimi-k3",
 				critic: "opencode-go/mimo-v2.5-pro",
 				architect: "openai-codex/gpt-5.6-sol:high",
 			},
@@ -858,11 +858,11 @@ describe("model profile activation", () => {
 		[
 			"alibaba-token-plan-qwen-deepseek",
 			{
-				default: "alibaba-token-plan/qwen-3.8-max:high",
+				default: "alibaba-token-plan/qwen3.8-max:high",
 				executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
 				planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
-				critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
-				architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+				critic: "alibaba-token-plan/qwen3.8-max:xhigh",
+				architect: "alibaba-token-plan/qwen3.8-max:xhigh",
 			},
 		],
 		[

@@ -782,6 +782,7 @@ interface OpenAICompat {
 	supportsStore?: boolean; // Whether provider supports the `store` field (default: true)
 	supportsDeveloperRole?: boolean; // Whether provider supports `developer` role vs `system` (default: true)
 	sendSessionHeaders?: boolean; // Forward the session id as `session_id`/`x-session-id` headers for relay session-affinity & prompt-cache reuse (default: false)
+	supportsResponsesSessionAffinity?: boolean; // Opt in to session-affinity headers for custom openai-responses relays; canonical OpenAI routing is automatic (default: false)
 	supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: true)
 	maxTokensField?: "max_completion_tokens" | "max_tokens"; // Which field name to use (default: max_completion_tokens)
 	extraBody?: Record<string, unknown>; // Extra request-body fields for custom proxy routing or provider-specific options

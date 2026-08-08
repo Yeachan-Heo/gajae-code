@@ -22,7 +22,7 @@ describe("ACP client bridge permission requests", () => {
 			_meta: { gjc: { permissionHandling: "prompt" } },
 		});
 
-		await bridge.requestPermission!(
+		const outcome = await bridge.requestPermission!(
 			{
 				toolCallId: "call-1",
 				toolName: "bash",
@@ -43,6 +43,25 @@ describe("ACP client bridge permission requests", () => {
 			rawInput: { command: "echo hi" },
 			content: [{ type: "content", content: { type: "text", text: "$ echo hi" } }],
 		});
+		expect(outcome).toEqual({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	});
+
+	it("returns cancelled ACP permission outcomes through the typed client bridge contract", async () => {
+		const connection = {
+			async requestPermission() {
+				return { outcome: { outcome: "cancelled" as const } };
+			},
+		} as unknown as AgentSideConnection;
+		const bridge = createAcpClientBridge(connection, "session-1", {
+			_meta: { gjc: { permissionHandling: "prompt" } },
+		});
+
+		expect(
+			await bridge.requestPermission!(
+				{ toolCallId: "call-2", toolName: "bash", title: "cancel", status: "pending" },
+				[{ optionId: "reject_once", name: "Reject once", kind: "reject_once" }],
+			),
+		).toEqual({ outcome: "cancelled" });
 	});
 
 	it("only enables ACP permission requests in prompt mode", () => {

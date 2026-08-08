@@ -24,32 +24,37 @@ function jobSection(workflowText: string, jobName: string): string {
 }
 
 describe("stable release policy", () => {
-	test("tag releases build natives, then binaries, then publish npm + the GitHub Release", async () => {
+	test("tag releases resolve metadata, build natives, then binaries, then publish npm + the GitHub Release", async () => {
 		const ci = await workflow();
-		const stages = ["native", "binaries", "publish"];
+		const stages = ["release_metadata", "native", "binaries", "publish"];
 		const positions = stages.map(stage => ci.indexOf(`   ${stage}:`));
 		for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
 
-		expect(jobSection(ci, "binaries")).toContain("needs: [native]");
-		expect(jobSection(ci, "publish")).toContain("needs: [native, binaries]");
+		expect(jobSection(ci, "native")).toContain("needs: [release_metadata]");
+		expect(jobSection(ci, "binaries")).toContain("needs: [native, release_metadata]");
+		expect(jobSection(ci, "publish")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
 		for (const stage of ["native", "binaries"]) {
-			expect(jobSection(ci, stage)).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}");
+			const section = jobSection(ci, stage);
+			expect(section).toContain("startsWith(github.ref, 'refs/tags/v')");
+			expect(section).toContain("inputs.rehearsal == 'tag-build-verify'");
 		}
-		expect(jobSection(ci, "publish")).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}");
-
 		const publish = jobSection(ci, "publish");
+		expect(publish).toContain("needs.release_metadata.outputs.channel == 'stable'");
+		expect(publish).toContain("github.event_name != 'workflow_dispatch'");
 		expect(publish).toContain("--prepare-evidence --evidence-dir");
 		expect(publish).toContain("--publish-from-evidence");
-		expect(publish).toContain("--release-serialization-key gajae-production-release");
+		expect(publish).toContain("gajae-production-release");
 		expect(publish).toContain("softprops/action-gh-release");
 		expect(publish).toContain("draft: false");
 	});
 
-	test("release tags run a non-cancelling concurrency lane", async () => {
+	test("stable tags and nightly publication lanes are non-cancelling", async () => {
 		const ci = await workflow();
 		const concurrency = ci.slice(ci.indexOf("concurrency:\n"), ci.indexOf("\njobs:"));
 
-		expect(concurrency).toContain("cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}");
+		expect(concurrency).toContain("gajae-npm-release");
+		expect(concurrency).toContain("startsWith(github.ref, 'refs/tags/v')");
+		expect(concurrency).toContain("inputs.rehearsal == 'nightly-release'");
 		expect(concurrency).not.toContain("cancel-in-progress: true");
 	});
 
@@ -139,6 +144,51 @@ describe("stable release policy", () => {
 		}
 	});
 
+	test("runs an immutable nightly deployment only after the complete source graph passes", async () => {
+		const ci = await workflow();
+		const metadata = jobSection(ci, "release_metadata");
+		const gate = jobSection(ci, "nightly_gate");
+		const native = jobSection(ci, "native");
+		const binaries = jobSection(ci, "binaries");
+		const publish = jobSection(ci, "publish");
+		const nativeAction = await Bun.file(path.join(repoRoot, ".github/actions/build-native/action.yml")).text();
+
+		expect(ci).toContain('cron: "23 4 * * *"');
+		expect(ci).toContain("options: [tag-build-verify, main-nontag, nightly-release]");
+		expect(jobSection(ci, "check")).toContain("inputs.rehearsal == 'nightly-release'");
+		expect(jobSection(ci, "test")).toContain("inputs.rehearsal == 'nightly-release'");
+		expect(metadata).toContain("bun scripts/nightly-release.ts version");
+		expect(metadata).toContain("expected_ref=refs/heads/dev");
+		expect(metadata).toContain('if [ "$EVENT_NAME" = schedule ]');
+		expect(metadata).toContain("expected_ref=refs/heads/main");
+		expect(metadata).toContain("git show -s --format=%cI");
+		expect(metadata).toContain("Stable release tag must be exact vX.Y.Z");
+		expect(metadata).toContain("does not match package version");
+		expect(gate).toContain("needs: [check, test]");
+		expect(gate).toContain("needs.check.result");
+		expect(gate).toContain("needs.test.result");
+		expect(native).toContain("nightly_version: ${{ needs.release_metadata.outputs.nightly_version }}");
+		expect(nativeAction).toContain("bun scripts/nightly-release.ts stage");
+		expect(nativeAction).toContain("PI_NATIVE_PROFILE:");
+		expect(binaries).toContain("Stage nightly release version");
+		expect(publish).toContain("needs.nightly_gate.result == 'success'");
+		expect(publish).toContain("--release-channel \"$RELEASE_CHANNEL\"");
+		expect(publish).toContain("Persist pre-publication package evidence");
+		expect(publish).toContain("release-evidence-${{ needs.release_metadata.outputs.version }}");
+		expect(publish).toContain("Reject pre-existing release tag or release");
+		expect(publish).toContain("refusing upsert");
+		expect(publish).toContain("$2 ~ /\\^\\{\\}$/");
+		expect(publish).not.toContain("same-run retry");
+		expect(publish).toContain("fail_on_unmatched_files: true");
+		expect(publish).toContain("Verify immutable GitHub Release");
+		expect(publish.indexOf("Reject pre-existing release tag or release")).toBeLessThan(publish.indexOf("Publish packages to npm"));
+		expect(publish).toContain("gajae-nightly-release");
+		expect(publish).toContain("prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}");
+		expect(publish).toContain("make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}");
+		expect(publish).toContain("gajae-release-packages-expected-v1.json");
+		expect(publish).toContain("gajae-release-packages-v1.json");
+		expect(publish).toContain("gajae-release-channel-v1.json");
+	});
 	test("rejects reused or moved tags and directs corrections to a newer stable version", async () => {
 		const releaseScript = await Bun.file(releaseScriptPath).text();
 

@@ -7,6 +7,8 @@ import {
 	acpSessionStateFromConfig,
 	applyAcpPermissionMode,
 	applyAcpStartupOptions,
+	collectActiveProviderIds,
+	collectModelCatalog,
 	createAcpReverseConnection,
 	paginateAcpSessions,
 } from "../src/modes/acp/acp-agent";
@@ -24,13 +26,20 @@ function providerNames(capabilities: unknown, env: NodeJS.ProcessEnv = {}): stri
 	return acpProviderRegistrations(capabilities as never, env).map(provider => provider.capability);
 }
 
-test("ACP registers a permission provider only for prompt handling", () => {
+test("ACP registers the permission channel for form-less clients regardless of permission mode", () => {
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "prompt" } } })).toContain("permission");
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } } })).not.toContain("permission");
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "always-allow" } } })).not.toContain("permission");
+	// Form-less clients always get the permission channel so selector asks can
+	// be answered even in auto/always-allow mode (the mode only gates tools).
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } } })).toContain("permission");
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "always-allow" } } })).toContain("permission");
 	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "prompt" })).toContain("permission");
-	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "auto" })).not.toContain("permission");
+	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "auto" })).toContain("permission");
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "invalid" } } })).toContain("permission");
+	// A form-eliciting client in allow mode keeps only the ui channel.
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } }, elicitation: { form: {} } })).not.toContain(
+		"permission",
+	);
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } }, elicitation: { form: {} } })).toContain("ui");
 });
 
 test("ACP registers the SDK UI provider only for clients with form elicitation", () => {
@@ -67,6 +76,7 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 	const reverse = createAcpReverseConnection(connection, "session-1");
 	const requests = [
 		["request", { toolCallId: "call-1", sessionId: "spoofed-session" }],
+		["permission.request", { toolCallId: "call-2", sessionId: "spoofed-session" }],
 		["fs.readTextFile", { path: "/workspace/README.md" }],
 		["fs.writeTextFile", { path: "/workspace/README.md", content: "updated" }],
 		["terminal.create", { command: "printf", args: ["ok"] }],
@@ -76,6 +86,7 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 
 	expect(calls).toEqual([
 		["session/request_permission", { toolCallId: "call-1", sessionId: "session-1" }, { cancellationSignal: signal }],
+		["session/request_permission", { toolCallId: "call-2", sessionId: "session-1" }, { cancellationSignal: signal }],
 		["fs/read_text_file", { path: "/workspace/README.md", sessionId: "session-1" }, { cancellationSignal: signal }],
 		[
 			"fs/write_text_file",
@@ -90,6 +101,28 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 		],
 	]);
 	expect(typedCalls).toEqual([]);
+});
+test("ACP reverse permission aliases normalize nested and flat outcomes into the SDK decision contract", async () => {
+	for (const method of ["request", "permission.request"] as const) {
+		for (const [response, expected] of [
+			[
+				{ outcome: { outcome: "selected", optionId: "allow_once" } },
+				{ outcome: "selected", optionId: "allow_once" },
+			],
+			[{ outcome: { outcome: "cancelled" } }, { outcome: "cancelled" }],
+			[
+				{ outcome: "selected", optionId: "allow_always" },
+				{ outcome: "selected", optionId: "allow_always" },
+			],
+			[{ outcome: "cancelled" }, { outcome: "cancelled" }],
+		] as const) {
+			const connection = {
+				request: async () => response,
+			} as unknown as AgentSideConnection;
+			const reverse = createAcpReverseConnection(connection, "session-1");
+			expect(await reverse.request?.(method, { toolCallId: "call-1" })).toEqual(expected);
+		}
+	}
 });
 
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {
@@ -191,20 +224,149 @@ test("ACP reports model presets when --mpreset is provided", () => {
 	expect(state.modes.currentModeId).toBe("plan");
 	expect(state.configOptions).toEqual(
 		expect.arrayContaining([
-			expect.objectContaining({ id: "mode", currentValue: "plan" }),
+			expect.objectContaining({ id: "mode", category: "mode", currentValue: "plan" }),
 			expect.objectContaining({
 				id: "model",
 				name: "Preset",
+				category: "model",
 				currentValue: "opus-codex",
 				options: [
 					{ value: "codex-medium", name: "Codex Medium" },
 					{ value: "opus-codex", name: "Opus Codex" },
 				],
 			}),
-			expect.objectContaining({ id: "thinking", currentValue: "high" }),
+			expect.objectContaining({ id: "thinking", category: "thought_level", currentValue: "high" }),
 			expect.objectContaining({ id: "steeringMode", currentValue: "one-at-a-time" }),
 		]),
 	);
+});
+test("ACP filters the model catalog to active providers and keeps the current model", () => {
+	const state = acpSessionStateFromConfig(
+		{
+			result: {
+				page: {
+					items: [
+						{
+							mode: "default",
+							model: "opencode-go/deepseek-v4-flash",
+							thinking: "high",
+						},
+					],
+				},
+			},
+		},
+		{
+			result: {
+				page: {
+					items: [
+						{ provider: "opencode-go", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+						{ provider: "openai-codex", id: "gpt-5.6", name: "GPT 5.6" },
+						{ provider: "anthropic", id: "claude-opus", name: "Claude Opus" },
+					],
+				},
+			},
+		},
+		undefined,
+		new Set(["opencode-go", "anthropic"]),
+	);
+	const modelOption = state.configOptions.find(option => option.id === "model");
+	expect(modelOption?.options).toEqual([
+		{ value: "opencode-go/deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+		{ value: "anthropic/claude-opus", name: "Claude Opus" },
+	]);
+	// Undefined active providers (older session host) keeps the full catalog.
+	const unfiltered = acpSessionStateFromConfig(
+		{ result: { page: { items: [{ model: "openai-codex/gpt-5.6" }] } } },
+		{
+			result: {
+				page: {
+					items: [{ provider: "openai-codex", id: "gpt-5.6", name: "GPT 5.6" }],
+				},
+			},
+		},
+	);
+	const unfilteredModel = unfiltered.configOptions.find(option => option.id === "model");
+	expect(unfilteredModel?.options).toEqual([{ value: "openai-codex/gpt-5.6", name: "GPT 5.6" }]);
+});
+test("ACP collects every active-provider page and filters by connection kind", async () => {
+	const pages = [
+		{
+			id: "1",
+			ok: true,
+			page: {
+				items: [
+					{ provider: "opencode-go", connectionKind: "credential" },
+					{ provider: "openai-codex", connectionKind: "none" },
+					{ provider: "litellm", connectionKind: "credentialless" },
+				],
+				complete: false,
+				continuationCursor: "cursor-2",
+			},
+		},
+		{
+			id: "2",
+			ok: true,
+			page: {
+				items: [{ provider: "anthropic", connectionKind: "credential" }],
+				complete: true,
+			},
+		},
+	];
+	const adapter = {
+		query: async (_query: string, _input: unknown, cursor?: string) => (cursor === "cursor-2" ? pages[1] : pages[0]),
+	} as never;
+	await expect(collectActiveProviderIds(adapter)).resolves.toEqual(new Set(["opencode-go", "litellm", "anthropic"]));
+});
+
+test("ACP fails open only for an unsupported providers.list/active query", async () => {
+	const unsupported = {
+		query: async () => {
+			throw Object.assign(new Error("not installed"), { code: "operation_not_session_owned" });
+		},
+	} as never;
+	await expect(collectActiveProviderIds(unsupported)).resolves.toBeUndefined();
+	const preQ29 = {
+		query: async () => {
+			throw Object.assign(new Error("unknown query"), { code: "invalid_request" });
+		},
+	} as never;
+	await expect(collectActiveProviderIds(preQ29)).resolves.toBeUndefined();
+	const operational = {
+		query: async () => {
+			throw Object.assign(new Error("timed out"), { code: "timeout" });
+		},
+	} as never;
+	await expect(collectActiveProviderIds(operational)).rejects.toThrow("timed out");
+});
+test("ACP collects every model-catalog page before filtering", async () => {
+	const pages = [
+		{
+			id: "1",
+			ok: true,
+			page: {
+				items: [
+					{ provider: "opencode-go", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+					{ provider: "openai-codex", id: "gpt-5.6", name: "GPT 5.6" },
+				],
+				complete: false,
+				continuationCursor: "cursor-2",
+			},
+		},
+		{
+			id: "2",
+			ok: true,
+			page: {
+				items: [{ provider: "anthropic", id: "claude-opus", name: "Claude Opus" }],
+				complete: true,
+			},
+		},
+	];
+	const adapter = {
+		query: async (_query: string, _input: unknown, cursor?: string) => (cursor === "cursor-2" ? pages[1] : pages[0]),
+	} as never;
+	const catalog = await collectModelCatalog(adapter);
+	const items = (catalog as { result: { page: { items: unknown[] } } }).result.page.items;
+	expect(items.map(item => (item as { id: string }).id)).toEqual(["deepseek-v4-flash", "gpt-5.6", "claude-opus"]);
 });
 
 test("ACP hides unavailable presets but retains an unavailable active preset", () => {

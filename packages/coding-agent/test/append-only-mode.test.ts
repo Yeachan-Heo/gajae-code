@@ -46,25 +46,42 @@ describe("append-only auto allowlist", () => {
 	});
 });
 
-describe("intent tracing UI gating", () => {
-	it("force-omits intent tracing without UI and keeps it enabled with UI", () => {
+describe("intent tracing sub-session gating", () => {
+	function withoutFlag<T>(run: () => T): T {
 		const previousFlag = Bun.env.PI_INTENT_TRACING;
+		delete Bun.env.PI_INTENT_TRACING;
 		try {
-			delete Bun.env.PI_INTENT_TRACING;
-			expect(resolveIntentTracingEnabled(true, false)).toBe(false);
-			expect(resolveIntentTracingEnabled(true, true)).toBe(true);
-			expect(resolveIntentTracingEnabled(false, true)).toBe(false);
-			expect(resolveIntentTracingEnabled(undefined, true)).toBe(false);
-
-			Bun.env.PI_INTENT_TRACING = "1";
-			expect(resolveIntentTracingEnabled(false, false)).toBe(false);
-			expect(resolveIntentTracingEnabled(false, true)).toBe(true);
+			return run();
 		} finally {
-			if (previousFlag === undefined) {
-				delete Bun.env.PI_INTENT_TRACING;
-			} else {
-				Bun.env.PI_INTENT_TRACING = previousFlag;
-			}
+			if (previousFlag === undefined) delete Bun.env.PI_INTENT_TRACING;
+			else Bun.env.PI_INTENT_TRACING = previousFlag;
+		}
+	}
+
+	it("keeps intent tracing on for every top-level surface, not just the TUI", () => {
+		withoutFlag(() => {
+			expect(resolveIntentTracingEnabled(true, { subSession: false })).toBe(true);
+			expect(resolveIntentTracingEnabled(false, { subSession: false })).toBe(false);
+			expect(resolveIntentTracingEnabled(undefined, { subSession: false })).toBe(false);
+		});
+	});
+
+	it("force-omits intent tracing for canonical sub-sessions", () => {
+		withoutFlag(() => {
+			expect(resolveIntentTracingEnabled(true, { subSession: true })).toBe(false);
+			expect(resolveIntentTracingEnabled(false, { subSession: true })).toBe(false);
+		});
+	});
+
+	it("lets PI_INTENT_TRACING override an off setting without defeating the sub-session omission", () => {
+		const previousFlag = Bun.env.PI_INTENT_TRACING;
+		Bun.env.PI_INTENT_TRACING = "1";
+		try {
+			expect(resolveIntentTracingEnabled(false, { subSession: false })).toBe(true);
+			expect(resolveIntentTracingEnabled(false, { subSession: true })).toBe(false);
+		} finally {
+			if (previousFlag === undefined) delete Bun.env.PI_INTENT_TRACING;
+			else Bun.env.PI_INTENT_TRACING = previousFlag;
 		}
 	});
 });

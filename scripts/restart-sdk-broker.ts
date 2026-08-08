@@ -107,4 +107,14 @@ if (import.meta.main) {
 	const closed = result.closedSessionIds?.length ?? 0;
 	const sessions = result.closedSessionIds ? ` (closed ${closed} session host${closed === 1 ? "" : "s"})` : "";
 	console.log(`SDK broker ${transition}${sessions}`);
+	const unclosed = result.unclosedSessionHosts ?? [];
+	if (unclosed.length > 0) {
+		// A surviving host keeps serving the source it started with, so reporting a
+		// clean restart here would recreate the stale-code failure this flag prevents.
+		console.error(
+			`warning: ${unclosed.length} session host${unclosed.length === 1 ? "" : "s"} did not close and may still serve older code:`,
+		);
+		for (const host of unclosed) console.error(`  ${host.sessionId}: ${host.reason}`);
+		process.exitCode = 1;
+	}
 }

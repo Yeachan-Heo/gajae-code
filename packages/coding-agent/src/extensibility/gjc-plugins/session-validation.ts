@@ -119,6 +119,16 @@ export function validateSessionBundles(
 	for (const entry of entries) {
 		if (!entry.enabled) continue; // user-disabled, not an error
 		if (quarantinedPlugins.has(identityKey(bundleIdentity(entry.scope, entry.name)))) continue;
+		if (entry.migration?.status === "failed" && entry.copiedFiles.length > 0) {
+			quarantine.push({
+				identity: bundleIdentity(entry.scope, entry.name),
+				plugin: entry.name,
+				surfaceId: entry.migration.failure?.surface ?? `plugin:${entry.name}`,
+				code: entry.migration.failure?.code === "hash_mismatch" ? "runtime_mismatch" : "migration_required",
+				message: entry.migration.failure?.cause ?? `Plugin "${entry.name}" has no usable v2 metadata`,
+			});
+			continue;
+		}
 		const surfaces = activeSurfaceIds(entry);
 		let collided = false;
 		const recordCollision = (surfaceId: string, what: string): void => {

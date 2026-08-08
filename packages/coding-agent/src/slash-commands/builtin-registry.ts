@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { type Model, modelsAreEqual } from "@gajae-code/ai";
+import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
@@ -21,7 +21,6 @@ import {
 	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
-import { resolveMemoryBackend } from "../memory-backend";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { theme } from "../modes/theme/theme";
 import {
@@ -29,19 +28,9 @@ import {
 	canApplyComposerSubmission,
 	type InteractiveModeContext,
 } from "../modes/types";
-import { ChatDaemonController } from "../sdk/bus/chat-daemon-control";
+// W1b/W5b: notification-service and daemon controllers stay off the static
+// import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
-import {
-	buildNotificationStatusReport,
-	checkNotificationHealth,
-	formatNotificationHealthReport,
-	formatNotificationRecoveryReport,
-	formatNotificationStatusReport,
-	formatNotificationTestResult,
-	recoverNotifications,
-	sendNotificationTest,
-} from "../sdk/bus/notification-service";
-import { TelegramDaemonController } from "../sdk/bus/telegram-daemon-control";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
@@ -201,8 +190,8 @@ function parseProviderSetupSlashArgs(args: string): {
 function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
-		"Presets: /provider add --preset <minimax|minimax-cn|glm> [--force]",
-		"Aliases: /provider add minimax, /provider add minimax-cn, /provider add glm, /provider add zai (writes glm-proxy)",
+		"Presets: /provider add --preset <id> [--force]",
+		"Aliases include minimax, zai, alibaba, cline, command-code, and goat.",
 		"API providers: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model> [--force]",
 		`Available presets:\n${formatProviderPresetList()}`,
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
@@ -577,26 +566,26 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
 			const action = verb || "status";
-			// `on`/`off` are session-local runtime controls owned by the
-			// notifications extension command (`api.registerCommand("notify")`),
-			// which holds the live per-session server/disable state. Pass them
-			// through untouched — never consume them — so this builtin cannot
-			// shadow that control. Everything below is config/service diagnostics
-			// the extension does not implement, so the builtin owns them exclusively
-			// (and the extension therefore never consumes them).
-			if (action === "on" || action === "off") {
-				return { prompt: command.text };
-			}
+			// Session-local notification controls are extension-owned. Always pass them
+			// through so this builtin cannot shadow the live per-session command.
+			if (action === "on" || action === "off") return { prompt: command.text };
 			const stateRoot = path.join(runtime.cwd, ".gjc", "state");
 			switch (action) {
-				case "status":
+				case "status": {
+					const { buildNotificationStatusReport, formatNotificationStatusReport } = await import(
+						"../sdk/bus/notification-service"
+					);
 					await runtime.output(formatNotificationStatusReport(buildNotificationStatusReport(runtime.settings)));
 					return commandConsumed();
+				}
 				case "health": {
 					const parsed = parseNotifyServiceArgs(rest, false);
 					if ("error" in parsed) {
 						return usage(`Usage: /notify health [telegram|discord|slack] [--probe]\n${parsed.error}`, runtime);
 					}
+					const { checkNotificationHealth, formatNotificationHealthReport } = await import(
+						"../sdk/bus/notification-service"
+					);
 					const report = await checkNotificationHealth({
 						settings: runtime.settings,
 						stateRoot,
@@ -614,6 +603,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							runtime,
 						);
 					}
+					const { sendNotificationTest, formatNotificationTestResult } = await import(
+						"../sdk/bus/notification-service"
+					);
 					const result = await sendNotificationTest({
 						settings: runtime.settings,
 						provider: parsed.provider,
@@ -622,8 +614,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							providerRuntimeStatus: async provider => {
 								const status =
 									provider === "telegram"
-										? await new TelegramDaemonController(runtime.settings).status()
-										: await new ChatDaemonController(runtime.settings, provider).status();
+										? await new (await import("../sdk/bus/telegram-daemon-control")).TelegramDaemonController(
+												runtime.settings,
+											).status()
+										: await new (await import("../sdk/bus/chat-daemon-control")).ChatDaemonController(
+												runtime.settings,
+												provider,
+											).status();
 								return status.health === "running" ? "ready" : "inactive";
 							},
 						},
@@ -632,6 +629,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					return commandConsumed();
 				}
 				case "recovery": {
+					const { recoverNotifications, formatNotificationRecoveryReport } = await import(
+						"../sdk/bus/notification-service"
+					);
 					const report = await recoverNotifications({ settings: runtime.settings, stateRoot });
 					await runtime.output(formatNotificationRecoveryReport(report));
 					return commandConsumed();
@@ -1680,9 +1680,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const verb = (command.args.trim().split(/\s+/)[0] ?? "").toLowerCase() || "view";
-			const backend = resolveMemoryBackend(runtime.settings);
 			switch (verb) {
 				case "view": {
+					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
 					const payload = await backend.buildDeveloperInstructions(
 						runtime.settings.getAgentDir(),
 						runtime.settings,
@@ -1695,6 +1695,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				}
 				case "clear":
 				case "reset": {
+					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
 					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
 					await runtime.session.refreshBaseSystemPrompt();
 					await runtime.output("Memory cleared.");
@@ -1702,6 +1703,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				}
 				case "enqueue":
 				case "rebuild": {
+					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
 					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
 					await runtime.output("Memory consolidation enqueued.");
 					return commandConsumed();

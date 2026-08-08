@@ -27,6 +27,7 @@ export interface MCPCommandArgs {
 		header?: string[];
 		cwd?: string;
 		timeout?: number;
+		sharing?: "per-session" | "shared";
 	};
 	cwd?: string;
 }
@@ -85,7 +86,10 @@ function parsePairs(values: string[] | undefined, label: string): Record<string,
 function buildServerConfig(args: MCPCommandArgs): MCPServerConfig {
 	const type = args.flags.type ?? (args.flags.url ? "http" : "stdio");
 	const timeout = args.flags.timeout;
-	const shared = timeout === undefined ? {} : { timeout };
+	const shared = {
+		...(timeout === undefined ? {} : { timeout }),
+		sharing: args.flags.sharing ?? "per-session",
+	} as const;
 
 	if (type === "stdio") {
 		const command = args.flags.command ?? args.commandArgs?.[0];

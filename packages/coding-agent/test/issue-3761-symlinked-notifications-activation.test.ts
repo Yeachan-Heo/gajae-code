@@ -187,6 +187,13 @@ describe("issue #3761 symlinked notifications activation", () => {
 			chatId: CHAT_ID,
 			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
 		});
+		// Readiness can publish while the parent still holds the transition
+		// steal lock; #3761 requires that the steal marker is released, not
+		// that the two events are same-tick. Bound the drain so CI load does
+		// not fail the contract while still catching a stuck steal.
+		for (let i = 0; i < 50 && fs.existsSync(paths.steal); i++) {
+			await Bun.sleep(20);
+		}
 		expect(fs.existsSync(paths.steal)).toBe(false);
 		expect(fs.existsSync(paths.lock)).toBe(true);
 	});

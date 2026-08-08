@@ -3,7 +3,7 @@ import {
 	resolvePythonIntegrationGate,
 	resolvePythonIpcTrace,
 	resolvePythonSkipCheck,
-} from "@gajae-code/coding-agent/tools";
+} from "@gajae-code/coding-agent/tools/implementations";
 import {
 	resolvePythonIntegrationGate as resolveKernelIntegrationGate,
 	resolvePythonIpcTrace as resolveKernelIpcTrace,

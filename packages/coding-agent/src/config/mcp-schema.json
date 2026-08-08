@@ -100,6 +100,12 @@
           "type": "boolean",
           "description": "Whether an explicit runtime MCP consumer should connect this server automatically when that consumer starts (default: true). Normal standalone gjc, gjc --tmux, and print-mode sessions do not consume gjc mcp registrations today; false keeps the server configured for consumers that support explicit connection."
         },
+        "sharing": {
+          "type": "string",
+          "enum": ["per-session", "shared"],
+          "default": "per-session",
+          "description": "MCP connection pool identity mode; W2 defaults to one connection per session."
+        },
         "timeout": {
           "type": "number",
           "exclusiveMinimum": 0,

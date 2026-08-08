@@ -157,7 +157,7 @@ describe("provider onboarding wizard red-team", () => {
 				apiKeyEnv: "EMPTY_MODELS_KEY",
 				models: ["", "  ", ","],
 			}),
-		).rejects.toThrow("At least one model id is required");
+		).rejects.toThrow("At least one model id or model discovery is required");
 	});
 
 	it("requires force for an existing provider and overwrites when force is confirmed", async () => {

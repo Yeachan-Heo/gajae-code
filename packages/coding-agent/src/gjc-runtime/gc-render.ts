@@ -72,6 +72,29 @@ export function buildGcReportText(report: GcReport): string {
 		lines.push("");
 	}
 
+	if (report.session_scope) {
+		const scope = report.session_scope;
+		const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+		const headline =
+			scope.status === "over_limit"
+				? "Session scope is OVER the managed budget — new sessions in this directory will fail to start"
+				: "Session scope is approaching the managed budget";
+		lines.push(headline);
+		lines.push(
+			`  ${mib(scope.total_bytes)} MiB of ${mib(scope.limit_bytes)} MiB across ${scope.entries} entries` +
+				`${scope.truncated ? " (walk truncated; totals are a floor)" : ""}`,
+		);
+		lines.push(`  ${scope.path}`);
+		lines.push("  gc does not reclaim session records; move stale session directories out of the scope by hand.");
+		lines.push("");
+	}
+
+	if (report.warnings.length > 0) {
+		lines.push(`Warnings (${report.warnings.length})`);
+		for (const warning of report.warnings) lines.push(`  [${warning.store}/${warning.scope}] ${warning.message}`);
+		lines.push("");
+	}
+
 	if (report.errors.length > 0) {
 		lines.push(`Errors (${report.errors.length})`);
 		for (const err of report.errors) lines.push(`  [${err.store}/${err.scope}] ${err.message}`);
@@ -82,7 +105,8 @@ export function buildGcReportText(report: GcReport): string {
 	lines.push(
 		`Summary: discovered=${c.discovered} stale=${c.stale} alive=${c.alive} eperm=${c.eperm} unknown=${c.unknown} ` +
 			`terminal_lifecycle=${c.terminal_lifecycle} unclassified=${c.unclassified} ` +
-			`${report.dry_run ? `would_remove=${c.would_remove}` : `removed=${c.removed} failed=${c.failed}`} errors=${c.errors}`,
+			`${report.dry_run ? `would_remove=${c.would_remove}` : `removed=${c.removed} failed=${c.failed}`} ` +
+			`errors=${c.errors} warnings=${report.warnings.length}`,
 	);
 	lines.push("");
 	return `${lines.join("\n")}`;

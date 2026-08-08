@@ -18,7 +18,7 @@ import type {
 	MessageAttribution,
 	TextContent,
 	ToolResultMessage,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 
 export {
 	type BranchSummaryMessage,

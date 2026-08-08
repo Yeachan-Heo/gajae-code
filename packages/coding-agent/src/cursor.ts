@@ -12,7 +12,7 @@ import type {
 	CursorShellStreamCallbacks,
 	CursorExecHandlers as ICursorExecHandlers,
 	ToolResultMessage,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 import { sanitizeText } from "@gajae-code/utils";
 import { resolveToCwd } from "./tools/path-utils";
 

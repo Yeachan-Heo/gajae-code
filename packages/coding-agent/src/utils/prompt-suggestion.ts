@@ -5,7 +5,7 @@
  * composer and Tab accepts it.
  */
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { type Api, type AssistantMessage, completeSimple, type Model } from "@gajae-code/ai";
+import { type Api, type AssistantMessage, completeSimple, type Model } from "@gajae-code/ai/core";
 import { logger, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";

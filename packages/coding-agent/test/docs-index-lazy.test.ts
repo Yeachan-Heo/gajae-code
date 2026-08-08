@@ -33,16 +33,14 @@ async function scanDocsCorpus(): Promise<string[]> {
 const REPO_ROOT = path.join(import.meta.dir, "../../..");
 const GENERATED_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
 
-/** `git diff --quiet HEAD -- <paths>`. Exit 0 means the worktree matches the commit. */
-function matchesHead(...paths: string[]): boolean {
+/** `git ls-files --error-unmatch <path>`. Exit 0 means git tracks the path. */
+function isTracked(relativePath: string): boolean {
 	const result = Bun.spawnSync({
-		cmd: ["git", "diff", "--quiet", "HEAD", "--", ...paths],
+		cmd: ["git", "ls-files", "--error-unmatch", "--", relativePath],
 		cwd: REPO_ROOT,
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	// 0 = no diff, 1 = diff. Anything else (no git, not a repo) is a real error.
-	expect([0, 1], result.stderr.toString() || `git diff exited ${result.exitCode}`).toContain(result.exitCode);
 	return result.exitCode === 0;
 }
 
@@ -103,23 +101,23 @@ describe("internal-urls docs index loading", () => {
 	});
 
 	/**
-	 * The two assertions above compare the worktree index to the worktree docs, and
-	 * the root `prepare` hook regenerates the index on every `bun install` — which CI
-	 * runs before any test. So a *committed* index that is stale gets silently repaired
-	 * in the worktree and both assertions pass. The invariant they cannot see is
-	 * `committed index == committed docs`.
+	 * The two assertions above compare the worktree index to the worktree docs,
+	 * which is the whole contract now that the index is generated rather than
+	 * committed: the root `prepare` hook rebuilds it on every `bun install`, so
+	 * the worktree copy is authoritative and a stale *committed* copy cannot
+	 * exist to drift from it.
 	 *
-	 * This closes that: if `docs/` matches HEAD but the index does not, the only thing
-	 * that could have rewritten the index is the generator, which means the commit
-	 * shipped a stale one. When `docs/` is itself dirty the developer is mid-edit and
-	 * there is nothing to conclude, so the check yields rather than false-failing.
+	 * Keeping it untracked is what makes that true. The generator emits one line
+	 * per doc — each holding an entire document as a single JSON string — so two
+	 * branches editing the same doc produce a whole-line conflict that git cannot
+	 * three-way merge. Tracking it reintroduces a conflict on every rebase, and
+	 * because `.gitignore` only governs untracked paths, the ignore rule goes
+	 * inert the moment something forces it back into the index.
 	 */
-	it("commits an index that matches the committed docs", () => {
-		if (!matchesHead("docs")) return;
-
+	it("keeps the generated index untracked so it cannot conflict on rebase", () => {
 		expect(
-			matchesHead(GENERATED_INDEX),
-			`committed docs index is stale relative to committed docs/; ${REGENERATE_HINT}`,
-		).toBe(true);
+			isTracked(GENERATED_INDEX),
+			`${GENERATED_INDEX} is committed; it is generated and gitignored. Run: git rm --cached ${GENERATED_INDEX}`,
+		).toBe(false);
 	});
 });

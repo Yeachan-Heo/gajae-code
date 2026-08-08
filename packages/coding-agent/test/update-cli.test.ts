@@ -6,18 +6,23 @@ import * as path from "node:path";
 import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	buildReleaseBinaryUrlForTest,
+	compareVersionsForTest,
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
+	parseReportedVersionForTest,
+	parseUpdateArgs,
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
+	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
 	runPackageManagerUpdateForTest,
 	runUpdateCommand,
 } from "../src/cli/update-cli";
+import { distTagForChannel, isUpdateChannel } from "../src/config/update-channel";
 import { initTheme } from "../src/modes/theme/theme";
 import { DEFAULT_NPM_REGISTRY } from "../src/utils/npm-registry";
 
@@ -687,5 +692,279 @@ describe("update-cli binary update flow", () => {
 		expect(calls).toEqual([`download ${targetPath}.new`, "fsync", `removeTemp ${targetPath}.new`]);
 		expect(calls).not.toContain("replace");
 		expect(calls).not.toContain("verify");
+	});
+});
+
+describe("update-cli release channels", () => {
+	it("maps channels to npm dist-tags without ever pointing nightly at latest", () => {
+		expect(distTagForChannel("stable")).toBe("latest");
+		expect(distTagForChannel("nightly")).toBe("nightly");
+	});
+
+	it("accepts only known channel names", () => {
+		expect(isUpdateChannel("stable")).toBe(true);
+		expect(isUpdateChannel("nightly")).toBe(true);
+		expect(isUpdateChannel("beta")).toBe(false);
+		expect(isUpdateChannel("")).toBe(false);
+	});
+
+	it("parses --channel from spaced and equals forms", () => {
+		expect(parseUpdateArgs(["update", "--channel", "nightly"])).toEqual({
+			force: false,
+			check: false,
+			channel: "nightly",
+		});
+		expect(parseUpdateArgs(["update", "--channel=stable", "--check"])).toEqual({
+			force: false,
+			check: true,
+			channel: "stable",
+		});
+	});
+
+	it("omits channel when the flag is absent and rejects unknown channels", () => {
+		expect(parseUpdateArgs(["update", "--force"])).toEqual({ force: true, check: false });
+		expect(parseUpdateArgs(["other"])).toBeUndefined();
+		expect(() => parseUpdateArgs(["update", "--channel", "beta"])).toThrow('Invalid --channel "beta"');
+		expect(() => parseUpdateArgs(["update", "--channel=nightlyy"])).toThrow("Invalid --channel");
+	});
+
+	it("orders nightly prereleases with real semver semantics", () => {
+		// A prerelease is older than the stable release with the same core version.
+		expect(compareVersionsForTest("0.12.12", "0.12.12-nightly.20260805044024.123.gabcdef123456")).toBeGreaterThan(0);
+		// A nightly of a newer core beats the previous stable.
+		expect(compareVersionsForTest("0.12.12-nightly.20260805044024.123.gabcdef123456", "0.12.11")).toBeGreaterThan(0);
+		// Later nightly timestamps sort after earlier ones.
+		expect(
+			compareVersionsForTest(
+				"0.12.12-nightly.20260806044024.123.gabcdef123456",
+				"0.12.12-nightly.20260805044024.123.gabcdef123456",
+			),
+		).toBeGreaterThan(0);
+		expect(compareVersionsForTest("0.12.11", "0.12.11")).toBe(0);
+	});
+
+	it("passes the requested channel to the release lookup and prints it for non-stable channels", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const seenChannels: string[] = [];
+		try {
+			await runUpdateCommand(
+				{ force: false, check: true, channel: "nightly" },
+				{
+					getLatestRelease: async options => {
+						seenChannels.push(options?.channel ?? "stable");
+						return {
+							tag: "v999.0.0-nightly.1.1.gabc",
+							version: "999.0.0-nightly.1.1.gabc",
+							registry: DEFAULT_NPM_REGISTRY,
+							warnings: [],
+						};
+					},
+				},
+			);
+			expect(seenChannels).toEqual(["nightly"]);
+			expect(output.join("\n")).toContain("Update channel: nightly (npm dist-tag nightly)");
+			expect(output.join("\n")).toContain("New version available: 999.0.0-nightly.1.1.gabc");
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("defaults to the stable channel and stays silent about it", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const seenChannels: string[] = [];
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					getLatestRelease: async options => {
+						seenChannels.push(options?.channel ?? "stable");
+						return { tag: "v0.0.1", version: "0.0.1", registry: DEFAULT_NPM_REGISTRY, warnings: [] };
+					},
+				},
+			);
+			expect(seenChannels).toEqual(["stable"]);
+			expect(output.join("\n")).toContain("Already up to date");
+			expect(output.join("\n")).not.toContain("Update channel:");
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("treats a same-version nightly as up to date instead of NaN-forcing a reinstall", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		try {
+			// VERSION is the current stable core; a nightly of the same core must not
+			// produce the misleading "Forcing reinstall" path without --force.
+			await runUpdateCommand(
+				{ force: false, check: false, channel: "nightly" },
+				{
+					getLatestRelease: async () => ({
+						tag: "v0.0.0-nightly.1.1.gabc",
+						version: "0.0.0-nightly.1.1.gabc",
+						registry: DEFAULT_NPM_REGISTRY,
+						warnings: [],
+					}),
+				},
+			);
+			expect(output.join("\n")).toContain("Already up to date");
+			expect(output.join("\n")).not.toContain("Forcing reinstall");
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+});
+
+describe("update-cli channel robustness", () => {
+	it("rejects a trailing value-less --channel instead of silently ignoring it", () => {
+		expect(() => parseUpdateArgs(["update", "--channel"])).toThrow("Missing value for --channel");
+	});
+
+	it("requests the nightly dist-tag route for nightly lookups", async () => {
+		const requested: string[] = [];
+		const release = await getLatestReleaseForTest({
+			homeDir: "/nonexistent-home",
+			platform: "darwin",
+			readFile: async () => undefined,
+			lookupEnv: () => undefined,
+			channel: "nightly",
+			fetchImpl: async url => {
+				requested.push(url);
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({ version: "1.2.3-nightly.1.1.gabc" }),
+				};
+			},
+		});
+
+		expect(requested).toEqual(["https://registry.npmjs.org/@gajae-code/coding-agent/nightly"]);
+		expect(release.version).toBe("1.2.3-nightly.1.1.gabc");
+	});
+
+	it("falls back to the packument dist-tags entry for the requested channel", async () => {
+		const requested: string[] = [];
+		const release = await getLatestReleaseForTest({
+			homeDir: "/nonexistent-home",
+			platform: "darwin",
+			readFile: async () => undefined,
+			lookupEnv: () => undefined,
+			channel: "nightly",
+			fetchImpl: async url => {
+				requested.push(url);
+				if (url.endsWith("/nightly")) {
+					return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
+				}
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({
+						"dist-tags": { latest: "1.2.3", nightly: "1.2.4-nightly.1.1.gabc" },
+					}),
+				};
+			},
+		});
+
+		expect(requested).toEqual([
+			"https://registry.npmjs.org/@gajae-code/coding-agent/nightly",
+			"https://registry.npmjs.org/@gajae-code/coding-agent",
+		]);
+		expect(release.version).toBe("1.2.4-nightly.1.1.gabc");
+	});
+
+	it("fails closed with workflow guidance when no nightly has ever been published", async () => {
+		const failing = getLatestReleaseForTest({
+			homeDir: "/nonexistent-home",
+			platform: "darwin",
+			readFile: async () => undefined,
+			lookupEnv: () => undefined,
+			channel: "nightly",
+			fetchImpl: async () => ({ ok: false, status: 404, statusText: "Not Found", json: async () => ({}) }),
+		});
+
+		await expect(failing).rejects.toThrow("nightly channel has no published release yet");
+	});
+
+	it("exits cleanly instead of crashing when the channel reports an unparseable version", async () => {
+		const errors: string[] = [];
+		const exitCodes: number[] = [];
+		const sentinel = new Error("exit");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			errors.push(String(message));
+		});
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => ({
+							tag: "vnot-a-semver",
+							version: "not-a-semver",
+							registry: DEFAULT_NPM_REGISTRY,
+							warnings: [],
+						}),
+						exit: code => {
+							exitCodes.push(code);
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(exitCodes).toEqual([1]);
+			expect(errors.join("\n")).toContain('unparseable version "not-a-semver"');
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("resolves update decisions across the channel matrix", () => {
+		// Nightly build switching back to stable installs the semver-lower target.
+		expect(
+			resolveUpdateDecision({
+				comparison: -1,
+				force: false,
+				channel: "stable",
+				currentVersion: "0.12.12-nightly.20260805044024.123.gabcdef123456",
+			}),
+		).toEqual({ install: true, kind: "switch-back" });
+		// The reverse direction never downgrades silently: a same-core nightly
+		// behind the installed stable still requires --force.
+		expect(
+			resolveUpdateDecision({ comparison: -1, force: false, channel: "nightly", currentVersion: "0.12.12" }),
+		).toEqual({ install: false, kind: "up-to-date" });
+		expect(
+			resolveUpdateDecision({ comparison: -1, force: true, channel: "nightly", currentVersion: "0.12.12" }),
+		).toEqual({ install: true, kind: "force" });
+		// A stable build on the stable channel never treats an older release as a switch-back.
+		expect(
+			resolveUpdateDecision({ comparison: -1, force: false, channel: "stable", currentVersion: "0.12.12" }),
+		).toEqual({ install: false, kind: "up-to-date" });
+		// Ordinary newer-version and equal-version behavior is unchanged.
+		expect(
+			resolveUpdateDecision({ comparison: 1, force: false, channel: "stable", currentVersion: "0.12.11" }),
+		).toEqual({ install: true, kind: "new-version" });
+		expect(
+			resolveUpdateDecision({ comparison: 0, force: false, channel: "stable", currentVersion: "0.12.11" }),
+		).toEqual({ install: false, kind: "up-to-date" });
+	});
+});
+
+describe("update-cli reported version parsing", () => {
+	it("parses stable and nightly prerelease version output", () => {
+		expect(parseReportedVersionForTest("gjc/0.12.11")).toBe("0.12.11");
+		expect(parseReportedVersionForTest("gjc/0.12.12-nightly.20260805044024.123456789.g6dd873fd26b8\n")).toBe(
+			"0.12.12-nightly.20260805044024.123456789.g6dd873fd26b8",
+		);
+		expect(parseReportedVersionForTest("gjc: no version")).toBeUndefined();
 	});
 });

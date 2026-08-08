@@ -23,6 +23,13 @@ project directory and does **not** set `GJC_COORDINATOR_MCP_MUTATIONS`.
 Delegation is read-only until the user explicitly enables a mutation class and
 passes `allow_mutation: true` per call. `GJC_COORDINATOR_MCP_REPO` is a
 namespace label only, never a filesystem path.
+## Codex resume bridge correlation
+
+After registering an app-server handoff with `gjc_coordinator_register_codex_handoff`,
+pass the same `session_id` as `codex_host_session_id` on delegate calls so new GJC
+sessions auto-bind to the Codex thread for wake-on-completion and questions. Acknowledge
+durable wakes by `wake_key` with `gjc_coordinator_ack_codex_handoff`; heartbeats are
+unsupported (`automation_update_unavailable`), so delivery is event-driven with startup drain.
 
 ## Polling
 

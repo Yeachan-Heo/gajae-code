@@ -134,4 +134,80 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 		expect(toolResults).toHaveLength(1);
 		expect(toolResults[0].text).toContain(`Tool ${toolName} not found`);
 	});
+
+	// Issue #3917, captured sessions 019fd580/019fd583/019fd595: the model called
+	// `mcp__<server>__<instance>_search` while plain `search` was active, five
+	// times across three sessions, and the bare not-found named no way back.
+	it("names the active tool when the call carries an MCP bridge namespace", async () => {
+		const toolName = "mcp__jzi2uzmxd57z__wbg7pcrl46bd_search";
+		const toolResults = await collectToolResults([makeTool("search"), makeTool("read")], toolName);
+
+		expect(toolResults).toHaveLength(1);
+		expectBaseNotFound(toolResults[0], toolName);
+		expect(toolResults[0].text).toContain("It is active as `search`");
+		expect(toolResults[0].text).not.toContain("`read`");
+	});
+
+	// Bridges mint the instance segment per session, so a name replayed from
+	// earlier context differs from the live registry only in that segment.
+	it("names the live alias when only the bridge instance segment went stale", async () => {
+		const toolName = "mcp__jzi2uzmxd57z__jgspauo3hmi5_subagent";
+		const toolResults = await collectToolResults([makeTool("mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent")], toolName);
+
+		expect(toolResults).toHaveLength(1);
+		expectBaseNotFound(toolResults[0], toolName);
+		expect(toolResults[0].text).toContain("It is active as `mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent`");
+	});
+
+	it("resolves an alias reachable only through customWireName", async () => {
+		const toolName = "mcp__srv__stale_apply_patch";
+		const toolResults = await collectToolResults([makeTool("edit", { customWireName: "apply_patch" })], toolName);
+
+		expect(toolResults).toHaveLength(1);
+		expectBaseNotFound(toolResults[0], toolName);
+		expect(toolResults[0].text).toContain("It is active as `apply_patch`");
+	});
+
+	it("does not invent an alias when no active tool shares the base name", async () => {
+		const toolName = "mcp__srv__abc_write";
+		const toolResults = await collectToolResults([makeTool("read"), makeTool("search")], toolName);
+
+		expect(toolResults).toHaveLength(1);
+		expectBaseNotFound(toolResults[0], toolName);
+		expect(toolResults[0].text).not.toContain("It is active as");
+	});
+
+	// Two servers can expose the same tool name, and routing the model at the
+	// wrong server's tool is worse than the dead end.
+	it("does not cross servers when suggesting an alias", async () => {
+		const toolName = "mcp__alpha__abc_search";
+		const toolResults = await collectToolResults([makeTool("mcp__beta__abc_search")], toolName);
+
+		expect(toolResults).toHaveLength(1);
+		expectBaseNotFound(toolResults[0], toolName);
+		expect(toolResults[0].text).not.toContain("It is active as");
+	});
+
+	// Emitting the bare `search_tool_bm25` literal here would name a second
+	// non-callable tool, so the hint has to carry the bridged call name.
+	it("points at the bridged discovery call name instead of the bare literal", async () => {
+		const toolName = "remembered_discoverable_tool";
+		const toolResults = await collectToolResults([makeTool("mcp__srv__abc_search_tool_bm25")], toolName);
+
+		expect(toolResults).toHaveLength(1);
+		expectBaseNotFound(toolResults[0], toolName);
+		expect(toolResults[0].text).toContain("call `mcp__srv__abc_search_tool_bm25` to discover");
+		expect(toolResults[0].text).not.toContain("call `search_tool_bm25` to discover");
+	});
+
+	it("prefers the unbridged discovery name when both are callable", async () => {
+		const toolName = "remembered_discoverable_tool";
+		const toolResults = await collectToolResults(
+			[makeTool("mcp__srv__abc_search_tool_bm25"), makeTool("search_tool_bm25")],
+			toolName,
+		);
+
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].text).toContain(DISCOVERY_HINT);
+	});
 });

@@ -284,7 +284,6 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (!record) {
 				missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 			} else {
-				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
 				if (record.status === "running") {
 					const handle = manager.getLiveHandle(record.subagentId);
 					if (!handle) throw new ToolError(`Subagent ${record.subagentId} has no live handle.`);

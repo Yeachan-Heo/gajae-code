@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import {
 	NPM_REGISTRY_URL,
+	NPM_NIGHTLY_TAG,
 	NPM_RELEASE_TAG,
 	normalizeFileDependencySpec,
 	packages as publishPackages,
@@ -308,16 +309,17 @@ describe("immutable stable release contracts", () => {
 		expect(publishedDirs).toEqual(evidencedDirs);
 	});
 
-	test("pins npm registry and latest without accepting registry redirects", async () => {
+	test("pins the npm registry and explicit stable/nightly dist-tags without accepting registry redirects", async () => {
 		const publisher = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
 		expect(NPM_REGISTRY_URL).toBe("https://registry.npmjs.org/");
 		expect(NPM_RELEASE_TAG).toBe("latest");
+		expect(NPM_NIGHTLY_TAG).toBe("nightly");
 		expect(validateNpmRegistryUrl("https://registry.npmjs.org", "test").href).toBe(NPM_REGISTRY_URL);
 		expect(() => validateNpmRegistryUrl("https://registry.npmjs.org.evil.invalid/", "test")).toThrow("must be");
 		expect(publisher).toContain("assertPinnedNpmConfiguration");
 		expect(publisher).toContain("assertPinnedPackagePublishConfig");
 		expect(publisher).toContain("--registry=${NPM_REGISTRY_URL}");
-		expect(publisher).toContain("--tag=${NPM_RELEASE_TAG}");
+		expect(publisher).toContain("--tag=${policy.npmTag}");
 	});
 
 	test("pushes main and the immutable version tag in one atomic refspec transaction", async () => {
@@ -376,9 +378,32 @@ describe("immutable stable release contracts", () => {
 		expect(parseReleasePublishCli(["--prepare-evidence", "--evidence-dir", "release-evidence"])).toEqual({
 			mode: "prepare-evidence",
 			evidenceDir: "release-evidence",
+			releaseChannel: "stable",
+		});
+		expect(parseReleasePublishCli([
+			"--prepare-evidence",
+			"--evidence-dir",
+			"release-evidence",
+			"--release-channel",
+			"nightly",
+		])).toEqual({ mode: "prepare-evidence", evidenceDir: "release-evidence", releaseChannel: "nightly" });
+		expect(parseReleasePublishCli([
+			"--publish-from-evidence",
+			"--evidence-dir",
+			"release-evidence",
+			"--release-serialization-key",
+			"gajae-nightly-release",
+			"--release-channel",
+			"nightly",
+		])).toEqual({
+			mode: "publish-from-evidence",
+			evidenceDir: "release-evidence",
+			releaseSerializationKey: "gajae-nightly-release",
+			releaseChannel: "nightly",
 		});
 		expect(() => parseReleasePublishCli(["--dry-run", "--evidence-dir", "release-evidence"])).toThrow("cannot be combined");
 		expect(() => parseReleasePublishCli(["--prepare-evidence", "--evidence-dir", "one", "--evidence-dir", "two"])).toThrow("requires exactly");
+		expect(() => parseReleasePublishCli(["--prepare-evidence", "--evidence-dir", "one", "--release-channel", "preview"])).toThrow("stable or nightly");
 
 		expect(parseReleaseCli(["watch"])).toEqual({ mode: "watch" });
 		expect(parseReleaseCli(["1.2.3"])).toEqual({ mode: "release", version: "1.2.3" });
@@ -433,34 +458,40 @@ describe("native release binary coverage", () => {
 		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*");
 	});
 
-	test("tag publication builds natives + binaries then publishes npm and the GitHub Release", async () => {
+	test("release publication preserves stable tags while admitting verified nightly runs", async () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
 		const native = workflowJob(workflow, "native");
 		const binaries = workflowJob(workflow, "binaries");
 		const publish = workflowJob(workflow, "publish");
 
-		// Native and binary builds also run in the tag rehearsal; publish remains tag-only.
 		for (const job of [native, binaries]) {
-			expect(job).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}");
+			expect(job).toContain("startsWith(github.ref, 'refs/tags/v')");
+			expect(job).toContain("inputs.rehearsal == 'tag-build-verify'");
+			expect(job).toContain("inputs.rehearsal == 'nightly-release'");
 		}
-		expect(publish).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}");
+		expect(publish).toContain("needs.release_metadata.outputs.channel == 'stable'");
+		expect(publish).toContain("needs.release_metadata.outputs.channel == 'nightly'");
 		expect(workflow).not.toContain("release_source_verify");
 		expect(workflow).not.toContain("verify exact source SHA passed a successful main CI run");
 
-		// Binaries wait on natives; publish waits on both.
-		expect(binaries).toContain("needs: [native]");
-		expect(publish).toContain("needs: [native, binaries]");
+		expect(native).toContain("needs: [release_metadata]");
+		expect(binaries).toContain("needs: [native, release_metadata]");
+		expect(publish).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
 
-		// Publish uses the proven evidence-based publish script in one job.
 		expect(publish).toContain("--prepare-evidence --evidence-dir");
 		expect(publish).toContain("--publish-from-evidence");
-		expect(publish).toContain("--release-serialization-key gajae-production-release");
+		expect(publish).toContain("gajae-production-release");
+		expect(publish).toContain("gajae-nightly-release");
+		expect(publish).toContain("Persist pre-publication package evidence");
 		expect(publish).toContain("NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
 
-		// Publish cuts the GitHub Release directly (no separate draft/finalize dance).
 		expect(publish).toContain("softprops/action-gh-release");
 		expect(publish).toContain("draft: false");
-		expect(publish).toContain("files: release-binaries/gjc-*");
+		expect(publish).toContain("release-binaries/gjc-*");
+		expect(publish).toContain("gajae-release-packages-v1.json");
+		expect(publish).toContain("gajae-release-channel-v1.json");
+		expect(publish).toContain("fail_on_unmatched_files: true");
+		expect(publish).toContain("Verify immutable GitHub Release");
 
 		// The paranoid multi-job evidence/verify chain is gone.
 		for (const removed of [

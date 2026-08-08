@@ -14,3 +14,9 @@ Call the `gjc_delegate_team` coordinator MCP tool to delegate this work to gajae
 GJC starts a session and runs `/skill:team` to completion, returning a
 durable `turn_id`, status, and artifact references. Poll with
 `gjc_coordinator_await_turn` or `gjc_coordinator_watch_events`.
+Codex resume bridge correlation: after registering an app-server handoff with
+`gjc_coordinator_register_codex_handoff`, pass the same `session_id` as
+`codex_host_session_id` on delegate calls so the new GJC session auto-binds to
+the Codex thread for wake-on-completion and questions. Acknowledge durable wakes
+by `wake_key` with `gjc_coordinator_ack_codex_handoff`; heartbeats are unsupported
+(`automation_update_unavailable`), so delivery is event-driven with startup drain.

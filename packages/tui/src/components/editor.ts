@@ -1,6 +1,7 @@
 import { getProjectDir, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
 import {
 	type AutocompleteProvider,
+	type AutocompleteSuggestionKind,
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	isInsideInlineCodeSpan,
@@ -475,6 +476,8 @@ export class Editor implements Component, Focusable {
 	#history: string[] = [];
 	#historyIndex: number = -1; // -1 = not browsing, 0 = most recent, 1 = older, etc.
 	#historyStorage?: HistoryStorage;
+	#historyStorageLoader?: () => Promise<HistoryStorage | undefined>;
+	#historyStorageLoad?: Promise<HistoryStorage | undefined>;
 
 	// Undo stack for editor state changes
 	#undoStack: EditorState[] = [];
@@ -636,9 +639,30 @@ export class Editor implements Component, Focusable {
 
 	setHistoryStorage(storage: HistoryStorage): void {
 		this.#historyStorage = storage;
-		const recent = storage.getRecent(100, getProjectDir());
-		this.#history = recent.map(entry => entry.prompt);
+		const recent = storage.getRecent(100, getProjectDir()).map(entry => entry.prompt);
+		const merged: string[] = [];
+		for (const prompt of [...this.#history, ...recent]) {
+			if (merged.includes(prompt)) continue;
+			merged.push(prompt);
+			if (merged.length >= 100) break;
+		}
+		this.#history = merged;
 		this.#historyIndex = -1;
+	}
+
+	setHistoryStorageLoader(loader: (() => Promise<HistoryStorage | undefined>) | undefined): void {
+		this.#historyStorageLoader = loader;
+		this.#historyStorageLoad = undefined;
+	}
+
+	#ensureHistoryStorage(): Promise<HistoryStorage | undefined> {
+		if (this.#historyStorage) return Promise.resolve(this.#historyStorage);
+		if (!this.#historyStorageLoader) return Promise.resolve(undefined);
+		this.#historyStorageLoad ??= this.#historyStorageLoader().then(storage => {
+			if (storage) this.setHistoryStorage(storage);
+			return storage;
+		});
+		return this.#historyStorageLoad;
 	}
 
 	/**
@@ -661,6 +685,13 @@ export class Editor implements Component, Focusable {
 			stor.add(trimmed, getProjectDir()).catch(error => {
 				logger.error("HistoryStorage add failed", { error: String(error) });
 			});
+		} else {
+			void this.#ensureHistoryStorage().then(storage => {
+				if (!storage) return;
+				return storage.add(trimmed, getProjectDir()).catch(error => {
+					logger.error("HistoryStorage add failed", { error: String(error) });
+				});
+			});
 		}
 	}
 
@@ -682,7 +713,13 @@ export class Editor implements Component, Focusable {
 
 	#navigateHistory(direction: 1 | -1): void {
 		this.#resetKillSequence();
-		if (this.#history.length === 0) return;
+		if (this.#history.length === 0) {
+			void this.#ensureHistoryStorage().then(storage => {
+				if (storage && this.#history.length > 0) this.#navigateHistory(direction);
+				this.invalidate();
+			});
+			return;
+		}
 		const newIndex = this.#historyIndex - direction; // Up(-1) increases index, Down(1) decreases
 		if (newIndex < -1 || newIndex >= this.#history.length) return;
 		this.#historyIndex = newIndex;
@@ -2056,8 +2093,8 @@ export class Editor implements Component, Focusable {
 		this.#undoStack.length = 0;
 		this.#wrappedLineCache.length = 0;
 
-		if (this.onChange) this.onChange("");
 		if (this.onSubmit) this.onSubmit(result);
+		if (this.onChange) this.onChange("");
 	}
 
 	#handleBackspace(): void {
@@ -2838,16 +2875,20 @@ export class Editor implements Component, Focusable {
 		);
 	}
 
-	#isSlashCommandNameAutocompleteSelection(): boolean {
-		if (this.#autocompleteState !== "regular") {
-			return false;
-		}
-
+	#isSlashCommandNameAutocompleteContext(): boolean {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol).trimStart();
 		return (
 			this.#isInSubmittedSlashCommandContext() && textBeforeCursor.startsWith("/") && !textBeforeCursor.includes(" ")
 		);
+	}
+
+	#isSlashCommandNameAutocompleteSelection(): boolean {
+		if (this.#autocompleteState !== "regular") {
+			return false;
+		}
+
+		return this.#isSlashCommandNameAutocompleteContext();
 	}
 
 	#isCompletedSlashCommandAtCursor(): boolean {
@@ -2890,7 +2931,7 @@ export class Editor implements Component, Focusable {
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
 			this.#autocompleteState = "regular";
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
@@ -2901,14 +2942,11 @@ export class Editor implements Component, Focusable {
 		}
 	}
 	#createAutocompleteList(
-		prefix: string,
 		items: Array<{ value: string; label: string; description?: string }>,
+		kind: AutocompleteSuggestionKind,
 	): SelectList {
-		// Layout options prepared for future SelectList enhancements (e.g., for slash commands)
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
-		// TODO: Pass layout to SelectList when constructor is updated to support it
-		void layout; // Use layout variable to avoid lint warnings
-		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList);
+		const layout = kind === "slash-command" ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
+		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
 	}
 
 	#handleTabCompletion(): void {
@@ -2985,7 +3023,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			}
 
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, "default");
 			this.#autocompleteState = "force";
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
@@ -3035,7 +3073,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
 			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {

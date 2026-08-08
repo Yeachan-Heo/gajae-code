@@ -13,6 +13,7 @@ import {
 	StartupUpdateOrchestrator,
 	type StartupUpdateRoute,
 } from "../src/main";
+import { getSettingsForTab } from "../src/modes/components/settings-defs";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
@@ -815,5 +816,27 @@ describe("startup update contract", () => {
 		expect(source).not.toMatch(/["']\.\/defaults\/gjc-defaults["']/);
 		expect(source).toContain("startupUpdate.startBeforeInteractiveInitialization()");
 		expect(source).toContain("startupUpdate.attachAfterInteractiveInitialization");
+	});
+
+	it("routes the startup check through the configured update channel", async () => {
+		const source = await Bun.file(new URL("../src/main.ts", import.meta.url)).text();
+
+		// The channel comes from the config-layer primitives (never the updater
+		// module) and defaults to the user's startup.updateChannel setting.
+		expect(source).toContain('from "./config/update-channel"');
+		expect(source).toContain('settingsInstance.get("startup.updateChannel")');
+
+		const settings = Settings.isolated({});
+		expect(settings.get("startup.updateChannel")).toBe("stable");
+		const nightly = Settings.isolated({ "startup.updateChannel": "nightly" });
+		expect(nightly.get("startup.updateChannel")).toBe("nightly");
+
+		// The settings menu (interaction tab) exposes the channel submenu with both options.
+		const menuEntry = getSettingsForTab("interaction").find(def => def.path === "startup.updateChannel");
+		expect(menuEntry).toBeDefined();
+		expect(menuEntry?.type).toBe("submenu");
+		if (menuEntry?.type === "submenu") {
+			expect(menuEntry.options.map(option => option.value)).toEqual(["stable", "nightly"]);
+		}
 	});
 });

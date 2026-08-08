@@ -31,10 +31,10 @@ import {
 	RELEASE_TARBALL_LIMITS,
 	assertExactInternalReleaseDependencies,
 	assertMonotonicLatestVersion,
-
 	compareStableVersions,
-
-
+	nightlyVersionPattern,
+	stableVersionPattern,
+	canonicalJsonBytes,
 	canonicalizePackageTarball,
 	classifyRegistryObservation,
 	createExpectedEvidence,
@@ -81,22 +81,66 @@ let isDryRun = false;
 
 export const NPM_REGISTRY_URL = "https://registry.npmjs.org/";
 export const NPM_RELEASE_TAG = "latest";
+export const NPM_NIGHTLY_TAG = "nightly";
+export const RELEASE_CHANNEL_EVIDENCE_FILE = "gajae-release-channel-v1.json";
+export type ReleaseChannel = "stable" | "nightly";
+
+interface ReleasePolicy {
+	channel: ReleaseChannel;
+	npmTag: typeof NPM_RELEASE_TAG | typeof NPM_NIGHTLY_TAG;
+}
+
 const npmRegistryOrigin = new URL(NPM_REGISTRY_URL).origin;
 const maxTarballRedirects = 3;
 const releaseSerializationKeyPattern = /^[a-z0-9][a-z0-9._/-]{7,127}$/u;
 
+function releasePolicy(channel: ReleaseChannel): ReleasePolicy {
+	return channel === "nightly"
+		? { channel, npmTag: NPM_NIGHTLY_TAG }
+		: { channel, npmTag: NPM_RELEASE_TAG };
+}
+
+function assertReleaseVersionForChannel(version: string, channel: ReleaseChannel): void {
+	const matches = channel === "nightly" ? nightlyVersionPattern.test(version) : stableVersionPattern.test(version);
+	if (!matches) throw new Error(`${channel} release requires an exact ${channel === "nightly" ? "X.Y.Z-nightly.<utc>.<run>.g<sha>" : "X.Y.Z"} version, received ${version}`);
+}
+export function assertReleaseSourceBinding(
+	version: string,
+	channel: ReleaseChannel,
+	evidenceSourceCommit: string,
+	checkedOutSourceCommit: string,
+): void {
+	if (!/^[0-9a-f]{40}$/u.test(evidenceSourceCommit) || !/^[0-9a-f]{40}$/u.test(checkedOutSourceCommit)) {
+		throw new Error("Release source binding requires exact lowercase commit SHAs");
+	}
+	if (evidenceSourceCommit !== checkedOutSourceCommit) {
+		throw new Error(`Release evidence source ${evidenceSourceCommit} does not match checked-out source ${checkedOutSourceCommit}`);
+	}
+	if (channel === "nightly" && !version.endsWith(`.g${checkedOutSourceCommit.slice(0, 12)}`)) {
+		throw new Error(`Nightly release version ${version} is not bound to checked-out source ${checkedOutSourceCommit}`);
+	}
+}
 
 export type ReleasePublishCli =
 	| { mode: "evidence-self-test" }
 	| { mode: "check-types" }
 	| { mode: "dry-run" }
-	| { mode: "prepare-evidence"; evidenceDir: string }
-	| { mode: "publish-from-evidence"; evidenceDir: string; releaseSerializationKey: string };
+	| { mode: "prepare-evidence"; evidenceDir: string; releaseChannel: ReleaseChannel }
+	| { mode: "publish-from-evidence"; evidenceDir: string; releaseSerializationKey: string; releaseChannel: ReleaseChannel };
 
+function extractReleaseChannel(argv: readonly string[]): { releaseChannel: ReleaseChannel; remaining: string[] } {
+	const positions = argv.flatMap((argument, index) => argument === "--release-channel" ? [index] : []);
+	if (positions.length === 0) return { releaseChannel: "stable", remaining: [...argv] };
+	if (positions.length !== 1) throw new Error("--release-channel may be supplied exactly once");
+	const index = positions[0]!;
+	const value = argv[index + 1];
+	if (value !== "stable" && value !== "nightly") throw new Error("--release-channel must be stable or nightly");
+	return { releaseChannel: value, remaining: argv.filter((_, argumentIndex) => argumentIndex !== index && argumentIndex !== index + 1) };
+}
 
 function parseEvidenceDirectory(mode: string, argv: readonly string[]): string {
 	if (argv.length !== 2 || argv[0] !== "--evidence-dir" || argv[1] === undefined || argv[1].startsWith("--")) {
-		throw new Error(`${mode} requires exactly --evidence-dir <directory>`);
+		throw new Error(`${mode} requires exactly --evidence-dir <directory> plus optional --release-channel <stable|nightly>`);
 	}
 	return argv[1];
 }
@@ -111,11 +155,10 @@ function parsePublishEvidenceOptions(argv: readonly string[]): { evidenceDir: st
 		argv[3] === undefined ||
 		!releaseSerializationKeyPattern.test(argv[3])
 	) {
-		throw new Error("--publish-from-evidence requires exactly --evidence-dir <directory> --release-serialization-key <shared-cross-version-key>");
+		throw new Error("--publish-from-evidence requires exactly --evidence-dir <directory> --release-serialization-key <shared-cross-version-key> plus optional --release-channel <stable|nightly>");
 	}
 	return { evidenceDir: argv[1], releaseSerializationKey: argv[3] };
 }
-
 
 export function parseReleasePublishCli(argv: readonly string[]): ReleasePublishCli {
 	const [mode, ...argumentsForMode] = argv;
@@ -129,13 +172,16 @@ export function parseReleasePublishCli(argv: readonly string[]): ReleasePublishC
 		case "--dry-run":
 			if (argumentsForMode.length !== 0) throw new Error("--dry-run cannot be combined with other arguments");
 			return { mode: "dry-run" };
-		case "--prepare-evidence":
-			return { mode: "prepare-evidence", evidenceDir: parseEvidenceDirectory(mode, argumentsForMode) };
-		case "--publish-from-evidence":
-			return { mode: "publish-from-evidence", ...parsePublishEvidenceOptions(argumentsForMode) };
+		case "--prepare-evidence": {
+			const { releaseChannel, remaining } = extractReleaseChannel(argumentsForMode);
+			return { mode: "prepare-evidence", evidenceDir: parseEvidenceDirectory(mode, remaining), releaseChannel };
+		}
+		case "--publish-from-evidence": {
+			const { releaseChannel, remaining } = extractReleaseChannel(argumentsForMode);
+			return { mode: "publish-from-evidence", ...parsePublishEvidenceOptions(remaining), releaseChannel };
+		}
 		default:
-			throw new Error("Use exactly one mode: --evidence-self-test, --check-types, --dry-run, --prepare-evidence --evidence-dir <directory>, or --publish-from-evidence --evidence-dir <directory> --release-serialization-key <shared-cross-version-key>");
-
+			throw new Error("Use exactly one mode: --evidence-self-test, --check-types, --dry-run, --prepare-evidence --evidence-dir <directory> [--release-channel stable|nightly], or --publish-from-evidence --evidence-dir <directory> --release-serialization-key <shared-cross-version-key> [--release-channel stable|nightly]");
 	}
 }
 const nativePlatformPackages: readonly PublishPackage[] = [
@@ -289,7 +335,7 @@ export function validateNpmRegistryTarballUrl(value: string, label: string): URL
 	return url;
 }
 
-function assertPinnedPackagePublishConfig(manifest: PackageManifest, pkgDir: string): void {
+function assertPinnedPackagePublishConfig(manifest: PackageManifest, pkgDir: string, releaseChannel: ReleaseChannel): void {
 	const publishConfig = manifest.publishConfig;
 	if (publishConfig === undefined) return;
 	if (publishConfig === null || typeof publishConfig !== "object" || Array.isArray(publishConfig)) {
@@ -300,8 +346,9 @@ function assertPinnedPackagePublishConfig(manifest: PackageManifest, pkgDir: str
 		if (typeof config.registry !== "string") throw new Error(`publishConfig.registry for ${pkgDir} must be a string`);
 		validateNpmRegistryUrl(config.registry, `publishConfig.registry for ${pkgDir}`);
 	}
-	if (config.tag !== undefined && config.tag !== NPM_RELEASE_TAG) {
-		throw new Error(`publishConfig.tag for ${pkgDir} must be ${NPM_RELEASE_TAG}`);
+	if (config.tag !== undefined) {
+		if (releaseChannel === "nightly") throw new Error(`publishConfig.tag for ${pkgDir} must be omitted for nightly publication`);
+		if (config.tag !== NPM_RELEASE_TAG) throw new Error(`publishConfig.tag for ${pkgDir} must be ${NPM_RELEASE_TAG}`);
 	}
 }
 
@@ -409,7 +456,7 @@ async function checkTypeDeclarations(): Promise<void> {
 	}
 }
 
-async function preparePackage(pkg: PublishPackage): Promise<PackageManifest> {
+async function preparePackage(pkg: PublishPackage, releaseChannel: ReleaseChannel): Promise<PackageManifest> {
 	const pkgDir = path.join(repoRoot, pkg.dir);
 	let manifest: PackageManifest;
 	if (pkg.kind === "native-platform") {
@@ -424,7 +471,7 @@ async function preparePackage(pkg: PublishPackage): Promise<PackageManifest> {
 		await emitTypeDeclarations(pkg);
 		manifest = await rewriteManifest(pkgDir, pkg.extraFiles ?? []);
 	}
-	assertPinnedPackagePublishConfig(manifest, pkg.dir);
+	assertPinnedPackagePublishConfig(manifest, pkg.dir, releaseChannel);
 	return manifest;
 }
 
@@ -516,12 +563,12 @@ export async function retainTarball(evidenceDirectory: string, record: PackageEv
 	return target;
 }
 
-async function prepareExpectedEvidence(evidenceDirectory: string): Promise<{ path: string; sha256: string }> {
+async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel: ReleaseChannel): Promise<{ path: string; sha256: string }> {
 	assertPublishConfiguration();
 	await assertPinnedNpmConfiguration();
 	const prepared: PreparedPackage[] = [];
 	for (const pkg of packages) {
-		const manifest = await preparePackage(pkg);
+		const manifest = await preparePackage(pkg, releaseChannel);
 		if (manifest.private === true) throw new Error(`Public release package ${pkg.dir} is private after preparation`);
 		prepared.push({ pkg, manifest });
 	}
@@ -537,13 +584,16 @@ async function prepareExpectedEvidence(evidenceDirectory: string): Promise<{ pat
 			throw new Error(`Prepared manifest and retained tarball disagree for ${preparedPackage.pkg.dir}`);
 		}
 		if (releaseVersion === undefined) releaseVersion = record.version;
-		if (record.version !== releaseVersion) throw new Error("All public packages must share one stable release version");
+		if (record.version !== releaseVersion) throw new Error("All public packages must share one exact release version");
 		await retainTarball(evidenceDirectory, record, tarball);
 		packageRecords.push(record);
 	}
 	if (releaseVersion === undefined) throw new Error("No public packages were prepared for release evidence");
+	assertReleaseVersionForChannel(releaseVersion, releaseChannel);
+	const commit = await sourceCommit();
+	assertReleaseSourceBinding(releaseVersion, releaseChannel, commit, commit);
 	const expected = createExpectedEvidence({
-		sourceCommit: await sourceCommit(),
+		sourceCommit: commit,
 		releaseVersion,
 		packages: packageRecords.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0),
 	});
@@ -562,6 +612,94 @@ async function prepareExpectedEvidence(evidenceDirectory: string): Promise<{ pat
 function isMissingRegistryPackage(output: string): boolean {
 	return /\bE404\b|404 Not Found|is not in this registry/iu.test(output);
 }
+export interface RegistryTagSnapshotRecord {
+	name: string;
+	version: string | null;
+}
+
+export interface ReleaseChannelEvidence {
+	schema_version: 1;
+	source_commit: string;
+	release_version: string;
+	release_channel: ReleaseChannel;
+	published_dist_tag: typeof NPM_RELEASE_TAG | typeof NPM_NIGHTLY_TAG;
+	protected_dist_tag: typeof NPM_RELEASE_TAG;
+	protected_before: RegistryTagSnapshotRecord[];
+	protected_after: RegistryTagSnapshotRecord[];
+	invariant: "advanced-to-release-version" | "unchanged";
+}
+
+function validateRegistryTagSnapshot(snapshot: readonly RegistryTagSnapshotRecord[], label: string): RegistryTagSnapshotRecord[] {
+	const expectedNames = PUBLIC_PACKAGE_DEFINITIONS.map(definition => definition.name);
+	if (snapshot.length !== expectedNames.length || snapshot.some((record, index) => record.name !== expectedNames[index])) {
+		throw new Error(`${label} must contain the complete public package set sorted by name`);
+	}
+	for (const record of snapshot) {
+		if (record.version !== null && !stableVersionPattern.test(record.version)) {
+			throw new Error(`${label} ${record.name} must resolve ${NPM_RELEASE_TAG} to stable X.Y.Z or be absent`);
+		}
+	}
+	return snapshot.map(record => ({ ...record }));
+}
+
+export function createReleaseChannelEvidence(input: {
+	sourceCommit: string;
+	releaseVersion: string;
+	releaseChannel: ReleaseChannel;
+	before: readonly RegistryTagSnapshotRecord[];
+	after: readonly RegistryTagSnapshotRecord[];
+}): ReleaseChannelEvidence {
+	assertReleaseSourceBinding(input.releaseVersion, input.releaseChannel, input.sourceCommit, input.sourceCommit);
+	const before = validateRegistryTagSnapshot(input.before, "protected tag snapshot before publication");
+	const after = validateRegistryTagSnapshot(input.after, "protected tag snapshot after publication");
+	if (input.releaseChannel === "nightly") {
+		if (JSON.stringify(before) !== JSON.stringify(after)) {
+			throw new Error(`Nightly publication changed protected npm ${NPM_RELEASE_TAG}`);
+		}
+	} else if (after.some(record => record.version !== input.releaseVersion)) {
+		throw new Error(`Stable publication did not advance every npm ${NPM_RELEASE_TAG} tag to ${input.releaseVersion}`);
+	}
+	return {
+		schema_version: 1,
+		source_commit: input.sourceCommit,
+		release_version: input.releaseVersion,
+		release_channel: input.releaseChannel,
+		published_dist_tag: releasePolicy(input.releaseChannel).npmTag,
+		protected_dist_tag: NPM_RELEASE_TAG,
+		protected_before: before,
+		protected_after: after,
+		invariant: input.releaseChannel === "nightly" ? "unchanged" : "advanced-to-release-version",
+	};
+}
+
+async function observeRegistryTagSnapshot(
+	records: readonly PackageEvidenceRecord[],
+	npmTag: typeof NPM_RELEASE_TAG,
+): Promise<RegistryTagSnapshotRecord[]> {
+	const snapshot: RegistryTagSnapshotRecord[] = [];
+	for (const record of records) {
+		const view = await $`npm view ${`${record.name}@${npmTag}`} version --json --registry=${NPM_REGISTRY_URL} --tag=${npmTag}`.quiet().nothrow();
+		const output = outputOf(view);
+		if (view.exitCode !== 0) {
+			if (isMissingRegistryPackage(output)) {
+				snapshot.push({ name: record.name, version: null });
+				continue;
+			}
+			throw new Error(`npm view failed for protected ${npmTag} ${record.name}: ${output || `exit ${view.exitCode ?? "unknown"}`}`);
+		}
+		let version: unknown;
+		try {
+			version = JSON.parse(view.stdout.toString()) as unknown;
+		} catch {
+			throw new Error(`npm view returned invalid protected ${npmTag} JSON for ${record.name}`);
+		}
+		if (typeof version !== "string" || !stableVersionPattern.test(version)) {
+			throw new Error(`npm view returned non-stable protected ${npmTag} version for ${record.name}`);
+		}
+		snapshot.push({ name: record.name, version });
+	}
+	return snapshot;
+}
 
 function parseRegistryDist(value: unknown, packageName: string): { integrity: string; tarball: string } {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -578,15 +716,15 @@ function parseRegistryDist(value: unknown, packageName: string): { integrity: st
 	return { integrity: dist.integrity, tarball: dist.tarball };
 }
 
-function parseLatestRegistryDist(value: unknown, packageName: string): { version: string; dist: { integrity: string; tarball: string } } {
+function parseTaggedRegistryDist(value: unknown, packageName: string, npmTag: string): { version: string; dist: { integrity: string; tarball: string } } {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
-		throw new Error(`npm view returned invalid latest metadata for ${packageName}`);
+		throw new Error(`npm view returned invalid ${npmTag} metadata for ${packageName}`);
 	}
-	const latest = value as Record<string, unknown>;
-	if (typeof latest.version !== "string" || latest.dist === undefined) {
-		throw new Error(`npm view returned incomplete latest metadata for ${packageName}`);
+	const tagged = value as Record<string, unknown>;
+	if (typeof tagged.version !== "string" || tagged.dist === undefined) {
+		throw new Error(`npm view returned incomplete ${npmTag} metadata for ${packageName}`);
 	}
-	return { version: latest.version, dist: parseRegistryDist(latest.dist, `${packageName}@${NPM_RELEASE_TAG}`) };
+	return { version: tagged.version, dist: parseRegistryDist(tagged.dist, `${packageName}@${npmTag}`) };
 }
 
 function assertContentLengthWithinLimit(response: Response, maxCompressedBytes: number): void {
@@ -655,37 +793,47 @@ export async function downloadNpmRegistryTarball(
 	}
 }
 
-async function observeLatestRegistryPackage(record: PackageEvidenceRecord): Promise<{ version: string; dist: { integrity: string; tarball: string } } | undefined> {
-	const latestView = await $`npm view ${`${record.name}@${NPM_RELEASE_TAG}`} version dist --json --registry=${NPM_REGISTRY_URL} --tag=${NPM_RELEASE_TAG}`.quiet().nothrow();
-	const latestOutput = outputOf(latestView);
-	if (latestView.exitCode !== 0) {
-		if (isMissingRegistryPackage(latestOutput)) return undefined;
-		throw new Error(`npm view failed for stable ${NPM_RELEASE_TAG} ${record.name}: ${latestOutput || `exit ${latestView.exitCode ?? "unknown"}`}`);
+async function observeTaggedRegistryPackage(
+	record: PackageEvidenceRecord,
+	policy: ReleasePolicy,
+): Promise<{ version: string; dist: { integrity: string; tarball: string } } | undefined> {
+	const taggedView = await $`npm view ${`${record.name}@${policy.npmTag}`} version dist --json --registry=${NPM_REGISTRY_URL} --tag=${policy.npmTag}`.quiet().nothrow();
+	const taggedOutput = outputOf(taggedView);
+	if (taggedView.exitCode !== 0) {
+		if (isMissingRegistryPackage(taggedOutput)) return undefined;
+		throw new Error(`npm view failed for ${policy.channel} ${policy.npmTag} ${record.name}: ${taggedOutput || `exit ${taggedView.exitCode ?? "unknown"}`}`);
 	}
-	let latestValue: unknown;
+	let taggedValue: unknown;
 	try {
-		latestValue = JSON.parse(latestView.stdout.toString()) as unknown;
+		taggedValue = JSON.parse(taggedView.stdout.toString()) as unknown;
 	} catch {
-		throw new Error(`npm view returned invalid latest JSON for ${record.name}`);
+		throw new Error(`npm view returned invalid ${policy.npmTag} JSON for ${record.name}`);
 	}
-	const latest = parseLatestRegistryDist(latestValue, record.name);
-	if (compareStableVersions(record.version, latest.version) < 0) {
-		throw new Error(`Refusing ${record.name}@${record.version}: current stable ${NPM_RELEASE_TAG} is newer at ${latest.version}`);
+	const tagged = parseTaggedRegistryDist(taggedValue, record.name, policy.npmTag);
+	const targetIsOlder = policy.channel === "stable"
+		? compareStableVersions(record.version, tagged.version) < 0
+		: Bun.semver.order(record.version, tagged.version) < 0;
+	if (targetIsOlder) {
+		throw new Error(`Refusing ${record.name}@${record.version}: current ${policy.channel} ${policy.npmTag} is newer at ${tagged.version}`);
 	}
-	return latest;
+	return tagged;
 }
 
-async function observeRegistryPackage(record: PackageEvidenceRecord, retainedTarball: Buffer): Promise<RegistryPackageObservation | undefined> {
+async function observeRegistryPackage(
+	record: PackageEvidenceRecord,
+	retainedTarball: Buffer,
+	policy: ReleasePolicy,
+): Promise<RegistryPackageObservation | undefined> {
 	const specifier = `${record.name}@${record.version}`;
-	// Read current latest before target-version absence can authorize any mutation.
-	const latest = await observeLatestRegistryPackage(record);
-	const view = await $`npm view ${specifier} dist --json --registry=${NPM_REGISTRY_URL} --tag=${NPM_RELEASE_TAG}`.quiet().nothrow();
+	// Read the selected dist-tag before target-version absence can authorize mutation.
+	const tagged = await observeTaggedRegistryPackage(record, policy);
+	const view = await $`npm view ${specifier} dist --json --registry=${NPM_REGISTRY_URL} --tag=${policy.npmTag}`.quiet().nothrow();
 	const viewOutput = outputOf(view);
 	if (view.exitCode !== 0) {
 		if (isMissingRegistryPackage(viewOutput)) return undefined;
 		throw new Error(`npm view failed for ${specifier}: ${viewOutput || `exit ${view.exitCode ?? "unknown"}`}`);
 	}
-	if (latest === undefined) throw new Error(`stable ${NPM_RELEASE_TAG} is absent although ${specifier} exists`);
+	if (tagged === undefined) throw new Error(`${policy.channel} ${policy.npmTag} tag is absent although ${specifier} exists`);
 	let distValue: unknown;
 	try {
 		distValue = JSON.parse(view.stdout.toString()) as unknown;
@@ -696,8 +844,8 @@ async function observeRegistryPackage(record: PackageEvidenceRecord, retainedTar
 	if (dist.integrity !== record.expected_sri) {
 		throw new Error(`npm view integrity for ${specifier} conflicts with immutable expected evidence`);
 	}
-	if (latest.version !== record.version || latest.dist.integrity !== dist.integrity || latest.dist.tarball !== dist.tarball) {
-		throw new Error(`stable ${NPM_RELEASE_TAG} for ${record.name} does not identify immutable expected evidence`);
+	if (tagged.version !== record.version || tagged.dist.integrity !== dist.integrity || tagged.dist.tarball !== dist.tarball) {
+		throw new Error(`${policy.channel} ${policy.npmTag} for ${record.name} does not identify immutable expected evidence`);
 	}
 
 	const registryTarball = await downloadNpmRegistryTarball(dist.tarball, record.expected_sri);
@@ -711,7 +859,7 @@ async function observeRegistryPackage(record: PackageEvidenceRecord, retainedTar
 		registry_tarball_sha512: createHash("sha512").update(registryTarball).digest("hex"),
 		registry_manifest_sha256: createHash("sha256").update(registryInspection.manifestBytes).digest("hex"),
 		registry_internal_dependencies: registryInspection.manifest.internalDependencies,
-		registry_latest_version: latest.version,
+		registry_latest_version: tagged.version,
 	};
 	const status = classifyRegistryObservation(record, observation);
 	if (status === "conflict") throw new Error(`Published ${specifier} conflicts with immutable expected evidence; release a newer version`);
@@ -753,13 +901,15 @@ export async function readRetainedTarball(record: PackageEvidenceRecord, tarball
 	}
 }
 
-function assertExactRegistryObservation(record: PackageEvidenceRecord, observation: RegistryPackageObservation): void {
-	const latestVersion = observation.registry_latest_version;
-	if (latestVersion === undefined) {
-		throw new Error(`Registry latest observation is missing for ${record.name}@${record.version}`);
+function assertExactRegistryObservation(record: PackageEvidenceRecord, observation: RegistryPackageObservation, policy: ReleasePolicy): void {
+	const taggedVersion = observation.registry_latest_version;
+	if (taggedVersion === undefined) {
+		throw new Error(`Registry ${policy.npmTag} observation is missing for ${record.name}@${record.version}`);
 	}
-	assertMonotonicLatestVersion(record.version, latestVersion, `stable ${NPM_RELEASE_TAG} for ${record.name}`);
-	if (latestVersion !== record.version || classifyRegistryObservation(record, observation) !== "skip") {
+	if (policy.channel === "stable") {
+		assertMonotonicLatestVersion(record.version, taggedVersion, `stable ${policy.npmTag} for ${record.name}`);
+	}
+	if (taggedVersion !== record.version || classifyRegistryObservation(record, observation) !== "skip") {
 		throw new Error(`Published ${record.name}@${record.version} conflicts with immutable expected evidence; release a newer version`);
 	}
 }
@@ -781,54 +931,52 @@ interface PublishRetainedPackageOperations {
 export async function publishRetainedPackage(
 	record: PackageEvidenceRecord,
 	tarballPath: string,
-	operations: PublishRetainedPackageOperations = {
+	operations?: PublishRetainedPackageOperations,
+	releaseChannel: ReleaseChannel = "stable",
+): Promise<RegistryPackageObservation> {
+	const policy = releasePolicy(releaseChannel);
+	const activeOperations: PublishRetainedPackageOperations = operations ?? {
 		readTarball: readRetainedTarball,
-		observe: observeRegistryPackage,
+		observe: async (candidate, retainedTarball) => observeRegistryPackage(candidate, retainedTarball, policy),
 		publish: async (candidateTarballPath) => {
-			const result = await $`npm publish ${candidateTarballPath} --access public --registry=${NPM_REGISTRY_URL} --tag=${NPM_RELEASE_TAG}`.quiet().nothrow();
+			const result = await $`npm publish ${candidateTarballPath} --access public --registry=${NPM_REGISTRY_URL} --tag=${policy.npmTag}`.quiet().nothrow();
 			return { exitCode: result.exitCode, output: outputOf(result) };
 		},
-	},
-): Promise<RegistryPackageObservation> {
-	const retainedTarball = await operations.readTarball(record, tarballPath);
+	};
+	const retainedTarball = await activeOperations.readTarball(record, tarballPath);
 	validateExpectedTarball(record, retainedTarball);
 
-	const existing = await operations.observe(record, retainedTarball);
+	const existing = await activeOperations.observe(record, retainedTarball);
 	if (existing !== undefined) {
-		assertExactRegistryObservation(record, existing);
+		assertExactRegistryObservation(record, existing, policy);
 		console.log(`Skipping ${record.name}@${record.version} (registry bytes match expected evidence)`);
 		return existing;
 	}
 	console.log(`Publishing retained ${record.name}@${record.version}…`);
-	const publish = await operations.publish(tarballPath);
+	const publish = await activeOperations.publish(tarballPath);
 	if (publish.exitCode !== 0) {
-		const raced = await operations.observe(record, retainedTarball);
+		const raced = await activeOperations.observe(record, retainedTarball);
 		if (raced !== undefined) {
-			assertExactRegistryObservation(record, raced);
+			assertExactRegistryObservation(record, raced, policy);
 			console.log(`Skipping ${record.name}@${record.version} (concurrent exact publication)`);
 			return raced;
 		}
 		throw new Error(`npm publish failed for ${record.name}@${record.version}: ${publish.output || `exit ${publish.exitCode ?? "unknown"}`}`);
 	}
 	// npm's registry is read-after-write eventually consistent: right after a successful
-	// publish the version can be briefly invisible to a follow-up read AND the `latest`
-	// dist-tag can briefly lag behind the just-published version. Both resolve within
-	// seconds, so re-observe with bounded backoff before treating either as a failure.
-	// Real conflicts (integrity/byte mismatch) are rethrown immediately, never retried.
-	const retries = operations.visibilityRetries ?? 12;
-	const delayMs = operations.visibilityDelayMs ?? 5000;
-	const sleep = operations.sleep ?? ((ms: number) => Bun.sleep(ms));
+	// publish the version can be briefly invisible and the selected dist-tag can lag.
+	// Re-observe with bounded backoff; byte or integrity conflicts fail immediately.
+	const retries = activeOperations.visibilityRetries ?? 12;
+	const delayMs = activeOperations.visibilityDelayMs ?? 5000;
+	const sleep = activeOperations.sleep ?? ((ms: number) => Bun.sleep(ms));
 	const isTransientVisibilityError = (error: unknown): boolean => {
 		const message = error instanceof Error ? error.message : String(error);
-		return (
-			message.includes(`does not identify immutable expected evidence`) ||
-			message.includes(`stable ${NPM_RELEASE_TAG} is absent although`)
-		);
+		return message.includes("does not identify immutable expected evidence") || message.includes("tag is absent although");
 	};
 	let observed: RegistryPackageObservation | undefined;
 	for (let attempt = 0; ; attempt++) {
 		try {
-			observed = await operations.observe(record, retainedTarball);
+			observed = await activeOperations.observe(record, retainedTarball);
 		} catch (error) {
 			if (attempt < retries && isTransientVisibilityError(error)) {
 				await sleep(delayMs);
@@ -840,7 +988,7 @@ export async function publishRetainedPackage(
 		await sleep(delayMs);
 	}
 	if (observed === undefined) throw new Error(`Registry did not expose ${record.name}@${record.version} after publish`);
-	assertExactRegistryObservation(record, observed);
+	assertExactRegistryObservation(record, observed, policy);
 	return observed;
 }
 
@@ -935,12 +1083,14 @@ export async function publishExpectedEvidencePackages<T>(
 export async function reobserveExpectedEvidencePackages(
 	records: readonly PackageEvidenceRecord[],
 	observeRecord: (record: PackageEvidenceRecord) => Promise<RegistryPackageObservation | undefined>,
+	releaseChannel: ReleaseChannel = "stable",
 ): Promise<Record<string, RegistryPackageObservation>> {
+	const policy = releasePolicy(releaseChannel);
 	const observations: Record<string, RegistryPackageObservation> = {};
 	for (const record of planExpectedEvidencePublication(records)) {
 		const observation = await observeRecord(record);
 		if (observation === undefined) throw new Error(`Registry did not expose ${record.name}@${record.version} during final evidence sweep`);
-		assertExactRegistryObservation(record, observation);
+		assertExactRegistryObservation(record, observation, policy);
 		observations[record.name] = observation;
 	}
 	return observations;
@@ -948,9 +1098,8 @@ export async function reobserveExpectedEvidencePackages(
 
 
 /**
- * The caller must hold the same external serialization guard for every stable
- * npm release. Version-scoped guards are rejected because they cannot prevent
- * two releases from racing the shared npm latest tag.
+ * The caller must hold the same external serialization guard for every release
+ * sharing one npm dist-tag. Version-scoped guards cannot prevent tag races.
  */
 export function assertReleaseSerializationGuard(releaseSerializationKey: string, releaseVersion: string): void {
 	if (!releaseSerializationKeyPattern.test(releaseSerializationKey)) {
@@ -961,23 +1110,38 @@ export function assertReleaseSerializationGuard(releaseSerializationKey: string,
 	}
 }
 
-async function publishFromExpectedEvidence(evidenceDirectory: string, releaseSerializationKey: string): Promise<void> {
+async function publishFromExpectedEvidence(evidenceDirectory: string, releaseSerializationKey: string, releaseChannel: ReleaseChannel): Promise<void> {
 	assertPublishConfiguration();
 	await assertPinnedNpmConfiguration();
 	const expectedPath = path.join(evidenceDirectory, EXPECTED_EVIDENCE_FILE);
 	const expectedAsset = await readExpectedEvidenceFile(expectedPath);
+	assertReleaseVersionForChannel(expectedAsset.value.release_version, releaseChannel);
+	const checkedOutCommit = await sourceCommit();
+	assertReleaseSourceBinding(expectedAsset.value.release_version, releaseChannel, expectedAsset.value.source_commit, checkedOutCommit);
+	const protectedBefore = await observeRegistryTagSnapshot(expectedAsset.value.packages, NPM_RELEASE_TAG);
+	const policy = releasePolicy(releaseChannel);
 	assertReleaseSerializationGuard(releaseSerializationKey, expectedAsset.value.release_version);
 	await publishExpectedEvidencePackages(expectedAsset.value.packages, async (record) => {
 		const tarballPath = path.join(evidenceDirectory, "tarballs", `${record.tarball_sha512}.tgz`);
-		return publishRetainedPackage(record, tarballPath);
+		return publishRetainedPackage(record, tarballPath, undefined, releaseChannel);
 	});
 	const observations = await reobserveExpectedEvidencePackages(expectedAsset.value.packages, async (record) => {
 		const tarballPath = path.join(evidenceDirectory, "tarballs", `${record.tarball_sha512}.tgz`);
-		return observeRegistryPackage(record, await readRetainedTarball(record, tarballPath));
+		return observeRegistryPackage(record, await readRetainedTarball(record, tarballPath), policy);
+	}, releaseChannel);
+	const protectedAfter = await observeRegistryTagSnapshot(expectedAsset.value.packages, NPM_RELEASE_TAG);
+	const channelEvidence = createReleaseChannelEvidence({
+		sourceCommit: checkedOutCommit,
+		releaseVersion: expectedAsset.value.release_version,
+		releaseChannel,
+		before: protectedBefore,
+		after: protectedAfter,
 	});
 	const final = createFinalEvidence(expectedAsset.value, expectedAsset.sha256, observations);
 	const finalPath = path.join(evidenceDirectory, FINAL_EVIDENCE_FILE);
 	const finalDigest = await writeImmutableEvidence(finalPath, final);
+	const channelEvidencePath = path.join(evidenceDirectory, RELEASE_CHANNEL_EVIDENCE_FILE);
+	const channelEvidenceDigest = await writeImmutableBytes(channelEvidencePath, canonicalJsonBytes(channelEvidence));
 	console.log(JSON.stringify({
 		ok: true,
 		phase: "final-evidence",
@@ -986,6 +1150,8 @@ async function publishFromExpectedEvidence(evidenceDirectory: string, releaseSer
 		final_evidence: finalPath,
 		final_evidence_sha256: finalDigest,
 		verified_packages: final.packages.length,
+		channel_evidence: channelEvidencePath,
+		channel_evidence_sha256: channelEvidenceDigest,
 	}));
 }
 
@@ -1024,10 +1190,10 @@ async function main(): Promise<void> {
 	}
 	await checkTypeDeclarations();
 	if (command.mode === "prepare-evidence") {
-		await prepareExpectedEvidence(command.evidenceDir);
+		await prepareExpectedEvidence(command.evidenceDir, command.releaseChannel);
 		return;
 	}
-	await publishFromExpectedEvidence(command.evidenceDir, command.releaseSerializationKey);
+	await publishFromExpectedEvidence(command.evidenceDir, command.releaseSerializationKey, command.releaseChannel);
 }
 
 if (import.meta.main) {

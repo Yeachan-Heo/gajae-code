@@ -146,6 +146,37 @@ describe("OpenAI Codex responses tool choice capability", () => {
 		expectSingleCleanFallbackEvents(events);
 	});
 
+	it("keeps an initial HTTP downgrade across a later provider retry", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const testModel = model({ id: "runtime-codex-http-sticky-downgrade" });
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+				if (bodies.length === 1) {
+					return createErrorResponse("Tool choice 'search' not found in 'tools' parameter.");
+				}
+				if (bodies.length === 2) {
+					return createSseResponse([{ type: "error", code: "server_error", message: "retry me" }]);
+				}
+				return okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICodexResponses(testModel, testContext, {
+			apiKey: codexToken,
+			preferWebsockets: false,
+			toolChoice: { type: "function", function: { name: "search" } },
+			streamMaxRetries: 1,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(3);
+		expect(bodies[0]?.tool_choice).toEqual({ type: "function", name: "search" });
+		expect(bodies[1]?.tool_choice).toBeUndefined();
+		expect(bodies[2]?.tool_choice).toBeUndefined();
+		expect(getToolChoiceCapabilityOverride(testModel)).toBe("auto");
+	});
 	it("retries once when a Codex SSE error rejects a named tool choice", async () => {
 		const bodies: Record<string, unknown>[] = [];
 		const testModel = model({ id: "runtime-codex-sse" });
@@ -185,6 +216,65 @@ describe("OpenAI Codex responses tool choice capability", () => {
 		expect(bodies[1]?.prompt_cache_key).toBe(bodies[0]?.prompt_cache_key);
 		expect(getToolChoiceCapabilityOverride(testModel)).toBe("auto");
 		expectSingleCleanFallbackEvents(events);
+	});
+	it("keeps the downgraded SSE body across a later provider retry", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const testModel = model({ id: "runtime-codex-sticky-downgrade" });
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+				if (bodies.length === 1) return statuslessToolChoiceError("search");
+				if (bodies.length === 2) {
+					return createSseResponse([{ type: "error", code: "server_error", message: "retry me" }]);
+				}
+				return okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICodexResponses(testModel, testContext, {
+			apiKey: codexToken,
+			preferWebsockets: false,
+			toolChoice: { type: "function", function: { name: "search" } },
+			streamMaxRetries: 1,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(3);
+		expect(bodies[0]?.tool_choice).toEqual({ type: "function", name: "search" });
+		expect(bodies[1]?.tool_choice).toBeUndefined();
+		expect(bodies[2]?.tool_choice).toBeUndefined();
+		expect(getToolChoiceCapabilityOverride(testModel)).toBe("auto");
+	});
+
+	it("allows the tool-choice fallback after an unrelated provider retry", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const testModel = model({ id: "runtime-codex-retry-then-downgrade" });
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+				if (bodies.length === 1) {
+					return createSseResponse([{ type: "error", code: "server_error", message: "retry me" }]);
+				}
+				if (bodies.length === 2) return statuslessToolChoiceError("search");
+				return okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICodexResponses(testModel, testContext, {
+			apiKey: codexToken,
+			preferWebsockets: false,
+			toolChoice: { type: "function", function: { name: "search" } },
+			streamMaxRetries: 1,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(3);
+		expect(bodies[0]?.tool_choice).toEqual({ type: "function", name: "search" });
+		expect(bodies[1]?.tool_choice).toEqual({ type: "function", name: "search" });
+		expect(bodies[2]?.tool_choice).toBeUndefined();
+		expect(getToolChoiceCapabilityOverride(testModel)).toBe("auto");
 	});
 
 	it("does not retry a statusless SSE error in managed mode", async () => {

@@ -2,11 +2,20 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as natives from "@gajae-code/natives";
+
+import type * as natives from "@gajae-code/natives";
+
 import { getWorktreeDir, hashPath, logger, Snowflake } from "@gajae-code/utils";
 import * as git from "../utils/git";
 
-const { IsoBackendKind } = natives;
+let nativeWorktreeBindings: typeof import("@gajae-code/natives") | undefined;
+
+function nativeWorktree(): typeof import("@gajae-code/natives") {
+	if (!nativeWorktreeBindings)
+		nativeWorktreeBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	return nativeWorktreeBindings;
+}
+
 type IsoBackendKind = natives.IsoBackendKind;
 
 /** Baseline state for a single git repository. */
@@ -337,6 +346,7 @@ export type TaskIsolationMode =
  * pick). Anything else returns the matching kind.
  */
 export function parseIsolationMode(mode: TaskIsolationMode): IsoBackendKind | undefined {
+	const { IsoBackendKind } = nativeWorktree();
 	switch (mode) {
 		case "none":
 		case "auto":
@@ -393,6 +403,7 @@ export async function ensureIsolation(
 	const repoRoot = await getRepoRoot(baseCwd);
 	const baseDir = getWorktreeDir(`${id}-${hashPath(repoRoot)}`);
 	const mergedDir = path.join(baseDir, "merged");
+	const natives = nativeWorktree();
 
 	const resolution = natives.isoResolve(preferred ?? null);
 	const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
@@ -423,6 +434,7 @@ export async function ensureIsolation(
 
 /** Tear down a handle returned by {@link ensureIsolation}. */
 export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+	const natives = nativeWorktree();
 	try {
 		try {
 			await natives.isoStop(handle.backend, handle.mergedDir);

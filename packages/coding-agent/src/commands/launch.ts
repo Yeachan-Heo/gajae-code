@@ -4,7 +4,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { THINKING_EFFORTS } from "@gajae-code/ai";
+import { THINKING_EFFORTS } from "@gajae-code/ai/core";
 import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { parseArgs } from "../cli/args";
@@ -107,6 +107,13 @@ export default class Index extends Command {
 		}),
 		"mcp-config": Flags.string({
 			description: "Tools-only MCP config file (absolute path)",
+		}),
+		"clipboard-transport": Flags.string({
+			description: "Clipboard transport: auto (default), native, osc52, or ssh",
+			options: ["auto", "native", "osc52", "ssh"],
+		}),
+		"clipboard-ssh-host": Flags.string({
+			description: "SSH host alias for --clipboard-transport ssh (from ~/.ssh/config)",
 		}),
 		"allow-home": Flags.boolean({
 			description: "Allow starting in ~ without auto-switching to a temp dir",

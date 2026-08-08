@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
-import type { Message, TextContent } from "@gajae-code/ai";
+import type { Message, TextContent } from "@gajae-code/ai/core";
 import { type SessionContext, transferSessionMessageIdentity } from "../session/session-manager";
 import { compileSecretRegex } from "./regex";
 

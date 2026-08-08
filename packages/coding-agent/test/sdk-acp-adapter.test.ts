@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { AcpSdkAdapter, type AcpSdkAdapterError } from "../src/sdk/acp";
+import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 
 class FakeSdkClient {
 	connectionId = "acp-connection";
@@ -229,6 +230,56 @@ test("ACP reverse dispatch requires exact current lease ownership and rejects in
 				result: { selected: "yes" },
 			},
 		]);
+	} finally {
+		await adapter.close();
+	}
+});
+test("ACP reverse responses reject an inner result below the cap when its frame exceeds the transport limit", async () => {
+	const sdk = new FakeSdkClient();
+	const emptyResultBytes = Buffer.byteLength(JSON.stringify({ value: "" }));
+	const result = { value: "x".repeat(MAX_REVERSE_PAYLOAD_BYTES - emptyResultBytes - 1) };
+	expect(Buffer.byteLength(JSON.stringify(result))).toBe(MAX_REVERSE_PAYLOAD_BYTES - 1);
+	expect(
+		Buffer.byteLength(
+			JSON.stringify({
+				type: "reverse_response",
+				id: "near-frame-limit",
+				connectionId: sdk.connectionId,
+				leaseId: "lease-1",
+				ok: true,
+				result,
+			}),
+		),
+	).toBeGreaterThan(MAX_REVERSE_PAYLOAD_BYTES);
+	const adapter = new AcpSdkAdapter({
+		url: "ws://unused",
+		token: "secret",
+		client: sdk as never,
+		providers: [{ capability: "terminal", definitions: [] }],
+		connection: { request: async () => result },
+	});
+	await adapter.start();
+	try {
+		sdk.emit({
+			type: "reverse_request",
+			id: "near-frame-limit",
+			connectionId: sdk.connectionId,
+			capability: "terminal",
+			leaseId: "lease-1",
+			payload: { method: "terminal.output", payload: {} },
+		});
+		await waitFor(
+			() => sdk.frames.some(frame => frame.type === "reverse_response" && frame.id === "near-frame-limit"),
+			"oversized reverse response rejection",
+		);
+		expect(sdk.frames.find(frame => frame.type === "reverse_response" && frame.id === "near-frame-limit")).toEqual({
+			type: "reverse_response",
+			id: "near-frame-limit",
+			connectionId: sdk.connectionId,
+			leaseId: "lease-1",
+			ok: false,
+			error: { code: "payload_too_large", message: "payload_too_large" },
+		});
 	} finally {
 		await adapter.close();
 	}

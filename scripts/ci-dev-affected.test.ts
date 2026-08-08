@@ -675,6 +675,48 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		// Native build tasks never appear as shards.
 		expect(matrix.include.every((shard: { key: string }) => shard.key !== "native-linux-x64")).toBe(true);
 	});
+
+	test("--matrix-json excludes the legacy native producer from docs-only shards", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-docs-matrix-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+
+		const { stdout, exitCode } = await runScript(["--matrix-json"], "docs/acp-local-development.md", {
+			GITHUB_EVENT_NAME: "pull_request",
+			CI_DEV_PLAN_MODE: "pr",
+			GITHUB_OUTPUT: outputFile,
+		});
+		expect(exitCode).toBe(0);
+		expect((JSON.parse(stdout.trim()) as Array<{ key: string }>).map(entry => entry.key)).toEqual([
+			"test:packages/coding-agent/test/docs-index-lazy.test.ts",
+			"native-linux-x64",
+		]);
+
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain("has_tasks=true");
+		expect(output).toContain("has_native=true");
+		const planDigest = output.split("\n").find(line => line.startsWith("plan_digest="))?.slice("plan_digest=".length);
+		const planSourceSha = output.split("\n").find(line => line.startsWith("plan_source_sha="))?.slice("plan_source_sha=".length);
+		expect(planDigest).toBeDefined();
+		expect(planSourceSha).toBe(sourceSha);
+		const matrix = JSON.parse((output.split("\n").find(line => line.startsWith("matrix=")) ?? "matrix={}").slice("matrix=".length)) as {
+			include: Array<{ key: string; identity: string }>;
+		};
+		expect(matrix.include.map(entry => entry.key)).toEqual(["test:packages/coding-agent/test/docs-index-lazy.test.ts"]);
+
+		const receiptDir = path.join(tempDir, "receipts");
+		await fs.mkdir(receiptDir);
+		for (const [index, entry] of matrix.include.entries()) {
+			await Bun.write(path.join(receiptDir, `${index}.json`), JSON.stringify({ key: entry.key, identity: entry.identity }));
+		}
+		const validation = await runScript(["--validate-shard-receipts"], "", {
+			CI_DEV_AFFECTED_PLAN: path.join(repoRoot, ".ci-dev-affected-plan.json"),
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+			CI_DEV_PLAN_DIGEST: planDigest,
+			CI_DEV_PLAN_SOURCE_SHA: planSourceSha,
+		});
+		expect(validation.exitCode).toBe(0);
+	});
 	test("CI_FORCE_FULL emits Python work outside the shard matrix", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-python-full-"));
 		tempDirs.push(tempDir);
@@ -805,6 +847,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/ai", "test:@gajae-code/ai",
 			"check:@gajae-code/coding-agent",
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
+			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
 			"check:@gajae-code/stats", "test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
@@ -1002,8 +1045,9 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
 	});
 
-	test("SDK host and coordinator prompt-control changes include only coding-agent shard 1", () => {
+	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
 		const shardOne = "test:@gajae-code/coding-agent:shard-1-of-8";
+		const isolated = "test:@gajae-code/coding-agent:sdk-production-host-isolated";
 		for (const changedPath of [
 			"packages/coding-agent/src/sdk/bus/index.ts",
 			"packages/coding-agent/src/sdk/host/reverse-leases.ts",
@@ -1016,6 +1060,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			expect(keys).toContain(shardOne);
 			expect(tasks.find(task => task.key === shardOne)?.command).toEqual(["bun", "test", "--shard=1/8"]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
+			expect(keys).toContain(isolated);
+			expect(tasks.find(task => task.key === isolated)?.command).toEqual([
+				"bun",
+				"test",
+				"test/sdk-chat-daemon-worker.test.ts",
+				"-t",
+				"routes Slack safe queries through the production Session SDK host",
+			]);
 		}
 	});
 
@@ -1024,6 +1076,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("check:@gajae-code/coding-agent");
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
+		expect(keys).toContain("test:@gajae-code/coding-agent:sdk-production-host-isolated");
 		expect(keys).not.toContain("test:packages/coding-agent/test/sdk/index.test.ts");
 		expect(keys).not.toContain("test:packages/coding-agent/test/other/index.test.ts");
 		expect(describeTasks(tasks).find(entry => entry.key === "check:@gajae-code/coding-agent")).toMatchObject({
@@ -1158,6 +1211,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("native path identity changes select the POSIX regression suite", () => {
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");
+	});
+	test("clean core changes select the clean script test alongside root tooling fallback", () => {
+		const keys = targeted(["scripts/clean-core.ts"]).map(task => task.key);
+		expect(keys).toContain("test:scripts/clean.test.ts");
+		expect(keys).toContain("root-check");
 	});
 	test("cache-eval evidence artifact adds its focused AI test without bypassing root fallback coverage", () => {
 		const tasks = targeted(["artifacts/architecture-2383-eval.json"]);
@@ -1541,6 +1599,7 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		// Default coding-agent shard count stays 8 (dev parity).
 		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
+		expect(keys).toContain("test:@gajae-code/coding-agent:sdk-production-host-isolated");
 		// Default rust-test stays a single unpartitioned task.
 		expect(keys).toContain("rust-test");
 		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
@@ -1556,6 +1615,17 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		const runtimeCheck = tasks.find(task => task.key === "runtime-check");
 		expect(runtimeCheck?.command).toEqual(["bun", "run", "check:runtime"]);
 		expect(runtimeCheck?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
+		const isolatedSdkHost = tasks.find(
+			task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated",
+		);
+		expect(isolatedSdkHost?.command).toEqual([
+			"bun",
+			"test",
+			"test/sdk-chat-daemon-worker.test.ts",
+			"-t",
+			"routes Slack safe queries through the production Session SDK host",
+		]);
+		expect(isolatedSdkHost?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
 	});
 
 	test("CI_CODING_AGENT_TEST_SHARDS overrides the coding-agent shard count", () => {

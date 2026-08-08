@@ -1,4 +1,4 @@
-import { type Api, getBundledModels, getBundledProviders, type Model } from "@gajae-code/ai";
+import { type Api, getBundledModels, getBundledProviders, type Model } from "@gajae-code/ai/core";
 
 export type CanonicalModelSource = "override" | "bundled" | "heuristic" | "fallback";
 

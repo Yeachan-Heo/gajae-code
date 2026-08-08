@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
@@ -134,7 +134,7 @@ import {
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
-} from "../../tools";
+} from "../../tools/implementations";
 import { copyToClipboard } from "../../utils/clipboard";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
@@ -1999,8 +1999,8 @@ export class SelectorController {
 			return { component: selector, focus: selector.getSelectList() };
 		});
 	}
-	showHistorySearch(): void {
-		const historyStorage = this.ctx.historyStorage;
+	async showHistorySearch(): Promise<void> {
+		const historyStorage = await this.ctx.ensureHistoryStorage();
 		if (!historyStorage) return;
 
 		this.showSelector(done => {

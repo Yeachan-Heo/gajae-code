@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "bu
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import type { ModelRegistry, ProviderDiscoveryState } from "@gajae-code/coding-agent/config/model-registry";
 import { ModelRegistry as ModelRegistryImpl } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -84,7 +85,7 @@ describe("issue #970 custom provider discovery", () => {
 		}
 	});
 
-	test("discovers custom openai-compatible models and lets YAML models override discovered fields", async () => {
+	test("preserves same-id YAML fields and discovered-only model overrides", async () => {
 		fs.writeFileSync(
 			modelsPath,
 			[
@@ -101,6 +102,11 @@ describe("issue #970 custom provider discovery", () => {
 				"        name: Qwen3.6",
 				"        contextWindow: 128000",
 				"        maxTokens: 8192",
+				"    modelOverrides:",
+				"      issue-3954-override-context:",
+				"        contextWindow: 64000",
+				"      issue-3954-override-max:",
+				"        maxTokens: 4096",
 			].join("\n"),
 		);
 
@@ -112,17 +118,32 @@ describe("issue #970 custom provider discovery", () => {
 			const headers = init?.headers as Headers | Record<string, string> | undefined;
 			const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
 			expect(authHeader).toBe("Bearer sk-1234");
-			return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }, { id: "deepseek-r1" }] }), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
+			return new Response(
+				JSON.stringify({
+					data: [
+						{ id: "qwen3.6", context_length: 256000 },
+						{ id: "issue-3954-override-context", context_length: 512000 },
+						{ id: "issue-3954-override-max", context_length: 384000 },
+						{ id: "issue-3954-uncatalogued" },
+					],
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			);
 		});
 
 		const registry = new ModelRegistryImpl(authStorage, modelsPath);
 		await registry.refreshProvider("vllm");
 
 		const providerModels = registry.getAll().filter(model => model.provider === "vllm");
-		expect(providerModels.map(model => model.id).sort()).toEqual(["deepseek-r1", "qwen3.6"]);
+		expect(providerModels.map(model => model.id).sort()).toEqual([
+			"issue-3954-override-context",
+			"issue-3954-override-max",
+			"issue-3954-uncatalogued",
+			"qwen3.6",
+		]);
 		expect(registry.getProviderDiscoveryState("vllm")?.status).toBe("ok");
 
 		const qwen = registry.find("vllm", "qwen3.6");
@@ -132,12 +153,17 @@ describe("issue #970 custom provider discovery", () => {
 		expect(qwen?.contextWindow).toBe(128000);
 		expect(qwen?.maxTokens).toBe(8192);
 
-		const deepseek = registry.find("vllm", "deepseek-r1");
-		expect(deepseek?.api).toBe("openai-completions");
-		expect(deepseek?.provider).toBe("vllm");
-		expect(deepseek?.name).toBe("deepseek-r1");
-		expect(deepseek?.contextWindow).toBe(128000);
-		expect(deepseek?.maxTokens).toBe(8192);
+		const contextOverride = registry.find("vllm", "issue-3954-override-context");
+		expect(contextOverride?.contextWindow).toBe(64000);
+		expect(contextOverride?.maxTokens).toBe(UNK_MAX_TOKENS);
+
+		const maxTokensOverride = registry.find("vllm", "issue-3954-override-max");
+		expect(maxTokensOverride?.contextWindow).toBe(384000);
+		expect(maxTokensOverride?.maxTokens).toBe(4096);
+
+		const uncatalogued = registry.find("vllm", "issue-3954-uncatalogued");
+		expect(uncatalogued?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+		expect(uncatalogued?.maxTokens).toBe(UNK_MAX_TOKENS);
 	});
 
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {

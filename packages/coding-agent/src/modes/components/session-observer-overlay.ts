@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
+import type { ToolCall, ToolResultMessage } from "@gajae-code/ai/core";
 import { matchesKey } from "@gajae-code/tui";
 import { formatDuration, formatNumber } from "@gajae-code/utils";
 import type { KeyId } from "../../config/keybindings";

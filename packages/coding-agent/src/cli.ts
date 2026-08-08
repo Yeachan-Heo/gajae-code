@@ -5,18 +5,9 @@
  * lightweight CLI runner from pi-utils.
  */
 import "@gajae-code/utils/postmortem";
-import { THINKING_EFFORTS } from "@gajae-code/ai";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
-import { loadNative as loadNativeBindings } from "../../natives/native/loader-state.js";
 import { runFixtureReport } from "./cli/fixture-report";
-import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from "./gjc-runtime/managed-owner-admission";
-import {
-	isManagedOwnerSupervisorArgv,
-	MANAGED_OWNER_CHILD_TOKEN_ENV,
-	runManagedOwnerSupervisor,
-} from "./gjc-runtime/managed-owner-supervisor";
-import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -33,12 +24,18 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 process.title = APP_NAME;
 const rootHelpFlags = ["--help", "-h", "help"];
 const versionFlags = ["--version", "-v"];
+const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
+const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
+const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
 
 export const commands: CommandEntry[] = [
 	{ name: "codex-native-hook", load: () => import("./commands/codex-native-hook").then(m => m.default) },
 	{ name: "state", load: () => import("./commands/state").then(m => m.default) },
 	{ name: "setup", load: () => import("./commands/setup").then(m => m.default) },
 	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
+	{ name: "auth-broker", load: () => import("./commands/auth-broker").then(m => m.default) },
+	{ name: "auth-gateway", load: () => import("./commands/auth-gateway").then(m => m.default) },
 	{ name: "skills", load: () => import("./commands/skills").then(m => m.default) },
 	{ name: "session", load: () => import("./commands/session").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },
@@ -205,7 +202,9 @@ function parseWindowsJobMemoryProbeResult(value: unknown): WindowsJobMemoryProbe
 export function runMemoryGuardNativeSmokeFastPath(
 	options: { loadNative?: MemoryGuardNativeSmokeLoad; writeStdout?: (text: string) => void } = {},
 ): void {
-	const probe = (options.loadNative ?? loadNativeBindings)().probeWindowsJobMemory;
+	if (!options.loadNative)
+		throw new Error("memory-guard-native-smoke: native loader is unavailable on the static CLI path");
+	const probe = options.loadNative().probeWindowsJobMemory;
 	if (typeof probe !== "function") {
 		throw new Error("memory-guard-native-smoke: probeWindowsJobMemory export missing from native addon");
 	}
@@ -215,6 +214,11 @@ export function runMemoryGuardNativeSmokeFastPath(
 		result: parseWindowsJobMemoryProbeResult((probe as () => unknown)()),
 	};
 	(options.writeStdout ?? (text => process.stdout.write(text)))(`${JSON.stringify(receipt)}\n`);
+}
+
+async function runMemoryGuardNativeSmokeFastPathFromCli(): Promise<void> {
+	const { runMemoryGuardNativeSmoke } = await import("./cli/native-smoke");
+	runMemoryGuardNativeSmoke();
 }
 
 function rootFixtureArg(argv: string[]): { present: boolean; id: string | undefined } {
@@ -270,6 +274,13 @@ export class RootHelpCommand extends Command {
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
 		"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
+		"clipboard-transport": Flags.string({
+			description: "Clipboard transport: auto (default), native, osc52, or ssh",
+			options: ["auto", "native", "osc52", "ssh"],
+		}),
+		"clipboard-ssh-host": Flags.string({
+			description: "SSH host alias for --clipboard-transport ssh (from ~/.ssh/config)",
+		}),
 		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
 		mode: Flags.string({
 			description: "Output mode: text (default), json, or acp",
@@ -345,18 +356,8 @@ function isSubcommand(first: string | undefined): boolean {
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
 	await smokeTestSyncWorker();
-	// Prove the embedded native addon extracts and the new perf exports resolve in
-	// the COMPILED single binary (dev runs only load the on-disk .node). Loading the
-	// natives module triggers loadNative()/embedded extraction; calling each new
-	// export confirms the symbols are present in the shipped binary.
-	const { h06FormatHashLines, h02ScoreSequenceFuzzy, h01FindBestFuzzyMatch } = await import("@gajae-code/natives");
-	const hashed = h06FormatHashLines("a\nb", 1);
-	if (hashed.split("\n").length !== 2) {
-		throw new Error(`smoke-test: h06FormatHashLines returned unexpected output: ${JSON.stringify(hashed)}`);
-	}
-	if (typeof h02ScoreSequenceFuzzy !== "function" || typeof h01FindBestFuzzyMatch !== "function") {
-		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
-	}
+	const { runNativeSmokeTest } = await import("./cli/native-smoke");
+	await runNativeSmokeTest();
 	await smokeTestTabWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
@@ -389,11 +390,34 @@ function routeLegacyRootArgv(argv: readonly string[]): string[] | undefined {
 	return ["team", size, ...remaining];
 }
 
+/**
+ * Map the common mistaken `models` subcommand spelling to non-agent listing.
+ *
+ * Agents frequently run `gjc models` from the bash tool expecting a catalog.
+ * Without this route, `models` was a positional launch prompt and nested agents
+ * re-invoked `gjc models`, spawning an unbounded process chain (#3857).
+ * Always rewrite to `launch --list-models` so the invocation exits after a
+ * bounded listing and never starts an interactive agent session.
+ */
+export function routeModelsAlias(argv: readonly string[]): string[] | undefined {
+	if (argv[0] !== "models") return undefined;
+	const rest = argv.slice(1);
+	if (rest.length === 0) return ["launch", "--list-models"];
+	// Pure search tokens become a single fuzzy pattern (matches --list-models).
+	if (rest.every(token => !token.startsWith("-") && !token.startsWith("@"))) {
+		return ["launch", "--list-models", rest.join(" ")];
+	}
+	// Mixed flags still go through list-models first so "models" is never a prompt.
+	return ["launch", "--list-models", ...rest];
+}
+
 /** Apply the same default-launch routing used by runCli after root fast paths. */
 export function routeRootArgv(argv: readonly string[]): string[] {
 	const normalizedArgv = normalizeResumeAlias(argv);
 	const legacyArgv = routeLegacyRootArgv(normalizedArgv);
 	if (legacyArgv) return legacyArgv;
+	const modelsArgv = routeModelsAlias(normalizedArgv);
+	if (modelsArgv) return modelsArgv;
 	const first = normalizedArgv[0];
 	return first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
 		? normalizedArgv
@@ -426,18 +450,23 @@ export async function runCli(argv: string[]): Promise<void> {
 		// Re-exec could not be spawned; fall through and run in this process.
 	}
 	if (isMemoryGuardNativeSmokeFastPath(argv)) {
-		runMemoryGuardNativeSmokeFastPath();
+		await runMemoryGuardNativeSmokeFastPathFromCli();
 		return;
 	}
-	if (isTmuxOwnerIsolationCliArgv(argv)) {
+	if (argv.length === 1 && argv[0] === TMUX_OWNER_ISOLATION_ARG) {
+		const { runTmuxOwnerIsolationCliFromStdin } = await import("./gjc-runtime/tmux-owner-isolation-cli");
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (isManagedOwnerSupervisorArgv(argv)) {
+	if (argv.length === 1 && argv[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
 		await runManagedOwnerSupervisor();
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
+		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import(
+			"./gjc-runtime/managed-owner-admission"
+		);
 		const admission = await admitManagedOwnerBeforeCli();
 		if (admission.kind === "blocked") return;
 		if (admission.kind === "recovery") {

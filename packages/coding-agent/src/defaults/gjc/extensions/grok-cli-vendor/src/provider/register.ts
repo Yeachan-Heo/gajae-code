@@ -2,7 +2,7 @@
  * GJC Grok Build provider — SuperGrok OAuth + cli-chat-proxy models.
  */
 
-import type { Api, Model } from '@gajae-code/ai';
+import type { Api, Model } from '@gajae-code/ai/core';
 import { Effort } from '@gajae-code/ai/model-thinking';
 import type { OAuthCredentials, OAuthLoginCallbacks } from '@gajae-code/ai/utils/oauth/types';
 import { loginXai, refreshXaiToken, XAI_OAUTH_SCOPE } from '@gajae-code/ai/utils/oauth/xai';

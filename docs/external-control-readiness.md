@@ -20,6 +20,8 @@ The SDK endpoint is loopback-only and is created with the session. It provides t
 
 ACP remains a stdio editor protocol. Its session control uses the SDK adapter internally; it is not a replacement external bot-control protocol.
 
+For the build/run/verify loop when changing ACP code locally, see [ACP local development](./acp-local-development.md).
+
 #### Evidence promotion policy
 
 Ordinary CI runs publish an **ephemeral** report under `$RUNNER_TEMP` and upload it as a
@@ -67,6 +69,30 @@ Air-created Git worktrees are supported because each ACP request's absolute `cwd
 Session title and update metadata are advisory state for the active ACP process. Text, thought, tool-call, and tool-result history is replayed on load, but historical binary image bytes are not replayed.
 
 See [Environment Variables](./environment-variables.md#11-acp-permission-handling) for supported values and precedence.
+## Paseo custom agent
+
+[Paseo](https://github.com/getpaseo/paseo) registers GJC as a generic ACP provider through its custom provider configuration. Add this entry to `$PASEO_HOME/config.json` (default `~/.paseo/config.json`); Paseo then lists **Gajae Code** in its provider picker with GJC's model catalog and Default/Plan modes:
+
+```json
+{
+  "version": 1,
+  "agents": {
+    "providers": {
+      "gjc": {
+        "extends": "acp",
+        "label": "Gajae Code",
+        "command": ["gjc", "acp"]
+      }
+    }
+  }
+}
+```
+
+GJC's ACP session configuration carries the spec-defined `category` on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), which lets ACP clients such as Paseo discover models and thinking levels without provider-specific metadata. The model catalog is filtered to providers with usable stored credentials (`providers.list/active`), falling back to the full catalog on session hosts that do not expose that query.
+
+Model profiles also appear in the ordinary **Model** picker as synthetic entries under the reserved namespace, e.g. `gajae-code/codex-eco` (displayed with the profile label, such as "Codex Eco"). Selecting one through the ACP `Model` select immediately switches the live session to the full profile without persisting `modelProfile.default`; persistence remains an explicit `/model` TUI choice or `gjc --mpreset codex-eco --default`. Only profiles whose providers have usable stored credentials are selectable; synthetic rows are already availability-filtered by the session host, so the Q29 active-provider filter never drops them. An unavailable-but-active profile stays visible as the current readback and, if selected, fails with the existing authentication-required error. The separate ACP startup `--mpreset`/Q27 `Preset` select is likewise session-scoped and non-persistent.
+
+Sessions launched through an ACP client (e.g. `paseo run --provider gjc/...`) are broker-managed and appear in ACP `session/list`, so Paseo's import flow can attach them. Interactive `gjc` sessions host their own SDK endpoint and are not broker-registered, so they are not listed by ACP clients; use the GJC SDK/notifications surface to control those sessions.
 
 ## ACP conformance and Air release gates
 

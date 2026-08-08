@@ -62,6 +62,9 @@
 							"sendSessionHeaders": {
 								"type": "boolean"
 							},
+							"supportsResponsesSessionAffinity": {
+								"type": "boolean"
+							},
 							"supportsMultipleSystemMessages": {
 								"type": "boolean"
 							},
@@ -214,6 +217,17 @@
 									"all_strict",
 									"none"
 								]
+							},
+							"supportsLongCacheRetention": {
+								"type": "boolean"
+							},
+							"promptCacheMode": {
+								"type": "string",
+								"enum": [
+									"none",
+									"explicit",
+									"automatic"
+								]
 							}
 						},
 						"additionalProperties": false
@@ -246,8 +260,27 @@
 									"ollama",
 									"llama.cpp",
 									"lm-studio",
-									"openai-models-list"
+									"openai-models-list",
+									"models-dev"
 								]
+							},
+							"apiByModelPrefix": {
+								"type": "object",
+								"propertyNames": {
+									"type": "string",
+									"minLength": 1
+								},
+								"additionalProperties": {
+									"type": "string",
+									"enum": [
+										"openai-completions",
+										"anthropic-messages"
+									]
+								}
+							},
+							"modelsDevProvider": {
+								"type": "string",
+								"minLength": 1
 							}
 						},
 						"required": [
@@ -475,6 +508,9 @@
 										"sendSessionHeaders": {
 											"type": "boolean"
 										},
+										"supportsResponsesSessionAffinity": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -626,6 +662,17 @@
 											"enum": [
 												"all_strict",
 												"none"
+											]
+										},
+										"supportsLongCacheRetention": {
+											"type": "boolean"
+										},
+										"promptCacheMode": {
+											"type": "string",
+											"enum": [
+												"none",
+												"explicit",
+												"automatic"
 											]
 										}
 									},
@@ -847,6 +894,9 @@
 										"sendSessionHeaders": {
 											"type": "boolean"
 										},
+										"supportsResponsesSessionAffinity": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -998,6 +1048,17 @@
 											"enum": [
 												"all_strict",
 												"none"
+											]
+										},
+										"supportsLongCacheRetention": {
+											"type": "boolean"
+										},
+										"promptCacheMode": {
+											"type": "string",
+											"enum": [
+												"none",
+												"explicit",
+												"automatic"
 											]
 										}
 									},

@@ -64,6 +64,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"artifacts/architecture-2383-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 };
 
 export interface PackageManifest {
@@ -332,6 +333,10 @@ function isNativeBuildKey(key: string): boolean {
 	return NATIVE_BUILD_KEYS.has(key);
 }
 
+function isNativeProducerTask(task: Task): boolean {
+	return task.capabilities?.nativeProducer ?? isNativeBuildKey(task.key);
+}
+
 // Tasks that load the @gajae-code/natives addon at runtime and therefore need a
 // prebuilt `.node` present in `packages/natives/native/`. By construction (see
 // planTasks) every such task only appears in a plan that also includes a native
@@ -375,7 +380,7 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 		native: task.capabilities?.nativeConsumer ?? taskNeedsNative(task.key),
 		rust: task.capabilities?.rust ?? taskNeedsRust(task.key),
 		nextest: task.capabilities?.nextest ?? isRustTestKey(task.key),
-		nativeBuild: task.capabilities?.nativeProducer ?? isNativeBuildKey(task.key),
+		nativeBuild: isNativeProducerTask(task),
 	}));
 }
 
@@ -443,7 +448,7 @@ async function emitFullMatrix(): Promise<void> {
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
 	const shards = tasks
-		.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python")
+		.filter(task => !isNativeProducerTask(task) && task.phase !== "python")
 		.map(task => {
 			const entry = describeTasks([task])[0]!;
 			return { key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest };
@@ -477,7 +482,7 @@ async function emitMatrix(): Promise<void> {
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
 	const shards = tasks
-		.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python")
+		.filter(task => !isNativeProducerTask(task) && task.phase !== "python")
 		.map(task => {
 			const entry = describeTasks([task])[0]!;
 			return { key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest };
@@ -891,6 +896,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		}
 		if (isCodingAgentShardOneCoveragePath(changedPath)) {
 			addCodingAgentTestShard(tasks, 1);
+			addCodingAgentSdkProductionHostTask(tasks);
 		}
 
 		if (mappedTests.length > 0) {
@@ -962,6 +968,7 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 	for (let shard = 1; shard <= total; shard++) {
 		addCodingAgentTestShard(tasks, shard, total);
 	}
+	addCodingAgentSdkProductionHostTask(tasks);
 }
 
 function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total: number = codingAgentTestShards()): void {
@@ -970,6 +977,22 @@ function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total:
 		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
 		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
 		["bun", "test", `--shard=${shard}/${total}`],
+		resolvePackageCwd("packages/coding-agent"),
+	);
+}
+
+function addCodingAgentSdkProductionHostTask(tasks: Map<string, Task>): void {
+	add(
+		tasks,
+		"test:@gajae-code/coding-agent:sdk-production-host-isolated",
+		"Test @gajae-code/coding-agent production SDK host in isolation",
+		[
+			"bun",
+			"test",
+			"test/sdk-chat-daemon-worker.test.ts",
+			"-t",
+			"routes Slack safe queries through the production Session SDK host",
+		],
 		resolvePackageCwd("packages/coding-agent"),
 	);
 }

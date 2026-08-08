@@ -91,6 +91,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-04-29
+      # Released CHANGELOG sections are append-only. These files have no
+      # `merge=union` driver, so a rebase conflicts here for real and a bad
+      # resolution can silently drop the whole file — which is exactly what
+      # happened to ten open PRs across six authors within ten minutes of the
+      # driver being removed. Runs in affected-plan because it already has
+      # full history and the immutable event base sha.
+      - name: Guard released CHANGELOG history
+        if: ${{ github.event_name == 'pull_request' }}
+        run: bun scripts/changelog-history-guard.ts
       - name: Compute changed-path relevance
         id: relevance
         run: bun scripts/ci-job-relevance.ts

@@ -1,5 +1,6 @@
 import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { getHistoryDbPath, logger } from "@gajae-code/utils";
 
@@ -62,6 +63,7 @@ class AsyncDrain<T> {
 export class HistoryStorage {
 	#db: Database;
 	static #instance?: HistoryStorage;
+	static #opening?: Promise<HistoryStorage>;
 	#drain = new AsyncDrain<Pick<HistoryEntry, "prompt" | "cwd">>(100);
 
 	// Prepared statements
@@ -80,8 +82,6 @@ export class HistoryStorage {
 	#lastPromptCache: string | null = null;
 
 	private constructor(dbPath: string) {
-		this.#ensureDir(dbPath);
-
 		this.#db = new Database(dbPath);
 
 		const hasFts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
@@ -141,14 +141,31 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 
 	static open(dbPath: string = getHistoryDbPath()): HistoryStorage {
 		if (!HistoryStorage.#instance) {
+			fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 			HistoryStorage.#instance = new HistoryStorage(dbPath);
 		}
 		return HistoryStorage.#instance;
 	}
 
+	static async openAsync(dbPath: string = getHistoryDbPath()): Promise<HistoryStorage> {
+		if (HistoryStorage.#instance) return HistoryStorage.#instance;
+		if (!HistoryStorage.#opening) {
+			HistoryStorage.#opening = (async () => {
+				await fsPromises.mkdir(path.dirname(dbPath), { recursive: true });
+				const storage = new HistoryStorage(dbPath);
+				HistoryStorage.#instance ??= storage;
+				return HistoryStorage.#instance;
+			})().finally(() => {
+				HistoryStorage.#opening = undefined;
+			});
+		}
+		return await HistoryStorage.#opening;
+	}
+
 	/** @internal Reset the singleton — test-only. */
 	static resetInstance(): void {
 		HistoryStorage.#instance = undefined;
+		HistoryStorage.#opening = undefined;
 	}
 
 	#insertBatch(rows: Array<Pick<HistoryEntry, "prompt" | "cwd">>): void {
@@ -239,11 +256,6 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 			merged.push(this.#toEntry(row));
 		}
 		return merged;
-	}
-
-	#ensureDir(dbPath: string): void {
-		const dir = path.dirname(dbPath);
-		fs.mkdirSync(dir, { recursive: true });
 	}
 
 	#historySchemaUsesUnixEpoch(): boolean {

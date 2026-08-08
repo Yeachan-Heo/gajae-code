@@ -13,6 +13,8 @@ target/
 *.node
 *.node.build.json
 *.b64.js
+# `bun build --compile` leaves these next to the entrypoint when it is interrupted.
+*.bun-build
 
 # Environment
 .env
@@ -58,6 +60,7 @@ packages/ai/test/.temp-images/
 .gjc/rlm/
 .gjc/state/
 .gjc/_session-*/
+.gjc/rss-checkpoints/
 .gjc/metrics.json
 .pi_config/
 .opencode/

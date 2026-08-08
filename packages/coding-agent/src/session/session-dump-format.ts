@@ -3,7 +3,7 @@
  */
 import type { AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { INTENT_FIELD } from "@gajae-code/agent-core";
-import type { AssistantMessage, Model } from "@gajae-code/ai";
+import type { AssistantMessage, Model } from "@gajae-code/ai/core";
 import { buildCacheEconomicsWarning, type CacheWarningBuildState } from "./cache-economics";
 import {
 	type BashExecutionMessage,

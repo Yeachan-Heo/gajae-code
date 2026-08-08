@@ -101,6 +101,8 @@ describe("famous provider list", () => {
 			"opencode-go",
 			"zai",
 			"glm-zcode",
+			"cline-pass",
+			"commandcode-goat",
 			"alibaba-token-plan",
 			"qwen-portal",
 			"kimi-code",
@@ -115,6 +117,7 @@ describe("famous provider list", () => {
 			"bizrouter",
 			"mara",
 			"github-copilot",
+			"jetbrains-junie",
 			"cursor",
 		];
 		expect([...FAMOUS_PROVIDER_ORDER]).toEqual(agreedOrder);

@@ -30,7 +30,7 @@ import type {
 	Tool,
 	TSchema,
 	UsageReport,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
 import type * as piCodingAgent from "@gajae-code/coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@gajae-code/tui";
@@ -387,6 +387,21 @@ export interface ExtensionContext {
 	/** Session control seams used by the SDK host. */
 	cycleModel(): Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
 	setModelProfile?(name: string): Promise<boolean>;
+	/** Persist a model profile as the global default (SDK host seam). */
+	setDefaultModelProfile?(
+		name: string,
+		options?: {
+			persistDefault?: boolean;
+			thinkingLevelOverride?: ThinkingLevel;
+			/** Internal SDK host hooks invoked inside the profile activation admission. */
+			onBeforeActivation?: () => void;
+			onAfterActivation?: () => void;
+		},
+	): Promise<DefaultModelProfileActivationResult>;
+	/** The in-session active-profile marker; sole source of logical current state. */
+	getActiveModelProfile?(): string | undefined;
+	/** Run a control-surface mutation inside the session admission boundary. */
+	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
 	cycleThinkingLevel(): ThinkingLevel | undefined;
 	setQueueMode(kind: "steering" | "follow_up" | "interrupt", mode: unknown): boolean;
 	getSkillState(): unknown;
@@ -1210,7 +1225,11 @@ export interface ExtensionAPI {
 	setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void>;
 
 	/** Set the model for this session only. Returns false when it is unavailable. */
-	setModelTemporaryForControl(model: Model, expectedSessionId?: string): Promise<boolean>;
+	setModelTemporaryForControl(
+		model: Model,
+		expectedSessionId?: string,
+		thinkingLevel?: ThinkingLevel,
+	): Promise<boolean>;
 
 	/** Fetch provider usage through the session's canonical provider resolution. */
 	fetchUsageReportsForControl(): Promise<UsageReport[] | null>;
@@ -1400,10 +1419,20 @@ export type SetThinkingVisibilityForControlHandler = (
 	persist: boolean,
 ) => Promise<void>;
 
-export type SetModelTemporaryForControlHandler = (model: Model, expectedSessionId?: string) => Promise<boolean>;
+export type SetModelTemporaryForControlHandler = (
+	model: Model,
+	expectedSessionId?: string,
+	thinkingLevel?: ThinkingLevel,
+) => Promise<boolean>;
+
+/** Result of activating a model profile as the global default from a control surface. */
+export interface DefaultModelProfileActivationResult {
+	changed: boolean;
+	/** The canonical (alias-resolved) profile id. */
+	id: string;
+}
 
 export type FetchUsageReportsForControlHandler = () => Promise<UsageReport[] | null>;
-
 export type GetThinkingScopeForControlHandler = () => "session" | "global config";
 
 export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
@@ -1477,6 +1506,18 @@ export interface ExtensionContextActions {
 	/** Session control and query seams exposed to the per-session SDK host. */
 	cycleModel?: () => Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
 	setModelProfile?: (name: string) => Promise<boolean>;
+	setDefaultModelProfile?: (
+		name: string,
+		options?: {
+			persistDefault?: boolean;
+			thinkingLevelOverride?: ThinkingLevel;
+			/** Internal SDK host hooks invoked inside the profile activation admission. */
+			onBeforeActivation?: () => void;
+			onAfterActivation?: () => void;
+		},
+	) => Promise<DefaultModelProfileActivationResult>;
+	getActiveModelProfile?: () => string | undefined;
+	withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
 	cycleThinkingLevel?: () => ThinkingLevel | undefined;
 	setQueueMode?: (kind: "steering" | "follow_up" | "interrupt", mode: unknown) => boolean;
 	getSkillState?: () => unknown;

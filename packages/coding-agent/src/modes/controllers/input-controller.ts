@@ -20,7 +20,7 @@ import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/ag
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
-import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
+import { copyToClipboard, pasteFromClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
@@ -100,6 +100,9 @@ export class InputController {
 			"app.message.dequeue": () => this.handleDequeue(),
 			"app.clipboard.pasteImage": async () => {
 				await this.handleImagePaste();
+			},
+			"app.clipboard.pasteText": async () => {
+				await this.handlePasteText();
 			},
 			"app.clipboard.copyLine": () => this.handleCopyCurrentLine(),
 			"app.clipboard.copyPrompt": () => this.handleCopyPrompt(),
@@ -184,7 +187,7 @@ export class InputController {
 			case "app.plan.toggle":
 				return this.ctx.planModeController.enabled && !this.ctx.goalModeController.enabled;
 			case "app.history.search":
-				return (this.ctx.historyStorage?.getRecent(1).length ?? 0) > 0;
+				return this.ctx.settings.get("history.enabled") !== false;
 			case "app.stt.toggle":
 				return Boolean(this.ctx.settings.get("stt.enabled"));
 			case "app.transcript.browse":
@@ -605,6 +608,10 @@ export class InputController {
 		);
 		this.ctx.editor.onPasteImage = () => this.actionRegistry.execute("app.clipboard.pasteImage");
 		this.#registerCommandPaletteAction("app.clipboard.pasteImage", pasteImageFromPalette);
+		const pasteTextFromPalette = async () => {
+			await this.handlePasteText();
+		};
+		this.#registerCommandPaletteAction("app.clipboard.pasteText", pasteTextFromPalette);
 		const copyPrompt = () => this.handleCopyPrompt();
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.copyPrompt",
@@ -771,6 +778,8 @@ export class InputController {
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		text = text.trim();
+		const submittedBashMode = this.ctx.isBashMode;
+		const submittedBashNoContext = this.ctx.isBashNoContext;
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 		if (this.ctx.hasActiveBtw()) {
 			if (!text) return;
@@ -873,19 +882,32 @@ export class InputController {
 		}
 
 		// Handle bash command (! for normal, !! for excluded from context)
-		if (text.startsWith("!")) {
-			const isExcluded = text.startsWith("!!");
-			const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+		const hasExplicitShellPrefix = text.startsWith("!");
+		const hasExplicitNoContextPrefix = text.startsWith("!!");
+		const shellMode = submittedBashMode || hasExplicitShellPrefix;
+		if (shellMode) {
+			const isExcluded = hasExplicitNoContextPrefix || (!hasExplicitShellPrefix && submittedBashNoContext);
+			const command = hasExplicitNoContextPrefix
+				? text.slice(2).trim()
+				: hasExplicitShellPrefix
+					? text.slice(1).trim()
+					: text.trim();
+			const historyText = hasExplicitShellPrefix ? text : `${isExcluded ? "!!" : "!"}${text}`;
 			if (command) {
 				if (this.ctx.session.isBashRunning) {
 					this.ctx.showWarning("A bash command is already running. Press Esc to cancel it first.");
 					if (this.#canModifyComposer(composer)) {
+						const isBashMode = hasExplicitShellPrefix || submittedBashMode;
+						const isBashNoContext = hasExplicitShellPrefix ? hasExplicitNoContextPrefix : submittedBashNoContext;
 						this.ctx.editor.setText(text);
+						this.ctx.isBashMode = isBashMode;
+						this.ctx.isBashNoContext = isBashNoContext;
+						this.ctx.updateEditorBorderColor();
 					}
 					return;
 				}
 				if (this.#canModifyComposer(composer)) {
-					this.ctx.editor.addToHistory(text);
+					this.ctx.editor.addToHistory(historyText);
 				}
 				await this.ctx.handleBashCommand(command, isExcluded);
 				this.ctx.isBashMode = false;
@@ -1759,9 +1781,8 @@ export class InputController {
 		if (this.ctx.pendingImages.length === 0 || IMAGE_PLACEHOLDER_PRESENT_PATTERN.test(text)) {
 			return;
 		}
-		// Editor submit resets the composer and emits onChange("") before onSubmit(result).
-		// Defer the empty-buffer clear so the submit handler can still resolve image
-		// placeholders against pendingImages, while manual clears still drop stale images.
+		// Editor clears its internal buffer before invoking onSubmit and emits
+		// onChange("") afterward; defer the empty-buffer clear for that callback.
 		if (text.length === 0) {
 			const pendingImages = this.ctx.pendingImages;
 			const pendingImageCount = pendingImages.length;
@@ -1827,6 +1848,33 @@ export class InputController {
 			return false;
 		}
 	}
+	/**
+	 * Explicit "Paste text from configured clipboard" action (P3-b v1). Only
+	 * meaningful when `clipboard.transport` is `ssh` — reads via `pbpaste` on
+	 * the configured host and inserts the result at the cursor. No default
+	 * key (command palette only), so it never collides with the platform
+	 * image-paste binding. Explicit ssh failures are surfaced verbatim and
+	 * never fall back to native/OSC52 or leave stale text inserted.
+	 */
+	async handlePasteText(): Promise<boolean> {
+		try {
+			const text = await pasteFromClipboard();
+			if (text === null) {
+				this.ctx.showStatus(
+					"Paste text from clipboard requires --clipboard-transport ssh (or clipboard.transport: ssh in config).",
+				);
+				return false;
+			}
+			this.ctx.editor.insertText(text);
+			this.ctx.ui.requestRender();
+			return true;
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to paste from clipboard: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
+		}
+	}
 
 	createAutocompleteProvider(commands: SlashCommand[], basePath: string): AutocompleteProvider {
 		this.#slashCommands = commands;
@@ -1837,6 +1885,7 @@ export class InputController {
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
 			pasteImage: () => void this.handleImagePaste(),
+			pasteText: () => void this.handlePasteText(),
 			newSession: () => void this.ctx.handleClearCommand(),
 			showHelp: () => this.ctx.handleHelpCommand(),
 			scrollTmuxToPreviousUserInput: () => this.scrollTmuxToPreviousUserInput(),
@@ -1857,14 +1906,14 @@ export class InputController {
 			this.ctx.showStatus("Nothing to copy");
 			return;
 		}
-		try {
-			copyToClipboard(text);
-			const sanitized = sanitizeText(text);
-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
-			this.ctx.showStatus(`Copied line: ${preview}`);
-		} catch {
-			this.ctx.showWarning("Failed to copy to clipboard");
-		}
+		copyToClipboard(text).then(
+			() => {
+				const sanitized = sanitizeText(text);
+				const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+				this.ctx.showStatus(`Copied line: ${preview}`);
+			},
+			() => this.ctx.showWarning("Failed to copy to clipboard"),
+		);
 	}
 
 	/** Copy current prompt text to system clipboard. */
@@ -1874,14 +1923,14 @@ export class InputController {
 			this.ctx.showStatus("Nothing to copy");
 			return;
 		}
-		try {
-			copyToClipboard(text);
-			const sanitized = sanitizeText(text);
-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
-			this.ctx.showStatus(`Copied: ${preview}`);
-		} catch {
-			this.ctx.showWarning("Failed to copy to clipboard");
-		}
+		copyToClipboard(text).then(
+			() => {
+				const sanitized = sanitizeText(text);
+				const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+				this.ctx.showStatus(`Copied: ${preview}`);
+			},
+			() => this.ctx.showWarning("Failed to copy to clipboard"),
+		);
 	}
 
 	async #dispatchPaletteSlashCommand(name: string, restoreComposer: () => void): Promise<void> {

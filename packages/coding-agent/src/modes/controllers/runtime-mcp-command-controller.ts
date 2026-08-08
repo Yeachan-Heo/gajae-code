@@ -4,12 +4,12 @@
  * Handles /mcp subcommands for managing MCP servers.
  */
 import * as path from "node:path";
-import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai";
+import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai/core";
 import { Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
-import { connectToServer, disconnectServer, listTools } from "../../runtime-mcp/client";
+import { listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
 	readDisabledServers,
@@ -34,7 +34,7 @@ import {
 	searchSmitheryRegistry,
 	toConfigName,
 } from "../../runtime-mcp/smithery-registry";
-import type { MCPAuthConfig, MCPServerConfig, MCPServerConnection } from "../../runtime-mcp/types";
+import type { MCPAuthConfig, MCPServerConfig } from "../../runtime-mcp/types";
 import type { OAuthCredential } from "../../session/auth-storage";
 import { shortenPath } from "../../tools/render-utils";
 import { openPath } from "../../utils/open";
@@ -669,19 +669,14 @@ export class MCPCommandController {
 	 * Throws an error if connection fails (used for auto-detection).
 	 */
 	async #handleTestConnection(config: MCPServerConfig): Promise<void> {
-		// Create temporary connection using a test name
 		const testName = `test_${Date.now()}`;
-		let resolvedConfig: MCPServerConfig;
-		if (this.ctx.mcpManager) {
-			resolvedConfig = await this.ctx.mcpManager.prepareConfig(config);
-		} else {
-			const tempManager = new MCPManager(getProjectDir());
-			tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
-			resolvedConfig = await tempManager.prepareConfig(config);
-		}
-
-		const connection = await connectToServer(testName, resolvedConfig);
-		await disconnectServer(connection);
+		const manager =
+			this.ctx.mcpManager ??
+			new MCPManager(getProjectDir(), null, {
+				sharedPoolIdleMs: this.ctx.settings.get("mcp.sharedPoolIdleMs"),
+			});
+		if (!this.ctx.mcpManager) manager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
+		await manager.withPreparedLease(testName, config, async () => {});
 	}
 
 	async #findConfiguredServer(
@@ -1122,7 +1117,6 @@ export class MCPCommandController {
 			abortController.abort();
 		};
 
-		let connection: MCPServerConnection | undefined;
 		try {
 			const found = await this.#findConfiguredServer(name);
 
@@ -1144,41 +1138,37 @@ export class MCPCommandController {
 			);
 
 			// Resolve auth config if needed
-			let resolvedConfig: MCPServerConfig;
-			if (this.ctx.mcpManager) {
-				resolvedConfig = await this.ctx.mcpManager.prepareConfig(config);
-			} else {
-				const tempManager = new MCPManager(getProjectDir());
-				tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
-				resolvedConfig = await tempManager.prepareConfig(config);
-			}
+			const manager =
+				this.ctx.mcpManager ??
+				new MCPManager(getProjectDir(), null, {
+					sharedPoolIdleMs: this.ctx.settings.get("mcp.sharedPoolIdleMs"),
+				});
+			if (!this.ctx.mcpManager) manager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
+			await manager.withPreparedLease(
+				name,
+				config,
+				async lease => {
+					const connection = lease.connectionForLease();
+					const tools = await listTools(connection, { signal: abortController.signal });
+					const lines = [
+						"",
+						theme.fg("success", `✓ Successfully connected to "${name}"`),
+						"",
+						`  Server: ${connection.serverInfo.name} v${connection.serverInfo.version}`,
+						`  Tools: ${tools.length}`,
+					];
 
-			// Create temporary connection
-			connection = await connectToServer(name, resolvedConfig, { signal: abortController.signal });
+					if (tools.length > 0 && tools.length <= 10) {
+						lines.push("", "  Available tools:");
+						for (const tool of tools) lines.push(`    • ${tool.name}`);
+					}
 
-			// List tools to verify connection
-			const tools = await listTools(connection, { signal: abortController.signal });
-
-			const lines = [
-				"",
-				theme.fg("success", `✓ Successfully connected to "${name}"`),
-				"",
-				`  Server: ${connection.serverInfo.name} v${connection.serverInfo.version}`,
-				`  Tools: ${tools.length}`,
-			];
-
-			// Show tool names if there are any
-			if (tools.length > 0 && tools.length <= 10) {
-				lines.push("");
-				lines.push("  Available tools:");
-				for (const tool of tools) {
-					lines.push(`    • ${tool.name}`);
-				}
-			}
-
-			lines.push("");
-			await this.#syncManagerConnection(name, config);
-			this.#showMessage(lines.join("\n"));
+					lines.push("");
+					await this.#syncManagerConnection(name, config);
+					this.#showMessage(lines.join("\n"));
+				},
+				{ signal: abortController.signal },
+			);
 		} catch (error) {
 			if (abortController.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
 				this.ctx.showStatus(`Cancelled MCP test for "${name}"`);
@@ -1204,10 +1194,6 @@ export class MCPCommandController {
 			this.ctx.showError(`Failed to connect to "${name}": ${errorMsg}${helpText}`);
 		} finally {
 			this.ctx.editor.onEscape = originalOnEscape;
-			if (connection) {
-				// Best-effort: don't block UI on cleanup.
-				void disconnectServer(connection);
-			}
 		}
 	}
 

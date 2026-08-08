@@ -8411,8 +8411,10 @@ mod exact_unlink_placeholder_tests {
 					.is_some_and(|name| name.starts_with(".gjc-exact-unlink-placeholder-"))
 			})
 			.expect("find detached placeholder");
+		let replacement = root.join("replacement");
+		fs::write(&replacement, b"unrelated").expect("write distinct replacement inode");
 		fs::remove_file(&retained).expect("remove detached placeholder");
-		fs::write(&retained, b"unrelated").expect("replace detached placeholder");
+		fs::rename(&replacement, &retained).expect("replace detached placeholder");
 		placeholder_resume_tx
 			.send(())
 			.expect("resume placeholder cleanup");

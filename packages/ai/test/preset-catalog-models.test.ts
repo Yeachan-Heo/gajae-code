@@ -42,14 +42,14 @@ describe("preset catalog model entries", () => {
 		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Minimal, maxLevel: Effort.High });
 	});
 
-	test("bundles minimax-code/minimax-v3", () => {
-		const model = getBundledModel("minimax-code", "minimax-v3");
+	test("bundles minimax-code/MiniMax-M3 canonical id (issue #3896)", () => {
+		const model = getBundledModel("minimax-code", "MiniMax-M3");
 
-		expect(model.id).toBe("minimax-v3");
+		expect(model.id).toBe("MiniMax-M3");
 		expect(model.provider).toBe("minimax-code");
-		expect(model.name).toBe("MiniMax-V3");
+		expect(model.name).toBe("MiniMax-M3");
 		expect(model.reasoning).toBe(true);
-		expect(model.contextWindow).toBe(512_000);
+		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.maxTokens).toBe(128_000);
 		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.High });
 	});

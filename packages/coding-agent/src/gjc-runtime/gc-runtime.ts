@@ -18,6 +18,7 @@ import { SessionIndex } from "../sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 
 import { buildGcReportText } from "./gc-render";
+import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
 
 export type GcStore =
 	| "harness_leases"
@@ -78,9 +79,18 @@ export interface GcError {
 	message: string;
 }
 
+/** Non-fatal discovery partials (e.g. traversal caps). Does not affect exit code. */
+export interface GcWarning {
+	store: GcStore;
+	scope: string;
+	message: string;
+}
+
 export interface GcCollectResult {
 	records: GcRecord[];
 	errors: GcError[];
+	/** Optional partial-result notices; omitted by adapters that have none. */
+	warnings?: GcWarning[];
 }
 
 export interface GcPruneOutcome {
@@ -140,7 +150,11 @@ export interface GcReport {
 	stores: Record<GcStore, GcRecord[]>;
 	counts: GcCounts;
 	errors: GcError[];
+	/** Partial-result notices that do not fail the run (e.g. walk caps). */
+	warnings: GcWarning[];
 	session_index?: GcSessionIndexHealth;
+	/** Managed-scope capacity, reported only when it is near or past the budget. */
+	session_scope?: GcSessionScopeUsage;
 }
 
 export interface GcRunResult {
@@ -298,12 +312,14 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext, prune: boolean): Promise<GcReport> {
 	const stores = emptyStores();
 	const errors: GcError[] = [];
+	const warnings: GcWarning[] = [];
 
 	for (const adapter of adapters) {
 		try {
 			const result = await adapter.collect(ctx);
 			stores[adapter.store].push(...result.records);
 			errors.push(...result.errors);
+			if (result.warnings) warnings.push(...result.warnings);
 		} catch (error) {
 			errors.push({
 				store: adapter.store,
@@ -350,7 +366,7 @@ export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext
 		}
 	}
 
-	return { dry_run: !prune, stores, counts: computeCounts(stores, errors), errors };
+	return { dry_run: !prune, stores, counts: computeCounts(stores, errors), errors, warnings };
 }
 
 /**
@@ -358,6 +374,7 @@ export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext
  * - usage/parse error => 2
  * - hard discovery errors => 1 (both modes)
  * - prune mode with a failed intended removal => 1
+ * - warnings alone never fail the run
  * - otherwise => 0
  */
 export function computeExitCode(report: GcReport): number {
@@ -368,6 +385,24 @@ export function computeExitCode(report: GcReport): number {
 
 function resolveGcAgentDir(env: NodeJS.ProcessEnv): string {
 	return env.GJC_CODING_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || getAgentDir();
+}
+
+/**
+ * Locate and measure the managed scope for `cwd`.
+ *
+ * Resolution is read-only (it never prepares or writes a scope), and any
+ * failure yields `undefined` so a capacity probe cannot fail a gc run.
+ */
+async function collectGcSessionScope(cwd: string, agentDir: string): Promise<GcSessionScopeUsage | undefined> {
+	try {
+		const { resolveManagedScope } = await import("../session/internal/managed-session-scope");
+		const { getSessionsDir } = await import("@gajae-code/utils");
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot: getSessionsDir(agentDir) });
+		if (resolved.kind !== "resolved") return undefined;
+		return await collectSessionScopeUsage(resolved.scope.directoryPath);
+	} catch {
+		return undefined;
+	}
 }
 
 async function collectSessionIndexHealth(repair: boolean, agentDir: string): Promise<GcSessionIndexHealth> {
@@ -423,6 +458,8 @@ export async function runGjcGcCommand(
 	const report = await collectGcReport(resolvedAdapters, ctx, parsed.prune);
 	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
 	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, resolveGcAgentDir(env));
+	const scopeUsage = await collectGcSessionScope(cwd, resolveGcAgentDir(env));
+	if (scopeUsage && shouldReportSessionScope(scopeUsage)) report.session_scope = scopeUsage;
 	const sessionIndexFailed =
 		report.session_index?.status === "corrupt" ||
 		report.session_index?.status === "unsupported" ||

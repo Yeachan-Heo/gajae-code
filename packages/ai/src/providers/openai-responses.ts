@@ -7,20 +7,21 @@ import type {
 } from "openai/resources/responses/responses";
 import packageJson from "../../package.json" with { type: "json" };
 import { getEnvApiKey } from "../stream";
-import type {
-	AssistantMessage,
-	CacheRetention,
-	Context,
-	FetchImpl,
-	MessageAttribution,
-	Model,
-	OpenAICompat,
-	ProviderSessionState,
-	ServiceTier,
-	StreamFunction,
-	StreamOptions,
-	Tool,
-	ToolChoice,
+import {
+	type AssistantMessage,
+	type CacheRetention,
+	type Context,
+	type FetchImpl,
+	isKnownProvider,
+	type MessageAttribution,
+	type Model,
+	type OpenAICompat,
+	type ProviderSessionState,
+	type ServiceTier,
+	type StreamFunction,
+	type StreamOptions,
+	type Tool,
+	type ToolChoice,
 } from "../types";
 import {
 	createOpenAIResponsesHistoryPayload,
@@ -140,6 +141,48 @@ function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
 	} catch {
 		return baseUrl === OPENAI_DEFAULT_BASE_URL;
 	}
+}
+
+function isCanonicalOpenAIAffinityOrigin(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return false;
+	try {
+		const url = new URL(baseUrl);
+		return (
+			url.origin === "https://api.openai.com" &&
+			url.username === "" &&
+			url.password === "" &&
+			(url.pathname === "" || url.pathname === "/" || url.pathname === "/v1") &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
+}
+/**
+ * Official OpenAI keeps its existing session-routing behavior even when prompt
+ * caching is disabled. Relay affinity is opt-in, cache-enabled, and limited to
+ * explicitly supported openai or unknown provider ids so known non-target
+ * transports cannot inherit the headers.
+ */
+
+function shouldSendOpenAIResponsesSessionHeaders(
+	model: Model<"openai-responses">,
+	baseUrl: string | undefined,
+	cacheRetention: CacheRetention,
+): boolean {
+	if (model.provider === "openai") {
+		if (isCanonicalOpenAIAffinityOrigin(baseUrl)) return true;
+		return cacheRetention !== "none" && model.compat?.supportsResponsesSessionAffinity === true;
+	}
+	if (cacheRetention === "none" || isKnownProvider(model.provider)) {
+		return false;
+	}
+	return (
+		Boolean(baseUrl?.trim()) &&
+		model.compat?.supportsResponsesSessionAffinity === true &&
+		!isCanonicalOpenAIAffinityOrigin(baseUrl)
+	);
 }
 
 function isOpenAIHostBaseUrl(baseUrl: string): boolean {
@@ -305,6 +348,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 		try {
 			// Keep request headers and prompt-cache routing on the same session-derived value.
 			const cacheSessionId = getOpenAIResponsesCacheSessionId(options);
+			const cacheRetention = resolveCacheRetention(options?.cacheRetention ?? model.cacheRetention);
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const { client, copilotPremiumRequests, baseUrl, requestBaseUrl, requestQuery } = createClient(
 				model,
@@ -313,6 +357,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.headers,
 				options?.initiatorOverride,
 				cacheSessionId,
+				cacheRetention,
 				options?.onSseEvent,
 				options?.fetch,
 				options?.authCredentialType,
@@ -323,7 +368,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
-			const { params } = buildParams(model, context, options, providerSessionState, baseUrl);
+			const { params } = buildParams(model, context, options, providerSessionState, cacheRetention, baseUrl);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
 			options?.onPayload?.(params, undefined, options?.attemptScope);
 			rawRequestDump = {
@@ -469,6 +514,7 @@ function createClient(
 	extraHeaders?: Record<string, string>,
 	initiatorOverride?: MessageAttribution,
 	sessionId?: string,
+	cacheRetention?: CacheRetention,
 	onSseEvent?: OpenAIResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
 	authCredentialType?: OpenAIResponsesOptions["authCredentialType"],
@@ -502,11 +548,6 @@ function createClient(
 				// `{...default, ...customHeaders}`). #3557.
 				mergeDashScopeTokenPlanHeaders({ ...(model.headers ?? {}), ...(extraHeaders ?? {}) })
 			: { ...(model.headers ?? {}), ...(extraHeaders ?? {}) };
-	const headers = applyOpenAIRequestTransformHeaders(
-		baseHeaders,
-		model.requestTransform,
-		`Gajae-Code/${packageJson.version}`,
-	);
 	let copilotPremiumRequests: number | undefined;
 
 	let baseUrl =
@@ -514,6 +555,7 @@ function createClient(
 	if (model.provider === "openai" && !baseUrl) {
 		baseUrl = OPENAI_DEFAULT_BASE_URL;
 	}
+	let headers = baseHeaders;
 	if (model.provider === "github-copilot") {
 		apiKey = parseGitHubCopilotApiKey(rawApiKey).accessToken;
 		const hasImages = hasCopilotVisionInput(context.messages);
@@ -528,10 +570,11 @@ function createClient(
 		copilotPremiumRequests = copilot.premiumRequests;
 		baseUrl = resolveGitHubCopilotBaseUrl(model.baseUrl, rawApiKey) ?? model.baseUrl;
 	}
-	if (sessionId && model.provider === "openai" && (!model.baseUrl || (baseUrl && isDefaultOpenAIBaseUrl(baseUrl)))) {
+	if (sessionId && shouldSendOpenAIResponsesSessionHeaders(model, baseUrl, cacheRetention ?? "short")) {
 		headers.session_id ??= sessionId;
 		headers["x-client-request-id"] ??= sessionId;
 	}
+	headers = applyOpenAIRequestTransformHeaders(headers, model.requestTransform, `Gajae-Code/${packageJson.version}`);
 	const { baseUrl: clientBaseUrl, query: endpointQuery } = splitBaseUrlQuery(baseUrl);
 	const baseFetch = fetchOverride ?? fetch;
 	const queryFetch = Object.assign(
@@ -579,6 +622,7 @@ function buildParams(
 	context: Context,
 	options: OpenAIResponsesOptions | undefined,
 	providerSessionState: OpenAIResponsesProviderSessionState | undefined,
+	cacheRetention: CacheRetention,
 	resolvedBaseUrl?: string,
 ): { conversationMessages: ResponseInput; params: OpenAIResponsesSamplingParams } {
 	const strictResponsesPairing =
@@ -621,7 +665,6 @@ function buildParams(
 		}
 	}
 
-	const cacheRetention = resolveCacheRetention(options?.cacheRetention ?? model.cacheRetention);
 	const promptCacheKey = getOpenAIResponsesCacheSessionId(options);
 	const params: OpenAIResponsesSamplingParams = {
 		model: model.wireModelId ?? model.id,

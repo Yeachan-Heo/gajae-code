@@ -2,11 +2,13 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
@@ -24,6 +26,7 @@ async function firePreflightAccept(options?: {
 	else options?.onPreflightAccepted?.();
 }
 
+import { createAcpReverseConnection } from "../src/modes/acp/acp-agent";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import {
@@ -38,6 +41,7 @@ import {
 	validateAskGateStageState,
 } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import type { InteractiveModeContext } from "../src/modes/types";
+import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
@@ -46,6 +50,7 @@ import { getNotificationConfig } from "../src/sdk/bus/config";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import * as telegramDaemon from "../src/sdk/bus/telegram-daemon";
 import { SessionSdkHost } from "../src/sdk/host";
+import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
 	normalizeSdkStartupFailure,
@@ -1040,6 +1045,57 @@ test("interactive extension context advertises typed SDK controls and forwards p
 	).rejects.toMatchObject({ code: "invalid_input" });
 });
 
+test("interactive SDK control routes synthetic gajae-code selections to session-scoped activation", async () => {
+	let contextActions: ExtensionContextActions | undefined;
+	let activated: { name: string; options: unknown } | undefined;
+	let thinkingLevel: string | undefined;
+	const runner = {
+		initialize(
+			_actions: ExtensionActions,
+			actions: ExtensionContextActions,
+			_commands: unknown,
+			_ui: ExtensionUIContext,
+		): void {
+			contextActions = actions;
+		},
+	};
+	const controller = new ExtensionUiController({
+		session: {
+			extensionRunner: runner,
+			modelRegistry: {
+				find: () => undefined,
+				getModelProfiles: () =>
+					new Map([["codex-eco", { name: "codex-eco", requiredProviders: [], modelMapping: {} }]]),
+				getError: () => undefined,
+			},
+			setDefaultModelProfileForControl: async (name: string, options?: unknown) => {
+				activated = { name, options };
+				thinkingLevel = "off";
+				return { changed: true, id: name };
+			},
+			getActiveModelProfile: () => undefined,
+			get thinkingLevel() {
+				return thinkingLevel;
+			},
+		},
+	} as unknown as InteractiveModeContext);
+	controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+	expect(
+		await contextActions?.sdkControl?.("model.set", {
+			id: "gajae-code/codex-eco",
+			thinkingLevel: "off",
+		}),
+	).toEqual({ provider: "gajae-code", modelId: "codex-eco", thinkingLevel: "off" });
+	expect(activated).toEqual({
+		name: "codex-eco",
+		options: { persistDefault: false, thinkingLevelOverride: "off" },
+	});
+
+	await expect(
+		contextActions?.sdkControl?.("model.set", { id: "gajae-code/codex-eco", thinkingLevel: "high" }),
+	).rejects.toMatchObject({ code: "invalid_input" });
+});
 test("interactive session.handoff SDK control threads focus instructions to session.handoff", async () => {
 	let contextActions: ExtensionContextActions | undefined;
 	const handoffCalls: (string | undefined)[] = [];
@@ -2819,6 +2875,144 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
 });
 
+test("ACP permission attachment normalizes decisions through the registered provider path", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-acp-permission-path-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-acp-permission-path-${Date.now()}`;
+	const acpSessionId = "acp-session-authority";
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled test model");
+	const bashTool = {
+		name: "bash",
+		label: "bash",
+		description: "Guarded fixture tool",
+		parameters: z.object({ command: z.string() }),
+		executeCalls: 0,
+		async execute() {
+			bashTool.executeCalls++;
+			return { content: [{ type: "text" as const, text: "executed" }] };
+		},
+	} satisfies AgentTool & { executeCalls: number };
+	const sessionManager = SessionManager.inMemory(cwd);
+	const agentSession = new AgentSession({
+		agent: new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [bashTool], messages: [] },
+			streamFn: createMockModel({ responses: [] }).stream,
+		}),
+		sessionManager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: {} as never,
+		toolRegistry: new Map([[bashTool.name, bashTool]]),
+	});
+	agentSession.setSdkPermissionMode("prompt");
+	let permissionProvider: SdkPermissionProvider;
+	const ctx = {
+		...context(cwd, sessionId),
+		setSdkPermissionProvider: (provider: SdkPermissionProvider | undefined) => {
+			permissionProvider = provider!;
+			agentSession.setSdkPermissionProvider(provider);
+		},
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(ctx);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+	let nextResponse: unknown;
+	let waitForReverseAbort = false;
+	let reverseAbortObserved = false;
+	const reverseCalls: Array<{
+		method: string;
+		input: Record<string, unknown>;
+		signal: AbortSignal | undefined;
+	}> = [];
+	const connection = {
+		async request(
+			method: string,
+			input: Record<string, unknown>,
+			options?: { cancellationSignal?: AbortSignal },
+		): Promise<unknown> {
+			const signal = options?.cancellationSignal;
+			reverseCalls.push({ method, input, signal });
+			if (!waitForReverseAbort) return nextResponse;
+			const { promise, resolve } = Promise.withResolvers<unknown>();
+			const observeAbort = () => {
+				reverseAbortObserved = true;
+				resolve({ outcome: { outcome: "cancelled" } });
+			};
+			if (signal?.aborted) observeAbort();
+			else signal?.addEventListener("abort", observeAbort, { once: true });
+			return await promise;
+		},
+	} as unknown as AgentSideConnection;
+	const adapter = await AcpSdkAdapter.connect({
+		url: endpoint.url,
+		token: endpoint.token,
+		connection: createAcpReverseConnection(connection, acpSessionId),
+		providers: [{ capability: "permission", definitions: [] }],
+		heartbeatMs: 60_000,
+	});
+
+	try {
+		await waitFor(() => permissionProvider !== undefined, "ACP permission provider installation");
+		await agentSession.setActiveToolsByName(["bash"]);
+		const guardedBash = agentSession.agent.state.tools.find(tool => tool.name === "bash");
+		if (!guardedBash) throw new Error("Expected guarded bash tool");
+		let callNumber = 0;
+		const execute = async (response: unknown, signal?: AbortSignal) => {
+			nextResponse = response;
+			return await guardedBash.execute(
+				`call-${++callNumber}`,
+				{ command: "printf guarded" },
+				signal,
+				undefined as never,
+				undefined as never,
+			);
+		};
+
+		for (const response of [
+			{ outcome: { outcome: "selected", optionId: "reject_once" } },
+			{ outcome: { outcome: "cancelled" } },
+			{ outcome: "cancelled" },
+			null,
+			1,
+			[],
+			{},
+			{ outcome: "unknown" },
+			{ outcome: "selected" },
+			{ outcome: "selected", optionId: 1 },
+			{ outcome: "selected", optionId: "" },
+			{ outcome: "selected", optionId: "unknown_option" },
+		]) {
+			await expect(execute(response)).rejects.toThrow();
+			expect(bashTool.executeCalls).toBe(0);
+		}
+
+		waitForReverseAbort = true;
+		const cancellation = new AbortController();
+		const cancelledExecution = execute(undefined, cancellation.signal);
+		await waitFor(() => reverseCalls.length === 13, "reverse permission cancellation request");
+		cancellation.abort();
+		await expect(cancelledExecution).rejects.toThrow("Permission request cancelled");
+		await waitFor(() => reverseAbortObserved, "ACP reverse cancellation signal");
+		expect(bashTool.executeCalls).toBe(0);
+		waitForReverseAbort = false;
+
+		await expect(execute({ outcome: { outcome: "selected", optionId: "allow_once" } })).resolves.toBeDefined();
+		await expect(execute({ outcome: "selected", optionId: "allow_once" })).resolves.toBeDefined();
+		expect(bashTool.executeCalls).toBe(2);
+		expect(reverseCalls).toHaveLength(15);
+		expect(reverseCalls.every(call => call.method === "session/request_permission")).toBe(true);
+		expect(reverseCalls.every(call => call.input.sessionId === acpSessionId)).toBe(true);
+		expect(reverseCalls.every(call => call.signal instanceof AbortSignal)).toBe(true);
+	} finally {
+		await adapter.close();
+		await agentSession.dispose();
+	}
+});
+
 test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-"));
 	dirs.push(cwd);
@@ -3629,6 +3823,41 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		ok: false,
 		error: { code: "invalid_input", message: "config.patch rejects secret fields at the SDK host." },
 	});
+	// Invalid values must be rejected before any durable write: a numeric
+	// cycleOrder would later break getRoleModelCycleCandidateCount()'s for...of.
+	expect(
+		await request("invalid-type-error", {
+			type: "control_request",
+			id: "invalid-type-error",
+			operation: "config.patch",
+			input: { patch: { cycleOrder: 1 } },
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "invalid-type-error",
+		ok: false,
+		error: {
+			code: "invalid_input",
+			message: "config.patch rejects invalid settings: cycleOrder (Expected array.)",
+		},
+	});
+	// Unknown paths are rejected the same way, with no durable side effects.
+	expect(
+		await request("unknown-path-error", {
+			type: "control_request",
+			id: "unknown-path-error",
+			operation: "config.patch",
+			input: { patch: { noSuchSetting: true } },
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "unknown-path-error",
+		ok: false,
+		error: {
+			code: "invalid_input",
+			message: "config.patch rejects invalid settings: noSuchSetting (Setting is not recognized by this version.)",
+		},
+	});
 	expect(configWrites).toEqual([]);
 });
 
@@ -4302,6 +4531,51 @@ test("PresentationArbiter retires and republishes an active replay whose option 
 	});
 });
 
+test("PresentationArbiter publishes the ask tool's selection state and keeps its own navigation control", () => {
+	const publications: Array<Record<string, unknown>> = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as Record<string, unknown>;
+				publications.push(action);
+				return { actionId: action.id as string, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "retired" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	// The ask tool owns its multi-select loop: one presentation per toggle, with
+	// its own Next/Done control rather than the workflow gate's synthesized one.
+	const presentation = (selectedOptions: string[]) => ({
+		gateId: `interactive:${selectedOptions.length}`,
+		sessionId: "session",
+		question: "Pick",
+		options: ["one", "two"],
+		controls: [
+			{ id: "navigation_forward" as const, kind: "navigation" as const, label: "Next" as const, enabled: true },
+		],
+		multi: true,
+		allowEmpty: false,
+		selectedOptions,
+	});
+
+	arbiter.retain(presentation([]));
+	expect(publications[0]).toMatchObject({
+		question: "Pick",
+		selectedOptionIndices: [],
+		controls: [{ id: "navigation_forward", label: "Next", enabled: true }],
+	});
+
+	arbiter.complete("interactive:0");
+	arbiter.retain(presentation(["two"]));
+	expect(publications[1]).toMatchObject({
+		question: "(1 selected) Pick",
+		selectedOptionIndices: [1],
+		controls: [{ id: "navigation_forward", label: "Next", enabled: true }],
+	});
+});
+
 test("PresentationArbiter keeps the routed option snapshot when replay retirement lacks terminal proof", () => {
 	const publications: Array<Record<string, unknown>> = [];
 	const arbiter = new PresentationArbiter(
@@ -4368,6 +4642,544 @@ test("PresentationArbiter terminalizes a queued direct control with explicit non
 	expect(arbiter.prepareDirectControl("queued")).toEqual({ status: "queued", ordinal: 1 });
 	expect(arbiter.complete("queued")).toBe("not_published");
 	expect(publications).toHaveLength(1);
+});
+
+test("PresentationArbiter defers suspended gates, direct controls, and stale source leases", () => {
+	const publications: string[] = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as { id: string };
+				publications.push(action.id);
+				return { actionId: action.id, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "retired" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	const presentation = (gateId: string) => ({
+		gateId,
+		workflowGateId: gateId,
+		sessionId: "session",
+		question: gateId,
+		options: ["approve"],
+		controls: [],
+		multi: false,
+		allowEmpty: false,
+		selectedOptions: [],
+	});
+
+	// Retention is local while policy is provisional; an accepted direct answer
+	// consumes the queued presentation and leaves no later publication behind.
+	arbiter.setPublicationSuspended(true);
+	arbiter.retain(presentation("accepted"), { publish: false, sourceEpoch: 1 });
+	expect(publications).toHaveLength(0);
+	const accepted = arbiter.prepareDirectControl("accepted");
+	expect(accepted).toEqual({ status: "queued", ordinal: 0 });
+	arbiter.finishDirectControl("accepted", accepted as { status: "queued"; ordinal: number }, "accepted");
+	arbiter.setPublicationSuspended(false);
+	arbiter.activateDeferred(1);
+	expect(publications).toHaveLength(0);
+
+	// A rejected direct answer remains queued until committed activation, and
+	// activation is idempotent rather than registering duplicate actions.
+	arbiter.setPublicationSuspended(true);
+	arbiter.retain(presentation("rejected"), { publish: false, sourceEpoch: 2 });
+	const rejected = arbiter.prepareDirectControl("rejected");
+	expect(rejected).toEqual({ status: "queued", ordinal: 0 });
+	arbiter.finishDirectControl("rejected", rejected as { status: "queued"; ordinal: number }, "rejected");
+	expect(publications).toHaveLength(0);
+	arbiter.setPublicationSuspended(false);
+	arbiter.activateDeferred(2);
+	arbiter.activateDeferred(2);
+	expect(publications).toHaveLength(1);
+
+	// Rebinding/disposal removes old-source leases; an activation for the stale
+	// epoch cannot publish the replacement until its own epoch is committed.
+	arbiter.setPublicationSuspended(true);
+	arbiter.retain(presentation("old-source"), { publish: false, sourceEpoch: 3 });
+	arbiter.dispose();
+	arbiter.retain(presentation("new-source"), { publish: false, sourceEpoch: 4 });
+	arbiter.setPublicationSuspended(false);
+	arbiter.activateDeferred(3);
+	expect(publications).toHaveLength(1);
+	arbiter.activateDeferred(4);
+	// Keep the exact-once assertion adjacent to the source-epoch release.
+	expect(publications).toHaveLength(2);
+	arbiter.activateDeferred(4);
+	expect(publications).toHaveLength(2);
+});
+
+test("PresentationArbiter releases unscoped asks with the current workflow source while fencing stale entries", () => {
+	const publications: Array<Record<string, unknown>> = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as Record<string, unknown>;
+				publications.push(action);
+				return { actionId: action.id as string, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "retired" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	const presentation = (gateId: string, workflowGateId?: string) => ({
+		gateId,
+		...(workflowGateId ? { workflowGateId } : {}),
+		sessionId: "session",
+		question: gateId,
+		options: ["approve"],
+		controls: [],
+		multi: false,
+		allowEmpty: false,
+		selectedOptions: [],
+	});
+
+	arbiter.setPublicationSuspended(true);
+	arbiter.retain(presentation("ordinary"));
+	arbiter.retain(presentation("current", "current"), { publish: false, sourceEpoch: 2 });
+	arbiter.retain(presentation("stale", "stale"), { publish: false, sourceEpoch: 1 });
+	arbiter.setPublicationSuspended(false);
+
+	// The unscoped ask and current workflow source are both eligible for this activation.
+	arbiter.activateDeferred(2);
+	expect(publications).toHaveLength(1);
+	expect(publications[0]?.workflowGateId).toBeUndefined();
+
+	// Queue serialization still releases the current workflow entry even with a stale tail.
+	const ordinaryActionId = publications[0]?.id;
+	expect(typeof ordinaryActionId).toBe("string");
+	arbiter.completeInteractive("ordinary", ordinaryActionId as string);
+	expect(publications).toHaveLength(2);
+	expect(publications[1]?.workflowGateId).toBe("current");
+
+	// The stale workflow epoch remains fenced and cannot publish on the current activation.
+	const currentActionId = publications[1]?.id;
+	expect(typeof currentActionId).toBe("string");
+	arbiter.completeInteractive("current", currentActionId as string);
+	arbiter.activateDeferred(2);
+	expect(publications).toHaveLength(2);
+
+	// The optional-argument form preserves its existing global-release behavior.
+	arbiter.activateDeferred();
+	expect(publications).toHaveLength(3);
+	expect(publications[2]?.workflowGateId).toBe("stale");
+});
+
+test("PresentationArbiter fences deferred direct-control completions across same-gate source replacement", async () => {
+	for (const outcome of ["accepted", "rejected", "unknown"] as const) {
+		const publications: Array<Record<string, unknown>> = [];
+		const arbiter = new PresentationArbiter(
+			{
+				registerArbitratedAsk(json: string) {
+					const action = JSON.parse(json) as Record<string, unknown>;
+					publications.push(action);
+					return { actionId: action.id as string, registrationEpoch: publications.length };
+				},
+				retireIfUnclaimed: () => ({ status: "retired" as const }),
+			} as never,
+			() => false,
+			"test",
+		);
+		const presentation = (question: string) => ({
+			gateId: "same-gate",
+			workflowGateId: "same-gate",
+			sessionId: "session",
+			question,
+			options: ["approve"],
+			controls: [],
+			multi: false,
+			allowEmpty: false,
+			selectedOptions: [],
+		});
+
+		arbiter.retain(presentation("old source"), { sourceEpoch: 1 });
+		const oldPrepared = arbiter.prepareDirectControl("same-gate");
+		expect(oldPrepared).toEqual({ status: "retired", ordinal: 0 });
+		if (oldPrepared.status !== "retired") throw new Error("Expected a retired direct-control lease");
+
+		// Keep the old durable completion in flight while the source is rebound and
+		// the replacement reuses the same gate id.
+		const oldResolution = Promise.withResolvers<typeof outcome>();
+		const oldFinished = Promise.withResolvers<void>();
+		void oldResolution.promise.then(result => {
+			arbiter.finishDirectControl("same-gate", oldPrepared, result);
+			oldFinished.resolve();
+		});
+		arbiter.setPublicationSuspended(true);
+		arbiter.dispose();
+		arbiter.retain(presentation("replacement source"), { publish: false, sourceEpoch: 2 });
+		oldResolution.resolve(outcome);
+		await oldFinished.promise;
+
+		// The stale completion cannot consume, requeue, or publish the replacement.
+		expect(publications).toHaveLength(1);
+		arbiter.setPublicationSuspended(false);
+		arbiter.activateDeferred(1);
+		expect(publications).toHaveLength(1);
+		arbiter.activateDeferred(2);
+		expect(publications).toHaveLength(2);
+		const replacementActionId = publications[1]!.id as string;
+		expect(arbiter.presentationFor(replacementActionId)?.question).toBe("replacement source");
+
+		const replacementPrepared = arbiter.prepareDirectControl("same-gate");
+		expect(replacementPrepared).toEqual({ status: "retired", ordinal: 0 });
+		if (replacementPrepared.status !== "retired") throw new Error("Expected replacement to remain answerable");
+		arbiter.finishDirectControl("same-gate", replacementPrepared, "accepted");
+		expect(arbiter.presentationFor(replacementActionId)).toBeUndefined();
+	}
+});
+
+test("PresentationArbiter preserves exact retired proof after route removal and suspension", () => {
+	for (const terminalStatus of ["retired", "already_terminal"] as const) {
+		const leases: Array<{ actionId: string; gateId: string; registrationEpoch: number }> = [];
+		let publishedAction: { id: string } | undefined;
+		const arbiter = new PresentationArbiter(
+			{
+				registerArbitratedAsk(json: string) {
+					const action = JSON.parse(json) as { id: string };
+					publishedAction = action;
+					return { actionId: action.id, registrationEpoch: 1 };
+				},
+				retireIfUnclaimed(lease: { actionId: string; gateId: string; registrationEpoch: number }) {
+					leases.push(lease);
+					return { status: terminalStatus };
+				},
+			} as never,
+			() => false,
+			"test",
+		);
+		arbiter.retain({
+			gateId: "proof",
+			workflowGateId: "proof",
+			sessionId: "session",
+			question: "Proof",
+			options: ["approve"],
+			controls: [],
+			multi: false,
+			allowEmpty: false,
+			selectedOptions: [],
+		});
+		expect(publishedAction).toBeDefined();
+		const actionId = publishedAction!.id;
+		expect(arbiter.routeFor(actionId)).toBe("proof");
+		expect(arbiter.closeInteraction(actionId, "test")).toBe(true);
+		expect(leases).toEqual([{ actionId, gateId: "proof", registrationEpoch: 1 }]);
+		arbiter.setPublicationSuspended(true);
+		expect(arbiter.complete("proof")).toBe(terminalStatus);
+	}
+});
+
+test("PresentationArbiter carries retained route proofs into direct terminalization after reissue failure", async () => {
+	for (const terminalStatus of ["retired", "already_terminal"] as const) {
+		const store = new MemoryGateStore();
+		const emitter = new BrokerWorkflowGateEmitter(`direct-proof-${terminalStatus}`, store, {
+			advance: async () => {},
+		});
+		const publications: string[] = [];
+		let registrationsFail = false;
+		const arbiter = new PresentationArbiter(
+			{
+				registerArbitratedAsk(json: string) {
+					if (registrationsFail) throw new Error("reissue unavailable");
+					const action = JSON.parse(json) as { id: string };
+					publications.push(action.id);
+					return { actionId: action.id, registrationEpoch: publications.length };
+				},
+				retireIfUnclaimed: () => ({ status: terminalStatus }),
+			} as never,
+			() => false,
+			"test",
+		);
+		emitter.registerGateTerminalController!({
+			completeGateInteractions: gateId => arbiter.complete(gateId),
+			cancelGateInteractions: (gateId, reason) => arbiter.cancel(gateId, reason),
+		});
+		let gateId = "";
+		emitter.onGateEmitted!(gate => {
+			gateId = gate.gate_id;
+			arbiter.retain({
+				gateId: gate.gate_id,
+				workflowGateId: gate.gate_id,
+				sessionId: "session",
+				question: "Proof",
+				options: ["approve"],
+				controls: [],
+				multi: false,
+				allowEmpty: false,
+				selectedOptions: [],
+			});
+		});
+		const continuation = emitter.emitGate({
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string", enum: ["approve"] },
+		});
+		expect(publications).toHaveLength(1);
+		const actionId = publications[0]!;
+		expect(arbiter.closeInteraction(actionId, "invalid_control")).toBe(true);
+		registrationsFail = true;
+		expect(arbiter.reissue(gateId)).toBeUndefined();
+		expect(publications).toHaveLength(1);
+
+		// A rejected direct attempt must leave the old exact proof available while
+		// the retained presentation waits for a replacement publication.
+		arbiter.setPublicationSuspended(true);
+		const rejected = arbiter.prepareDirectControl(gateId);
+		expect(rejected).toEqual({ status: "queued", ordinal: 0, terminalProof: terminalStatus });
+		if (rejected.status !== "queued") throw new Error("Expected queued direct control for rejected retry");
+		arbiter.finishDirectControl(gateId, rejected, "rejected");
+		const prepared = arbiter.prepareDirectControl(gateId);
+		expect(prepared).toEqual({ status: "queued", ordinal: 0, terminalProof: terminalStatus });
+		if (prepared.status !== "queued" || !prepared.terminalProof)
+			throw new Error("Expected the retained route proof on the queued direct control");
+		expect(emitter.prepareTerminalization(gateId, prepared.terminalProof)).toBe(true);
+		await expect(
+			emitter.resolveGate!({ gate_id: gateId, answer: "approve", idempotency_key: `direct-${terminalStatus}` }),
+		).resolves.toMatchObject({ status: "accepted" });
+		await expect(continuation).resolves.toBe("approve");
+		expect(store.get(gateId)).toMatchObject({
+			status: "accepted",
+			terminalized: true,
+			terminalProof: terminalStatus,
+			advanced: true,
+		});
+		expect(publications).toHaveLength(1);
+	}
+});
+
+test("PresentationArbiter preserves the already-terminal proof across multi-select toggle reissue failure", async () => {
+	const store = new MemoryGateStore();
+	const emitter = new BrokerWorkflowGateEmitter("direct-multi-proof", store, { advance: async () => {} });
+	const publications: string[] = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as { id: string };
+				publications.push(action.id);
+				return { actionId: action.id, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "retired" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	emitter.registerGateTerminalController!({
+		completeGateInteractions: gateId => arbiter.complete(gateId),
+		cancelGateInteractions: (gateId, reason) => arbiter.cancel(gateId, reason),
+	});
+	let gateId = "";
+	emitter.onGateEmitted!(gate => {
+		gateId = gate.gate_id;
+		arbiter.retain({
+			gateId: gate.gate_id,
+			workflowGateId: gate.gate_id,
+			sessionId: "session",
+			question: "Choose",
+			options: ["one", "two"],
+			controls: [],
+			multi: true,
+			allowEmpty: false,
+			selectedOptions: [],
+		});
+	});
+	const continuation = emitter.emitGate({
+		stage: "ralplan",
+		kind: "approval",
+		schema: { type: "object" },
+	});
+	const actionId = publications[0]!;
+	arbiter.setPublicationSuspended(true);
+	expect(arbiter.toggle(actionId, "one")).toBe(true);
+	expect(publications).toHaveLength(1);
+
+	const prepared = arbiter.prepareDirectControl(gateId);
+	expect(prepared).toEqual({ status: "queued", ordinal: 0, terminalProof: "already_terminal" });
+	if (prepared.status !== "queued" || prepared.terminalProof !== "already_terminal")
+		throw new Error("Expected already-terminal proof for toggled published route");
+	expect(emitter.prepareTerminalization(gateId, prepared.terminalProof)).toBe(true);
+	await expect(
+		emitter.resolveGate!({ gate_id: gateId, answer: { selected: ["one"] }, idempotency_key: "direct-multi-proof" }),
+	).resolves.toMatchObject({ status: "accepted" });
+	await expect(continuation).resolves.toEqual({ selected: ["one"] });
+	expect(store.get(gateId)).toMatchObject({
+		status: "accepted",
+		terminalized: true,
+		terminalProof: "already_terminal",
+		advanced: true,
+	});
+	expect(publications).toHaveLength(1);
+});
+
+test("PresentationArbiter fails closed when a published route loses its proof during reissue failure", () => {
+	const publications: string[] = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as { id: string };
+				publications.push(action.id);
+				return { actionId: action.id, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "retired" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	arbiter.retain({
+		gateId: "unknown-proof",
+		workflowGateId: "unknown-proof",
+		sessionId: "session",
+		question: "Choose",
+		options: ["one"],
+		controls: [],
+		multi: false,
+		allowEmpty: false,
+		selectedOptions: [],
+	});
+	const actionId = publications[0]!;
+	arbiter.setPublicationSuspended(true);
+	arbiter.reissueAfterFailure(actionId);
+	expect(publications).toHaveLength(1);
+	// No exact native proof survived this transport failure, so direct control
+	// must not manufacture not_published for a gate that was already published.
+	expect(arbiter.prepareDirectControl("unknown-proof")).toEqual({ status: "stale" });
+});
+
+test("PresentationArbiter preserves replay retirement proof when replacement publication is suspended", async () => {
+	for (const terminalStatus of ["retired", "already_terminal"] as const) {
+		const publications: string[] = [];
+		const arbiter = new PresentationArbiter(
+			{
+				registerArbitratedAsk(json: string) {
+					const action = JSON.parse(json) as { id: string };
+					publications.push(action.id);
+					return { actionId: action.id, registrationEpoch: publications.length };
+				},
+				retireIfUnclaimed: () => ({ status: terminalStatus }),
+			} as never,
+			() => false,
+			"test",
+		);
+		arbiter.retain({
+			gateId: "replay-proof",
+			workflowGateId: "replay-proof",
+			sessionId: "session",
+			question: "Pick",
+			options: ["one", "two"],
+			controls: [],
+			multi: false,
+			allowEmpty: false,
+			selectedOptions: [],
+		});
+		expect(publications).toHaveLength(1);
+		arbiter.setPublicationSuspended(true);
+		arbiter.retain({
+			gateId: "replay-proof",
+			workflowGateId: "replay-proof",
+			sessionId: "session",
+			question: "Pick again",
+			options: ["one", "two", "three"],
+			controls: [],
+			multi: false,
+			allowEmpty: false,
+			selectedOptions: [],
+		});
+		const prepared = arbiter.prepareDirectControl("replay-proof");
+		expect(prepared).toEqual({ status: "queued", ordinal: 0, terminalProof: terminalStatus });
+		expect(publications).toHaveLength(1);
+	}
+});
+
+test("PresentationArbiter preserves exact proof while completing an active route", () => {
+	for (const terminalStatus of ["retired", "already_terminal"] as const) {
+		const publications: string[] = [];
+		const arbiter = new PresentationArbiter(
+			{
+				registerArbitratedAsk(json: string) {
+					const action = JSON.parse(json) as { id: string };
+					publications.push(action.id);
+					return { actionId: action.id, registrationEpoch: 1 };
+				},
+				retireIfUnclaimed: () => ({ status: terminalStatus }),
+			} as never,
+			() => false,
+			"test",
+		);
+		arbiter.retain({
+			gateId: "active-proof",
+			workflowGateId: "active-proof",
+			sessionId: "session",
+			question: "Proof",
+			options: ["approve"],
+			controls: [],
+			multi: false,
+			allowEmpty: false,
+			selectedOptions: [],
+		});
+		const actionId = publications[0];
+		if (!actionId) throw new Error("Expected an active workflow gate route");
+		expect(arbiter.routeFor(actionId)).toBe("active-proof");
+		expect(arbiter.complete("active-proof")).toBe(terminalStatus);
+		expect(arbiter.routeFor(actionId)).toBeUndefined();
+	}
+});
+
+test("PresentationArbiter persists an already-terminal active proof", async () => {
+	const store = new MemoryGateStore();
+	const publications: string[] = [];
+	const emitter = new BrokerWorkflowGateEmitter("already-terminal-proof", store, {
+		advance: async () => {},
+	});
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as { id: string };
+				publications.push(action.id);
+				return { actionId: action.id, registrationEpoch: 1 };
+			},
+			retireIfUnclaimed: () => ({ status: "already_terminal" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	emitter.registerGateTerminalController!({
+		completeGateInteractions: gateId => arbiter.complete(gateId),
+		cancelGateInteractions: (gateId, reason) => arbiter.cancel(gateId, reason),
+	});
+	let gateId: string | undefined;
+	emitter.onGateEmitted!(gate => {
+		gateId = gate.gate_id;
+		arbiter.retain({
+			gateId: gate.gate_id,
+			workflowGateId: gate.gate_id,
+			sessionId: "session",
+			question: "Proof",
+			options: ["approve"],
+			controls: [],
+			multi: false,
+			allowEmpty: false,
+			selectedOptions: [],
+		});
+	});
+	const continuation = emitter.emitGate({
+		stage: "ralplan",
+		kind: "approval",
+		schema: { type: "string" },
+	});
+	if (!gateId) throw new Error("Expected workflow gate emission");
+	expect(publications).toHaveLength(1);
+	await expect(
+		emitter.resolveGate!({ gate_id: gateId, answer: "approve", idempotency_key: "already-terminal-proof" }),
+	).resolves.toMatchObject({ status: "accepted" });
+	await expect(continuation).resolves.toBe("approve");
+	expect(store.get(gateId)).toMatchObject({
+		status: "accepted",
+		terminalized: true,
+		terminalProof: "already_terminal",
+		advanced: true,
+	});
 });
 
 test("PresentationArbiter clears only the exact interactive route across settlement and terminal teardown", () => {
@@ -4658,7 +5470,7 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 		compact: async () => {
 			compactions++;
 		},
-		getConfigItems: () => ({ "ui.theme": "light" }),
+		getConfigItems: () => ({ "theme.dark": "light" }),
 	};
 	process.env.GJC_NOTIFICATIONS = "1";
 	start(ctx, settings);
@@ -4766,7 +5578,7 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 			type: "control_request",
 			id: "config-patch",
 			operation: "config.patch",
-			input: { patch: { "ui.theme": "dark" } },
+			input: { patch: { "theme.dark": "dark" } },
 			expectedRevision: "0",
 			idempotencyKey: "successful-verbs-config-patch",
 		}),
@@ -4774,9 +5586,27 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 		type: "control_response",
 		id: "config-patch",
 		ok: true,
-		result: { patched: ["ui.theme"], revision: "1" },
+		result: { patched: ["theme.dark"], revision: "1" },
 	});
-	expect(configWrites).toEqual([["ui.theme", "dark"]]);
+	expect(
+		await request("config-patch-repeat", {
+			type: "control_request",
+			id: "config-patch-repeat",
+			operation: "config.patch",
+			input: { patch: { "theme.dark": "light" } },
+			expectedRevision: "1",
+			idempotencyKey: "successful-verbs-config-patch-repeat",
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "config-patch-repeat",
+		ok: true,
+		result: { patched: ["theme.dark"], revision: "2" },
+	});
+	expect(configWrites).toEqual([
+		["theme.dark", "dark"],
+		["theme.dark", "light"],
+	]);
 	expect(
 		await request("config-readback", {
 			type: "query_request",
@@ -4787,7 +5617,7 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 		type: "query_response",
 		id: "config-readback",
 		ok: true,
-		page: { items: [{ "ui.theme": "dark" }] },
+		page: { items: [{ "theme.dark": "light" }] },
 	});
 });
 
@@ -5394,4 +6224,201 @@ test("identical clientRefs in separate session runtimes stay isolated", async ()
 
 	await handlersA.get("session_shutdown")?.({ type: "session_shutdown" }, contextA);
 	await handlersB.get("session_shutdown")?.({ type: "session_shutdown" }, contextB);
+});
+test("canonical subagent lifecycle keeps the parent workflow-gate runtime turn correlated", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-canonical-subagent-gate-correlation-"));
+	dirs.push(cwd);
+	const subagentSessionManager = SessionManager.inMemory(cwd);
+	const sessionId = subagentSessionManager.getSessionId();
+	const emitter = new BrokerWorkflowGateEmitter(
+		sessionId,
+		new FileGateStore(path.join(cwd, ".gjc", "state", "workflow-gates.json")),
+	);
+	const sessionContext = context(cwd, sessionId, "main", {}, emitter);
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "canonical-subagent-prompt",
+			operation: "turn.prompt",
+			input: { text: "preserve the parent runtime turn" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "canonical-subagent-prompt"),
+		"prompt acknowledgement",
+	);
+	const acknowledgement = frames.find(
+		frame => frame.type === "control_response" && frame.id === "canonical-subagent-prompt",
+	) as { result?: { commandId?: unknown; turnId?: unknown } };
+	const commandId = acknowledgement.result?.commandId;
+	const turnId = acknowledgement.result?.turnId;
+	expect(acknowledgement).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await waitFor(
+		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
+		"correlated parent agent start",
+	);
+
+	const resolveParentGate = async (idempotencyKey: string): Promise<void> => {
+		const advance = emitter.emitGate({
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string", enum: ["approve"] },
+		});
+		const gate = emitter.listWorkflowGateQueryRecords!().find(record => record.tag === "pending");
+		expect(gate).toMatchObject({ tag: "pending", runtime_turn_id: turnId });
+		await emitter.resolveGate!({
+			gate_id: gate!.gate_id,
+			answer: "approve",
+			idempotency_key: idempotencyKey,
+		});
+		expect(await advance).toBe("approve");
+	};
+
+	let subagentSession: AgentSession | undefined;
+	try {
+		const subagent = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			sessionManager: subagentSessionManager,
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			parentTaskPrefix: "0-Subagent",
+			currentAgentType: "planner",
+		});
+		subagentSession = subagent.session;
+		expect(subagentSession.getWorkflowGateEmitter()).toBeDefined();
+
+		// A canonical subagent must remain local while the parent gate stays bound.
+		await resolveParentGate("canonical-subagent-bound");
+
+		await subagentSession.dispose();
+		subagentSession = undefined;
+
+		// Its teardown must not clear the parent endpoint binding.
+		await resolveParentGate("canonical-subagent-disposed");
+
+		await handlers.get("agent_end")?.(
+			{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] } as never,
+			sessionContext,
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "agent_end" && frame.commandId === commandId),
+			"correlated parent terminal",
+		);
+		const terminalFrames = frames.filter(frame => frame.type === "agent_end" || frame.type === "agent_failed");
+		expect(terminalFrames).toEqual([
+			expect.objectContaining({
+				type: "agent_end",
+				sessionId,
+				commandId,
+				turnId,
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			}),
+		]);
+		expect(frames.filter(frame => frame.type === "agent_end")).toHaveLength(1);
+	} finally {
+		await subagentSession?.dispose();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+});
+
+/**
+ * Regression: a continuation (todo reminder, TTSR resume, auto-continue) re-enters
+ * the agent loop inside one prompt and emits a second `agent_start`. That start
+ * used to shift the empty pending queue and overwrite the live correlation with
+ * `undefined`, so the prompt's `agent_end` carried no correlation, was never
+ * terminalized, and every ACP client hung until the 30-minute prompt deadline.
+ */
+test("SDK host keeps the prompt correlation across a mid-prompt continuation agent_start", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-continuation-correlation-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-continuation-correlation-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "continuation-prompt",
+			operation: "turn.prompt",
+			input: { text: "read the file and answer" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "continuation-prompt"),
+		"prompt acknowledgement",
+	);
+	const acknowledgement = frames.find(
+		frame => frame.type === "control_response" && frame.id === "continuation-prompt",
+	) as { result?: { commandId?: unknown; turnId?: unknown } };
+	const commandId = acknowledgement.result?.commandId;
+	const turnId = acknowledgement.result?.turnId;
+	expect(acknowledgement).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+
+	// First loop entry claims the pending correlation.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await waitFor(
+		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
+		"correlated agent start",
+	);
+
+	// The continuation re-enters the loop while the same prompt is still in flight.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+
+	// The terminal must still carry this prompt's exact identity.
+	await handlers.get("agent_end")?.(
+		{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] } as never,
+		sessionContext,
+	);
+	await waitFor(() => frames.some(frame => frame.type === "agent_end"), "correlated prompt terminal");
+	expect(frames.find(frame => frame.type === "agent_end")).toMatchObject({
+		sessionId,
+		commandId,
+		turnId,
+		outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+	});
+	// The continuation must not publish a duplicate lifecycle start.
+	expect(frames.filter(frame => frame.type === "agent_start").length).toBe(1);
+
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });

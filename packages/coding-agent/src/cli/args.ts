@@ -2,7 +2,7 @@
  * CLI argument parsing
  */
 import * as path from "node:path";
-import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai";
+import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseEffort } from "../thinking";
@@ -24,6 +24,8 @@ export interface Args {
 	credential?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
+	clipboardTransport?: "auto" | "native" | "osc52" | "ssh";
+	clipboardSshHost?: string;
 	mcpConfig?: string;
 	thinking?: Effort;
 	continue?: boolean;
@@ -163,6 +165,28 @@ export function parseArgs(args: string[]): Args {
 			result.systemPrompt = args[++i];
 		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
 			result.appendSystemPrompt = args[++i];
+		} else if (arg === "--clipboard-transport") {
+			const next = args[i + 1];
+			if (!next || next.startsWith("-")) {
+				throw new CliParseError("--clipboard-transport requires <auto|native|osc52|ssh>");
+			}
+			if (next !== "auto" && next !== "native" && next !== "osc52" && next !== "ssh") {
+				throw new CliParseError(
+					`invalid --clipboard-transport value: ${next} (expected auto, native, osc52, or ssh)`,
+				);
+			}
+			result.clipboardTransport = args[++i] as "auto" | "native" | "osc52" | "ssh";
+		} else if (arg === "--clipboard-ssh-host") {
+			const next = args[i + 1];
+			if (!next || next.startsWith("-")) {
+				throw new CliParseError("--clipboard-ssh-host requires <alias>");
+			}
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(next)) {
+				throw new CliParseError(
+					`invalid --clipboard-ssh-host value: ${JSON.stringify(next)} (must be a bare host alias — no whitespace, control characters, or leading dash)`,
+				);
+			}
+			result.clipboardSshHost = args[++i];
 		} else if (arg === "--mcp-config") {
 			if (result.mcpConfig !== undefined) {
 				throw new CliParseError("--mcp-config can only be specified once");

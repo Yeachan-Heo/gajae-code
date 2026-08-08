@@ -20,6 +20,13 @@ function codexModel(contextWindow: number): Model<Api> {
 		maxTokens: 128_000,
 	};
 }
+function codexTierModel(id: string, contextWindow: number): Model<Api> {
+	return {
+		...codexModel(contextWindow),
+		id,
+		name: id,
+	};
+}
 
 describe("model manager Codex GPT-5.6 cap", () => {
 	let cacheDir: string;
@@ -47,10 +54,10 @@ describe("model manager Codex GPT-5.6 cap", () => {
 			},
 			"online",
 		);
-		expect(result.models[0]?.contextWindow).toBe(272_000);
+		expect(result.models[0]?.contextWindow).toBe(372_000);
 	});
 
-	it("prefers a newly observed smaller live cap over stale larger cache metadata", async () => {
+	it("forces the 372K window over stale larger cache metadata and smaller live observations", async () => {
 		const now = () => 1_800_000_000_000;
 		writeModelCache("openai-codex", now(), [codexModel(373_000)], true, "empty", cacheDbPath);
 		const result = await resolveProviderModels<Api>(
@@ -63,7 +70,21 @@ describe("model manager Codex GPT-5.6 cap", () => {
 			},
 			"online",
 		);
-		expect(result.models[0]?.contextWindow).toBe(200_000);
+		expect(result.models[0]?.contextWindow).toBe(372_000);
+	});
+	it("forces the 372K window for every tier id through the manager pipeline", async () => {
+		for (const id of ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const) {
+			const result = await resolveProviderModels<Api>(
+				{
+					providerId: "openai-codex",
+					staticModels: [],
+					cacheDbPath,
+					fetchDynamicModels: async () => [codexTierModel(id, 272_000)],
+				},
+				"online",
+			);
+			expect(result.models[0]?.contextWindow).toBe(372_000);
+		}
 	});
 
 	it("applies GPT-5.6 pricing to dynamically discovered models without a static entry", async () => {

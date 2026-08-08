@@ -550,7 +550,6 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		} satisfies ProviderSessionState);
 
 		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
-		expect(seed.cacheIdentity).toBe(parent.sessionId);
 		expect(seed.messages).toHaveLength(3);
 		expect(seed.metadata.skippedReasons["developer-role"]).toBe(1);
 		const inheritedToolDigest = seed.messages.at(-1);
@@ -604,7 +603,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		authStorages.push(childAuthStorage);
 
 		expect(child.sessionId).not.toBe(parent.sessionId);
-		expect(child.agent.providerSessionId).toBe(parent.sessionId);
+		expect(child.agent.providerSessionId).toBe(child.sessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
 		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
@@ -676,6 +675,128 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			expect(seed.appendOnlyPrefixSnapshot).toBeUndefined();
 		}
 	});
+
+	it("preserves a forked child seeded prefix across compaction and prune rewrites", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-seeded-rewrite-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+		const { session: parent, authStorage: parentAuthStorage } = await createSessionHarness(tempDir, parentManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+			settings: { "provider.appendOnlyContext": "on" },
+		});
+		sessions.push(parent);
+		authStorages.push(parentAuthStorage);
+		parent.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "parent seeded prefix" }],
+			attribution: "user",
+			timestamp: Date.now() - 10_000,
+		});
+		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
+		expect(seed.appendOnlyPrefixSnapshot).toBeDefined();
+		const childManager = SessionManager.create(tempDir, tempDir);
+		const { session: child, authStorage: childAuthStorage } = await createSessionHarness(tempDir, childManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+			settings: { "provider.appendOnlyContext": "on", "compaction.keepRecentTokens": 10 },
+			forkContextSeed: seed,
+		});
+		sessions.push(child);
+		authStorages.push(childAuthStorage);
+		const appendOnly = child.agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		if (!appendOnly) return;
+		const seededPrefix = appendOnly.log.toMessages();
+		expect(seededPrefix).toEqual(seed.messages);
+
+		const oldLocal = { role: "user" as const, content: "child old local", timestamp: Date.now() - 3_000 };
+		const keptLocal = { role: "user" as const, content: "child kept local", timestamp: Date.now() - 2_000 };
+		child.agent.appendMessage(oldLocal);
+		child.agent.appendMessage(keptLocal);
+		childManager.appendMessage(oldLocal);
+		const firstKeptEntryId = childManager.appendMessage(keptLocal);
+		const compactionEntryId = childManager.appendCompaction(
+			"child summary",
+			"child summary",
+			firstKeptEntryId,
+			1_000,
+		);
+		const compactionLocal = {
+			role: "user" as const,
+			content: "child-before-compaction-rewrite",
+			timestamp: Date.now() - 1_000,
+		};
+		appendOnly.syncMessages([...seededPrefix, compactionLocal]);
+		expect(appendOnly.log.toMessages()).toHaveLength(seededPrefix.length + 1);
+		await child.applyCompactionPostAppendForTests(compactionEntryId, firstKeptEntryId);
+		expect(appendOnly.log.toMessages().slice(0, seededPrefix.length)).toEqual(seededPrefix);
+		expect(appendOnly.log.toMessages()).not.toContainEqual(compactionLocal);
+
+		const pruneOutput = "fork-prune-output-".repeat(60_000);
+		const pruneCallId = "fork-prune-call";
+		const pruneAssistant = {
+			role: "assistant" as const,
+			content: [{ type: "toolCall" as const, id: pruneCallId, name: "bash", arguments: { command: "cat" } }],
+			api: child.model!.api,
+			provider: child.model!.provider,
+			model: child.model!.id,
+			usage: createUsage(),
+			stopReason: "toolUse" as const,
+			timestamp: Date.now(),
+		};
+		const pruneResult = {
+			role: "toolResult" as const,
+			toolCallId: pruneCallId,
+			toolName: "bash",
+			content: [{ type: "text" as const, text: pruneOutput }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const recentPruneResult = {
+			role: "toolResult" as const,
+			toolCallId: "fork-recent-call",
+			toolName: "bash",
+			content: [{ type: "text" as const, text: "fork-recent-output-".repeat(20_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const pruneFinalAssistant = {
+			...createStaleAssistantMessage("fork final response", {
+				api: child.model!.api,
+				provider: child.model!.provider,
+				model: child.model!.id,
+			}),
+			usage: { ...createUsage(), totalTokens: (child.model!.contextWindow ?? 200_000) + 100_000 },
+		};
+		for (const message of [
+			pruneAssistant,
+			pruneResult,
+			recentPruneResult,
+			{ role: "user" as const, content: "fork fence one", timestamp: Date.now() },
+			pruneFinalAssistant,
+			{ role: "user" as const, content: "fork fence two", timestamp: Date.now() },
+		]) {
+			child.agent.appendMessage(message as never);
+			childManager.appendMessage(message as never);
+		}
+		const pruneLocal = { role: "user" as const, content: "child-before-prune-rewrite", timestamp: Date.now() };
+		appendOnly.syncMessages([...seededPrefix, pruneLocal]);
+		expect(appendOnly.log.toMessages()).toHaveLength(seededPrefix.length + 1);
+		const outcome = await child.runMidRunMaintenanceForTests({
+			systemPrompt: child.state.systemPrompt,
+			messages: child.messages,
+			tools: [],
+		});
+		expect(outcome).toBe("pruned");
+		expect(appendOnly.log.toMessages().slice(0, seededPrefix.length)).toEqual(seededPrefix);
+		expect(appendOnly.log.toMessages()).not.toContainEqual(pruneLocal);
+		// Each session created by this test races the workspace-tree scan's 5s
+		// startup deadline, so on slower runners the two harness sessions plus the
+		// maintenance can exceed bun's 5s default. The CI failure this guards was
+		// the StablePrefix fingerprint crash (fast); the generous bound only
+		// prevents environment-speed false timeouts.
+	}, 30_000);
 
 	it("spawns bundled executor and architect via TaskTool with inheritContext: bounded through the production path", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));
@@ -832,10 +953,10 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 
 		for (const child of [execChild!, archChild!]) {
 			expect(child.forkContextSeed).toBeDefined();
-			// cacheIdentity is the seed-borne identity; it must reuse the parent's sessionId so
-			// the child session's provider-side prefix cache hits when configured via sdk/session.ts:870
-			// (which uses options.forkContextSeed?.cacheIdentity as the providerSessionId fallback).
-			expect(child.forkContextSeed!.cacheIdentity).toBe(parent.sessionId);
+			// Seeds carry conversation content only. TaskTool must not inject a
+			// provider identity: each child derives its own from its logical session
+			// so concurrent workers never share an upstream session owner.
+			expect(child.providerSessionId).toBeUndefined();
 		}
 	});
 
@@ -955,9 +1076,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
 			modelId: "gpt-5.2-codex",
+			settings: { "provider.appendOnlyContext": "on" },
 		});
 		sessions.push(session);
 		authStorages.push(authStorage);
+		const appendOnly = session.agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		appendOnly?.syncMessages([{ role: "user", content: "reload-provider-marker" }]);
+		expect(appendOnly?.log.length).toBe(1);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
@@ -974,6 +1100,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		await session.reload();
 
 		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(appendOnly?.log.length).toBe(0);
 		expect(session.providerSessionState.size).toBe(0);
 		expect(session.model?.provider).toBe("openai-codex");
 		expect(session.model?.id).toBe("gpt-5.2-codex");

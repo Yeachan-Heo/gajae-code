@@ -6,6 +6,15 @@ export const REVERSE_LEASE_TTL_MS = 15_000;
 export const REVERSE_RECLAIM_GRACE_MS = 15_000;
 export const MAX_REVERSE_OUTSTANDING = 64;
 export const MAX_REVERSE_PAYLOAD_BYTES = 256 * 1024;
+/**
+ * Matches the raw WebSocket frame ceiling in crates/gjc-sdk/src/server.rs.
+ * Reverse responses must fit after their protocol envelope is serialized.
+ */
+export function assertReverseResponseFrame(frame: SdkFrame): void {
+	const encoded = JSON.stringify(frame);
+	if (encoded !== undefined && Buffer.byteLength(encoded) > MAX_REVERSE_PAYLOAD_BYTES)
+		throw new ReverseLeaseError("payload_too_large");
+}
 
 export class ReverseLeaseError extends Error {
 	constructor(
@@ -265,7 +274,7 @@ export class ReverseLeaseRuntime {
 		result: unknown,
 		error?: { code: string; message: string },
 	): void {
-		this.#assertPayload(result);
+		this.#assertResponseFrame(connectionId, id, leaseId, result, error);
 		const request = this.#outstanding.get(id);
 		if (!request) throw new ReverseLeaseError("unknown_request");
 		if (request.connectionId !== connectionId || request.leaseId !== leaseId)
@@ -353,6 +362,19 @@ export class ReverseLeaseRuntime {
 	#removeDefinitions(capability: string): void {
 		if (!this.#installedCapabilities.delete(capability)) return;
 		this.#onDefinitionsRemoved?.(capability);
+	}
+	#assertResponseFrame(
+		connectionId: string,
+		id: string,
+		leaseId: string,
+		result: unknown,
+		error?: { code: string; message: string },
+	): void {
+		assertReverseResponseFrame(
+			error
+				? { type: "reverse_response", id, connectionId, leaseId, ok: false, error }
+				: { type: "reverse_response", id, connectionId, leaseId, ok: true, result },
+		);
 	}
 	#assertPayload(payload: unknown): void {
 		const encoded = JSON.stringify(payload);

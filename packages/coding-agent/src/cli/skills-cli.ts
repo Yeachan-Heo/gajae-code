@@ -72,17 +72,18 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 		return;
 	}
 
+	const content = skill.loadContent ? await skill.loadContent() : skill.content;
 	const entry: SkillsReadEntry = {
 		name: skill.name,
 		description: skill.description,
 		path: skill.filePath,
 		source: skill.source,
-		content: skill.content,
+		content,
 	};
 	if (cmd.flags?.json) {
 		writeJson(entry);
 		return;
 	}
-	process.stdout.write(skill.content);
-	if (!skill.content.endsWith("\n")) process.stdout.write("\n");
+	process.stdout.write(content);
+	if (!content.endsWith("\n")) process.stdout.write("\n");
 }

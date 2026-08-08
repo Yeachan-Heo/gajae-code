@@ -5,7 +5,7 @@
  * Messages are newline-delimited JSON.
  */
 
-import { getProjectDir, readJsonl, Snowflake } from "@gajae-code/utils";
+import { readJsonl, Snowflake } from "@gajae-code/utils";
 import { type OwnedProcess, spawnOwnedProcess } from "../../runtime/process-lifecycle";
 import type {
 	JsonRpcError,
@@ -101,7 +101,7 @@ export class StdioTransport implements MCPTransport {
 					...Bun.env,
 					...this.config.env,
 				};
-		const cwd = this.config.cwd ?? getProjectDir();
+		const cwd = this.config.cwd ?? process.cwd();
 
 		try {
 			this.#process = spawnOwnedProcess([this.config.command, ...args], {

@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { AssistantMessage, ImageContent, Message } from "@gajae-code/ai";
+import type { AssistantMessage, ImageContent, Message } from "@gajae-code/ai/core";
 import { type Component, Loader, Spacer, Text, TruncatedText, type TUI, truncateToWidth } from "@gajae-code/tui";
 import { settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";

@@ -1,6 +1,6 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
-import { completeSimple } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
+import { completeSimple } from "@gajae-code/ai/core";
 import { prompt } from "@gajae-code/utils";
 import reduceSystemPrompt from "../../commit/prompts/reduce-system.md" with { type: "text" };
 import reduceUserPrompt from "../../commit/prompts/reduce-user.md" with { type: "text" };

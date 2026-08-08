@@ -1,7 +1,7 @@
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import { calculatePromptTokens } from "@gajae-code/agent-core/compaction/compaction";
-import type { AssistantMessage, ImageContent } from "@gajae-code/ai";
-import { parseRateLimitReason } from "@gajae-code/ai";
+import type { AssistantMessage, ImageContent } from "@gajae-code/ai/core";
+import { parseRateLimitReason } from "@gajae-code/ai/core";
 import { type Component, Loader, TERMINAL, Text } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import { settings } from "../../config/settings";

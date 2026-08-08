@@ -31,14 +31,15 @@ Default writes are v2-only. Legacy discovery/migration is lazy, validates identi
 There are two different listing pipelines:
 
 1. `getRecentSessions(sessionDir, limit)` (welcome/summary view)
-   - Reads a bounded 4KB prefix plus bounded trailing v4 header patches from each file.
-   - Parses header metadata, applicable tail patches, and the earliest user text preview.
+   - Reads a bounded 4KB prefix plus reverse-scanned v4/v5 header patches from each file.
+   - Parses header metadata, applicable trailing patches, and the earliest user text preview.
    - Returns lightweight `RecentSessionInfo` with lazy `name` and `timeAgo` getters.
    - Sorts by file `mtime` descending.
 
 2. `SessionManager.list(...)` / `SessionManager.listAll()` (resume pickers and ID matching)
-   - Reads a bounded 4KB prefix plus at most 16KB of trailing v4 header patches for file-backed sessions.
-   - Builds `SessionInfo` objects from bounded metadata and preview extraction; buried patches outside the tail budget deliberately fall back to line-1 header metadata.
+   - Reads a bounded 4KB prefix, then reverse-scans for the latest strict `header_patch` values (cwd/title) in 4KB chunks, stopping once both fields resolve.
+   - Recent patches near EOF stay cheap; when a field is still missing the scan continues past the historical 16KB window so a buried but still-canonical title remains listable without a full sequential JSONL parse of multi-MB message bodies.
+   - Builds `SessionInfo` objects from that projection plus prefix preview extraction.
    - Drops sessions with zero `message` entries and sorts by `modified` descending.
 
 ### Metadata fallback behavior

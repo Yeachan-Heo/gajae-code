@@ -279,7 +279,8 @@ describe("system Handlebars prompt templates", () => {
 		expect(countOccurrences(rendered, "Informational questions are answer-only/read-only")).toBe(1);
 		expect(rendered).toContain("unless the user explicitly requests a change, command, or execution");
 		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
-		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
+		expect(rendered).toContain("recommend `/skill:deep-interview` via `ask`");
+		expect(rendered).toContain("Explicit user intent outranks every routing heuristic");
 	});
 	test("system-prompt routes explicit worktree requests through isolated delegation", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
@@ -383,6 +384,47 @@ describe("system Handlebars prompt templates", () => {
 			expect(volatile).toContain("Working directory layout (sorted by mtime, recent first; depth ≤ 3):");
 			expect(volatile).toContain("(some entries elided to keep the tree short");
 		});
+	});
+
+	// Regression for #3859: default prompt path (no customPrompt) must inject
+	// always-apply bodies and rulebook listings. They lived only in
+	// custom-system-prompt.md and were silently dropped for normal sessions.
+	test("buildSystemPrompt injects alwaysApplyRules and rulebook on the default path", async () => {
+		const alwaysBody = "MAGICPROBE7F3A is the passphrase.";
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: os.tmpdir(),
+			contextFiles: [],
+			skills: [],
+			rules: [
+				{
+					name: "probe-rulebook",
+					description: "rulebook probe description",
+					path: "/tmp/probe-rulebook.md",
+					globs: ["**/*.ts"],
+				},
+			],
+			alwaysApplyRules: [{ name: "probe", content: alwaysBody, path: "/tmp/probe.md" }],
+			toolNames: ["read"],
+			workspaceTree: {
+				rootPath: os.tmpdir(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+
+		// Default path is [system-prompt, project-prompt]; rules land in project.
+		const projectPrompt = systemPrompt[1] ?? "";
+		const full = systemPrompt.join("\n\n");
+
+		expect(full).toContain(alwaysBody);
+		expect(projectPrompt).toContain(alwaysBody);
+		expect(projectPrompt).toContain("Rules are local constraints");
+		expect(projectPrompt).toContain('rule name="probe-rulebook"');
+		expect(projectPrompt).toContain("rulebook probe description");
+		expect(projectPrompt).toContain("<glob>**/*.ts</glob>");
+		expect(projectPrompt).toContain("rule://");
 	});
 
 	test("buildSystemPrompt deduplicates always-apply rules already present in SYSTEM.md", async () => {

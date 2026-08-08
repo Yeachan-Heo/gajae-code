@@ -123,6 +123,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let releasePermissionModeSet: (() => void) | undefined;
 	let activeModelPreset = "test-preset";
 	let completeNextPromptBeforeAck = false;
+	/** Queries `#sessionState` issues before `session/new` can answer. */
+	const SESSION_STATE_QUERIES = new Set(["config.list/get", "models.profiles.list", "providers.list/active"]);
+	let queryStallMs = 0;
 
 	let server!: ReturnType<typeof Bun.serve>;
 	server = Bun.serve({
@@ -318,9 +321,21 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 													},
 												]
 											: [];
-					socket.send(
-						JSON.stringify({ type: "query_response", id: frame.id, ok: true, result: { page: { items } } }),
-					);
+					const sendQueryResponse = () =>
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id: frame.id,
+								ok: true,
+								result: { page: { items, complete: true } },
+							}),
+						);
+					// Session-state queries answer slowly on purpose. Bootstrap updates used to be
+					// scheduled on a fixed 50ms timer taken before these ran, so a slow host let
+					// them overtake the session/new response and reference an unknown session.
+					if (queryStallMs > 0 && SESSION_STATE_QUERIES.has(String(frame.query)))
+						setTimeout(sendQueryResponse, queryStallMs);
+					else sendQueryResponse();
 					return;
 				}
 				if (frame.operation === "permission_mode.set" && holdPermissionModeSet) {
@@ -417,7 +432,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		{ agentDir, startupOptions: { modelPreset: "codex-medium" } },
 	);
 	const initialized = await bounded(agent.initialize({ protocolVersion: 1, clientCapabilities: {} }), "initialize");
-	expect(initialized.agentCapabilities?.mcpCapabilities).toEqual({ http: true, sse: true });
+	// Legacy MCP HTTP+SSE is deprecated and unimplemented, so it must not be advertised.
+	expect(initialized.agentCapabilities?.mcpCapabilities).toEqual({ http: true });
+	// Make session-state resolution outlast the old fixed bootstrap timer, reproducing a
+	// slow host: without the fix the skill list overtakes the response below.
+	queryStallMs = 120;
 	const created = await bounded(
 		agent.newSession({
 			cwd,
@@ -440,6 +459,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		"new session",
 	);
 	expect(created.sessionId).toBe("owned-session");
+	// The client only learns the sessionId from this response, so any session/update
+	// published before it names a session the client cannot route and is dropped —
+	// which is how the skill list went missing in Paseo. ACP's session-setup sequence
+	// allows updates before the response only for session/load.
+	expect(updates.filter(update => update.sessionId === created.sessionId)).toEqual([]);
+	queryStallMs = 0;
 	expect(initialized.agentCapabilities?.sessionCapabilities).not.toHaveProperty("additionalDirectories");
 	expect(created.configOptions).toEqual(
 		expect.arrayContaining([
@@ -555,6 +580,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			mcpServers: [],
 		}),
 	).rejects.toMatchObject({ code: "unsupported" });
+	expect(await agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" })).toEqual({});
+	await expect(agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" })).rejects.toMatchObject({
+		code: "unsupported",
+		message: "ACP plan mode is not available because this ACP session has no host plan-mode lifecycle.",
+	});
+	expect(controlOperations).not.toContain("mode.plan.set");
+	expect(lifecycleInputs).toEqual([expect.objectContaining({ cwd, modelPreset: "codex-medium" })]);
 
 	let firstSettled = false;
 	const firstPrompt = agent

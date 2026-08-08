@@ -1,4 +1,4 @@
-import type { ImageContent, Message, Model, TextContent } from "@gajae-code/ai";
+import type { ImageContent, Message, Model, TextContent } from "@gajae-code/ai/core";
 import type { Component, TUI } from "@gajae-code/tui";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";

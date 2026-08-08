@@ -145,10 +145,17 @@ function validStageState(value: unknown, labels: string[]): value is Record<stri
 function askSchema(labels: string[], multi: boolean, allowEmpty: boolean): JsonSchema {
 	return buildAskGateAnswerSchema({ multi, allowEmpty }, labels);
 }
+
+const ASK_GATE_STAGE_KINDS = new Set([
+	"deep-interview/question",
+	"ralplan/question",
+	"ultragoal/question",
+	"ralplan/approval",
+]);
+
 export function decodeAskGateV1(gate: WorkflowGate): PrivateAskGateCodecV1 | null {
 	if (
-		(gate.stage !== "deep-interview" && gate.stage !== "ralplan" && gate.stage !== "ultragoal") ||
-		gate.kind !== "question" ||
+		!ASK_GATE_STAGE_KINDS.has(`${gate.stage}/${gate.kind}`) ||
 		!isRecord(gate.context) ||
 		!boundedText(gate.context.prompt, MAX_TEXT) ||
 		gate.context.prompt !== gate.context.title ||

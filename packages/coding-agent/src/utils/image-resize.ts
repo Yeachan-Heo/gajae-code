@@ -1,4 +1,4 @@
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 
 export interface ImageResizeOptions {
 	maxWidth?: number;

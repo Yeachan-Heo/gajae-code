@@ -113,64 +113,74 @@ export interface ThinkingConfig {
 	mode: ThinkingControlMode;
 }
 
-export type KnownProvider =
-	| "alibaba-token-plan"
-	| "amazon-bedrock"
-	| "azure-openai"
-	| "anthropic"
-	| "google"
-	| "google-gemini-cli"
-	| "google-antigravity"
-	| "google-vertex"
-	| "openai"
-	| "openai-codex"
-	| "opencodex"
-	| "kimi-code"
-	| "minimax-code"
-	| "minimax-code-cn"
-	| "github-copilot"
-	| "fireworks"
-	| "firepass"
-	| "fugu"
-	| "gitlab-duo"
-	| "cursor"
-	| "deepseek"
-	| "deepinfra"
-	| "xai"
-	| "groq"
-	| "cerebras"
-	| "openrouter"
-	| "kilo"
-	| "vercel-ai-gateway"
-	| "zai"
-	| "glm-zcode"
-	| "mistral"
-	| "minimax"
-	| "opencode-go"
-	| "opencode-zen"
-	| "opengateway"
-	| "bizrouter"
-	| "mara"
-	| "synthetic"
-	| "cloudflare-ai-gateway"
-	| "huggingface"
-	| "litellm"
-	| "moonshot"
-	| "nvidia"
-	| "nanogpt"
-	| "ollama"
-	| "ollama-cloud"
-	| "qianfan"
-	| "qwen-portal"
-	| "together"
-	| "venice"
-	| "vllm"
-	| "xiaomi"
-	| "xiaomi-token-plan-sgp"
-	| "xiaomi-token-plan-ams"
-	| "xiaomi-token-plan-cn"
-	| "zenmux"
-	| "lm-studio";
+export const KNOWN_PROVIDERS = [
+	"alibaba-token-plan",
+	"amazon-bedrock",
+	"azure-openai",
+	"anthropic",
+	"google",
+	"google-gemini-cli",
+	"google-antigravity",
+	"google-vertex",
+	"openai",
+	"openai-codex",
+	"opencodex",
+	"kimi-code",
+	"minimax-code",
+	"minimax-code-cn",
+	"github-copilot",
+	"fireworks",
+	"firepass",
+	"fugu",
+	"gitlab-duo",
+	"cursor",
+	"jetbrains-junie",
+	"deepseek",
+	"deepinfra",
+	"xai",
+	"groq",
+	"cerebras",
+	"openrouter",
+	"kilo",
+	"vercel-ai-gateway",
+	"zai",
+	"glm-zcode",
+	"mistral",
+	"minimax",
+	"opencode-go",
+	"opencode-zen",
+	"opengateway",
+	"bizrouter",
+	"mara",
+	"synthetic",
+	"cloudflare-ai-gateway",
+	"huggingface",
+	"litellm",
+	"moonshot",
+	"nvidia",
+	"nanogpt",
+	"ollama",
+	"ollama-cloud",
+	"qianfan",
+	"qwen-portal",
+	"together",
+	"venice",
+	"vllm",
+	"xiaomi",
+	"xiaomi-token-plan-sgp",
+	"xiaomi-token-plan-ams",
+	"xiaomi-token-plan-cn",
+	"zenmux",
+	"lm-studio",
+] as const;
+
+export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];
+
+const KNOWN_PROVIDER_SET = new Set<string>(KNOWN_PROVIDERS);
+
+export function isKnownProvider(provider: string): provider is KnownProvider {
+	return KNOWN_PROVIDER_SET.has(provider);
+}
 export type Provider = KnownProvider | string;
 
 import type { Effort } from "./model-thinking";
@@ -743,7 +753,11 @@ export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: inf
 export type RawArgumentRejectionCode =
 	| "ask-intent-review-requires-positive-round"
 	| "ask-intent-contract-requires-non-empty-authority"
-	| "ask-deep-interview-metadata-requires-deep-interview-gate";
+	| "ask-deep-interview-metadata-requires-deep-interview-gate"
+	| "todo-write-unknown-root-key"
+	| "todo-write-unknown-op-entry-key"
+	| "todo-write-done-drop-requires-target"
+	| "todo-write-unknown-init-entry-key";
 
 export type RawArgumentValidationResult =
 	| { outcome: "passthrough" }
@@ -849,6 +863,13 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 */
 	sendSessionHeaders?: boolean;
 	/**
+	 * Whether an OpenAI Responses transport may forward the agent session id
+	 * as `session_id` and `x-client-request-id` affinity headers for an
+	 * explicitly configured custom relay. First-party OpenAI uses its canonical
+	 * HTTPS origin automatically; known non-OpenAI providers remain excluded.
+	 */
+	supportsResponsesSessionAffinity?: boolean;
+	/**
 	 * Whether the provider's chat-completions endpoint accepts multiple
 	 * leading `system`/`developer` messages. When false, ordered system
 	 * prompts are coalesced into a single message joined by `\n\n` so
@@ -947,8 +968,10 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsLongCacheRetention?: boolean;
 	/**
 	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
-	 * Canonical Anthropic defaults to `"automatic"`; noncanonical endpoints default
-	 * to `"none"` and must explicitly opt into generated `"explicit"` markers.
+	 * Canonical Anthropic defaults to `"automatic"`; Claude-family models on
+	 * noncanonical compatible endpoints default to `"explicit"`; non-Claude
+	 * compatible endpoints default to `"none"`. Set `"automatic"` to opt into
+	 * top-level caching, `"none"` to opt out, or `"explicit"` for block markers.
 	 */
 	promptCacheMode?: "none" | "explicit" | "automatic";
 }

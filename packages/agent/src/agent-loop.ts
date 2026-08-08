@@ -1521,11 +1521,18 @@ async function runLoopBody(
 					awaitEventDrain: (invocationSignal: AbortSignal) =>
 						stream.waitForConsumerDrain(AbortSignal.any([loopSignal, invocationSignal])),
 				};
-				const maintenanceOutcome = await config.maintainContext(currentContext, lifecycle);
+				const maintenanceResult = await config.maintainContext(currentContext, lifecycle);
+				const maintenance =
+					typeof maintenanceResult === "string" ? { outcome: maintenanceResult } : maintenanceResult;
 				// A callback can settle after its loop has been cancelled. Never let a
 				// stale "not-needed" fall through to streamAssistantResponse, which
 				// invokes the provider before it observes the aborted signal.
-				const outcome = loopSignal.aborted ? "aborted" : maintenanceOutcome;
+				const outcome = loopSignal.aborted ? "aborted" : maintenance.outcome;
+				if (maintenance.releaseCurrentContext) {
+					currentContext.messages.length = 0;
+					newMessages.length = 0;
+					convertedContextCache.delete(config);
+				}
 
 				if (outcome !== "not-needed") {
 					publishAgentEnd(
@@ -2440,6 +2447,7 @@ async function streamAssistantResponse(
 		});
 	} catch (err) {
 		failChatSpan(telemetry, chatSpan, {
+			stepNumber: chatStepNumber,
 			errorObject: err,
 			responseHeaders: capturedHeaders,
 			baseUrl: config.model.baseUrl,
@@ -2486,14 +2494,79 @@ function emitAbortedAssistantMessage(
 }
 
 /**
- * Match a tool against the model-visible call name. Tools emitted via OpenAI's
- * custom-tool path (e.g. `apply_patch` on GPT-5) arrive under their wire-level
- * name, which may differ from the harness-internal `name`, so dispatch and any
- * "is this tool callable" check must consider both. Internal `name` takes
- * precedence when a caller needs a single match.
+ * Model-visible call names of a tool. Tools emitted via OpenAI's custom-tool
+ * path (e.g. `apply_patch` on GPT-5) arrive under their wire-level name, which
+ * may differ from the harness-internal `name`, so dispatch and any "is this
+ * tool callable" check must consider both.
  */
-function toolMatchesCallName(tool: { name: string; customWireName?: string }, callName: string): boolean {
-	return tool.name === callName || (tool.customWireName !== undefined && tool.customWireName === callName);
+function toolCallNames(tool: { name: string; customWireName?: string }): string[] {
+	return tool.customWireName === undefined || tool.customWireName === tool.name
+		? [tool.name]
+		: [tool.name, tool.customWireName];
+}
+
+/**
+ * Wire name of the tool-discovery tool. Sessions that hide discoverable
+ * built-ins expose it under this name, or under a bridge alias of it.
+ */
+const TOOL_DISCOVERY_NAME = "search_tool_bm25";
+
+/**
+ * Split an MCP bridge namespace off a call name so it can be compared against
+ * the tool it actually denotes. Bridges expose tools as `mcp__<server>_<tool>`,
+ * and proxied bridges add a per-session instance segment
+ * (`mcp__<server>__<instance>_<tool>`). A name the model replayed from earlier
+ * context therefore differs from the live registry only in that segment.
+ */
+function parseToolCallName(name: string): { server?: string; base: string } {
+	const namespace = /^mcp__([^_]+)(?:__[^_]+)?_/.exec(name);
+	if (!namespace) return { base: name };
+	return { server: namespace[1], base: name.slice(namespace[0].length) };
+}
+
+/**
+ * Call names of active tools that denote the same tool as an unresolved call
+ * name. Two servers can expose the same tool name, so a namespaced call is only
+ * matched against its own server or against an unnamespaced tool.
+ */
+function findToolCallNameAliases(
+	callName: string,
+	tools: ReadonlyArray<{ name: string; customWireName?: string }> | undefined,
+	limit = 3,
+): string[] {
+	const target = parseToolCallName(callName);
+	if (target.base.length === 0) return [];
+	const aliases: string[] = [];
+	for (const tool of tools ?? []) {
+		for (const candidate of toolCallNames(tool)) {
+			if (candidate === callName) continue;
+			const parsed = parseToolCallName(candidate);
+			if (parsed.base !== target.base) continue;
+			if (parsed.server !== undefined && target.server !== undefined && parsed.server !== target.server) continue;
+			if (aliases.includes(candidate)) continue;
+			aliases.push(candidate);
+			if (aliases.length === limit) return aliases;
+		}
+	}
+	return aliases;
+}
+
+/**
+ * Resolve how tool discovery is actually callable in this session. Assuming the
+ * bare `search_tool_bm25` literal both drops the hint when the discovery tool is
+ * bridged and, worse, would name a second non-callable tool if emitted anyway.
+ */
+function findToolDiscoveryCallName(
+	tools: ReadonlyArray<{ name: string; customWireName?: string }> | undefined,
+): string | undefined {
+	let bridged: string | undefined;
+	for (const tool of tools ?? []) {
+		for (const candidate of toolCallNames(tool)) {
+			if (candidate === TOOL_DISCOVERY_NAME) return candidate;
+			if (bridged === undefined && parseToolCallName(candidate).base === TOOL_DISCOVERY_NAME) bridged = candidate;
+		}
+	}
+	return bridged;
 }
 
 /**
@@ -2697,12 +2770,20 @@ async function executeToolCalls(
 					// base wording stays byte-for-byte stable for downstream consumers;
 					// the period and hint are appended only when discovery is callable.
 					const base = `Tool ${toolCall.name} not found`;
-					const hasToolDiscovery = tools?.some(t => toolMatchesCallName(t, "search_tool_bm25")) ?? false;
-					throw new Error(
-						hasToolDiscovery
-							? `${base}. If you are unsure whether this tool exists or how to use it, call \`search_tool_bm25\` to discover and activate the matching tool, then retry.`
-							: base,
-					);
+					const hints: string[] = [];
+					const aliases = findToolCallNameAliases(toolCall.name, tools);
+					if (aliases.length > 0) {
+						hints.push(
+							`It is active as ${aliases.map(name => `\`${name}\``).join(" or ")} — call that name instead.`,
+						);
+					}
+					const discoveryCallName = findToolDiscoveryCallName(tools);
+					if (discoveryCallName !== undefined) {
+						hints.push(
+							`If you are unsure whether this tool exists or how to use it, call \`${discoveryCallName}\` to discover and activate the matching tool, then retry.`,
+						);
+					}
+					throw new Error(hints.length > 0 ? `${base}. ${hints.join(" ")}` : base);
 				}
 
 				let effectiveArgs: Record<string, unknown>;
@@ -2895,7 +2976,26 @@ async function executeToolCalls(
 		}
 	}
 
-	await Promise.allSettled(tasks);
+	const allTasks = Promise.allSettled(tasks);
+	if (!signal) {
+		await allTasks;
+	} else {
+		const abortPromise = Promise.withResolvers<boolean>();
+		const onAbort = () => abortPromise.resolve(true);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			const aborted = signal.aborted || (await Promise.race([allTasks.then(() => false), abortPromise.promise]));
+			if (aborted) {
+				for (const record of records) {
+					if (record.toolResultMessage) continue;
+					record.skipped = true;
+					emitToolResult(record, createAbortedToolExecutionResult(), true);
+				}
+			}
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
 
 	for (const record of records) {
 		if (!record.toolResultMessage) {
@@ -2967,6 +3067,12 @@ function createAbortedToolResult(
 function createSkippedToolResult(): AgentToolResult<any> {
 	return {
 		content: [{ type: "text", text: "Skipped due to queued user message." }],
+		details: {},
+	};
+}
+function createAbortedToolExecutionResult(): AgentToolResult<any> {
+	return {
+		content: [{ type: "text", text: "Tool execution was aborted." }],
 		details: {},
 	};
 }

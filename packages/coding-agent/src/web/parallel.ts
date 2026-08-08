@@ -1,4 +1,4 @@
-import { getEnvApiKey } from "@gajae-code/ai";
+import { getEnvApiKey } from "@gajae-code/ai/core";
 import type { AgentStorage } from "../session/agent-storage";
 import { findCredential, withHardTimeout } from "./search/providers/utils";
 

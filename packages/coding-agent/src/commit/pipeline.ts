@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { getProjectDir, logger, prompt } from "@gajae-code/utils";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";

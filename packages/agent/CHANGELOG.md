@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Forked-session restore no longer crashes when the seeded append-only prefix includes a tool whose `intent` policy is a deferred function (e.g. `eval`, `bisect`, `checkpoint`, `rewind`). `StablePrefix.importSnapshot` re-normalized the cloned tool JSON, which loses function-valued `intent` fields, so those tools flipped from `omit` to `optional` intent injection and the recomputed fingerprint diverged from the stored one (`StablePrefix.importSnapshot() fingerprint mismatch`). Import now verifies against the stored, already-normalized tools instead of re-normalizing.
+
+## [0.12.15] - 2026-08-06
+
+## [0.12.14] - 2026-08-06
+
+## [0.12.13] - 2026-08-06
+
+### Fixed
+
+- An aborted run whose tool ignores its `AbortSignal` now terminates on its own (#3894). `Promise.allSettled` waited on the unresolved call forever, so the turn only ended when the session's force-abort budget expired; the loop now emits a synthetic aborted result for the outstanding calls and `waitForIdle` settles immediately. Session dispose consequently reaches idle through the cooperative path instead of force-invalidating the run.
+### Changed
+
+- Telemetry configured with `spans: false` now skips span and attribute construction while preserving usage and cost hooks.
+
 ## [0.12.12] - 2026-08-05
 
 ### Fixed

@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import { formatBytes, readImageMetadata, SUPPORTED_IMAGE_MIME_TYPES } from "@gajae-code/utils";
 import { resolveReadPath } from "../tools/path-utils";
 import { formatDimensionNote, resizeImageBuffer } from "./image-resize";

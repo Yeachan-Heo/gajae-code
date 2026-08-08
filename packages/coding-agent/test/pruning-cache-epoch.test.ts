@@ -183,7 +183,7 @@ describe("pruning cache-epoch invariant", () => {
 		expect(prunedEntryCount()).toBeGreaterThan(0);
 	});
 
-	it("keeps pruning best-effort when artifact reservation initialization fails", async () => {
+	it("retains tool outputs when artifact reservation initialization fails", async () => {
 		await createSession();
 		seedPrunableHistory();
 		const artifactManager = sessionManager.getArtifactManager();
@@ -194,7 +194,7 @@ describe("pruning cache-epoch invariant", () => {
 		await expect(driveTurnEnd(assistantMessage(190_000))).resolves.toBeUndefined();
 		expect(allocatePath).toHaveBeenCalledTimes(1);
 		expect(allocateId).not.toHaveBeenCalled();
-		expect(prunedEntryCount()).toBeGreaterThan(0);
+		expect(prunedEntryCount()).toBe(0);
 		expect(() =>
 			sessionManager.appendMessage({ role: "user", content: "session remains writable", timestamp: Date.now() }),
 		).not.toThrow();
@@ -221,9 +221,11 @@ describe("pruning cache-epoch invariant", () => {
 		// rejects the staged prune the published artifact must be rolled back on disk.
 		const artifactManager = sessionManager.getArtifactManager();
 		if (!artifactManager) throw new Error("expected a managed artifact manager for this session");
-		const publish = artifactManager.publishNamedNoReplace.bind(artifactManager);
-		vi.spyOn(artifactManager, "publishNamedNoReplace").mockImplementation((filename, bytes) =>
-			bytes.byteLength > 100_000 ? Promise.reject(new Error("publish failed")) : publish(filename, bytes),
+		const publish = artifactManager.publishExactText.bind(artifactManager);
+		vi.spyOn(artifactManager, "publishExactText").mockImplementation((text, options) =>
+			Buffer.byteLength(text) > 100_000
+				? Promise.resolve({ outcome: "failed", diagnostic: "publish failed" })
+				: publish(text, options),
 		);
 		const applyMessageSpy = vi.spyOn(sessionManager, "applyEntryMessageUpdates");
 		const applyCustomSpy = vi.spyOn(sessionManager, "applyCustomMessageEntryUpdates");
@@ -245,7 +247,7 @@ describe("pruning cache-epoch invariant", () => {
 		expect(rewriteSpy).not.toHaveBeenCalled();
 		expect(replaceMessagesSpy).not.toHaveBeenCalled();
 		// The one successfully staged artifact publication was rolled back on disk.
-		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log"))).toEqual([]);
+		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".evicted.log"))).toEqual([]);
 	});
 
 	it("rolls back staged artifacts when pruning aborts during publication", async () => {
@@ -253,15 +255,16 @@ describe("pruning cache-epoch invariant", () => {
 		seedPrunableHistory();
 		const artifactManager = sessionManager.getArtifactManager();
 		if (!artifactManager) throw new Error("expected a managed artifact manager for this session");
-		const publish = artifactManager.publishNamedNoReplace.bind(artifactManager);
+		const publish = artifactManager.publishExactText.bind(artifactManager);
 		const abortController = new AbortController();
 		let aborted = false;
-		vi.spyOn(artifactManager, "publishNamedNoReplace").mockImplementation(async (filename, bytes) => {
-			await publish(filename, bytes);
+		vi.spyOn(artifactManager, "publishExactText").mockImplementation(async (text, options) => {
+			const outcome = await publish(text, options);
 			if (!aborted) {
 				aborted = true;
 				abortController.abort();
 			}
+			return outcome;
 		});
 
 		const context: AgentContext = {
@@ -277,7 +280,7 @@ describe("pruning cache-epoch invariant", () => {
 		expect(aborted).toBe(true);
 		expect(result).toBe("aborted");
 		expect(prunedEntryCount()).toBe(0);
-		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log"))).toEqual([]);
+		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".evicted.log"))).toEqual([]);
 	});
 
 	it("commits maintenance pruning when actual savings clear the cache-epoch cost", async () => {
@@ -292,6 +295,8 @@ describe("pruning cache-epoch invariant", () => {
 
 		expect(prunedEntryCount()).toBeGreaterThan(0);
 		// Committed prune keeps its published artifacts referenced.
-		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log")).length).toBeGreaterThan(0);
+		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".evicted.log")).length).toBeGreaterThan(
+			0,
+		);
 	});
 });

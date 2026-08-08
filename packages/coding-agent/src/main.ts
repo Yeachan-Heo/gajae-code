@@ -9,7 +9,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import {
 	$pickenv,
 	getAgentDir,
@@ -33,14 +33,12 @@ import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
+import { distTagForChannel, type UpdateChannel } from "./config/update-channel";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
-import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from "./gjc-runtime/managed-owner-admission";
-import { isManagedOwnerSupervisorArgv, runManagedOwnerSupervisor } from "./gjc-runtime/managed-owner-supervisor";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
-import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -80,10 +78,19 @@ import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEn
 import type { EventBus } from "./utils/event-bus";
 import { fetchLatestPackageVersion } from "./utils/npm-registry";
 
-async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
+const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
+const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
+const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
+
+async function checkForNewVersion(
+	currentVersion: string,
+	channel: UpdateChannel = "stable",
+): Promise<string | undefined> {
 	try {
 		// Resolved from npm config so mirrored/firewalled networks are checked too.
-		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent");
+		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent", {
+			distTag: distTagForChannel(channel),
+		});
 		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;
@@ -1449,7 +1456,7 @@ export async function runRootCommand(
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
-		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION)),
+		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION, settingsInstance.get("startup.updateChannel"))),
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
@@ -1467,15 +1474,31 @@ export async function runRootCommand(
 			...(roleOverrides.plan ? { plan: roleOverrides.plan } : {}),
 		});
 	}
+	// Apply --clipboard-transport / --clipboard-ssh-host as ephemeral runtime
+	// overrides (CLI > persisted config > "auto" default). Not persisted —
+	// mirrors the role-override precedence above.
+	if (parsedArgs.clipboardTransport) {
+		settingsInstance.override("clipboard.transport", parsedArgs.clipboardTransport);
+	}
+	if (parsedArgs.clipboardSshHost) {
+		settingsInstance.override("clipboard.sshHost", parsedArgs.clipboardSshHost);
+	}
+	if (parsedArgs.clipboardTransport === "ssh" && !settingsInstance.get("clipboard.sshHost")) {
+		process.stderr.write(
+			`${chalk.red("Error: --clipboard-transport ssh requires --clipboard-ssh-host <alias> (or clipboard.sshHost in config)")}\n`,
+		);
+		process.exit(1);
+	}
 
 	await logger.time(
 		"initTheme:final",
 		deps.initTheme ?? initTheme,
-		isInteractive,
+		isInteractive && settingsInstance.get("theme.watchFiles"),
 		settingsInstance.get("symbolPreset"),
 		settingsInstance.get("colorBlindMode"),
 		settingsInstance.get("theme.dark"),
 		settingsInstance.get("theme.light"),
+		settingsInstance.get("syntaxHighlighting.enabled"),
 	);
 
 	const credentialAutoImportNotice = isInteractive
@@ -1567,7 +1590,10 @@ export async function runRootCommand(
 	let rootTokenTurn = 0;
 	const baseTelemetry = sessionOptions.telemetry;
 	sessionOptions.telemetry = {
-		...(baseTelemetry ?? {}),
+		// C3 telemetry split: the default token-log wrapper is usage-only —
+		// spans stay off unless an SDK embedder supplied its own telemetry
+		// config, which remains authoritative.
+		...(baseTelemetry ?? { spans: false }),
 		onChatUsage: async event => {
 			await baseTelemetry?.onChatUsage?.(event);
 			const currentSessionId = sessionManager?.getSessionId();
@@ -1735,7 +1761,7 @@ export async function runRootCommand(
 				startDeferredModelProfiles = async () => {
 					try {
 						const result = await applyDeferredStartupModelProfilesForRoot(profileArgs);
-						startDeferredMemoryBackend?.();
+						await startDeferredMemoryBackend?.();
 						ready.resolve();
 						return result;
 					} catch (error) {
@@ -1745,7 +1771,7 @@ export async function runRootCommand(
 				};
 			} else {
 				const { recoverableErrors } = await applyStartupModelProfilesForRoot(profileArgs);
-				startDeferredMemoryBackend?.();
+				await startDeferredMemoryBackend?.();
 				for (const recoverableError of recoverableErrors) {
 					notifs.push({ kind: "error", message: recoverableError });
 				}
@@ -1839,6 +1865,9 @@ export async function runRootCommand(
 				} catch {
 					logger.warn("Failed to dispose session after interactive error");
 				}
+				if (error !== null && typeof error === "object" && "code" in error && error.code === "cancelled") {
+					return;
+				}
 				throw error;
 			}
 
@@ -1869,19 +1898,26 @@ export async function runRootCommand(
 }
 
 export async function main(args: string[]): Promise<void> {
-	if (isTmuxOwnerIsolationCliArgv(args)) {
+	if (args.length === 1 && args[0] === TMUX_OWNER_ISOLATION_ARG) {
+		const { runTmuxOwnerIsolationCliFromStdin } = await import("./gjc-runtime/tmux-owner-isolation-cli");
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (isManagedOwnerSupervisorArgv(args)) {
+	if (args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
 		await runManagedOwnerSupervisor();
 		return;
 	}
-	const admission = await admitManagedOwnerBeforeCli();
-	if (admission.kind === "blocked") return;
-	if (admission.kind === "recovery") {
-		await completeManagedOwnerRecovery(admission.context);
-		return;
+	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
+		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import(
+			"./gjc-runtime/managed-owner-admission"
+		);
+		const admission = await admitManagedOwnerBeforeCli();
+		if (admission.kind === "blocked") return;
+		if (admission.kind === "recovery") {
+			await completeManagedOwnerRecovery(admission.context);
+			return;
+		}
 	}
 	const { runCli } = await import("./cli");
 	await runCli(args.length === 0 ? ["launch"] : args);

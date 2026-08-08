@@ -23,6 +23,39 @@ describe("models config sendSessionHeaders", () => {
 		});
 		expect(result.success).toBe(true);
 	});
+	test("accepts supportsResponsesSessionAffinity in provider and model compat", () => {
+		const result = ModelsConfigSchema.safeParse({
+			providers: {
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: true },
+					models: [
+						{
+							id: "relay-model",
+							name: "Relay",
+							contextWindow: 128000,
+							maxTokens: 8192,
+							compat: { supportsResponsesSessionAffinity: false },
+						},
+					],
+				},
+			},
+		});
+		expect(result.success).toBe(true);
+	});
+	test("rejects a non-boolean supportsResponsesSessionAffinity value", () => {
+		const result = ModelsConfigSchema.safeParse({
+			providers: {
+				relay: {
+					baseUrl: "https://relay.example.com/v1",
+					api: "openai-responses",
+					compat: { supportsResponsesSessionAffinity: "yes" },
+				},
+			},
+		});
+		expect(result.success).toBe(false);
+	});
 
 	test("rejects a non-boolean sendSessionHeaders value", () => {
 		const result = ModelsConfigSchema.safeParse({

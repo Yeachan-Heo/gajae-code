@@ -10,6 +10,7 @@ import { Agent, AgentBusyError, type AgentTool } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type Message, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import type { Rule } from "@gajae-code/coding-agent/capability/rule";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -418,6 +419,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			appendOnlyContext: createAppendOnlyContextManager(model.provider),
 		});
 		const currentSessionManager = SessionManager.create(tempDir, tempDir);
 		const targetSessionManager = SessionManager.create(tempDir, tempDir);
@@ -448,11 +450,16 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry,
 			extensionRunner,
 		});
+		const appendOnly = agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		appendOnly?.syncMessages([{ role: "user", content: "switch-provider-marker" }]);
+		expect(appendOnly?.log.length).toBe(1);
 		await session.steer("pre-switch steering");
 		expect(session.getQueuedMessages().steering).toEqual(["pre-switch steering"]);
 		expect(agent.snapshotSteering()).toHaveLength(1);
 
 		expect(await session.switchSession(targetSessionFile)).toBe(true);
+		expect(appendOnly?.log.length).toBe(0);
 
 		expect(session.getQueuedMessages().steering).toEqual(["queued by switch hook"]);
 		expect(agent.snapshotSteering()).toHaveLength(1);

@@ -6,7 +6,7 @@
  */
 import type { AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
-import type { Model, Static, TSchema } from "@gajae-code/ai";
+import type { Model, Static, TSchema } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import type { Rule } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";

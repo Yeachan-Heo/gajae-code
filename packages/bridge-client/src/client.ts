@@ -28,6 +28,12 @@ export interface SdkClientOptions {
 
 	reconnectAttempts?: number;
 	reconnectBackoffMs?: number;
+	/**
+	 * Per-attempt ceiling for the exponential reconnect backoff. A long reconnect
+	 * budget must keep probing frequently instead of sleeping for tens of seconds
+	 * on its last attempts. Defaults to 2s.
+	 */
+	reconnectMaxBackoffMs?: number;
 }
 
 export interface SdkRequestOptions {
@@ -104,6 +110,7 @@ export class SdkClient {
 	readonly #timeoutMs: number;
 	readonly #reconnectAttempts: number;
 	readonly #reconnectBackoffMs: number;
+	readonly #reconnectMaxBackoffMs: number;
 	/**
 	 * Bounded grace for best-effort transport close, independent of the request
 	 * deadline. Close teardown must never be gated by an already-elapsed operation
@@ -134,6 +141,7 @@ export class SdkClient {
 
 		this.#reconnectAttempts = options.reconnectAttempts ?? 3;
 		this.#reconnectBackoffMs = options.reconnectBackoffMs ?? 25;
+		this.#reconnectMaxBackoffMs = Math.max(this.#reconnectBackoffMs, options.reconnectMaxBackoffMs ?? 2_000);
 	}
 
 	static async connect(url: string, token: string, options: SdkClientOptions = {}): Promise<SdkClient> {
@@ -356,7 +364,9 @@ export class SdkClient {
 						true,
 					);
 				if (attempt < this.#reconnectAttempts) {
-					const backoffMs = this.#remainingTimeout(this.#reconnectBackoffMs * 2 ** attempt);
+					const backoffMs = this.#remainingTimeout(
+						Math.min(this.#reconnectBackoffMs * 2 ** attempt, this.#reconnectMaxBackoffMs),
+					);
 					if (backoffMs <= 0) break;
 					cycle.phase = "backoff";
 					await new Promise<void>((resolve, reject) => {

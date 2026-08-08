@@ -8,12 +8,12 @@
  * sibling SQLite store and never POSTs the broker sentinel to a Google token
  * endpoint.
  */
+import type { AuthStorage } from "@gajae-code/ai/core";
 import {
 	ANTIGRAVITY_SYSTEM_INSTRUCTION,
-	type AuthStorage,
 	getAntigravityUserAgent,
 	getGeminiCliHeaders,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/providers/google-gemini-headers";
 import { fetchWithRetry } from "@gajae-code/utils";
 
 import type { SearchCitation, SearchResponse, SearchSource } from "../../../web/search/types";

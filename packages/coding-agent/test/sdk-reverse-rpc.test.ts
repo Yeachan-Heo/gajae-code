@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ReverseLeaseError, ReverseLeaseRuntime } from "../src/sdk/host";
+import { MAX_REVERSE_PAYLOAD_BYTES, ReverseLeaseError, ReverseLeaseRuntime } from "../src/sdk/host";
 
 describe("directed reverse RPC leases", () => {
 	test("bootstraps atomically, conflicts, reclaims, and hands off", () => {
@@ -78,6 +78,35 @@ describe("directed reverse RPC leases", () => {
 		runtime.disconnect("owner");
 		await expect(cancelledRequest).rejects.toThrow("request_cancelled");
 		expect(cancelled).toHaveLength(1);
+	});
+	test("rejects a reverse response whose envelope exceeds the WebSocket frame ceiling", () => {
+		const sent: Array<Record<string, unknown>> = [];
+		const runtime = new ReverseLeaseRuntime({
+			sendFrame: (_connectionId, frame) => {
+				sent.push(frame);
+			},
+		});
+		const lease = runtime.registerProvider("owner", "terminal", {});
+		const pending = runtime.request("terminal", "terminal.output", {});
+		void pending.catch(() => {});
+		const id = String(sent[0].id);
+		const emptyResultBytes = Buffer.byteLength(JSON.stringify({ value: "" }));
+		const result = { value: "x".repeat(MAX_REVERSE_PAYLOAD_BYTES - emptyResultBytes - 1) };
+		expect(Buffer.byteLength(JSON.stringify(result))).toBe(MAX_REVERSE_PAYLOAD_BYTES - 1);
+		expect(
+			Buffer.byteLength(
+				JSON.stringify({
+					type: "reverse_response",
+					id,
+					connectionId: "owner",
+					leaseId: lease.leaseId,
+					ok: true,
+					result,
+				}),
+			),
+		).toBeGreaterThan(MAX_REVERSE_PAYLOAD_BYTES);
+		expect(() => runtime.respond("owner", id, lease.leaseId, result)).toThrow(ReverseLeaseError);
+		runtime.dispose();
 	});
 
 	test("propagates caller aborts to the reverse provider", async () => {

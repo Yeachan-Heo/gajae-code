@@ -53,6 +53,12 @@ describe("SDK package exports", () => {
 		expect(root).toHaveProperty("createAgentSession");
 	});
 
+	it("keeps concrete tool classes behind the opt-in implementation barrel", async () => {
+		const implementations = await import("@gajae-code/coding-agent/tools/implementations");
+		expect(implementations.BashTool).toBeFunction();
+		expect(implementations.ReadTool).toBeFunction();
+		expect(implementations.WebSearchTool).toBeFunction();
+	});
 	it("loads the public SDK and bus package subpaths", () => {
 		expect(publicSdk.createAgentSession).toBeFunction();
 		expect(bus.createNotificationsExtension).toBeFunction();
