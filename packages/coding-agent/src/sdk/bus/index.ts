@@ -95,7 +95,7 @@ import {
 } from "../model-profile-model";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { createReconciliationStore } from "../reconciliation-store";
+import { createReconciliationStore, resolveReconciliationSessionFile } from "../reconciliation-store";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -4117,10 +4117,13 @@ export function createNotificationsExtension(
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
-		const sessionFile =
+		const persistedSessionFile =
 			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
 		const reconciliationSessionId =
 			typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
+		const sessionFile = reconciliationSessionId
+			? resolveReconciliationSessionFile(persistedSessionFile, stateRoot, String(reconciliationSessionId))
+			: null;
 		const durableStore =
 			sessionFile && reconciliationSessionId
 				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })

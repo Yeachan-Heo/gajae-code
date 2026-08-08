@@ -19,6 +19,14 @@ export const RECONCILIATION_STORE_VERSION = 1;
 export const RECONCILIATION_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const RECONCILIATION_DIR_NAME = ".sdk-reconciliation";
 
+export function resolveReconciliationSessionFile(
+	sessionFile: string | undefined | null,
+	stateRoot: string,
+	sessionId: string,
+): string {
+	return sessionFile ?? path.join(stateRoot, `${sessionId}.jsonl`);
+}
+
 export type ReconciliationKind = "prompt" | "skill";
 
 export interface DurableExecutionReconciliationRecord extends PromptCorrelation {
