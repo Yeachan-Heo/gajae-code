@@ -4,14 +4,14 @@ import type { AgentSideConnection, PromptRequest, SessionNotification } from "@a
 import { TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { ACP_PROMPT_INACTIVITY_TIMEOUT_MS } from "../src/sdk/prompt-watchdog";
+import { ACP_PROMPT_INACTIVITY_TIMEOUT_MS, ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS } from "../src/sdk/prompt-watchdog";
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
 
 /**
  * Virtual timer source for the prompt watchdog. Every watchdog assertion moves this
- * clock instead of sleeping, so a 3800s inactivity bound costs no wall time.
+ * clock instead of sleeping, so a 60min tool-activity bound costs no wall time.
  */
 class VirtualClock {
 	#now = 0;
@@ -63,6 +63,8 @@ type Fixture = {
 	correlation(): { commandId: string; turnId: string };
 	sendAssistantText(text: string): void;
 	sendStopped(reason: StoppedReason): void;
+	sendToolStart(toolCallId: string): void;
+	sendToolEnd(toolCallId: string): void;
 	dispose(): void;
 };
 
@@ -104,6 +106,16 @@ function textChunks(updates: SessionNotification[]): number {
 	return updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length;
 }
 
+/** ACP `tool_call` updates, i.e. tool executions the host reported as started. */
+function toolCalls(updates: SessionNotification[]): number {
+	return updates.filter(update => update.update.sessionUpdate === "tool_call").length;
+}
+
+/** ACP `tool_call_update` updates, i.e. tool executions the host reported as finished. */
+function toolCallUpdates(updates: SessionNotification[]): number {
+	return updates.filter(update => update.update.sessionUpdate === "tool_call_update").length;
+}
+
 async function createFixture(): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@acp-prompt-watchdog-");
 	const agentDir = path.join(tempDir.path(), "agent");
@@ -141,6 +153,39 @@ async function createFixture(): Promise<Fixture> {
 			commandId,
 			turnId,
 			outcome: { kind: "stopped", reason, provenance: reason === "cancelled" ? "client_cancel" : "agent" },
+		});
+	};
+	const sendToolStart = (toolCallId: string): void => {
+		send({
+			type: "event",
+			commandId,
+			turnId,
+			payload: {
+				event_type: "tool_execution_start",
+				event: {
+					type: "tool_execution_start",
+					toolCallId,
+					toolName: "bash",
+					args: { command: "sleep 100000" },
+				},
+			},
+		});
+	};
+	const sendToolEnd = (toolCallId: string): void => {
+		send({
+			type: "event",
+			commandId,
+			turnId,
+			payload: {
+				event_type: "tool_execution_end",
+				event: {
+					type: "tool_execution_end",
+					toolCallId,
+					toolName: "bash",
+					isError: false,
+					result: { content: [{ type: "text", text: "done" }] },
+				},
+			},
 		});
 	};
 
@@ -251,6 +296,8 @@ async function createFixture(): Promise<Fixture> {
 		correlation: () => ({ commandId, turnId }),
 		sendAssistantText,
 		sendStopped,
+		sendToolStart,
+		sendToolEnd,
 		dispose: () => {
 			abort.abort();
 			server.stop(true);
@@ -385,6 +432,98 @@ test("a normal agent_end settles the prompt once and disarms the watchdog", asyn
 		expect(fixture.updates.length).toBe(updatesAfterSettle);
 		expect(idleUpdates(fixture.updates)).toBe(idleAfterSettle);
 		expect(await bounded(pending, "settled prompt")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("the watchdog bounds stay pinned to their derivation", () => {
+	// Slowest tool default (`bash`, 300s) + one SDK reconnect budget (2 x 20s heartbeat).
+	expect(ACP_PROMPT_INACTIVITY_TIMEOUT_MS).toBe(340_000);
+	// Slowest per-tool ceiling (`bash`/`ssh`, 3600s) + the same reconnect budget.
+	expect(ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS).toBe(3_640_000);
+	// A frame-free gap with nothing running must stay operationally useful; the wide
+	// bound is only ever reachable while a tool call is observably in flight.
+	expect(ACP_PROMPT_INACTIVITY_TIMEOUT_MS).toBeLessThan(10 * 60_000);
+	expect(ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS).toBeGreaterThan(3_600_000);
+});
+
+test("a tool call running past the idle bound is protected while it runs, not after it ends", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		const started = toolCalls(fixture.updates);
+		fixture.sendToolStart("watchdog-tool-1");
+		await waitFor(() => toolCalls(fixture.updates) > started, "tool call start");
+
+		// A `bash` that blocks far past the idle bound is evidenced as running, so the
+		// silence it produces is legitimate and must not be rejected.
+		fixture.clock.advance(ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS - 1);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		const ended = toolCallUpdates(fixture.updates);
+		fixture.sendToolEnd("watchdog-tool-1");
+		await waitFor(() => toolCallUpdates(fixture.updates) > ended, "tool call end");
+
+		// Evidence is gone: the next frame-free gap is bounded by the idle bound again.
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("ACP prompt was abandoned");
+		expect((error as Error).message).toContain('"tool_execution_end"');
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a tool call still in flight keeps the wide bound armed across silent gaps", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		const started = toolCalls(fixture.updates);
+		fixture.sendToolStart("watchdog-tool-a");
+		await waitFor(() => toolCalls(fixture.updates) > started, "first tool call start");
+
+		// A second tool starting and finishing must not retire the evidence held by the
+		// first one, which is still running.
+		const ended = toolCallUpdates(fixture.updates);
+		fixture.sendToolStart("watchdog-tool-b");
+		fixture.sendToolEnd("watchdog-tool-b");
+		await waitFor(() => toolCallUpdates(fixture.updates) > ended, "second tool call end");
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS * 3);
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}
