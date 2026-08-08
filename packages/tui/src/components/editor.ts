@@ -1896,6 +1896,31 @@ export class Editor implements Component, Focusable {
 		this.#notifyBackwardDelete();
 		return true;
 	}
+	/**
+	 * Delete a same-line text range containing the cursor as one edit.
+	 * Returns false without changing the document when the range is invalid.
+	 */
+	deleteTextRangeAroundCursor(startCol: number, endCol: number): boolean {
+		const line = this.#state.lines[this.#state.cursorLine] || "";
+		if (
+			!Number.isInteger(startCol) ||
+			!Number.isInteger(endCol) ||
+			startCol < 0 ||
+			startCol >= endCol ||
+			endCol > line.length ||
+			startCol > this.#state.cursorCol ||
+			endCol < this.#state.cursorCol
+		)
+			return false;
+
+		this.#exitHistoryForEditing();
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.#state.lines[this.#state.cursorLine] = line.slice(0, startCol) + line.slice(endCol);
+		this.#setCursorCol(startCol);
+		this.#notifyBackwardDelete();
+		return true;
+	}
 
 	// All the editor methods from before...
 	#insertCharacter(char: string): void {

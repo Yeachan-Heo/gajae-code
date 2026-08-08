@@ -316,3 +316,67 @@ export function parsePastedImagePaths(
 export function formatPastedImageReference(placeholder: string, imagePath: string): string {
 	return `${placeholder} source=${JSON.stringify(imagePath)}`;
 }
+export interface PastedImageReferenceRange {
+	imageIndex: number;
+	startCol: number;
+	endCol: number;
+}
+
+function findJsonStringEnd(text: string, startCol: number): number | null {
+	if (text[startCol] !== '"') return null;
+
+	let escaped = false;
+	for (let index = startCol + 1; index < text.length; index += 1) {
+		const character = text[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (character === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (character !== '"') continue;
+
+		const endCol = index + 1;
+		try {
+			if (typeof JSON.parse(text.slice(startCol, endCol)) !== "string") return null;
+		} catch {
+			return null;
+		}
+		return endCol;
+	}
+	return null;
+}
+
+export function locatePastedImageReferenceAroundCursor(
+	line: string,
+	cursorCol: number,
+): PastedImageReferenceRange | null {
+	if (!Number.isInteger(cursorCol) || cursorCol < 0 || cursorCol > line.length) return null;
+
+	const placeholderPattern = /\[image ([1-9]\d*)\]/g;
+	for (const match of line.matchAll(placeholderPattern)) {
+		const startCol = match.index;
+		const placeholder = match[0];
+		const imageIndex = Number.parseInt(match[1] ?? "", 10);
+		if (startCol === undefined || !Number.isSafeInteger(imageIndex)) continue;
+
+		const placeholderEnd = startCol + placeholder.length;
+		const sourcePrefix = " source=";
+		if (line.startsWith(sourcePrefix, placeholderEnd)) {
+			const fullEnd = findJsonStringEnd(line, placeholderEnd + sourcePrefix.length);
+			if (fullEnd === null) {
+				if (cursorCol === placeholderEnd) return null;
+				continue;
+			}
+			if (cursorCol === placeholderEnd || cursorCol === fullEnd) {
+				return { imageIndex, startCol, endCol: fullEnd };
+			}
+			continue;
+		}
+
+		if (cursorCol === placeholderEnd) return { imageIndex, startCol, endCol: placeholderEnd };
+	}
+	return null;
+}

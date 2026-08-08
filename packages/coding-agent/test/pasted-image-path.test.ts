@@ -6,6 +6,7 @@ import {
 	decodePastedPathCandidate,
 	decodePastedPathCandidates,
 	formatPastedImageReference,
+	locatePastedImageReferenceAroundCursor,
 	MAX_PASTED_IMAGE_COUNT,
 	MAX_PASTED_IMAGE_PATH_CHARACTERS,
 	parsePastedImagePaths,
@@ -190,5 +191,35 @@ describe("formatPastedImageReference", () => {
 		expect(formatPastedImageReference("[image 2]", String.raw`C:\Users\me\shot "final".png`)).toBe(
 			String.raw`[image 2] source="C:\\Users\\me\\shot \"final\".png"`,
 		);
+	});
+});
+describe("locatePastedImageReferenceAroundCursor", () => {
+	it("locates a formatted reference at either supported cursor boundary", () => {
+		const reference = formatPastedImageReference("[image 2]", String.raw`C:\Users\me\shot "final".png`);
+		const line = `before ${reference} after`;
+		const startCol = "before ".length;
+		const placeholderEnd = startCol + "[image 2]".length;
+		const referenceEnd = startCol + reference.length;
+
+		expect(locatePastedImageReferenceAroundCursor(line, placeholderEnd)).toEqual({
+			imageIndex: 2,
+			startCol,
+			endCol: referenceEnd,
+		});
+		expect(locatePastedImageReferenceAroundCursor(line, referenceEnd)).toEqual({
+			imageIndex: 2,
+			startCol,
+			endCol: referenceEnd,
+		});
+	});
+
+	it("keeps bare placeholders supported without accepting malformed source suffixes", () => {
+		expect(locatePastedImageReferenceAroundCursor("[image 3]", "[image 3]".length)).toEqual({
+			imageIndex: 3,
+			startCol: 0,
+			endCol: "[image 3]".length,
+		});
+		expect(locatePastedImageReferenceAroundCursor('[image 3] source="unterminated', "[image 3]".length)).toBeNull();
+		expect(locatePastedImageReferenceAroundCursor('[image 3] source="/tmp/a.png"', 1)).toBeNull();
 	});
 });

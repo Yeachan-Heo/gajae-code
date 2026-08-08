@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added atomic same-line deletion APIs for text immediately before or around the `Editor` cursor.
+
 ### Changed
 
 - Native fuzzy matching and image encoding bindings now load only when their TUI feature is used instead of at module startup.

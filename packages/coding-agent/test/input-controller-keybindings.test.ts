@@ -53,6 +53,7 @@ type FakeEditor = {
 	getLines(): string[];
 	getCursor(): { line: number; col: number };
 	deleteTextBeforeCursor(text: string): boolean;
+	deleteTextRangeAroundCursor(startCol: number, endCol: number): boolean;
 	addToHistory(text: string): void;
 	setActionKeys(action: string, keys: string[]): void;
 	setCustomKeyHandler(key: string, handler: () => boolean | undefined): void;
@@ -164,6 +165,22 @@ async function createContext(options?: {
 		deleteTextBeforeCursor(text: string) {
 			if (!editorText.endsWith(text)) return false;
 			editorText = editorText.slice(0, -text.length);
+			editor.onChange?.(editorText);
+			return true;
+		},
+		deleteTextRangeAroundCursor(startCol: number, endCol: number) {
+			const cursorCol = editorText.length;
+			if (
+				!Number.isInteger(startCol) ||
+				!Number.isInteger(endCol) ||
+				startCol < 0 ||
+				startCol >= endCol ||
+				endCol > editorText.length ||
+				startCol > cursorCol ||
+				endCol < cursorCol
+			)
+				return false;
+			editorText = editorText.slice(0, startCol) + editorText.slice(endCol);
 			editor.onChange?.(editorText);
 			return true;
 		},
@@ -837,21 +854,51 @@ describe("InputController keybinding setup", () => {
 			images: [image],
 		});
 	});
+	it.each([
+		["at the reference end", false],
+		["immediately after the placeholder", true],
+	])("deletes an attached pasted-path reference atomically %s", async (_name, moveAfterPlaceholder) => {
+		const { InputController, ctx } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "image",
+			mimeType: "image/png",
+		};
+		const editor = new CustomEditor(defaultEditorTheme);
+		const reference = formatPastedImageReference("[image 1]", String.raw`C:\shots\final "one".png`);
+		ctx.editor = editor;
+		ctx.pendingImages = [image];
+		editor.setText(`describe ${reference}`);
+		if (moveAfterPlaceholder) {
+			for (let index = 0; index < reference.length - "[image 1]".length; index += 1) {
+				editor.handleInput("\x1b[D");
+			}
+		}
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.handleInput("\x7f");
+
+		expect(editor.getText()).toBe("describe ");
+		expect(ctx.pendingImages).toEqual([]);
+
+		editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+		expect(editor.getText()).toBe(`describe ${reference}`);
+		expect(ctx.pendingImages).toEqual([image]);
+	});
 
 	it("leaves ordinary Backspace handling to the editor", async () => {
-		const { InputController, ctx, editor } = await createContext();
+		const { InputController, ctx } = await createContext();
+		const editor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = editor;
 		ctx.pendingImages = [{ type: "image", data: "image", mimeType: "image/png" }];
 		editor.setText("describe image");
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
-		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
-			([key]) => key === "backspace",
-		);
-		const handler = registration?.[1] as (() => boolean) | undefined;
+		editor.handleInput("\x7f");
 
-		expect(handler?.()).toBe(false);
-		expect(editor.getText()).toBe("describe image");
+		expect(editor.getText()).toBe("describe imag");
 	});
 	it("omits pasted image attachments when their placeholders were deleted", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();

@@ -25,7 +25,11 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-image-loading";
-import { formatPastedImageReference, parsePastedImagePaths } from "../../utils/pasted-image-path";
+import {
+	formatPastedImageReference,
+	locatePastedImageReferenceAroundCursor,
+	parsePastedImagePaths,
+} from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
 import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
@@ -52,7 +56,6 @@ const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
-const IMAGE_PLACEHOLDER_BEFORE_CURSOR_PATTERN = /\[image ([1-9]\d*)\]$/;
 
 interface InputControllerDependencies {
 	loadPastedImageBatch?: typeof loadPastedImageBatch;
@@ -1755,16 +1758,16 @@ export class InputController {
 
 		const { line, col } = this.ctx.editor.getCursor();
 		const currentLine = this.ctx.editor.getLines()[line] ?? "";
-		const match = currentLine.slice(0, col).match(IMAGE_PLACEHOLDER_BEFORE_CURSOR_PATTERN);
-		const placeholderNumberText = match?.[1];
-		if (!match || !placeholderNumberText) return false;
+		const range = locatePastedImageReferenceAroundCursor(currentLine, col);
+		if (!range) return false;
+		const placeholderNumberText = String(range.imageIndex);
 
 		const imageIndex = Number.parseInt(placeholderNumberText, 10) - 1;
 		if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length) return false;
 
 		const beforeText = this.ctx.editor.getText();
 		const pendingImages = this.ctx.pendingImages;
-		const deleted = this.ctx.editor.deleteTextBeforeCursor(match[0]);
+		const deleted = this.ctx.editor.deleteTextRangeAroundCursor(range.startCol, range.endCol);
 		if (deleted) {
 			this.#imagePlaceholderDeletionUndo = {
 				beforeText,
