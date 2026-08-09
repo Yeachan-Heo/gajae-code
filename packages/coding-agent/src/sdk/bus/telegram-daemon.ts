@@ -6228,8 +6228,12 @@ export class TelegramNotificationDaemon {
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
 					const connected = this.sessions.get(sessionId);
 					if (connected) {
+						const recoveryRejectedAfterArchive =
+							connected.recoveryLease?.state === "rejected" &&
+							this.topics.get(sessionId)?.authorityState === "inactive";
 						if (
 							connected.endpointKey !== endpointKey ||
+							recoveryRejectedAfterArchive ||
 							(connected.ws.readyState === WebSocket.CONNECTING &&
 								this.runtime.now() - connected.connectingSince >= CONNECTING_RECONNECT_MS)
 						)
@@ -10073,6 +10077,16 @@ export class TelegramNotificationDaemon {
 			);
 			if (this.sessions.get(session.sessionId) !== session) return;
 			if (!recovered) {
+				const authorityState = this.topics.get(replayCandidateSessionId)?.authorityState;
+				if (
+					replayCandidateSessionId === session.sessionId &&
+					(authorityState === "archive_pending" || authorityState === "archive_exhausted")
+				) {
+					// The old topic remains fenced, but the authenticated live transport
+					// must stay attached while archive reconciliation retries.
+					session.replayPending = false;
+					return;
+				}
 				if (session.hostGeneration === msg.generation && session.recoveryLease?.state !== "pending")
 					this.dropSession(session, "recovery_rejected");
 				return;

@@ -12082,6 +12082,26 @@ test("archive-pending topics fence model choices and threaded frames while activ
 	bot.calls = [];
 	daemon.connectSession("S", "ws://resumed", "replacement-token");
 	const resumedSession = daemon.sessions.get("S")!;
+	(resumedSession.ws as unknown as FakeWs).dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(resumedSession, {
+		type: "event_replay_result",
+		id: resumedSession.replayId,
+		ok: true,
+		generation: 1,
+		lastSeq: 1,
+		events: [
+			{
+				seq: 1,
+				payload: {
+					type: "identity_header",
+					sessionId: "S",
+					repo: "r",
+					branch: "b",
+				},
+			},
+		],
+	});
+	expect(daemon.sessions.get("S")).toBe(resumedSession);
 	await daemon.handleSessionMessage(resumedSession, {
 		type: "control_command_result",
 		status: "ok",

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "branch": "fix/telegram-daemon-authority-crash",
+  "base": "upstream/dev@57b82b32a",
+  "testedCommit": "ab0029d05",
+  "environment": {
+    "os": "darwin-arm64",
+    "runtime": "Bun 1.3.14",
+    "cli": "workspace source via /Users/chiz/.local/bin/gjc"
+  },
+  "historicalFailure": {
+    "observed": true,
+    "daemonLog": "/Users/chiz/.gjc/agent/notifications/daemon.log",
+    "error": "Uncaught Exception: shared topic authority unavailable",
+    "effect": "daemon process remained present while its heartbeat became stale"
+  },
+  "preFixDogfood": {
+    "initialHealth": "OK",
+    "initialDelivery": "OK",
+    "observationWindowSeconds": 180,
+    "finalDaemonStatus": "stopped",
+    "finalHealth": "WARN: heartbeat stale",
+    "liveEndpoints": 1
+  },
+  "archiveScanPatchDogfood": {
+    "initialHealth": "OK",
+    "initialDelivery": "OK",
+    "observationWindowSeconds": 180,
+    "finalDaemonStatus": "stopped",
+    "finalHealth": "WARN: heartbeat stale",
+    "liveEndpoints": 1,
+    "finalDelivery": "FAILED: telegram runtime is not ready or attached",
+    "result": "BUG REPRODUCED; archive-scan patch is insufficient"
+  },
+  "recoveryFenceFixDogfood": {
+    "rootCause": "same-session replay against an archive_pending predecessor was dropped as recovery_rejected on every scan",
+    "initialHealth": "OK",
+    "observationWindowSeconds": 120,
+    "finalDaemonStatus": "running",
+    "finalHealth": "OK: heartbeat fresh",
+    "liveEndpoints": 1,
+    "finalDelivery": "OK",
+    "result": "PASS"
+  },
+  "verification": {
+    "build": "PASS: bun run --cwd=packages/coding-agent build",
+    "nativeBuild": "PASS: bun --cwd=packages/natives run build",
+    "telegramRegression": "PASS: 615 tests, 0 failures, 2361 assertions",
+    "typescriptFullSuite": "FAIL: 15765 pass, 418 skip, 559 fail, 29 errors; failures include existing macOS /var symlink canonicalization and unrelated TUI/session tests",
+    "aggregateCheck": "FAIL: TypeScript checks passed after docs-index regeneration; Rust clippy reported 6 pre-existing pi-natives warnings-as-errors",
+    "aggregateTestFirstRun": "INCOMPLETE: cargo-nextest unavailable and stale native addon; native addon was rebuilt before focused and TS reruns"
+  }
+}
