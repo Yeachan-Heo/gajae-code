@@ -6920,8 +6920,13 @@ export class SessionManager {
 		if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 	}
 
-	#freshSessionState(options?: NewSessionOptions, sessionFileOverride?: string): FreshSessionState {
-		const preallocated = this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId();
+	#freshSessionState(
+		options?: NewSessionOptions,
+		sessionFileOverride?: string,
+		managedSessionId?: string,
+	): FreshSessionState {
+		const preallocated =
+			managedSessionId ?? (this.#lifecycleIdAdopted ? undefined : lifecyclePreallocatedSessionId());
 		const sessionId = preallocated ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const sessionFile =
@@ -16788,6 +16793,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
 		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
+		managedSessionId?: string,
 	): Promise<SessionManager> {
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
@@ -16819,7 +16825,7 @@ export class SessionManager {
 			writeTerminalBreadcrumb(manager.cwd, resolved);
 			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		} else {
-			const fresh = manager.#freshSessionState(undefined, resolved);
+			const fresh = manager.#freshSessionState(undefined, resolved, managedSessionId);
 			const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			manager.#applyFreshSessionMetadata(fresh);
 			manager.#commitResidentTextStoreTransition(transition);
