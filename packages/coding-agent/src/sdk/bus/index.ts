@@ -155,6 +155,12 @@ export {
 
 const PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT = 8;
 const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
+/**
+ * Upper bound on the failure reason copied into the local operator log. Mirrors
+ * the 512-char bound documented for reconciliation failure messages so a runaway
+ * provider error cannot flood the log file.
+ */
+const PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX = 512;
 
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
@@ -6304,7 +6310,7 @@ export function createNotificationsExtension(
 				message =>
 					(message as { stopReason?: unknown }).stopReason === "error" ||
 					(message as { stopReason?: unknown }).stopReason === "aborted",
-			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown } | undefined;
+			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown; errorKind?: unknown } | undefined;
 			const legacyCode =
 				event.stopReason === "cancelled"
 					? "cancelled"
@@ -6313,6 +6319,24 @@ export function createNotificationsExtension(
 						: terminalAssistant?.stopReason === "aborted"
 							? "aborted"
 							: undefined;
+			// The wire outcome is a fixed safe token by contract (see `sanitizePromptFailure`):
+			// SDK clients, the ACP `-32603` envelope, and therefore every lane transcript only
+			// ever see "Prompt submission failed." This local log is the ONLY place the reason
+			// a turn died survives, so a turn that ends with no visible error stays diagnosable.
+			// Client cancellation is intent, not a defect, so it is not logged as an error.
+			if (outcome.kind === "failed" && event.stopReason !== "cancelled") {
+				const rawReason = typeof terminalAssistant?.errorMessage === "string" ? terminalAssistant.errorMessage : "";
+				const errorKind = typeof terminalAssistant?.errorKind === "string" ? terminalAssistant.errorKind : "";
+				logger.error("sdk_prompt_terminal_failed", {
+					sessionId: id,
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+					loopStopReason: event.stopReason ?? "none",
+					assistantStopReason: terminalAssistant?.stopReason ?? "none",
+					...(errorKind ? { errorKind } : {}),
+					reason: rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported",
+				});
+			}
 			void rt.terminalizePrompt(correlation, outcome, {
 				...(finalText ? { finalText } : {}),
 				...(outcome.kind === "failed" && legacyCode
