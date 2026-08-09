@@ -954,8 +954,10 @@ async function runRawGlobal(
 		throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
 	const client = await connectBroker(agentDir);
 	try {
+		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 		const response = await client.global(operation, input, {
 			idempotencyKey,
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
 			...(args.elevationRequestId === undefined ? {} : { elevationRequestId: args.elevationRequestId }),
 		});
 		return args.showEndpointCredential ? response : stripSecretFields(response);
