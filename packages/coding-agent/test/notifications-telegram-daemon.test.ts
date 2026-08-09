@@ -19304,6 +19304,15 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			[77],
 			false,
 		],
+		[
+			"non-forum chat cannot retain a closable topic",
+			async () => ({ ok: false, error_code: 400, description: "Bad Request: the chat is not a supergroup forum" }),
+			"inactive",
+			"42",
+			"42",
+			[77],
+			false,
+		],
 		...([401, 403, 429, 500] as const).map(
 			errorCode =>
 				[

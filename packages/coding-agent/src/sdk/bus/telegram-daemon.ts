@@ -531,7 +531,7 @@ function topicArchiveSettled(response: unknown): boolean {
 	if (result.ok === true && result.result === true) return true;
 	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
 	const description = result.description.trim();
-	return /^(?:Bad Request: )?(?:TOPIC_NOT_FOUND|THREAD_NOT_FOUND|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
+	return /^(?:Bad Request: )?(?:TOPIC_NOT_FOUND|THREAD_NOT_FOUND|the chat is not a supergroup forum|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
 		description,
 	);
 }

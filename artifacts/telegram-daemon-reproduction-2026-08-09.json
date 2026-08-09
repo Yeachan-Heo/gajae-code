@@ -42,10 +42,17 @@
     "finalDelivery": "OK",
     "result": "PASS"
   },
+  "nonForumArchiveSettlement": {
+    "telegramResponse": "400: Bad Request: the chat is not a supergroup forum",
+    "previousResult": "archive_pending retry loop",
+    "fixedResult": "active with no archive job",
+    "daemonHealth": "OK",
+    "result": "PASS"
+  },
   "verification": {
     "build": "PASS: bun run --cwd=packages/coding-agent build",
     "nativeBuild": "PASS: bun --cwd=packages/natives run build",
-    "telegramRegression": "PASS: 615 tests, 0 failures, 2361 assertions",
+    "telegramRegression": "PASS: 616 tests, 0 failures, 2363 assertions",
     "typescriptFullSuite": "FAIL: 15765 pass, 418 skip, 559 fail, 29 errors; failures include existing macOS /var symlink canonicalization and unrelated TUI/session tests",
     "aggregateCheck": "FAIL: TypeScript checks passed after docs-index regeneration; Rust clippy reported 6 pre-existing pi-natives warnings-as-errors",
     "aggregateTestFirstRun": "INCOMPLETE: cargo-nextest unavailable and stale native addon; native addon was rebuilt before focused and TS reruns"
