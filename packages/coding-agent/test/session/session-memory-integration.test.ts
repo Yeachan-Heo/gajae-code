@@ -1491,9 +1491,13 @@ it("matches eager replay-metadata sanitation on bounded first open and exact reo
 		"copy-retain",
 		"enabled",
 	);
-	expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
-	expect(reopened.buildSessionContext()).toEqual(expected);
-	await reopened.close();
+		expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+		enabledStorage.unlinkSync(sidecarPath("/enabled/session.jsonl", "idx"));
+		const fallbackEntries = reopened.getEntriesForExport();
+		expect(JSON.stringify(fallbackEntries)).not.toContain("stale-signature");
+		expect(JSON.stringify(fallbackEntries)).not.toContain("openaiResponsesHistory");
+		expect(reopened.buildSessionContext()).toEqual(expected);
+		await reopened.close();
 });
 
 it("commits cold label clears and appended usage before exact reopen", async () => {
