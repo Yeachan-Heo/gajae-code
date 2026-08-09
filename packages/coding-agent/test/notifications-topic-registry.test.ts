@@ -365,9 +365,13 @@ describe("TopicRegistry", () => {
 	test("retains archived topic records and never recreates physical topics", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");
+		expect(reg.acquireLease("s1", "host", 100, 1_000, 500)).toBe(true);
+		expect(reg.releaseLeaseToGrace("s1", "host", 200, 500)).toBe(true);
+		expect(reg.get("s1")?.disconnectGraceExpiresAt).toBe(700);
 
 		reg.beginArchive("s1");
 		expect(reg.get("s1")?.authorityState).toBe("archive_pending");
+		expect(reg.get("s1")?.disconnectGraceExpiresAt).toBeUndefined();
 		expect(reg.sessionForTopic("1")).toBeUndefined();
 
 		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
@@ -717,6 +721,35 @@ test("rejects future topic registry versions and quarantines retained legacy rec
 
 	expect(registry.get("legacy")).toMatchObject({ topicId: "42", authorityState: "legacy_quarantined" });
 	expect(registry.sessionForTopic("42")).toBeUndefined();
+});
+
+test("repairs an archive record carrying a stale disconnect-grace marker", () => {
+	const state = parseTopicRegistryState({
+		version: 2,
+		registryGeneration: 7,
+		topics: {
+			session: {
+				topicId: "42",
+				topicOrigin: "daemon_created",
+				sessionUuid: "session-uuid",
+				identitySent: true,
+				createdAt: 1,
+				orphanedAt: 2,
+				authorityEpoch: 1,
+				authorityState: "archive_pending",
+				chatId: "42",
+				endpointKey: "endpoint",
+				endpointDigest: "digest",
+				endpointGeneration: 1,
+				archiveHostId: "host",
+				archiveLeaseEpoch: 1,
+				disconnectGraceExpiresAt: 3,
+			},
+		},
+	});
+
+	expect(state?.topics.session?.authorityState).toBe("archive_pending");
+	expect(state?.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
 });
 test("fences a concurrent host and permits same-topic resume only before grace expiry", async () => {
 	const registry = new TopicRegistry();

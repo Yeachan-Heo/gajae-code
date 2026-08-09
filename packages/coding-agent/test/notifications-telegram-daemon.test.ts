@@ -20817,6 +20817,53 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const after = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
 		expect(after.topics.S).toMatchObject({ replayGeneration: 1, replaySeq: 1 });
 	});
+	test("a sequence-gap replay with a consistent identity resumes the exact endpoint authority", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "S", "S", { generation: 1 });
+		const topicId = bot.createdTopicThreadIds[0]!;
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		restarted.connectSession("S", "ws://canonical", "canonical-token");
+		const session = restarted.sessions.get("S")!;
+		session.ws.dispatchEvent(new Event("open"));
+		bot.calls.length = 0;
+
+		await restarted.handleSessionMessage(session, {
+			type: "event_replay_result",
+			ok: true,
+			id: session.replayId,
+			generation: 1,
+			lastSeq: 10,
+			gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 5, resyncQueries: ["Q01", "Q02"] },
+			events: [
+				{
+					payload: {
+						type: "identity_header",
+						sessionId: "S",
+						repo: "gajae-code",
+						branch: "dev",
+						title: "Recovered after replay gap",
+					},
+				},
+			],
+		});
+
+		expect(restarted.sessions.get("S")).toBe(session);
+		expect(session.replayPending).toBe(false);
+		expect(session.logicalSessionIdTrusted).toBe(true);
+		expect(
+			(restarted as unknown as { topics: { get(id: string): { topicId: string } | undefined } }).topics.get("S"),
+		).toMatchObject({ topicId: String(topicId) });
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		expect((await readTopicAuthorityState(agentDir)).topics.S).toMatchObject({
+			replayGeneration: 1,
+			replaySeq: 10,
+		});
+	});
 	test.each([
 		[
 			"generation reset",

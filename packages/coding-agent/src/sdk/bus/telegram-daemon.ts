@@ -10001,7 +10001,6 @@ export class TelegramNotificationDaemon {
 				msg.generation >= 1 &&
 				Number.isSafeInteger(msg.lastSeq) &&
 				msg.lastSeq >= 0 &&
-				msg.gap === undefined &&
 				Array.isArray(msg.events) &&
 				msg.events.every((event: unknown) => event !== null && typeof event === "object" && !Array.isArray(event));
 			const replayed: Record<string, unknown>[] = replayValid
@@ -10020,7 +10019,19 @@ export class TelegramNotificationDaemon {
 				frame => typeof frame.sessionId !== "string" || !frame.sessionId.trim(),
 			);
 			const identityConflict = new Set(identities).size > 1;
-			if (!replayValid || malformedIdentity || identityConflict) {
+			const sequenceGapWithIdentityProof =
+				msg.gap !== null &&
+				typeof msg.gap === "object" &&
+				!Array.isArray(msg.gap) &&
+				msg.gap.kind === "sequence_gap" &&
+				Number.isSafeInteger(msg.gap.fromSeq) &&
+				Number.isSafeInteger(msg.gap.toSeq) &&
+				msg.gap.fromSeq < msg.gap.toSeq &&
+				Array.isArray(msg.gap.resyncQueries) &&
+				msg.gap.resyncQueries.every((query: unknown) => typeof query === "string") &&
+				identityFrames.length > 0;
+			const gapAllowsRecovery = msg.gap === undefined || sequenceGapWithIdentityProof;
+			if (!replayValid || !gapAllowsRecovery || malformedIdentity || identityConflict) {
 				// A replay result is the admission proof. Never clear its barrier or drain
 				// queued frames after malformed/conflicting proof; the socket cannot fall
 				// back to transport-local config rekeying.
