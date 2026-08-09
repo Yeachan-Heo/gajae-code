@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { disposeAllKernelSessions, executePython } from "@gajae-code/coding-agent/eval/py/executor";
+import { disposeAllKernelSessions, executePython, type PythonResult } from "@gajae-code/coding-agent/eval/py/executor";
 import type {
 	KernelExecuteOptions,
 	KernelExecuteResult,
@@ -60,6 +60,27 @@ async function waitForProcessGone(pid: number, timeoutMs = 5000): Promise<boolea
 		await Bun.sleep(50);
 	}
 	return !isProcessAlive(pid);
+}
+
+async function waitForOwnedProcess(pidFile: string, timeoutMs = 5000): Promise<number> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await Bun.file(pidFile).exists()) {
+			const pid = Number((await Bun.file(pidFile).text()).trim());
+			if (Number.isSafeInteger(pid) && pid > 0 && isProcessAlive(pid)) return pid;
+		}
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for owned descendant PID at ${pidFile}`);
+}
+
+async function waitForFile(path: string, timeoutMs = 5000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await Bun.file(path).exists()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for readiness file at ${path}`);
 }
 
 function countAbortListeners(signal: AbortSignal): { readonly count: () => number; readonly restore: () => void } {
@@ -134,17 +155,19 @@ describe("python eval lifecycle red-team", () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 		const unrelated = Bun.spawn(["/bin/sh", "-c", "sleep 30"], { stdout: "ignore", stderr: "ignore" });
-		let childPid: number | undefined;
+		const controller = new AbortController();
+		let execution: Promise<PythonResult> | undefined;
 		try {
 			const pidFile = `${tempDir.path()}/owned-child.pid`;
-			const result = await executePython(`%%bash\n(sleep 30) &\nprintf '%s' "$!" > "${pidFile}"\nwait`, {
+			execution = executePython(`%%bash\n(sleep 30) &\nprintf '%s' "$!" > "${pidFile}"\nwait`, {
 				cwd: tempDir.path(),
 				sessionId: "redteam-bash-descendant-timeout",
 				kernelMode: "session",
-				timeoutMs: 500,
+				signal: controller.signal,
 			});
-			childPid = Number(await Bun.file(pidFile).text());
-			expect(Number.isSafeInteger(childPid) && childPid > 0).toBe(true);
+			const childPid = await waitForOwnedProcess(pidFile);
+			controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
+			const result = await execution;
 			expect(result.cancelled).toBe(true);
 			expect(await waitForProcessGone(childPid)).toBe(true);
 			expect(isProcessAlive(unrelated.pid)).toBe(true);
@@ -155,6 +178,8 @@ describe("python eval lifecycle red-team", () => {
 				// ignore cleanup races
 			}
 			await unrelated.exited.catch(() => undefined);
+			controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
+			await execution?.catch(() => undefined);
 		}
 	});
 
@@ -163,29 +188,44 @@ describe("python eval lifecycle red-team", () => {
 		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 		const controller = new AbortController();
 		const listeners = countAbortListeners(controller.signal);
+		const kernelStarted = Promise.withResolvers<void>();
 		let shutdown: (() => Promise<KernelShutdownResult>) | undefined;
+		let execution: Promise<PythonResult> | undefined;
 		try {
 			PythonKernel.start = async () => {
-				const kernel = await originalStart({ cwd: tempDir.path() });
-				shutdown = () => kernel.shutdown({ timeoutMs: 100 });
-				return kernel;
+				try {
+					const kernel = await originalStart({ cwd: tempDir.path() });
+					shutdown = () => kernel.shutdown({ timeoutMs: 100 });
+					kernelStarted.resolve();
+					return kernel;
+				} catch (error) {
+					kernelStarted.reject(error);
+					throw error;
+				}
 			};
 
-			const execution = executePython("import time\ntime.sleep(60)", {
-				cwd: tempDir.path(),
-				sessionId: "redteam-inflight-shutdown",
-				kernelMode: "session",
-				signal: controller.signal,
-				timeoutMs: 60_000,
-			});
-			await Bun.sleep(250);
+			const executionReadyFile = `${tempDir.path()}/kernel-executing`;
+			execution = executePython(
+				`from pathlib import Path\nPath(${JSON.stringify(executionReadyFile)}).touch()\nimport time\ntime.sleep(60)`,
+				{
+					cwd: tempDir.path(),
+					sessionId: "redteam-inflight-shutdown",
+					kernelMode: "session",
+					signal: controller.signal,
+					timeoutMs: 60_000,
+				},
+			);
+			await kernelStarted.promise;
+			await waitForFile(executionReadyFile);
 			expect(listeners.count()).toBe(1);
-			expect(shutdown).toBeDefined();
+			if (!shutdown) throw new Error("Python kernel did not expose shutdown after startup");
 
-			await shutdown?.();
+			await shutdown();
 			await execution;
 			expect(listeners.count()).toBe(0);
 		} finally {
+			await shutdown?.().catch(() => undefined);
+			await execution?.catch(() => undefined);
 			listeners.restore();
 		}
 	});
