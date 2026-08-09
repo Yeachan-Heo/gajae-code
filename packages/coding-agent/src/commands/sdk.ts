@@ -8,6 +8,7 @@ import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
+import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
@@ -509,6 +510,12 @@ export async function runSessionHost(
 			throw await registrationFailure(error);
 		}
 
+		try {
+			await initTheme(false);
+		} catch (error) {
+			throw await registrationFailure(error);
+		}
+
 		// The longer MCP startup ceiling is scoped to ACP lifecycle launches only:
 		// it applies when this request actually carried `mcpServers`. Ordinary
 		// CLI/SDK `mcpConfigPath` consumers keep the manager's short default.
@@ -517,8 +524,8 @@ export async function runSessionHost(
 		// Inside it, the throw would be caught, reclassified as
 		// `registration`/`failed`, and written a second time, losing the
 		// `startup`/`pending` outcome the readiness cutoff is supposed to report.
-		// Session-manager open and MCP config write already consumed part of the
-		// budget, so re-read the clock here rather than reusing the earlier check.
+		// Session-manager open, MCP config write, and theme initialization already
+		// consumed part of the budget, so re-read the clock here.
 		let mcpStartupTimeoutMs: number | undefined;
 		if (mcpConfigPath !== undefined) {
 			const remaining = request.semanticReadyDeadlineAt - now() - ACP_MCP_STARTUP_HEADROOM_MS;

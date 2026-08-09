@@ -429,6 +429,7 @@ export interface ExtensionContext {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -1179,6 +1180,7 @@ export interface ExtensionAPI {
 			deliverAs?: "steer" | "followUp";
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
 		},
 	): Promise<void>;
 
@@ -1396,6 +1398,7 @@ export type SendUserMessageHandler = (
 		deliverAs?: "steer" | "followUp";
 		onPreflightAccepted?: () => void;
 		onPreflightAcceptCommit?: () => void | Promise<void>;
+		preflightSignal?: AbortSignal;
 	},
 ) => void | Promise<void>;
 
@@ -1555,6 +1558,7 @@ export interface ExtensionContextActions {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

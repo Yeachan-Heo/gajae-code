@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
-import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 
 type TestServer = {
@@ -85,6 +85,19 @@ async function createSessionListBroker(
 	return { directory, agentDir, requests };
 }
 
+test("ACP advertised skill commands require one complete canonical text block", () => {
+	expect(acpSkillInvocation([{ type: "text", text: " /skill:deep-interview clarify choices " }])).toEqual({
+		name: "deep-interview",
+		args: "clarify choices",
+	});
+	expect(acpSkillInvocation([{ type: "text", text: "/skill:" }])).toBeUndefined();
+	expect(
+		acpSkillInvocation([
+			{ type: "text", text: "/skill:deep-interview" },
+			{ type: "text", text: "extra context" },
+		]),
+	).toBeUndefined();
+});
 test("production ACP routes zero-session SDK globals through the broker adapter", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-production-"));
 	directories.push(directory);
@@ -200,10 +213,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const lifecycleInputs: Record<string, unknown>[] = [];
 	const brokerRequests: Record<string, unknown>[] = [];
 	const promptInputs: Record<string, unknown>[] = [];
+	const skillInputs: Record<string, unknown>[] = [];
 	const controlOperations: string[] = [];
 	const updates: SessionNotification[] = [];
 	const providerRegistrations: Array<Record<string, unknown>> = [];
 	let promptSocket: { send(message: string): void } | undefined;
+	let holdSkillPreflight = false;
+	let pendingSkillControlId: string | undefined;
 	let abortAcknowledged = true;
 	let promptDeliveredWhileBusy = false;
 	const sessionCloseLedger = new Map<string, Record<string, unknown>>();
@@ -477,6 +493,34 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 							);
 						}
 					}
+					if (frame.operation === "skill.invoke") {
+						skillInputs.push(frame.input as Record<string, unknown>);
+						promptSocket = socket;
+						if (holdSkillPreflight) {
+							pendingSkillControlId = String(frame.id);
+							return;
+						}
+					}
+					if (frame.operation === "turn.abort" && pendingSkillControlId) {
+						socket.send(
+							JSON.stringify({
+								type: "control_response",
+								id: pendingSkillControlId,
+								ok: false,
+								error: { code: "busy", message: "Skill preflight was cancelled before execution." },
+							}),
+						);
+						pendingSkillControlId = undefined;
+						socket.send(
+							JSON.stringify({
+								type: "control_response",
+								id: frame.id,
+								ok: true,
+								result: { aborted: true, disposition: "preflight_cancelled" },
+							}),
+						);
+						return;
+					}
 					socket.send(
 						JSON.stringify({
 							type: "control_response",
@@ -485,9 +529,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 							result:
 								frame.operation === "turn.prompt"
 									? { commandId: "prompt-command", turnId: "prompt-turn", accepted: true }
-									: frame.operation === "turn.abort"
-										? { aborted: abortAcknowledged }
-										: {},
+									: frame.operation === "skill.invoke"
+										? { commandId: "skill-command", turnId: "skill-turn", accepted: true }
+										: frame.operation === "turn.abort"
+											? { aborted: abortAcknowledged }
+											: {},
 						}),
 					);
 				}
@@ -643,6 +689,34 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(availableCommands.availableCommands?.map(command => command.name)).toEqual(
 		expect.arrayContaining(["skill:deep-interview", "skill:ralplan", "skill:ultragoal", "skill:team"]),
 	);
+	const skillPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "/skill:deep-interview clarify ACP choices" }],
+	});
+	await waitFor(() => skillInputs.length === 1 && promptSocket !== undefined, "ACP skill invocation");
+	expect(skillInputs).toEqual([{ name: "deep-interview", args: "clarify ACP choices" }]);
+	expect(promptInputs).toHaveLength(0);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "skill-command",
+			turnId: "skill-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	await expect(bounded(skillPrompt, "ACP skill prompt completion")).resolves.toMatchObject({ stopReason: "end_turn" });
+	holdSkillPreflight = true;
+	const preflightCancelledSkill = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "/skill:deep-interview cancel before start" }],
+	});
+	await waitFor(() => pendingSkillControlId !== undefined, "pending ACP skill preflight");
+	await agent.cancel({ sessionId: created.sessionId });
+	await expect(bounded(preflightCancelledSkill, "preflight-cancelled ACP skill")).resolves.toEqual({
+		stopReason: "cancelled",
+	});
+	holdSkillPreflight = false;
 	const listedOwned = await bounded(agent.listSessions({ cwd }), "list owned session");
 	expect(listedOwned.sessions).toEqual([
 		expect.objectContaining({

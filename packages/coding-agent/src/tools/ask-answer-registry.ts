@@ -3,8 +3,10 @@
  *
  * Decouples the `ask` tool (which reads the source via `AgentSession`) from the
  * notifications extension (which registers one), without threading a new method
- * through the extension/runner/controller wiring. A session has at most one
- * source; registering returns a disposer.
+ * through the extension/runner/controller wiring. A session may have multiple
+ * sources. A "protocol" source always takes precedence over an "interactive"
+ * source regardless of registration order; within the same kind, the most
+ * recently registered source wins. Registering returns a disposer.
  */
 
 /** Error code a remote ask source uses to signal that its own timeout fired. */
@@ -14,19 +16,31 @@ import { logger } from "@gajae-code/utils";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { AskAnswerSource } from "./index";
 
-const sources = new Map<string, AskAnswerSource[]>();
+export type AskAnswerSourceKind = "protocol" | "interactive";
+
+export interface RegisteredAskAnswerSource {
+	readonly source: AskAnswerSource;
+	readonly kind: AskAnswerSourceKind;
+}
+
+const sources = new Map<string, RegisteredAskAnswerSource[]>();
 const workflowGateEmitters = new Map<string, WorkflowGateEmitter>();
 const workflowGateListeners = new Map<string, Set<(emitter: WorkflowGateEmitter | undefined) => void>>();
 
 /** Register `source` for `sessionId`. Returns a disposer that restores the prior source. */
-export function registerAskAnswerSource(sessionId: string, source: AskAnswerSource): () => void {
+export function registerAskAnswerSource(
+	sessionId: string,
+	source: AskAnswerSource,
+	kind: AskAnswerSourceKind = "interactive",
+): () => void {
 	const stack = sources.get(sessionId) ?? [];
-	stack.push(source);
+	const entry: RegisteredAskAnswerSource = { source, kind };
+	stack.push(entry);
 	sources.set(sessionId, stack);
 	return () => {
 		const current = sources.get(sessionId);
 		if (!current) return;
-		const index = current.lastIndexOf(source);
+		const index = current.lastIndexOf(entry);
 		if (index >= 0) current.splice(index, 1);
 		if (current.length === 0) sources.delete(sessionId);
 	};
@@ -34,7 +48,9 @@ export function registerAskAnswerSource(sessionId: string, source: AskAnswerSour
 
 /** The highest-priority answer source for `sessionId`, if one is registered. */
 export function getAskAnswerSource(sessionId: string): AskAnswerSource | undefined {
-	return sources.get(sessionId)?.at(-1);
+	const entries = sources.get(sessionId);
+	const protocolEntry = entries?.findLast(entry => entry.kind === "protocol");
+	return protocolEntry?.source ?? entries?.at(-1)?.source;
 }
 
 /** Publish a session's current workflow-gate emitter after mode initialization. */

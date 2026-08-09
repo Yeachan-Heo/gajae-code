@@ -70,9 +70,9 @@ describe("SDK prompt terminal arbiter", () => {
 		const { reconciliation, store } = await accepted();
 		const first = stopped("end_turn");
 
-		expect(await reconciliation.claimPendingOutcome(correlation, first)).toEqual(first);
-		expect(await reconciliation.claimPendingOutcome(correlation, stopped("cancelled"))).toEqual(first);
-		expect(reconciliation.peekPendingOutcome(correlation)).toEqual(first);
+		expect(await reconciliation.claimPendingOutcome("prompt", correlation, first)).toEqual(first);
+		expect(await reconciliation.claimPendingOutcome("prompt", correlation, stopped("cancelled"))).toEqual(first);
+		expect(reconciliation.peekPendingOutcome("prompt", correlation)).toEqual(first);
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "accepted" });
 		expect(reconciliation.lookup("prompt", correlation)).not.toHaveProperty("outcome");
 		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
@@ -85,8 +85,8 @@ describe("SDK prompt terminal arbiter", () => {
 		for (const reason of ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"] as const) {
 			const { reconciliation } = await accepted();
 			const outcome = stopped(reason);
-			await reconciliation.claimPendingOutcome(correlation, outcome);
-			await reconciliation.finalizePromptOutcome(correlation);
+			await reconciliation.claimPendingOutcome("prompt", correlation, outcome);
+			await reconciliation.finalizeOutcome("prompt", correlation);
 
 			expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 				status: "terminal_ok",
@@ -99,8 +99,8 @@ describe("SDK prompt terminal arbiter", () => {
 		for (const code of ["prompt_failed", "prompt_deadline_exceeded"] as const) {
 			const { reconciliation } = await accepted();
 			const outcome = failed(code);
-			await reconciliation.claimPendingOutcome(correlation, outcome);
-			await reconciliation.finalizePromptOutcome(correlation);
+			await reconciliation.claimPendingOutcome("prompt", correlation, outcome);
+			await reconciliation.finalizeOutcome("prompt", correlation);
 			expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 				status: "failed",
 				outcome,
@@ -109,8 +109,11 @@ describe("SDK prompt terminal arbiter", () => {
 		}
 
 		const { reconciliation } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, failed("prompt_failed"));
-		await reconciliation.finalizePromptOutcome(correlation, undefined, { code: "overridden", message: "override" });
+		await reconciliation.claimPendingOutcome("prompt", correlation, failed("prompt_failed"));
+		await reconciliation.finalizeOutcome("prompt", correlation, undefined, {
+			code: "overridden",
+			message: "override",
+		});
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 			status: "failed",
 			error: { code: "overridden", message: "override" },
@@ -121,11 +124,11 @@ describe("SDK prompt terminal arbiter", () => {
 		const { reconciliation, store } = await accepted();
 		store.failNext();
 
-		await expect(reconciliation.claimPendingOutcome(correlation, stopped("end_turn"))).rejects.toThrow(
+		await expect(reconciliation.claimPendingOutcome("prompt", correlation, stopped("end_turn"))).rejects.toThrow(
 			"persist failed",
 		);
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "accepted" });
-		expect(reconciliation.peekPendingOutcome(correlation)).toBeUndefined();
+		expect(reconciliation.peekPendingOutcome("prompt", correlation)).toBeUndefined();
 		expect(store.snapshot()).toEqual([
 			expect.objectContaining({ kind: "prompt", commandId: "command", turnId: "turn", status: "accepted" }),
 		]);
@@ -137,7 +140,7 @@ describe("SDK prompt terminal arbiter", () => {
 		const claimEntered = Promise.withResolvers<void>();
 		store.holdNext(held.promise, claimEntered.resolve);
 
-		const claim = reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		const claim = reconciliation.claimPendingOutcome("prompt", correlation, stopped("end_turn"));
 		await claimEntered.promise;
 		const skill = reconciliation.noteAccepted("skill", { commandId: "skill-command", turnId: "skill-turn" });
 		held.resolve();
@@ -151,13 +154,51 @@ describe("SDK prompt terminal arbiter", () => {
 		);
 	});
 
-	test("settles restart records with pending prompt outcomes and preserves skill restart failures", () => {
+	test("serializes delayed skill claims before exact normal and cancellation finalization", async () => {
+		for (const outcome of [stopped("end_turn"), stopped("cancelled")]) {
+			const store = new MemoryStore();
+			const reconciliation = createKindAwareReconciliation({ store, now: () => 200 });
+			await reconciliation.noteAccepted("skill", correlation, "skill-ref", { skillName: "deep-interview" });
+			const held = Promise.withResolvers<void>();
+			const claimEntered = Promise.withResolvers<void>();
+			store.holdNext(held.promise, claimEntered.resolve);
+
+			const claim = reconciliation.claimPendingOutcome("skill", correlation, outcome);
+			await claimEntered.promise;
+			const finalize = reconciliation.finalizeOutcome("skill", correlation);
+			held.resolve();
+			await Promise.all([claim, finalize]);
+
+			expect(reconciliation.lookup("skill", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome,
+			});
+			expect(store.snapshot()).toMatchObject([
+				{
+					kind: "skill",
+					status: "terminal_ok",
+					outcome,
+					pendingOutcome: undefined,
+				},
+			]);
+		}
+	});
+
+	test("settles restart records with pending prompt and skill outcomes while preserving outcome-less skill failures", () => {
 		const pendingOutcome: SdkPromptTerminalOutcome = stopped("max_tokens");
 		const settled = settleProcessRestart(
 			[
 				{ kind: "prompt", commandId: "pending", turnId: "1", status: "accepted", acceptedAt: 1, pendingOutcome },
 				{ kind: "prompt", commandId: "missing", turnId: "2", status: "in_flight", acceptedAt: 1 },
 				{ kind: "skill", commandId: "skill", turnId: "3", status: "accepted", acceptedAt: 1 },
+				{
+					kind: "skill",
+					commandId: "skill-pending",
+					turnId: "4",
+					status: "in_flight",
+					acceptedAt: 1,
+					pendingOutcome: stopped("cancelled"),
+				},
 			],
 			500,
 		);
@@ -170,6 +211,11 @@ describe("SDK prompt terminal arbiter", () => {
 			error: { code: "prompt_failed" },
 		});
 		expect(settled[2]).toMatchObject({ status: "failed", error: { code: "process_restart" } });
+		expect(settled[3]).toMatchObject({
+			status: "terminal_ok",
+			outcome: stopped("cancelled"),
+			pendingOutcome: undefined,
+		});
 	});
 	test("surfaces a late agent_failed reason on a terminal_ok record through the production lookup and persists it", async () => {
 		const { reconciliation, store } = await accepted();

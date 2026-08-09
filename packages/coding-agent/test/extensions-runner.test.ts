@@ -89,6 +89,28 @@ describe("ExtensionRunner", () => {
 			expect(resolver).toHaveBeenCalledWith("safe-tool");
 			expect(resolver).toHaveBeenCalledWith("unknown-tool");
 		});
+
+		it("forwards skill lifecycle hooks through the extension context", async () => {
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const invokeSkill = vi.fn(async () => ({ name: "fixture-skill", path: "/fixture/SKILL.md" }));
+			runner.initialize({} as never, { invokeSkill } as never);
+			const options = {
+				onPreflightAccepted: vi.fn(),
+				onPreflightAcceptCommit: vi.fn(async () => {}),
+				onSkillPrepared: vi.fn(),
+				preflightSignal: new AbortController().signal,
+			};
+
+			await runner.createContext().invokeSkill?.("fixture-skill", "argument", options);
+
+			expect(invokeSkill).toHaveBeenCalledWith("fixture-skill", "argument", options);
+		});
 	});
 
 	describe("shortcut conflicts", () => {

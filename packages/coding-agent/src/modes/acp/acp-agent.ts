@@ -117,6 +117,8 @@ interface PromptWaiter {
 	cancelWatchdog?: () => void;
 	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
 	activity: PromptActivity;
+	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
+	cancelAttempt?: Promise<boolean>;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -859,6 +861,14 @@ export function acpSessionStateFromConfig(
 	};
 }
 
+/** Recognize an advertised ACP skill command only when it is the complete, single text prompt. */
+export function acpSkillInvocation(blocks: PromptRequest["prompt"]): { name: string; args: string } | undefined {
+	if (blocks.length !== 1 || blocks[0]?.type !== "text") return undefined;
+	const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/.exec(blocks[0].text.trim());
+	if (!match?.[1]) return undefined;
+	return { name: match[1], args: match[2]?.trim() ?? "" };
+}
+
 /** Convert every ACP prompt block the agent advertises without silently discarding context. */
 export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 	text: string;
@@ -1384,6 +1394,7 @@ export class AcpAgent implements Agent {
 		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
 		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
+		const skillInvocation = acpSkillInvocation(params.prompt);
 		// The SDK transport hard-caps a single request frame at 256 KiB and answers an
 		// oversize frame by closing the socket (CloseCode::Size, crates/gjc-sdk/src/server.rs),
 		// which surfaces to the client as an opaque `connection_closed` mid-turn. Reject
@@ -1394,8 +1405,9 @@ export class AcpAgent implements Agent {
 		const promptFrameBytes = Buffer.byteLength(
 			JSON.stringify({
 				type: "control_request",
-				operation: "turn.prompt",
-				input: { text: payload.text, images: payload.images },
+				operation: skillInvocation ? "skill.invoke" : "turn.prompt",
+				input: skillInvocation ?? { text: payload.text, images: payload.images },
+				...(skillInvocation ? { confirm: false } : {}),
 				id: PROMPT_FRAME_ID_PLACEHOLDER,
 			}),
 		);
@@ -1449,10 +1461,12 @@ export class AcpAgent implements Agent {
 			);
 		}
 		const acknowledgementTask = (async (): Promise<PromptResponse> => {
-			const acknowledgement = await record.adapter.prompt({
-				text: payload.text,
-				...(payload.images.length ? { images: payload.images } : {}),
-			});
+			const acknowledgement = skillInvocation
+				? await record.adapter.control("skill.invoke", skillInvocation)
+				: await record.adapter.prompt({
+						text: payload.text,
+						...(payload.images.length ? { images: payload.images } : {}),
+					});
 			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
 			if (!acknowledgementCorrelation)
 				throw new AcpSdkAdapterError(
@@ -1538,6 +1552,7 @@ export class AcpAgent implements Agent {
 		try {
 			return await Promise.race([response, acknowledgementTask]);
 		} catch (error) {
+			if (waiter.cancelAttempt && (await waiter.cancelAttempt) && waiter.settled) return await response;
 			waiter.deferredFrames.length = 0;
 			waiter.deferredActivityFrames.length = 0;
 			clearPromptWatchdog(waiter);
@@ -1563,16 +1578,40 @@ export class AcpAgent implements Agent {
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
 		record.cancelRequested = true;
-		const acknowledgement = await record.adapter.cancel();
-		const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
-		if (result?.aborted !== true)
-			throw new AcpSdkAdapterError(
-				"abort_unacknowledged",
-				"SDK did not acknowledge cancellation of the active prompt.",
-			);
-		// The acknowledgement proves the run was aborted, not that its terminal was
-		// published. Arm the bounded settlement so the turn cannot outlive the cancel.
-		this.#scheduleCancelSettlement(params.sessionId, record);
+		const waiter = record.activePrompt;
+		const cancelAttempt = waiter ? Promise.withResolvers<boolean>() : undefined;
+		if (waiter && cancelAttempt) waiter.cancelAttempt = cancelAttempt.promise;
+		try {
+			const acknowledgement = await record.adapter.cancel();
+			const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
+			if (result?.aborted !== true)
+				throw new AcpSdkAdapterError(
+					"abort_unacknowledged",
+					"SDK did not acknowledge cancellation of the active prompt.",
+				);
+			if (
+				result.disposition === "preflight_cancelled" &&
+				waiter &&
+				record.activePrompt === waiter &&
+				!waiter.acknowledged &&
+				!waiter.settled
+			) {
+				record.activePrompt = undefined;
+				waiter.settled = true;
+				waiter.deferredFrames.length = 0;
+				waiter.terminal = undefined;
+				waiter.resolve({ stopReason: "cancelled" });
+			} else {
+				// The acknowledgement proves the run was aborted, not that its terminal was
+				// published. Arm the bounded settlement so the turn cannot outlive the cancel.
+				this.#scheduleCancelSettlement(params.sessionId, record);
+			}
+			cancelAttempt?.resolve(true);
+		} catch (error) {
+			record.cancelRequested = false;
+			cancelAttempt?.resolve(false);
+			throw error;
+		}
 	}
 
 	/**

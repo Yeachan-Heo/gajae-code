@@ -94,15 +94,6 @@ describe("reconciliation restart recovery", () => {
 				acceptedAt: 1,
 				pendingOutcome: { kind: "stopped", reason: "nope", provenance: "agent" },
 			},
-			// A skill record may never carry a prompt pending claim.
-			{
-				kind: "skill",
-				commandId: "c",
-				turnId: "t",
-				status: "accepted",
-				acceptedAt: 1,
-				pendingOutcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
-			},
 			// A finalized record may not still hold a pending claim.
 			{
 				kind: "prompt",

@@ -34,15 +34,17 @@ export interface KindAwareReconciliation {
 		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
 	): Promise<void>;
 	claimPendingOutcome(
+		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome: SdkPromptTerminalOutcome,
 	): Promise<SdkPromptTerminalOutcome>;
-	finalizePromptOutcome(
+	finalizeOutcome(
+		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
 		recordError?: { code: string; message: string },
 	): Promise<void>;
-	peekPendingOutcome(correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
+	peekPendingOutcome(kind: ReconciliationKind, correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
 	lookup(
 		kind: ReconciliationKind,
 		selector: { commandId?: string; turnId?: string; clientRef?: string },
@@ -216,8 +218,18 @@ export function createKindAwareReconciliation(
 				record.startedAt = now();
 				return { value: undefined, changed: true };
 			}
+			const pendingOutcome = record.pendingOutcome;
 			record.terminalAt = now();
-			if (frame.type === "agent_failed") {
+			if (pendingOutcome !== undefined) {
+				record.outcome = pendingOutcome;
+				record.pendingOutcome = undefined;
+				if (pendingOutcome.kind === "failed") {
+					record.status = "failed";
+					record.error = { code: pendingOutcome.code, message: pendingOutcome.message };
+				} else {
+					record.status = "terminal_ok";
+				}
+			} else if (frame.type === "agent_failed") {
 				record.status = "failed";
 				record.error = sanitizePromptFailure(frame.error);
 			} else record.status = "terminal_ok";
@@ -227,26 +239,28 @@ export function createKindAwareReconciliation(
 	};
 
 	const claimPendingOutcome = async (
+		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome: SdkPromptTerminalOutcome,
 	): Promise<SdkPromptTerminalOutcome> =>
 		await queueMutation(candidate => {
-			const record = candidate.get(keyOf("prompt", correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== "prompt")
+			const record = candidate.get(keyOf(kind, correlation));
+			if (!record || record.terminalAt !== undefined || record.kind !== kind)
 				return { value: outcome, changed: false };
 			if (record.pendingOutcome !== undefined) return { value: record.pendingOutcome, changed: false };
 			record.pendingOutcome = outcome;
 			return { value: outcome, changed: true };
 		});
 
-	const finalizePromptOutcome = async (
+	const finalizeOutcome = async (
+		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
 		recordError?: { code: string; message: string },
 	) => {
 		await queueMutation(candidate => {
-			const record = candidate.get(keyOf("prompt", correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== "prompt")
+			const record = candidate.get(keyOf(kind, correlation));
+			if (!record || record.terminalAt !== undefined || record.kind !== kind)
 				return { value: undefined, changed: false };
 			const finalOutcome = outcome ?? record.pendingOutcome;
 			record.terminalAt = now();
@@ -261,8 +275,8 @@ export function createKindAwareReconciliation(
 		});
 	};
 
-	const peekPendingOutcome = (correlation: PromptCorrelation) =>
-		records.get(keyOf("prompt", correlation))?.pendingOutcome;
+	const peekPendingOutcome = (kind: ReconciliationKind, correlation: PromptCorrelation) =>
+		records.get(keyOf(kind, correlation))?.pendingOutcome;
 
 	const lookup = (
 		kind: ReconciliationKind,
@@ -325,7 +339,7 @@ export function createKindAwareReconciliation(
 		noteAccepted,
 		noteTransition,
 		claimPendingOutcome,
-		finalizePromptOutcome,
+		finalizeOutcome,
 		peekPendingOutcome,
 		lookup,
 		cleanup,

@@ -794,12 +794,26 @@ export interface PromptOptions {
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
+	preflightSignal?: AbortSignal;
 }
 
 function promptPreflightCancelledError(): Error {
 	const error = Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
 	error.name = "PromptPreflightCancelledError";
 	return error;
+}
+async function awaitPromptInvocationPreflight<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return await pending;
+	if (signal.aborted) throw promptPreflightCancelledError();
+	const cancellation = Promise.withResolvers<never>();
+	const cancel = () => cancellation.reject(promptPreflightCancelledError());
+	signal.addEventListener("abort", cancel, { once: true });
+	try {
+		return await Promise.race([pending, cancellation.promise]);
+	} finally {
+		signal.removeEventListener("abort", cancel);
+	}
 }
 
 function isPromptPreflightCancelledError(error: unknown): boolean {
@@ -2419,8 +2433,9 @@ export class AgentSession {
 	async #withSessionAdmission<T>(
 		kind: SessionAdmissionKind,
 		body: (lease: SessionAdmissionLease) => Promise<T>,
+		signal?: AbortSignal,
 	): Promise<T> {
-		if (kind === "prompt") await this.#awaitStartupTurnBarrier();
+		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
@@ -2441,9 +2456,23 @@ export class AgentSession {
 			settled: Promise.withResolvers<void>(),
 			released: false,
 		};
+		const releaseEntry = () => {
+			if (entry.released) return;
+			entry.released = true;
+			entry.settled.resolve();
+			const queuedIndex = this.#sessionAdmissionQueue.indexOf(entry);
+			if (queuedIndex >= 0) this.#sessionAdmissionQueue.splice(queuedIndex, 1);
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+		};
 		this.#sessionAdmissionQueue.push(entry);
 		this.#activateNextSessionAdmission();
-		await entry.ready.promise;
+		try {
+			await awaitPromptInvocationPreflight(entry.ready.promise, signal);
+		} catch (error) {
+			releaseEntry();
+			throw error;
+		}
 		if (this.#sessionAdmissionClosed || this.#isDisposed) {
 			entry.released = true;
 			entry.settled.resolve();
@@ -2464,11 +2493,7 @@ export class AgentSession {
 		}
 
 		const release = () => {
-			if (entry.released) return;
-			entry.released = true;
-			entry.settled.resolve();
-			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
-			this.#activateNextSessionAdmission();
+			releaseEntry();
 		};
 		try {
 			return await this.#sessionAdmissionContext.run(entry, () => body({ release }));
@@ -7890,8 +7915,12 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared">,
+		options?: Pick<
+			PromptOptions,
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
 		if (typeof args !== "string")
@@ -7903,18 +7932,24 @@ export class AgentSession {
 			throw Object.assign(new Error(`Skill ${skillName} was not found.${availableHint}`), { code: "invalid_input" });
 		}
 		const deepInterviewUserIntentEpoch = this.#claimDeepInterviewUserIntent();
-		const activation = await resolveSubskillActivationForSkillInvocation({
-			cwd: this.sessionManager.getCwd(),
-			sessionId: this.sessionId,
-			skillName: skill.name,
-			args,
-		});
-		const built = await buildSkillPromptMessage(skill, activation.cleanedArgs, {
-			subskillActivation: activation.activation,
-			subskillActivationSet: activation.activeSubskillsToPersist,
-			cwd: this.sessionManager.getCwd(),
-			sessionId: this.sessionId,
-		});
+		const activation = await awaitPromptInvocationPreflight(
+			resolveSubskillActivationForSkillInvocation({
+				cwd: this.sessionManager.getCwd(),
+				sessionId: this.sessionId,
+				skillName: skill.name,
+				args,
+			}),
+			options?.preflightSignal,
+		);
+		const built = await awaitPromptInvocationPreflight(
+			buildSkillPromptMessage(skill, activation.cleanedArgs, {
+				subskillActivation: activation.activation,
+				subskillActivationSet: activation.activeSubskillsToPersist,
+				cwd: this.sessionManager.getCwd(),
+				sessionId: this.sessionId,
+			}),
+			options?.preflightSignal,
+		);
 		const skillPromptMessage = {
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,
@@ -7923,6 +7958,7 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		options?.onSkillPrepared?.({
 			name: skill.name,
 			path: skill.filePath,
@@ -8811,9 +8847,15 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: Pick<
 			PromptOptions,
-			"streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+			| "streamingBehavior"
+			| "toolChoice"
+			| "followUpQueuePolicy"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "preflightSignal"
 		>,
 	): Promise<void> {
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -8844,31 +8886,37 @@ export class AgentSession {
 
 		const admissionGeneration = this.#promptGeneration;
 		const admissionSignal = this.#promptPreflightAbortController.signal;
-		await this.#withSessionAdmission("prompt", async admission => {
-			this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
-			const customMessage: CustomMessage<T> = {
-				role: "custom",
-				customType: message.customType,
-				content: message.content,
-				display: message.display,
-				details: message.details,
-				attribution: message.attribution ?? "agent",
-				timestamp: Date.now(),
-			};
-			if (deepInterviewUserIntentEpoch !== undefined)
-				this.#deepInterviewGenuineUserMessageEpochs.set(customMessage, deepInterviewUserIntentEpoch);
+		await this.#withSessionAdmission(
+			"prompt",
+			async admission => {
+				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
+				if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+				const customMessage: CustomMessage<T> = {
+					role: "custom",
+					customType: message.customType,
+					content: message.content,
+					display: message.display,
+					details: message.details,
+					attribution: message.attribution ?? "agent",
+					timestamp: Date.now(),
+				};
+				if (deepInterviewUserIntentEpoch !== undefined)
+					this.#deepInterviewGenuineUserMessageEpochs.set(customMessage, deepInterviewUserIntentEpoch);
 
-			await this.#syncSkillPromptActiveStateSafely(customMessage, true);
-			try {
-				await this.#promptWithMessage(customMessage, textContent, {
-					...options,
-					admissionLease: admission,
-					resetRetryReplaySafety: true,
-				});
-			} finally {
-				await this.#syncSkillPromptActiveStateSafely(customMessage, false);
-			}
-		});
+				try {
+					await this.#syncSkillPromptActiveStateSafely(customMessage, true);
+					if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+					await this.#promptWithMessage(customMessage, textContent, {
+						...options,
+						admissionLease: admission,
+						resetRetryReplaySafety: true,
+					});
+				} finally {
+					await this.#syncSkillPromptActiveStateSafely(customMessage, false);
+				}
+			},
+			options?.preflightSignal,
+		);
 	}
 
 	async #promptWithMessage(
@@ -8876,7 +8924,12 @@ export class AgentSession {
 		expandedText: string,
 		options?: Pick<
 			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+			| "toolChoice"
+			| "images"
+			| "skipCompactionCheck"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "preflightSignal"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -8888,7 +8941,8 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
-		await this.#agentEndPublicationPromise;
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
@@ -8897,7 +8951,10 @@ export class AgentSession {
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
 		const generation = this.#promptGeneration;
-		const preflightSignal = this.#promptPreflightAbortController.signal;
+		const sessionPreflightSignal = this.#promptPreflightAbortController.signal;
+		const preflightSignal = options?.preflightSignal
+			? AbortSignal.any([sessionPreflightSignal, options.preflightSignal])
+			: sessionPreflightSignal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
@@ -9148,6 +9205,15 @@ export class AgentSession {
 					attemptMessages = undefined;
 				},
 			};
+			// Abort can race asynchronous preflight work. The injection signatures were
+			// consumed while building context, but no prompt was accepted, so reset them.
+			if (this.#isPromptPreflightCancelled(generation, preflightSignal) || options?.preflightSignal?.aborted) {
+				this.#resetInjectedContextSignatures();
+				// Ack-waiting callers are told the preflight never ran; direct callers
+				// (aborted after setup) resolve gracefully as before f24f46ff5.
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
+				return;
+			}
 
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
@@ -9168,6 +9234,7 @@ export class AgentSession {
 					if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
 				},
 			};
+
 			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
 				signal: preflightSignal,
 				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
@@ -9822,9 +9889,11 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp";
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -9876,6 +9945,7 @@ export class AgentSession {
 			images,
 			onPreflightAccepted: options?.onPreflightAccepted,
 			onPreflightAcceptCommit: options?.onPreflightAcceptCommit,
+			preflightSignal: options?.preflightSignal,
 		});
 	}
 

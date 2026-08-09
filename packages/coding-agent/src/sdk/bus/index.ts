@@ -129,7 +129,7 @@ import {
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
+import { createKindAwareReconciliation, type ReconciliationKind } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation } from "./prompt-reconciliation";
@@ -2376,8 +2376,13 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation?: boolean,
+		preflightAbort?: () => void,
+		reconciliationKind?: ReconciliationKind,
 	) => void | Promise<void> = () => {},
-	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
+	onPromptFailed: (
+		correlation: { commandId: string; turnId: string },
+		error: unknown,
+	) => void | Promise<void> = () => {},
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
@@ -2402,6 +2407,7 @@ function sdkControlSurface(
 			clientRef?: string,
 			extra?: { skillName?: string },
 		) => Promise<void>;
+		cancel: (correlation: { commandId: string; turnId: string }) => Promise<void>;
 		noteTransition: (
 			correlation: { commandId: string; turnId: string } | undefined,
 			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
@@ -2409,8 +2415,8 @@ function sdkControlSurface(
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	},
 ): ControlSurface & {
-	cancelPendingPreflights(): void;
-	cancelPendingPreflightsForConnection(connectionId: string): void;
+	cancelPendingPreflights(): Promise<void>;
+	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 } {
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
@@ -2522,19 +2528,22 @@ function sdkControlSurface(
 			return unavailable(operation, "no typed session seam is installed")();
 		return ctx.sdkControl(operation, input);
 	};
-	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => void }>();
+	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => Promise<void> }>();
 	const preflightKey = (connectionId: string | undefined, correlation: { commandId: string; turnId: string }) =>
 		`${connectionId ?? ""}\0${correlation.commandId}\0${correlation.turnId}`;
-	const cancelPendingPreflights = () => {
-		for (const { cancel } of pendingPreflightCancellations.values()) cancel();
+	const cancelPendingPreflights = async () => {
+		await Promise.all([...pendingPreflightCancellations.values()].map(async entry => await entry.cancel()));
 	};
-	const cancelPendingPreflightsForConnection = (connectionId: string) => {
-		for (const entry of pendingPreflightCancellations.values())
-			if (entry.connectionId === connectionId) entry.cancel();
+	const cancelPendingPreflightsForConnection = async (connectionId: string) => {
+		await Promise.all(
+			[...pendingPreflightCancellations.values()]
+				.filter(entry => entry.connectionId === connectionId)
+				.map(async entry => await entry.cancel()),
+		);
 	};
 	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
 	const awaitAbortReady = async () => {
-		cancelPendingPreflights();
+		await cancelPendingPreflights();
 		await (ctx.abort as () => unknown)();
 		while (isSessionBusy()) {
 			await Bun.sleep(10);
@@ -2601,37 +2610,55 @@ function sdkControlSurface(
 		const turnId = crypto.randomUUID();
 		type PreflightTerminalResult = { status: "accepted" } | { status: "rejected"; error: unknown };
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
+		const preflightController = new AbortController();
+		const cancellationError = Object.assign(new Error("Prompt preflight was cancelled before execution."), {
+			code: "busy",
+		});
 		let preflightSettled = false;
+		let accepting = false;
 		let accepted = false;
+		let submission: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
 			if (preflightSettled) return;
 			preflightSettled = true;
 			preflight.resolve(result);
 		};
-		const cancelPreflight = () =>
-			settlePreflight({
-				status: "rejected",
-				error: Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
-			});
-		pendingPreflightCancellations.set(preflightKey(requesterConnectionId, correlation), {
+		const cancelPreflight = async () => {
+			preflightController.abort();
+			if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
+			try {
+				await submission;
+			} catch (error) {
+				if (accepted && error !== cancellationError) throw error;
+			}
+		};
+		pendingPreflightCancellations.set(key, {
 			connectionId: requesterConnectionId,
 			cancel: cancelPreflight,
 		});
 		const settleAccepted = async () => {
 			if (preflightSettled) return;
-			accepted = true;
+			accepting = true;
 			try {
 				await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
 			} catch (error) {
+				accepting = false;
 				// Durable acceptance failed, so the prompt was never accepted: reject the
 				// control preflight and rethrow so the awaiting session does not execute it.
-				accepted = false;
 				onPromptAcceptFailed(correlation);
 				settlePreflight({ status: "rejected", error });
 				throw error;
 			}
+			accepting = false;
+			pendingPreflightCancellations.delete(key);
+			accepted = true;
 			settlePreflight({ status: "accepted" });
+			if (preflightController.signal.aborted) {
+				await abortOwnedPrompt(requesterConnectionId);
+				throw cancellationError;
+			}
 		};
 		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
 		const onPreflightAcceptCommit = settleAccepted;
@@ -2642,17 +2669,17 @@ function sdkControlSurface(
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
 		// succeeds. The terminal result records correlation before agent_start can fire.
-		let submission: Promise<void> | undefined;
 		try {
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
+					preflightSignal: preflightController.signal,
 				}),
 			);
 		} catch (error) {
-			if (accepted) onPromptFailed(correlation, error);
+			if (accepted) void onPromptFailed(correlation, error);
 			else settlePreflight({ status: "rejected", error });
 		}
 		if (submission) {
@@ -2667,7 +2694,7 @@ function sdkControlSurface(
 						});
 				},
 				error => {
-					if (accepted) onPromptFailed(correlation, error);
+					if (accepted) void onPromptFailed(correlation, error);
 					else settlePreflight({ status: "rejected", error });
 				},
 			);
@@ -2680,12 +2707,12 @@ function sdkControlSurface(
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		} finally {
-			pendingPreflightCancellations.delete(preflightKey(requesterConnectionId, correlation));
+			pendingPreflightCancellations.delete(key);
 		}
 	};
 	const surface: ControlSurface & {
-		cancelPendingPreflights(): void;
-		cancelPendingPreflightsForConnection(connectionId: string): void;
+		cancelPendingPreflights(): Promise<void>;
+		cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 	} = {
 		authorizeElevationClaim: (sdkId, input, capability) =>
 			elevationAuthorityToken !== undefined &&
@@ -2700,8 +2727,8 @@ function sdkControlSurface(
 				entry => entry.connectionId === requesterConnectionId,
 			);
 			if (pendingPreflight) {
-				if (requesterConnectionId) cancelPendingPreflightsForConnection(requesterConnectionId);
-				else cancelPendingPreflights();
+				if (requesterConnectionId) await cancelPendingPreflightsForConnection(requesterConnectionId);
+				else await cancelPendingPreflights();
 				return { aborted: true, disposition: "preflight_cancelled" };
 			}
 			return await abortOwnedPrompt(requesterConnectionId);
@@ -2885,6 +2912,7 @@ function sdkControlSurface(
 			const commandId = crypto.randomUUID();
 			const turnId = crypto.randomUUID();
 			const correlation = { commandId, turnId };
+			const requesterConnectionId = controlRequesterContext.getStore();
 			if (skillRecon) {
 				try {
 					await awaitReconciliationReady();
@@ -2895,44 +2923,127 @@ function sdkControlSurface(
 				}
 				skillRecon.admit(trimmedClientRef);
 			}
+			const cancellationError = Object.assign(new Error("Skill preflight was cancelled before execution."), {
+				code: "busy",
+			});
+			const preflightController = new AbortController();
 			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
-			let phase: "pending" | "accepted" | "rejected" = "pending";
+			let phase: "pending" | "accepting" | "accepted" | "rejected" = "pending";
+			let promptOwned = false;
+			let durableSkillAccepted = false;
+			let admissionReleased = false;
+			const releaseAdmission = () => {
+				if (admissionReleased || durableSkillAccepted) return;
+				admissionReleased = true;
+				skillRecon?.release(trimmedClientRef);
+			};
 			const settleAccept = (value: Record<string, unknown>) => {
-				if (phase !== "pending") return;
+				if (phase !== "pending" && phase !== "accepting") return;
 				phase = "accepted";
 				resolve(value);
 			};
 			const settleReject = (error: unknown) => {
-				if (phase !== "pending") return;
+				if (phase === "accepted" || phase === "rejected") return;
 				phase = "rejected";
 				reject(error);
 			};
+			const executionSettled = Promise.withResolvers<void>();
+			let cancellationWaiterAttached = false;
+			const key = preflightKey(requesterConnectionId, correlation);
+			const cancelPreflight = async () => {
+				cancellationWaiterAttached = true;
+				preflightController.abort();
+				if (phase === "pending") {
+					releaseAdmission();
+					settleReject(cancellationError);
+				}
+				await executionSettled.promise;
+			};
+			pendingPreflightCancellations.set(key, {
+				connectionId: requesterConnectionId,
+				cancel: cancelPreflight,
+			});
 			let prepared: { name: string; path: string; lineCount?: number; cleanedArgs?: string } | undefined;
-			const run = Promise.resolve(
-				ctx.invokeSkill(name, args as string | undefined, {
-					onSkillPrepared: meta => {
-						prepared = meta;
-					},
-					onPreflightAcceptCommit: async () => {
-						const meta = prepared ?? { name: String(name), path: "" };
-						if (skillRecon)
-							await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
-						settleAccept({
-							accepted: true,
-							commandId,
-							turnId,
-							name: meta.name,
-							path: meta.path,
-							...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
-							...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
-							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
-						});
-					},
-				}),
-			).then(
+			let run: Promise<unknown>;
+			try {
+				run = Promise.resolve(
+					ctx.invokeSkill(name, args as string | undefined, {
+						preflightSignal: preflightController.signal,
+						onSkillPrepared: meta => {
+							prepared = meta;
+						},
+						onPreflightAcceptCommit: async () => {
+							if (preflightController.signal.aborted) throw cancellationError;
+							phase = "accepting";
+							const meta = prepared ?? { name: String(name), path: "" };
+							const acceptedValue = {
+								accepted: true,
+								commandId,
+								turnId,
+								name: meta.name,
+								path: meta.path,
+								...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
+								...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
+								...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
+							};
+							try {
+								await onPromptAccepted(
+									correlation,
+									requesterConnectionId,
+									undefined,
+									false,
+									() => preflightController.abort(),
+									"skill",
+								);
+								promptOwned = requesterConnectionId !== undefined;
+							} catch (error) {
+								onPromptAcceptFailed(correlation);
+								releaseAdmission();
+								settleReject(error);
+								throw error;
+							}
+							if (preflightController.signal.aborted) {
+								pendingPreflightCancellations.delete(key);
+								onPromptAcceptFailed(correlation);
+								promptOwned = false;
+								releaseAdmission();
+								settleReject(cancellationError);
+								throw cancellationError;
+							}
+							try {
+								if (skillRecon) {
+									await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
+									durableSkillAccepted = true;
+								}
+							} catch (error) {
+								pendingPreflightCancellations.delete(key);
+								onPromptAcceptFailed(correlation);
+								promptOwned = false;
+								releaseAdmission();
+								settleReject(error);
+								throw error;
+							}
+							pendingPreflightCancellations.delete(key);
+							settleAccept(acceptedValue);
+							if (preflightController.signal.aborted) {
+								await Promise.all([
+									abortOwnedPrompt(requesterConnectionId),
+									...(skillRecon && durableSkillAccepted ? [skillRecon.cancel(correlation)] : []),
+								]);
+								throw cancellationError;
+							}
+						},
+					}),
+				);
+			} catch (error) {
+				releaseAdmission();
+				settleReject(error);
+				run = Promise.reject(error);
+			}
+			void run.then(
 				result => {
 					if (phase === "pending") {
-						// Completed without fence (e.g. queue path) — still surface result.
+						pendingPreflightCancellations.delete(key);
 						settleAccept({
 							accepted: true,
 							commandId,
@@ -2940,23 +3051,35 @@ function sdkControlSurface(
 							...(typeof result === "object" && result ? (result as object) : {}),
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
-					} else if (skillRecon) {
+					} else if (!promptOwned && durableSkillAccepted && skillRecon) {
 						void skillRecon.noteTransition(correlation, { type: "agent_end" });
 					}
-					return result;
+					executionSettled.resolve();
 				},
 				error => {
-					if (phase === "pending") {
-						if (skillRecon) skillRecon.release(trimmedClientRef);
+					if (phase === "pending" || phase === "accepting") {
+						releaseAdmission();
 						settleReject(error);
-					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+					} else if (phase === "accepted" && promptOwned) {
+						void onPromptFailed(correlation, error);
 					}
-					throw error;
+					if (!promptOwned && durableSkillAccepted && skillRecon)
+						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+					if (
+						cancellationWaiterAttached &&
+						preflightController.signal.aborted &&
+						phase === "accepted" &&
+						error !== cancellationError
+					)
+						executionSettled.reject(error);
+					else executionSettled.resolve();
 				},
 			);
-			void run.catch(() => {});
-			return await acceptedP;
+			try {
+				return await acceptedP;
+			} finally {
+				pendingPreflightCancellations.delete(key);
+			}
 		},
 		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
@@ -3969,6 +4092,7 @@ export function createNotificationsExtension(
 				createSdkPermissionAskAnswerSource(
 					async (params, signal) => await host!.reverse.request("permission", "request", params, signal),
 				),
+				"protocol",
 			);
 		};
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
@@ -4012,6 +4136,7 @@ export function createNotificationsExtension(
 					createSdkUiAskAnswerSource(
 						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
 					),
+					"protocol",
 				);
 				disposePermissionAnswerSource?.();
 				disposePermissionAnswerSource = undefined;
@@ -4112,12 +4237,15 @@ export function createNotificationsExtension(
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
+			/** Cancels accepted skill preparation before an execution handle exists. */
+			preflightAbort?: () => void;
+			reconciliationKind: ReconciliationKind;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
 		const fencedConnections = new Set<string>();
-		let cancelPreflightsForConnection: ((connectionId: string) => void) | undefined;
+		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
 		// Authoritative bounded reconciliation state for Q26 turn.prompt_status
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
@@ -4274,6 +4402,8 @@ export function createNotificationsExtension(
 			requesterConnectionId?: string,
 			clientRef?: string,
 			trackReconciliation = false,
+			preflightAbort?: () => void,
+			reconciliationKind: ReconciliationKind = "prompt",
 		) => {
 			if (!requesterConnectionId) {
 				// No delivery owner: tracked prompts cannot be reconciled. Release
@@ -4306,6 +4436,8 @@ export function createNotificationsExtension(
 				phase: "active",
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
+				...(preflightAbort ? { preflightAbort } : {}),
+				reconciliationKind,
 				bufferedFrames: [],
 			};
 			promptSubmissions.set(promptSubmissionKey(correlation), submission);
@@ -4326,6 +4458,8 @@ export function createNotificationsExtension(
 		};
 		/** Roll back process-local registration when durable acceptance failed. */
 		const discardPromptAcceptance = (correlation: { commandId: string; turnId: string }) => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (submission?.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			promptSubmissions.delete(promptSubmissionKey(correlation));
 			removePendingPromptCorrelation(correlation);
 		};
@@ -4378,7 +4512,10 @@ export function createNotificationsExtension(
 			// connection is marked failed (every later inbound frame from it is refused),
 			// its reverse leases are released, and its deliveries are abandoned. The durable
 			// record stays active for Q26 and restart recovery.
-			cancelPreflightsForConnection?.(submission.connectionId);
+			if (cancelPreflightsForConnection)
+				void cancelPreflightsForConnection(submission.connectionId).catch(error =>
+					logger.warn(`sdk: failed to cancel fenced preflight: ${String(error)}`),
+				);
 			fencedConnections.add(submission.connectionId);
 			host?.handleDisconnect(submission.connectionId);
 			for (const [key, owned] of promptSubmissions)
@@ -4398,7 +4535,10 @@ export function createNotificationsExtension(
 			handle: string | undefined,
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (submission) submission.executionHandle = handle;
+			if (submission) {
+				submission.executionHandle = handle;
+				submission.preflightAbort = undefined;
+			}
 		};
 		const terminalizePrompt = async (
 			correlation: { commandId: string; turnId: string },
@@ -4414,7 +4554,11 @@ export function createNotificationsExtension(
 			submission.phase = "outcome_claimed";
 			let winner: SdkPromptTerminalOutcome;
 			try {
-				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome);
+				winner = await kindReconciliation.claimPendingOutcome(
+					submission.reconciliationKind,
+					correlation,
+					requestedOutcome,
+				);
 			} catch (error) {
 				// The claim is the durability boundary: without it nothing may be published
 				// and the endpoint must fail closed so the client rejects exactly once. The
@@ -4469,7 +4613,7 @@ export function createNotificationsExtension(
 				}
 			}
 			try {
-				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error);
+				await kindReconciliation.finalizeOutcome(submission.reconciliationKind, correlation, winner, extra?.error);
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
@@ -4515,7 +4659,7 @@ export function createNotificationsExtension(
 				});
 			}
 		};
-		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
 				commandId: correlation.commandId,
 				turnId: correlation.turnId,
@@ -4538,7 +4682,7 @@ export function createNotificationsExtension(
 				provenance: outcome.provenance,
 				reason: formatPromptTerminalFailureReason(error),
 			});
-			void terminalizePrompt(
+			await terminalizePrompt(
 				correlation,
 				outcome,
 				{},
@@ -4547,7 +4691,7 @@ export function createNotificationsExtension(
 				{ error: sanitized, diagnostic: { reason: error }, diagnosticAlreadyLogged: true },
 			);
 		};
-		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+		const recordPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			submission.failed = true;
@@ -4557,7 +4701,7 @@ export function createNotificationsExtension(
 				runtime.activePromptCorrelation.turnId === correlation.turnId
 			)
 				runtime.activePromptCorrelation = undefined;
-			emitPromptFailure(correlation, error);
+			await emitPromptFailure(correlation, error);
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
 			const key = promptSubmissionKey(correlation);
@@ -4617,13 +4761,20 @@ export function createNotificationsExtension(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
 				);
 				if (!active) return { aborted: true, disposition: "idle" as const };
-				const [commandId, turnId] = active[0].split(":", 2);
-				if (commandId && turnId)
+				const [key, submission] = active;
+				const [commandId, turnId] = key.split(":", 2);
+				if (commandId && turnId) {
+					const hasExecutionHandle = Boolean(submission.executionHandle);
+					if (!hasExecutionHandle) {
+						submission.preflightAbort?.();
+						removePendingPromptCorrelation({ commandId, turnId });
+					}
 					await terminalizePrompt(
 						{ commandId, turnId },
 						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-						{ fence: true },
+						{ fence: hasExecutionHandle },
 					);
+				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
 			{
@@ -4631,6 +4782,14 @@ export function createNotificationsExtension(
 				release: (clientRef?: string) => kindReconciliation.releaseAdmission("skill", clientRef),
 				noteAccepted: (correlation, clientRef, extra) =>
 					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
+				cancel: async correlation => {
+					const outcome = await kindReconciliation.claimPendingOutcome("skill", correlation, {
+						kind: "stopped",
+						reason: "cancelled",
+						provenance: "client_cancel",
+					});
+					await kindReconciliation.finalizeOutcome("skill", correlation, outcome);
+				},
 				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
 				lookup: selector => kindReconciliation.lookup("skill", selector),
 			},
@@ -4840,7 +4999,8 @@ export function createNotificationsExtension(
 				if (
 					(request.operation === "turn.prompt" ||
 						request.operation === "turn.follow_up" ||
-						request.operation === "turn.abort_and_prompt") &&
+						request.operation === "turn.abort_and_prompt" ||
+						request.operation === "skill.invoke") &&
 					response.ok === true &&
 					response.result &&
 					typeof response.result === "object" &&
@@ -4981,10 +5141,17 @@ export function createNotificationsExtension(
 			pendingPromptCorrelations,
 			activePromptCorrelation: undefined,
 			bindPromptExecutionHandle,
-			peekPromptPendingOutcome: correlation => kindReconciliation.peekPendingOutcome(correlation),
+			peekPromptPendingOutcome: correlation => {
+				const kind =
+					promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const);
+				return kindReconciliation.peekPendingOutcome(kind, correlation);
+			},
 			terminalizePrompt: (correlation, outcome, extra) => terminalizePrompt(correlation, outcome, {}, extra),
 			notePromptReconciliation: (correlation, frame) => {
-				void kindReconciliation.noteTransition("prompt", correlation, frame);
+				const kind = correlation
+					? (promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const))
+					: "prompt";
+				void kindReconciliation.noteTransition(kind, correlation, frame);
 			},
 			emitPromptFailure,
 			emitPromptLifecycle,
@@ -5125,7 +5292,9 @@ export function createNotificationsExtension(
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
-				controlSurface.cancelPendingPreflightsForConnection(connectionId);
+				void controlSurface
+					.cancelPendingPreflightsForConnection(connectionId)
+					.catch(error => logger.warn(`sdk: failed to cancel disconnected preflight: ${String(error)}`));
 				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
@@ -5139,7 +5308,10 @@ export function createNotificationsExtension(
 				// therefore only abandons delivery; ACP rejects its own local waiter once and
 				// terminal authority stays with the eventual normalized SDK outcome.
 				for (const submission of promptSubmissions.values())
-					if (submission.connectionId === connectionId) abandonPrompt(submission);
+					if (submission.connectionId === connectionId) {
+						submission.preflightAbort?.();
+						abandonPrompt(submission);
+					}
 			});
 
 			server.onReply((err, reply) => {
