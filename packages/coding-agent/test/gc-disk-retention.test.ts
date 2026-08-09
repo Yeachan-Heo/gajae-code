@@ -140,6 +140,18 @@ async function writeHarnessRegistry(fixture: TestRoot, sessionId: string): Promi
 	);
 }
 
+async function registerDirectCliSession(fixture: TestRoot, sessionId: string): Promise<void> {
+	const index = new SessionIndex(fixture.agentDir);
+	await index.append({
+		type: "host_registered",
+		sessionId,
+		locator: { repo: fixture.root, stateRoot: fixture.agentDir },
+		endpointGeneration: 0,
+		pid: process.pid,
+	});
+}
+
+
 /** Sorted `relative-path:size` listing, used to prove a dry run mutated nothing. */
 async function snapshotTree(root: string): Promise<string[]> {
 	const out: string[] = [];
@@ -1425,6 +1437,28 @@ describe("gjc gc --disk (session tool artifacts)", () => {
 			expect(disk.surfaces.artifacts.reclaimed).toBe(0);
 			expect(disk.surfaces.artifacts.kept_bytes).toBe(payloadBytes);
 			expect((await fsp.readdir(directory)).sort()).toEqual(Object.keys(payload).sort());
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+	test("keeps an older directly resumed CLI session's artifacts while idle artifacts still reclaim", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			await writeSession(fixture, "repo-a", "older-resumed-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "idle-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			const liveDirectory = await writeArtifacts(fixture, "repo-a", "older-resumed-session", payload, 10);
+			const idleDirectory = await writeArtifacts(fixture, "repo-a", "idle-session", payload, 10);
+			await registerDirectCliSession(fixture, "older-resumed-session");
+
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+
+			expect(reasonById(disk, "artifacts").get("older-resumed-session/2.bash.log")).toBe(
+				"keep:referenced_by_live_surface",
+			);
+			expect((await fsp.readdir(liveDirectory)).sort()).toEqual(Object.keys(payload).sort());
+			expect(disk.surfaces.artifacts.reclaimed_bytes).toBe(payloadBytes);
+			expect(await fsp.readdir(idleDirectory)).toEqual([]);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}

@@ -54,6 +54,8 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "./sdk";
+import { SessionIndex } from "./sdk/broker/session-index";
+
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -1756,6 +1758,29 @@ export async function runRootCommand(
 			eventBus,
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
+		// Ordinary CLI sessions share the broker's canonical liveness index. GC uses
+		// this PID-bound registration before reclaiming their artifact sidecars.
+		const directSessionId = process.env.GJC_LIFECYCLE_REQUEST_ID ? undefined : sessionManager?.getSessionId();
+		if (directSessionId) {
+			const sessionIndex = new SessionIndex(settingsInstance.getAgentDir());
+			const locator = { repo: sessionManager?.getCwd() ?? cwd, stateRoot: settingsInstance.getAgentDir() };
+			await sessionIndex.append({
+				type: "host_registered",
+				sessionId: directSessionId,
+				locator,
+				endpointGeneration: 0,
+				pid: process.pid,
+			});
+			postmortem.register("direct-session-index", async () => {
+				await sessionIndex.append({
+					type: "host_unregistered",
+					sessionId: directSessionId,
+					locator,
+					endpointGeneration: 0,
+					pid: process.pid,
+				});
+			});
+		}
 
 		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
 		if (deps.rlmPreset?.onSessionCreated) {
