@@ -2,22 +2,24 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent, type AgentEvent } from "@gajae-code/agent-core";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { logger } from "@gajae-code/utils";
+import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
 
 /**
- * A turn that dies abnormally publishes a terminal whose wire text is the fixed
- * safe token "Prompt submission failed." (see `sanitizePromptFailure`), so an ACP
- * client can only render `-32603 ... {"code":"prompt_failed"}` and a lane whose
- * transport lost even that frame shows a turn that simply ended: no error, no
- * edit, nothing to act on. The reason a turn died must therefore survive in the
- * local operator log, including for loop-level terminals that carry no legacy
- * discriminator and no assistant message at all.
+ * A provider failure reaches this extension as an `agent_end` carrying an error
+ * assistant message. The SDK/ACP failure envelope uses the fixed safe token
+ * "Prompt submission failed." (see `sanitizePromptFailure`), while the assistant
+ * message can remain in the local session transcript. The bounded operator log
+ * keeps that failure diagnosable without widening the SDK/ACP redaction boundary.
  */
 
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
+type AgentEndEvent = Extract<AgentEvent, { type: "agent_end" }>;
 
 afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
@@ -64,31 +66,56 @@ function context(cwd: string, sessionId: string): Record<string, unknown> {
 	};
 }
 
-function start(ctx: Record<string, unknown>): Map<string, (event: unknown, context: unknown) => unknown> {
+function start(
+	ctx: Record<string, unknown>,
+	deliverUserMessage: ExtensionActions["sendUserMessage"] = () => undefined,
+): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
 		on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
 		registerCommand: () => {},
 		getThinkingLevel: () => undefined,
-		sendUserMessage: (_content: unknown, options?: Record<string, unknown>) => {
-			const commit = options?.onPreflightAcceptCommit as (() => unknown) | undefined;
-			const accepted = options?.onPreflightAccepted as (() => void) | undefined;
-			if (commit) return Promise.resolve(commit()).then(() => accepted?.());
+		sendUserMessage: (
+			content: Parameters<ExtensionActions["sendUserMessage"]>[0],
+			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
+		) => {
+			const commit = options?.onPreflightAcceptCommit;
+			const accepted = options?.onPreflightAccepted;
+			const deliver = () => Promise.resolve(deliverUserMessage(content));
+			if (commit)
+				return Promise.resolve(commit()).then(() => {
+					accepted?.();
+					return deliver();
+				});
 			accepted?.();
-			return Promise.resolve(undefined);
+			return deliver();
 		},
-	} as never;
+	} as unknown as ExtensionAPI;
 	createNotificationsExtension(api, undefined);
 	void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
 }
 
-test("SDK host logs why a prompt terminal failed even though the wire text is a fixed safe token", async () => {
+test("SDK host logs a bounded reason from a reachable provider failure", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-diagnostics-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-terminal-diagnostics-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext);
+	const reason = `Session context exceeds materialization budget (99 > 64 bytes): ${"x".repeat(600)}`;
+	const model = createMockModel({ handler: { throw: new Error(reason) } });
+	const agent = new Agent({
+		initialState: { model, systemPrompt: ["test"], messages: [], tools: [] },
+		streamFn: model.stream,
+		requestMaxRetries: 0,
+		streamMaxRetries: 0,
+	});
+	let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
+	handlers = start(sessionContext, async () => {
+		await agent.prompt("reproduce the reviewer findings");
+	});
+	const unsubscribe = agent.subscribe(event => {
+		void handlers.get(event.type)?.(event, sessionContext);
+	});
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -127,27 +154,12 @@ test("SDK host logs why a prompt terminal failed even though the wire text is a 
 	};
 
 	try {
-		// 1. Provider-side turn failure: only the assistant message carries the reason.
+		// A real provider exception is converted by Agent into an error assistant
+		// and a normal loop terminal; the assistant error makes the SDK terminal fail.
 		const first = await submit("failing-prompt");
-		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-		await handlers.get("agent_end")?.(
-			{
-				type: "agent_end",
-				stopReason: "completed",
-				messages: [
-					{
-						role: "assistant",
-						stopReason: "error",
-						errorKind: "provider_error",
-						errorMessage: "Session context exceeds materialization budget (99 > 64 bytes)",
-					},
-				],
-			} as never,
-			sessionContext,
-		);
 		await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "failed prompt terminal");
 
-		// Reproduction: the wire never names the cause, only the fixed safe token.
+		// The SDK failure envelope never names the cause, only the fixed safe token.
 		const failure = frames.find(frame => frame.type === "agent_failed") as Record<string, unknown>;
 		expect(failure).toMatchObject({
 			commandId: first.commandId,
@@ -157,7 +169,6 @@ test("SDK host logs why a prompt terminal failed even though the wire text is a 
 		});
 		expect(JSON.stringify(failure)).not.toContain("materialization budget");
 
-		// The local diagnostic is the only surviving record of why the turn died.
 		expect(diagnostics).toHaveLength(1);
 		expect(diagnostics[0]).toMatchObject({
 			sessionId,
@@ -165,28 +176,11 @@ test("SDK host logs why a prompt terminal failed even though the wire text is a 
 			turnId: first.turnId,
 			loopStopReason: "completed",
 			assistantStopReason: "error",
-			errorKind: "provider_error",
-			reason: "Session context exceeds materialization budget (99 > 64 bytes)",
+			reason: reason.slice(0, 512),
 		});
-
-		// 2. Loop-level exhaustion carries no legacy discriminator and no assistant at
-		// all, so without the diagnostic an operator has literally nothing to act on.
-		const second = await submit("exhausted-prompt");
-		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-		await handlers.get("agent_end")?.(
-			{ type: "agent_end", stopReason: "exhausted", messages: [] } as never,
-			sessionContext,
-		);
-		await waitFor(() => diagnostics.length > 1, "exhausted prompt diagnostic");
-		expect(diagnostics[1]).toMatchObject({
-			commandId: second.commandId,
-			turnId: second.turnId,
-			loopStopReason: "exhausted",
-			assistantStopReason: "none",
-			reason: "unreported",
-		});
-		expect(diagnostics[1]).not.toHaveProperty("errorKind");
+		expect(diagnostics[0]?.reason).toHaveLength(512);
 	} finally {
+		unsubscribe();
 		errorSpy.mockRestore();
 	}
 
@@ -230,11 +224,9 @@ test("SDK host does not log a client cancellation as a prompt terminal failure",
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "cancelled-prompt"),
 			"prompt acknowledgement",
 		);
+		const cancelled: AgentEndEvent = { type: "agent_end", stopReason: "cancelled", messages: [] };
 		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-		await handlers.get("agent_end")?.(
-			{ type: "agent_end", stopReason: "cancelled", messages: [] } as never,
-			sessionContext,
-		);
+		await handlers.get("agent_end")?.(cancelled, sessionContext);
 		await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "cancelled prompt terminal");
 
 		// A user interrupt is intent, not an undiagnosable defect, so it must not

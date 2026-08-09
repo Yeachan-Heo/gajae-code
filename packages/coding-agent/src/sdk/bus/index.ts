@@ -6319,10 +6319,10 @@ export function createNotificationsExtension(
 						: terminalAssistant?.stopReason === "aborted"
 							? "aborted"
 							: undefined;
-			// The wire outcome is a fixed safe token by contract (see `sanitizePromptFailure`):
-			// SDK clients, the ACP `-32603` envelope, and therefore every lane transcript only
-			// ever see "Prompt submission failed." This local log is the ONLY place the reason
-			// a turn died survives, so a turn that ends with no visible error stays diagnosable.
+			// The SDK wire outcome and ACP error envelope use a fixed safe token by
+			// contract (see `sanitizePromptFailure`). Assistant failure messages may
+			// still remain in the local session transcript; this bounded operator log
+			// preserves diagnostics without widening the SDK/ACP redaction boundary.
 			// Client cancellation is intent, not a defect, so it is not logged as an error.
 			if (outcome.kind === "failed" && event.stopReason !== "cancelled") {
 				const rawReason = typeof terminalAssistant?.errorMessage === "string" ? terminalAssistant.errorMessage : "";
