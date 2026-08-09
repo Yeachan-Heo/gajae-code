@@ -117,6 +117,10 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 	);
 }
 
+function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
+	return error instanceof Error && error.message === "managed_replace_receipt_cleanup_pending:io_error";
+}
+
 /** A same-filesystem rename updates the moved root's ctime but no other tree identity. */
 function sameDirectoryTreeSnapshotAfterRename(
 	left: NativeDirectoryTreeSnapshot,
@@ -1141,7 +1145,13 @@ export class ManagedSessionDescendantStore {
 			for (const name of fs.readdirSync(this.#baseDir)) {
 				if (!name.startsWith(".gjc-replace-cleanup-")) continue;
 				if (replacementCleanupReceiptBinding(name)) {
-					this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
+					try {
+						this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
+					} catch (error) {
+						// A transient Windows handle/AV failure leaves the receipt intact for a
+						// later reconciliation; it must not abort the session mutation.
+						if (!isRetryableReplacementReceiptCleanupError(error)) throw error;
+					}
 					continue;
 				}
 				if (legacyReplacementCleanupReceiptBinding(name)) {
