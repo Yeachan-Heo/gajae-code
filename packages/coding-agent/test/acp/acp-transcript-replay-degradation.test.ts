@@ -91,6 +91,7 @@ describe("ACP transcript replay degradation", () => {
 	let connectionAbort: AbortController;
 	let server: Bun.Server<undefined> | undefined;
 	let transcriptItems: unknown[] = [];
+	let transcriptSecondPageFailure: string | undefined;
 	let updates: SessionNotification[] = [];
 	let agentDir = "";
 	let cwd = "";
@@ -99,6 +100,7 @@ describe("ACP transcript replay degradation", () => {
 		tempDir = TempDir.createSync("@acp-transcript-replay-");
 		connectionAbort = new AbortController();
 		transcriptItems = [];
+		transcriptSecondPageFailure = undefined;
 		updates = [];
 		agentDir = path.join(tempDir.path(), "agent");
 		cwd = path.join(tempDir.path(), "workspace");
@@ -142,6 +144,36 @@ describe("ACP transcript replay degradation", () => {
 									id: frame.id,
 									ok: true,
 									result: { promptTerminalOutcomeVersion: 1 },
+								}),
+							);
+							return;
+						}
+						// A paged transcript whose second page fails: the first page replays, the
+						// cursor promises more, and the follow-up query rejects.
+						if (frame.query === "transcript.list" && transcriptSecondPageFailure !== undefined) {
+							if (frame.cursor === undefined) {
+								socket.send(
+									JSON.stringify({
+										type: "query_response",
+										id: frame.id,
+										ok: true,
+										result: {
+											page: {
+												items: transcriptItems,
+												complete: false,
+												continuationCursor: "transcript-page-2",
+											},
+										},
+									}),
+								);
+								return;
+							}
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: false,
+									error: { code: transcriptSecondPageFailure, message: transcriptSecondPageFailure },
 								}),
 							);
 							return;
@@ -193,7 +225,7 @@ describe("ACP transcript replay degradation", () => {
 	});
 
 	/** Creates a session, drains its bootstrap updates, then replays it through `session/load`. */
-	async function loadReplayedSession(items: unknown[]): Promise<SessionNotification[]> {
+	async function loadReplayedSession(items: unknown[], expectLoadRejection = false): Promise<SessionNotification[]> {
 		transcriptItems = items;
 		const connection = {
 			sessionUpdate: async (notification: SessionNotification) => {
@@ -211,7 +243,9 @@ describe("ACP transcript replay degradation", () => {
 			"new session bootstrap",
 		);
 		updates.length = 0;
-		await bounded(acp.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }), "load session");
+		const load = bounded(acp.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }), "load session");
+		if (expectLoadRejection) await expect(load).rejects.toThrow();
+		else await load;
 		return updates;
 	}
 
@@ -378,6 +412,30 @@ describe("ACP transcript replay degradation", () => {
 		expect(toolCallStates(replayed)).toEqual([]);
 		expect(pendingToolCalls(replayed)).toEqual([]);
 		expect(skipBoundaries(replayed)).toEqual([{ count: 1, reason: "transcript_tool_call_unavailable" }]);
+	});
+
+	// A start the transcript never resolved is closed as unresolved; a start the replay
+	// itself abandoned mid-page is a different failure and must read differently (#4063).
+	it("closes published tool calls when a later transcript page throws", async () => {
+		transcriptSecondPageFailure = "unavailable";
+		const replayed = await loadReplayedSession(
+			[
+				{
+					id: "assistant-1",
+					role: "assistant",
+					textSummary: "Reading",
+					body: "Reading",
+					content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "missing.ts" } }],
+				},
+			],
+			true,
+		);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:failed"]);
+		expect(pendingToolCalls(replayed)).toEqual([]);
+		expect(JSON.stringify(replayed)).toContain("Transcript replay stopped before this tool call reached a result.");
+		expect(JSON.stringify(replayed)).not.toContain("without a result for this tool call");
+		expect(skipBoundaries(replayed)).toEqual([]);
 	});
 });
 

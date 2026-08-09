@@ -463,6 +463,9 @@ const TRANSCRIPT_TOOL_RESULT_UNAVAILABLE = "The transcript entry holding this to
 /** Stands in for a tool call the transcript never recorded a result for. */
 const TRANSCRIPT_TOOL_CALL_UNRESOLVED = "The session transcript ends without a result for this tool call.";
 
+/** Stands in for a tool call replay abandoned before it could read back a result. */
+const TRANSCRIPT_REPLAY_INTERRUPTED = "Transcript replay stopped before this tool call reached a result.";
+
 function decodeTranscriptContinuation(field: string, body: string): unknown {
 	if (field !== "content" && field !== "isError") return body;
 	try {
@@ -2505,11 +2508,48 @@ export class AcpAgent implements Agent {
 		const adapter = this.#adapter(id);
 		const record = this.#sessions.get(id);
 		if (!record) return;
+		const replayTools = new Map<string, { name: string; args: unknown }>();
+		try {
+			await this.#replayTranscriptPages(id, adapter, record, replayTools);
+		} finally {
+			// One boundary for every way the replay body can end: a normal return, an early
+			// exit, or a `transcript.list` page that throws. A start still open here was
+			// abandoned mid-replay, so it reaches a terminal status now instead of spinning
+			// at `pending` for the life of the session.
+			for (const [toolCallId, tool] of replayTools) {
+				try {
+					await this.#closeUnresolvedReplayToolCall(
+						id,
+						adapter,
+						record.cwd,
+						toolCallId,
+						tool,
+						TRANSCRIPT_REPLAY_INTERRUPTED,
+					);
+				} catch {
+					// The failure that aborted replay is the one worth propagating; a cleanup
+					// publish that fails as well must not replace it.
+				}
+			}
+			replayTools.clear();
+		}
+	}
+
+	/**
+	 * Walks the transcript pages for {@link AcpAgent.#replaySession}. `replayTools` stays
+	 * owned by the caller so every start this pass published is still closable once it
+	 * exits, however it exits.
+	 */
+	async #replayTranscriptPages(
+		id: string,
+		adapter: AcpSdkAdapter,
+		record: SessionRecord,
+		replayTools: Map<string, { name: string; args: unknown }>,
+	): Promise<void> {
 		let cursor: string | undefined;
 		let imageLimitationReported = false;
 		let unreplayableEntries = 0;
 		let unreplayableReason: TranscriptReplaySkipReason | undefined;
-		const replayTools = new Map<string, { name: string; args: unknown }>();
 		for (let pageCount = 0; pageCount < MAX_ACP_REPLAY_PAGES; pageCount++) {
 			const response = object(await adapter.query("transcript.list", {}, cursor));
 			const result = object(response?.result) ?? response;
