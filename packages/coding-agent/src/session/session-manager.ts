@@ -13361,6 +13361,10 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = stage.persistsToExistingFile;
 		this.#ensuredOnDisk = stage.persistsToExistingFile;
+		if (stage.persistsToExistingFile && this.#readOnlyResume && this.#sessionFile) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 		if (!stage.boundedCold) {
 			this.#commitResidentTextStoreTransition(transition);
 			return { kind: "promoted" };
