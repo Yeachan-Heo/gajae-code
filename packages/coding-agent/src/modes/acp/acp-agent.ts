@@ -861,7 +861,7 @@ export function acpSessionStateFromConfig(
 	};
 }
 
-/** Recognize an advertised ACP skill command only when it is the complete, single text prompt. */
+/** Recognize a canonical ACP skill command only when it is the complete, single text prompt. */
 export function acpSkillInvocation(blocks: PromptRequest["prompt"]): { name: string; args: string } | undefined {
 	if (blocks.length !== 1 || blocks[0]?.type !== "text") return undefined;
 	const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/.exec(blocks[0].text.trim());
@@ -1407,6 +1407,8 @@ export class AcpAgent implements Agent {
 				type: "control_request",
 				operation: skillInvocation ? "skill.invoke" : "turn.prompt",
 				input: skillInvocation ?? { text: payload.text, images: payload.images },
+				// AcpSdkAdapter.control passes `confirm: false` to SdkClient, which serializes
+				// the field even though it is not part of the skill input payload.
 				...(skillInvocation ? { confirm: false } : {}),
 				id: PROMPT_FRAME_ID_PLACEHOLDER,
 			}),

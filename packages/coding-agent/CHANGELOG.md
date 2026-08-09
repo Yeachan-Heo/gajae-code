@@ -167,6 +167,7 @@
 - `todo_write` now accepts the synonyms models actually emit instead of failing the tool call mid-turn: `complete`/`completed` for the `done` operation, and `content` for `task`. The operation sets a status spelled `completed` and stores the task as `content`, so the schema's own vocabulary invited both mistakes. The accepted key set and the requirement that a completion name a task or phase are unchanged (#3962).
 
 - Managed session scope failures are no longer misreported as `binding_invalid`. An over-budget managed-tree snapshot now surfaces as `capacity_exceeded` carrying the native `content_too_large` message instead of pointing operators at a byte-for-byte canonical binding file, and `migration_busy` is preserved from every classification path rather than only one of the three.
+- ACP clients can now map advertised `/skill:*` commands to canonical `skill.invoke` while binding the run to exact correlated prompt completion and cancellation ownership, and can answer deep-interview forms in headless lifecycle sessions. Lifecycle hosts initialize the shared theme before tools render and before the MCP readiness budget is calculated, preventing the pre-elicitation `theme.status` failure, and protocol form providers remain authoritative if a local `/notify on` registers an interactive source later.
 ## [0.12.15] - 2026-08-06
 
 ## [0.12.14] - 2026-08-06
@@ -243,7 +244,6 @@
 - Slack Web API requests now use form encoding instead of JSON, preventing thread reconciliation through `conversations.replies` from failing with `invalid_arguments`.
 
 - Managed replacement cleanup now migrates version-one receipts from earlier releases and recovers canonical exchange placeholders left by interrupted cleanup, so a stale receipt cannot permanently block the next managed session mutation with `managed_replace_cleanup_receipt_invalid`.
-- ACP clients can now map advertised `/skill:*` commands to canonical `skill.invoke` while binding the run to exact correlated prompt completion and cancellation ownership, and can answer deep-interview forms in headless lifecycle sessions. Lifecycle hosts initialize the shared theme before tools render and before the MCP readiness budget is calculated, preventing the pre-elicitation `theme.status` failure, and protocol form providers remain authoritative if a local `/notify on` registers an interactive source later.
 
 ## [0.12.11] - 2026-08-03
 

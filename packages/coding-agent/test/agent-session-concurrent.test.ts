@@ -111,6 +111,63 @@ describe("AgentSession concurrent prompt guard", () => {
 		throw new Error("Timed out waiting for condition");
 	}
 
+	it("forwards preflight cancellation when a prompt reroutes to a skill", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const authStorage = await AuthStorage.create(path.join(tempDir, "skill-reroute-auth.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "skill-reroute-models.yml"));
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+			skills: [
+				{
+					name: "fixture-skill",
+					description: "Fixture skill",
+					filePath: "/tmp/fixture-skill/SKILL.md",
+					baseDir: "/tmp/fixture-skill",
+					source: "test",
+				},
+			],
+		});
+		const controller = new AbortController();
+		const rerouteStarted = Promise.withResolvers<void>();
+		const invokeSkill = vi.spyOn(session, "invokeSkill").mockImplementation(async (_name, _args, options) => {
+			const signal = options?.preflightSignal;
+			if (!signal) throw new Error("missing preflight signal");
+			rerouteStarted.resolve();
+			const cancellation = Promise.withResolvers<never>();
+			signal.addEventListener(
+				"abort",
+				() =>
+					cancellation.reject(
+						Object.assign(new Error("Skill preflight was cancelled before execution."), {
+							code: "busy",
+						}),
+					),
+				{ once: true },
+			);
+			await cancellation.promise;
+			return { name: _name, path: "/tmp/fixture-skill/SKILL.md", args: _args };
+		});
+
+		const prompt = session.prompt("/skill:fixture-skill review", {
+			preflightSignal: controller.signal,
+		});
+		await rerouteStarted.promise;
+		controller.abort();
+
+		await expect(prompt).rejects.toMatchObject({ code: "busy" });
+		expect(invokeSkill).toHaveBeenCalledWith("fixture-skill", "review", {
+			preflightSignal: controller.signal,
+		});
+	});
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
 

@@ -18,7 +18,7 @@ import type { AskAnswerSource } from "./index";
 
 export type AskAnswerSourceKind = "protocol" | "interactive";
 
-export interface RegisteredAskAnswerSource {
+interface RegisteredAskAnswerSource {
 	readonly source: AskAnswerSource;
 	readonly kind: AskAnswerSourceKind;
 }

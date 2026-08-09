@@ -97,6 +97,10 @@ test("ACP advertised skill commands require one complete canonical text block", 
 			{ type: "text", text: "extra context" },
 		]),
 	).toBeUndefined();
+	expect(acpSkillInvocation([{ type: "text", text: "/skill:not-advertised" }])).toEqual({
+		name: "not-advertised",
+		args: "",
+	});
 });
 test("production ACP routes zero-session SDK globals through the broker adapter", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-production-"));

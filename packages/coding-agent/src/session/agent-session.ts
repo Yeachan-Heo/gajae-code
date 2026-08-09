@@ -8651,12 +8651,13 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted || options?.onPreflightAcceptCommit
+						options?.onPreflightAccepted || options?.onPreflightAcceptCommit || options?.preflightSignal
 							? {
 									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 									...(options.onPreflightAcceptCommit
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
+									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
 								}
 							: undefined,
 					);
