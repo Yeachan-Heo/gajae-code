@@ -1511,7 +1511,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
-					options.parentSessionId,
+					canonicalChildScope,
 					{ managedFallback: true },
 					canonicalChildScope,
 				),
@@ -1659,6 +1659,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					authStorage,
 					modelRegistry,
 					settings: subagentSettings,
+					providerSessionId: canonicalChildScope,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
 					modelSubstitution:

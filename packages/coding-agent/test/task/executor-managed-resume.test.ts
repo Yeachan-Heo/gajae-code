@@ -138,7 +138,9 @@ describe("runSubprocess managed child resume", () => {
 
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		AsyncJobManager.setInstance(manager);
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(createSuccessfulResumeSession()));
+		const createAgentSessionSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(createSuccessfulResumeSession()));
 		const agent: AgentDefinition = {
 			name: "executor",
 			description: "test executor",
@@ -153,6 +155,7 @@ describe("runSubprocess managed child resume", () => {
 			index: 0,
 			id: "0-ManagedChild",
 			subagentId: "0-ManagedChild",
+			parentSessionId: parent.getSessionId(),
 			runMode: "message",
 			resumeMessage: "continue",
 			sessionFile: childFile,
@@ -169,6 +172,9 @@ describe("runSubprocess managed child resume", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(result.error).toBeUndefined();
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.providerSessionId).toBe(
+			JSON.stringify(["subagent-canonical", parent.getSessionId(), "0-ManagedChild"]),
+		);
 		expect(result.extractedToolData?.yield).toEqual([
 			{ status: "success", data: { resumed: true }, error: undefined },
 		]);

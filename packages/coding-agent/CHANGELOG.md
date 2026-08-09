@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Parallel task children now use their durable parent/task ownership tuple as a stable provider-facing continuity identity, preventing nested managed children from contending for one websocket owner while preserving logical session headers, artifact hierarchy, detached-resume identity, and explicit provider-session overrides.
 - Session contexts no longer retain materialized resident text after the backing cache disappears; subsequent reads rematerialize the existing public-safe missing-blob placeholder. Headless `--export` coverage now expects the established error for a nonexistent source file.
 - SDK prompt reconciliation now preserves bounded safe provider failure codes after `agent_failed`, while retaining the fixed redacted wire/persisted message and recording a bounded local diagnostic.
 

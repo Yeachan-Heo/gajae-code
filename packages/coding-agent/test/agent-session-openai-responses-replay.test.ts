@@ -913,6 +913,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				"task.forkContext.enabled": true,
 			}),
 			getSessionFile: () => parent.sessionManager.getSessionFile(),
+			getSessionId: () => parent.sessionId,
 			getSessionSpawns: () => "*",
 			model: parent.model,
 			buildForkContextSeed: (opts: Parameters<AgentSession["buildForkContextSeed"]>[0]) =>
@@ -951,12 +952,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(execChild).toBeDefined();
 		expect(archChild).toBeDefined();
 
+		const expectedIds = new Map([
+			["executor", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ExecFork"])],
+			["architect", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ArchFork"])],
+		]);
 		for (const child of [execChild!, archChild!]) {
 			expect(child.forkContextSeed).toBeDefined();
-			// Seeds carry conversation content only. TaskTool must not inject a
-			// provider identity: each child derives its own from its logical session
-			// so concurrent workers never share an upstream session owner.
-			expect(child.providerSessionId).toBeUndefined();
+			expect(child.providerSessionId).toBe(expectedIds.get(child.agentDisplayName!));
+			expect(child.providerSessionId).not.toBe(parent.sessionId);
 		}
 	});
 
