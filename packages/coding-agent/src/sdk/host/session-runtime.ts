@@ -22,6 +22,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
+import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ControlSurface, dispatchControl } from "./control";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
@@ -265,7 +266,7 @@ export interface InvocationReconciliation {
 	hydrate(): Promise<void>;
 }
 
-function createInvocationReconciliation(
+export function createInvocationReconciliation(
 	options: { stateRoot?: string; sessionId?: string } = {},
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
@@ -361,6 +362,7 @@ function createInvocationReconciliation(
 					record.terminalAt = Date.now();
 					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
 				}
+				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
 				records.set(key(record.kind, record), { ...record });
 			}
 		}
@@ -416,7 +418,15 @@ function createInvocationReconciliation(
 			} else {
 				record.status = frame.type === "agent_failed" ? "failed" : "terminal_ok";
 				record.terminalAt = Date.now();
-				if (frame.type === "agent_failed") record.error = { code: "prompt_failed", message: "Invocation failed." };
+				if (frame.type === "agent_failed") {
+					logger.error("SDK invocation failed", {
+						kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						error: formatPromptFailureForLocalLog(frame.error),
+					});
+					record.error = sanitizePromptFailure(frame.error);
+				}
 			}
 			await persist();
 		},

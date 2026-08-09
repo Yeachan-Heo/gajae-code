@@ -93,6 +93,7 @@ import {
 	syntheticModelInputError,
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
+import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -128,7 +129,7 @@ import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMess
 import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
-import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
+import { createPromptReconciliation } from "./prompt-reconciliation";
 import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
@@ -4057,7 +4058,6 @@ export function createNotificationsExtension(
 			connectionId: string;
 			abandoned: boolean;
 			failed: boolean;
-			error: unknown;
 			terminal: boolean;
 			retainCorrelation: boolean;
 			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
@@ -4256,7 +4256,6 @@ export function createNotificationsExtension(
 				connectionId: requesterConnectionId,
 				abandoned: false,
 				failed: false,
-				error: undefined,
 				terminal: false,
 				retainCorrelation: trackReconciliation,
 				createdAt: Date.now(),
@@ -4455,6 +4454,11 @@ export function createNotificationsExtension(
 			}
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+			logger.error("SDK prompt submission failed", {
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+				error: formatPromptFailureForLocalLog(error),
+			});
 			const sanitized = sanitizePromptFailure(error);
 			void terminalizePrompt(
 				correlation,
@@ -4474,7 +4478,6 @@ export function createNotificationsExtension(
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			submission.failed = true;
-			submission.error = error;
 			removePendingPromptCorrelation(correlation);
 			if (
 				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&

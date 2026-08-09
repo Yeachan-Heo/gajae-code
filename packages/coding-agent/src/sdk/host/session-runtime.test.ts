@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
 	SessionSdkSessionRuntime,
 	type SessionSdkTransport,
@@ -63,6 +64,55 @@ function extensionContext(sessionId: string, cwd: string): any {
 		},
 	};
 }
+
+test("preserves an agent failure code in host prompt reconciliation", async () => {
+	const reconciliation = createInvocationReconciliation();
+	const correlation = { commandId: "failed-command", turnId: "failed-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "failed-ref");
+	await reconciliation.noteTransition("prompt", correlation, {
+		type: "agent_failed",
+		error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
+	});
+	expect(reconciliation.lookup("prompt", { clientRef: "failed-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "provider_unavailable", message: "Prompt submission failed." },
+	});
+});
+
+test("redacts a persisted host failure during hydration", async () => {
+	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-reconciliation-"));
+	const sessionId = "hydrated-failure";
+	try {
+		await Bun.write(
+			path.join(stateRoot, ".sdk-reconciliation", `${sessionId}.json`),
+			JSON.stringify({
+				version: 1,
+				sessionId,
+				records: [
+					{
+						kind: "prompt",
+						commandId: "persisted-command",
+						turnId: "persisted-turn",
+						status: "failed",
+						acceptedAt: 1,
+						terminalAt: Date.now(),
+						error: { code: "unsafe code!", message: "secret provider payload" },
+					},
+				],
+			}),
+		);
+		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
+		await reconciliation.hydrate();
+		expect(
+			reconciliation.lookup("prompt", { commandId: "persisted-command", turnId: "persisted-turn" }),
+		).toMatchObject({
+			status: "failed",
+			error: { code: "internal", message: "Prompt submission failed." },
+		});
+	} finally {
+		await rm(stateRoot, { recursive: true, force: true });
+	}
+});
 
 describe("SessionSdkSessionRuntime", () => {
 	test("has no notification adapter or native notification import edge", async () => {
