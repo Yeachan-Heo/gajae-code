@@ -72,7 +72,12 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import { DEFAULT_READINESS_TIMEOUT_MS, startupQueueWaitMs } from "./startup-budget";
+import {
+	DEFAULT_READINESS_TIMEOUT_MS,
+	isValidReadinessTimeoutMs,
+	READINESS_TIMEOUT_INVALID_MESSAGE,
+	startupQueueWaitMs,
+} from "./startup-budget";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -81,8 +86,6 @@ export {
 	processIncarnation,
 };
 
-const MIN_READY_TIMEOUT_MS = 4_000;
-const MAX_READY_TIMEOUT_MS = 60_000;
 const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RECEIVED_AT_SKEW_MS = 5_000;
@@ -99,12 +102,7 @@ export interface LifecycleDeadlines {
 }
 
 export function deriveLifecycleDeadlines(receivedAt: number, requestedReadinessTimeoutMs: number): LifecycleDeadlines {
-	if (
-		!Number.isSafeInteger(receivedAt) ||
-		!Number.isSafeInteger(requestedReadinessTimeoutMs) ||
-		requestedReadinessTimeoutMs < MIN_READY_TIMEOUT_MS ||
-		requestedReadinessTimeoutMs > MAX_READY_TIMEOUT_MS
-	)
+	if (!Number.isSafeInteger(receivedAt) || !isValidReadinessTimeoutMs(requestedReadinessTimeoutMs))
 		throw new Error("Lifecycle timing values must be safe integers in the approved readiness range.");
 	const phaseWindowMs = Math.min(1_000, Math.max(500, Math.floor(requestedReadinessTimeoutMs / 4)));
 	const lifecycleCleanupDeadlineAt = receivedAt + requestedReadinessTimeoutMs;
@@ -493,16 +491,7 @@ export function validateBrokerModelPresetForTest(agentDir: string, requestedProf
 function readinessTimeout(input: Input): number | BrokerResponse {
 	const value = input.readinessTimeoutMs;
 	if (value === undefined) return DEFAULT_READINESS_TIMEOUT_MS;
-	if (
-		typeof value !== "number" ||
-		!Number.isSafeInteger(value) ||
-		value < MIN_READY_TIMEOUT_MS ||
-		value > MAX_READY_TIMEOUT_MS
-	)
-		return fail(
-			"invalid_input",
-			`readinessTimeoutMs must be an integer between ${MIN_READY_TIMEOUT_MS} and ${MAX_READY_TIMEOUT_MS}.`,
-		);
+	if (!isValidReadinessTimeoutMs(value)) return fail("invalid_input", READINESS_TIMEOUT_INVALID_MESSAGE);
 	return value;
 }
 

@@ -246,6 +246,111 @@ test("closing the startup queue refuses its waiters instead of granting or stran
 	expect(queuedTaskRuns).toBe(0);
 });
 
+test("closing after grant but before task execution refuses the admitted startup", async () => {
+	const queue = new StartupAdmissionQueue(1);
+	const release = Promise.withResolvers<void>();
+	let nowCalls = 0;
+	let queuedTaskRuns = 0;
+	const timing: StartupAdmissionTiming = {
+		now: () => {
+			nowCalls += 1;
+			if (nowCalls === 2) queue.close();
+			return 1_000;
+		},
+		sleep: () => Promise.withResolvers<void>().promise,
+	};
+	const holder = queue.run(4_000, timing, async () => {
+		await release.promise;
+	});
+	const queued = queue.run(4_000, timing, async () => {
+		queuedTaskRuns += 1;
+	});
+	await Promise.resolve();
+
+	release.resolve();
+	await holder;
+
+	expect(await queued).toEqual({ status: "admission_refused", reason: "admission_refused" });
+	expect(queuedTaskRuns).toBe(0);
+});
+
+async function expectGraceWindowFenceRefusesQueuedStartup(observation: "replaced" | "ambiguous"): Promise<void> {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-${observation}-fence-admission-`));
+	const agentDir = path.join(root, "agent");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const broker = new Broker({ agentDir, heartbeatTtlMs: 300 });
+	const release = Promise.withResolvers<void>();
+	const parked: StartupAdmissionTiming = { now: Date.now, sleep: () => Promise.withResolvers<void>().promise };
+	const queuedInAdmission = Promise.withResolvers<void>();
+	let spawnCalls = 0;
+	try {
+		delete process.env.GJC_SDK_SESSION_COMMAND;
+		await broker.start();
+		if (observation === "ambiguous") setAmbiguityGraceForTest(broker, 60_000);
+		setLifecycleCommandResolverForTest(broker, () => {
+			spawnCalls += 1;
+			throw new Error("SDK internal launch refused: fenced broker must not spawn.");
+		});
+		const holders = Array.from({ length: sdkHostStartupConcurrency() }, () =>
+			broker.runStartup(4_000, parked, async () => {
+				await release.promise;
+			}),
+		);
+		await Promise.resolve();
+		setLifecycleTimingForTest(broker, {
+			now: Date.now,
+			sleep: () => {
+				queuedInAdmission.resolve();
+				return Promise.withResolvers<void>().promise;
+			},
+		});
+		const queued = broker.handleRequest(
+			"session.create",
+			{ cwd: root, stateRoot: path.join(root, ".gjc", "state"), readinessTimeoutMs: 4_000 },
+			`queued-during-${observation}-fence`,
+		);
+		await queuedInAdmission.promise;
+
+		setPublicationObservationForTest(broker, observation);
+		const fenceDeadline = Date.now() + 2_000;
+		let listResponse = await broker.handleRequest("session.list", {});
+		while ((listResponse.ok || listResponse.error.code !== "unavailable") && Date.now() < fenceDeadline) {
+			await Bun.sleep(10);
+			listResponse = await broker.handleRequest("session.list", {});
+		}
+		expect(listResponse).toMatchObject({ ok: false, error: { code: "unavailable" } });
+
+		release.resolve();
+		await Promise.all(holders);
+		expect(await queued).toEqual({
+			ok: false,
+			error: {
+				code: "startup_admission_refused",
+				message: "SDK host startup was refused because the broker no longer owns the session root.",
+			},
+		});
+		expect(spawnCalls).toBe(0);
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		setLifecycleTimingForTest(broker, undefined);
+		setPublicationObservationForTest(broker, undefined);
+		setAmbiguityGraceForTest(broker, undefined);
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		release.resolve();
+		await broker.stop().catch(() => undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}
+
+test("suspect-unpublished fence refuses queued startup before loss grace expires", async () => {
+	await expectGraceWindowFenceRefusesQueuedStartup("replaced");
+});
+
+test("observation-ambiguous fence refuses queued startup before ambiguity grace expires", async () => {
+	await expectGraceWindowFenceRefusesQueuedStartup("ambiguous");
+});
+
 test("a broker that lost the root refuses queued startups instead of spawning children", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lost-root-admission-"));
 	const agentDir = path.join(root, "agent");
