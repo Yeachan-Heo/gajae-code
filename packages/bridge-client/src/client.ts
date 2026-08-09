@@ -51,7 +51,6 @@ export interface SdkSentRecord {
 	readonly operation?: string;
 	readonly idempotencyKey?: string;
 	readonly fingerprint: string;
-	readonly brokerSelector?: unknown;
 }
 export type SdkFrameHandler = (frame: SdkFrame) => void;
 export type SdkReconnectHandler = () => void;
@@ -310,6 +309,10 @@ export class SdkClient {
 	getSentRecord(id: string): SdkSentRecord | undefined {
 		return this.#sentRecords.get(id);
 	}
+	#rememberSentRecord(record: SdkSentRecord): void {
+		this.#sentRecords.set(record.id, record);
+		while (this.#sentRecords.size > 256) this.#sentRecords.delete(this.#sentRecords.keys().next().value!);
+	}
 
 	async lookupLifecycle(record: SdkSentRecord, timeoutMs?: number): Promise<unknown> {
 		if (!record.operation || !record.idempotencyKey)
@@ -318,11 +321,7 @@ export class SdkClient {
 			{
 				type: "broker_request",
 				operation: "broker.lookup_lifecycle",
-				input: {
-					operation: record.operation,
-					fingerprint: record.fingerprint,
-					...(record.brokerSelector === undefined ? {} : { selector: record.brokerSelector }),
-				},
+				input: { operation: record.operation, fingerprint: record.fingerprint },
 			},
 			{ timeoutMs, idempotencyKey: record.idempotencyKey },
 		);
@@ -340,6 +339,8 @@ export class SdkClient {
 			id,
 			...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
 		};
+		const serializedRequest = JSON.stringify(requestFrame);
+		const serializedFrame = JSON.parse(serializedRequest) as Frame;
 		return await new Promise<unknown>((resolve, reject) => {
 			const pending: Pending = {
 				incarnation,
@@ -365,20 +366,16 @@ export class SdkClient {
 				return;
 			}
 			try {
-				incarnation.socket.send(JSON.stringify(requestFrame));
+				incarnation.socket.send(serializedRequest);
 				pending.sent = true;
-				this.#sentRecords.set(id, {
+				this.#rememberSentRecord({
 					id,
-					operation: typeof frame.operation === "string" ? frame.operation : undefined,
+					operation: typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined,
 					idempotencyKey: options.idempotencyKey,
 					fingerprint:
-						typeof frame.operation === "string"
-							? lifecycleFingerprint(frame.operation, frame.input ?? {})
-							: canonicalJson(frame.input ?? {}),
-					brokerSelector:
-						typeof frame.input === "object" && frame.input !== null
-							? (frame.input as Record<string, unknown>).selector
-							: undefined,
+						typeof serializedFrame.operation === "string"
+							? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
+							: canonicalJson(serializedFrame.input ?? {}),
 				});
 			} catch (error) {
 				this.#settlePending(

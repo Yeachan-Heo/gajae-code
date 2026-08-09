@@ -665,6 +665,17 @@ export class LifecycleLedger {
 		}
 		return replacement !== undefined;
 	}
+	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
+	}
+	async migrateIdentity(from: string, to: string): Promise<LifecycleLedgerEntry | undefined> {
+		return this.#mutate(async () => {
+			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
+			const entry = this.#byIdentity.get(from);
+			if (!entry) return undefined;
+			return await this.#append({ ...entry, identity: to, ts: Date.now() });
+		});
+	}
 	get warnings(): readonly string[] {
 		return this.#warnings;
 	}
@@ -726,7 +737,8 @@ export class LifecycleLedger {
 		if (terminal(prior.state) || (prior.state === "effect_started" && this.#isCleanupPending(prior)))
 			return { kind: "replay", entry: prior };
 		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };
-		if (prior.state === "accepted") return { kind: "in_progress", entry: prior };
+		// Accepted is durable admission only; no effect fence exists, so a restart may retry it.
+		if (prior.state === "accepted") return { kind: "new", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
 	async transition(

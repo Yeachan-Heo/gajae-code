@@ -26,8 +26,7 @@ pub mod server;
 pub use actions::{ActionIdentity, ActionRegistry, ReplyClassification, ReplyOutcome};
 pub use broker_protocol::{
 	BrokerClientFrame, BrokerError, BrokerHello, BrokerOperation, BrokerRequest, BrokerResponse,
-	BrokerServerFrame, LifecycleLookupRequest, LifecycleLookupResponse, PROTOCOL_MAJOR,
-	ReconciliationSelector,
+	BrokerServerFrame, PROTOCOL_MAJOR,
 };
 pub use control::{
 	ControlClientFrame, ControlError, ControlRequest, ControlResponse, ControlServerFrame,

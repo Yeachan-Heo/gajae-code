@@ -11,6 +11,7 @@ import {
 	SdkClient,
 	SdkClientError,
 	SdkDiscoveryError,
+	type SdkSentRecord,
 } from "../client";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status.js";
 import { validateAdapterControl } from "../protocol/adapter-validation";
@@ -962,13 +963,25 @@ async function runRawGlobal(
 		throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
 	const client = await connectBroker(agentDir);
 	try {
-		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const response = await client.global(operation, input, {
-			idempotencyKey,
-			...(timeoutMs === undefined ? {} : { timeoutMs }),
-			...(args.elevationRequestId === undefined ? {} : { elevationRequestId: args.elevationRequestId }),
-		});
-		return args.showEndpointCredential ? response : stripSecretFields(response);
+		try {
+			const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+			const response = await client.global(operation, input, {
+				idempotencyKey,
+				...(timeoutMs === undefined ? {} : { timeoutMs }),
+				...(args.elevationRequestId === undefined ? {} : { elevationRequestId: args.elevationRequestId }),
+			});
+			return args.showEndpointCredential ? response : stripSecretFields(response);
+		} catch (error) {
+			if (
+				isLifecycleOperation(operation) &&
+				error instanceof SdkClientError &&
+				error.code === "uncertain_after_send" &&
+				error.details &&
+				typeof error.details === "object"
+			)
+				return stripSecretFields(await client.lookupLifecycle(error.details as SdkSentRecord));
+			throw error;
+		}
 	} finally {
 		await client.close();
 	}

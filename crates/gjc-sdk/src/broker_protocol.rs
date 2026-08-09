@@ -62,36 +62,6 @@ pub struct AcceptedResponse {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub uncertain:     Option<UncertainStatus>,
 }
-
-/// Stable selector used to reconcile a lifecycle submission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReconciliationSelector {
-	pub session_id:    String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub request_id:    Option<String>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub submission_id: Option<String>,
-}
-
-/// Public lifecycle lookup request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LifecycleLookupRequest {
-	pub selector: ReconciliationSelector,
-}
-
-/// Public lifecycle lookup response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LifecycleLookupResponse {
-	pub found:     bool,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub state:     Option<LifecycleState>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub uncertain: Option<UncertainStatus>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerResponse {
