@@ -15136,8 +15136,8 @@ export class AgentSession {
 	/**
 	 * Ordered retry classification: typed safety stop (surface) -> legacy safety stop
 	 * (surface) -> overflow (compaction) -> terminal (surface) -> usage_limit
-	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry) ->
-	 * unknown (bounded retry).
+	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry,
+	 * except canonical idle-stream stalls bounded downstream) -> unknown (bounded retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
