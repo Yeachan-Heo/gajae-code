@@ -26,7 +26,7 @@ export default class Gc extends Command {
 		force: Flags.boolean({ description: "Alias for --prune (eligible records only)", default: false }),
 		"dry-run": Flags.boolean({ description: "Force report-only mode", default: false }),
 		disk: Flags.boolean({
-			description: "Also report on-disk retention (sessions, blobs, natives, backups)",
+			description: "Also report on-disk retention (sessions, blobs, artifacts, natives, backups)",
 			default: false,
 		}),
 		"repair-session-index": Flags.boolean({

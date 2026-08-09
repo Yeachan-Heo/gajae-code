@@ -528,15 +528,16 @@ export function gcHelpText(): string {
 		"  --dry-run         Force report-only mode (overrides --prune/--force)",
 		"  -j, --json        Emit machine-readable JSON",
 		"  --repair-session-index  Explicitly quarantine a corrupt session-index suffix and retain its valid prefix",
-		"  --disk            Also report on-disk retention (sessions, blobs, natives, backups)",
+		"  --disk            Also report on-disk retention (sessions, blobs, artifacts, natives, backups)",
 		"",
 		"Liveness-only: a record is removed only when its owning process is dead",
 		"(ESRCH). Live / permission-denied / unknown processes are always kept.",
 		"",
 		"Disk retention (--disk) is a separate, opt-in axis. Without --prune it only",
 		"reports reclaimable bytes per surface. Live, referenced, permission-denied or",
-		"otherwise ambiguous state is always KEPT and the report says why. Managed",
-		"worktrees under ~/.gjc/wt are never touched.",
+		"otherwise ambiguous state is always KEPT and the report says why. Session tool",
+		"artifacts (`*.<tool>.log`, `.artifact-id-*`, evicted output) are reported per",
+		"family. Managed worktrees under ~/.gjc/wt are never touched.",
 		"",
 	].join("\n");
 }
@@ -580,15 +581,21 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 // needs evidence-based merge detection, which this axis does not have.
 
 /** On-disk surfaces the retention axis can reclaim. */
-export type GcDiskSurface = "sessions" | "blobs" | "natives" | "backups";
+export type GcDiskSurface = "sessions" | "blobs" | "artifacts" | "natives" | "backups";
 
-export const GC_DISK_SURFACES: readonly GcDiskSurface[] = ["sessions", "blobs", "natives", "backups"] as const;
+export const GC_DISK_SURFACES: readonly GcDiskSurface[] = [
+	"sessions",
+	"blobs",
+	"artifacts",
+	"natives",
+	"backups",
+] as const;
 
 export type GcDiskAction = "keep" | "would_reclaim" | "reclaimed" | "reclaim_failed";
 
 export interface GcDiskRecord {
 	surface: GcDiskSurface;
-	/** Session id, blob hash, natives version, or backup entry name. */
+	/** Session id, blob hash, `<session id>/<filename>` artifact, natives version, or backup entry name. */
 	id: string;
 	path: string;
 	bytes: number;
@@ -600,6 +607,20 @@ export interface GcDiskRecord {
 	partial?: true;
 	/** Set when this entry was a reclaim candidate that its surface withheld on incomplete evidence. */
 	withheld?: true;
+}
+
+/**
+ * Per-family rollup of a surface whose growth is many small files.
+ *
+ * The artifacts surface writes one record per file, which answers "what may go"
+ * but not "what filled the scope". A family is derived from the filename shape
+ * (`*.bash.log`, `.artifact-id-*`, …) rather than a fixed list, so a tool that
+ * starts writing a new kind of log is counted the day it ships.
+ */
+export interface GcDiskFamilyUsage {
+	family: string;
+	count: number;
+	bytes: number;
 }
 
 /**
@@ -626,6 +647,8 @@ export interface GcDiskSurfaceReport {
 	failed: number;
 	/** Set when the surface declined to reclaim anything because its evidence was incomplete. */
 	declined?: GcDiskDeclined;
+	/** Per-family counts and bytes. Only surfaces whose records are individual files set this. */
+	families?: GcDiskFamilyUsage[];
 	records: GcDiskRecord[];
 }
 
@@ -1328,6 +1351,185 @@ async function runGcDiskBlobs(input: {
 	}
 }
 
+/**
+ * Which family of GJC-written file a name belongs to, derived from the name's
+ * shape rather than from a list of known tools.
+ *
+ * A published artifact is `<id>.<toolType>.log` and an ID claim is
+ * `.artifact-id-<n>`, so a tool that starts writing `*.newthing.log` tomorrow is
+ * counted the day it ships. Everything else falls back to its extension, so
+ * nothing lands in the scope uncounted.
+ */
+function gcDiskArtifactFamily(name: string): string {
+	const toolLog = /^\d+\.([A-Za-z0-9_-]+)\.log$/.exec(name);
+	if (toolLog) return `*.${toolLog[1]}.log`;
+	if (/^\.artifact-id-\d+$/.test(name)) return ".artifact-id-*";
+	const extension = path.extname(name);
+	return extension ? `*${extension}` : "(no extension)";
+}
+
+function countGcDiskArtifactFamily(families: Map<string, GcDiskFamilyUsage>, name: string, bytes: number): void {
+	const family = gcDiskArtifactFamily(name);
+	const usage = families.get(family);
+	if (!usage) {
+		families.set(family, { family, count: 1, bytes });
+		return;
+	}
+	usage.count++;
+	usage.bytes += bytes;
+}
+
+/**
+ * The per-session artifact directories GJC writes its own tool output into:
+ * `<id>.<tool>.log`, `.artifact-id-<n>` ID claims, evicted-output generations.
+ *
+ * The sessions surface already counts these bytes, but only as one number per
+ * session and only reclaimable by retiring the whole session — so a scope filled
+ * by a retained session's own tool logs was both unattributable and
+ * unreclaimable. They are reported per family always, and reclaimed only for a
+ * transcript that (a) no live surface references, (b) is not the newest
+ * resumable transcript left in its project directory, and (c) holds a file that
+ * has been still for the write-grace window.
+ *
+ * The walk never leaves `sessionsRoot`: directories come from the same
+ * transcript enumeration the sessions surface uses, and inside one only regular
+ * non-symlink files are candidates. A symlink, a subdirectory, or an unstattable
+ * entry is reported as unverified and left alone — never followed, never removed.
+ */
+async function runGcDiskArtifacts(input: {
+	surface: GcDiskSurfaceReport;
+	survivors: GcDiskTranscript[];
+	references: GcSessionReferences;
+	now: number;
+	prune: boolean;
+	errors: GcDiskError[];
+}): Promise<void> {
+	const { surface, survivors, references, now, prune, errors } = input;
+
+	// Recomputed over survivors: whichever transcript the sessions surface left
+	// newest in a project directory is the `--continue` target, and a resumed
+	// session still reads its own `artifact://` handles.
+	const newestPerDirectory = new Map<string, GcDiskTranscript>();
+	for (const transcript of survivors) {
+		const current = newestPerDirectory.get(transcript.directory);
+		if (!current || transcript.mtimeMs > current.mtimeMs) newestPerDirectory.set(transcript.directory, transcript);
+	}
+
+	const families = new Map<string, GcDiskFamilyUsage>();
+	let withheld = 0;
+	let withheldBytes = 0;
+
+	for (const transcript of survivors) {
+		const directory = transcript.path.slice(0, -".jsonl".length);
+		let entries: Dirent[];
+		try {
+			entries = await fsp.readdir(directory, { withFileTypes: true });
+		} catch (error) {
+			// No artifact directory is complete evidence: this session wrote none.
+			if (!isEnoent(error)) {
+				errors.push({ surface: "artifacts", scope: directory, message: gcDiskErrorText(error) });
+			}
+			continue;
+		}
+
+		const retained = !references.complete
+			? `reference_scan_incomplete: ${references.notes.join(", ")}`
+			: references.ids.has(transcript.sessionId)
+				? "referenced_by_live_surface"
+				: newestPerDirectory.get(transcript.directory) === transcript
+					? "most_recent_resumable_session"
+					: undefined;
+
+		for (const entry of entries) {
+			if (surface.records.length >= GC_DISK_MAX_WALK_ENTRIES) {
+				errors.push({ surface: "artifacts", scope: directory, message: "artifact_walk_capped" });
+				break;
+			}
+			const target = path.join(directory, entry.name);
+			const record: GcDiskRecord = {
+				surface: "artifacts",
+				id: `${transcript.sessionId}/${entry.name}`,
+				path: target,
+				bytes: 0,
+				age_days: 0,
+				action: "keep",
+				reason: "",
+			};
+
+			// A symlink is never followed and never removed: following one is exactly
+			// how a scope cleanup reaches bytes that are not GJC's to reclaim.
+			// Anything that is not a regular file is unverified state, not an artifact.
+			if (entry.isSymbolicLink() || !entry.isFile()) {
+				record.reason = `unverified_entry: ${entry.isSymbolicLink() ? "symlink" : "not_a_regular_file"}`;
+				record.withheld = true;
+				surface.records.push(record);
+				countGcDiskArtifactFamily(families, entry.name, 0);
+				withheld++;
+				continue;
+			}
+
+			let stat: Stats;
+			try {
+				stat = await fsp.lstat(target);
+			} catch (error) {
+				// Vanished mid-walk is the opposite of withheld: it is already gone.
+				if (isEnoent(error)) continue;
+				const message = gcDiskErrorText(error);
+				errors.push({ surface: "artifacts", scope: target, message });
+				record.reason = `entry_unverifiable: ${message}`;
+				record.error = message;
+				record.withheld = true;
+				surface.records.push(record);
+				countGcDiskArtifactFamily(families, entry.name, 0);
+				withheld++;
+				continue;
+			}
+
+			record.bytes = stat.size;
+			record.age_days = gcDiskAgeDays(now, stat.mtimeMs);
+			surface.records.push(record);
+			countGcDiskArtifactFamily(families, entry.name, stat.size);
+
+			if (retained !== undefined) {
+				record.reason = retained;
+				if (!references.complete) {
+					record.withheld = true;
+					withheld++;
+					withheldBytes += record.bytes;
+				}
+				continue;
+			}
+			if (now - stat.mtimeMs < GC_DISK_BLOB_GRACE_MS) {
+				record.reason = "within_write_grace_window";
+				continue;
+			}
+			record.action = "would_reclaim";
+			record.reason = "unreferenced_by_any_live_session";
+
+			if (!prune) continue;
+			const removal = await removeGcDiskEntry(target, stat);
+			if (removal.removed) record.action = "reclaimed";
+			else if (removal.failed) {
+				record.action = "reclaim_failed";
+				record.reason = removal.reason;
+				record.error = removal.reason;
+			} else {
+				record.action = "keep";
+				record.reason = removal.reason;
+				if (removal.withheld) record.withheld = true;
+			}
+		}
+	}
+
+	surface.families = [...families.values()].sort((a, b) => b.bytes - a.bytes || a.family.localeCompare(b.family));
+	if (!references.complete) {
+		surface.declined = {
+			reason: `reference_scan_incomplete: ${references.notes.join(", ")}`,
+			withheld,
+			withheld_bytes: withheldBytes,
+		};
+	}
+}
 /** Numeric `major.minor.patch` prefix, or undefined when the name is not a version. */
 function parseGcDiskVersion(value: string): [number, number, number] | undefined {
 	const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(value);
@@ -1649,6 +1851,7 @@ export async function collectGcDiskReport(input: {
 	const surfaces: Record<GcDiskSurface, GcDiskSurfaceReport> = {
 		sessions: emptyGcDiskSurface("sessions", getSessionsDir(agentDir)),
 		blobs: emptyGcDiskSurface("blobs", getBlobsDir(agentDir)),
+		artifacts: emptyGcDiskSurface("artifacts", getSessionsDir(agentDir)),
 		natives: emptyGcDiskSurface("natives", path.join(gjcRoot, "natives")),
 		backups: emptyGcDiskSurface("backups", path.join(gjcRoot, "backups")),
 	};
@@ -1673,6 +1876,7 @@ export async function collectGcDiskReport(input: {
 		prune,
 		errors,
 	});
+	await runGcDiskArtifacts({ surface: surfaces.artifacts, survivors, references, now, prune, errors });
 	await runGcDiskNatives({
 		surface: surfaces.natives,
 		policy,
@@ -1687,10 +1891,15 @@ export async function collectGcDiskReport(input: {
 	for (const name of GC_DISK_SURFACES) {
 		const surface = surfaces[name];
 		summarizeGcDiskSurface(surface);
-		totals.scanned_bytes += surface.scanned_bytes;
+		// The artifacts surface re-attributes bytes the sessions surface already
+		// counted inside surviving sessions, so only what it can act on is added:
+		// summing its scan too would report more bytes than exist on disk.
+		if (name !== "artifacts") {
+			totals.scanned_bytes += surface.scanned_bytes;
+			totals.kept_bytes += surface.kept_bytes;
+		}
 		totals.reclaimable_bytes += surface.reclaimable_bytes;
 		totals.reclaimed_bytes += surface.reclaimed_bytes;
-		totals.kept_bytes += surface.kept_bytes;
 		totals.failed += surface.failed;
 	}
 
@@ -1700,6 +1909,7 @@ export async function collectGcDiskReport(input: {
 const GC_DISK_SURFACE_HEADINGS: Record<GcDiskSurface, string> = {
 	sessions: "Session transcripts",
 	blobs: "Content-addressed blobs",
+	artifacts: "Session tool artifacts",
 	natives: "Cached native versions",
 	backups: "Update/restore backups",
 };
@@ -1759,6 +1969,11 @@ export function buildGcDiskReportText(disk: GcDiskReport): string {
 				`  declined: reclaimed nothing — ${surface.declined.reason} ` +
 					`(withheld=${surface.declined.withheld} (${formatGcDiskBytes(surface.declined.withheld_bytes)}))`,
 			);
+		}
+		// The per-file records below say what may go; the family rollup is what
+		// answers "what filled this scope?", so it is never truncated.
+		for (const family of surface.families ?? []) {
+			lines.push(`  family ${family.family} count=${family.count} (${formatGcDiskBytes(family.bytes)})`);
 		}
 		// Reclaim decisions first: they are what an operator has to audit.
 		const ranked = [...surface.records].sort(

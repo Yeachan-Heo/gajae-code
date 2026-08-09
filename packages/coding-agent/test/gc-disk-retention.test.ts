@@ -9,6 +9,7 @@ import {
 	GC_DISK_POLICY_DEFAULTS,
 	type GcDiskPolicy,
 	type GcDiskReport,
+	type GcDiskSurface,
 	type GcPruneOutcome,
 	type GcRecord,
 	type GcReport,
@@ -97,6 +98,24 @@ async function writeSession(
 	return file;
 }
 
+/** GJC's own tool artifacts for a session: `<id>.<tool>.log` payloads and ID claims. */
+async function writeArtifacts(
+	fixture: TestRoot,
+	project: string,
+	id: string,
+	files: Record<string, string>,
+	ageDays: number,
+): Promise<string> {
+	const directory = path.join(fixture.sessionsRoot, project, id);
+	await fsp.mkdir(directory, { recursive: true });
+	for (const [name, content] of Object.entries(files)) {
+		const file = path.join(directory, name);
+		await Bun.write(file, content);
+		await backdate(file, ageDays);
+	}
+	return directory;
+}
+
 async function writeBlob(fixture: TestRoot, content: string, ageDays: number): Promise<string> {
 	await fsp.mkdir(fixture.blobsDir, { recursive: true, mode: 0o700 });
 	const hash = new Bun.SHA256().update(content).digest("hex");
@@ -161,7 +180,7 @@ function requireDisk(report: GcReport): GcDiskReport {
 	return report.disk;
 }
 
-function reasonById(disk: GcDiskReport, surface: "sessions" | "blobs" | "natives" | "backups"): Map<string, string> {
+function reasonById(disk: GcDiskReport, surface: GcDiskSurface): Map<string, string> {
 	return new Map(disk.surfaces[surface].records.map(record => [record.id, `${record.action}:${record.reason}`]));
 }
 
@@ -1262,6 +1281,245 @@ describe("gjc gc --disk (backups retention)", () => {
 			expect(await fsp.readdir(fixture.backupsDir)).toEqual([]);
 		} finally {
 			spy.mockRestore();
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("gjc gc --disk (session tool artifacts)", () => {
+	const payload = {
+		"1.bash.log": "b".repeat(100),
+		"2.bash.log": "b".repeat(200),
+		"3.edit.log": "e".repeat(50),
+		"4.subagent.log": "s".repeat(70),
+		"5.search.log": "r".repeat(30),
+		"6.tool-output.9f2a.output": "o".repeat(11),
+		".artifact-id-7": "",
+	};
+	const payloadBytes = 100 + 200 + 50 + 70 + 30 + 11;
+
+	test("reports every artifact family with counts and byte totals", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			await writeArtifacts(fixture, "repo-a", "worked-session", payload, 10);
+
+			const before = await snapshotTree(fixture.root);
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--json"]));
+			expect(await snapshotTree(fixture.root)).toEqual(before);
+
+			// Families are derived from the filename shape, so a tool nobody
+			// hardcoded here (`*.output`) is still attributed.
+			expect(disk.surfaces.artifacts.families).toEqual([
+				{ family: "*.bash.log", count: 2, bytes: 300 },
+				{ family: "*.subagent.log", count: 1, bytes: 70 },
+				{ family: "*.edit.log", count: 1, bytes: 50 },
+				{ family: "*.search.log", count: 1, bytes: 30 },
+				{ family: "*.output", count: 1, bytes: 11 },
+				{ family: ".artifact-id-*", count: 1, bytes: 0 },
+			]);
+			expect(disk.surfaces.artifacts.scanned).toBe(7);
+			expect(disk.surfaces.artifacts.scanned_bytes).toBe(payloadBytes);
+			expect(disk.surfaces.artifacts.reclaimable).toBe(7);
+			expect(disk.surfaces.artifacts.reclaimable_bytes).toBe(payloadBytes);
+
+			// The sessions surface still keeps this session, which is why nothing
+			// used to reclaim these bytes.
+			expect(reasonById(disk, "sessions").get("worked-session")).toBe("keep:newer_than_max_age(30d)");
+
+			const text = await runGjcGcCommand(["--disk"], fixture.root, fixture.env, [], policy());
+			expect(text.stdout).toContain("Session tool artifacts");
+			expect(text.stdout).toContain("family *.bash.log count=2 (300 B)");
+			expect(text.stdout).toContain("family .artifact-id-* count=1 (0 B)");
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("--prune removes artifacts and reports what it removed", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const transcript = await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			const directory = await writeArtifacts(fixture, "repo-a", "worked-session", payload, 10);
+
+			const dry = requireDisk(await runDisk(fixture, ["--disk", "--json"]));
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+
+			expect(disk.surfaces.artifacts.reclaimed).toBe(dry.surfaces.artifacts.reclaimable);
+			expect(disk.surfaces.artifacts.reclaimed_bytes).toBe(dry.surfaces.artifacts.reclaimable_bytes);
+			expect(disk.surfaces.artifacts.reclaimed_bytes).toBe(payloadBytes);
+			expect(disk.surfaces.artifacts.failed).toBe(0);
+			expect(reasonById(disk, "artifacts").get("worked-session/2.bash.log")).toBe(
+				"reclaimed:unreferenced_by_any_live_session",
+			);
+			expect(reasonById(disk, "artifacts").get("worked-session/.artifact-id-7")).toBe(
+				"reclaimed:unreferenced_by_any_live_session",
+			);
+			expect(disk.totals.reclaimed_bytes).toBeGreaterThanOrEqual(payloadBytes);
+
+			expect(await fsp.readdir(directory)).toEqual([]);
+			// The transcript itself is user-visible history and is not artifact bytes.
+			expect(await Bun.file(transcript).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("--prune skips and reports an entry it cannot verify as an artifact file", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			const directory = await writeArtifacts(fixture, "repo-a", "worked-session", payload, 10);
+
+			// A symlink out of the managed scope is the exact way a cleanup could
+			// turn into data loss, and a subdirectory is state the walk did not write.
+			const outside = path.join(fixture.root, "outside");
+			await fsp.mkdir(outside, { recursive: true });
+			const userData = path.join(outside, "user-data.txt");
+			await Bun.write(userData, "not gc's to delete");
+			await fsp.symlink(userData, path.join(directory, "8.bash.log"));
+			await fsp.mkdir(path.join(directory, "nested"), { recursive: true });
+			await Bun.write(path.join(directory, "nested", "inner.bin"), "keep me");
+
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			const reasons = reasonById(disk, "artifacts");
+
+			expect(reasons.get("worked-session/8.bash.log")).toBe("keep:unverified_entry: symlink");
+			expect(reasons.get("worked-session/nested")).toBe("keep:unverified_entry: not_a_regular_file");
+			for (const name of ["8.bash.log", "nested"]) {
+				const record = disk.surfaces.artifacts.records.find(entry => entry.id === `worked-session/${name}`);
+				expect(record?.withheld).toBe(true);
+				expect(record?.bytes).toBe(0);
+			}
+
+			// Skipped, not followed and not removed.
+			expect(await Bun.file(userData).exists()).toBe(true);
+			expect((await fsp.lstat(path.join(directory, "8.bash.log"))).isSymbolicLink()).toBe(true);
+			expect(await Bun.file(path.join(directory, "nested", "inner.bin")).exists()).toBe(true);
+			// A skipped entry never suppresses the verifiable ones.
+			expect(disk.surfaces.artifacts.reclaimed_bytes).toBe(payloadBytes);
+			for (const record of disk.surfaces.artifacts.records) {
+				expect(record.path.startsWith(`${fixture.sessionsRoot}${path.sep}`)).toBe(true);
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("never removes artifacts of a session a live surface still references", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			await writeSession(fixture, "repo-a", "leased-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			const directory = await writeArtifacts(fixture, "repo-a", "leased-session", payload, 10);
+			await writeHarnessRegistry(fixture, "leased-session");
+
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+
+			expect(reasonById(disk, "artifacts").get("leased-session/2.bash.log")).toBe(
+				"keep:referenced_by_live_surface",
+			);
+			expect(disk.surfaces.artifacts.reclaimed).toBe(0);
+			expect(disk.surfaces.artifacts.kept_bytes).toBe(payloadBytes);
+			expect((await fsp.readdir(directory)).sort()).toEqual(Object.keys(payload).sort());
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps artifacts a session may still be writing, and its resume target", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			// Freshly written: an open log of a session gc cannot prove is idle.
+			await writeArtifacts(fixture, "repo-a", "worked-session", { "9.bash.log": "still writing" }, 0);
+			await writeArtifacts(fixture, "repo-a", "newest-session", { "1.bash.log": "resume target" }, 10);
+
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			const reasons = reasonById(disk, "artifacts");
+
+			expect(reasons.get("worked-session/9.bash.log")).toBe("keep:within_write_grace_window");
+			expect(reasons.get("newest-session/1.bash.log")).toBe("keep:most_recent_resumable_session");
+			expect(disk.surfaces.artifacts.reclaimed).toBe(0);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("reclaims nothing and names the reason when the live-surface scan is incomplete", async () => {
+		const fixture = await makeTestRoot();
+		const localRoots = path.join(fixture.env.TMPDIR!, "gjc-local");
+		try {
+			await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			const directory = await writeArtifacts(fixture, "repo-a", "worked-session", payload, 10);
+			// An unreadable `local://` root parent means gc cannot enumerate every
+			// live session, so it may not prove any session is idle.
+			await fsp.mkdir(localRoots, { recursive: true });
+			await fsp.chmod(localRoots, 0o000);
+
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			await fsp.chmod(localRoots, 0o700);
+
+			expect(reasonById(disk, "artifacts").get("worked-session/2.bash.log")).toBe(
+				"keep:reference_scan_incomplete: local_root_parent_unreadable",
+			);
+			expect(disk.surfaces.artifacts.declined).toEqual({
+				reason: "reference_scan_incomplete: local_root_parent_unreadable",
+				withheld: 7,
+				withheld_bytes: payloadBytes,
+			});
+			expect(disk.surfaces.artifacts.reclaimed).toBe(0);
+			expect((await fsp.readdir(directory)).sort()).toEqual(Object.keys(payload).sort());
+		} finally {
+			await fsp.chmod(localRoots, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("leaves the sessions, blobs, natives and backups surfaces reporting as before", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
+			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });
+			await writeArtifacts(fixture, "repo-a", "worked-session", payload, 10);
+			await writeBlob(fixture, "unreferenced blob payload", 5);
+			await writeNativesVersion(fixture, "0.0.1");
+
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--json"], { natives_keep_versions: 0 }));
+
+			// Only the artifacts surface carries a family rollup.
+			for (const surface of ["sessions", "blobs", "natives", "backups"] as const) {
+				expect(disk.surfaces[surface].families).toBeUndefined();
+			}
+			// Session bytes still include the artifact tree they would take with them.
+			const session = disk.surfaces.sessions.records.find(record => record.id === "worked-session");
+			expect(session?.bytes).toBeGreaterThan(payloadBytes);
+			// Totals stay the four legacy surfaces, so artifact bytes are not counted twice.
+			expect(disk.totals.scanned_bytes).toBe(
+				disk.surfaces.sessions.scanned_bytes +
+					disk.surfaces.blobs.scanned_bytes +
+					disk.surfaces.natives.scanned_bytes +
+					disk.surfaces.backups.scanned_bytes,
+			);
+			expect(disk.totals.kept_bytes).toBe(
+				disk.surfaces.sessions.kept_bytes +
+					disk.surfaces.blobs.kept_bytes +
+					disk.surfaces.natives.kept_bytes +
+					disk.surfaces.backups.kept_bytes,
+			);
+			expect(disk.totals.reclaimable_bytes).toBe(
+				disk.surfaces.sessions.reclaimable_bytes +
+					disk.surfaces.blobs.reclaimable_bytes +
+					disk.surfaces.artifacts.reclaimable_bytes +
+					disk.surfaces.natives.reclaimable_bytes +
+					disk.surfaces.backups.reclaimable_bytes,
+			);
+		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
 	});
