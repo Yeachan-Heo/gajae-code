@@ -613,7 +613,7 @@ export class SlackNotificationDaemon {
 		} else {
 			const publication =
 				existing?.record.state === "active"
-					? await this.#resumeWithRootPublication(sessionId, body, generation)
+					? await this.#resumeWithRootPublication(sessionId, body, generation, rootPublication?.clientMsgId)
 					: await this.#postRoot(sessionId, body, generation, rootPublication?.clientMsgId);
 			conversation = publication.conversation;
 			bodyWasUsedAsRoot ||= publication.created;
@@ -795,14 +795,28 @@ export class SlackNotificationDaemon {
 		return true;
 	}
 
-	async resume(sessionId: string, body: string, endpointGeneration?: number): Promise<SlackConversation> {
-		return (await this.#resumeWithRootPublication(sessionId, body, endpointGeneration)).conversation;
+	async resume(
+		sessionId: string,
+		body: string,
+		endpointGeneration?: number,
+		publicationId?: string,
+	): Promise<SlackConversation> {
+		const rootPublication =
+			publicationId === undefined
+				? undefined
+				: await this.#publicationAttempt(
+						`root:${sessionId}:${publicationId}`,
+						clientMsgId => `root:${sessionId}:${clientMsgId}`,
+					);
+		return (await this.#resumeWithRootPublication(sessionId, body, endpointGeneration, rootPublication?.clientMsgId))
+			.conversation;
 	}
 
 	async #resumeWithRootPublication(
 		sessionId: string,
 		body: string,
 		endpointGeneration?: number,
+		requestedClientMsgId?: string,
 	): Promise<SlackRootPublication> {
 		const inFlight = this.#rollovers.get(sessionId);
 		if (inFlight) {
@@ -812,9 +826,9 @@ export class SlackNotificationDaemon {
 				return { conversation: publication.conversation, created: false };
 			if (endpointGeneration < activeGeneration)
 				throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
-			return await this.#resumeWithRootPublication(sessionId, body, endpointGeneration);
+			return await this.#resumeWithRootPublication(sessionId, body, endpointGeneration, requestedClientMsgId);
 		}
-		const rollover = this.#resumeRoot(sessionId, body, endpointGeneration);
+		const rollover = this.#resumeRoot(sessionId, body, endpointGeneration, requestedClientMsgId);
 		this.#rollovers.set(sessionId, rollover);
 		try {
 			return await rollover;
@@ -823,7 +837,12 @@ export class SlackNotificationDaemon {
 		}
 	}
 
-	async #resumeRoot(sessionId: string, body: string, endpointGeneration?: number): Promise<SlackRootPublication> {
+	async #resumeRoot(
+		sessionId: string,
+		body: string,
+		endpointGeneration?: number,
+		requestedClientMsgId?: string,
+	): Promise<SlackRootPublication> {
 		const endpoint = await this.#resolveEndpoint(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack root rollover requires the current session endpoint.");
@@ -838,7 +857,7 @@ export class SlackNotificationDaemon {
 				previous = { key: previous.key, record: reconciled };
 				waitedForRollover = true;
 			}
-			if (!previous) return await this.#postRoot(sessionId, body, generation);
+			if (!previous) return await this.#postRoot(sessionId, body, generation, requestedClientMsgId);
 			if (previous.record.state !== "active") {
 				if (
 					previous.record.rootPublicationOwner !== this.#publicationOwnerId &&
@@ -848,7 +867,7 @@ export class SlackNotificationDaemon {
 					await Bun.sleep(10);
 					continue;
 				}
-				return await this.#postRoot(sessionId, body, generation);
+				return await this.#postRoot(sessionId, body, generation, requestedClientMsgId);
 			}
 			const previousGeneration = this.#requireEndpointGeneration(previous.record);
 			if (previousGeneration > generation)
@@ -909,7 +928,7 @@ export class SlackNotificationDaemon {
 				resumed.rootPublicationOwner === this.#publicationOwnerId &&
 				resumed.rootPublicationFence === fence
 			)
-				return await this.#postRoot(sessionId, body, generation);
+				return await this.#postRoot(sessionId, body, generation, requestedClientMsgId);
 			waitedForRollover = true;
 			await Bun.sleep(10);
 		}

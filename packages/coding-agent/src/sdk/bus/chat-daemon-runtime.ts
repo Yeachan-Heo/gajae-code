@@ -1191,12 +1191,7 @@ export class ChatDaemonRuntime {
 		await this.#slack?.close(sessionId);
 	}
 
-	private async resume(
-		sessionId: string,
-		generation: number,
-		content: string,
-		publicationId?: string,
-	): Promise<void> {
+	private async resume(sessionId: string, generation: number, content: string, publicationId?: string): Promise<void> {
 		if (this.#discord) {
 			await this.#discord.resume(sessionId, generation);
 			await this.#discord.notify({

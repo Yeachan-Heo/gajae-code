@@ -5,8 +5,8 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
-import type { DiscordMessageComponent, DiscordProvider, DiscordThread } from "../src/sdk/bus/discord-provider";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
+import type { DiscordMessageComponent, DiscordProvider, DiscordThread } from "../src/sdk/bus/discord-provider";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import type { SlackProviderClient } from "../src/sdk/bus/slack-provider";
 import { ACP_SESSION_RECONNECT } from "../src/sdk/session-reconnect";
@@ -120,7 +120,12 @@ class FakeDiscordProvider implements DiscordProvider {
 	async start(): Promise<void> {}
 	async stop(): Promise<void> {}
 
-	async createThread(input: { guildId: string; parentId: string; name: string; nonce: string }): Promise<DiscordThread> {
+	async createThread(input: {
+		guildId: string;
+		parentId: string;
+		name: string;
+		nonce: string;
+	}): Promise<DiscordThread> {
 		const existing = this.#threadsByNonce.get(input.nonce);
 		if (existing) return existing;
 		const thread = {
@@ -138,8 +143,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	}
 
 	async findMessageByNonce(input: { threadId: string; nonce: string }): Promise<{ id: string } | null> {
-		if (input.nonce === this.reconciliationFailureNonce)
-			throw new Error("discord reconciliation is unavailable");
+		if (input.nonce === this.reconciliationFailureNonce) throw new Error("discord reconciliation is unavailable");
 		const message = this.#messagesByNonce.get(input.nonce);
 		return message?.threadId === input.threadId ? { id: message.id } : null;
 	}
@@ -1305,6 +1309,31 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 	});
 }, 20_000);
 
+test("an ambiguously acknowledged Slack session-ready publication is not posted twice", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			provider.acceptThenThrowPosts = 1;
+			host.emitSessionReady();
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(100);
+
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC session ready."]);
+			expect(
+				provider.postAttempts.filter(post => post.text === "GJC session ready.").map(post => post.clientMsgId),
+			).toEqual([provider.posts[0]?.clientMsgId, provider.posts[0]?.clientMsgId]);
+		});
+	});
+}, 20_000);
 test("an ambiguously acknowledged Discord session-ready publication is not posted twice", async () => {
 	await withAttachedDiscordRuntime(async ({ runtime, provider, reconcile }) => {
 		await withFakeTransport(async () => {
