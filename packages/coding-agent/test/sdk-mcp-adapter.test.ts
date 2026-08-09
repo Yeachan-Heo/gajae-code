@@ -64,7 +64,11 @@ function fixture() {
  * the fixture broker through `ensureBroker` (external discovery) instead of
  * spawning a real one. `connect` stubs route on this URL.
  */
-function brokerFixture(repo: string, session: { sessionId: string; url: string; token: string }) {
+function brokerFixture(
+	repo: string,
+	session: { sessionId: string; url: string; token: string },
+	sessions?: Array<Record<string, unknown>>,
+) {
 	const agentDir = path.join(repo, "agent");
 	const brokerDir = path.join(agentDir, "sdk");
 	fs.mkdirSync(brokerDir, { recursive: true });
@@ -95,26 +99,36 @@ function brokerFixture(repo: string, session: { sessionId: string; url: string; 
 		client: () =>
 			({
 				global: async (operation: string, input: Record<string, unknown>) => {
-					if (operation === "session.list")
-						return {
-							ok: true,
-							result: {
-								indexSeq: 1,
-								sessions: [
-									{
-										sessionId: session.sessionId,
-										locator: { repo, stateRoot: path.join(repo, ".gjc", "state") },
-										endpointGeneration: 1,
-										pid: process.pid,
-										live: true,
-										indexSeq: 1,
-										ambiguous: false,
-										terminal: false,
-									},
-								],
-								warnings: [],
-							},
-						};
+					if (operation === "session.list") {
+						const rows =
+							sessions ??
+							([
+								{
+									sessionId: session.sessionId,
+									locator: { repo, stateRoot: path.join(repo, ".gjc", "state") },
+									endpointGeneration: 1,
+									pid: process.pid,
+									live: true,
+									indexSeq: 1,
+									ambiguous: false,
+									terminal: false,
+								},
+							] satisfies Array<Record<string, unknown>>);
+						if (rows.length > 100) {
+							if (input.cursor === "page-2")
+								return { ok: true, result: { indexSeq: 1, sessions: rows.slice(100), warnings: [] } };
+							return {
+								ok: true,
+								result: {
+									indexSeq: 1,
+									sessions: rows.slice(0, 100),
+									warnings: [],
+									continuationCursor: "page-2",
+								},
+							};
+						}
+						return { ok: true, result: { indexSeq: 1, sessions: rows, warnings: [] } };
+					}
 					if (operation === "session.get_endpoint" && input.sessionId === session.sessionId)
 						return { ok: true, result: { sessionId: session.sessionId, url: session.url, token: session.token } };
 					return { ok: false, error: { code: "resource_gone", message: "session endpoint record is gone" } };
@@ -353,4 +367,35 @@ test("MCP SDK control/query tools use discovered live session endpoints and unkn
 	await expect(
 		mcp.callTool("gjc_session_query", { sessionId: "missing", query: "session.metadata" }),
 	).resolves.toEqual({ ok: false, error: expect.objectContaining({ code: "not_found" }) });
+});
+test("MCP session list and resolution see entries beyond the first 100-session page", async () => {
+	const { repo, url } = fixture();
+	// The broker's session.list page limit is 100; the live session is the
+	// 150th row, so list/resolution must exhaust cursor pagination.
+	const rows = Array.from({ length: 150 }, (_, index) => ({
+		sessionId: `sess-${index + 1}`,
+		live: index === 149,
+		ambiguous: false,
+	}));
+	const broker = brokerFixture(repo, { sessionId: "sess-150", url, token: "sdk-mcp-test-token" }, rows);
+	const mcp = createSdkMcpServer({
+		repo,
+		agentDir: broker.agentDir,
+		connect: async (target, token) => (target === broker.url ? broker.client() : SdkClient.connect(target, token)),
+	});
+	const listed = (await mcp.callTool("gjc_session_list", {})) as {
+		ok: boolean;
+		sessions: Array<{ sessionId: string }>;
+	};
+	expect(listed.ok).toBe(true);
+	expect(listed.sessions).toHaveLength(150);
+	expect(listed.sessions).toContainEqual({ sessionId: "sess-150" });
+	// withSession resolves the beyond-page row and reaches its live endpoint.
+	await expect(
+		mcp.callTool("gjc_session_control", {
+			sessionId: "sess-150",
+			operation: "turn.prompt",
+			input: { text: "hello" },
+		}),
+	).resolves.toMatchObject({ ok: true, echoed: { operation: "turn.prompt" } });
 });

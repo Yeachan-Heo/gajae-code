@@ -3,6 +3,8 @@ import { CliParseError } from "@gajae-code/utils/cli";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { DEFAULT_PENDING_CEILING_BYTES, MIN_PENDING_CEILING_BYTES, startSocketServe, startStdioServe } from "./index";
 
+const MAX_SESSION_LIST_PAGES = 10_000;
+
 type ServeMode = { kind: "stdio" } | { kind: "socket"; socketPath: string };
 
 interface ServeArguments {
@@ -91,8 +93,28 @@ function brokerSessionRows(value: Record<string, unknown>): BrokerSessionRow[] {
 	});
 }
 
-/** Selects the session to serve through broker `session.list` truth (C10). */
-function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessionId: string | undefined): string {
+/**
+ * Exhausts broker `session.list` cursor pagination (default page limit 100) to
+ * one full snapshot; exported for tests.
+ */
+export async function listBrokerSessions(broker: SdkClient): Promise<BrokerSessionRow[]> {
+	const rows: BrokerSessionRow[] = [];
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+		const listed = brokerResult(await broker.global("session.list", cursor === undefined ? {} : { cursor }));
+		rows.push(...brokerSessionRows(listed));
+		const nextCursor =
+			typeof listed.continuationCursor === "string" && listed.continuationCursor.length > 0
+				? listed.continuationCursor
+				: undefined;
+		if (!nextCursor) return rows;
+		cursor = nextCursor;
+	}
+	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+}
+
+/** Selects the session to serve through broker `session.list` truth (C10); exported for tests. */
+export function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessionId: string | undefined): string {
 	if (explicitSessionId !== undefined) {
 		const row = sessions.find(session => session.sessionId === explicitSessionId);
 		if (!row) throw new Error(`not_found: session ${explicitSessionId} is not indexed by the broker`);
@@ -129,8 +151,7 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		throw new Error("broker_unavailable: SDK broker is not reachable");
 	}
 	try {
-		const listed = brokerResult(await broker.global("session.list", {}));
-		const sessionId = selectBrokerSession(brokerSessionRows(listed), parsed.sessionId);
+		const sessionId = selectBrokerSession(await listBrokerSessions(broker), parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
 		const token = typeof endpoint.token === "string" ? endpoint.token : "";

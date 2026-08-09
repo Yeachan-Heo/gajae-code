@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { withFileLock } from "../../config/file-lock";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "../broker/state-version";
 import {
 	canonicalGuideManifestBytes,
@@ -23,14 +24,15 @@ import {
  *
  * Layout under `<agentDir>/sdk/guides/cache/` (mode 0700):
  *   meta.json — atomic commit pointer {version, manifestId, sequence, generation, installedAt}
+ *   meta.json.lock — cross-process install lock (project `withFileLock` convention)
  *   generations/<generation>/manifest.json — canonical manifest bytes
  *   generations/<generation>/manifest.sig — detached Ed25519 signature
  *   generations/<generation>/guides/<sha256> — immutable advisory text
  *
  * A complete generation is written and fsynced before `meta.json` is atomically
- * replaced. Readers follow only the committed generation, so an interrupted
- * install cannot expose a new manifest with stale metadata or disturb the
- * previously valid cache.
+ * replaced under the install lock. Readers follow only the committed
+ * generation, so an interrupted install cannot expose a new manifest with
+ * stale metadata or disturb the previously valid cache.
  */
 export interface GuideCacheMetaV1 {
 	version: typeof SDK_STATE_VERSION;
@@ -244,11 +246,16 @@ async function syncDirectory(dir: string): Promise<void> {
  * Order of operations:
  *   1. Verify the manifest signature, expiry, and every advisory hash before
  *      any write — a tampered or expired payload never touches disk.
- *   2. Enforce the monotonic version floor against the committed meta record
- *      (`rollback` when the candidate does not advance the channel).
+ *   2. Under the cache's cross-process install lock, enforce the monotonic
+ *      version floor against the committed meta record (`rollback` when the
+ *      candidate does not advance the channel).
  *   3. Write and fsync a complete immutable generation, then atomically replace
  *      `meta.json` as the only commit pointer.
  *
+ * Steps 2–3 are serialized with `<cacheDir>/meta.json.lock` (the project's
+ * `withFileLock` convention): the floor is re-read under the same lock that
+ * guards the commit pointer replacement, so a concurrent install can never
+ * read an older floor, observe a newer commit, and then downgrade the channel.
  * Any failure aborts before the commit, leaving the prior valid cache fully
  * intact and readable.
  */
@@ -279,72 +286,74 @@ export async function installGuideCache(params: {
 	}
 
 	const dir = guideCacheDir(params.agentDir);
-	const generationsDir = path.join(dir, "generations");
-	let priorMeta: GuideCacheMetaV1 | undefined;
+	const metaPath = path.join(dir, "meta.json");
 	try {
-		const metaRaw = await readBoundedBytes(path.join(dir, "meta.json"), GUIDE_CACHE_META_MAX_BYTES);
-		if (metaRaw !== undefined) {
-			let metaValue: unknown;
+		return await withFileLock(metaPath, async () => {
+			let priorMeta: GuideCacheMetaV1 | undefined;
 			try {
-				metaValue = parseFatalUtf8Json(metaRaw);
-			} catch {
-				return installFailure("corrupt_cache", "Existing guide cache meta.json is not valid UTF-8 JSON.");
-			}
-			try {
-				assertSupportedStateVersion(path.join(dir, "meta.json"), metaValue);
+				const metaRaw = await readBoundedBytes(metaPath, GUIDE_CACHE_META_MAX_BYTES);
+				if (metaRaw !== undefined) {
+					let metaValue: unknown;
+					try {
+						metaValue = parseFatalUtf8Json(metaRaw);
+					} catch {
+						return installFailure("corrupt_cache", "Existing guide cache meta.json is not valid UTF-8 JSON.");
+					}
+					try {
+						assertSupportedStateVersion(metaPath, metaValue);
+					} catch (error) {
+						if (error instanceof Error && "code" in error && error.code === "unsupported_state_version")
+							return installFailure("unsupported_state_version", error.message);
+						throw error;
+					}
+					if (!isGuideCacheMetaV1(metaValue))
+						return installFailure("corrupt_cache", "Existing guide cache meta.json is malformed.");
+					priorMeta = metaValue;
+				}
 			} catch (error) {
-				if (error instanceof Error && "code" in error && error.code === "unsupported_state_version")
-					return installFailure("unsupported_state_version", error.message);
-				throw error;
+				return installFailure(
+					"io_error",
+					`Guide cache meta could not be read: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
-			if (!isGuideCacheMetaV1(metaValue))
-				return installFailure("corrupt_cache", "Existing guide cache meta.json is malformed.");
-			priorMeta = metaValue;
-		}
-	} catch (error) {
-		return installFailure(
-			"io_error",
-			`Guide cache meta could not be read: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
 
-	const floor = guideRollbackCheck(priorMeta, manifest);
-	if (!floor.ok) return installFailure(floor.error.code, floor.error.message);
+			const floor = guideRollbackCheck(priorMeta, manifest);
+			if (!floor.ok) return installFailure(floor.error.code, floor.error.message);
 
-	try {
-		const generation = `${manifest.sequence}-${randomUUID()}`;
-		const generationDir = path.join(generationsDir, generation);
-		const guidesDir = path.join(generationDir, "guides");
-		await fs.mkdir(guidesDir, { recursive: true, mode: 0o700 });
-		for (const advisory of advisories) {
-			await writeVerifiedTemp(path.join(guidesDir, advisory.entry.sha256), advisory.text);
-		}
-		await writeVerifiedTemp(path.join(generationDir, "manifest.json"), canonicalGuideManifestBytes(manifest));
-		await writeVerifiedTemp(path.join(generationDir, "manifest.sig"), Buffer.from(signatureBytes));
-		await syncDirectory(generationDir);
-		const meta: GuideCacheMetaV1 = {
-			version: SDK_STATE_VERSION,
-			manifestId: manifest.manifestId,
-			sequence: manifest.sequence,
-			installedAt: now,
-			generation,
-		};
-		await writeVerifiedTemp(path.join(dir, "meta.json"), Buffer.from(`${JSON.stringify(meta)}\n`));
-		await syncDirectory(dir);
-		return {
-			ok: true,
-			value: {
-				manifest,
-				signatureBytes,
-				meta,
-				guides: advisories.map(advisory => ({
-					id: advisory.entry.id,
-					title: advisory.entry.title,
-					sha256: advisory.entry.sha256,
-					text: guideUtf8Decoder.decode(advisory.text),
-				})),
-			},
-		};
+			const generation = `${manifest.sequence}-${randomUUID()}`;
+			const generationDir = path.join(dir, "generations", generation);
+			const guidesDir = path.join(generationDir, "guides");
+			await fs.mkdir(guidesDir, { recursive: true, mode: 0o700 });
+			for (const advisory of advisories) {
+				await writeVerifiedTemp(path.join(guidesDir, advisory.entry.sha256), advisory.text);
+			}
+			await writeVerifiedTemp(path.join(generationDir, "manifest.json"), canonicalGuideManifestBytes(manifest));
+			await writeVerifiedTemp(path.join(generationDir, "manifest.sig"), Buffer.from(signatureBytes));
+			await syncDirectory(generationDir);
+			const meta: GuideCacheMetaV1 = {
+				version: SDK_STATE_VERSION,
+				manifestId: manifest.manifestId,
+				sequence: manifest.sequence,
+				installedAt: now,
+				generation,
+			};
+			await writeVerifiedTemp(metaPath, Buffer.from(`${JSON.stringify(meta)}\n`));
+			await syncDirectory(dir);
+			return {
+				ok: true,
+				value: {
+					manifest,
+					signatureBytes,
+					meta,
+					guides: advisories.map(advisory => ({
+						id: advisory.entry.id,
+						title: advisory.entry.title,
+						sha256: advisory.entry.sha256,
+						text: guideUtf8Decoder.decode(advisory.text),
+					})),
+				},
+			};
+		});
 	} catch (error) {
 		return installFailure(
 			"io_error",

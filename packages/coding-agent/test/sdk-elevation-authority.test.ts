@@ -368,4 +368,46 @@ describe("SDK elevation authority", () => {
 		if (!unavailable.ok) throw new Error("unavailable answer failed");
 		expect(unavailable.value.outcome).toBe("target_unavailable");
 	});
+	it("binds a delete grant against a retained stopped session identity like any other identity", async () => {
+		const { ledger } = await freshLedger();
+		const stopped = sessionIdentity();
+		const issued = await ledger.issue({
+			elevationRequestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+			operation: { kind: "global", sdkId: "session.delete" },
+			input: { sessionId: stopped.sessionId },
+			sessionIdentity: stopped,
+			principal: principal(),
+			requester: requester(),
+		});
+		expect(issued.ok).toBe(true);
+		if (!issued.ok) throw new Error("issue failed");
+		const answered = await ledger.answer({
+			elevationRequestId: issued.value.elevationRequestId,
+			answer: "approve",
+			presentedDigest: issued.value.requestDigest,
+			principal: principal(),
+			answerer: { source: "local_operator", attestedBy: "tui-operator" },
+			currentSessionIdentity: stopped,
+		});
+		expect(answered.ok).toBe(true);
+		if (!answered.ok) throw new Error("answer failed");
+		expect(answered.value.outcome).toBe("granted");
+		// A replaced identity is refused before a valid claim consumes the grant.
+		const stale = await ledger.claim({
+			elevationRequestId: issued.value.elevationRequestId,
+			claimIdentity: claimIdentity(),
+			currentSessionIdentity: { ...stopped, endpointIncarnation: "b".repeat(64) },
+		});
+		expect(stale.ok).toBe(false);
+		if (stale.ok) throw new Error("stale claim should fail");
+		expect(stale.error.code).toBe("endpoint_stale");
+		const claimed = await ledger.claim({
+			elevationRequestId: issued.value.elevationRequestId,
+			claimIdentity: claimIdentity(),
+			currentSessionIdentity: stopped,
+		});
+		expect(claimed.ok).toBe(true);
+		if (!claimed.ok) throw new Error("claim failed");
+		expect(claimed.value.grant.state).toBe("claimed");
+	});
 });

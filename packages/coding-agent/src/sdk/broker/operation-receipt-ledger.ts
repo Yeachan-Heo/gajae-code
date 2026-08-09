@@ -43,8 +43,19 @@ function isReceipt(value: unknown): value is OperationReceipt {
 	);
 }
 
-export function operationReceiptDigest(operation: string, input: Record<string, unknown>): string {
-	return createHash("sha256").update(canonicalElevationJson({ operation, input })).digest("hex");
+/**
+ * Target-session-scoped idempotency key for a clientRef. Identical refs on
+ * different sessions are independent, so a receipt can never replay or
+ * conflict across sessions.
+ */
+export function operationReceiptKey(sessionId: string, clientRef: string): string {
+	return `${sessionId}\u0000${clientRef}`;
+}
+
+export function operationReceiptDigest(operation: string, input: Record<string, unknown>, sessionId?: string): string {
+	return createHash("sha256")
+		.update(canonicalElevationJson({ operation, input, ...(sessionId === undefined ? {} : { sessionId }) }))
+		.digest("hex");
 }
 
 export class OperationReceiptLedger {

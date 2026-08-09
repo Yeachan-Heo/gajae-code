@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { installGuideCache, readGuideCache } from "../src/sdk/guides/cache";
 import {
 	BUNDLED_GUIDE_MANIFESTS,
@@ -10,8 +11,10 @@ import {
 	guideFetchPolicy,
 	isGuideFetchUrlAllowed,
 } from "../src/sdk/guides/catalog";
+import { runSdkGuidesCli } from "../src/sdk/guides/cli";
 import {
 	canonicalGuideManifestBytes,
+	GUIDE_MANIFEST_MAX_BYTES,
 	type GuideEntryV1,
 	type GuideManifestV1,
 	parseGuideManifest,
@@ -84,6 +87,21 @@ function fakeFetch(
 	}) as unknown as typeof fetch;
 }
 
+async function runGuidesCli(
+	args: Parameters<typeof runSdkGuidesCli>[0],
+): Promise<{ output: unknown[]; exitCode: number | undefined }> {
+	const output: unknown[] = [];
+	let exitCode: number | undefined;
+	await runSdkGuidesCli(
+		args,
+		value => output.push(value),
+		code => {
+			exitCode = code;
+		},
+	);
+	return { output, exitCode };
+}
+
 const NOW = Date.UTC(2026, 3, 1);
 
 beforeEach(() => {
@@ -92,6 +110,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	FileLockTestHooks.afterParentMkdir = undefined;
 	removeTestGuidePinnedKey(TEST_KEY_ID);
 	delete process.env.GJC_TEST_GUIDE_KEYS;
 });
@@ -277,6 +296,58 @@ describe("guide cache", () => {
 		expect(read.ok).toBe(false);
 		if (!read.ok) expect(read.error.code).toBe("corrupt_cache");
 	});
+	it("serializes the rollback-floor check with the commit pointer replacement across processes", async () => {
+		const agentDir = await tempAgentDir();
+		const text = "Floor-guard text.";
+		const v1 = makeManifest({ sequence: 1, guides: [entry("floor/guard", "Floor guard", text)] });
+		const seeded = await installFixture(agentDir, v1, TEST_PRIVATE_DER_HEX, { "floor/guard": text });
+		expect(seeded.ok).toBe(true);
+
+		// Park the older contender (seq 2) at the cross-process lock boundary so
+		// the newer contender (seq 3) fully commits first. Without the lock the
+		// older contender's floor check (read before the commit) would pass and
+		// it would downgrade the cache to seq 2 after seq 3 landed.
+		let gateRelease: (() => void) | undefined;
+		const gate = new Promise<void>(resolve => {
+			gateRelease = resolve;
+		});
+		let parkedResolve: (() => void) | undefined;
+		const parked = new Promise<void>(resolve => {
+			parkedResolve = resolve;
+		});
+		let gateOlder = true;
+		const originalHook = FileLockTestHooks.afterParentMkdir;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (!lockPath.endsWith("meta.json.lock")) return;
+			if (gateOlder) {
+				gateOlder = false;
+				parkedResolve?.();
+				await gate;
+			}
+		};
+		try {
+			const v2 = makeManifest({ sequence: 2, guides: [entry("floor/guard", "Floor guard", text)] });
+			const v3 = makeManifest({ sequence: 3, guides: [entry("floor/guard", "Floor guard", text)] });
+			const older = installFixture(agentDir, v2, TEST_PRIVATE_DER_HEX, { "floor/guard": text });
+			await parked;
+			const newer = await installFixture(agentDir, v3, TEST_PRIVATE_DER_HEX, { "floor/guard": text });
+			expect(newer.ok).toBe(true);
+			gateRelease?.();
+			const olderResult = await older;
+			expect(olderResult.ok).toBe(false);
+			if (!olderResult.ok) expect(olderResult.error.code).toBe("rollback");
+
+			const read = await readGuideCache({ agentDir, now: NOW });
+			expect(read.ok).toBe(true);
+			if (read.ok) expect(read.value.manifest.sequence).toBe(3);
+
+			const cacheDir = path.join(agentDir, "sdk", "guides", "cache");
+			expect(await fs.readdir(cacheDir)).not.toContain("meta.json.lock");
+		} finally {
+			gateRelease?.();
+			FileLockTestHooks.afterParentMkdir = originalHook;
+		}
+	});
 });
 
 describe("guide catalog selection", () => {
@@ -389,6 +460,83 @@ describe("guide catalog selection", () => {
 		expect(result.ok).toBe(false);
 		if (!result.ok) expect(result.error.code).toBe("unavailable");
 	});
+	it("re-checks the rollback floor when concurrent online refreshes race and falls back to the newer cache", async () => {
+		const agentDir = await tempAgentDir();
+		const text = "Concurrent refresh text.";
+		const v1 = makeManifest({ sequence: 1, guides: [entry("concurrent/refresh", "Concurrent refresh", text)] });
+		const seeded = await installFixture(agentDir, v1, TEST_PRIVATE_DER_HEX, { "concurrent/refresh": text });
+		expect(seeded.ok).toBe(true);
+
+		const v2 = makeManifest({ sequence: 2, guides: [entry("concurrent/refresh", "Concurrent refresh", text)] });
+		const v3 = makeManifest({ sequence: 3, guides: [entry("concurrent/refresh", "Concurrent refresh", text)] });
+		const records = new Map<string, { body: Uint8Array }>([
+			["https://guides.gajae-code.com/manifest-v2.json", { body: new TextEncoder().encode(JSON.stringify(v2)) }],
+			["https://guides.gajae-code.com/manifest-v2.json.sig", { body: signCanonical(v2, TEST_PRIVATE_DER_HEX) }],
+			["https://guides.gajae-code.com/manifest-v3.json", { body: new TextEncoder().encode(JSON.stringify(v3)) }],
+			["https://guides.gajae-code.com/manifest-v3.json.sig", { body: signCanonical(v3, TEST_PRIVATE_DER_HEX) }],
+			["https://guides.gajae-code.com/guides/concurrent/refresh", { body: new TextEncoder().encode(text) }],
+		]);
+		const fetchImpl = fakeFetch(records);
+
+		let gateRelease: (() => void) | undefined;
+		const gate = new Promise<void>(resolve => {
+			gateRelease = resolve;
+		});
+		let parkedResolve: (() => void) | undefined;
+		const parked = new Promise<void>(resolve => {
+			parkedResolve = resolve;
+		});
+		let gateOlder = true;
+		const originalHook = FileLockTestHooks.afterParentMkdir;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (!lockPath.endsWith("meta.json.lock")) return;
+			if (gateOlder) {
+				gateOlder = false;
+				parkedResolve?.();
+				await gate;
+			}
+		};
+		try {
+			const olderCatalog = new GuideCatalog({
+				agentDir,
+				onlineUrl: "https://guides.gajae-code.com/manifest-v2.json",
+				fetchImpl,
+				now: () => NOW,
+			});
+			const newerCatalog = new GuideCatalog({
+				agentDir,
+				onlineUrl: "https://guides.gajae-code.com/manifest-v3.json",
+				fetchImpl,
+				now: () => NOW,
+			});
+			const olderRefresh = olderCatalog.refresh();
+			await parked;
+			const newerResult = await newerCatalog.refresh();
+			expect(newerResult.ok).toBe(true);
+			if (newerResult.ok) {
+				expect(newerResult.value.source).toBe("online");
+				expect(newerResult.value.manifest.sequence).toBe(3);
+			}
+			gateRelease?.();
+			const olderResult = await olderRefresh;
+			expect(olderResult.ok).toBe(true);
+			if (olderResult.ok) {
+				// The loser must not present its own stale manifest as a
+				// success: it falls back to the newer verified cache and
+				// reports the rollback as a structured warning.
+				expect(olderResult.value.source).toBe("cache");
+				expect(olderResult.value.manifest.sequence).toBe(3);
+				expect(olderResult.value.warnings.some(w => w.includes("rollback"))).toBe(true);
+			}
+
+			const read = await readGuideCache({ agentDir, now: NOW });
+			expect(read.ok).toBe(true);
+			if (read.ok) expect(read.value.manifest.sequence).toBe(3);
+		} finally {
+			gateRelease?.();
+			FileLockTestHooks.afterParentMkdir = originalHook;
+		}
+	});
 });
 
 describe("guide fetch boundary and CLI-facing selection outcomes", () => {
@@ -438,5 +586,140 @@ describe("guide fetch boundary and CLI-facing selection outcomes", () => {
 		if (!parsed.ok) return;
 		expect(parsed.manifest.guides.length).toBeGreaterThan(0);
 		expect(parsed.manifest.guides[0]!.id.length).toBeGreaterThan(0);
+	});
+	it("installs a bounded online manifest and reports an online source", async () => {
+		const agentDir = await tempAgentDir();
+		const text = "Bounded refresh text.";
+		const manifestV1 = makeManifest({ sequence: 1, guides: [entry("bounded/refresh", "Bounded refresh", text)] });
+		const manifestV2 = makeManifest({ sequence: 2, guides: [entry("bounded/refresh", "Bounded refresh", text)] });
+		const records = new Map<string, { body: Uint8Array }>([
+			[
+				"https://guides.gajae-code.com/manifest.json",
+				{ body: new TextEncoder().encode(JSON.stringify(manifestV1)) },
+			],
+			["https://guides.gajae-code.com/manifest.json.sig", { body: signCanonical(manifestV1, TEST_PRIVATE_DER_HEX) }],
+			["https://guides.gajae-code.com/guides/bounded/refresh", { body: new TextEncoder().encode(text) }],
+		]);
+		const fetchImpl = fakeFetch(records);
+
+		const catalog = new GuideCatalog({
+			agentDir,
+			onlineUrl: "https://guides.gajae-code.com/manifest.json",
+			fetchImpl,
+			now: () => NOW,
+		});
+		const result = await catalog.refresh();
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.value.source).toBe("online");
+		expect(result.value.manifest.sequence).toBe(1);
+
+		// A follow-up CLI refresh that advances the floor still reports online.
+		records.set("https://guides.gajae-code.com/manifest.json", {
+			body: new TextEncoder().encode(JSON.stringify(manifestV2)),
+		});
+		records.set("https://guides.gajae-code.com/manifest.json.sig", {
+			body: signCanonical(manifestV2, TEST_PRIVATE_DER_HEX),
+		});
+		const cli = await runGuidesCli({
+			action: "refresh",
+			url: "https://guides.gajae-code.com/manifest.json",
+			agentDir,
+			fetchImpl,
+		});
+		expect(cli.exitCode).toBe(undefined);
+		expect(cli.output).toHaveLength(1);
+		const payload = cli.output[0] as { ok: boolean; result?: { source: string; manifest: { sequence: number } } };
+		expect(payload.ok).toBe(true);
+		expect(payload.result?.source).toBe("online");
+		expect(payload.result?.manifest.sequence).toBe(2);
+	});
+
+	it("fails the refresh verb operationally when online refresh falls back to cache", async () => {
+		const agentDir = await tempAgentDir();
+		const text = "Cached CLI text.";
+		const manifest = makeManifest({ sequence: 1, guides: [entry("cli/fallback", "CLI fallback", text)] });
+		const installed = await installFixture(agentDir, manifest, TEST_PRIVATE_DER_HEX, { "cli/fallback": text });
+		expect(installed.ok).toBe(true);
+
+		const fetchImpl = fakeFetch(new Map(), { error: new Error("network unreachable") });
+		const refresh = await runGuidesCli({
+			action: "refresh",
+			url: "https://guides.gajae-code.com/manifest.json",
+			agentDir,
+			fetchImpl,
+		});
+		expect(refresh.exitCode).toBe(1);
+		expect(refresh.output).toHaveLength(1);
+		const payload = refresh.output[0] as { ok: boolean; error?: { code: string; message: string } };
+		expect(payload.ok).toBe(false);
+		expect(payload.error?.code).toBe("online_refresh_failed");
+		expect(payload.error?.message).toContain("cache");
+		expect(payload.error?.message).toContain("network_error");
+
+		// The failed refresh leaves the prior valid cache intact and usable.
+		const read = await readGuideCache({ agentDir, now: NOW });
+		expect(read.ok).toBe(true);
+		if (read.ok) expect(read.value.manifest.sequence).toBe(1);
+		const list = await runGuidesCli({ action: "list", agentDir });
+		expect(list.exitCode).toBe(undefined);
+		const listPayload = list.output[0] as { ok: boolean; result?: { source: string } };
+		expect(listPayload.ok).toBe(true);
+		expect(listPayload.result?.source).toBe("cache");
+	});
+
+	it("rejects an oversized online manifest before any install (bounded response behavior)", async () => {
+		const agentDir = await tempAgentDir();
+		const oversizedBody = new Uint8Array(GUIDE_MANIFEST_MAX_BYTES + 1);
+		const records = new Map<string, { body: Uint8Array }>([
+			["https://guides.gajae-code.com/manifest.json", { body: oversizedBody }],
+		]);
+		const fetchImpl = fakeFetch(records);
+
+		// The catalog falls back with a structured `oversize` warning and never
+		// installs the oversized content.
+		const catalog = new GuideCatalog({
+			agentDir,
+			onlineUrl: "https://guides.gajae-code.com/manifest.json",
+			fetchImpl,
+			now: () => NOW,
+		});
+		const result = await catalog.refresh();
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.value.source).toBe("bundled");
+		expect(result.value.warnings.some(w => w.includes("oversize"))).toBe(true);
+		const cache = await readGuideCache({ agentDir, now: NOW });
+		expect(cache.ok).toBe(false);
+		if (!cache.ok) expect(cache.error.code).toBe("missing_cache");
+
+		// The CLI fails operationally instead of presenting the fallback as a
+		// successful refresh.
+		const cli = await runGuidesCli({
+			action: "refresh",
+			url: "https://guides.gajae-code.com/manifest.json",
+			agentDir,
+			fetchImpl,
+		});
+		expect(cli.exitCode).toBe(1);
+		const payload = cli.output[0] as { ok: boolean; error?: { code: string; message: string } };
+		expect(payload.ok).toBe(false);
+		expect(payload.error?.code).toBe("online_refresh_failed");
+		expect(payload.error?.message).toContain("oversize");
+	});
+
+	it("refuses a non-allowlisted refresh URL as a usage error before any fetch", async () => {
+		const agentDir = await tempAgentDir();
+		const cli = await runGuidesCli({
+			action: "refresh",
+			url: "http://guides.gajae-code.com/manifest.json",
+			agentDir,
+			fetchImpl: fakeFetch(new Map()),
+		});
+		expect(cli.exitCode).toBe(2);
+		expect(cli.output).toHaveLength(1);
+		const payload = cli.output[0] as { ok: boolean; error?: { code: string } };
+		expect(payload.ok).toBe(false);
+		expect(payload.error?.code).toBe("usage");
 	});
 });

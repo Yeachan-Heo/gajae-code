@@ -626,7 +626,10 @@ async function requestEventReplay(
 		session.send({
 			type: "event_replay",
 			id,
-			...(record !== undefined ? { sinceGeneration: record.generation, sinceSeq: Math.max(0, record.seq - 1) } : {}),
+			// Resume strictly after the checkpoint sequence: the checkpoint event
+			// was already observed, so re-emitting it would let a terminal
+			// checkpoint event satisfy --until-idle without any new turn.
+			...(record !== undefined ? { sinceGeneration: record.generation, sinceSeq: record.seq } : {}),
 		});
 		return await promise;
 	} finally {
@@ -733,11 +736,16 @@ async function offlineTailReplay(
 	}
 }
 
-async function runTail(repo: string, agentDir: string, sessionId: string, args: SdkSessionCliArgs): Promise<unknown> {
+export async function runTail(
+	repo: string,
+	agentDir: string,
+	sessionId: string,
+	args: SdkSessionCliArgs,
+): Promise<unknown> {
 	const broker = await connectBroker(agentDir);
 	let row: SdkSessionRowV1 | undefined;
 	try {
-		const response = await broker.global("session.list", {});
+		const response = await paginatedSessionList(broker);
 		row = arrayOf(resultObject(response)?.sessions ?? undefined)
 			.map(toSessionRowV1)
 			.find(candidate => candidate.sessionId === sessionId);

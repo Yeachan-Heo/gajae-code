@@ -4392,3 +4392,273 @@ test("session surface wires a synchronous Q30 checkpoint from the transcript aut
 	expect(typeof result?.issuedAt).toBe("number");
 	expect(typeof result?.expiresAt).toBe("number");
 });
+async function registerFakeLiveSessionWithEndpoint(
+	broker: Broker,
+	input: { sessionId: string; stateRoot: string; url?: string },
+): Promise<void> {
+	const endpointMtimeMs = 1_700_000_000_000;
+	await fs.mkdir(path.join(input.stateRoot, "sdk", ".authority"), { recursive: true, mode: 0o700 });
+	const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
+	await Bun.write(
+		endpointPath,
+		`${JSON.stringify({
+			sessionId: input.sessionId,
+			pid: process.pid,
+			url: input.url ?? "ws://127.0.0.1:1",
+			token: "endpoint-token",
+		})}\n`,
+	);
+	await fs.utimes(endpointPath, new Date(endpointMtimeMs), new Date(endpointMtimeMs));
+	await Bun.write(
+		path.join(input.stateRoot, "sdk", ".authority", `${input.sessionId}.json`),
+		`${JSON.stringify({ token: "authority-token" })}\n`,
+	);
+	await registerFakeLiveSession(broker, { sessionId: input.sessionId, stateRoot: input.stateRoot, endpointMtimeMs });
+	// Registration alone is not live; the control path requires a heartbeat checkpoint.
+	await broker.heartbeatSessions();
+}
+
+test("elevation grants bind to the approved target session: equal-input cross-session misuse fails closed", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-elevation-crosstarget-"));
+	const agentDir = path.join(root, "agent");
+	const firstState = path.join(root, "first", ".gjc", "state");
+	const secondState = path.join(root, "second", ".gjc", "state");
+	const firstId = "cross-session-a";
+	const secondId = "cross-session-b";
+	await withElevationEnabled(async () => {
+		const broker = new Broker({ agentDir });
+		try {
+			await broker.start();
+			await registerFakeLiveSession(broker, { sessionId: firstId, stateRoot: firstState });
+			await registerFakeLiveSession(broker, { sessionId: secondId, stateRoot: secondState });
+			const controlInput = { id: "gate-1", response: "approve" };
+			const issued = await broker.handleRequest("elevation.issue", {
+				sessionId: firstId,
+				operation: { kind: "control", sdkId: "workflow.gate_answer" },
+				input: controlInput,
+				elevationRequestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+			});
+			expect(issued.ok).toBe(true);
+			if (!issued.ok) throw new Error(issued.error.message);
+			const issue = issued.result as { elevationRequestId: string; requestDigest: string };
+			expect(
+				await broker.elevationAnswer({
+					elevationRequestId: issue.elevationRequestId,
+					answer: "approve",
+					presentedDigest: issue.requestDigest,
+					answerer: { source: "local_operator", attestedBy: "test-operator" },
+				}),
+			).toMatchObject({ ok: true, result: { outcome: "granted" } });
+
+			// The A-bound grant must not authorize a byte-identical control on B:
+			// the pre-claim target binding fails closed and the grant stays
+			// unconsumed (never claimed, never dispatched).
+			expect(
+				await broker.handleRequest("session.control", {
+					sessionId: secondId,
+					operation: "workflow.gate_answer",
+					input: controlInput,
+					elevationRequestId: issue.elevationRequestId,
+				}),
+			).toMatchObject({ ok: false, error: { code: "elevation_digest_mismatch" } });
+			expect(
+				await broker.handleRequest("elevation.status", { elevationRequestId: issue.elevationRequestId }),
+			).toMatchObject({ ok: true, result: { grant: { state: "granted" } } });
+
+			// Global lifecycle input is bound at issue time: a close grant for A
+			// cannot approve input that names a different session (B).
+			expect(
+				await broker.handleRequest("elevation.issue", {
+					sessionId: firstId,
+					operation: { kind: "global", sdkId: "session.close" },
+					input: { sessionId: secondId },
+					elevationRequestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+				}),
+			).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+}, 30_000);
+
+test("elevation issues, grants, and dispatches a delete grant for a retained stopped session", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-elevation-stopped-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "retained-del";
+	await withElevationEnabled(async () => {
+		const broker = new Broker({ agentDir });
+		try {
+			await broker.start();
+			await registerFakeLiveSession(broker, { sessionId, stateRoot });
+			// Stop the session: the retained row keeps its endpoint identity tuple.
+			await broker.index.append({
+				type: "host_unregistered",
+				sessionId,
+				locator: { repo: path.dirname(stateRoot), stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: 1_700_000_000_000,
+			});
+			expect(broker.index.listSessions().sessions.find(row => row.sessionId === sessionId)).toMatchObject({
+				terminal: true,
+				live: false,
+			});
+			// session.delete is the only operation that may elevate a stopped
+			// session; its identity is bound from the retained row.
+			const deleteInput = { sessionId, cwd: root, sessionPath: path.join(root, "saved", `${sessionId}.json`) };
+			const issued = await broker.handleRequest("elevation.issue", {
+				sessionId,
+				operation: { kind: "global", sdkId: "session.delete" },
+				input: deleteInput,
+				elevationRequestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+			});
+			expect(issued.ok).toBe(true);
+			if (!issued.ok) throw new Error(issued.error.message);
+			const issue = issued.result as {
+				elevationRequestId: string;
+				requestDigest: string;
+				grant: { sessionIdentity: { sessionId: string } };
+			};
+			expect(issue.grant.sessionIdentity.sessionId).toBe(sessionId);
+			// A close grant against the same stopped session still fails closed.
+			expect(
+				await broker.handleRequest("elevation.issue", {
+					sessionId,
+					operation: { kind: "global", sdkId: "session.close" },
+					input: { sessionId },
+					elevationRequestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+				}),
+			).toMatchObject({ ok: false, error: { code: "target_unavailable" } });
+			expect(
+				await broker.elevationAnswer({
+					elevationRequestId: issue.elevationRequestId,
+					answer: "approve",
+					presentedDigest: issue.requestDigest,
+					answerer: { source: "local_operator", attestedBy: "test-operator" },
+				}),
+			).toMatchObject({ ok: true, result: { outcome: "granted" } });
+			// Dispatch: the grant is claimed and its truthful outcome recorded
+			// even though the lifecycle delete cannot find an owned managed
+			// session at the exact locator.
+			const response = await broker.handleRequest(
+				"session.delete",
+				deleteInput,
+				"delete-stopped",
+				issue.elevationRequestId,
+			);
+			expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+			expect(
+				await broker.handleRequest("elevation.status", { elevationRequestId: issue.elevationRequestId }),
+			).toMatchObject({
+				ok: true,
+				result: {
+					grant: {
+						state: "dispatched",
+						outcome: { status: "failed", code: "invalid_input" },
+					},
+				},
+			});
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+}, 30_000);
+
+test("clientRef idempotency is target-session scoped and never replays across sessions", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-clientref-scope-"));
+	const agentDir = path.join(root, "agent");
+	const firstState = path.join(root, "first", ".gjc", "state");
+	const secondState = path.join(root, "second", ".gjc", "state");
+	const firstId = "clientref-session-a";
+	const secondId = "clientref-session-b";
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		// Session A has a real endpoint record so dispatch reaches the transport
+		// (and fails there); session B has none (dispatch fails before the
+		// transport with its own authority).
+		await registerFakeLiveSessionWithEndpoint(broker, { sessionId: firstId, stateRoot: firstState });
+		await registerFakeLiveSession(broker, { sessionId: secondId, stateRoot: secondState });
+		const clientRef = "01JSDKCLIENTREF00000000000";
+		const control = { sessionId: firstId, operation: "turn.prompt", input: { text: "hello", clientRef } };
+		const first = await broker.handleRequest("session.control", control);
+		expect(first).toMatchObject({ ok: false });
+		// Within the same session the exact response replays (idempotent).
+		const replay = await broker.handleRequest("session.control", control);
+		expect(replay).toEqual(first);
+		// The identical ref on session B is an independent operation: it must
+		// fail on B's own authority (resource_gone), never replay A's receipt.
+		const cross = await broker.handleRequest("session.control", {
+			sessionId: secondId,
+			operation: "turn.prompt",
+			input: { text: "hello", clientRef },
+		});
+		expect(cross).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+		expect(cross).not.toEqual(first);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("elevation preflight before clientRef reservation lets a later granted retry dispatch", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-elevation-retry-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "elevation-retry";
+	await withElevationEnabled(async () => {
+		const broker = new Broker({ agentDir });
+		try {
+			await broker.start();
+			await registerFakeLiveSessionWithEndpoint(broker, { sessionId, stateRoot });
+			const clientRef = "01JSDKCLIENTREF00000000001";
+			const controlInput = { id: "gate-2", response: "approve", clientRef };
+			const control = { sessionId, operation: "workflow.gate_answer", input: controlInput };
+			// The no-grant attempt must not reserve the clientRef.
+			expect(await broker.handleRequest("session.control", control)).toMatchObject({
+				ok: false,
+				error: { code: "elevation_required" },
+			});
+			// A fresh grant for the same content makes the retry dispatch instead
+			// of replaying a poisoned in_progress receipt.
+			const issued = await broker.handleRequest("elevation.issue", {
+				sessionId,
+				operation: { kind: "control", sdkId: "workflow.gate_answer" },
+				input: controlInput,
+				elevationRequestId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+			});
+			expect(issued.ok).toBe(true);
+			if (!issued.ok) throw new Error(issued.error.message);
+			const issue = issued.result as { elevationRequestId: string; requestDigest: string };
+			expect(
+				await broker.elevationAnswer({
+					elevationRequestId: issue.elevationRequestId,
+					answer: "approve",
+					presentedDigest: issue.requestDigest,
+					answerer: { source: "local_operator", attestedBy: "test-operator" },
+				}),
+			).toMatchObject({ ok: true, result: { outcome: "granted" } });
+			const retried = (await broker.handleRequest("session.control", {
+				...control,
+				elevationRequestId: issue.elevationRequestId,
+			})) as BrokerResponse;
+			// Not poisoned: the operation dispatched (and failed only at the
+			// unreachable session transport), consuming the grant truthfully.
+			if (retried.ok) throw new Error("elevated retry unexpectedly succeeded");
+			expect(retried.error.code).not.toBe("elevation_required");
+			expect(retried.error.code).not.toBe("operation_in_progress");
+			expect(
+				await broker.handleRequest("elevation.status", { elevationRequestId: issue.elevationRequestId }),
+			).toMatchObject({
+				ok: true,
+				result: { grant: { state: "dispatched", outcome: { status: "failed" } } },
+			});
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+}, 30_000);

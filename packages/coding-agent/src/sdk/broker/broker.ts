@@ -17,6 +17,7 @@ import {
 } from "../elevation/dispatch-receipt";
 import {
 	type ElevationAnswerValue,
+	type ElevationGrantRecord,
 	ElevationLedger,
 	type ElevationRequester,
 	type ElevationResult,
@@ -52,7 +53,7 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
-import { OperationReceiptLedger, operationReceiptDigest } from "./operation-receipt-ledger";
+import { OperationReceiptLedger, operationReceiptDigest, operationReceiptKey } from "./operation-receipt-ledger";
 import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
@@ -210,6 +211,14 @@ type ElevationSessionResolution =
 	| { kind: "identity"; identity: ElevationSessionIdentity }
 	| { kind: "ambiguous" }
 	| { kind: "unavailable" };
+function sameElevationSessionIdentity(left: ElevationSessionIdentity, right: ElevationSessionIdentity): boolean {
+	return (
+		left.sessionId === right.sessionId &&
+		path.resolve(left.endpointStateRoot) === path.resolve(right.endpointStateRoot) &&
+		left.endpointGeneration === right.endpointGeneration &&
+		left.endpointIncarnation === right.endpointIncarnation
+	);
+}
 function isCleanupPending(response: BrokerResponse): boolean {
 	return !response.ok && response.error.code === "cleanup_pending" && response.error.cleanup !== undefined;
 }
@@ -1472,6 +1481,24 @@ export class Broker {
 			const digest = elevationRequestDigest({ kind: elevationGateKind, sdkId: operation, input: approvedInput });
 			if (!digest.ok || digest.digest !== grant.requestDigest)
 				return error("elevation_digest_mismatch", "elevation grant digest does not match the dispatched input");
+			// Bind the grant to the actual lifecycle target before any claim: the
+			// approved input must resolve to the exact session identity the grant
+			// was issued against (C10). session.delete may target a retained
+			// stopped session; everything else requires a live endpoint.
+			const targetSessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+			if (targetSessionId !== undefined) {
+				const target = await this.#elevationSessionResolution(targetSessionId, {
+					allowStopped: operation === "session.delete",
+				});
+				if (target.kind === "ambiguous")
+					return error("ambiguous_session", "session id maps to more than one state root");
+				if (target.kind !== "identity")
+					return error("target_unavailable", "session endpoint is unreachable or its identity is not provable");
+				if (grant.sessionIdentity.sessionId !== target.identity.sessionId)
+					return error("elevation_digest_mismatch", "elevation grant was issued for a different session target");
+				if (!sameElevationSessionIdentity(grant.sessionIdentity, target.identity))
+					return error("endpoint_stale", "session endpoint identity no longer matches the elevation grant");
+			}
 			elevationRequestIdForDispatch = elevationRequestId;
 		}
 		const target = createHash("sha256")
@@ -1746,15 +1773,23 @@ export class Broker {
 	 * elevation grant can bind; an unreachable or unprovable session is
 	 * `unavailable`. The heartbeat checkpoint pass runs first so a fresh
 	 * registration is observable as live.
+	 *
+	 * `allowStopped` is the session.delete-only exemption: a retained stopped
+	 * session keeps its exact endpoint identity tuple (generation/pid/mtime)
+	 * in the index row, so a delete grant can still be bound and dispatched
+	 * against it. Everything else fails closed unless the endpoint is live.
 	 */
-	async #elevationSessionResolution(sessionId: string): Promise<ElevationSessionResolution> {
+	async #elevationSessionResolution(
+		sessionId: string,
+		options?: { allowStopped?: boolean },
+	): Promise<ElevationSessionResolution> {
 		if (!isCanonicalSessionId(sessionId)) return { kind: "unavailable" };
 		await this.index.refresh();
 		await this.heartbeatSessions();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		if (!record) return { kind: "unavailable" };
 		if (record.ambiguous) return { kind: "ambiguous" };
-		if (!record.live) return { kind: "unavailable" };
+		if (!record.live && options?.allowStopped !== true) return { kind: "unavailable" };
 		const incarnation = endpointIncarnation(record, sessionId);
 		if (incarnation === undefined) return { kind: "unavailable" };
 		return {
@@ -1818,32 +1853,17 @@ export class Broker {
 				"invalid_input",
 				"session.control requires a valid sessionId, control operation, and object input",
 			);
-		const clientRef =
-			typeof controlInput.clientRef === "string" && controlInput.clientRef.length > 0
-				? controlInput.clientRef
-				: undefined;
-		const receiptDigest = clientRef === undefined ? undefined : operationReceiptDigest(operation, controlInput);
-		if (clientRef !== undefined && receiptDigest !== undefined) {
-			const reservation = await this.operationReceipts.reserve(clientRef, receiptDigest);
-			if (reservation.status === "replay") return reservation.response;
-			if (reservation.status === "in_progress")
-				return error("operation_in_progress", "operation receipt is pending");
-			if (reservation.status === "conflict")
-				return error("idempotency_conflict", "clientRef was reused with different operation input");
-		}
-		const settle = async (response: BrokerResponse): Promise<BrokerResponse> => {
-			if (clientRef !== undefined && receiptDigest !== undefined)
-				await this.operationReceipts.complete(clientRef, receiptDigest, response);
-			return response;
-		};
 		const elevationRequestId = typeof input.elevationRequestId === "string" ? input.elevationRequestId : undefined;
 		const elevatable = this.#elevationEnforced && isElevatableOperation("control", operation);
+		// Elevation preflight (F1.3) runs before any clientRef reservation so a
+		// no-grant attempt can never poison a later granted retry with a stale
+		// pending receipt.
+		let grant: ElevationGrantRecord | undefined;
 		if (elevatable) {
-			if (!elevationRequestId)
-				return settle(error("elevation_required", "an elevation grant is required for this control"));
+			if (!elevationRequestId) return error("elevation_required", "an elevation grant is required for this control");
 			const resolved = await this.elevation.get(elevationRequestId);
-			if (!resolved.ok) return settle(elevationResultToBroker(resolved));
-			const grant = resolved.value.grant;
+			if (!resolved.ok) return elevationResultToBroker(resolved);
+			grant = resolved.value.grant;
 			const digest = elevationRequestDigest({ kind: "control", sdkId: operation, input: controlInput });
 			if (
 				grant.operation.kind !== "control" ||
@@ -1851,16 +1871,53 @@ export class Broker {
 				!digest.ok ||
 				digest.digest !== grant.requestDigest
 			)
-				return settle(error("elevation_digest_mismatch", "elevation grant does not match the requested control"));
+				return error("elevation_digest_mismatch", "elevation grant does not match the requested control");
 		}
 		await this.index.refresh();
 		const matches = this.index.listSessions().sessions.filter(session => session.sessionId === sessionId);
 		if (matches.some(session => session.ambiguous) || matches.length > 1)
-			return settle(error("ambiguous_session", "session id maps to more than one state root"));
+			return error("ambiguous_session", "session id maps to more than one state root");
 		const record = matches[0];
-		if (!record?.live) return settle(error("target_unavailable", "session endpoint is unavailable"));
+		if (!record?.live) return error("target_unavailable", "session endpoint is unavailable");
 		const incarnation = endpointIncarnation(record, sessionId);
-		if (!incarnation) return settle(error("endpoint_stale", "session endpoint incarnation is unavailable"));
+		if (!incarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
+		// Bind the grant to the actual approved target session identity before
+		// claim/capability minting: a grant issued for a different session can
+		// never authorize this control, even with byte-identical input.
+		if (grant !== undefined) {
+			if (grant.sessionIdentity.sessionId !== record.sessionId)
+				return error("elevation_digest_mismatch", "elevation grant was issued for a different session target");
+			const targetIdentity: ElevationSessionIdentity = {
+				sessionId: record.sessionId,
+				endpointStateRoot: record.locator.stateRoot,
+				endpointGeneration: record.endpointGeneration,
+				endpointIncarnation: incarnation,
+			};
+			if (!sameElevationSessionIdentity(grant.sessionIdentity, targetIdentity))
+				return error("endpoint_stale", "session endpoint identity no longer matches the elevation grant");
+		}
+		const clientRef =
+			typeof controlInput.clientRef === "string" && controlInput.clientRef.length > 0
+				? controlInput.clientRef
+				: undefined;
+		// clientRef idempotency is target-session scoped: identical refs and
+		// input on different sessions never collide, conflict, or replay.
+		const receiptKey = clientRef === undefined ? undefined : operationReceiptKey(sessionId, clientRef);
+		const receiptDigest =
+			clientRef === undefined ? undefined : operationReceiptDigest(operation, controlInput, sessionId);
+		if (receiptKey !== undefined && receiptDigest !== undefined) {
+			const reservation = await this.operationReceipts.reserve(receiptKey, receiptDigest);
+			if (reservation.status === "replay") return reservation.response;
+			if (reservation.status === "in_progress")
+				return error("operation_in_progress", "operation receipt is pending");
+			if (reservation.status === "conflict")
+				return error("idempotency_conflict", "clientRef was reused with different operation input");
+		}
+		const settle = async (response: BrokerResponse): Promise<BrokerResponse> => {
+			if (receiptKey !== undefined && receiptDigest !== undefined)
+				await this.operationReceipts.complete(receiptKey, receiptDigest, response);
+			return response;
+		};
 		const endpointResponse = await this.#endpoint({
 			sessionId,
 			endpointGeneration: record.endpointGeneration,
@@ -1952,11 +2009,23 @@ export class Broker {
 	}): Promise<BrokerResponse> {
 		if (!isCanonicalSessionId(params.sessionId))
 			return error("invalid_input", "sessionId must be a canonical safe identifier");
-		const resolution = await this.#elevationSessionResolution(params.sessionId);
+		// Retained stopped sessions may only back an elevation request for the
+		// exact global lifecycle operation that needs them (session.delete); all
+		// other operations still require a live endpoint (fail closed otherwise).
+		const allowStopped = params.operation.kind === "global" && params.operation.sdkId === "session.delete";
+		const resolution = await this.#elevationSessionResolution(params.sessionId, { allowStopped });
 		if (resolution.kind === "ambiguous")
 			return error("ambiguous_session", "session id maps to more than one state root");
 		if (resolution.kind === "unavailable")
 			return error("target_unavailable", "session endpoint is unreachable or its identity is not provable");
+		// Bind the grant to the actual approved target session: the approved
+		// input for a global lifecycle operation must name the elevation session
+		// itself, never a different session (C10).
+		if (params.operation.kind === "global") {
+			const approvedTarget = typeof params.input.sessionId === "string" ? params.input.sessionId : undefined;
+			if (approvedTarget !== undefined && approvedTarget !== params.sessionId)
+				return error("invalid_input", "approved input targets a different session than the elevation session");
+		}
 		const { identity: sessionIdentity } = resolution;
 		let principal: BrokerOwnerPrincipal;
 		try {
@@ -1983,7 +2052,10 @@ export class Broker {
 		const resolved = await this.elevation.get(params.elevationRequestId);
 		if (!resolved.ok) return elevationResultToBroker(resolved);
 		const sessionId = resolved.value.grant.sessionIdentity.sessionId;
-		const resolution = await this.#elevationSessionResolution(sessionId);
+		const grantOperation = resolved.value.grant.operation;
+		const resolution = await this.#elevationSessionResolution(sessionId, {
+			allowStopped: grantOperation.kind === "global" && grantOperation.sdkId === "session.delete",
+		});
 		if (resolution.kind === "ambiguous")
 			return error("ambiguous_session", "session id maps to more than one state root");
 		const currentSessionIdentity = resolution.kind === "identity" ? resolution.identity : undefined;
@@ -2002,7 +2074,10 @@ export class Broker {
 		const resolved = await this.elevation.get(params.elevationRequestId);
 		if (!resolved.ok) return elevationResultToBroker(resolved);
 		const sessionId = resolved.value.grant.sessionIdentity.sessionId;
-		const resolution = await this.#elevationSessionResolution(sessionId);
+		const grantOperation = resolved.value.grant.operation;
+		const resolution = await this.#elevationSessionResolution(sessionId, {
+			allowStopped: grantOperation.kind === "global" && grantOperation.sdkId === "session.delete",
+		});
 		if (resolution.kind === "ambiguous")
 			return error("ambiguous_session", "session id maps to more than one state root");
 		const currentSessionIdentity = resolution.kind === "identity" ? resolution.identity : undefined;

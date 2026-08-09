@@ -1,6 +1,6 @@
 import { getAgentDir } from "@gajae-code/utils";
 import { readGuideCache } from "./cache";
-import { BUNDLED_GUIDE_MANIFESTS, GuideCatalog, guideFetchPolicy } from "./catalog";
+import { BUNDLED_GUIDE_MANIFESTS, GuideCatalog, guideFetchPolicy, isGuideFetchUrlAllowed } from "./catalog";
 import { GUIDE_CLIENT_VERSION, GUIDE_PINNED_KEYS } from "./verify";
 
 /**
@@ -8,7 +8,11 @@ import { GUIDE_CLIENT_VERSION, GUIDE_PINNED_KEYS } from "./verify";
  *
  * Verbs:
  *   refresh --url <https url>  fetch + verify the online manifest and advisory
- *                              text, install the verified cache, report selection
+ *                              text, install the verified cache, report selection.
+ *                              Fails operationally (exit 1) whenever the online
+ *                              manifest is not selected: fallback cache/bundled
+ *                              content is reported as a failure, never as a
+ *                              successful refresh
  *   list                       offline selection: verified cache, else bundled
  *   show <guideId>             render the advisory text for one guide (data only)
  *   status                     selection provenance, cache health, fetch policy
@@ -29,6 +33,8 @@ export interface SdkGuidesCliArgs {
 	agentDir?: string;
 	/** Bounded fetch timeout for `refresh`. */
 	timeoutMs?: number;
+	/** Fetch implementation override for `refresh` (test seam); defaults to the global fetch. */
+	fetchImpl?: typeof fetch;
 }
 
 const GUIDE_CLI_ACTIONS: readonly string[] = ["refresh", "list", "show", "status", "trust"];
@@ -100,10 +106,23 @@ function manifestSummary(manifest: {
 
 async function runRefresh(agentDir: string, args: SdkGuidesCliArgs): Promise<unknown> {
 	const url = requireValue(args.url, "--url");
-	const catalog = new GuideCatalog({ agentDir, onlineUrl: url, timeoutMs: args.timeoutMs });
+	if (!isGuideFetchUrlAllowed(url)) throw usageFailure(`--url ${url} is outside the HTTPS allowlist.`);
+	const catalog = new GuideCatalog({
+		agentDir,
+		onlineUrl: url,
+		timeoutMs: args.timeoutMs,
+		fetchImpl: args.fetchImpl,
+	});
 	const result = await catalog.refresh();
 	if (!result.ok) throw operationalFailure(result.error.code, result.error.message);
 	const selection = result.value;
+	if (selection.source !== "online") {
+		const reasons = selection.warnings.length > 0 ? ` ${selection.warnings.join("; ")}` : "";
+		throw operationalFailure(
+			"online_refresh_failed",
+			`Online refresh did not select an online source (selected ${selection.source} instead)${reasons}.`,
+		);
+	}
 	return {
 		source: selection.source,
 		manifest: manifestSummary(selection.manifest),

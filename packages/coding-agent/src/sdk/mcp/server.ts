@@ -25,6 +25,7 @@ export interface SdkMcpServerOptions {
 	agentDir?: string;
 	connect?: (url: string, token: string) => Promise<SdkClient>;
 }
+const MAX_SESSION_LIST_PAGES = 10_000;
 
 export const SDK_MCP_TOOL_NAMES = [
 	"gjc_session_control",
@@ -195,6 +196,30 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 	function arrayOf(value: unknown): unknown[] {
 		return Array.isArray(value) ? value : [];
 	}
+	/**
+	 * Exhausts broker `session.list` cursor pagination (default page limit 100)
+	 * to one full snapshot. The broker remains the sole session authority; this
+	 * only aggregates its indexed truth across pages.
+	 */
+	async function paginatedBrokerSessionList(
+		client: SdkClient,
+	): Promise<{ sessions: Record<string, unknown>[]; warnings: unknown[] }> {
+		const sessions: Record<string, unknown>[] = [];
+		let warnings: unknown[] = [];
+		let cursor: string | undefined;
+		for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+			const listed = brokerResult(await client.global("session.list", cursor === undefined ? {} : { cursor }));
+			sessions.push(...arrayOf(listed.sessions).filter(isObject));
+			if (Array.isArray(listed.warnings)) warnings = listed.warnings;
+			const nextCursor =
+				typeof listed.continuationCursor === "string" && listed.continuationCursor.length > 0
+					? listed.continuationCursor
+					: undefined;
+			if (!nextCursor) return { sessions, warnings };
+			cursor = nextCursor;
+		}
+		throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+	}
 
 	/**
 	 * Resolves one session through broker `session.list` + `session.get_endpoint`
@@ -206,10 +231,8 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 		let client: SdkClient | undefined;
 		try {
 			broker = await brokerClient();
-			const listed = brokerResult(await broker.global("session.list", {}));
-			const row = arrayOf(listed.sessions).find(item => isObject(item) && item.sessionId === sessionId) as
-				| Record<string, unknown>
-				| undefined;
+			const { sessions } = await paginatedBrokerSessionList(broker);
+			const row = sessions.find(item => item.sessionId === sessionId) as Record<string, unknown> | undefined;
 			if (!row) return { ok: false, error: { code: "not_found", message: `SDK session not found: ${sessionId}` } };
 			if (row.ambiguous === true)
 				return {
@@ -238,13 +261,11 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 			let broker: SdkClient | undefined;
 			try {
 				broker = await brokerClient();
-				const listed = brokerResult(await broker.global("session.list", {}));
-				const sessions = arrayOf(listed.sessions)
-					.filter(isObject)
-					.flatMap(item =>
-						typeof item.sessionId === "string" && item.sessionId ? [{ sessionId: item.sessionId }] : [],
-					);
-				return { ok: true, sessions, warnings: arrayOf(listed.warnings) };
+				const { sessions, warnings } = await paginatedBrokerSessionList(broker);
+				const listed = sessions.flatMap(item =>
+					typeof item.sessionId === "string" && item.sessionId ? [{ sessionId: item.sessionId }] : [],
+				);
+				return { ok: true, sessions: listed, warnings };
 			} catch (error) {
 				return resultError(error);
 			} finally {
