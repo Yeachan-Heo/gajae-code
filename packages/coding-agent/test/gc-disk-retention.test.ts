@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import type { Dirent, PathLike, Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -901,6 +902,122 @@ describe("gjc gc --disk (backups retention)", () => {
 				await fsp.chmod(path.join(fixture.backupsDir, "gjc-update-old", "locked"), 0o700).catch(() => {});
 				await fsp.rm(fixture.root, { recursive: true, force: true });
 			}
+		}
+	});
+
+	test("withholds a backup that goes unreadable between the size walk and the remove", async () => {
+		const fixture = await makeTestRoot();
+		const backup = path.join(fixture.backupsDir, "gjc-update-old");
+		const locked = path.join(backup, "locked");
+		const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+		// The candidate is lstat'd twice: once to classify it, once to verify it
+		// immediately before the remove. Locking the subtree on that second call is
+		// a subtree that goes unreadable after the walk, without touching the root's
+		// own inode or mtime — exactly the window the measurement-time check misses.
+		let candidateStats = 0;
+		const spy = spyOn(fsp, "lstat");
+		spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+			if (path.resolve(String(target)) === backup && ++candidateStats === 2) await fsp.chmod(locked, 0o000);
+			return await realLstat(target, options);
+		}) as unknown as typeof fsp.lstat);
+		try {
+			// Wide enough that a recursive remove destroys the readable half before
+			// it reaches the locked subdirectory and gives up.
+			await fsp.mkdir(locked, { recursive: true });
+			await fsp.mkdir(path.join(backup, "sibling"), { recursive: true });
+			for (let index = 0; index < 200; index++) {
+				await Bun.write(path.join(backup, `payload-${index}.bin`), "x".repeat(64));
+				await Bun.write(path.join(backup, "sibling", `s-${index}.bin`), "x".repeat(64));
+			}
+			await Bun.write(path.join(locked, "inner.bin"), "z".repeat(2048));
+			await backdate(backup, 40);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy(),
+				prune: true,
+			});
+			spy.mockRestore();
+
+			// The refusal has to land before anything is destroyed, not after.
+			expect((await fsp.readdir(backup)).sort()).toEqual(
+				["locked", "sibling", ...Array.from({ length: 200 }, (_unused, index) => `payload-${index}.bin`)].sort(),
+			);
+			expect((await fsp.readdir(path.join(backup, "sibling"))).length).toBe(200);
+			expect(reasonById(disk, "backups").get("gjc-update-old")).toBe(
+				"keep:withheld_evidence_incomplete: tree_unreadable",
+			);
+			expect(disk.surfaces.backups.records.find(record => record.id === "gjc-update-old")?.withheld).toBe(true);
+			expect(disk.surfaces.backups.reclaimed).toBe(0);
+			expect(disk.surfaces.backups.failed).toBe(0);
+
+			// A dry run over the state the prune actually faced withholds it for the
+			// same reason, so the two axes never disagree about what is withheld.
+			const dryDisk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy(),
+				prune: false,
+			});
+			expect(reasonById(dryDisk, "backups").get("gjc-update-old")).toBe(
+				"keep:withheld_evidence_incomplete: tree_unreadable",
+			);
+			expect(dryDisk.surfaces.backups.reclaimable).toBe(0);
+		} finally {
+			spy.mockRestore();
+			await fsp.chmod(locked, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("reclaims a backup whose enumerated files vanished under the walk", async () => {
+		const fixture = await makeTestRoot();
+		const backup = path.join(fixture.backupsDir, "gjc-update-old");
+		const vanishing = path.join(backup, "many");
+		const realReaddir = fsp.readdir as unknown as (
+			dir: PathLike,
+			options?: { withFileTypes?: true },
+		) => Promise<Array<string | Dirent>>;
+		// Enumerate, then delete: every entry the walk is about to stat answers
+		// ENOENT, exactly like a concurrent cleanup of an already-walked tree. Gone
+		// is the opposite of unreadable — a vanished file cannot block a remove.
+		const spy = spyOn(fsp, "readdir");
+		spy.mockImplementation((async (dir: PathLike, options?: { withFileTypes?: true }) => {
+			const entries = await realReaddir(dir, options);
+			if (path.resolve(String(dir)) === vanishing) {
+				for (const entry of entries) {
+					const name = typeof entry === "string" ? entry : entry.name;
+					await fsp.rm(path.join(vanishing, name), { force: true });
+				}
+			}
+			return entries;
+		}) as unknown as typeof fsp.readdir);
+		try {
+			await fsp.mkdir(vanishing, { recursive: true });
+			await Bun.write(path.join(backup, "payload.bin"), "x".repeat(64));
+			for (let index = 0; index < 200; index++) {
+				await Bun.write(path.join(vanishing, `chunk-${index}.bin`), "y".repeat(32));
+			}
+			await backdate(backup, 40);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy(),
+				prune: true,
+			});
+			spy.mockRestore();
+
+			const record = disk.surfaces.backups.records.find(entry => entry.id === "gjc-update-old");
+			expect(record?.partial).toBe(true);
+			expect(record?.withheld).toBeUndefined();
+			expect(reasonById(disk, "backups").get("gjc-update-old")).toBe("reclaimed:older_than_max_age(14d)");
+			expect(disk.surfaces.backups.reclaimed).toBe(1);
+			expect(await fsp.readdir(fixture.backupsDir)).toEqual([]);
+		} finally {
+			spy.mockRestore();
+			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
 	});
 });

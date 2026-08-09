@@ -761,6 +761,10 @@ function summarizeGcDiskSurface(report: GcDiskSurfaceReport): void {
  * blind to part of what it just measured. A caller about to remove the tree must
  * treat that as incomplete evidence — a recursive remove cannot finish past an
  * unreadable entry, so it would destroy the readable half and leave the rest.
+ *
+ * An entry that vanished mid-walk (`ENOENT`) is the opposite fact: it is gone,
+ * not withheld. A vanished entry cannot block a recursive remove, so it only
+ * makes `bytes` a floor and never withholds the tree.
  */
 async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial: boolean; unreadable: boolean }> {
 	let bytes = 0;
@@ -795,9 +799,9 @@ async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial
 			if (!entry.isFile()) continue;
 			try {
 				bytes += (await fsp.lstat(child)).size;
-			} catch {
+			} catch (error) {
 				partial = true;
-				unreadable = true;
+				if (!isEnoent(error)) unreadable = true;
 			}
 		}
 	}
@@ -1411,6 +1415,7 @@ async function runGcDiskNatives(input: {
 		} else {
 			record.action = "keep";
 			record.reason = removal.reason;
+			if (removal.withheld) record.withheld = true;
 		}
 	}
 }
@@ -1418,11 +1423,17 @@ async function runGcDiskNatives(input: {
 /**
  * Remove one directory/file entry, fail-closed on identity drift. Anything that
  * changed inode or mtime between classification and removal is left alone.
+ *
+ * Readability is re-proven here instead of being trusted from measurement time:
+ * a nested directory can become unreadable after the size walk without touching
+ * the root's inode or mtime, and a recursive remove that cannot finish past it
+ * would destroy the readable half. The fact has to hold at the moment it
+ * matters, so a removal that cannot complete never starts.
  */
 async function removeGcDiskEntry(
 	target: string,
 	expected: Stats,
-): Promise<{ removed: true } | { removed: false; reason: string; failed?: true }> {
+): Promise<{ removed: true } | { removed: false; reason: string; failed?: true; withheld?: true }> {
 	let current: Stats;
 	try {
 		current = await fsp.lstat(target);
@@ -1435,6 +1446,9 @@ async function removeGcDiskEntry(
 		return { removed: false, reason: "entry_identity_changed" };
 	}
 	if (current.mtimeMs !== expected.mtimeMs) return { removed: false, reason: "entry_changed" };
+	if (current.isDirectory() && (await measureGcDiskTree(target)).unreadable) {
+		return { removed: false, reason: "withheld_evidence_incomplete: tree_unreadable", withheld: true };
+	}
 	try {
 		await fsp.rm(target, { recursive: true, force: false });
 		return { removed: true };
@@ -1523,6 +1537,7 @@ async function runGcDiskBackups(input: {
 		} else {
 			record.action = "keep";
 			record.reason = removal.reason;
+			if (removal.withheld) record.withheld = true;
 		}
 	}
 }
