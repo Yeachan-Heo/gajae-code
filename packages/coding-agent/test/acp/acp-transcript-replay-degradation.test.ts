@@ -86,6 +86,14 @@ function pendingToolCalls(notifications: SessionNotification[]): string[] {
 	return [...status].filter(([, value]) => value !== "completed" && value !== "failed").map(([id]) => id);
 }
 
+/** The tool call a terminal `tool_call_update` closes, when that is what the notification is. */
+function terminalToolCallId(notification: SessionNotification): string | undefined {
+	const update = notification.update as { sessionUpdate: string; toolCallId?: string; status?: string };
+	if (update.sessionUpdate !== "tool_call_update") return undefined;
+	if (update.status !== "completed" && update.status !== "failed") return undefined;
+	return typeof update.toolCallId === "string" ? update.toolCallId : undefined;
+}
+
 describe("ACP transcript replay degradation", () => {
 	let tempDir: TempDir;
 	let connectionAbort: AbortController;
@@ -93,6 +101,9 @@ describe("ACP transcript replay degradation", () => {
 	let transcriptItems: unknown[] = [];
 	let transcriptSecondPageFailure: string | undefined;
 	let updates: SessionNotification[] = [];
+	/** Every update the agent handed the connection, including the ones the client rejected. */
+	let attempted: SessionNotification[] = [];
+	let loadRejection: unknown;
 	let agentDir = "";
 	let cwd = "";
 
@@ -102,6 +113,8 @@ describe("ACP transcript replay degradation", () => {
 		transcriptItems = [];
 		transcriptSecondPageFailure = undefined;
 		updates = [];
+		attempted = [];
+		loadRejection = undefined;
 		agentDir = path.join(tempDir.path(), "agent");
 		cwd = path.join(tempDir.path(), "workspace");
 
@@ -225,10 +238,17 @@ describe("ACP transcript replay degradation", () => {
 	});
 
 	/** Creates a session, drains its bootstrap updates, then replays it through `session/load`. */
-	async function loadReplayedSession(items: unknown[], expectLoadRejection = false): Promise<SessionNotification[]> {
+	async function loadReplayedSession(
+		items: unknown[],
+		expectLoadRejection = false,
+		rejectSessionUpdate?: (notification: SessionNotification) => boolean,
+	): Promise<SessionNotification[]> {
 		transcriptItems = items;
 		const connection = {
 			sessionUpdate: async (notification: SessionNotification) => {
+				attempted.push(notification);
+				// A client that refuses one frame never saw it, so it must not count as delivered.
+				if (rejectSessionUpdate?.(notification)) throw new Error("client rejected session update");
 				updates.push(notification);
 			},
 			signal: connectionAbort.signal,
@@ -243,8 +263,15 @@ describe("ACP transcript replay degradation", () => {
 			"new session bootstrap",
 		);
 		updates.length = 0;
+		attempted.length = 0;
 		const load = bounded(acp.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }), "load session");
-		if (expectLoadRejection) await expect(load).rejects.toThrow();
+		if (expectLoadRejection)
+			loadRejection = await load.then(
+				() => {
+					throw new Error("Expected session/load to reject");
+				},
+				(error: unknown) => error,
+			);
 		else await load;
 		return updates;
 	}
@@ -436,6 +463,45 @@ describe("ACP transcript replay degradation", () => {
 		expect(JSON.stringify(replayed)).toContain("Transcript replay stopped before this tool call reached a result.");
 		expect(JSON.stringify(replayed)).not.toContain("without a result for this tool call");
 		expect(skipBoundaries(replayed)).toEqual([]);
+	});
+
+	// The cleanup itself can fail. Publishing tool-1's terminal update used to tear the
+	// session record down, after which every later cleanup publication was a silent no-op:
+	// tool-2 stayed pending and nothing said so (#4063).
+	it("closes the calls behind a failing cleanup publication and reports the ones it could not close", async () => {
+		transcriptSecondPageFailure = "unavailable";
+		const replayed = await loadReplayedSession(
+			[
+				{
+					id: "assistant-1",
+					role: "assistant",
+					textSummary: "Reading",
+					body: "Reading",
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "missing.ts" } },
+						{ type: "toolCall", id: "tool-2", name: "read", arguments: { path: "other.ts" } },
+					],
+				},
+			],
+			true,
+			notification => terminalToolCallId(notification) === "tool-1",
+		);
+
+		// Every open call is attempted, not only the ones ahead of the first failure.
+		expect(attempted.map(terminalToolCallId).filter(id => id !== undefined)).toEqual(["tool-1", "tool-2"]);
+		// tool-2 queued behind the failure still reaches a terminal status on the client.
+		expect(toolCallStates(replayed)).toEqual([
+			"tool_call:tool-1:pending",
+			"tool_call:tool-2:pending",
+			"tool_call_update:tool-2:failed",
+		]);
+		// tool-1's terminal frame was refused by the client, so it cannot be closed — and every
+		// call left pending is named by the failure `session/load` reports.
+		expect(pendingToolCalls(replayed)).toEqual(["tool-1"]);
+		const reported = String((loadRejection as Error).message);
+		expect(reported).toContain("ACP transcript replay could not close published tool calls: tool-1");
+		expect(reported).not.toContain("tool-2");
+		for (const toolCallId of pendingToolCalls(replayed)) expect(reported).toContain(toolCallId);
 	});
 });
 

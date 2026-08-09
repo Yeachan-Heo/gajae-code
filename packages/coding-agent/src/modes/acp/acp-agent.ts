@@ -2504,35 +2504,95 @@ export class AcpAgent implements Agent {
 			await this.#publishSessionUpdate(id, notification, adapter);
 	}
 
+	/**
+	 * Closes every tool call still open when replay stops, in a single pass.
+	 *
+	 * Publication runs straight off the connection instead of through
+	 * {@link AcpAgent.#publishSessionUpdate}, because that helper fails the session on the
+	 * first rejected frame and a deleted session record turns every later publication into
+	 * a silent no-op — the calls queued behind the first failure would stay `pending` for
+	 * the life of the client. Teardown therefore happens once, after every call has been
+	 * attempted, and the calls that could not be closed are reported instead of dropped.
+	 */
+	async #closeOpenReplayToolCalls(
+		id: string,
+		adapter: AcpSdkAdapter,
+		cwd: string,
+		replayTools: Map<string, { name: string; args: unknown }>,
+		reason: string,
+	): Promise<void> {
+		const open = [...replayTools];
+		replayTools.clear();
+		if (open.length === 0) return;
+		const unclosed: string[] = [];
+		const failures: unknown[] = [];
+		for (const [toolCallId, tool] of open) {
+			const record = this.#sessions.get(id);
+			// The session can only be gone here through a teardown this loop did not cause.
+			// The call is unclosable either way, and saying so beats publishing into nothing.
+			if (!record || record.adapter !== adapter) {
+				unclosed.push(toolCallId);
+				continue;
+			}
+			try {
+				for (const notification of mapAgentSessionEventToAcpSessionUpdates(
+					{
+						type: "tool_execution_end",
+						toolCallId,
+						toolName: tool.name,
+						result: { content: [{ type: "text", text: reason }] },
+						isError: true,
+					} as never,
+					id,
+					{ cwd, getToolArgs: () => tool.args },
+				))
+					await this.#connection.sessionUpdate(notification);
+			} catch (error) {
+				unclosed.push(toolCallId);
+				failures.push(this.#frameProcessingFailure(error));
+			}
+		}
+		if (unclosed.length === 0) return;
+		const failure = aggregateAcpFailure(
+			"frame_processing_failed",
+			`ACP transcript replay could not close published tool calls: ${unclosed.join(", ")}`,
+			failures,
+		);
+		await this.#failSession(id, adapter, failure);
+		throw failure;
+	}
+
 	async #replaySession(id: string): Promise<void> {
 		const adapter = this.#adapter(id);
 		const record = this.#sessions.get(id);
 		if (!record) return;
 		const replayTools = new Map<string, { name: string; args: unknown }>();
+		let replayFailure: unknown;
 		try {
 			await this.#replayTranscriptPages(id, adapter, record, replayTools);
-		} finally {
-			// One boundary for every way the replay body can end: a normal return, an early
-			// exit, or a `transcript.list` page that throws. A start still open here was
-			// abandoned mid-replay, so it reaches a terminal status now instead of spinning
-			// at `pending` for the life of the session.
-			for (const [toolCallId, tool] of replayTools) {
-				try {
-					await this.#closeUnresolvedReplayToolCall(
-						id,
-						adapter,
-						record.cwd,
-						toolCallId,
-						tool,
-						TRANSCRIPT_REPLAY_INTERRUPTED,
-					);
-				} catch {
-					// The failure that aborted replay is the one worth propagating; a cleanup
-					// publish that fails as well must not replace it.
-				}
-			}
-			replayTools.clear();
+		} catch (error) {
+			replayFailure = error;
 		}
+		// One boundary for every way the replay body can end: normal return, early exit, or a
+		// `transcript.list` page that throws. Whatever is still open was abandoned mid-replay,
+		// so it reaches a terminal status now instead of spinning at `pending` for the life of
+		// the session.
+		try {
+			await this.#closeOpenReplayToolCalls(id, adapter, record.cwd, replayTools, TRANSCRIPT_REPLAY_INTERRUPTED);
+		} catch (cleanupFailure) {
+			if (replayFailure === undefined) throw cleanupFailure;
+			// Both facts matter: what stopped replay, and which calls it left open. Reporting
+			// only one is what kept a whole session's orphaned tool calls invisible.
+			const detail = [replayFailure, cleanupFailure]
+				.map(failure => (failure instanceof Error ? failure.message : String(failure)))
+				.join("; ");
+			throw aggregateAcpFailure(
+				"frame_processing_failed",
+				`ACP transcript replay failed and left published tool calls unclosed: ${detail}`,
+				[replayFailure, cleanupFailure],
+			);
+		}
+		if (replayFailure !== undefined) throw replayFailure;
 	}
 
 	/**
@@ -2715,19 +2775,11 @@ export class AcpAgent implements Agent {
 			if (cursor) continue;
 			// Every start still parked here outlived its result row, so replay ends it
 			// instead of handing the client a tool call nothing will ever complete.
-			for (const [toolCallId, tool] of replayTools) {
-				unreplayableEntries++;
+			if (replayTools.size > 0) {
+				unreplayableEntries += replayTools.size;
 				unreplayableReason ??= "transcript_tool_call_unavailable";
-				await this.#closeUnresolvedReplayToolCall(
-					id,
-					adapter,
-					record.cwd,
-					toolCallId,
-					tool,
-					TRANSCRIPT_TOOL_CALL_UNRESOLVED,
-				);
+				await this.#closeOpenReplayToolCalls(id, adapter, record.cwd, replayTools, TRANSCRIPT_TOOL_CALL_UNRESOLVED);
 			}
-			replayTools.clear();
 			// An entry without its production body is skipped, never fatal: losing one
 			// transcript row must not revoke `session/load` for the whole session.
 			if (unreplayableReason)
