@@ -234,4 +234,32 @@ describe("locatePastedImageReferenceAroundCursor", () => {
 			),
 		).toBeNull();
 	});
+
+	it("never deletes a placeholder-looking token inside a validated source path", () => {
+		const orphaned = ' source="/tmp/[image 1].png"';
+		expect(locatePastedImageReferenceAroundCursor(orphaned, orphaned.indexOf("].png") + 1)).toBeNull();
+		expect(locatePastedImageReferenceAroundCursor(orphaned, orphaned.length)).toBeNull();
+
+		const trailing = 'note source="/tmp/[image 2].png" tail';
+		expect(locatePastedImageReferenceAroundCursor(trailing, trailing.indexOf("].png") + 1)).toBeNull();
+	});
+
+	it("resolves each reference independently when an earlier path embeds a later placeholder", () => {
+		const first = formatPastedImageReference("[image 1]", "/tmp/[image 2].png");
+		const second = formatPastedImageReference("[image 2]", "/tmp/b.png");
+		const line = `${first} ${second}`;
+		const secondStart = first.length + 1;
+
+		expect(locatePastedImageReferenceAroundCursor(line, first.length)).toEqual({
+			imageIndex: 1,
+			startCol: 0,
+			endCol: first.length,
+		});
+		expect(locatePastedImageReferenceAroundCursor(line, line.length)).toEqual({
+			imageIndex: 2,
+			startCol: secondStart,
+			endCol: line.length,
+		});
+		expect(locatePastedImageReferenceAroundCursor(line, first.indexOf("].png") + 1)).toBeNull();
+	});
 });
