@@ -2986,7 +2986,12 @@ function hasMainVerticalPaneTopology(config: GjcTeamConfig, target: string): boo
 	const ordered = [...stack].sort((a, b) => a[1] - b[1]);
 	return (
 		ordered[0]![1] === 0 &&
-		ordered.every((pane, index) => index === 0 || pane[1] === ordered[index - 1]![1] + ordered[index - 1]![3]) &&
+		ordered.every((pane, index) => {
+			if (index === 0) return true;
+			const previous = ordered[index - 1]!;
+			const rowGap = pane[1] - (previous[1] + previous[3]);
+			return rowGap >= 0 && rowGap <= 1;
+		}) &&
 		ordered.at(-1)![1] + ordered.at(-1)![3] === bottom
 	);
 }
