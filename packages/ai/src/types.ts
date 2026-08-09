@@ -756,6 +756,7 @@ export type RawArgumentRejectionCode =
 	| "ask-deep-interview-metadata-requires-deep-interview-gate"
 	| "todo-write-unknown-root-key"
 	| "todo-write-unknown-op-entry-key"
+	| "todo-write-unknown-op-value"
 	| "todo-write-done-drop-requires-target"
 	| "todo-write-unknown-init-entry-key";
 
@@ -766,7 +767,7 @@ export type RawArgumentRejectionCode =
  * differ from the failed call.
  */
 export interface RawArgumentRejectionDetail {
-	/** Offending keys, in payload order. */
+	/** Offending keys, or the offending value, in payload order. */
 	readonly rejectedKeys?: readonly string[];
 	/**
 	 * Correction for a rejected key whose replacement is exact and

@@ -485,6 +485,8 @@ describe("tool descriptor compatibility gate", () => {
 			{ ops: "not-an-array" },
 			{ ops: [{ op: "done", task: "x" }], stray: true },
 			{ _i: "Tracking progress", ops: [{ op: "done", task: "x" }] },
+			{ ops: [{ op: "retitle", task: "x", newTask: "y" }] },
+			{ ops: [{ op: "add", phase: "P", items: ["a"] }] },
 		];
 		for (const payload of payloads) {
 			expect(lazy.rawArgumentValidation(payload)).toEqual(eager.rawArgumentValidation(payload));
@@ -506,6 +508,55 @@ describe("tool descriptor compatibility gate", () => {
 				arguments: { ops: [{ op: "done" }] },
 			}),
 		).toThrow("todo_write done and drop entries require a task or phase target");
+	});
+
+	test("deferred and loaded todo_write reject a bad payload with the same message", async () => {
+		const session = makeSession({ "tools.discoveryMode": "all" });
+		session.hasUI = true;
+		const lazy = (await createTools(session)).find(tool => tool.name === "todo_write");
+		const eager = await BUILTIN_TOOL_DESCRIPTORS.todo_write.load(session);
+		if (!lazy || !eager) throw new Error("expected deferred and loaded todo_write tools");
+		const capture = (run: () => unknown): string => {
+			try {
+				run();
+			} catch (error) {
+				return error instanceof Error ? error.message : String(error);
+			}
+			throw new Error("expected a raw-argument rejection");
+		};
+		const call = (arguments_: Record<string, unknown>) => ({
+			id: "call-parity",
+			type: "toolCall" as const,
+			name: "todo_write",
+			arguments: arguments_,
+		});
+		// The observed incident: four usable entries discarded alongside one
+		// invented op. Whichever path runs first must say the same thing, or the
+		// caller that hit the cold registry sees none of the added guidance.
+		const invalidOp = call({
+			ops: [
+				{ op: "append", phase: "Work", items: ["ship it"] },
+				{ op: "done", task: "first" },
+				{ op: "done", task: "second" },
+				{ op: "done", task: "third" },
+				{ op: "retitle", task: "third", newTask: "fourth" },
+			],
+		});
+		const lazyOpMessage = capture(() => validateToolArguments(lazy, invalidOp));
+		expect(lazyOpMessage).toBe(capture(() => validateToolArguments(eager, invalidOp)));
+		expect(lazyOpMessage).toContain("todo_write operation entries require a known op value");
+		expect(lazyOpMessage).toContain("op must be one of: init, start, done, rm, drop, append, note");
+		expect(lazyOpMessage).toContain("ops[4]");
+
+		const unknownKey = call({
+			ops: [
+				{ op: "done", task: "x" },
+				{ op: "done", task: "y", bogusOpKey: 1 },
+			],
+		});
+		const lazyKeyMessage = capture(() => validateToolArguments(lazy, unknownKey));
+		expect(lazyKeyMessage).toBe(capture(() => validateToolArguments(eager, unknownKey)));
+		expect(lazyKeyMessage).toContain('rejected key: "bogusOpKey" (ops[1])');
 	});
 
 	test("deferred ask validator recovers the canonical round-zero pair", async () => {

@@ -968,6 +968,7 @@ const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> 
 	"todo-write-unknown-root-key": "todo_write root accepts only an ops array of operation entries",
 	"todo-write-unknown-op-entry-key":
 		"todo_write operation entries accept only op, list, task, phase, items, and text keys",
+	"todo-write-unknown-op-value": "todo_write operation entries require a known op value",
 	"todo-write-done-drop-requires-target": "todo_write done and drop entries require a task or phase target",
 	"todo-write-unknown-init-entry-key": "todo_write init list entries accept only phase and items keys",
 };
