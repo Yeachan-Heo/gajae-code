@@ -1039,11 +1039,14 @@ export class Broker {
 			this.#fence("heartbeat-ambiguous");
 			return;
 		}
-		this.#publicationState = "healthy-owned";
-		this.#startupAdmissions.reopen();
-		this.#lossAt = null;
-		this.#ambiguousAt = null;
-		this.discovery = { ...this.discovery, heartbeatAt };
+		const recovery = this.runSynchronousEffectWithFreshPublicationAuthority(() => {
+			this.#publicationState = "healthy-owned";
+			this.#startupAdmissions.reopen();
+			this.#lossAt = null;
+			this.#ambiguousAt = null;
+			this.discovery = { ...this.discovery!, heartbeatAt };
+		});
+		if (!recovery.authorized) return;
 	}
 	async heartbeat(): Promise<void> {
 		if (this.#publicationState !== "healthy-owned") return;
@@ -1098,6 +1101,32 @@ export class Broker {
 		} catch {
 			return false;
 		}
+	}
+	/**
+	 * Revalidate retained publication ownership and begin one synchronous effect in
+	 * the same stack. The callback is the authority boundary: callers must perform
+	 * the authorized effect inside it, so no awaited work can separate proof from
+	 * the effect it authorizes.
+	 */
+	runSynchronousEffectWithFreshPublicationAuthority<T>(
+		effect: () => T,
+		..._synchronousOnly: T extends PromiseLike<unknown> ? [never] : []
+	): { authorized: true; value: T } | { authorized: false } {
+		if (!this.#publication || this.#publicationState === "stopping") return { authorized: false };
+		let observation: BrokerPublicationObservation;
+		try {
+			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
+		} catch {
+			this.#fence("observation-ambiguous");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			return { authorized: false };
+		}
+		if (observation !== "owned") {
+			this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			return { authorized: false };
+		}
+		return { authorized: true, value: effect() };
 	}
 	/**
 	 * A stop may take the owning path only while it can prove it still owns the root.

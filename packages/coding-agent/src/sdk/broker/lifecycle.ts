@@ -3243,41 +3243,49 @@ async function executeLifecycleResponse(
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
 		try {
-			const cmd = command(broker);
-			const spawned = spawn(cmd.file, cmd.args, {
-				cwd: launch.cwd,
-				detached: true,
-				stdio: "ignore",
-				env: {
-					...("kind" in cmd ? cmd.env : process.env),
-					GJC_AGENT_DIR: broker.settings.agentDir,
-					GJC_CODING_AGENT_DIR: broker.settings.agentDir,
-					GJC_SESSION_ID: launch.id,
-					GJC_STATE_ROOT: launch.root,
-					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
-					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
-					// Coordinator-correlation env scoped to this designated launch only (#2549).
-					// The runtime sidecar reads these to write terminal state to the
-					// coordinator-shared file instead of an unread session-local fallback.
-					// The broker computes the file path from coordinatorStateDir + launch.id
-					// because the session ID is generated at spawn time.
-					...(launch.coordinatorStateDir
-						? {
-								[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
-									launch.coordinatorStateDir,
-									"session-states",
-									`${launch.id}.json`,
-								),
-							}
-						: {}),
-					...(launch.coordinatorSessionId
-						? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
-						: {}),
-					...(launch.coordinatorSessionBranch
-						? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
-						: {}),
-				},
+			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
+				const cmd = command(broker);
+				return spawn(cmd.file, cmd.args, {
+					cwd: launch.cwd,
+					detached: true,
+					stdio: "ignore",
+					env: {
+						...("kind" in cmd ? cmd.env : process.env),
+						GJC_AGENT_DIR: broker.settings.agentDir,
+						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
+						GJC_SESSION_ID: launch.id,
+						GJC_STATE_ROOT: launch.root,
+						GJC_LIFECYCLE_REQUEST_ID: effectMarker,
+						GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+						// Coordinator-correlation env scoped to this designated launch only (#2549).
+						// The runtime sidecar reads these to write terminal state to the
+						// coordinator-shared file instead of an unread session-local fallback.
+						// The broker computes the file path from coordinatorStateDir + launch.id
+						// because the session ID is generated at spawn time.
+						...(launch.coordinatorStateDir
+							? {
+									[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
+										launch.coordinatorStateDir,
+										"session-states",
+										`${launch.id}.json`,
+									),
+								}
+							: {}),
+						...(launch.coordinatorSessionId
+							? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
+							: {}),
+						...(launch.coordinatorSessionBranch
+							? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
+							: {}),
+					},
+				});
 			});
+			if (!authorizedSpawn.authorized)
+				return fail(
+					"startup_admission_refused",
+					"SDK host startup was refused because the broker no longer owns the session root.",
+				);
+			const spawned = authorizedSpawn.value;
 			child = spawned;
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
