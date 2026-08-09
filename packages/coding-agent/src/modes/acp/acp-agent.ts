@@ -2357,6 +2357,9 @@ export class AcpAgent implements Agent {
 		notification: SessionNotification,
 		expectedAdapter?: AcpSdkAdapter,
 	): Promise<void> {
+		// A session that is gone has no update channel, so this is a drop and not a failure:
+		// whoever owned the frame is the one that ended the session. Callers whose bookkeeping
+		// assumes delivery have to end at the session too — see `#replaySession`.
 		const record = this.#sessions.get(id);
 		if (!record || (expectedAdapter && record.adapter !== expectedAdapter)) return;
 		try {
@@ -2562,6 +2565,17 @@ export class AcpAgent implements Agent {
 		} catch (error) {
 			replayFailure = error;
 		}
+		// Every terminal below is addressed to this session, and `session/close`, a failed
+		// session, or connection teardown can remove it mid-replay. That removal takes the
+		// client's view of these calls with it: nothing is left to observe a `pending` one,
+		// and a frame carrying a closed session id is one the client asked to stop receiving.
+		// The obligation ends where the session ends; the next `session/load` replays the same
+		// transcript rows from scratch. Read once here rather than at each exit, because
+		// `#closeReplayToolCall` bypasses `#publishSessionUpdate` on purpose — so its own
+		// failures cannot silence the calls behind it — and therefore cannot notice the
+		// session is gone. `#sessionState` reports that missing session to the caller more
+		// accurately than any replay failure about it would.
+		if (this.#sessions.get(id)?.adapter !== adapter) return;
 		// The one boundary that closes replayed tool calls, covering every way the replay body
 		// can end: normal return, early exit, or a `transcript.list` page that throws. Whatever
 		// is still open was abandoned mid-replay, so it reaches a terminal status now instead of

@@ -242,19 +242,23 @@ describe("ACP transcript replay degradation", () => {
 		items: unknown[],
 		expectLoadRejection = false,
 		rejectSessionUpdate?: (notification: SessionNotification) => boolean,
+		onSessionUpdate?: (notification: SessionNotification, agent: AcpAgent) => Promise<void>,
 	): Promise<SessionNotification[]> {
 		transcriptItems = items;
+		let agent: AcpAgent | undefined;
 		const connection = {
 			sessionUpdate: async (notification: SessionNotification) => {
 				attempted.push(notification);
 				// A client that refuses one frame never saw it, so it must not count as delivered.
 				if (rejectSessionUpdate?.(notification)) throw new Error("client rejected session update");
 				updates.push(notification);
+				if (agent) await onSessionUpdate?.(notification, agent);
 			},
 			signal: connectionAbort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection;
 		const acp = new AcpAgent(connection, { agentDir });
+		agent = acp;
 		const created = await bounded(acp.newSession({ cwd, mcpServers: [] }), "new session");
 		await waitFor(
 			() =>
@@ -581,6 +585,88 @@ describe("ACP transcript replay degradation", () => {
 		expect(reported).toContain("ACP transcript replay could not close published tool calls: tool-1");
 		for (const toolCallId of pendingToolCalls(replayed)) expect(reported).toContain(toolCallId);
 		expect(skipBoundaries(replayed)).toEqual([{ count: 3, reason: "transcript_tool_call_unavailable" }]);
+	});
+
+	// `session/close` lands mid-replay: the session record is removed while a `tool_call`
+	// start is already on the wire. The client asked for that session to end, so its view
+	// of the call ends with it — there is no observer left to owe a terminal to, and the
+	// transcript row that would name one is replayed from scratch by the next
+	// `session/load`. Replay therefore stops at the session, publishing nothing more (#4063).
+	it("stops replaying into a session the client closed from a tool-call start", async () => {
+		const replayed = await loadReplayedSession(
+			[
+				{
+					id: "assistant-1",
+					role: "assistant",
+					textSummary: "Reading",
+					body: "Reading",
+					content: [{ type: "toolCall", id: "tool-race", name: "read", arguments: { path: "missing.ts" } }],
+				},
+				{
+					id: "result-1",
+					role: "toolResult",
+					textSummary: "File not found",
+					body: "File not found",
+					content: [{ type: "text", text: "File not found" }],
+					toolCallId: "tool-race",
+					toolName: "read",
+				},
+			],
+			true,
+			undefined,
+			async (notification, agent) => {
+				if (terminalToolCallId(notification) !== undefined) return;
+				const update = notification.update as { sessionUpdate: string; toolCallId?: string };
+				if (update.sessionUpdate !== "tool_call" || update.toolCallId !== "tool-race") return;
+				await agent.closeSession({ sessionId: notification.sessionId });
+			},
+		);
+
+		// The start reached the client before the close; nothing after it was addressed to a
+		// session the client had already closed.
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-race:pending"]);
+		expect(attempted.map(terminalToolCallId).filter(id => id !== undefined)).toEqual([]);
+		expect(skipBoundaries(replayed)).toEqual([]);
+		// `session/load` fails on the session itself, not on tool calls it could not close.
+		const reported = String((loadRejection as Error).message);
+		expect(reported).toContain("Unknown session, not found");
+		expect(reported).not.toContain("tool-race");
+	});
+
+	// Same race, but the transcript never resolves the call, so the replay boundary is the
+	// one holding it open. The boundary publishes straight to the connection — by design,
+	// so a failed session cannot silence it — which is exactly how a terminal reached a
+	// session id the client had closed. Session gone means boundary gone too (#4063).
+	it("closes no replayed tool call once the session it was replaying into is gone", async () => {
+		const replayed = await loadReplayedSession(
+			[
+				{
+					id: "assistant-1",
+					role: "assistant",
+					textSummary: "Reading",
+					body: "Reading",
+					content: [
+						{ type: "toolCall", id: "tool-race", name: "read", arguments: { path: "missing.ts" } },
+						{ type: "toolCall", id: "tool-after", name: "read", arguments: { path: "other.ts" } },
+					],
+				},
+			],
+			true,
+			undefined,
+			async (notification, agent) => {
+				const update = notification.update as { sessionUpdate: string; toolCallId?: string };
+				if (update.sessionUpdate !== "tool_call" || update.toolCallId !== "tool-race") return;
+				await agent.closeSession({ sessionId: notification.sessionId });
+			},
+		);
+
+		// No terminal was even attempted: the boundary bypasses the session check on purpose,
+		// so the rule has to be read before it runs, not inside it.
+		expect(attempted.map(terminalToolCallId).filter(id => id !== undefined)).toEqual([]);
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-race:pending"]);
+		expect(pendingToolCalls(replayed)).toEqual(["tool-race"]);
+		const reported = String((loadRejection as Error).message);
+		expect(reported).toContain("Unknown session, not found");
 	});
 });
 
