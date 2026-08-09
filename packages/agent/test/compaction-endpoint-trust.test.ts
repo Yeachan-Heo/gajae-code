@@ -35,6 +35,11 @@ async function endpointIn(cwd: string, overrides: Record<string, string> = {}): 
 	}
 	// Never let the outer environment leak an endpoint override into the child.
 	delete env.OPENAI_BASE_URL;
+	const home = path.join(cwd, ".home");
+	fs.mkdirSync(home, { recursive: true });
+	env.HOME = home;
+	delete env.GJC_CONFIG_DIR;
+	delete env.PI_CONFIG_DIR;
 	Object.assign(env, overrides);
 
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
