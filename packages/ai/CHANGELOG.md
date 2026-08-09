@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI Responses transports no longer send tool declarations whose names the provider reserves for its own built-ins. OpenCode Zen/Go reject `web_search` as a custom function with `invalid tools in request: custom function name "web_search" is reserved`, and that rejection is request-scoped — one colliding declaration failed the entire tools array before any token streamed, so the bundled `critic`, `planner`, and `architect` agents failed 100% of the time on those providers (#4104). The collision is dropped rather than renamed, because a renamed function tool returns as a `function_call` under the wire alias and that path does not populate `Tool.customWireName`, which would leave the agent-loop dispatcher unable to route the call. `compat.reservedToolNames` overrides the per-provider default.
+
 ## [0.12.19] - 2026-08-08
 
 ## [0.12.18] - 2026-08-08

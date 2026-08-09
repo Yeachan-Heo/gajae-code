@@ -887,6 +887,18 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 */
 	supportsResponsesSessionAffinity?: boolean;
 	/**
+	 * Tool names the provider reserves for its own built-ins and refuses to
+	 * accept as custom function declarations. A colliding tool is sent under a
+	 * prefixed wire alias instead of being dropped, so the capability survives
+	 * and the agent-loop dispatcher still resolves the call through
+	 * `Tool.customWireName`.
+	 *
+	 * Without this, one reserved name rejects the ENTIRE tools array with a
+	 * single 400 and no tokens ever stream — every agent carrying that tool
+	 * fails 100% of the time on that provider.
+	 */
+	reservedToolNames?: string[];
+	/**
 	 * Whether the provider's chat-completions endpoint accepts multiple
 	 * leading `system`/`developer` messages. When false, ordered system
 	 * prompts are coalesced into a single message joined by `\n\n` so
