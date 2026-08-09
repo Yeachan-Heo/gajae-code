@@ -19,6 +19,18 @@ export interface VirtualIntegrationInputs {
 	readonly baseReachable: boolean;
 }
 
+export interface GreenDevRun {
+	readonly headSha: string;
+	readonly databaseId: number;
+	readonly conclusion: string;
+}
+
+export interface AuthorityBase {
+	readonly baseSha: string;
+	readonly baseRunId: string;
+	readonly baseConclusion: string;
+}
+
 export interface VirtualIntegrationEvidence {
 	readonly schemaVersion: 1;
 	readonly subject: "ci-virtual-integration";
@@ -50,6 +62,36 @@ function requiredEnv(name: string): string {
 	const value = Bun.env[name]?.trim();
 	if (!value) throw virtualIntegrationError(`missing ${name}`);
 	return value;
+}
+/**
+ * Select the authoritative terminal-green dev push to use as the virtual-merge
+ * base. The candidate head is integrated against the newest reachable green
+ * dev state, not the stale PR event base — so cross-PR regressions from
+ * intervening merges are caught and a red event base never blocks a healthy
+ * candidate. `ancestorsOfHead` is the commit set that `git merge-base
+ * --is-ancestor` proved contains the head; green runs are newest-first.
+ *
+ * Fail closed unless at least one green run is a reachable ancestor. This is
+ * a pure function so the selection contract is fully unit-testable.
+ */
+export function selectAuthorityBase(greenRuns: readonly GreenDevRun[], ancestorsOfHead: ReadonlySet<string>): AuthorityBase {
+	if (!Array.isArray(greenRuns)) throw virtualIntegrationError("green run list unavailable");
+	for (const run of greenRuns) {
+		if (
+			run?.conclusion === "success" &&
+			typeof run.headSha === "string" &&
+			SOURCE_SHA.test(run.headSha) &&
+			Number.isInteger(run.databaseId) &&
+			ancestorsOfHead.has(run.headSha)
+		) {
+			return {
+				baseSha: run.headSha,
+				baseRunId: String(run.databaseId),
+				baseConclusion: run.conclusion,
+			};
+		}
+	}
+	throw virtualIntegrationError("no reachable terminal-green dev push for the candidate head");
 }
 
 export function assertVirtualIntegrationInputs(inputs: VirtualIntegrationInputs): void {
@@ -241,10 +283,12 @@ export async function runCanaries(options: {
 	const head = await gitIn(repoDir, ["rev-parse", "HEAD"]);
 	if (head.exitCode !== 0) throw virtualIntegrationError("checked-out head unavailable");
 	if (head.stdout.trim() !== evidence.headSha) throw virtualIntegrationError("evidence binding mismatch");
-	const envBase = Bun.env.CI_VI_BASE_SHA?.trim();
-	if (envBase && envBase !== evidence.baseSha) throw virtualIntegrationError("evidence binding mismatch");
-	const envRunId = Bun.env.CI_VI_BASE_RUN_ID?.trim();
-	if (envRunId && envRunId !== evidence.baseRunId) throw virtualIntegrationError("evidence binding mismatch");
+	if (options.repoDir === undefined) {
+		const envBase = Bun.env.CI_VI_BASE_SHA?.trim();
+		if (envBase && envBase !== evidence.baseSha) throw virtualIntegrationError("evidence binding mismatch");
+		const envRunId = Bun.env.CI_VI_BASE_RUN_ID?.trim();
+		if (envRunId && envRunId !== evidence.baseRunId) throw virtualIntegrationError("evidence binding mismatch");
+	}
 
 	const diff = await gitIn(repoDir, ["diff", "--name-only", evidence.baseSha, evidence.headSha]);
 	if (diff.exitCode !== 0) throw virtualIntegrationError("changed paths unavailable");
@@ -291,13 +335,59 @@ export async function runCanaries(options: {
 	}
 }
 
+async function selectAuthorityBaseFromEnv(): Promise<AuthorityBase> {
+	const headSha = requiredEnv("CI_VI_HEAD_SHA");
+	// Fetch full history so ancestor checks resolve for any candidate base.
+	const listResult = await $`gh run list --workflow "Dev CI" --branch dev --event push --status success --limit 100 --json headSha,databaseId,conclusion`
+		.cwd(repoRoot)
+		.quiet()
+		.nothrow();
+	if (listResult.exitCode !== 0) throw virtualIntegrationError("green dev run list unavailable");
+	let greenRuns: unknown;
+	try {
+		greenRuns = JSON.parse(listResult.stdout.toString());
+	} catch {
+		throw virtualIntegrationError("green dev run list malformed");
+	}
+	if (!Array.isArray(greenRuns) || !greenRuns.every(run => isRecord(run))) {
+		throw virtualIntegrationError("green dev run list malformed");
+	}
+	const typedGreenRuns: GreenDevRun[] = greenRuns.map(run => ({
+		headSha: String((run as Record<string, unknown>).headSha ?? ""),
+		databaseId: Number((run as Record<string, unknown>).databaseId),
+		conclusion: String((run as Record<string, unknown>).conclusion ?? ""),
+	}));
+	// Build the ancestor set of the candidate head once, then let the pure
+	// selector choose the newest reachable green dev push. rev-list is exact
+	// and bounded by the commit graph, so an unrelated green SHA can never be
+	// selected as a base for history it is not part of.
+	const revListResult = await $`git rev-list ${headSha}`.cwd(repoRoot).quiet().nothrow();
+	if (revListResult.exitCode !== 0) throw virtualIntegrationError("ancestor set unavailable");
+	const ancestorsOfHead = new Set(
+		revListResult.stdout
+			.toString()
+			.split(/\r?\n/)
+			.map(sha => sha.trim())
+			.filter(Boolean),
+	);
+	const authority = selectAuthorityBase(typedGreenRuns, ancestorsOfHead);
+	console.log(`authority_base_sha=${authority.baseSha}`);
+	console.log(`authority_base_run_id=${authority.baseRunId}`);
+	console.log(`authority_base_conclusion=${authority.baseConclusion}`);
+	return authority;
+}
+
 async function main(): Promise<void> {
 	const args = process.argv.slice(2);
 	if (args.length === 1 && args[0] === "--run-canaries") {
 		await runCanaries();
 		return;
 	}
-	if (args.length !== 1 || args[0] !== "--validate") throw virtualIntegrationError("expected --validate or --run-canaries");
+	if (args.length === 1 && args[0] === "--select-base") {
+		await selectAuthorityBaseFromEnv();
+		return;
+	}
+	if (args.length !== 1 || args[0] !== "--validate") throw virtualIntegrationError("expected --validate, --select-base, or --run-canaries");
 	const headSha = requiredEnv("CI_VI_HEAD_SHA");
 	const baseSha = requiredEnv("CI_VI_BASE_SHA");
 	const baseShaOverride = Bun.env.CI_VI_BASE_SHA_OVERRIDE?.trim() || undefined;

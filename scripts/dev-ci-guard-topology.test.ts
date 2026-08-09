@@ -170,6 +170,29 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(checkoutStep(guard.steps).with?.["fetch-depth"]).toBe(0);
 		expect(authorityFetch).not.toContain("--depth");
 	});
+	test("binds stable virtual integration admission to an authoritative terminal-green base", async () => {
+		const d = await workflow();
+		const virtual = requiredJob(d, "virtual-integration");
+		expect(virtual.needs).toEqual(["affected-plan", "affected"]);
+		expect(virtual.if).toBe("${{ always() && ((github.event_name == 'pull_request' && needs.affected.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.head_sha != '')) }}");
+		expect(requiredEnvValue(virtual, "CI_VI_HEAD_SHA")).toBe("${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}");
+		expect(requiredEnvValue(virtual, "CI_VI_REQUIRED")).toBe("${{ github.event_name == 'workflow_dispatch' && 'true' || needs.affected-plan.outputs.has_risk_canaries }}");
+		// The base is no longer pinned to the stale event base at the job level;
+		// it is selected per-step from the authoritative terminal-green dev push.
+		expect(virtual.env).not.toHaveProperty("CI_VI_BASE_SHA");
+		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
+		expect(source).toContain("group: dev-ci-virtual-integration\n      cancel-in-progress: false");
+		expect(source).toContain("group: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' && 'dev-ci-virtual-integration'");
+		expect(source).toContain("cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}");
+		expect(source).toContain("Select authoritative terminal-green dev base");
+		expect(source).toContain("bun scripts/ci-virtual-integration.ts --select-base");
+		expect(source).toContain("CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}");
+		expect(source).toContain("No authoritative terminal-green dev base selected");
+		expect(source).toContain("Provision pinned Rust toolchain for canary native build");
+		expect(source).toContain("toolchain: nightly-2026-04-29");
+		expect(source).toContain("Run risk-selected canaries in the materialized merge");
+	});
+
 	// Regression for the shared Windows CI blocker seen on PRs #3423/#3422/#3325 and
 	// the #3424/#3425/#3426/#3428 burst: `bun test <path>` only treats the argument as
 	// a path when it resolves; otherwise Bun silently degrades it to a *name filter*,

@@ -96,7 +96,7 @@ export const RISK_CLASSES: readonly RiskClass[] = [
 		match: {
 			exact: ["scripts/ci-dev-affected.ts", "scripts/ci-risk-canary-manifest.ts", "scripts/ci-virtual-integration.ts"],
 		},
-		canaries: [],
+		canaries: ["scripts/ci-virtual-integration.test.ts"],
 	},
 ];
 

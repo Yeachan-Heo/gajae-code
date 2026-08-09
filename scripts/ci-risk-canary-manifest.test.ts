@@ -43,6 +43,10 @@ describe("risk canary manifest", () => {
 		expect(riskClass?.promotedFrom).toBe("dev-ci run 30309767471");
 	});
 
+	test("selects virtual integration coverage for CI planner changes", () => {
+		expect(selectCanaryTests(["scripts/ci-virtual-integration.ts"])).toEqual(["scripts/ci-virtual-integration.test.ts"]);
+	});
+
 	test("keeps selected canaries within the bounded cost", () => {
 		const selected = selectCanaryTests(representativePaths.map(([, changedPath]) => changedPath));
 		const declared = new Set(RISK_CLASSES.flatMap(riskClass => riskClass.canaries));

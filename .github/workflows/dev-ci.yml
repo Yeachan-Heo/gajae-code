@@ -55,6 +55,7 @@ jobs:
       has_tasks: ${{ steps.plan.outputs.has_tasks }}
       has_native: ${{ steps.plan.outputs.has_native }}
       has_python: ${{ steps.plan.outputs.has_python }}
+      has_risk_canaries: ${{ steps.plan.outputs.has_risk_canaries }}
       has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}
       has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
@@ -879,22 +880,33 @@ jobs:
           echo "gjc-state-gates shard result: $result"
           test "$result" = success
 
+  # Stable pre-merge status: this runs for every PR after the protected affected
+  # aggregate, then only materializes a virtual merge when the canonical planner
+  # selected risk canaries. A dispatch remains available for exact-head bootstrap
+  # evidence. Every candidate shares this non-cancelling job-level group so PR
+  # and dispatch validation cannot race different base/head merge candidates.
   virtual-integration:
     name: Virtual integration validation
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' }}
+    needs: [affected-plan, affected]
+    if: ${{ always() && ((github.event_name == 'pull_request' && needs.affected.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.head_sha != '')) }}
+    concurrency:
+      group: dev-ci-virtual-integration
+      cancel-in-progress: false
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
       contents: read
       actions: read
     env:
-      CI_VI_HEAD_SHA: ${{ inputs.head_sha }}
-      CI_VI_BASE_SHA_OVERRIDE: ${{ inputs.base_sha_override }}
+      CI_VI_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
+      # CI_VI_BASE_SHA is set per-step from the authoritative terminal-green
+      # dev base selected by --select-base, never from the stale PR event base.
+      CI_VI_REQUIRED: ${{ github.event_name == 'workflow_dispatch' && 'true' || needs.affected-plan.outputs.has_risk_canaries }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.head_sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_sha }}
       - name: Verify checked-out source head
         shell: bash
         run: |
@@ -903,44 +915,63 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3.14"
-      - name: Resolve latest terminal-green dev run
+      - name: Select authoritative terminal-green dev base
         id: green-dev
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_VI_HEAD_SHA: ${{ env.CI_VI_HEAD_SHA }}
         shell: bash
         run: |
           set -euo pipefail
-          gh run list --workflow "Dev CI" --branch dev --event push --status success --limit 1 --json headSha,databaseId,conclusion |
-            bun -e '
-              const runs = JSON.parse(await Bun.stdin.text());
-              const run = runs[0];
-              const headSha = typeof run?.headSha === "string" ? run.headSha : "";
-              const runId = run?.databaseId === undefined || run?.databaseId === null ? "" : String(run.databaseId);
-              if (run?.conclusion !== "success" || !/^[0-9a-f]{40}$/i.test(headSha) || !/^[0-9]+$/.test(runId)) {
-                console.error("No terminal-green push Dev CI run found");
-                process.exit(1);
-              }
-              console.log(`base_sha=${headSha}`);
-              console.log(`base_run_id=${runId}`);
-              console.log(`base_conclusion=${run.conclusion}`);
-            ' >> "$GITHUB_OUTPUT"
-      - name: Fetch and verify resolved terminal-green base
+          bun scripts/ci-virtual-integration.ts --select-base |
+            {
+              base_sha=""
+              base_run_id=""
+              base_conclusion=""
+              while IFS='=' read -r key value; do
+                case "$key" in
+                  authority_base_sha) base_sha="$value" ;;
+                  authority_base_run_id) base_run_id="$value" ;;
+                  authority_base_conclusion) base_conclusion="$value" ;;
+                esac
+              done
+              test -n "$base_sha" || { echo "::error::No authoritative terminal-green dev base selected"; exit 1; }
+              echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+              echo "base_run_id=$base_run_id" >> "$GITHUB_OUTPUT"
+              echo "base_conclusion=$base_conclusion" >> "$GITHUB_OUTPUT"
+            }
+      - name: Fetch and verify authoritative base
+        env:
+          CI_VI_AUTHORITY_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}
+        run: |
+          git fetch --no-tags origin "${CI_VI_AUTHORITY_BASE_SHA}:refs/remotes/origin/ci-virtual-base"
+          fetched="$(git rev-parse origin/ci-virtual-base)"
+          test "$fetched" = "$CI_VI_AUTHORITY_BASE_SHA" || { echo "::error::Fetched base $fetched != $CI_VI_AUTHORITY_BASE_SHA"; exit 1; }
+      - name: Validate virtual integration evidence
+        if: ${{ env.CI_VI_REQUIRED == 'true' }}
         env:
           CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}
-        run: git fetch --no-tags origin "${CI_VI_BASE_SHA}:refs/remotes/origin/ci-virtual-base"
-      - name: Validate virtual integration
-        env:
-          CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}
+          CI_VI_BASE_SHA_OVERRIDE: ${{ inputs.base_sha_override }}
           CI_VI_BASE_RUN_ID: ${{ steps.green-dev.outputs.base_run_id }}
           CI_VI_BASE_CONCLUSION: ${{ steps.green-dev.outputs.base_conclusion }}
         run: bun scripts/ci-virtual-integration.ts --validate
-      - run: bun install --frozen-lockfile
-      - name: Run risk-selected canaries
+      - name: Provision pinned Rust toolchain for canary native build
+        if: ${{ env.CI_VI_REQUIRED == 'true' }}
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        if: ${{ env.CI_VI_REQUIRED == 'true' }}
+        with:
+          shared-key: dev-virtual-integration-linux-x64
+      - name: Run risk-selected canaries in the materialized merge
+        if: ${{ env.CI_VI_REQUIRED == 'true' }}
         env:
           CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}
           CI_VI_BASE_RUN_ID: ${{ steps.green-dev.outputs.base_run_id }}
         run: bun scripts/ci-virtual-integration.ts --run-canaries
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: ${{ env.CI_VI_REQUIRED == 'true' }}
         with:
           name: dev-virtual-integration-${{ github.run_id }}
           path: .ci-virtual-integration.json

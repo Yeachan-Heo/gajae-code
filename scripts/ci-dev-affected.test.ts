@@ -574,16 +574,21 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
-	test("push affected selftest runs selector and topology coverage for workflow and topology changes", () => {
-		for (const changedPath of [".github/workflows/dev-ci.yml", "scripts/dev-ci-guard-topology.test.ts"]) {
-			const task = planTasks([changedPath], packages).find(candidate => candidate.key === "affected-selftest");
+	test("push affected selftest and risk canary selection cover CI changes", () => {
+		for (const changedPath of [".github/workflows/dev-ci.yml", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-virtual-integration.ts"]) {
+			const tasks = planTasks([changedPath], packages);
+			const task = tasks.find(candidate => candidate.key === "affected-selftest");
 			expect(task?.command).toEqual([
 				"bun",
 				"test",
 				"scripts/ci-dev-affected.test.ts",
 				"scripts/dev-ci-guard-topology.test.ts",
+				"scripts/ci-risk-canary-manifest.test.ts",
+				"scripts/ci-virtual-integration.test.ts",
 			]);
 		}
+		const riskTasks = planTasks(["packages/coding-agent/src/session/session-manager.ts"], packages);
+		expect(riskTasks.some(task => task.key === "test:packages/coding-agent/test/notifications-live-stream.test.ts")).toBe(true);
 	});
 
 	test("cwd is emitted repo-relative for package-scoped tasks", () => {
@@ -1242,9 +1247,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		}
 	});
 
-	test("a CI harness script change plans ci-selftest + ci-dry-run + workflow-permissions (no yaml-parse)", () => {
+	test("a CI planner change includes the virtual integration canary", () => {
 		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
-		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "native-linux-x64", "test:scripts/ci-virtual-integration.test.ts", "workflow-permissions"]);
 	});
 
 	test("a workflow permission checker change plans its own regression", () => {

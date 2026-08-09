@@ -13,6 +13,8 @@ import {
 	removeVirtualMergeWorktree,
 	parseCanonicalVirtualIntegrationEvidence,
 	runCanaries,
+	selectAuthorityBase,
+	type GreenDevRun,
 	type VirtualIntegrationInputs,
 } from "./ci-virtual-integration";
 
@@ -41,7 +43,7 @@ describe("virtual integration inputs", () => {
 		expect(() => assertVirtualIntegrationInputs(validInputs({ baseReachable: false }))).toThrow(/stale base/);
 	});
 
-	test.each(["failure", "cancelled"]) ("rejects a non-green base run: %s", baseConclusion => {
+	test.each(["failure", "cancelled", ""])("rejects a non-green base run: %s", baseConclusion => {
 		expect(() => assertVirtualIntegrationInputs(validInputs({ baseConclusion }))).toThrow(/base run not terminal-green/);
 	});
 
@@ -96,6 +98,71 @@ describe("virtual integration evidence", () => {
 
 		const extra = `${JSON.stringify({ ...evidence, extra: true })}\n`;
 		expect(() => parseCanonicalVirtualIntegrationEvidence(extra)).toThrow(/malformed evidence/);
+	});
+});
+
+describe("authority base selection", () => {
+	const GREEN_A = "a".repeat(40);
+	const GREEN_B = "b".repeat(40);
+	const GREEN_UNREACHABLE = "e".repeat(40);
+
+	function greenRun(headSha: string, databaseId: number): GreenDevRun {
+		return { headSha, databaseId, conclusion: "success" };
+	}
+
+	test("selects the newest reachable terminal-green dev push", () => {
+		// newest-first: GREEN_A is newer and reachable
+		const runs = [greenRun(GREEN_A, 100), greenRun(GREEN_B, 99)];
+		const ancestors = new Set([GREEN_A, GREEN_B]);
+		const selected = selectAuthorityBase(runs, ancestors);
+		expect(selected.baseSha).toBe(GREEN_A);
+		expect(selected.baseRunId).toBe("100");
+		expect(selected.baseConclusion).toBe("success");
+	});
+
+	test("skips a newer green run that is not an ancestor of the head", () => {
+		// GREEN_A is newer but NOT reachable; GREEN_B is the next reachable one
+		const runs = [greenRun(GREEN_UNREACHABLE, 100), greenRun(GREEN_B, 99)];
+		const ancestors = new Set([GREEN_B]);
+		const selected = selectAuthorityBase(runs, ancestors);
+		expect(selected.baseSha).toBe(GREEN_B);
+	});
+
+	test("fails closed when no green run is a reachable ancestor", () => {
+		const runs = [greenRun(GREEN_UNREACHABLE, 100)];
+		const ancestors = new Set([GREEN_A]);
+		expect(() => selectAuthorityBase(runs, ancestors)).toThrow(/no reachable terminal-green/);
+	});
+
+	test("fails closed when the green run list is empty", () => {
+		expect(() => selectAuthorityBase([], new Set([GREEN_A]))).toThrow(/no reachable terminal-green/);
+	});
+
+	test("rejects a red current event base in favor of a reachable green one", () => {
+		// Simulates the PR #4071 scenario: the event base d62b7a4 had a failed
+		// Dev CI run, but an older reachable green push exists. The selector
+		// must pick the green push, not fail on the red event base.
+		const runs = [greenRun(GREEN_A, 200), greenRun(GREEN_B, 100)];
+		const ancestors = new Set([GREEN_A, GREEN_B]);
+		const selected = selectAuthorityBase(runs, ancestors);
+		expect(selected.baseSha).toBe(GREEN_A);
+		expect(selected.baseConclusion).toBe("success");
+	});
+
+	test("ignores non-success conclusions even when reachable", () => {
+		const failedRun: GreenDevRun = { headSha: GREEN_A, databaseId: 50, conclusion: "failure" };
+		const goodRun = greenRun(GREEN_B, 49);
+		const ancestors = new Set([GREEN_A, GREEN_B]);
+		const selected = selectAuthorityBase([failedRun, goodRun], ancestors);
+		expect(selected.baseSha).toBe(GREEN_B);
+	});
+
+	test("ignores malformed SHAs and non-integer run ids in the green list", () => {
+		const malformed: GreenDevRun = { headSha: "short", databaseId: 200, conclusion: "success" };
+		const valid = greenRun(GREEN_B, 49);
+		const ancestors = new Set([GREEN_B]);
+		const selected = selectAuthorityBase([malformed, valid], ancestors);
+		expect(selected.baseSha).toBe(GREEN_B);
 	});
 });
 
