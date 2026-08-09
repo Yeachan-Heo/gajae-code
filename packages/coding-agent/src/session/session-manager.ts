@@ -12620,7 +12620,10 @@ export class SessionManager {
 		}
 		if (!hasStrictSessionSchema(entries)) throw new Error("cold_transcript_schema_invalid");
 		const migrationApplied = migrateToCurrentVersion(entries);
-		for (const entry of entries) residentizePersistedBlobRefs(entry);
+		for (const entry of entries) {
+			if (entry.type !== "session") sanitizeLoadedSessionEntryReplayMetadata(entry);
+			residentizePersistedBlobRefs(entry);
+		}
 		const transition = this.#prepareResidentTextStoreTransition(
 			{
 				target: { sessionId: header.id, sessionFile: this.#sessionFile },
