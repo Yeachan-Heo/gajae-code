@@ -174,6 +174,7 @@ if (command === "-V" || command === "--version") {
 	}
 } else if (command === "list-panes") {
 	if (config.paneLayout === "even-horizontal") console.log("0 0 120 20\n0 20 120 20");
+	else if (config.paneLayout === "misaligned-stack") console.log("0 0 59 40\n60 0 60 20\n61 20 59 20");
 	else console.log("0 0 59 40\n60 0 60 40");
 } else if (command === "show-options" || command === "show-window-options") {
 	const name = args.at(-1);
@@ -274,7 +275,7 @@ async function createFakeTmuxBin(
 		commandName?: string;
 		versionOutput?: string;
 		windowLayout?: string;
-		paneLayout?: "main-vertical" | "even-horizontal";
+		paneLayout?: "main-vertical" | "even-horizontal" | "misaligned-stack";
 	} = {},
 ): Promise<string> {
 	if (!fakeTmuxRunnerPath) throw new Error("fake tmux runner was not compiled");
@@ -1340,6 +1341,27 @@ describe("native gjc team runtime", () => {
 				agentType: "executor",
 				task: "Reject horizontal layout",
 				teamName: "layout-topology-proof-team",
+				cwd: cleanupRoot,
+				env: {
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					PATH: process.env.PATH ?? "",
+					GJC_TEAM_WORKER_COMMAND: "true",
+					GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				},
+			}),
+		).rejects.toThrow("tmux_layout_postproof_failed");
+	});
+
+	it("fails when a multi-pane right stack is not contiguous", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { paneLayout: "misaligned-stack" });
+
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Reject misaligned layout stack",
+				teamName: "layout-stack-proof-team",
 				cwd: cleanupRoot,
 				env: {
 					GJC_SESSION_ID: TEST_SESSION_ID,
