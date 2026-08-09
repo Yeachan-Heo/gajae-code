@@ -72,6 +72,7 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import { startupQueueWaitMs } from "./startup-budget";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -3125,20 +3126,21 @@ async function executeLifecycleResponse(
 				input.terminationStartDeadlineAt,
 				input.lifecycleCleanupDeadlineAt,
 			];
-			let queueWaitMs: number;
+			let requestedReadinessTimeoutMs: number;
 			if (suppliedDeadlineFields.some(value => value !== undefined)) {
 				const supplied = lifecycleDeadlines(input, timing.now());
 				if ("ok" in supplied) return supplied;
-				queueWaitMs = supplied.requestedReadinessTimeoutMs;
+				requestedReadinessTimeoutMs = supplied.requestedReadinessTimeoutMs;
 			} else {
 				const timeout = readinessTimeout(input);
 				if (typeof timeout !== "number") return timeout;
-				queueWaitMs = timeout;
+				requestedReadinessTimeoutMs = timeout;
 			}
+			const queueWaitMs = startupQueueWaitMs(requestedReadinessTimeoutMs);
 			const launch = await launchInput(broker, operation, input);
 			if ("ok" in launch) return launch;
 			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
-				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, queueWaitMs) };
+				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, requestedReadinessTimeoutMs) };
 				startupAdmittedInputs.add(admittedInput);
 				startupLaunchInputs.set(admittedInput, launch);
 				try {
@@ -3149,6 +3151,11 @@ async function executeLifecycleResponse(
 				}
 			});
 			if (admitted.status === "completed") return admitted.value;
+			if (admitted.status === "admission_refused")
+				return fail(
+					"startup_admission_refused",
+					"SDK host startup was refused because the broker no longer owns the session root.",
+				);
 			const failure = normalizeSdkStartupFailure("startup", admitted.reason);
 			return fail("startup_admission_timeout", failure.message);
 		}
