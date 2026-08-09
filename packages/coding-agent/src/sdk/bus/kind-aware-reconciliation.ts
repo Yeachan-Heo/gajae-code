@@ -195,7 +195,21 @@ export function createKindAwareReconciliation(
 		if (!correlation) return;
 		await queueMutation(candidate => {
 			const record = candidate.get(keyOf(kind, correlation));
-			if (!record || record.terminalAt !== undefined) return { value: undefined, changed: false };
+			if (!record) return { value: undefined, changed: false };
+			if (record.terminalAt !== undefined) {
+				// The terminal is claimed by one delivery path while the reason arrives on
+				// another, so ordering is not the caller's to control. A late agent_failed
+				// enriches the settled record instead of being dropped; it must not resurrect
+				// it, so status, terminalAt, retention order, and the clientRef index stay
+				// as-is (cleanupRecords is intentionally not re-run). First reason wins: a
+				// late generic frame never overwrites a specific one. Persisted so the reason
+				// survives reconnect/restart reconciliation.
+				if (frame.type === "agent_failed" && record.error === undefined) {
+					record.error = sanitizePromptFailure(frame.error);
+					return { value: undefined, changed: true };
+				}
+				return { value: undefined, changed: false };
+			}
 			if (frame.type === "agent_start") {
 				if (record.status !== "accepted") return { value: undefined, changed: false };
 				record.status = "in_flight";
@@ -278,7 +292,12 @@ export function createKindAwareReconciliation(
 			terminalAt: record.terminalAt as number,
 			...(record.outcome !== undefined ? { outcome: record.outcome } : {}),
 		};
-		if (record.status === "terminal_ok") return { status: "terminal_ok", ...terminal };
+		if (record.status === "terminal_ok")
+			return {
+				status: "terminal_ok",
+				...terminal,
+				...(record.error !== undefined ? { error: record.error } : {}),
+			};
 		return { status: "failed", ...terminal, error: record.error ?? sanitizePromptFailure(undefined) };
 	};
 

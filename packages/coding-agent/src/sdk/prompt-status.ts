@@ -24,6 +24,12 @@
  * - Q26 tracks prompts accepted through the SDK control surface (which always
  *   carries a requesting connection); submissions without a delivery owner are
  *   outside the reconciliation contract and hold no reservation.
+ * - A terminal outcome settles once: the first terminal transition wins. A late
+ *   `agent_failed` (arriving on a different delivery path than the one that
+ *   claimed the terminal) may still attach its bounded, sanitized reason to an
+ *   already-terminal record that has none, surfaced as `error` on `terminal_ok`.
+ *   It never changes status, `terminalAt`, retention order, or the clientRef
+ *   index, and the first recorded reason always wins over a later frame.
  */
 
 export const PROMPT_CLIENT_REF_MAX_LENGTH = 128;
@@ -79,6 +85,8 @@ export interface TurnPromptReconciliationTerminalOk extends TurnPromptReconcilia
 	/** Epoch milliseconds of the terminal transition. */
 	terminalAt: number;
 	outcome?: SdkPromptTerminalOutcome;
+	/** Present when a late `agent_failed` supplied the only failure reason. */
+	error?: { code: string; message: string };
 }
 
 export interface TurnPromptReconciliationFailed extends TurnPromptReconciliationIdentity {
