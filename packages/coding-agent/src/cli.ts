@@ -221,6 +221,16 @@ async function runMemoryGuardNativeSmokeFastPathFromCli(): Promise<void> {
 	runMemoryGuardNativeSmoke();
 }
 
+function isLaunchWorktreeSelector(arg: string): boolean {
+	return (
+		arg === "--worktree" ||
+		arg === "-w" ||
+		arg.startsWith("--worktree=") ||
+		arg.startsWith("-w=") ||
+		(arg.startsWith("-w") && arg.length > 2)
+	);
+}
+
 function rootFlagDescriptor(arg: string) {
 	if (arg.startsWith("--") && !arg.includes("="))
 		return ROOT_LAUNCH_FLAGS[arg.slice(2) as keyof typeof ROOT_LAUNCH_FLAGS];
@@ -254,7 +264,7 @@ function rootFixtureArg(argv: string[]): { present: boolean; id: string | undefi
 function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i] ?? "";
-		if (arg === "--" || isSubcommand(arg)) return false;
+		if (arg === "--" || isSubcommand(arg) || isLaunchWorktreeSelector(arg)) return false;
 		if (flags.includes(arg)) return true;
 		i = rootFlagValueIndex(argv, i);
 	}
