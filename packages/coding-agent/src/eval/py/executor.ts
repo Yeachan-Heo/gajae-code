@@ -362,9 +362,11 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 		if (sessions.get(sessionId) === initializing) {
 			if (isCancellationError(err)) {
 				initializing.cancelled = new PythonExecutionCancelledError(isTimedOutCancellation(err, options.signal));
+				sessions.delete(sessionId);
 				await initializing.promise.catch(() => undefined);
+			} else {
+				sessions.delete(sessionId);
 			}
-			if (sessions.get(sessionId) === initializing) sessions.delete(sessionId);
 		}
 		throw err;
 	}

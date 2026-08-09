@@ -182,9 +182,14 @@ describe("python eval lifecycle red-team", () => {
 				PythonKernel.start = async options => {
 					startupCalled.resolve();
 					await startupGate.promise;
-					const kernel = await originalStart(options);
-					kernelStarted.resolve();
-					return kernel;
+					try {
+						const kernel = await originalStart(options);
+						kernelStarted.resolve();
+						return kernel;
+					} catch (error) {
+						kernelStarted.reject(error);
+						throw error;
+					}
 				};
 				const pidFile = `${tempDir.path()}/owned-child.pid`;
 				execution = executePython(`%%bash\n(sleep 30) &\nprintf '%s' "$!" > "${pidFile}"\nwait`, {
@@ -213,6 +218,100 @@ describe("python eval lifecycle red-team", () => {
 				}
 				await unrelated.exited.catch(() => undefined);
 			}
+		},
+		LIFECYCLE_TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"rejects the startup handshake and cleans up when kernel startup fails",
+		async () => {
+			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
+			const unrelated = Bun.spawn(["/bin/sh", "-c", "sleep 30"], { stdout: "ignore", stderr: "ignore" });
+			const kernelStarted = Promise.withResolvers<void>();
+			const startupError = new Error("kernel startup failed");
+			PythonKernel.start = async () => {
+				try {
+					throw startupError;
+				} catch (error) {
+					kernelStarted.reject(error);
+					throw error;
+				}
+			};
+			const execution = executePython("print('never runs')", {
+				cwd: tempDir.path(),
+				sessionId: "redteam-startup-failure",
+				kernelMode: "session",
+			});
+			void execution.catch(() => undefined);
+			try {
+				await expect(kernelStarted.promise).rejects.toThrow(startupError);
+				await expect(execution).rejects.toThrow(startupError);
+				expect(isProcessAlive(unrelated.pid)).toBe(true);
+			} finally {
+				try {
+					unrelated.kill("SIGKILL");
+				} catch {
+					// ignore cleanup races
+				}
+				await unrelated.exited.catch(() => undefined);
+				await disposeAllKernelSessions();
+			}
+		},
+		LIFECYCLE_TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"retires a cancelled initializer before an uncancelled successor acquires a replacement",
+		async () => {
+			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
+			const controller = new AbortController();
+			const listeners = countAbortListeners(controller.signal);
+			const startup = Promise.withResolvers<void>();
+			const startupCalled = Promise.withResolvers<void>();
+			const firstKernel = new FakeKernel();
+			const secondKernel = new FakeKernel();
+			let startCalls = 0;
+			PythonKernel.start = async () => {
+				startCalls += 1;
+				if (startCalls === 1) {
+					startupCalled.resolve();
+					await startup.promise;
+					return firstKernel as unknown as PythonKernel;
+				}
+				return secondKernel as unknown as PythonKernel;
+			};
+			try {
+				const cancelled = executePython("print('cancelled')", {
+					cwd: tempDir.path(),
+					sessionId: "redteam-cancelled-initializer",
+					kernelMode: "session",
+					signal: controller.signal,
+				});
+				await startupCalled.promise;
+				controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
+				await Bun.sleep(0);
+				expect(listeners.count()).toBe(0);
+
+				const successor = executePython("print('successor')", {
+					cwd: tempDir.path(),
+					sessionId: "redteam-cancelled-initializer",
+					kernelMode: "session",
+				});
+				startup.resolve();
+				const [cancelledResult, successorResult] = await Promise.all([cancelled, successor]);
+				expect(cancelledResult.cancelled).toBe(true);
+				expect(successorResult.cancelled).toBe(false);
+				expect(startCalls).toBe(2);
+				expect(firstKernel.shutdownCalls).toBe(1);
+				expect(secondKernel.executeCalls).toEqual(["print('successor')"]);
+			} finally {
+				startup.resolve();
+				await disposeAllKernelSessions();
+				listeners.restore();
+			}
+			expect(secondKernel.shutdownCalls).toBe(1);
 		},
 		LIFECYCLE_TEST_TIMEOUT_MS,
 	);
