@@ -1088,8 +1088,12 @@ export class ChatDaemonRuntime {
 		// it may pass this sequence only once every configured surface has taken the
 		// frame: moving it first turns one refused publication into permanent loss,
 		// because the next replay would resume above a frame nobody ever published.
+		// Rebuilds and replays retain this stream identity, so an acknowledgement that
+		// disappears after provider acceptance is reconciled as the same publication.
+		const publicationId =
+			seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
 		try {
-			await this.#publishFrame(attached, correlated);
+			await this.#publishFrame(attached, correlated, publicationId);
 		} catch (error) {
 			// An unsequenced frame has no cursor to hold back, so its failure stays a
 			// rejection for the frame queue to absorb.
@@ -1113,7 +1117,7 @@ export class ChatDaemonRuntime {
 	 * nothing to publish — and throwing means no surface took it. Only the caller moves
 	 * the cursor, and only on the first.
 	 */
-	async #publishFrame(attached: AttachedSession, correlated: CorrelatedFrame): Promise<void> {
+	async #publishFrame(attached: AttachedSession, correlated: CorrelatedFrame, publicationId?: string): Promise<void> {
 		const normalizedFrame = correlated.body;
 		// The SDK's own request/response traffic arrives on this same observer:
 		// `SdkClient` settles a pending request and still forwards that frame to
@@ -1166,6 +1170,7 @@ export class ChatDaemonRuntime {
 				sessionId,
 				endpointGeneration: attached.generation,
 				content,
+				...(publicationId === undefined ? {} : { publicationId }),
 				...(notification.type === "action_needed"
 					? { actionId: notification.id, options: notification.options }
 					: {}),
@@ -1176,6 +1181,7 @@ export class ChatDaemonRuntime {
 				content,
 				notification.type === "action_needed" ? notification.id : undefined,
 				attached.generation,
+				publicationId,
 			);
 	}
 

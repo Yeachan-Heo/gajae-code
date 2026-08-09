@@ -107,6 +107,7 @@ export interface DiscordNotificationInput {
 	threadName?: string;
 	actionId?: string;
 	options?: string[];
+	publicationId?: string;
 }
 
 type DiscordInboundEffectPayload =
@@ -326,7 +327,7 @@ export class DiscordNotificationDaemon {
 		// original post and preserves the original component route.
 		const effectId = pendingActionId
 			? authoritative.pendingActionEffectId!
-			: `notification:${authoritative.threadId}:${randomUUID()}`;
+			: `notification:${authoritative.threadId}:${input.publicationId ?? randomUUID()}`;
 		await this.#postEffect(effectId, authoritative, input.content, components, pendingActionId !== undefined);
 
 		return authoritative;

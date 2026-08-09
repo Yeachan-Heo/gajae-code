@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { SdkClientError } from "../client/client";
 import { readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import type { ChatDeliveryError } from "./chat-daemon-runtime";
@@ -35,7 +35,12 @@ class SlackReconciledAbsentEffectError extends Error {
 	}
 }
 
-import { type ChatEffect, ChatEffectJournal, type ChatEffectLease } from "./chat-effect-journal";
+import {
+	type ChatEffect,
+	ChatEffectJournal,
+	type ChatEffectLease,
+	MAX_TERMINAL_CHAT_EFFECTS,
+} from "./chat-effect-journal";
 import { SlackProviderError } from "./slack-live-provider";
 import type {
 	SlackMessageSearchResult,
@@ -43,6 +48,11 @@ import type {
 	SlackProvider,
 	SlackSocketEnvelope,
 } from "./slack-provider";
+
+function slackPublicationClientMsgId(publicationId: string): string {
+	const digest = createHash("sha256").update(publicationId).digest("hex");
+	return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+}
 
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
@@ -440,7 +450,12 @@ export class SlackNotificationDaemon {
 			throw new SlackThreadBindingError("root_not_found", "The Slack root was not found in the configured channel.");
 	}
 
-	async #postRoot(sessionId: string, body: string, endpointGeneration?: number): Promise<SlackRootPublication> {
+	async #postRoot(
+		sessionId: string,
+		body: string,
+		endpointGeneration?: number,
+		requestedClientMsgId?: string,
+	): Promise<SlackRootPublication> {
 		const endpoint = await this.#resolveEndpoint(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack root publication requires the current session endpoint.");
@@ -473,7 +488,7 @@ export class SlackNotificationDaemon {
 				teamId: this.options.teamId,
 				channelId: this.options.channelId,
 				sessionId,
-				clientMsgId: this.#randomId(),
+				clientMsgId: requestedClientMsgId ?? this.#randomId(),
 				rootPublicationOwner: this.#publicationOwnerId,
 				rootPublicationLeaseExpiresAt: now + this.#publicationLeaseMs,
 				rootPublicationFence: (current?.rootPublicationFence ?? 0) + 1,
@@ -570,27 +585,38 @@ export class SlackNotificationDaemon {
 		body: string,
 		actionId?: string,
 		endpointGeneration?: number,
+		publicationId?: string,
 	): Promise<SlackConversation> {
 		const endpoint = await this.#resolveEndpoint(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack notification requires the current session endpoint.");
 		const generation = endpoint.generation;
+		const rootPublication =
+			publicationId === undefined
+				? undefined
+				: await this.#publicationAttempt(
+						`root:${sessionId}:${publicationId}`,
+						clientMsgId => `root:${sessionId}:${clientMsgId}`,
+					);
 		const existing = await this.findSession(sessionId, false);
 		const usedExistingRoot =
 			existing?.record.state === "active" &&
 			!!existing.record.rootTs &&
 			existing.record.endpointGeneration === generation;
 		let conversation: SlackConversation;
-		let bodyWasUsedAsRoot = false;
+		let bodyWasUsedAsRoot =
+			usedExistingRoot &&
+			rootPublication !== undefined &&
+			existing.record.clientMsgId === rootPublication.clientMsgId;
 		if (usedExistingRoot) {
 			conversation = existing.record;
 		} else {
 			const publication =
 				existing?.record.state === "active"
 					? await this.#resumeWithRootPublication(sessionId, body, generation)
-					: await this.#postRoot(sessionId, body, generation);
+					: await this.#postRoot(sessionId, body, generation, rootPublication?.clientMsgId);
 			conversation = publication.conversation;
-			bodyWasUsedAsRoot = publication.created;
+			bodyWasUsedAsRoot ||= publication.created;
 		}
 		if (!conversation.rootTs) return conversation;
 		const key = usedExistingRoot && existing ? existing.key : this.#intentKey(sessionId);
@@ -607,11 +633,21 @@ export class SlackNotificationDaemon {
 			return active;
 		}
 		if (!actionId) {
-			await this.#postDurable(`notification:${sessionId}:${this.#randomId()}`, sessionId, conversationGeneration, {
+			const publication =
+				publicationId === undefined
+					? {
+							effectId: `notification:${sessionId}:${this.#randomId()}`,
+							clientMsgId: this.#randomId(),
+						}
+					: await this.#publicationAttempt(
+							`notification:${sessionId}:${publicationId}`,
+							clientMsgId => `notification:${sessionId}:${clientMsgId}`,
+						);
+			await this.#postDurable(publication.effectId, sessionId, conversationGeneration, {
 				channel: conversation.channelId,
 				threadTs: conversation.rootTs,
 				text: body,
-				clientMsgId: this.#randomId(),
+				clientMsgId: publication.clientMsgId,
 			});
 			return conversation;
 		}
@@ -1820,6 +1856,24 @@ export class SlackNotificationDaemon {
 		);
 	}
 
+	/**
+	 * Reuse one provider identity while its outcome is pending or uncertain. Only a
+	 * terminal definite refusal advances to a fresh attempt identity, so safe retries
+	 * remain possible without turning an ambiguous acknowledgement into a duplicate.
+	 */
+	async #publicationAttempt(
+		baseId: string,
+		effectIdForClientMsgId: (clientMsgId: string) => string,
+	): Promise<{ effectId: string; clientMsgId: string }> {
+		for (let attempt = 1; attempt <= MAX_TERMINAL_CHAT_EFFECTS + 1; attempt++) {
+			const occurrenceId = attempt === 1 ? baseId : `${baseId}:retry:${attempt}`;
+			const clientMsgId = slackPublicationClientMsgId(occurrenceId);
+			const effectId = effectIdForClientMsgId(clientMsgId);
+			const existing = await this.#journal.read(effectId);
+			if (existing?.state !== "terminal" || existing.receipt?.status === "posted") return { effectId, clientMsgId };
+		}
+		throw new Error("Slack publication exhausted its retained definite-failure identities");
+	}
 	async #providerEffectPayload(
 		id: string,
 		sessionId: string,

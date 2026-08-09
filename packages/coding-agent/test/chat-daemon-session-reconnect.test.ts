@@ -6,6 +6,7 @@ import { logger } from "@gajae-code/utils";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
+import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import type { SlackProviderClient } from "../src/sdk/bus/slack-provider";
 import { ACP_SESSION_RECONNECT } from "../src/sdk/session-reconnect";
 import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } from "./helpers/fake-sdk-transport";
@@ -28,8 +29,13 @@ const CAP_GATED_REPLAY_KINDS = new Set(["tool_activity", "reasoning_summary"]);
 
 class FakeSlackProvider implements SlackProviderClient {
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
+	readonly postAttempts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
 	/** How many upcoming posts are refused, the way a provider outage refuses them. */
 	failPosts = 0;
+	/** How many upcoming posts Slack accepts before their acknowledgements are lost. */
+	acceptThenThrowPosts = 0;
+	/** How many publication reconciliation attempts fail after an ambiguous acknowledgement. */
+	failReconciliations = 0;
 	/** Every post this provider refused, so a test can settle on the refusal itself. */
 	readonly refused: string[] = [];
 	readonly transportHealthy = true;
@@ -73,12 +79,24 @@ class FakeSlackProvider implements SlackProviderClient {
 			this.refused.push(input.text);
 			throw new Error("slack provider is unavailable");
 		}
+		this.postAttempts.push(input);
+		const duplicate = this.posts.findIndex(post => post.clientMsgId === input.clientMsgId);
+		if (duplicate >= 0) return { channel: input.channel, ts: `7.${duplicate + 1}`, client_msg_id: input.clientMsgId };
 		const position = this.posts.push(input);
+		if (this.acceptThenThrowPosts > 0) {
+			this.acceptThenThrowPosts -= 1;
+			this.failReconciliations = 1;
+			throw new SlackProviderError("connection", "chat.postMessage", undefined, undefined, true);
+		}
 		if (this.#publishGate) await this.#publishGate;
 		return { channel: input.channel, ts: `7.${position}`, client_msg_id: input.clientMsgId };
 	}
 
 	async findMessageByClientMsgId(): Promise<null> {
+		if (this.failReconciliations > 0) {
+			this.failReconciliations -= 1;
+			throw new Error("slack reconciliation is unavailable");
+		}
 		return null;
 	}
 
@@ -1151,6 +1169,34 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 	});
 }, 20_000);
 
+test("an ambiguously acknowledged publication is not posted twice when reconciliation fails", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			provider.acceptThenThrowPosts = 1;
+			host.emit("two");
+			await awaitPosts(provider, 2);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(50);
+
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
+			expect(
+				provider.postAttempts.filter(post => post.text === "GJC notice\ntwo").map(post => post.clientMsgId),
+			).toEqual([provider.posts[1]?.clientMsgId, provider.posts[1]?.clientMsgId]);
+		});
+	});
+}, 20_000);
 test("a surface that refuses a frame for good concedes it instead of wedging the stream", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
 		await withFakeTransport(async () => {
