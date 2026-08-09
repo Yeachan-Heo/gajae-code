@@ -16,6 +16,7 @@ import {
 	setLifecycleTimingForTest,
 } from "../src/sdk/broker/lifecycle";
 import {
+	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
 	lifecycleStartupBudgetMs,
 	startupQueueWaitMs,
@@ -607,3 +608,97 @@ test("a default startup admitted late by the production broker stays inside the 
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 15_000);
+
+test("a refused waiter cancels the queue-wait cutoff it no longer needs", async () => {
+	const queue = new StartupAdmissionQueue(1);
+	const release = Promise.withResolvers<void>();
+	const cutoffs: Array<AbortSignal | undefined> = [];
+	const timing: StartupAdmissionTiming = {
+		now: () => 1_000,
+		sleep: (_ms, signal) => {
+			cutoffs.push(signal);
+			return Promise.withResolvers<void>().promise;
+		},
+	};
+	const holder = queue.run(4_000, timing, () => release.promise);
+	const queued = queue.run(4_000, timing, async () => "queued");
+	await Promise.resolve();
+
+	// While the waiter is still queued its cutoff is the only thing that can end the wait.
+	expect(cutoffs).toHaveLength(1);
+	expect(cutoffs[0]?.aborted).toBe(false);
+
+	queue.close();
+	expect(await queued).toEqual({ status: "admission_refused", reason: "admission_refused" });
+	// A refusal is terminal, so the cutoff must not outlive it holding a timer that could
+	// run for the rest of the queue-wait budget.
+	expect(cutoffs[0]?.aborted).toBe(true);
+
+	release.resolve();
+	await holder;
+});
+
+test("the production queue-wait sleep ends with its cutoff instead of its duration", async () => {
+	const cutoff = new AbortController();
+	let settled = false;
+	const sleeping = cancellableSleep(600_000, cutoff.signal).then(() => {
+		settled = true;
+	});
+	await Bun.sleep(5);
+	expect(settled).toBe(false);
+
+	cutoff.abort();
+	await sleeping;
+	expect(settled).toBe(true);
+
+	// An already-cancelled cutoff never arms a timer at all.
+	const cancelled = new AbortController();
+	cancelled.abort();
+	await cancellableSleep(600_000, cancelled.signal);
+});
+
+test("the ACP caller deadline follows a supplied lifecycle deadline tuple, not the field it overrides", async () => {
+	const receivedAt = 1_000_000;
+	const tuple = deriveLifecycleDeadlines(receivedAt, 30_000);
+
+	// The broker sizes both the admission wait and the readiness window from the tuple and
+	// ignores `readinessTimeoutMs` entirely, so budgeting the overridden field would cut the
+	// caller off long before the broker reaches its own terminal.
+	const supplied = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: supplied as never }).global(
+		"session.create",
+		{ cwd: "/workspace", readinessTimeoutMs: 4_000, ...tuple },
+		"supplied-deadline-tuple",
+	);
+	expect(supplied.timeoutMs).toBe(lifecycleStartupBudgetMs(30_000) + 1_000);
+
+	// A close carries no admission wait, so it is budgeted on the tuple's readiness alone.
+	const closing = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: closing as never }).global(
+		"session.close",
+		{ sessionId: "s", ...tuple },
+		"closing-deadline-tuple",
+	);
+	expect(closing.timeoutMs).toBe(31_000);
+});
+
+test("the ACP caller leaves an unbudgetable lifecycle request on the generic client deadline", async () => {
+	// A partial tuple conflicts with the broker's all-or-nothing deadline contract, and an
+	// out-of-range readiness value is out of contract on its own. Both are refused as invalid
+	// input before anything is queued, so neither may claim a startup-sized caller deadline.
+	const partial = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: partial as never }).global(
+		"session.create",
+		{ cwd: "/workspace", receivedAt: 1_000_000, requestedReadinessTimeoutMs: 30_000 },
+		"partial-deadline-tuple",
+	);
+	expect(partial.timeoutMs).toBeUndefined();
+
+	const outOfRange = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: outOfRange as never }).global(
+		"session.create",
+		{ cwd: "/workspace", readinessTimeoutMs: 600_000 },
+		"out-of-range-readiness",
+	);
+	expect(outOfRange.timeoutMs).toBeUndefined();
+});

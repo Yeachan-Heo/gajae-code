@@ -13,6 +13,23 @@ export function isValidReadinessTimeoutMs(value: unknown): value is number {
 }
 
 export const READINESS_TIMEOUT_INVALID_MESSAGE = `readinessTimeoutMs must be an integer between ${MIN_READINESS_TIMEOUT_MS} and ${MAX_READINESS_TIMEOUT_MS}.`;
+/**
+ * Sleep until the duration elapses or the caller cancels the wait. Queue admission
+ * uses this so a granted or refused waiter does not retain its cutoff timer for the
+ * rest of the readiness budget.
+ */
+export function cancellableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted || ms <= 0) return Promise.resolve();
+	const settled = Promise.withResolvers<void>();
+	const cancel = (): void => {
+		clearTimeout(timer);
+		signal?.removeEventListener("abort", cancel);
+		settled.resolve();
+	};
+	const timer = setTimeout(cancel, ms);
+	signal?.addEventListener("abort", cancel, { once: true });
+	return settled.promise;
+}
 
 /**
  * Slack a caller adds over the broker-side budget so that a startup which runs to the
@@ -62,9 +79,24 @@ export function lifecycleStartupBudgetMs(requestedReadinessTimeoutMs: number): n
  * the startup to a durably persisted terminal result.
  */
 export function lifecycleRequestTimeoutMs(operation: string, input: Record<string, unknown>): number | undefined {
-	const requested = input.readinessTimeoutMs;
-	if (requested !== undefined && !isValidReadinessTimeoutMs(requested)) return undefined;
-	const supplied = requested as number | undefined;
+	const deadlineFields = [
+		input.receivedAt,
+		input.requestedReadinessTimeoutMs,
+		input.semanticReadyDeadlineAt,
+		input.terminationStartDeadlineAt,
+		input.lifecycleCleanupDeadlineAt,
+	];
+	const hasDeadlineTuple = deadlineFields.some(value => value !== undefined);
+	let supplied: number | undefined;
+	if (hasDeadlineTuple) {
+		if (!deadlineFields.every(value => typeof value === "number" && Number.isSafeInteger(value))) return undefined;
+		if (!isValidReadinessTimeoutMs(input.requestedReadinessTimeoutMs)) return undefined;
+		supplied = input.requestedReadinessTimeoutMs;
+	} else {
+		const requested = input.readinessTimeoutMs;
+		if (requested !== undefined && !isValidReadinessTimeoutMs(requested)) return undefined;
+		supplied = requested as number | undefined;
+	}
 	if (isStartupLifecycleOperation(operation))
 		return lifecycleStartupBudgetMs(supplied ?? DEFAULT_READINESS_TIMEOUT_MS) + CALLER_DEADLINE_SLACK_MS;
 	return supplied === undefined ? undefined : supplied + CALLER_DEADLINE_SLACK_MS;

@@ -73,6 +73,7 @@ import {
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import {
+	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
 	isValidReadinessTimeoutMs,
 	READINESS_TIMEOUT_INVALID_MESSAGE,
@@ -126,13 +127,10 @@ export function deriveLifecycleDeadlines(receivedAt: number, requestedReadinessT
 
 export interface LifecycleTiming {
 	now(): number;
-	sleep(ms: number): Promise<void>;
+	sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
-const defaultLifecycleTiming: LifecycleTiming = {
-	now: Date.now,
-	sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-};
+const defaultLifecycleTiming: LifecycleTiming = { now: Date.now, sleep: cancellableSleep };
 const lifecycleTimingsForTest = new WeakMap<Broker, LifecycleTiming>();
 type LifecycleCommand = SdkInternalSpawnCommand | { file: string; args: string[] };
 type LifecycleCommandResolver = () => LifecycleCommand;

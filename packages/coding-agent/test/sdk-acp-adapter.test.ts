@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { AcpSdkAdapter, type AcpSdkAdapterError } from "../src/sdk/acp";
+import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
+import { SdkClientError } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 
 class FakeSdkClient {
@@ -431,4 +432,33 @@ test("ACP reverse cancellation and stale failures suppress responses over the re
 		await adapter.close();
 		server.stop(true);
 	}
+});
+
+test("the ACP MCP launch wrapper reports a broker refusal instead of blaming the MCP servers", () => {
+	const mcpServers = [
+		{ name: "docs", command: "docs-mcp", args: [] },
+		{ name: "search", command: "search-mcp", args: [] },
+	];
+
+	// A refused admission never opened an MCP handshake: the broker declined it because it
+	// no longer owns the session root, and that reason is what tells a caller to retry.
+	const refused = new SdkClientError(
+		"startup_admission_refused",
+		"SDK host startup was refused because the broker no longer owns the session root.",
+	);
+	expect(acpMcpLaunchFailure(refused, mcpServers)).toBe(refused);
+
+	// A launch that did reach the servers keeps naming them, which is the useful answer.
+	const masked = acpMcpLaunchFailure(new SdkClientError("spawn_failed", "child exited"), mcpServers) as {
+		code: string;
+		message: string;
+	};
+	expect(masked).toMatchObject({
+		code: "unavailable",
+		message: "MCP server request failed to start (docs, search).",
+	});
+
+	// Without MCP servers there is nothing to re-attribute to in the first place.
+	const bare = new SdkClientError("spawn_failed", "child exited");
+	expect(acpMcpLaunchFailure(bare, [])).toBe(bare);
 });
