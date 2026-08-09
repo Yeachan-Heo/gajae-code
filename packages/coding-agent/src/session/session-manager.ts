@@ -9052,6 +9052,7 @@ export class SessionManager {
 		let managedDestinationStore: ManagedSessionDescendantStore | undefined;
 		let rollbackManagedMove: (() => Promise<void>) | undefined;
 		let residentTransition: PreparedResidentStoreTransition | undefined;
+		const hadPersistedSession = this.#ensuredOnDisk;
 
 		if (this.persist && this.#sessionFile) {
 			// Close the persist writer before moving files
@@ -9287,7 +9288,7 @@ export class SessionManager {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
-			} else if (this.persist && this.#sessionFile && (hasAssistant || !hadSessionFile)) {
+			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
 			} else {
