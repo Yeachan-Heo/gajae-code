@@ -2604,6 +2604,13 @@ export class AgentSession {
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
 			this.#refreshTeamWorkerHeartbeat();
+			// The turn is over, so nothing can split a tool_use/tool_result pair any
+			// more: a `!`/`$` block that finished mid-stream must own its place in
+			// agent state and the session now, not at the next prompt. Until it does,
+			// the TUI shows output the transcript lacks and `onPersisted` stays unfired,
+			// so a rebuild in that gap drops the only rendering of the execution.
+			this.#flushPendingBashMessages();
+			this.#flushPendingPythonMessages();
 			this.#flushPendingBackgroundExchanges();
 			this.#flushPendingAgentEnd();
 		}
