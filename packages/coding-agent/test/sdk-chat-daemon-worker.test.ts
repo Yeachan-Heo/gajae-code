@@ -1074,7 +1074,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -1084,6 +1084,15 @@ describe("chat daemon worker", () => {
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
 		});
 		const runtimeInput = {
 			kind: "slack" as const,
