@@ -44,9 +44,9 @@ export class AcpSdkAdapterError extends Error {
 /**
  * Lifecycle failures the ACP MCP launch wrapper must report verbatim. Everything else
  * is re-attributed to the configured MCP servers, which is the useful answer for a
- * launch that actually reached them — but a startup the broker refused before
- * admission never opened an MCP handshake, so blaming the servers would hide both the
- * real authority reason and the fact that the request is safely retryable.
+ * launch that actually reached them — but a startup the broker ended before admission
+ * never opened an MCP handshake, so blaming the servers would hide both the real
+ * authority reason and the fact that the request is safely retryable.
  */
 const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"invalid_input",
@@ -54,6 +54,7 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"unknown_model_profile",
 	"model_profile_registry_error",
 	"startup_admission_refused",
+	"startup_admission_timeout",
 ]);
 
 /**

@@ -123,25 +123,36 @@ test("MCP lifecycle responses never expose broker endpoint credentials", async (
 	expect(JSON.stringify(result)).not.toContain("secret");
 });
 
-test("MCP invalid readiness budgets reach broker validation before client deadlines", async () => {
-	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-mcp-invalid-readiness-"));
+test("MCP forwards the lifecycle startup budget to the broker client deadline", async () => {
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-mcp-startup-budget-"));
 	dirs.push(repo);
 	const agentDir = path.join(repo, "agent");
 	const broker = new Broker({ agentDir });
+	let forwardedTimeoutMs: number | undefined;
 	await broker.start();
 	try {
-		const result = await createSdkMcpServer({ repo, agentDir }).callTool("gjc_session_global", {
+		const result = await createSdkMcpServer({
+			repo,
+			agentDir,
+			connect: async () =>
+				({
+					global: async (
+						_operation: string,
+						_input: Record<string, unknown>,
+						options?: { timeoutMs?: number },
+					) => {
+						forwardedTimeoutMs = options?.timeoutMs;
+						return { ok: true, result: { sessionId: "created-session" } };
+					},
+					close: async () => {},
+				}) as never,
+		}).callTool("gjc_session_global", {
 			operation: "session.create",
-			input: { cwd: repo, readinessTimeoutMs: -1_000 },
-			idempotencyKey: "invalid-readiness",
+			input: { cwd: repo, readinessTimeoutMs: 4_000 },
+			idempotencyKey: "forward-startup-budget",
 		});
-		expect(result).toEqual({
-			ok: false,
-			error: {
-				code: "invalid_input",
-				message: "readinessTimeoutMs must be an integer between 4000 and 60000.",
-			},
-		});
+		expect(result).toEqual({ ok: true, result: { sessionId: "created-session" } });
+		expect(forwardedTimeoutMs).toBe(9_000);
 	} finally {
 		await broker.stop();
 	}

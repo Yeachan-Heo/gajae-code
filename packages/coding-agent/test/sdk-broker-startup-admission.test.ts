@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
@@ -350,6 +350,88 @@ test("suspect-unpublished fence refuses queued startup before loss grace expires
 
 test("observation-ambiguous fence refuses queued startup before ambiguity grace expires", async () => {
 	await expectGraceWindowFenceRefusesQueuedStartup("ambiguous");
+});
+
+test("publication replacement during heartbeat persistence cannot reopen startup admission", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-heartbeat-reopen-fence-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		await broker.start();
+		const heartbeat = broker.heartbeat();
+		setPublicationObservationForTest(broker, "replaced");
+		await heartbeat;
+
+		expect(await broker.handleRequest("session.list", {})).toEqual({
+			ok: false,
+			error: { code: "unavailable", message: "broker publication is unavailable" },
+		});
+	} finally {
+		setPublicationObservationForTest(broker, undefined);
+		await broker.stop().catch(() => undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+test("an admitted startup fenced during ledger persistence cannot reach synchronous spawn", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-admitted-ledger-fence-"));
+	const agentDir = path.join(root, "agent");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const broker = new Broker({ agentDir, heartbeatTtlMs: 300 });
+	const transitionEntered = Promise.withResolvers<void>();
+	const releaseTransition = Promise.withResolvers<void>();
+	let spawnCalls = 0;
+	let paused = false;
+	try {
+		delete process.env.GJC_SDK_SESSION_COMMAND;
+		await broker.start();
+		const transition = broker.ledger.transition.bind(broker.ledger);
+		const transitionSpy = spyOn(broker.ledger, "transition").mockImplementation(async (identity, state, fields) => {
+			if (!paused && state === "effect_started") {
+				paused = true;
+				transitionEntered.resolve();
+				await releaseTransition.promise;
+			}
+			return transition(identity, state, fields);
+		});
+		setLifecycleCommandResolverForTest(broker, () => {
+			spawnCalls += 1;
+			throw new Error("SDK internal launch refused: fenced broker must not spawn.");
+		});
+
+		const startup = broker.handleRequest(
+			"session.create",
+			{ cwd: root, stateRoot: path.join(root, ".gjc", "state"), readinessTimeoutMs: 4_000 },
+			"admitted-before-ledger-fence",
+		);
+		await transitionEntered.promise;
+
+		setPublicationObservationForTest(broker, "replaced");
+		const fenceDeadline = Date.now() + 2_000;
+		let listResponse = await broker.handleRequest("session.list", {});
+		while ((listResponse.ok || listResponse.error.code !== "unavailable") && Date.now() < fenceDeadline) {
+			await Bun.sleep(10);
+			listResponse = await broker.handleRequest("session.list", {});
+		}
+		expect(listResponse).toMatchObject({ ok: false, error: { code: "unavailable" } });
+
+		releaseTransition.resolve();
+		expect(await startup).toEqual({
+			ok: false,
+			error: {
+				code: "startup_admission_refused",
+				message: "SDK host startup was refused because the broker no longer owns the session root.",
+			},
+		});
+		expect({ fenced: !listResponse.ok, spawnCalls }).toEqual({ fenced: true, spawnCalls: 0 });
+		transitionSpy.mockRestore();
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		setPublicationObservationForTest(broker, undefined);
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		releaseTransition.resolve();
+		await broker.stop().catch(() => undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
 });
 
 test("a broker that lost the root refuses queued startups instead of spawning children", async () => {
