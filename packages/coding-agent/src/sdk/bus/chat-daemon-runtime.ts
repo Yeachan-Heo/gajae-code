@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { type IndexedSession, SessionIndex } from "../broker/session-index";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import { SESSION_PREPARED_EVENT } from "../host/host";
@@ -46,7 +47,7 @@ export interface ChatDaemonSdkClient {
 	onReconnect?(handler: () => void): () => void;
 	/** Re-dials a retired socket; a no-op on a live one. */
 	connect?(): Promise<void>;
-	request(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
+	request(frame: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>>;
 	close(): Promise<void>;
 	send(frame: Record<string, unknown>): void;
 }
@@ -144,6 +145,16 @@ const REPLAY_BARRIER_LIMIT = 1_024;
  */
 const REPLAY_RETRY_ATTEMPTS = 3;
 const REPLAY_RETRY_BACKOFF_MS = 100;
+
+/**
+ * How many rounds re-serve one sequence whose publication failed before it is conceded.
+ *
+ * A refused publication holds the cursor below its frame, and the rebuild that follows
+ * re-serves exactly that frame. A surface that is down for good would repeat that
+ * forever and deliver nothing else, so the rounds are bounded: past this count the frame
+ * is conceded the way a retention gap is, and the stream resumes above it.
+ */
+const DELIVERY_ATTEMPT_LIMIT = 3;
 
 type AttachedSession = Readonly<{
 	id: string;
@@ -403,6 +414,18 @@ export class ChatDaemonRuntime {
 	#stopTimer: (() => void) | undefined;
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
+	/**
+	 * The frame an attachment failed to publish, with how many rounds have tried it.
+	 *
+	 * Keyed by session rather than by attachment because the retire-and-rebuild a refused
+	 * publication triggers replaces the attachment: the count has to outlive it, or a
+	 * surface that is down for good would rebuild from the same sequence forever. It does
+	 * not outlive the stream, though: a sequence names a frame only within one endpoint
+	 * generation, so a rolled endpoint reopens a sequence space whose first frame nothing
+	 * has ever been offered. Charging it for what an earlier generation's frame cost would
+	 * concede it after a single refusal.
+	 */
+	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
 	readonly #reviving = new Set<string>();
 	#reconcileTail: Promise<void> = Promise.resolve();
 
@@ -880,6 +903,35 @@ export class ChatDaemonRuntime {
 	}
 
 	/**
+	 * Retire one attachment whose frame reached a surface without landing on it.
+	 *
+	 * The cursor is delivery's record, so a frame no surface took must stay above it. The
+	 * attachment is retired exactly like one whose barrier failed, and the rebuild replays
+	 * from a cursor that still sits below the frame. Later frames cannot drag the cursor
+	 * over it either, because a retired attachment publishes nothing.
+	 *
+	 * The rounds are bounded, because a surface that is down for good would re-serve that
+	 * same sequence forever and never deliver another. On the last one the frame is
+	 * conceded — loudly, like a retention gap — and the cursor steps over it, since a
+	 * stream that never advances again loses every later frame instead of just this one.
+	 */
+	#failDelivery(attached: AttachedSession, seq: number, error: unknown): void {
+		const previous = this.#undelivered.get(attached.sessionId);
+		const attempts = previous?.generation === attached.generation && previous.seq === seq ? previous.attempts + 1 : 1;
+		const reason = error instanceof Error ? error.message : String(error);
+		if (attempts >= DELIVERY_ATTEMPT_LIMIT) {
+			this.#undelivered.delete(attached.sessionId);
+			attached.cursor.seq = seq;
+			logger.warn(
+				`chat daemon conceded seq ${seq} of session ${attached.sessionId} at generation ${attached.generation} after ${attempts} refused publications (${reason}); delivery resumes above it.`,
+			);
+			return;
+		}
+		this.#undelivered.set(attached.sessionId, { generation: attached.generation, seq, attempts });
+		this.#failBarrier(attached, `publication failed at seq ${seq} (${reason})`);
+	}
+
+	/**
 	 * Publish what this round held, lowest sequence first, then reopen live ingress.
 	 *
 	 * Frames keep arriving while the drain runs, so the barrier is only lifted by a pass
@@ -1032,8 +1084,41 @@ export class ChatDaemonRuntime {
 				held.push({ seq, frame });
 				return;
 			}
-			attached.cursor.seq = seq;
 		}
+		// Publication is the delivery boundary. The cursor records what was delivered, so
+		// it may pass this sequence only once every configured surface has taken the
+		// frame: moving it first turns one refused publication into permanent loss,
+		// because the next replay would resume above a frame nobody ever published.
+		// Rebuilds and replays retain this stream identity, so an acknowledgement that
+		// disappears after provider acceptance is reconciled as the same publication.
+		const publicationId =
+			seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
+		try {
+			await this.#publishFrame(attached, correlated, publicationId);
+		} catch (error) {
+			// An unsequenced frame has no cursor to hold back, so its failure stays a
+			// rejection for the frame queue to absorb.
+			if (seq === undefined || !ownsSequence) throw error;
+			this.#failDelivery(attached, seq, error);
+			return;
+		}
+		if (seq !== undefined && ownsSequence) {
+			this.#undelivered.delete(attached.sessionId);
+			// The publish was awaited, so a concession may have carried the cursor past this
+			// sequence in the meantime. Delivery records a sequence; it never rewinds one.
+			if (seq > attached.cursor.seq) attached.cursor.seq = seq;
+		}
+	}
+
+	/**
+	 * Publish one correlated frame to every surface this runtime fans out to.
+	 *
+	 * Split from sequencing so the two outcomes stay distinguishable: returning means the
+	 * frame is delivered — published, or deliberately dropped by a filter that leaves
+	 * nothing to publish — and throwing means no surface took it. Only the caller moves
+	 * the cursor, and only on the first.
+	 */
+	async #publishFrame(attached: AttachedSession, correlated: CorrelatedFrame, publicationId?: string): Promise<void> {
 		const normalizedFrame = correlated.body;
 		// The SDK's own request/response traffic arrives on this same observer:
 		// `SdkClient` settles a pending request and still forwards that frame to
@@ -1060,7 +1145,7 @@ export class ChatDaemonRuntime {
 		if (name === SESSION_PREPARED_EVENT || bodyType === SESSION_PREPARED_EVENT) return;
 		if (name === "session_ready") {
 			if (correlated.generation !== attached.generation) return;
-			await this.resume(sessionId, attached.generation, "GJC session ready.");
+			await this.resume(sessionId, attached.generation, "GJC session ready.", publicationId);
 			return;
 		}
 		const notification = this.#notificationEvent(sessionId, normalizedFrame);
@@ -1086,6 +1171,7 @@ export class ChatDaemonRuntime {
 				sessionId,
 				endpointGeneration: attached.generation,
 				content,
+				...(publicationId === undefined ? {} : { publicationId }),
 				...(notification.type === "action_needed"
 					? { actionId: notification.id, options: notification.options }
 					: {}),
@@ -1096,20 +1182,32 @@ export class ChatDaemonRuntime {
 				content,
 				notification.type === "action_needed" ? notification.id : undefined,
 				attached.generation,
+				publicationId,
 			);
 	}
 
 	private async close(sessionId: string): Promise<void> {
+		this.#undelivered.delete(sessionId);
 		await this.#discord?.close(sessionId);
 		await this.#slack?.close(sessionId);
 	}
 
-	private async resume(sessionId: string, generation: number, content: string): Promise<void> {
+	// Each surface takes the identity on the call that actually publishes, so a retry
+	// reconciles the attempt it retries instead of adding a second message. Discord's
+	// resume only unarchives the thread — the publication, and the nonce reconciled
+	// against it, belong to the notify below. Slack's resume rolls the root over and
+	// posts the body itself, so it carries the identity directly.
+	private async resume(sessionId: string, generation: number, content: string, publicationId?: string): Promise<void> {
 		if (this.#discord) {
 			await this.#discord.resume(sessionId, generation);
-			await this.#discord.notify({ sessionId, endpointGeneration: generation, content });
+			await this.#discord.notify({
+				sessionId,
+				endpointGeneration: generation,
+				content,
+				...(publicationId === undefined ? {} : { publicationId }),
+			});
 		}
-		if (this.#slack) await this.#slack.resume(sessionId, content, generation);
+		if (this.#slack) await this.#slack.resume(sessionId, content, generation, publicationId);
 	}
 	async #runChatCommand(
 		transport: ChatTransport,
@@ -1175,7 +1273,11 @@ export class ChatDaemonRuntime {
 			throw new ChatDeliveryError("pre_send");
 		}
 		try {
-			return await client.request({ type: "broker_request", operation, input, idempotencyKey });
+			const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+			return await client.request(
+				{ type: "broker_request", operation, input, idempotencyKey },
+				timeoutMs === undefined ? undefined : { timeoutMs },
+			);
 		} finally {
 			await client.close();
 		}

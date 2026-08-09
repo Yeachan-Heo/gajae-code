@@ -113,7 +113,7 @@ describe("SessionManager session ids", () => {
 			expect(session.getSessionId()).toBe(oldSessionId);
 			const entries = await fs.readdir(path.dirname(oldSessionFile));
 			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
-			expect(entries.some(entry => entry.includes("fork-staging"))).toBe(false);
+			expect(entries.some(entry => entry.includes("fork-staging") && !entry.endsWith(".removing"))).toBe(false);
 		} finally {
 			injection.restore();
 			await session.close();
@@ -235,14 +235,14 @@ describe("SessionManager session ids", () => {
 			destination.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
 		);
 		try {
-			await expect(session.fork()).rejects.toThrow("io_error");
+			await expect(session.fork()).rejects.toThrow("staged_publish_rejected:io_failure");
 			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 			expect(session.getSessionId()).toBe(oldSessionId);
 			const entries = await fs.readdir(path.dirname(oldSessionFile));
 			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
 			const artifactDirectories = entries.filter(
-				entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile),
+				entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile) && !entry.endsWith(".removing"),
 			);
 			expect(artifactDirectories).toContain(path.basename(oldSessionFile, ".jsonl"));
 			expect(artifactDirectories).toHaveLength(1);
@@ -277,7 +277,7 @@ describe("SessionManager session ids", () => {
 			publish.assertHit();
 			cleanup.assertHit();
 			// The PRIMARY error survives verbatim.
-			expect(String(error?.message)).toContain("io_error");
+			expect(String(error?.message)).toContain("staged_publish_rejected:io_failure");
 			// The cleanup outcome must NOT have superseded it.
 			expect(String(error?.message)).not.toContain("Failed to clean up fork publication");
 			expect(error?.cause).toBeUndefined();
@@ -315,7 +315,7 @@ describe("SessionManager session ids", () => {
 			expect(String(error?.message)).toContain("identity_mismatch");
 			// The primary failure is preserved rather than discarded.
 			expect(error?.cause).toBeInstanceOf(Error);
-			expect(String((error?.cause as Error).message)).toContain("io_error");
+			expect(String((error?.cause as Error).message)).toContain("staged_publish_rejected:io_failure");
 		} finally {
 			cleanup.restore();
 			publish.restore();

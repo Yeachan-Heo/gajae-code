@@ -77,7 +77,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
-		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() }}");
+		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}");
 		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
@@ -108,7 +108,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("remains a required producer audit binding");
 		expect(workflow).not.toContain("continue-on-error");
 		const protectedJob = workflow.slice(workflow.indexOf("  affected:\n"), workflow.indexOf("\n  gjc-state-gates-matrix:"));
-		expect(protectedJob).toContain("if: ${{ always() }}");
+		expect(protectedJob).toContain("if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}");
 		expect(protectedJob).toContain("name: Validate finalized affected evidence");
 		expect(protectedJob).not.toContain("continue-on-error");
 		const validationStart = protectedJob.indexOf("name: Validate finalized affected evidence");
@@ -574,16 +574,21 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
-	test("push affected selftest runs selector and topology coverage for workflow and topology changes", () => {
-		for (const changedPath of [".github/workflows/dev-ci.yml", "scripts/dev-ci-guard-topology.test.ts"]) {
-			const task = planTasks([changedPath], packages).find(candidate => candidate.key === "affected-selftest");
+	test("push affected selftest and risk canary selection cover CI changes", () => {
+		for (const changedPath of [".github/workflows/dev-ci.yml", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-virtual-integration.ts"]) {
+			const tasks = planTasks([changedPath], packages);
+			const task = tasks.find(candidate => candidate.key === "affected-selftest");
 			expect(task?.command).toEqual([
 				"bun",
 				"test",
 				"scripts/ci-dev-affected.test.ts",
 				"scripts/dev-ci-guard-topology.test.ts",
+				"scripts/ci-risk-canary-manifest.test.ts",
+				"scripts/ci-virtual-integration.test.ts",
 			]);
 		}
+		const riskTasks = planTasks(["packages/coding-agent/src/session/session-manager.ts"], packages);
+		expect(riskTasks.some(task => task.key === "test:packages/coding-agent/test/notifications-live-stream.test.ts")).toBe(true);
 	});
 
 	test("cwd is emitted repo-relative for package-scoped tasks", () => {
@@ -1242,9 +1247,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		}
 	});
 
-	test("a CI harness script change plans ci-selftest + ci-dry-run + workflow-permissions (no yaml-parse)", () => {
+	test("a CI planner change includes the virtual integration canary", () => {
 		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
-		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "native-linux-x64", "test:scripts/ci-virtual-integration.test.ts", "workflow-permissions"]);
 	});
 
 	test("a workflow permission checker change plans its own regression", () => {
@@ -1260,6 +1265,8 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"test",
 			"scripts/ci-dev-affected.test.ts",
 			"scripts/dev-ci-guard-topology.test.ts",
+			"scripts/ci-risk-canary-manifest.test.ts",
+			"scripts/ci-virtual-integration.test.ts",
 		]);
 	});
 

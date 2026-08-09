@@ -23,11 +23,11 @@ export function prepareAcpTerminalAuthArgs(rawArgs: readonly string[]): AcpTermi
 	const args: string[] = [];
 	for (let i = 0; i < withoutAuthFlag.length; i++) {
 		const arg = withoutAuthFlag[i];
-		if (arg === "--mode") {
+		if (arg === "--mode" && withoutAuthFlag[i + 1] === "acp") {
 			i++;
 			continue;
 		}
-		if (arg.startsWith("--mode=")) {
+		if (arg === "--mode=acp") {
 			continue;
 		}
 		args.push(arg);

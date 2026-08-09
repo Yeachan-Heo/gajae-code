@@ -17,6 +17,7 @@ const compat: Required<OpenAICompat> = {
 	supportsDeveloperRole: true,
 	sendSessionHeaders: false,
 	supportsResponsesSessionAffinity: false,
+	reservedToolNames: [],
 	supportsMultipleSystemMessages: true,
 	supportsReasoningEffort: true,
 	reasoningEffortMap: {},

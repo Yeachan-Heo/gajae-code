@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
+import { Broker } from "../src/sdk/broker/broker";
 import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createSdkMcpServer } from "../src/sdk/mcp";
@@ -120,6 +121,41 @@ test("MCP lifecycle responses never expose broker endpoint credentials", async (
 	});
 	expect(result).toEqual({ ok: true, result: { sessionId: "created-session" } });
 	expect(JSON.stringify(result)).not.toContain("secret");
+});
+
+test("MCP forwards the lifecycle startup budget to the broker client deadline", async () => {
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-mcp-startup-budget-"));
+	dirs.push(repo);
+	const agentDir = path.join(repo, "agent");
+	const broker = new Broker({ agentDir });
+	let forwardedTimeoutMs: number | undefined;
+	await broker.start();
+	try {
+		const result = await createSdkMcpServer({
+			repo,
+			agentDir,
+			connect: async () =>
+				({
+					global: async (
+						_operation: string,
+						_input: Record<string, unknown>,
+						options?: { timeoutMs?: number },
+					) => {
+						forwardedTimeoutMs = options?.timeoutMs;
+						return { ok: true, result: { sessionId: "created-session" } };
+					},
+					close: async () => {},
+				}) as never,
+		}).callTool("gjc_session_global", {
+			operation: "session.create",
+			input: { cwd: repo, readinessTimeoutMs: 4_000 },
+			idempotencyKey: "forward-startup-budget",
+		});
+		expect(result).toEqual({ ok: true, result: { sessionId: "created-session" } });
+		expect(forwardedTimeoutMs).toBe(9_000);
+	} finally {
+		await broker.stop();
+	}
 });
 
 test("MCP global schema exposes and requires caller lifecycle idempotency keys", async () => {

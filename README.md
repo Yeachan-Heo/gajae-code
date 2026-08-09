@@ -383,3 +383,48 @@ Gajae-Code includes a [`geobench`](https://github.com/NomaDamas/geobench) produc
 
 - Spec: [`geobench/gajae-code.yaml`](geobench/gajae-code.yaml)
 - Runbook: [`docs/geobench.md`](docs/geobench.md)
+
+## macOS + iTerm2 + GJC Option/Alt 키 설정
+
+macOS에서 Option 키가 `œ`, `ˆ` 같은 문자 조합으로 전달되지 않고 GJC의 Alt/Meta 입력으로 전달되도록 설정한 기록입니다.
+
+### iTerm2 설정
+
+**Settings → Profiles → Keys → General**에서 사용하는 프로파일의 다음 값을 설정합니다.
+
+- Left Option Key: `+Esc`
+- Right Option Key: `+Esc`
+
+현재 live 설정은 `Default`와 `tmux` 모두 `Option Key Sends = 1`, `Right Option Key Sends = 1`입니다. `+Esc`는 `Option+Q`를 `ESC q`, `Option+I`를 `ESC i`로 전달합니다.
+
+**Settings → Profiles → Keys → Key Mappings**에서 `Option+Q` 또는 `Option+I`를 가로채는 `Send Text`, `Send Escape Sequence`, 기타 매핑을 삭제하고, 설정 변경 후 각 프로파일의 새 세션을 엽니다.
+
+### macOS 입력 소스
+
+GJC의 Alt 명령을 입력할 때는 현재 활성 키보드 레이아웃을 `ABC`로 전환합니다. `scripts/verify-option-key.sh`는 단순히 ABC가 목록에 있는지만 보지 않고 `AppleCurrentKeyboardLayoutInputSourceID = com.apple.keylayout.ABC`와 선택 목록의 ABC를 함께 검사합니다.
+
+### 검증
+
+```sh
+./scripts/verify-option-key.sh
+python3 scripts/capture-option-key.py
+```
+
+검증 스크립트는 `Default`와 `tmux` 프로파일, 양쪽 Option 키, physical keycode(`Q=12`, `I=34`) 및 character code(`q=0x71`, `i=0x69`) 형식의 Option+Q/I 매핑 충돌, 활성 ABC 레이아웃, Bun, GJC smoke test를 검사합니다.
+
+캡처 도구는 실제 TTY에서 사용합니다. raw mode의 Ctrl-C는 `KeyboardInterrupt`가 아닌 `0x03`이므로 이를 감지해 터미널을 복구하고 종료합니다. 새 Default와 tmux 세션에서 `Option+Q`, `Option+I`가 각각 `ESC q`, `ESC i`로 도착하고 GJC 명령을 실행하는지는 물리 키 입력으로 확인해야 합니다.
+
+GJC 개발 환경은 프로젝트의 `CONTRIBUTING.md`에 따라 다음 흐름을 사용합니다.
+
+```sh
+bun install
+bun run dev:doctor
+bun run dev
+```
+
+관련 live 및 fixture 검증 증거는 `artifacts/option-key-verification.json`에 기록되어 있습니다. `raw/` 폴더는 존재하지 않았으며 생성하거나 수정하지 않았습니다.
+
+출처:
+
+- [Gajae-Code CONTRIBUTING.md](https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/CONTRIBUTING.md)
+- [iTerm2 Profiles → Keys](https://iterm2.com/documentation-preferences-profiles-keys.html)

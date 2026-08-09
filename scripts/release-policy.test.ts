@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
-import { STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME } from "./release";
+import { releasedBunLockContent, STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME } from "./release";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ciWorkflowPath = path.join(repoRoot, ".github/workflows/ci.yml");
@@ -188,6 +188,45 @@ describe("stable release policy", () => {
 		expect(publish).toContain("gajae-release-packages-expected-v1.json");
 		expect(publish).toContain("gajae-release-packages-v1.json");
 		expect(publish).toContain("gajae-release-channel-v1.json");
+	});
+	test("updates owned Bun lock versions without re-resolving third-party packages", () => {
+		const lock = `{
+  "workspaces": {
+    "packages/agent": {
+      "name": "@gajae-code/agent-core",
+      "version": "0.12.20",
+    },
+  },
+  "catalog": {
+    "@gajae-code/agent-core": "0.12.20",
+    "lucide-react": "^1.14.0",
+  },
+  "packages": {
+    "lucide-react": ["lucide-react@1.28.0", "", {}, "sha512-frozen"],
+  },
+}`;
+
+		const updated = releasedBunLockContent(lock, "0.12.20", "0.12.21");
+
+		expect(updated).toContain('"version": "0.12.21"');
+		expect(updated).toContain('"@gajae-code/agent-core": "0.12.21"');
+		expect(updated).toContain('"lucide-react@1.28.0"');
+		expect(updated).toContain('"sha512-frozen"');
+	});
+
+	test("fails closed when the Bun lock workspace or catalog versions do not match", () => {
+		const lock = `{
+  "workspaces": { "packages/agent": { "version": "0.12.20" } },
+  "catalog": { "@gajae-code/agent-core": "0.12.19" },
+  "packages": {}
+}`;
+
+		expect(() => releasedBunLockContent(lock, "0.12.20", "0.12.21")).toThrow(
+			"no @gajae-code catalog versions matching 0.12.20",
+		);
+		expect(() => releasedBunLockContent(lock, "0.12.18", "0.12.21")).toThrow(
+			"no workspace package versions matching 0.12.18",
+		);
 	});
 	test("rejects reused or moved tags and directs corrections to a newer stable version", async () => {
 		const releaseScript = await Bun.file(releaseScriptPath).text();

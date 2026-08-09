@@ -6,6 +6,12 @@ const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 100_000;
 const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS = 600_000;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MS = 300_000;
 
+const ANTHROPIC_STREAM_IDLE_TIMEOUT_MS = 300_000;
+
+export function getProviderStreamIdleTimeoutFallbackMs(provider: string): number | undefined {
+	return provider === "anthropic" ? ANTHROPIC_STREAM_IDLE_TIMEOUT_MS : undefined;
+}
+
 export function getProviderFirstEventTimeoutFallbackMs(provider: string): number | undefined {
 	if (provider === "alibaba-token-plan") return ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS;
 	return provider === "kimi-code" ? KIMI_CODE_FIRST_EVENT_TIMEOUT_MS : undefined;

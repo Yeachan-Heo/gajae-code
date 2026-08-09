@@ -17,6 +17,8 @@ import {
 } from "@gajae-code/tui";
 import { getProjectDir, logger, sanitizeText } from "@gajae-code/utils";
 import { EDIT_MODE_STRATEGIES, type EditMode, type PerFileDiffPreview } from "../../edit";
+import { type EditRenderContext, getPerFileEditRenderArgs, getPerFileEditRenderContext } from "../../edit/renderer";
+import { getEditRequestTargetInventory, orderedDistinctPaths } from "../../edit/streaming";
 import type { Theme } from "../../modes/theme/theme";
 import { theme } from "../../modes/theme/theme";
 import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
@@ -81,9 +83,10 @@ function argsCanBeSharedWithRenderer(toolName: string, tool: AgentTool | undefin
 	return !tool?.renderCall && !tool?.renderResult && READONLY_ARG_RENDERER_TOOLS.has(toolName);
 }
 
-function partialJsonLength(args: unknown): number {
-	const value = args && typeof args === "object" ? (args as { __partialJson?: unknown }).__partialJson : undefined;
-	return typeof value === "string" ? value.length : -1;
+function previewPayloadKey(args: unknown): string | undefined {
+	const partialJson =
+		args && typeof args === "object" ? (args as { __partialJson?: unknown }).__partialJson : undefined;
+	return typeof partialJson === "string" ? `${partialJson.length}:${partialJson}` : undefined;
 }
 
 /**
@@ -234,6 +237,7 @@ export class ToolExecutionComponent extends Container {
 	#editDiffLastArgsKey?: string;
 	#argsIdentityVersion = 0;
 	#lastArgsReference: any;
+
 	#shareArgsWithRenderer = false;
 	// Cached converted images for Kitty protocol (which requires PNG), keyed by index and source.
 	#convertedImages: Map<number, { data: string; mimeType: string; source: string }> = new Map();
@@ -312,6 +316,7 @@ export class ToolExecutionComponent extends Container {
 	updateArgs(args: any, _toolCallId?: string): void {
 		const argsChanged = !Bun.deepEquals(this.#args, args);
 		if (!argsChanged && !this.#editMode) return;
+
 		if (args !== this.#lastArgsReference) {
 			this.#lastArgsReference = args;
 			this.#argsIdentityVersion += 1;
@@ -352,11 +357,12 @@ export class ToolExecutionComponent extends Container {
 			effectiveArgs = args;
 		}
 
-		// Coalesce duplicate computes without serializing multi-KB streamed args every delta.
+		// The streamed partial JSON is the exact payload snapshot. Its length alone
+		// cannot distinguish same-size replacements. Completed calls lack that
+		// snapshot, so retain identity invalidation for their distinct arg objects.
 		const argsKey = [
 			this.#toolName,
-			this.#argsIdentityVersion,
-			partialJsonLength(args),
+			previewPayloadKey(args) ?? `identity:${this.#argsIdentityVersion}`,
 			this.#argsComplete ? 1 : 0,
 		].join(":");
 		if (argsKey === this.#editDiffLastArgsKey) return;
@@ -498,7 +504,21 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	#captureLogicalVisibleProjection(): string {
-		return this.render(10_000).join("\n");
+		const rendered = this.render(10_000).join("\n");
+		// The sticky-viewport source tracks semantic transcript output, not just
+		// the literal pixels. A result-first collapsed edit card intentionally
+		// hides in-flight diff previews, so preview resolution changes the
+		// rendered text by nothing — yet it is still semantic progress the
+		// viewport must re-anchor on (the preview becomes visible the moment the
+		// user expands, and downstream snapshot/replay keys off this revision).
+		// Fold a compact fingerprint of resolved-preview state into the logical
+		// projection so it advances independently of the sparse collapsed render.
+		const preview = this.#editDiffPreview;
+		if (!preview || preview.length === 0) return rendered;
+		const fingerprint = preview
+			.map(file => `${file.path}:${file.diff ? "1" : "0"}:${file.firstChangedLine ?? ""}:${file.error ? "1" : "0"}`)
+			.join("|");
+		return `${rendered}\u0000preview:${fingerprint}`;
 	}
 
 	#markVisibleMutationIfChanged(notify = false): void {
@@ -697,13 +717,17 @@ export class ToolExecutionComponent extends Container {
 			const perFileResults = this.#result?.details?.perFileResults as
 				| Array<{ path: string; isError?: boolean }>
 				| undefined;
-			if (perFileResults && perFileResults.length > 1) {
+			const requestedEditFiles = isEditLikeToolName(this.#toolName)
+				? getEditRequestTargetInventory(this.#args, this.#editMode, { isPartial: this.#isPartial }).paths.length
+				: 0;
+			if (perFileResults && (perFileResults.length > 1 || (this.#isPartial && requestedEditFiles > 1))) {
 				// Multi-file: render each file as its own Box (identical to separate tool calls)
 				this.#contentBox.setBgFn(undefined);
 				this.#contentBox.clear();
 
 				const renderContext = this.#buildRenderContext();
 				this.#renderState.renderContext = renderContext;
+				const callArgs = this.#getCallArgsForRender();
 
 				for (let i = 0; i < perFileResults.length; i++) {
 					const fileResult = perFileResults[i];
@@ -717,10 +741,17 @@ export class ToolExecutionComponent extends Container {
 						: (text: string) => theme.bg("toolSuccessBg", text);
 					const fileBox = new Box(1, 0, fileBgFn);
 					try {
+						const fileRenderState = {
+							...this.#renderState,
+							renderContext: getPerFileEditRenderContext(renderContext as EditRenderContext, fileResult.path) as
+								| Record<string, unknown>
+								| undefined,
+						};
 						const resultComponent = renderer.renderResult(
 							{ content: [], details: fileResult, isError: fileResult.isError },
-							this.#renderState,
+							fileRenderState,
 							theme,
+							getPerFileEditRenderArgs(callArgs, fileResult.path, this.#editMode),
 						);
 						if (resultComponent) {
 							fileBox.addChild(ensureInvalidate(resultComponent));
@@ -733,10 +764,11 @@ export class ToolExecutionComponent extends Container {
 				}
 
 				// Show pending indicator for remaining files
-				const totalFiles = this.#args?.edits
-					? new Set((this.#args.edits as any[]).map((e: any) => e?.path).filter(Boolean)).size
-					: 0;
-				const remaining = Math.max(0, totalFiles - perFileResults.length);
+				const requestedFiles = getEditRequestTargetInventory(this.#args, this.#editMode, {
+					isPartial: this.#isPartial,
+				}).paths.length;
+				const representedFiles = orderedDistinctPaths(perFileResults.map(file => file.path)).length;
+				const remaining = Math.max(0, requestedFiles - representedFiles);
 				if (remaining > 0 && this.#isPartial) {
 					const pendingSpacer = new Spacer(1);
 					this.#multiFileBoxes.push(pendingSpacer);
@@ -906,11 +938,11 @@ export class ToolExecutionComponent extends Container {
 						? { error: first.error }
 						: { diff: first.diff ?? "", firstChangedLine: first.firstChangedLine };
 				}
-				if (previews.length > 1) {
+				if (previews.some(preview => preview.path.length > 0)) {
 					context.perFileDiffPreview = previews;
 				}
 			}
-			if (!previews?.some(preview => preview.diff)) {
+			if (this.#expanded && !previews?.some(preview => preview.diff)) {
 				const editMode = this.#editMode;
 				const strategy = editMode ? EDIT_MODE_STRATEGIES[editMode] : undefined;
 				const fallback = strategy?.renderStreamingFallback(this.#args, theme);

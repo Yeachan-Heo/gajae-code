@@ -324,7 +324,10 @@ test("SdkClient owns request timeout, reconnect backoff, and absolute deadline d
 		const timedOut = client.control("wait");
 		await flush();
 		clock.advanceBy(50);
-		await expect(timedOut).rejects.toMatchObject({ code: "timeout" });
+		await expect(timedOut).rejects.toMatchObject({
+			code: "timeout",
+			details: { requestSent: true, requestId: expect.any(String) },
+		});
 
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");

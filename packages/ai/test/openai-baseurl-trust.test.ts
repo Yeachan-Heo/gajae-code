@@ -45,6 +45,11 @@ async function resolveIn(cwd: string, overrides: Record<string, string> = {}): P
 	}
 	// Never let the outer environment leak an endpoint override into the child.
 	for (const key of KEYS) delete env[key];
+	const home = path.join(cwd, ".home");
+	fs.mkdirSync(home, { recursive: true });
+	env.HOME = home;
+	delete env.GJC_CONFIG_DIR;
+	delete env.PI_CONFIG_DIR;
 	Object.assign(env, overrides);
 
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });

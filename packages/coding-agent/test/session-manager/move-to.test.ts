@@ -328,12 +328,11 @@ describe("SessionManager.moveTo", () => {
 		expect(header?.cwd).toBe(path.resolve(cwdB));
 	});
 
-	it("recreates file from memory when old file is deleted (assistant exists)", async () => {
+	it("recreates file from memory when old file is deleted", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
-		await session.close();
 
 		const oldFile = session.getSessionFile()!;
 		// Delete the file to simulate unexpected removal

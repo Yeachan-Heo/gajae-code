@@ -107,6 +107,7 @@ function figOptionFromFlag(name: string, descriptor: FlagDescriptor): FigOption 
 		const arg: FigArg = { name: optionArgName(name, descriptor) };
 		const suggestions = argSuggestions(descriptor.options);
 		if (suggestions) arg.suggestions = suggestions;
+		if (descriptor.optionalValue) arg.isOptional = true;
 		option.args = arg;
 	}
 	return option;

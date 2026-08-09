@@ -21,7 +21,7 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
 import type { SessionContext } from "@gajae-code/coding-agent/session/session-manager";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { SessionContextTooLargeError, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container } from "@gajae-code/tui";
 
 beforeAll(() => {
@@ -106,6 +106,13 @@ describe("UiHelpers.renderInitialMessages — isolated", () => {
 			updateFooter: true,
 			populateHistory: true,
 		});
+	});
+	it("surfaces the exported typed overflow when the fallback context build throws", () => {
+		const { ctx } = makeCtx();
+		(ctx.sessionManager.buildSessionContext as Mock<() => SessionContext>).mockImplementation(() => {
+			throw new SessionContextTooLargeError(70 * 1024 * 1024);
+		});
+		expect(() => new UiHelpers(ctx).renderInitialMessages()).toThrow(SessionContextTooLargeError);
 	});
 });
 

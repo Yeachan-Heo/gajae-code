@@ -789,6 +789,53 @@ describe("Editor component", () => {
 			expect(editor.getText()).toBe("");
 		});
 
+		it("deletes an exact text run before the cursor as one undoable edit", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 1] after");
+			for (let index = 0; index < " after".length; index++) {
+				editor.handleInput("\x1b[D");
+			}
+
+			expect(editor.deleteTextBeforeCursor("[image 1]")).toBe(true);
+			expect(editor.getText()).toBe("before  after");
+			expect(editor.getCursor()).toEqual({ line: 0, col: "before ".length });
+
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe("before [image 1] after");
+		});
+
+		it("does not delete when the exact text is absent before the cursor", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 2]");
+
+			expect(editor.deleteTextBeforeCursor("[image 1]")).toBe(false);
+			expect(editor.getText()).toBe("before [image 2]");
+		});
+		it("deletes a range around the cursor as one undoable edit", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const text = 'before [image 1] source="/tmp/a.png" after';
+			const startCol = "before ".length;
+			const endCol = text.indexOf(" after");
+			editor.setText(text);
+			for (let index = 0; index < ' source="/tmp/a.png" after'.length; index += 1) {
+				editor.handleInput("\x1b[D");
+			}
+
+			expect(editor.deleteTextRangeAroundCursor(startCol, endCol)).toBe(true);
+			expect(editor.getText()).toBe("before  after");
+			expect(editor.getCursor()).toEqual({ line: 0, col: startCol });
+
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe(text);
+		});
+
+		it("rejects ranges that do not contain the cursor", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 1]");
+
+			expect(editor.deleteTextRangeAroundCursor(0, 3)).toBe(false);
+			expect(editor.getText()).toBe("before [image 1]");
+		});
 		it("deletes single-code-unit unicode characters (umlauts) with Backspace", () => {
 			const editor = new Editor(defaultEditorTheme);
 

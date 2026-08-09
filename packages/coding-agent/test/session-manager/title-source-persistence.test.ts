@@ -45,7 +45,9 @@ class FailingPatchStorage extends FileSessionStorage {
 			writeLine: async () => {
 				throw new Error("entry patch failed");
 			},
-			writeLineSync: line => writer.writeLineSync(line),
+			writeLineSync: () => {
+				throw new Error("entry patch failed");
+			},
 			flush: () => writer.flush(),
 			fsync: () => writer.fsync(),
 			close: () => writer.close(),

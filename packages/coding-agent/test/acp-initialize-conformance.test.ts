@@ -113,6 +113,14 @@ describe("ACP initialize conformance", () => {
 			args: [],
 			terminalAuth: true,
 		});
+		expect(prepareAcpTerminalAuthArgs([ACP_TERMINAL_AUTH_FLAG, "--mode", "--mpresett"])).toEqual({
+			args: ["--mode", "--mpresett"],
+			terminalAuth: true,
+		});
+		expect(prepareAcpTerminalAuthArgs(["--mode=--mpresett", ACP_TERMINAL_AUTH_FLAG])).toEqual({
+			args: ["--mode=--mpresett"],
+			terminalAuth: true,
+		});
 	});
 
 	it("declares agentInfo.version that matches the published package version", async () => {

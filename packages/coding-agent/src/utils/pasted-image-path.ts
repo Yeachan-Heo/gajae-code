@@ -316,3 +316,96 @@ export function parsePastedImagePaths(
 export function formatPastedImageReference(placeholder: string, imagePath: string): string {
 	return `${placeholder} source=${JSON.stringify(imagePath)}`;
 }
+export interface PastedImageReferenceRange {
+	imageIndex: number;
+	startCol: number;
+	endCol: number;
+}
+
+function findJsonStringEnd(text: string, startCol: number): number | null {
+	if (text[startCol] !== '"') return null;
+
+	let escaped = false;
+	for (let index = startCol + 1; index < text.length; index += 1) {
+		const character = text[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (character === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (character !== '"') continue;
+
+		const endCol = index + 1;
+		try {
+			if (typeof JSON.parse(text.slice(startCol, endCol)) !== "string") return null;
+		} catch {
+			return null;
+		}
+		return endCol;
+	}
+	return null;
+}
+
+/**
+ * Collects every validated `source=<JSON string>` value span on the line.
+ *
+ * A placeholder-looking token inside one of these spans is part of a file path,
+ * not a composer placeholder, so deleting it would corrupt the path. Spans are
+ * collected independently of any preceding placeholder because an orphaned
+ * `source="…"` can outlive the placeholder that produced it.
+ */
+function findSourceValueSpans(line: string): Array<{ start: number; end: number }> {
+	const spans: Array<{ start: number; end: number }> = [];
+	const sourcePattern = /source=/g;
+	while (true) {
+		const match = sourcePattern.exec(line);
+		if (!match) return spans;
+		const valueStart = match.index + match[0].length;
+		const valueEnd = findJsonStringEnd(line, valueStart);
+		if (valueEnd === null) continue;
+		spans.push({ start: valueStart, end: valueEnd });
+		sourcePattern.lastIndex = valueEnd;
+	}
+}
+
+export function locatePastedImageReferenceAroundCursor(
+	line: string,
+	cursorCol: number,
+): PastedImageReferenceRange | null {
+	if (!Number.isInteger(cursorCol) || cursorCol < 0 || cursorCol > line.length) return null;
+
+	const sourceValueSpans = findSourceValueSpans(line);
+	const placeholderPattern = /\[image ([1-9]\d*)\]/g;
+	while (true) {
+		const match = placeholderPattern.exec(line);
+		if (!match) return null;
+
+		const startCol = match.index;
+		const placeholder = match[0];
+		const imageIndex = Number.parseInt(match[1] ?? "", 10);
+		if (!Number.isSafeInteger(imageIndex)) continue;
+
+		const enclosingSpan = sourceValueSpans.find(span => startCol >= span.start && startCol < span.end);
+		if (enclosingSpan) {
+			placeholderPattern.lastIndex = enclosingSpan.end;
+			continue;
+		}
+
+		const placeholderEnd = startCol + placeholder.length;
+		const sourcePrefix = " source=";
+		if (line.startsWith(sourcePrefix, placeholderEnd)) {
+			const fullEnd = findJsonStringEnd(line, placeholderEnd + sourcePrefix.length);
+			if (fullEnd === null) return null;
+			if (cursorCol === placeholderEnd || cursorCol === fullEnd) {
+				return { imageIndex, startCol, endCol: fullEnd };
+			}
+			placeholderPattern.lastIndex = fullEnd;
+			continue;
+		}
+
+		if (cursorCol === placeholderEnd) return { imageIndex, startCol, endCol: placeholderEnd };
+	}
+}

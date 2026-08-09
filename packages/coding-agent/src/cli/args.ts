@@ -7,8 +7,33 @@ import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseEffort } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
+import { type ConsumerLaunchFlagName, LAUNCH_PARSE_FLAGS, launchFlagIsOwnedBy } from "./root-flags";
+
+const ROOT_FLAG_TOKENS = new Set<string>();
+for (const [name, descriptor] of Object.entries(LAUNCH_PARSE_FLAGS)) {
+	ROOT_FLAG_TOKENS.add(`--${name}`);
+	if (descriptor.char) ROOT_FLAG_TOKENS.add(`-${descriptor.char}`);
+}
+
+const INTERNAL_ROOT_FLAG_TOKENS = new Set(["--help", "-h", "--version", "-v", "--session", "--provider-session-id"]);
+
+function isExternallyParsedRootFlagToken(arg: string): boolean {
+	return (
+		arg === "--acp-terminal-auth" ||
+		arg === "--worktree" ||
+		arg === "-w" ||
+		arg.startsWith("-w=") ||
+		arg.startsWith("-w")
+	);
+}
+
+function isKnownRootFlagToken(arg: string): boolean {
+	return ROOT_FLAG_TOKENS.has(arg) || INTERNAL_ROOT_FLAG_TOKENS.has(arg) || isExternallyParsedRootFlagToken(arg);
+}
 
 export type Mode = "text" | "json" | "acp";
+
+export type ParseArgsAuthority = "local" | "acp" | "deferred";
 
 export interface Args {
 	cwd?: string;
@@ -58,11 +83,13 @@ export interface Args {
 	noTitle?: boolean;
 	messages: string[];
 	fileArgs: string[];
-	/** Retained for test/runtime compatibility; extension-defined flags are no longer parsed. */
+	/** Flags unknown to every launch parser; their consumer supplies the diagnostic. */
 	unknownFlags: Map<string, boolean | string>;
 	/** Exact interactive startup login intent, recognized before model-profile activation. */
 	authBootstrap?: true;
 }
+
+const CONSUMER_FLAGS_BY_ARGS = new WeakMap<Args, Map<ConsumerLaunchFlagName, string>>();
 
 function isStartupSlashCommandArg(arg: string | undefined): boolean {
 	return (
@@ -80,15 +107,36 @@ function isStartupLoginCommandArg(args: readonly string[], index: number): boole
 	return argumentCount === 0 || (argumentCount === 1 && !args[index + 1].startsWith("-"));
 }
 
-export function parseArgs(args: string[]): Args {
+function takeFlagValue(args: readonly string[], index: number, flag: string, allowDashPrefixed = false): string {
+	const value = args[index + 1];
+	if (!value || (!allowDashPrefixed && value.startsWith("-"))) {
+		throw new CliParseError(`${flag} requires a value`);
+	}
+	return value;
+}
+
+function takePromptValue(
+	args: readonly string[],
+	index: number,
+	flag: string,
+	allowInlineDashPrefixed: boolean,
+): string {
+	const value = args[index + 1];
+	const allowSeparatedDashPrefixed = value === "-" || value?.startsWith("- ") === true;
+	return takeFlagValue(args, index, flag, allowInlineDashPrefixed || allowSeparatedDashPrefixed);
+}
+
+export function parseArgs(args: string[], authority: ParseArgsAuthority = "local"): Args {
 	const result: Args = {
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
 	};
+	const consumerFlags = new Map<ConsumerLaunchFlagName, string>();
 
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
+		let hasInlineValue = false;
 
 		if (isStartupLoginCommandArg(args, i)) {
 			result.authBootstrap = true;
@@ -100,14 +148,27 @@ export function parseArgs(args: string[]): Args {
 			result.messages.push(args.slice(i).join(" "));
 			break;
 		}
+		if (arg === "--") {
+			for (const positional of args.slice(i + 1)) {
+				if (positional.startsWith("@")) result.fileArgs.push(positional.slice(1));
+				else result.messages.push(positional);
+			}
+			break;
+		}
 
 		// Support --flag=value syntax (e.g. --tools=ask,read)
 		if (arg.startsWith("--") && arg.includes("=")) {
 			const eqIdx = arg.indexOf("=");
 			const value = arg.slice(eqIdx + 1);
 			arg = arg.slice(0, eqIdx);
+			hasInlineValue = true;
 			// Insert the value so the existing "args[++i]" logic picks it up
 			args.splice(i + 1, 0, value);
+		}
+		if (arg.startsWith("-") && !isKnownRootFlagToken(arg)) {
+			result.unknownFlags.set(arg, true);
+			if (hasInlineValue) i++;
+			continue;
 		}
 
 		if (arg === "--help" || arg === "-h") {
@@ -116,8 +177,9 @@ export function parseArgs(args: string[]): Args {
 			result.version = true;
 		} else if (arg === "--allow-home") {
 			result.allowHome = true;
-		} else if (arg === "--mode" && i + 1 < args.length) {
-			const mode = args[++i];
+		} else if (arg === "--mode") {
+			const mode = takeFlagValue(args, i, "--mode");
+			i++;
 			if (mode === "text" || mode === "json" || mode === "acp") {
 				result.mode = mode;
 			} else {
@@ -137,34 +199,34 @@ export function parseArgs(args: string[]): Args {
 			} else {
 				result.resume = true;
 			}
-		} else if (arg === "--fork" && i + 1 < args.length) {
-			result.fork = args[++i];
-		} else if (arg === "--provider" && i + 1 < args.length) {
-			result.provider = args[++i];
-		} else if (arg === "--model" && i + 1 < args.length) {
-			result.model = args[++i];
-		} else if (arg === "--smol" && i + 1 < args.length) {
-			result.smol = args[++i];
-		} else if (arg === "--slow" && i + 1 < args.length) {
-			result.slow = args[++i];
-		} else if (arg === "--plan" && i + 1 < args.length) {
-			result.plan = args[++i];
-		} else if (arg === "--mpreset" && i + 1 < args.length) {
-			result.mpreset = args[++i];
+		} else if (arg === "--fork") {
+			result.fork = takeFlagValue(args, i++, "--fork");
+		} else if (arg === "--provider") {
+			result.provider = takeFlagValue(args, i++, "--provider");
+		} else if (arg === "--model") {
+			result.model = takeFlagValue(args, i++, "--model");
+		} else if (arg === "--smol") {
+			result.smol = takeFlagValue(args, i++, "--smol");
+		} else if (arg === "--slow") {
+			result.slow = takeFlagValue(args, i++, "--slow");
+		} else if (arg === "--plan") {
+			result.plan = takeFlagValue(args, i++, "--plan");
+		} else if (arg === "--mpreset") {
+			result.mpreset = takeFlagValue(args, i++, "--mpreset");
 		} else if (arg === "--default") {
 			result.default = true;
-		} else if (arg === "--api-key" && i + 1 < args.length) {
-			result.apiKey = args[++i];
+		} else if (arg === "--api-key") {
+			result.apiKey = takeFlagValue(args, i++, "--api-key");
 		} else if (arg === "--credential") {
 			const next = args[i + 1];
 			if (!next || next.startsWith("-")) {
 				throw new CliParseError("--credential requires <selector>");
 			}
 			result.credential = args[++i];
-		} else if (arg === "--system-prompt" && i + 1 < args.length) {
-			result.systemPrompt = args[++i];
-		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
-			result.appendSystemPrompt = args[++i];
+		} else if (arg === "--system-prompt") {
+			result.systemPrompt = takePromptValue(args, i++, "--system-prompt", hasInlineValue);
+		} else if (arg === "--append-system-prompt") {
+			result.appendSystemPrompt = takePromptValue(args, i++, "--append-system-prompt", hasInlineValue);
 		} else if (arg === "--clipboard-transport") {
 			const next = args[i + 1];
 			if (!next || next.startsWith("-")) {
@@ -196,14 +258,16 @@ export function parseArgs(args: string[]): Args {
 				throw new CliParseError("--mcp-config requires <absolute-path>");
 			}
 			result.mcpConfig = args[++i];
-		} else if (arg === "--provider-session-id" && i + 1 < args.length) {
-			result.providerSessionId = args[++i];
+		} else if (arg === "--provider-session-id") {
+			result.providerSessionId = takeFlagValue(args, i++, "--provider-session-id");
 		} else if (arg === "--no-session") {
 			result.noSession = true;
-		} else if (arg === "--session-dir" && i + 1 < args.length) {
-			result.sessionDir = args[++i];
-		} else if (arg === "--models" && i + 1 < args.length) {
-			result.models = args[++i].split(",").map(s => s.trim());
+		} else if (arg === "--session-dir") {
+			result.sessionDir = takeFlagValue(args, i++, "--session-dir");
+		} else if (arg === "--models") {
+			result.models = takeFlagValue(args, i++, "--models")
+				.split(",")
+				.map(s => s.trim());
 		} else if (arg === "--no-tools") {
 			result.noTools = true;
 		} else if (arg === "--no-lsp") {
@@ -212,8 +276,28 @@ export function parseArgs(args: string[]): Args {
 			result.noPty = true;
 		} else if (arg === "--tmux") {
 			result.tmux = true;
-		} else if (arg === "--tools" && i + 1 < args.length) {
-			const toolNames = args[++i]
+		} else if (arg === "--extension" || arg === "-e") {
+			const extension = takeFlagValue(args, i++, "--extension");
+			result.extensions = [...(result.extensions ?? []), extension];
+			consumerFlags.set("extension", "--extension");
+		} else if (arg === "--hook") {
+			const hook = takeFlagValue(args, i++, "--hook");
+			result.hooks = [...(result.hooks ?? []), hook];
+			consumerFlags.set("hook", "--hook");
+		} else if (arg === "--no-extensions") {
+			result.noExtensions = true;
+			consumerFlags.set("no-extensions", "--no-extensions");
+		} else if (arg === "--no-skills") {
+			result.noSkills = true;
+			consumerFlags.set("no-skills", "--no-skills");
+		} else if (arg === "--skills") {
+			result.skills = takeFlagValue(args, i++, "--skills")
+				.split(",")
+				.map(s => s.trim())
+				.filter(Boolean);
+			consumerFlags.set("skills", "--skills");
+		} else if (arg === "--tools") {
+			const toolNames = takeFlagValue(args, i++, "--tools")
 				.split(",")
 				.map(s => s.trim().toLowerCase())
 				.filter(Boolean);
@@ -248,8 +332,8 @@ export function parseArgs(args: string[]): Args {
 			result.thinking = thinking;
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
-		} else if (arg === "--export" && i + 1 < args.length) {
-			result.export = args[++i];
+		} else if (arg === "--export") {
+			result.export = takeFlagValue(args, i++, "--export");
 		} else if (arg === "--no-rules") {
 			result.noRules = true;
 		} else if (arg === "--no-title") {
@@ -265,20 +349,30 @@ export function parseArgs(args: string[]): Args {
 			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
 		} else if (!arg.startsWith("-")) {
 			result.messages.push(arg);
+		} else if (!isExternallyParsedRootFlagToken(arg)) {
+			throw new CliParseError(`Root option is declared but not parsed: ${arg}`);
 		}
 	}
 
 	if (result.default && !result.mpreset) {
-		throw new Error("--default requires --mpreset <name>");
+		throw new CliParseError("--default requires --mpreset <name>");
 	}
-	if (
-		result.mcpConfig !== undefined &&
-		(result.mode === "acp" || result.listModels !== undefined || result.export !== undefined)
-	) {
+	if (result.mcpConfig !== undefined && (result.listModels !== undefined || result.export !== undefined)) {
 		throw new CliParseError(
 			"--mcp-config is only supported in standalone interactive, tmux, print, text, or json modes.",
 		);
 	}
 
+	CONSUMER_FLAGS_BY_ARGS.set(result, consumerFlags);
+	if (authority === "local") assertLocalLaunchArgs(result);
 	return result;
+}
+
+/** Reject flags whose only owners are non-local startup consumers. */
+export function assertLocalLaunchArgs(parsed: Args): void {
+	const unknown = parsed.unknownFlags.keys().next().value;
+	if (unknown) throw new CliParseError(`Unknown option: ${unknown}`);
+	for (const [name, token] of CONSUMER_FLAGS_BY_ARGS.get(parsed) ?? []) {
+		if (!launchFlagIsOwnedBy(name, "local")) throw new CliParseError(`Unknown option: ${token}`);
+	}
 }

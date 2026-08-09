@@ -696,6 +696,57 @@ describe("runSubprocess yield reminders", () => {
 		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("uses one stable child-owned identity for auth resolution and createAgentSession", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-provider-identity",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const authSessionIds: Array<string | undefined> = [];
+
+		await runSubprocess({
+			...baseOptions,
+			id: "3-Child",
+			subagentId: "3-Child",
+			parentSessionId: "parent-session",
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [
+					{
+						id: "mock",
+						name: "mock",
+						provider: "openai",
+						api: "openai-responses",
+						baseUrl: "https://api.openai.com/v1",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128_000,
+						maxTokens: 16_384,
+					} as Model,
+				],
+				getApiKey: async (_model: Model, sessionId?: string) => {
+					authSessionIds.push(sessionId);
+					return kNoAuth;
+				},
+			} as unknown as import("../../src/config/model-registry").ModelRegistry,
+			modelOverride: "openai/mock",
+		});
+
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.providerSessionId).toBe(
+			JSON.stringify(["subagent-canonical", "parent-session", "3-Child"]),
+		);
+		expect(authSessionIds).toEqual([JSON.stringify(["subagent-canonical", "parent-session", "3-Child"])]);
+	});
+
 	it("renders shared task context in subagent system prompt before now", async () => {
 		let userPrompt = "";
 		const session = createMockSession(({ text, emit }) => {

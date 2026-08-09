@@ -335,6 +335,54 @@ process.exitCode = await child.exited;`;
 		}
 	}, 30_000);
 
+	it("routes compact worktree selectors before root help and version fast paths", () => {
+		for (const args of [
+			["-winvalid..branch", "--help"],
+			["-w=invalid..branch", "--help"],
+		]) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...args], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+			expect(result.exitCode, output).toBe(0);
+			expect(result.stdout.toString()).toContain("$ gjc launch");
+		}
+
+		for (const args of [
+			["-winvalid..branch", "--version"],
+			["-w=invalid..branch", "--version"],
+		]) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...args], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+
+			expect(result.exitCode, result.stderr.toString()).toBe(0);
+			expect(result.stdout.toString()).toBe(`${packageJson.version}\n`);
+		}
+
+		const delimiter = Bun.spawnSync(["bun", cliEntry, "-winvalid..branch", "--", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const delimiterOutput = `${delimiter.stdout.toString()}\n${delimiter.stderr.toString()}`;
+		expect(delimiter.exitCode, delimiterOutput).not.toBe(0);
+		expect(delimiterOutput).toContain("invalid..branch");
+
+		const unrelated = Bun.spawnSync(["bun", cliEntry, "-xnot-worktree", "--version"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(unrelated.exitCode, unrelated.stderr.toString()).toBe(0);
+		expect(unrelated.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
+	}, 30_000);
+
 	it("does not capture absolute-path prompts as startup slash commands", () => {
 		const parsed = parseArgs(["/tmp/request.md", "--model", "opus", "summarize"]);
 

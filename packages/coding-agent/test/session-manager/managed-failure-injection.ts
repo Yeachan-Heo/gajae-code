@@ -171,38 +171,6 @@ export function injectManagedFileRename(
 	impl: (source: string, destination: string) => ReturnType<typeof publishFailure> | "passthrough",
 ): ManagedInjectionHandle {
 	const hits = { n: 0 };
-	if (process.platform === "linux") {
-		const real = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
-		const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "renameManagedFileNoReplace").mockImplementation(function (
-			this: native.RecoveryFsRoot,
-			sourceRelativePath,
-			destinationRelativePath,
-			expectedDev,
-			expectedIno,
-			expectedSize,
-			expectedMtimeNs,
-			expectedCtimeNs,
-			expectedSha256,
-		) {
-			const result = impl(String(sourceRelativePath), String(destinationRelativePath));
-			if (result === "passthrough") {
-				return real.call(
-					this,
-					sourceRelativePath,
-					destinationRelativePath,
-					expectedDev,
-					expectedIno,
-					expectedSize,
-					expectedMtimeNs,
-					expectedCtimeNs,
-					expectedSha256,
-				);
-			}
-			hits.n += 1;
-			return result;
-		});
-		return handle(hits, () => spy.mockRestore());
-	}
 	const real = native.renameNoReplacePath;
 	const spy = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
 		const result = impl(String(source), String(destination));

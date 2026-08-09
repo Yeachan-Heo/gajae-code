@@ -14,6 +14,7 @@ import { sessionStateDir, sessionUltragoalDir } from "@gajae-code/coding-agent/g
 import {
 	buildSessionContext,
 	loadEntriesFromFile,
+	SessionContextTooLargeError,
 	type SessionEntry,
 } from "@gajae-code/coding-agent/session/session-manager";
 
@@ -294,6 +295,29 @@ describe("GJC ultragoal goal mode request", () => {
 		const context = buildSessionContext(entries);
 		expect(context.modeData?.goal).toMatchObject(existingGoal);
 	}, 15_000);
+
+	it("surfaces the exported typed overflow from the session context build", async () => {
+		const root = await tempDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const timestamp = new Date().toISOString();
+		await Bun.write(
+			sessionFile,
+			[
+				JSON.stringify({ type: "session", version: 5, id: "overflow", timestamp, cwd: root }),
+				JSON.stringify({
+					type: "message",
+					id: "big",
+					parentId: null,
+					timestamp,
+					message: { role: "user", content: "x".repeat(40_000_000), timestamp: 1 },
+				}),
+			].join("\n"),
+		);
+
+		await expect(
+			writeCurrentSessionGoalModeState({ sessionFile, objective: "Complete generated plan" }),
+		).rejects.toThrow(SessionContextTooLargeError);
+	});
 
 	it("surfaces corrupt pending request json", async () => {
 		const root = await tempDir();

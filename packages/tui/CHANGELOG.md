@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added atomic same-line deletion APIs and an `Editor` undo callback for keeping application state synchronized with editor history.
+
+## [0.12.21] - 2026-08-09
+
+## [0.12.20] - 2026-08-09
+
 ## [0.12.19] - 2026-08-08
 
 ## [0.12.18] - 2026-08-08
@@ -13,6 +21,10 @@
 ### Changed
 
 - Native fuzzy matching and image encoding bindings now load only when their TUI feature is used instead of at module startup.
+
+### Fixed
+
+- Slash-command autocomplete now uses the same prompt-start rule for suggestions and Enter-time completion, preserves inline file-path suggestions, and never rewrites slash-like text on later prompt lines.
 
 ## [0.12.15] - 2026-08-06
 

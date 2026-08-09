@@ -41,7 +41,10 @@ import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
+import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+// Ensure mandatory subagent result extraction is available even when a session is mocked.
+import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import type { ReportFindingDetails } from "../tools/review";
@@ -293,7 +296,7 @@ export class ManagedTaskPersistence {
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
-	async openSession(cwd: string): Promise<SessionManager> {
+	async openSession(cwd: string, sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow"): Promise<SessionManager> {
 		const store = this.#artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
 		this.#artifacts.assertManagedBinding();
@@ -304,6 +307,7 @@ export class ManagedTaskPersistence {
 			store,
 			undefined,
 			cwd,
+			sessionMemoryMode,
 		);
 		this.#artifacts.assertManagedBinding();
 		return session;
@@ -1566,10 +1570,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			const sessionManager = options.managedPersistence
-				? await awaitAbortable(options.managedPersistence.openSession(worktree ?? cwd))
+				? await awaitAbortable(
+						options.managedPersistence.openSession(worktree ?? cwd, subagentSettings.get("sessionMemory.mode")),
+					)
 				: sessionFile
 					? await awaitAbortable(
-							SessionManager.open(sessionFile, SessionManager.explicitDestination(path.dirname(sessionFile))),
+							SessionManager.open(
+								sessionFile,
+								SessionManager.explicitDestination(path.dirname(sessionFile)),
+								new FileSessionStorage(),
+								subagentSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain",
+								subagentSettings.get("sessionMemory.mode"),
+							),
 						)
 					: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
@@ -1660,6 +1672,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					authStorage,
 					modelRegistry,
 					settings: subagentSettings,
+					providerSessionId: canonicalChildScope,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
 					activeModelProfile: options.parentActiveModelProfile,

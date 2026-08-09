@@ -3871,6 +3871,32 @@ pub(crate) mod platform {
 				return *result;
 			},
 		};
+		// Serialize checked replacements on the destination object itself. Without this
+		// advisory lock, two publishers can both pass the preflight and then exchange
+		// the same pathname in sequence, defeating the expected-destination CAS.
+		// SAFETY: destination_parent is a live directory descriptor and
+		// destination_name is NUL-terminated.
+		let destination_lock = unsafe {
+			libc::openat(
+				destination_parent,
+				destination_name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		// SAFETY: destination_lock is either an open descriptor or negative; flock does
+		// not dereference it.
+		if destination_lock < 0 || unsafe { libc::flock(destination_lock, libc::LOCK_EX) } != 0 {
+			if destination_lock >= 0 {
+				// SAFETY: this branch owns destination_lock exactly once.
+				unsafe { libc::close(destination_lock) };
+			}
+			// SAFETY: this branch owns source_parent and destination_parent exactly once.
+			unsafe {
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return NativeExactUnlinkResult::failure("lock_failed");
+		}
 		let preflight = (|| {
 			for (parent, identity) in
 				[(source_parent, expected_source), (destination_parent, expected_destination)]
@@ -4007,8 +4033,9 @@ pub(crate) mod platform {
 				},
 			}
 		};
-		// SAFETY: this function owns both retained descriptors exactly once.
+		// SAFETY: this function owns all retained descriptors exactly once.
 		unsafe {
+			libc::close(destination_lock);
 			libc::close(source_parent);
 			libc::close(destination_parent);
 		}

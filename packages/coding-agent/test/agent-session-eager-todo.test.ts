@@ -239,6 +239,12 @@ describe("AgentSession eager todo enforcement", () => {
 				},
 				flush: () => writer.flush(),
 				fsync: () => writer.fsync(),
+				fsyncSync: () => writer.fsyncSync?.(),
+				statSync: () =>
+					writer.statSync?.() ??
+					(() => {
+						throw new Error("Expected writer statSync support");
+					})(),
 				close: () => writer.close(),
 				closeSync: () => writer.closeSync(),
 				getError: () => writer.getError(),
@@ -776,6 +782,12 @@ describe("AgentSession eager todo enforcement", () => {
 				},
 				flush: () => writer.flush(),
 				fsync: () => writer.fsync(),
+				fsyncSync: () => writer.fsyncSync?.(),
+				statSync: () =>
+					writer.statSync?.() ??
+					(() => {
+						throw new Error("Expected writer statSync support");
+					})(),
 				close: () => writer.close(),
 				closeSync: () => writer.closeSync(),
 				getError: () => writer.getError(),

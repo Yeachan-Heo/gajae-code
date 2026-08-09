@@ -190,8 +190,197 @@ function installProcessStdoutWriteClassifier(): void {
 	process.stdout.write = markedWrite as typeof process.stdout.write;
 }
 
-function errorForDiagnostic(reason: unknown): Error {
-	return reason instanceof Error ? reason : new Error(String(reason));
+const UNREADABLE_FIELD = "[unreadable]";
+const UNREADABLE_THROWABLE = "[unreadable throwable]";
+const ERROR_FIELDS = ["name", "message", "stack"] as const;
+type ErrorField = (typeof ERROR_FIELDS)[number];
+const CRASH_CONTEXT_FIELDS = new Set([
+	"code",
+	"errno",
+	"syscall",
+	"path",
+	"dest",
+	"address",
+	"port",
+	"fd",
+	"status",
+	"statusCode",
+	"url",
+	"method",
+	"phase",
+	"reason",
+	"exitCode",
+	"stderr",
+]);
+const CRASH_CONTEXT_FIELD_MAX_BYTES = 4 * 1024;
+const CRASH_CONTEXT_FIELD_TRUNCATION_MARKER = "… [field truncated]";
+const UNDEFINED_FIELD = "[undefined]";
+
+type FieldRead =
+	| { readonly kind: "missing" }
+	| { readonly kind: "unreadable" }
+	| { readonly kind: "value"; readonly value: unknown };
+
+interface CapturedPayload {
+	readonly serialized: string;
+}
+
+/** Reads one top-level field exactly once and keeps both its value and refusal state. */
+function readField(reason: object, key: string, preserveUndefined = false): FieldRead {
+	try {
+		const value = (reason as Record<string, unknown>)[key];
+		return value === undefined && !preserveUndefined ? { kind: "missing" } : { kind: "value", value };
+	} catch {
+		return { kind: "unreadable" };
+	}
+}
+
+function capturedValue(field: FieldRead): unknown {
+	if (field.kind === "value") return field.value;
+	if (field.kind === "unreadable") return UNREADABLE_FIELD;
+	return undefined;
+}
+
+function boundedJsonString(value: string): string {
+	const redacted = redactCrashSecrets(value);
+	if (Buffer.byteLength(JSON.stringify(redacted), "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES)
+		return JSON.stringify(redacted);
+
+	let low = 0;
+	let high = redacted.length;
+	while (low < high) {
+		const midpoint = Math.ceil((low + high) / 2);
+		const candidate = JSON.stringify(`${redacted.slice(0, midpoint)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
+		if (Buffer.byteLength(candidate, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) low = midpoint;
+		else high = midpoint - 1;
+	}
+	let end = low;
+	if (end > 0 && /[\uD800-\uDBFF]/.test(redacted[end - 1] ?? "")) end--;
+	return JSON.stringify(`${redacted.slice(0, end)}${CRASH_CONTEXT_FIELD_TRUNCATION_MARKER}`);
+}
+
+/**
+ * Serializes one already-captured diagnostic value. Credential shapes are
+ * redacted before output, and oversized fields become a bounded string preview
+ * so one request body cannot evict the remaining crash context.
+ */
+function serializeCapturedValue(value: unknown): string {
+	if (value === undefined) return JSON.stringify(UNDEFINED_FIELD);
+	if (typeof value === "string") return boundedJsonString(value);
+
+	try {
+		const serialized = JSON.stringify(value);
+		if (typeof serialized !== "string") return boundedJsonString(String(value));
+		const redacted = redactCrashSecrets(serialized);
+		if (Buffer.byteLength(redacted, "utf8") <= CRASH_CONTEXT_FIELD_MAX_BYTES) return redacted;
+		return boundedJsonString(redacted);
+	} catch {
+		try {
+			return boundedJsonString(String(value));
+		} catch {
+			return JSON.stringify(UNREADABLE_FIELD);
+		}
+	}
+}
+
+/**
+ * Captures only stable diagnostic context. Arbitrary request objects and bodies
+ * are intentionally excluded: they are large, routinely contain credentials,
+ * and add less crash value than transport, process, and lifecycle metadata.
+ */
+function capturePayload(reason: object): CapturedPayload | undefined {
+	let keys: string[];
+	try {
+		keys = Object.keys(reason);
+	} catch {
+		return undefined;
+	}
+
+	const properties: string[] = [];
+	for (const key of keys) {
+		if (!CRASH_CONTEXT_FIELDS.has(key)) continue;
+		const serialized = serializeCapturedValue(capturedValue(readField(reason, key, true)));
+		properties.push(`${JSON.stringify(key)}:${serialized}`);
+	}
+	return properties.length > 0 ? { serialized: `{${properties.join(",")}}` } : undefined;
+}
+
+function fieldText(field: FieldRead, fallback: string): string {
+	if (field.kind === "unreadable") return UNREADABLE_FIELD;
+	if (field.kind !== "value") return fallback;
+	try {
+		const text = typeof field.value === "string" ? field.value : String(field.value);
+		return text || fallback;
+	} catch {
+		return UNREADABLE_FIELD;
+	}
+}
+
+/** A throwable reduced to captured text; the rest of this module reads nothing else. */
+interface FatalDiagnostic {
+	name: string;
+	message: string;
+	stack: string;
+	payload?: string;
+}
+
+/**
+ * The single read of an unknown throwable, and the only one this module has.
+ *
+ * Objects retain the named diagnostic fields independently from the optional
+ * allowlisted context payload. Context never replaces a readable identity,
+ * message, or stack.
+ */
+function describeFatal(reason: unknown): FatalDiagnostic {
+	try {
+		if (typeof reason !== "object" || reason === null) {
+			let message: string;
+			try {
+				message = String(reason);
+			} catch {
+				message = UNREADABLE_THROWABLE;
+			}
+			return { name: "Error", message: message || "(no message)", stack: "" };
+		}
+
+		const fields: Record<ErrorField, FieldRead> = {
+			name: readField(reason, "name"),
+			message: readField(reason, "message"),
+			stack: readField(reason, "stack"),
+		};
+		const payload = capturePayload(reason);
+		const payloadIsMessage = payload !== undefined && ERROR_FIELDS.every(key => fields[key].kind === "missing");
+
+		const name = fieldText(fields.name, "Error");
+		const message = fieldText(fields.message, "(no message)");
+		let stack = "";
+		if (fields.stack.kind === "unreadable") {
+			stack = `${name}: ${message}\n${UNREADABLE_FIELD}`;
+		} else if (
+			fields.stack.kind === "value" &&
+			typeof fields.stack.value === "string" &&
+			fields.stack.value.length > 0
+		) {
+			stack = fields.stack.value.includes("\n") ? fields.stack.value : `${name}: ${message}\n${fields.stack.value}`;
+		}
+
+		return {
+			name,
+			message: payloadIsMessage ? payload.serialized : message,
+			stack,
+			payload: payloadIsMessage ? undefined : payload?.serialized,
+		};
+	} catch {
+		return { name: "Error", message: UNREADABLE_THROWABLE, stack: "" };
+	}
+}
+
+/** Rebuild an `Error` for structured logging out of strings that are already safe to read. */
+function fatalErrorForLog(fatal: FatalDiagnostic): Error {
+	const error = new Error(fatal.message);
+	error.name = fatal.name;
+	if (fatal.stack) error.stack = fatal.stack;
+	return error;
 }
 
 // Register signal and error event handlers to trigger cleanup before exit.
@@ -199,13 +388,13 @@ function errorForDiagnostic(reason: unknown): Error {
 // Worker thread: exit only (workers use self.addEventListener for exceptions)
 let inspectorOpened = false;
 
-function formatFatalError(label: string, err: Error): string {
-	const name = err.name || "Error";
-	const message = err.message || "(no message)";
-	const stack = err.stack || "";
-	const stackLines = stack.split("\n").slice(1);
+function formatFatalError(label: string, fatal: FatalDiagnostic): string {
+	const stackLines = fatal.stack.split("\n").slice(1);
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
-	return `\n[${label}] ${name}: ${message}${formattedStack}\n`;
+	const formattedPayload = fatal.payload ? `\n${fatal.payload}` : "";
+	return boundCrashRecord(
+		redactCrashSecrets(`\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}${formattedPayload}\n`),
+	);
 }
 /** Cap for the durable crash log; it is reset past this so a crash loop cannot fill the disk. */
 export const CRASH_LOG_MAX_BYTES = 512 * 1024;
@@ -284,14 +473,23 @@ export function recordFatalCrash(
 	reason: unknown,
 	options: { path?: string; now?: Date } = {},
 ): string | undefined {
+	return writeCrashRecord(label, describeFatal(reason), options);
+}
+
+function writeCrashRecord(
+	label: string,
+	fatal: FatalDiagnostic,
+	options: { path?: string; now?: Date } = {},
+): string | undefined {
 	try {
-		const err = errorForDiagnostic(reason);
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
+		const stack = fatal.stack ? `${redactCrashSecrets(fatal.stack)}\n` : "";
+		const payload = fatal.payload ? `${redactCrashSecrets(fatal.payload)}\n` : "";
 		const report = boundCrashRecord(
 			`${now.toISOString()} pid=${process.pid} [${label}] ` +
-				`${err.name || "Error"}: ${redactCrashSecrets(err.message || "(no message)")}\n` +
-				`${redactCrashSecrets(err.stack ?? "")}\n\n`,
+				`${redactCrashSecrets(fatal.name)}: ${redactCrashSecrets(fatal.message)}\n` +
+				`${stack}${payload}\n`,
 		);
 		fs.mkdirSync(path.dirname(target), { recursive: true });
 		let existingSize = 0;
@@ -336,14 +534,15 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	// contract, including when it arrives while quiet cleanup is still pending.
 	ordinaryFatalStarted = true;
 	process.exitCode = 1;
-	const err = errorForDiagnostic(reason);
+	const fatal = describeFatal(reason);
 	// Persist first: the rotation-immune record must land before any
 	// best-effort stderr output, so a slow or failing stderr cannot cost the
 	// crash record. Cleanup (which may itself hang or fail) runs afterwards.
-	const crashLogPath = recordFatalCrash(label, err);
-	safeStderrWrite(formatFatalError(label, err));
+	const crashLogPath = writeCrashRecord(label, fatal);
+	safeStderrWrite(formatFatalError(label, fatal));
 	if (crashLogPath) safeStderrWrite(`[${label}] crash recorded at ${crashLogPath}\n`);
 	if (!quietShutdownStarted) {
+		const err = fatalErrorForLog(fatal);
 		logger.error(label === "Uncaught Exception" ? "Uncaught exception" : "Unhandled rejection", {
 			err,
 			stack: err.stack,

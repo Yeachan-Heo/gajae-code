@@ -77,6 +77,12 @@ type SdkControlServerOptions = {
 	platform?: NodeJS.Platform;
 	canonicalizePath?: (value: string) => Promise<string>;
 	controlResult?: (control: SdkControl) => unknown;
+	globalResult?: (
+		operation: string,
+		input: Record<string, unknown>,
+		brokerSessions: Array<Record<string, unknown>>,
+	) => unknown;
+
 	promptAckTimeoutMs?: number;
 	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
 	/** Every raw session frame the server sent, in order (activation frames included). */
@@ -259,6 +265,8 @@ async function createSdkControlServer(
 						options: { idempotencyKey?: string } = {},
 					) => {
 						controls.push({ operation, input, idempotencyKey: options.idempotencyKey });
+						const customResult = serverOptions.globalResult?.(operation, input, brokerSessions);
+						if (customResult !== undefined) return customResult;
 						if (operation === "session.list") return { ok: true, result: { sessions: brokerSessions } };
 						if (operation === "session.get_endpoint") {
 							if (endpointRequestHandler) return endpointRequestHandler(input, brokerSessions);
@@ -721,6 +729,56 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		});
 		expect(JSON.stringify(status)).not.toContain("stale-secret");
 		expect(controls).toEqual([{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined }]);
+	});
+	it("drains coordinator session.list continuation pages before returning status", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const pageOne = { sessionId: "page-one", locator: { repo: root }, live: true };
+		const pageTwo = { sessionId: "page-two", locator: { repo: root }, live: false };
+		const server = await createSdkControlServer(root, controls, [], undefined, [pageOne], undefined, undefined, {
+			globalResult: (operation, input) => {
+				if (operation !== "session.list") return undefined;
+				return input.cursor === undefined
+					? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
+					: { ok: true, result: { sessions: [pageTwo] } };
+			},
+		});
+
+		const status = await server.callTool("gjc_coordinator_read_status");
+		expect(status).toMatchObject({
+			ok: true,
+			sessions: [
+				{ session_id: "page-one", live: true },
+				{ session_id: "page-two", live: false },
+			],
+		});
+		expect(controls).toEqual([
+			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
+			{ operation: "session.list", input: { cwd: root, cursor: "page-2" }, idempotencyKey: undefined },
+		]);
+	});
+
+	it("returns coordinator session.list continuation failures without partial status", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const pageOne = { sessionId: "page-one", locator: { repo: root }, live: true };
+		const server = await createSdkControlServer(root, controls, [], undefined, [pageOne], undefined, undefined, {
+			globalResult: (operation, input) => {
+				if (operation !== "session.list") return undefined;
+				return input.cursor === undefined
+					? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
+					: { ok: false, error: { code: "continuation_failed", message: "page two failed" } };
+			},
+		});
+
+		await expect(server.callTool("gjc_coordinator_read_status")).resolves.toMatchObject({
+			ok: false,
+			error: { code: "continuation_failed", message: "page two failed" },
+		});
+		expect(controls).toEqual([
+			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
+			{ operation: "session.list", input: { cwd: root, cursor: "page-2" }, idempotencyKey: undefined },
+		]);
 	});
 	it("reads bounded tail output through the SDK", async () => {
 		const root = await tempRoot();

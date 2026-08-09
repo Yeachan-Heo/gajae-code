@@ -14,7 +14,12 @@ import {
 	resolveRlmArtifactPaths,
 } from "@gajae-code/coding-agent/rlm/artifacts";
 import { loadRlmDataContext } from "@gajae-code/coding-agent/rlm/data-context";
-import { buildRlmGoalObjective, createRlmPreset, ensureRlmGjcSessionId } from "@gajae-code/coding-agent/rlm/index";
+import {
+	buildRlmGoalObjective,
+	createRlmPreset,
+	ensureRlmGjcSessionId,
+	runRlmCommand,
+} from "@gajae-code/coding-agent/rlm/index";
 import { RlmNotebookWriter } from "@gajae-code/coding-agent/rlm/notebook";
 import {
 	assertRlmToolAllowlist,
@@ -54,6 +59,18 @@ const okCell = (output: string): RlmCellResult => ({
 });
 
 describe("rlm artifacts", () => {
+	describe("RLM command parsing", () => {
+		test("rejects unknown startup flags before creating research artifacts", async () => {
+			const priorSessionId = process.env.GJC_SESSION_ID;
+			try {
+				await expect(runRlmCommand(["--modle", "opus"])).rejects.toThrow("Unknown option: --modle");
+			} finally {
+				if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+				else delete process.env.GJC_SESSION_ID;
+			}
+		});
+	});
+
 	test("validates session ids", () => {
 		expect(isValidRlmSessionId("2026-06-16-abc")).toBe(true);
 		expect(isValidRlmSessionId("../escape")).toBe(false);

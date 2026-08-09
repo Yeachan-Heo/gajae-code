@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError, type SdkFrame } from "../client";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { ACP_SESSION_RECONNECT } from "../session-reconnect";
+import type { SessionLifecycleMcpServer } from "./mcp";
 
 type JsonObject = Record<string, unknown>;
 
@@ -37,6 +39,40 @@ export class AcpSdkAdapterError extends Error {
 		this.name = "AcpSdkAdapterError";
 		this.code = code;
 	}
+}
+
+/**
+ * Lifecycle failures the ACP MCP launch wrapper must report verbatim. Everything else
+ * is re-attributed to the configured MCP servers, which is the useful answer for a
+ * launch that actually reached them — but a startup the broker ended before admission
+ * never opened an MCP handshake, so blaming the servers would hide both the real
+ * authority reason and the fact that the request is safely retryable.
+ */
+const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
+	"invalid_input",
+	"authentication_failed",
+	"unknown_model_profile",
+	"model_profile_registry_error",
+	"startup_admission_refused",
+	"startup_admission_timeout",
+]);
+
+/**
+ * The error an ACP session launch must throw once a lifecycle request that carried MCP
+ * servers has failed.
+ */
+export function acpMcpLaunchFailure(error: unknown, mcpServers: SessionLifecycleMcpServer[]): unknown {
+	const code =
+		typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+			? error.code
+			: undefined;
+	if (mcpServers.length === 0 || (code !== undefined && ACP_MCP_PRESERVED_LAUNCH_CODES.has(code))) return error;
+	const names = mcpServers
+		.slice(0, 8)
+		.map(server => server.name)
+		.join(", ");
+	const suffix = mcpServers.length > 8 ? `, and ${mcpServers.length - 8} more` : "";
+	return new AcpSdkAdapterError("unavailable", `MCP server request failed to start (${names}${suffix}).`);
 }
 
 export type AcpReconnectFailedHandler = (error: SdkClientError) => void;
@@ -187,13 +223,15 @@ export class AcpSdkAdapter {
 		this.#assertGenericDisposition("global", operation);
 		if (isLifecycleOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
-		const readinessTimeoutMs =
-			typeof input.readinessTimeoutMs === "number" && Number.isSafeInteger(input.readinessTimeoutMs)
-				? input.readinessTimeoutMs
-				: undefined;
+		// The broker may hold a startup in its admission queue before the readiness
+		// clock even starts, so the caller deadline covers the queue wait too; sizing
+		// it on readiness alone times out requests the broker is still running. A
+		// request that named no readiness budget is queued for the default one, so it
+		// needs the same extension rather than the client's generic request deadline.
+		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 		return await this.#client.global(operation, input, {
 			idempotencyKey,
-			...(readinessTimeoutMs ? { timeoutMs: readinessTimeoutMs + 1_000 } : {}),
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		});
 	}
 

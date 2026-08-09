@@ -31,7 +31,7 @@ import { replaceTabs, truncateToWidth } from "../tools/render-utils";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { computeEditDiff, type DiffError, type DiffResult } from "./diff";
 import { type ApplyPatchEntry, expandApplyPatchToEntries, expandApplyPatchToPreviewEntries } from "./modes/apply-patch";
-import { computePatchDiff, type PatchEditEntry } from "./modes/patch";
+import { computePatchDiff, type Operation, type PatchEditEntry } from "./modes/patch";
 import type { ReplaceEditEntry } from "./modes/replace";
 
 export interface PerFileDiffPreview {
@@ -73,6 +73,113 @@ export interface EditStreamingStrategy<Args = unknown> {
 	 * compute returned `null` because args are still too partial).
 	 */
 	renderStreamingFallback(args: Args, uiTheme: Theme): string;
+}
+export interface EditRequestTargetInventory {
+	paths: string[];
+	/** Operation of the first target (Create/Delete) when derivable from the
+	 * request payload (apply_patch/hashline free-form envelopes carry op on the
+	 * parsed entry, not on the top-level args). */
+	firstOp?: Operation;
+	parseError?: string;
+}
+const MISSING_APPLY_PATCH_END_ERROR = `The last line of the patch must be '${END_PATCH_MARKER}'`;
+
+export function orderedDistinctPaths(paths: readonly (string | undefined)[]): string[] {
+	const seen = new Set<string>();
+	const distinct: string[] = [];
+	for (const path of paths) {
+		if (!path || seen.has(path)) continue;
+		seen.add(path);
+		distinct.push(path);
+	}
+	return distinct;
+}
+
+function decodePartialJsonStringFragment(fragment: string): string {
+	let text = fragment.replace(/\\u[0-9a-fA-F]{0,3}$/, "");
+	const trailingBackslashes = text.match(/\\+$/)?.[0].length ?? 0;
+	if (trailingBackslashes % 2 === 1) text = text.slice(0, -1);
+	try {
+		return JSON.parse(`"${text}"`) as string;
+	} catch {
+		return text;
+	}
+}
+
+function extractTrailingPartialJsonPath(partialJson: string | undefined): string | undefined {
+	if (!partialJson) return undefined;
+	const pattern = /"(?:file_path|path)"\s*:\s*"((?:\\.|[^"\\])*)/gu;
+	let trailingPath: string | undefined;
+	for (const match of partialJson.matchAll(pattern)) {
+		trailingPath = decodePartialJsonStringFragment(match[1]);
+	}
+	return trailingPath;
+}
+
+function normalizeHashlineTargetPath(rawPath: string): string {
+	const trimmed = rawPath.trim();
+	if (trimmed.length < 2) return trimmed;
+	const first = trimmed[0];
+	const last = trimmed[trimmed.length - 1];
+	return (first === '"' || first === "'") && first === last ? trimmed.slice(1, -1) : trimmed;
+}
+
+function getHashlineTargetPaths(input: string): string[] {
+	const stripped = input.startsWith("\uFEFF") ? input.slice(1) : input;
+	const paths: string[] = [];
+	for (const rawLine of stripped.split("\n")) {
+		const trimmed = rawLine.replace(/\r$/, "").trimEnd();
+		if (trimmed === END_PATCH_MARKER || trimmed === ABORT_MARKER) break;
+		if (isHashlineHeaderLine(trimmed)) paths.push(normalizeHashlineTargetPath(parseHashlineHeaderPath(trimmed)));
+	}
+	return paths.filter(Boolean);
+}
+
+export function getEditRequestTargetInventory(
+	args: unknown,
+	editMode: EditMode | undefined,
+	options: { isPartial: boolean },
+): EditRequestTargetInventory {
+	if (editMode === "vim") return { paths: [] };
+	const values = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+	const partialJson = typeof values.__partialJson === "string" ? values.__partialJson : undefined;
+	const topLevelPath =
+		typeof values.file_path === "string"
+			? values.file_path
+			: typeof values.path === "string"
+				? values.path
+				: undefined;
+	const edits = Array.isArray(values.edits) ? values.edits : [];
+
+	if (editMode === "hashline") {
+		const input = typeof values.input === "string" ? values.input : "";
+		const headerPaths = getHashlineTargetPaths(input);
+		return { paths: orderedDistinctPaths(headerPaths.length > 0 ? headerPaths : [topLevelPath]) };
+	}
+
+	if (editMode === "apply_patch") {
+		const input = typeof values.input === "string" ? values.input : "";
+		try {
+			const entries = expandApplyPatchToEntries({ input });
+			return { paths: orderedDistinctPaths(entries.map(entry => entry.path)), firstOp: entries[0]?.op };
+		} catch (err) {
+			const parseError = err instanceof Error ? err.message : String(err);
+			const previewEntries = expandApplyPatchToPreviewEntries({ input });
+			const paths = orderedDistinctPaths(previewEntries.map(entry => entry.path));
+			if (options.isPartial && parseError === MISSING_APPLY_PATCH_END_ERROR) {
+				return { paths, firstOp: previewEntries[0]?.op };
+			}
+			return { paths, firstOp: previewEntries[0]?.op, parseError };
+		}
+	}
+
+	const editPaths = edits.map(edit => {
+		if (!edit || typeof edit !== "object") return undefined;
+		const entry = edit as Record<string, unknown>;
+		return typeof entry.path === "string" ? entry.path : undefined;
+	});
+	const partialPath = options.isPartial ? extractTrailingPartialJsonPath(partialJson) : undefined;
+	return { paths: orderedDistinctPaths([topLevelPath, ...editPaths, partialPath]) };
 }
 
 const STREAMING_FALLBACK_LINES = 12;

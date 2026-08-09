@@ -128,6 +128,8 @@ class ThrowingWriterStorage extends MemorySessionStorage {
 			},
 			flush: () => writer.flush(),
 			fsync: () => writer.fsync(),
+			fsyncSync: writer.fsyncSync?.bind(writer),
+			statSync: writer.statSync?.bind(writer),
 			close: () => writer.close(),
 			closeSync: () => writer.closeSync(),
 			getError: () => writer.getError(),
@@ -150,6 +152,8 @@ class ThrowingRewriteStorage extends MemorySessionStorage {
 			},
 			flush: () => writer.flush(),
 			fsync: () => writer.fsync(),
+			fsyncSync: writer.fsyncSync?.bind(writer),
+			statSync: writer.statSync?.bind(writer),
 			close: () => writer.close(),
 			closeSync: () => writer.closeSync(),
 			getError: () => writer.getError(),
@@ -242,6 +246,8 @@ class RetryablePreparedPersistenceStorage extends MemorySessionStorage {
 			writeLineSync: line => writer.writeLineSync(line),
 			flush: () => writer.flush(),
 			fsync: () => writer.fsync(),
+			fsyncSync: writer.fsyncSync?.bind(writer),
+			statSync: writer.statSync?.bind(writer),
 			close: async () => {
 				this.closeAttempts++;
 				if (this.failClose) {

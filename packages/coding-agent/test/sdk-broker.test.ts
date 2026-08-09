@@ -865,6 +865,37 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("recovers request admission synchronously with the watchdog observation, not after the heartbeat write", async () => {
+		// Regression: #watchPublication must restore the cached publicationState
+		// before the awaited heartbeat IO so a request that follows the watchdog
+		// in the same async tick sees healthy ownership without an extra sleep.
+		const dir = await temp();
+		let watchdog: (() => void) | undefined;
+		const realSetInterval = globalThis.setInterval;
+		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+			watchdog = callback;
+			return realSetInterval(() => {}, 2 ** 31 - 1);
+		}) as typeof setInterval);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await broker.start();
+
+			const retainedRoot = path.join(dir, "retained-sdk");
+			await fs.rename(path.join(dir, "sdk"), retainedRoot);
+			watchdog!();
+			await new Promise(r => setTimeout(r, 10));
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: false });
+
+			await fs.rename(retainedRoot, path.join(dir, "sdk"));
+			// No sleep, no extra microtask drain between the watchdog and the request.
+			watchdog!();
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
+		} finally {
+			interval.mockRestore();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("terminates and reaps the spawned broker when discovery times out", async () => {
 		const dir = await temp();
 		// Force ensureBroker's discovery reads to never resolve a live record so the
@@ -1844,8 +1875,7 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: {
 					code: "terminal_uncertain",
-					message:
-						"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
+					message: "Prior cleanup authority for this session is corrupt or incomplete.",
 				},
 			});
 			expect(calls).toBe(1);

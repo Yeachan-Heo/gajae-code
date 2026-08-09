@@ -43,6 +43,7 @@ import {
 	type AcpReverseConnection,
 	AcpSdkAdapter,
 	AcpSdkAdapterError,
+	acpMcpLaunchFailure,
 } from "../../sdk/acp";
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
@@ -69,6 +70,7 @@ const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
+const MAX_ACP_SESSION_LIST_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 /**
@@ -184,6 +186,42 @@ function parsePromptWatchdogClock(value: unknown): PromptWatchdogClock | undefin
 
 function object(value: unknown): JsonObject | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
+}
+
+async function collectAcpSessionList(
+	request: (input: JsonObject) => Promise<unknown>,
+	input: JsonObject = {},
+): Promise<JsonObject> {
+	const aggregate: JsonObject = {};
+	const sessions: unknown[] = [];
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_ACP_SESSION_LIST_PAGES; pageCount++) {
+		const response = object(await request({ ...input, ...(cursor === undefined ? {} : { cursor }) }));
+		const listing = object(response?.result) ?? response;
+		if (response?.ok === false) {
+			const failure = object(response.error);
+			throw new AcpSdkAdapterError(
+				typeof failure?.code === "string" ? failure.code : "broker_error",
+				typeof failure?.message === "string" ? failure.message : "session.list failed",
+			);
+		}
+		if (listing) {
+			for (const [key, value] of Object.entries(listing)) {
+				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
+			}
+			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
+			const nextCursor =
+				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
+					? listing.continuationCursor
+					: undefined;
+			if (nextCursor) {
+				cursor = nextCursor;
+				continue;
+			}
+		}
+		return { ...aggregate, sessions };
+	}
+	throw new AcpSdkAdapterError("protocol_error", "session.list exceeded the page budget.");
 }
 
 function aggregateAcpFailure(code: string, message: string, failures: unknown[]): AcpSdkAdapterError {
@@ -460,6 +498,22 @@ const RECOVERABLE_TRANSCRIPT_FIELDS = ["role", "body", "content", "toolCallId", 
 /** Stands in for a tool result whose transcript entry replay could not restore. */
 const TRANSCRIPT_TOOL_RESULT_UNAVAILABLE = "The transcript entry holding this tool result could not be replayed.";
 
+/** Stands in for a tool call the transcript never recorded a result for. */
+const TRANSCRIPT_TOOL_CALL_UNRESOLVED = "The session transcript ends without a result for this tool call.";
+
+/** Stands in for a tool call replay abandoned before it could read back a result. */
+const TRANSCRIPT_REPLAY_INTERRUPTED = "Transcript replay stopped before this tool call reached a result.";
+
+/**
+ * The published tool calls a replay cleanup pass could not close, with the frame failures
+ * that refused them. `#replaySession` reads `unclosedToolCallIds` to name every stranded
+ * call in the `session/load` rejection, so a close that could not happen is reported to the
+ * caller instead of being discarded with the session record.
+ */
+interface UnclosedReplayToolCalls {
+	unclosedToolCallIds: string[];
+	failures: unknown[];
+}
 function decodeTranscriptContinuation(field: string, body: string): unknown {
 	if (field !== "content" && field !== "isError") return body;
 	try {
@@ -1162,9 +1216,10 @@ export class AcpAgent implements Agent {
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
-		const result = object(await (await this.#brokerAdapter()).global("session.list"));
-		const listing = object(result?.result) ?? result;
-		const listed = Array.isArray(listing?.sessions) ? listing.sessions : [];
+		const adapter = await this.#brokerAdapter();
+		const listing = await collectAcpSessionList(input => adapter.global("session.list", input));
+		const listed = Array.isArray(listing.sessions) ? listing.sessions : [];
+
 		if (params.cwd) {
 			const discovered = new Set<string>();
 			for (const session of listed) {
@@ -1638,8 +1693,9 @@ export class AcpAgent implements Agent {
 	}
 
 	async #scopedBrokerSession(id: string, cwd: string): Promise<BrokerSession | undefined> {
-		const response = object(await (await this.#brokerAdapter()).global("session.list", { cwd }));
-		const result = object(response?.result) ?? response;
+		const adapter = await this.#brokerAdapter();
+		const result = await collectAcpSessionList(input => adapter.global("session.list", input), { cwd });
+
 		const matches: BrokerSession[] = [];
 		for (const item of Array.isArray(result?.sessions) ? result.sessions : []) {
 			const session = object(item) as BrokerSession | undefined;
@@ -1909,10 +1965,11 @@ export class AcpAgent implements Agent {
 	}
 
 	async #resolveSavedSession(id: string, cwd: string): Promise<string> {
-		const response = object(
-			await (await this.#brokerAdapter()).global("session.list", { resolveSessionId: id, cwd }),
-		);
-		const result = object(response?.result) ?? response;
+		const adapter = await this.#brokerAdapter();
+		const result = await collectAcpSessionList(input => adapter.global("session.list", input), {
+			resolveSessionId: id,
+			cwd,
+		});
 		const saved = object(result?.savedSession);
 		if (saved?.id !== id || typeof saved.path !== "string")
 			throw new AcpSdkAdapterError("not_found", `Saved ACP session does not exist: ${id}`);
@@ -2341,6 +2398,9 @@ export class AcpAgent implements Agent {
 		notification: SessionNotification,
 		expectedAdapter?: AcpSdkAdapter,
 	): Promise<void> {
+		// A session that is gone has no update channel, so this is a drop and not a failure:
+		// whoever owned the frame is the one that ended the session. Callers whose bookkeeping
+		// assumes delivery have to end at the session too — see `#replaySession`.
 		const record = this.#sessions.get(id);
 		if (!record || (expectedAdapter && record.adapter !== expectedAdapter)) return;
 		try {
@@ -2471,41 +2531,148 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * A skipped `toolResult` would leave its already-published `tool_call` at
-	 * `status: "pending"` forever, so replay closes it with the same
-	 * `tool_execution_end` shape a real result uses. Replay cannot know the outcome, so
-	 * it reports failure rather than claiming a success it cannot prove.
+	 * Publishes the terminal update for one replayed tool call and reports whether the client
+	 * took it. A `toolResult` replay cannot use leaves its already-published `tool_call` at
+	 * `status: "pending"` forever, so replay closes it with the same `tool_execution_end`
+	 * shape a real result uses. Replay cannot know the outcome, so it reports failure rather
+	 * than claiming a success it cannot prove.
+	 *
+	 * Publication runs straight off the connection instead of through
+	 * {@link AcpAgent.#publishSessionUpdate}: that helper fails the session and deletes its
+	 * record on the first rejected frame, which turns every later close into a silent no-op
+	 * and would strand every call queued behind the first refusal. The direct path still
+	 * checks session ownership before every frame so a concurrent `session/close` stops it.
 	 */
-	async #closeUnresolvedReplayToolCall(
+	async #closeReplayToolCall(
 		id: string,
-		adapter: AcpSdkAdapter,
+		expectedAdapter: AcpSdkAdapter,
 		cwd: string,
 		toolCallId: string,
 		tool: { name: string; args: unknown },
-	): Promise<void> {
-		for (const notification of mapAgentSessionEventToAcpSessionUpdates(
-			{
-				type: "tool_execution_end",
-				toolCallId,
-				toolName: tool.name,
-				result: { content: [{ type: "text", text: TRANSCRIPT_TOOL_RESULT_UNAVAILABLE }] },
-				isError: true,
-			} as never,
-			id,
-			{ cwd, getToolArgs: () => tool.args },
-		))
-			await this.#publishSessionUpdate(id, notification, adapter);
+		reason: string,
+	): Promise<AcpSdkAdapterError | undefined> {
+		try {
+			for (const notification of mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId,
+					toolName: tool.name,
+					result: { content: [{ type: "text", text: reason }] },
+					isError: true,
+				} as never,
+				id,
+				{ cwd, getToolArgs: () => tool.args },
+			)) {
+				const record = this.#sessions.get(id);
+				if (!record || record.adapter !== expectedAdapter) return undefined;
+				await this.#connection.sessionUpdate(notification);
+			}
+			return undefined;
+		} catch (error) {
+			return this.#frameProcessingFailure(error);
+		}
+	}
+
+	/**
+	 * Closes every tool call still open when replay stops, in a single pass, and hands back
+	 * the ones the client refused.
+	 *
+	 * An entry leaves `replayTools` only once its close was accepted. Removing it on the
+	 * attempt is what made a refused close disappear from the map before anything could name
+	 * it, so the one call the report exists to surface was the one call it never mentioned.
+	 */
+	async #closeOpenReplayToolCalls(
+		id: string,
+		adapter: AcpSdkAdapter,
+		cwd: string,
+		replayTools: Map<string, { name: string; args: unknown }>,
+		reason: string,
+	): Promise<UnclosedReplayToolCalls> {
+		const unclosed: UnclosedReplayToolCalls = { unclosedToolCallIds: [], failures: [] };
+		for (const [toolCallId, tool] of [...replayTools]) {
+			const failure = await this.#closeReplayToolCall(id, adapter, cwd, toolCallId, tool, reason);
+			if (failure === undefined) {
+				replayTools.delete(toolCallId);
+				continue;
+			}
+			unclosed.unclosedToolCallIds.push(toolCallId);
+			unclosed.failures.push(failure);
+		}
+		return unclosed;
 	}
 
 	async #replaySession(id: string): Promise<void> {
 		const adapter = this.#adapter(id);
 		const record = this.#sessions.get(id);
 		if (!record) return;
+		const replayTools = new Map<string, { name: string; args: unknown }>();
+		let replayFailure: unknown;
+		try {
+			await this.#replayTranscriptPages(id, adapter, record, replayTools);
+		} catch (error) {
+			replayFailure = error;
+		}
+		// Every terminal below is addressed to this session, and `session/close`, a failed
+		// session, or connection teardown can remove it mid-replay. That removal takes the
+		// client's view of these calls with it: nothing is left to observe a `pending` one,
+		// and a frame carrying a closed session id is one the client asked to stop receiving.
+		// The obligation ends where the session ends; the next `session/load` replays the same
+		// transcript rows from scratch. The boundary check avoids entering cleanup for an
+		// already-closed session, while `#closeReplayToolCall` repeats the ownership check before
+		// each direct publication so a close during cleanup stops the remaining frames without
+		// restoring the failure side effects that used to silence calls behind a refused close.
+		if (this.#sessions.get(id)?.adapter !== adapter) return;
+		// The one boundary that closes replayed tool calls, covering every way the replay body
+		// can end: normal return, early exit, or a `transcript.list` page that throws. Whatever
+		// is still open was abandoned mid-replay, so it reaches a terminal status now instead of
+		// spinning at `pending` for the life of the session.
+		const unclosed = await this.#closeOpenReplayToolCalls(
+			id,
+			adapter,
+			record.cwd,
+			replayTools,
+			replayFailure === undefined ? TRANSCRIPT_TOOL_CALL_UNRESOLVED : TRANSCRIPT_REPLAY_INTERRUPTED,
+		);
+		if (unclosed.unclosedToolCallIds.length === 0) {
+			if (replayFailure !== undefined) throw replayFailure;
+			return;
+		}
+		const cleanupFailure = aggregateAcpFailure(
+			"frame_processing_failed",
+			`ACP transcript replay could not close published tool calls: ${unclosed.unclosedToolCallIds.join(", ")}`,
+			unclosed.failures,
+		);
+		// A client refusing this session's frames leaves no usable record behind, but teardown
+		// runs only after every open call has been attempted and every refusal named above.
+		await this.#failSession(id, adapter, cleanupFailure);
+		if (replayFailure === undefined) throw cleanupFailure;
+		// Both facts matter: what stopped replay, and which calls it left open. Reporting
+		// only one is what kept a whole session's orphaned tool calls invisible.
+		const detail = [replayFailure, cleanupFailure]
+			.map(failure => (failure instanceof Error ? failure.message : String(failure)))
+			.join("; ");
+		throw aggregateAcpFailure(
+			"frame_processing_failed",
+			`ACP transcript replay failed and left published tool calls unclosed: ${detail}`,
+			[replayFailure, cleanupFailure],
+		);
+	}
+
+	/**
+	 * Walks the transcript pages for {@link AcpAgent.#replaySession}. `replayTools` stays
+	 * owned by the caller so every start this pass published is still closable once it
+	 * exits, however it exits.
+	 */
+	async #replayTranscriptPages(
+		id: string,
+		adapter: AcpSdkAdapter,
+		record: SessionRecord,
+		replayTools: Map<string, { name: string; args: unknown }>,
+	): Promise<void> {
 		let cursor: string | undefined;
 		let imageLimitationReported = false;
 		let unreplayableEntries = 0;
 		let unreplayableReason: TranscriptReplaySkipReason | undefined;
-		const replayTools = new Map<string, { name: string; args: unknown }>();
 		for (let pageCount = 0; pageCount < MAX_ACP_REPLAY_PAGES; pageCount++) {
 			const response = object(await adapter.query("transcript.list", {}, cursor));
 			const result = object(response?.result) ?? response;
@@ -2523,9 +2690,18 @@ export class AcpAgent implements Agent {
 					unreplayableReason ??= replay.reason;
 					const unresolvedId = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
 					const unresolved = unresolvedId === undefined ? undefined : replayTools.get(unresolvedId);
+					// The start keeps its place in `replayTools` until the close is accepted, so a
+					// refused close is retried and named by the boundary instead of dropped here.
 					if (unresolvedId !== undefined && unresolved) {
-						replayTools.delete(unresolvedId);
-						await this.#closeUnresolvedReplayToolCall(id, adapter, record.cwd, unresolvedId, unresolved);
+						const failure = await this.#closeReplayToolCall(
+							id,
+							adapter,
+							record.cwd,
+							unresolvedId,
+							unresolved,
+							TRANSCRIPT_TOOL_RESULT_UNAVAILABLE,
+						);
+						if (failure === undefined) replayTools.delete(unresolvedId);
 					}
 					continue;
 				}
@@ -2608,12 +2784,33 @@ export class AcpAgent implements Agent {
 				}
 				if (message.role === "toolResult" && typeof message.toolCallId === "string") {
 					const replayTool = replayTools.get(message.toolCallId);
-					const toolName = typeof message.toolName === "string" ? message.toolName : replayTool?.name;
 					// Pairing outranks content: publishing a result whose `tool_call` start
 					// never reached the client renders an update for a call it never saw begin.
-					if (!toolName || !replayTool) {
+					if (!replayTool) {
 						unreplayableEntries++;
 						unreplayableReason ??= "transcript_tool_call_unavailable";
+						continue;
+					}
+					// The start already named the call, so a result row that lost its own name
+					// falls back to it rather than dropping a result the client can still place.
+					const toolName =
+						typeof message.toolName === "string" && message.toolName ? message.toolName : replayTool.name;
+					// A start with no usable name anywhere still has to reach a terminal status:
+					// skipping it here is what left the call spinning at `pending` forever.
+					if (!toolName) {
+						unreplayableEntries++;
+						unreplayableReason ??= "transcript_tool_call_unavailable";
+						// The start keeps its place in `replayTools` until the close is accepted, so a
+						// refused close is retried and named by the boundary instead of dropped here.
+						const failure = await this.#closeReplayToolCall(
+							id,
+							adapter,
+							record.cwd,
+							message.toolCallId,
+							replayTool,
+							TRANSCRIPT_TOOL_RESULT_UNAVAILABLE,
+						);
+						if (failure === undefined) replayTools.delete(message.toolCallId);
 						continue;
 					}
 					const resultContent = richContent
@@ -2657,6 +2854,12 @@ export class AcpAgent implements Agent {
 			}
 			cursor = typeof page?.continuationCursor === "string" ? page.continuationCursor : undefined;
 			if (cursor) continue;
+			// Every start still parked here outlived its result row. `#replaySession` owns the
+			// close at its single boundary, so this pass only accounts for them.
+			if (replayTools.size > 0) {
+				unreplayableEntries += replayTools.size;
+				unreplayableReason ??= "transcript_tool_call_unavailable";
+			}
 			// An entry without its production body is skipped, never fatal: losing one
 			// transcript row must not revoke `session/load` for the whole session.
 			if (unreplayableReason)
@@ -2848,24 +3051,7 @@ export class AcpAgent implements Agent {
 		try {
 			return await (await this.#brokerAdapter()).global(operation, input, idempotencyKey);
 		} catch (error) {
-			const code =
-				typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
-					? error.code
-					: undefined;
-			if (
-				mcpServers.length === 0 ||
-				code === "invalid_input" ||
-				code === "authentication_failed" ||
-				code === "unknown_model_profile" ||
-				code === "model_profile_registry_error"
-			)
-				throw error;
-			const names = mcpServers
-				.slice(0, 8)
-				.map(server => server.name)
-				.join(", ");
-			const suffix = mcpServers.length > 8 ? `, and ${mcpServers.length - 8} more` : "";
-			throw new AcpSdkAdapterError("unavailable", `MCP server request failed to start (${names}${suffix}).`);
+			throw acpMcpLaunchFailure(error, mcpServers);
 		}
 	}
 

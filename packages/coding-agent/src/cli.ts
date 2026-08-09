@@ -5,9 +5,10 @@
  * lightweight CLI runner from pi-utils.
  */
 import "@gajae-code/utils/postmortem";
-import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
+import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -24,7 +25,6 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 process.title = APP_NAME;
 const rootHelpFlags = ["--help", "-h", "help"];
 const versionFlags = ["--version", "-v"];
-const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
@@ -221,21 +221,52 @@ async function runMemoryGuardNativeSmokeFastPathFromCli(): Promise<void> {
 	runMemoryGuardNativeSmoke();
 }
 
+function isLaunchWorktreeSelector(arg: string): boolean {
+	return (
+		arg === "--worktree" ||
+		arg === "-w" ||
+		arg.startsWith("--worktree=") ||
+		arg.startsWith("-w=") ||
+		(arg.startsWith("-w") && arg.length > 2)
+	);
+}
+
+function rootFlagDescriptor(arg: string) {
+	if (arg.startsWith("--") && !arg.includes("="))
+		return ROOT_LAUNCH_FLAGS[arg.slice(2) as keyof typeof ROOT_LAUNCH_FLAGS];
+	if (/^-[^-]$/.test(arg))
+		return Object.values(ROOT_LAUNCH_FLAGS).find(descriptor => descriptor.char === arg.slice(1));
+	return undefined;
+}
+
+function rootFlagValueIndex(argv: readonly string[], index: number): number {
+	const descriptor = rootFlagDescriptor(argv[index] ?? "");
+	if (!descriptor || descriptor.kind === "boolean") return index;
+	const value = argv[index + 1];
+	return value && !value.startsWith("-") ? index + 1 : index;
+}
+
 function rootFixtureArg(argv: string[]): { present: boolean; id: string | undefined } {
 	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i];
-		// Stop at the first subcommand token so a `--fixture` flag belonging to a
-		// subcommand never hijacks the root fast-path into fixture-report mode.
-		if (isSubcommand(arg)) return { present: false, id: undefined };
+		const arg = argv[i] ?? "";
+		if (arg === "--" || isSubcommand(arg)) return { present: false, id: undefined };
 		if (arg === "--fixture") return { present: true, id: argv[i + 1] };
+		const descriptor = rootFlagDescriptor(arg);
+		if (descriptor && descriptor.kind !== "boolean") {
+			const value = argv[i + 1];
+			if (!value || value.startsWith("-")) return { present: false, id: undefined };
+			i++;
+		}
 	}
 	return { present: false, id: undefined };
 }
 
 function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
-	for (const arg of argv) {
-		if (isSubcommand(arg)) return false;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i] ?? "";
+		if (arg === "--" || isSubcommand(arg) || isLaunchWorktreeSelector(arg)) return false;
 		if (flags.includes(arg)) return true;
+		i = rootFlagValueIndex(argv, i);
 	}
 	return false;
 }
@@ -258,63 +289,7 @@ export class RootHelpCommand extends Command {
 			multiple: true,
 		}),
 	};
-	static flags = {
-		model: Flags.string({ description: 'Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")' }),
-		smol: Flags.string({ description: "Smol/fast model for lightweight tasks (or GJC_SMOL_MODEL env)" }),
-		slow: Flags.string({ description: "Slow/reasoning model for thorough analysis (or GJC_SLOW_MODEL env)" }),
-		plan: Flags.string({ description: "Plan model for architectural planning (or GJC_PLAN_MODEL env)" }),
-		mpreset: Flags.string({ description: "Model profile preset to activate for this session" }),
-		default: Flags.boolean({ description: "Persist --mpreset as the default model profile" }),
-		provider: Flags.string({ description: "Provider to use (legacy; prefer --model)" }),
-		"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
-		credential: Flags.string({
-			description:
-				"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
-		}),
-		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
-		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
-		"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
-		"clipboard-transport": Flags.string({
-			description: "Clipboard transport: auto (default), native, osc52, or ssh",
-			options: ["auto", "native", "osc52", "ssh"],
-		}),
-		"clipboard-ssh-host": Flags.string({
-			description: "SSH host alias for --clipboard-transport ssh (from ~/.ssh/config)",
-		}),
-		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
-		mode: Flags.string({
-			description: "Output mode: text (default), json, or acp",
-			options: ["text", "json", "acp"],
-		}),
-		print: Flags.boolean({ char: "p", description: "Non-interactive mode: process prompt and exit" }),
-		continue: Flags.boolean({ char: "c", description: "Continue previous session" }),
-		resume: Flags.string({ char: "r", description: "Resume a session (by ID prefix, path, or picker if omitted)" }),
-		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
-		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
-		models: Flags.string({ description: "Comma-separated model patterns for Alt+N cycling" }),
-		"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
-		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
-		"no-pty": Flags.boolean({ description: "Disable PTY-based interactive bash execution" }),
-		tmux: Flags.boolean({ description: "Launch interactive startup inside tmux" }),
-		tools: Flags.string({ description: "Comma-separated list of tools to enable (default: all)" }),
-		thinking: Flags.string({
-			description: `Set thinking level: ${THINKING_EFFORTS.join(", ")}`,
-			options: [...THINKING_EFFORTS],
-		}),
-		hook: Flags.string({ description: "Load a hook/extension file (can be used multiple times)", multiple: true }),
-		extension: Flags.string({
-			char: "e",
-			description: "Load an extension file (can be used multiple times)",
-			multiple: true,
-		}),
-		"no-extensions": Flags.boolean({ description: "Disable extension discovery (explicit -e paths still work)" }),
-		"no-skills": Flags.boolean({ description: "Disable skills discovery and loading" }),
-		skills: Flags.string({ description: "Comma-separated glob patterns to filter skills (e.g., git-*,docker)" }),
-		"no-rules": Flags.boolean({ description: "Disable rules discovery and loading" }),
-		export: Flags.string({ description: "Export session file to HTML and exit" }),
-		"list-models": Flags.string({ description: "List available models (with optional fuzzy search)" }),
-		"no-title": Flags.boolean({ description: "Disable title auto-generation" }),
-	};
+	static flags = ROOT_LAUNCH_FLAGS;
 	static examples = [
 		`# Interactive mode\n  ${APP_NAME}`,
 		`# Interactive mode with initial prompt\n  ${APP_NAME} "List all .ts files in src/"`,

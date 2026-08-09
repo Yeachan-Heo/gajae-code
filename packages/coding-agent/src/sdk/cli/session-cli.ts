@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import {
 	listSdkSessionEndpoints,
 	readSdkBrokerDiscovery,
@@ -34,6 +35,7 @@ export interface SdkSessionCliArgs {
 
 type JsonRecord = Record<string, unknown>;
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
+const MAX_SESSION_LIST_PAGES = 10_000;
 
 class SdkSessionCliError extends Error {
 	constructor(
@@ -67,6 +69,10 @@ function containsSecretField(value: unknown): boolean {
 	if (Array.isArray(value)) return value.some(containsSecretField);
 	if (!value || typeof value !== "object") return false;
 	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
+}
+
+function object(value: unknown): JsonRecord | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : undefined;
 }
 
 async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
@@ -174,11 +180,49 @@ function brokerAbsent(error: unknown): boolean {
 	);
 }
 
+async function paginatedSessionList(client: SdkClient, input: JsonRecord = {}): Promise<unknown> {
+	const aggregate: JsonRecord = {};
+	const sessions: unknown[] = [];
+	let firstResponse: JsonRecord | undefined;
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+		const response = object(
+			await client.global("session.list", { ...input, ...(cursor === undefined ? {} : { cursor }) }),
+		);
+		firstResponse ??= response;
+		if (response?.ok === false) {
+			const failure = object(response.error);
+			throw new SdkClientError(
+				typeof failure?.code === "string" ? failure.code : "broker_error",
+				typeof failure?.message === "string" ? failure.message : "session.list failed",
+			);
+		}
+		const listing = object(response?.result) ?? response;
+		if (listing) {
+			for (const [key, value] of Object.entries(listing)) {
+				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
+			}
+			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
+			const nextCursor =
+				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
+					? listing.continuationCursor
+					: undefined;
+			if (nextCursor) {
+				cursor = nextCursor;
+				continue;
+			}
+		}
+		const result = { ...aggregate, sessions };
+		return firstResponse && "result" in firstResponse ? { ...firstResponse, result } : result;
+	}
+	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+}
+
 async function runList(repo: string, agentDir: string): Promise<unknown> {
 	try {
 		const client = await connectBroker(agentDir);
 		try {
-			return await client.global("session.list", {});
+			return await paginatedSessionList(client);
 		} finally {
 			await client.close();
 		}
@@ -242,7 +286,13 @@ export async function runSdkSessionCli(
 				throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
 			const client = await connectBroker(agentDir);
 			try {
-				writeOutput(await client.global(operation, input, { idempotencyKey }));
+				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+				writeOutput(
+					await client.global(operation, input, {
+						idempotencyKey,
+						...(timeoutMs === undefined ? {} : { timeoutMs }),
+					}),
+				);
 			} finally {
 				await client.close();
 			}

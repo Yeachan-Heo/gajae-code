@@ -5,6 +5,7 @@ import {
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	isInsideInlineCodeSpan,
+	isSlashCommandPromptStart,
 } from "../autocomplete";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { getKeybindings, type KeybindingsManager } from "../keybindings";
@@ -489,6 +490,7 @@ export class Editor implements Component, Focusable {
 	onSubmit?: (text: string) => void;
 	onAltEnter?: (text: string) => void;
 	onChange?: (text: string) => void;
+	onUndo?: (text: string) => void;
 	onAutocompleteCancel?: () => void;
 	onTabDeclined?: (text: string) => void;
 	/**
@@ -1877,6 +1879,50 @@ export class Editor implements Component, Focusable {
 		this.#exitHistoryForEditing();
 		this.#insertTextAtCursor(text);
 	}
+	/**
+	 * Delete an exact text run immediately before the cursor as one edit.
+	 * Returns false without changing the document when the text is not present.
+	 */
+	deleteTextBeforeCursor(text: string): boolean {
+		if (text.length === 0 || this.#state.cursorCol < text.length) return false;
+
+		const line = this.#state.lines[this.#state.cursorLine] || "";
+		const startCol = this.#state.cursorCol - text.length;
+		if (line.slice(startCol, this.#state.cursorCol) !== text) return false;
+
+		this.#exitHistoryForEditing();
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.#state.lines[this.#state.cursorLine] = line.slice(0, startCol) + line.slice(this.#state.cursorCol);
+		this.#setCursorCol(startCol);
+		this.#notifyBackwardDelete();
+		return true;
+	}
+	/**
+	 * Delete a same-line text range containing the cursor as one edit.
+	 * Returns false without changing the document when the range is invalid.
+	 */
+	deleteTextRangeAroundCursor(startCol: number, endCol: number): boolean {
+		const line = this.#state.lines[this.#state.cursorLine] || "";
+		if (
+			!Number.isInteger(startCol) ||
+			!Number.isInteger(endCol) ||
+			startCol < 0 ||
+			startCol >= endCol ||
+			endCol > line.length ||
+			startCol > this.#state.cursorCol ||
+			endCol < this.#state.cursorCol
+		)
+			return false;
+
+		this.#exitHistoryForEditing();
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.#state.lines[this.#state.cursorLine] = line.slice(0, startCol) + line.slice(endCol);
+		this.#setCursorCol(startCol);
+		this.#notifyBackwardDelete();
+		return true;
+	}
 
 	// All the editor methods from before...
 	#insertCharacter(char: string): void {
@@ -2129,6 +2175,10 @@ export class Editor implements Component, Focusable {
 			this.#setCursorCol(previousLine.length);
 		}
 
+		this.#notifyBackwardDelete();
+	}
+
+	#notifyBackwardDelete(): void {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
@@ -2289,6 +2339,7 @@ export class Editor implements Component, Focusable {
 		this.#preferredVisualCol = null;
 		Object.assign(this.#state, snapshot);
 		this.#bumpDocumentVersion();
+		this.onUndo?.(this.getText());
 
 		if (this.onChange) {
 			this.onChange(this.getText());
@@ -2838,13 +2889,14 @@ export class Editor implements Component, Focusable {
 	#isInSubmittedSlashCommandContext(): boolean {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-		return this.#hasOnlyWhitespaceBeforeCursorLine() && beforeCursor.trimStart().startsWith("/");
+		return isSlashCommandPromptStart(this.#state.lines, this.#state.cursorLine, beforeCursor);
 	}
 
 	#getSlashTokenBeforeCursor(): string | null {
+		if (!this.#hasOnlyWhitespaceBeforeCursorLine()) return null;
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-		return extractSlashCommandTokenPrefix(beforeCursor);
+		return extractSlashCommandTokenPrefix(beforeCursor.trimStart());
 	}
 
 	#isInSlashTokenContext(): boolean {
@@ -2856,7 +2908,7 @@ export class Editor implements Component, Focusable {
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 		if (!textBeforeCursor.endsWith(this.#autocompletePrefix)) return false;
 		if (this.#autocompleteState !== "regular" || !this.#autocompletePrefix.startsWith("/")) return true;
-		return extractSlashCommandTokenPrefix(textBeforeCursor) === this.#autocompletePrefix;
+		return this.#getSlashTokenBeforeCursor() === this.#autocompletePrefix;
 	}
 	#captureAutocompleteOrigin(): { docVersion: number; cursorLine: number; cursorCol: number } {
 		return {

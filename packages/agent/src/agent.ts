@@ -1428,6 +1428,26 @@ export class Agent {
 
 		await this.#runLoop(undefined, options);
 	}
+	/**
+	 * Continue by consuming queued steering/follow-up messages without replaying
+	 * the current non-assistant tail.
+	 */
+	async continueQueuedMessages(options?: AgentPromptOptions): Promise<void> {
+		if (this.#state.isStreaming) {
+			throw new AgentBusyError();
+		}
+		const queuedSteering = this.#dequeueSteeringMessages();
+		if (queuedSteering.length > 0) {
+			await this.#runLoop(queuedSteering, { ...options, skipInitialSteeringPoll: true });
+			return;
+		}
+		const queuedFollowUp = this.#dequeueFollowUpMessages();
+		if (queuedFollowUp.length > 0) {
+			await this.#runLoop(queuedFollowUp, options);
+			return;
+		}
+		throw new Error("No queued messages to continue");
+	}
 
 	/**
 	 * Run the agent loop.

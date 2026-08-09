@@ -502,6 +502,24 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	});
 });
 
+describe("managed descriptor reads", () => {
+	it("returns transcript identity without exposing file bytes", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
+		try {
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			const bytes = Buffer.from("descriptor payload\n");
+			store.publishNoReplaceSync("session.jsonl", bytes);
+			const descriptor = store.descriptorExpected("session.jsonl");
+			expect(descriptor).toMatchObject({ size: bytes.byteLength, isFile: true });
+			expect(descriptor?.dev).toBeTypeOf("bigint");
+			expect(descriptor?.ino).toBeTypeOf("bigint");
+			expect(store.descriptorExpected("missing.jsonl")).toBeNull();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
 	it("atomically replaces an existing file through the Darwin path", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-")));
@@ -1160,6 +1178,91 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		);
 		expect(fs.existsSync(path.join(root, "toctou-not-found"))).toBe(true);
 	});
+
+	it("defers a canonical receipt cleanup I/O failure without blocking a session mutation", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation(pathname => {
+			if (pathname === receipt) return { ok: false, code: "io_error" };
+			throw new Error(`Unexpected exact unlink: ${pathname}`);
+		});
+		replay("cleanup-io-error");
+
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "cleanup-io-error"))).toBe(true);
+	});
+
+	it("retries a retained canonical receipt after a transient I/O failure", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const realExactUnlink = native.exactUnlink;
+		let firstAttempt = true;
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			if (pathname === receipt && firstAttempt) {
+				firstAttempt = false;
+				return { ok: false, code: "io_error" };
+			}
+			return realExactUnlink(pathname, expected);
+		});
+		replay("cleanup-io-error-first-attempt");
+		expect(fs.existsSync(receipt)).toBe(true);
+
+		replay("cleanup-io-error-retry");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "cleanup-io-error-retry"))).toBe(true);
+	});
+
+	it("keeps canonical receipt identity failures fail-closed", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+
+		vi.spyOn(native, "exactUnlink").mockImplementation(pathname => {
+			if (pathname === receipt) return { ok: false, code: "identity_mismatch" };
+			throw new Error(`Unexpected exact unlink: ${pathname}`);
+		});
+
+		expect(() => replay("cleanup-identity-mismatch")).toThrow(
+			"managed_replace_receipt_cleanup_pending:identity_mismatch",
+		);
+		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "cleanup-identity-mismatch"))).toBe(false);
+	});
+
+	it.skipIf(process.platform !== "darwin")(
+		"keeps an exact replacement I/O failure fail-closed because replacement state is unknown",
+		() => {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("predecessor\n"));
+			const destination = path.join(sessionDir, "session.jsonl");
+
+			vi.spyOn(native, "exactReplacePath").mockReturnValue({ ok: false, code: "io_error" });
+
+			expect(() => store.replaceSync("session.jsonl", Buffer.from("successor\n"))).toThrow(
+				"managed_replace_failed:io_error",
+			);
+			expect(fs.readFileSync(destination, "utf8")).toBe("predecessor\n");
+			expect(fs.readdirSync(sessionDir).some(name => name.startsWith(".gjc-replace-cleanup-"))).toBe(true);
+		},
+	);
 
 	it("continues reconcile when a canonical receipt disappears before first capture (ENOENT)", () => {
 		const predecessorPath = path.join(root, "predecessor");

@@ -20,6 +20,8 @@ The client adds the endpoint token as a WebSocket query parameter, waits for a s
 
 A request that has been sent is never replayed after reconnect. Callers that need retry semantics must decide whether retrying their operation is safe and provide their own idempotency protocol where appropriate.
 
+For a request timeout, `SdkClientError.details` is an `SdkRequestTimeoutDetails` object. `requestSent: true` means `WebSocket.send()` returned, not that the server accepted or completed the request. Treat it as execution uncertainty: do not resend an ordered `turn.prompt` or `skill.invoke`; retain a fresh `clientRef` before sending and query `turn.prompt_status` or `skill.invoke_status` with that reference.
+
 ## Scope and compatibility
 
 This package is transport-only. It does not import, instantiate, dispatch to, or otherwise own `AgentSession`, broker lifecycle, backend process management, or application operation handlers.

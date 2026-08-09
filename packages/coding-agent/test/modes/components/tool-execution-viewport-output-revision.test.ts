@@ -214,6 +214,86 @@ describe("ToolExecutionComponent visible preview revisions", () => {
 	});
 });
 
+describe("ToolExecutionComponent collapsed-card preview mutations", () => {
+	beforeEach(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		await initTheme(false);
+	});
+
+	afterEach(() => {
+		resetSettingsForTest();
+		vi.restoreAllMocks();
+	});
+
+	it("records a visible transcript mutation when a preview resolves while the card stays collapsed", async () => {
+		const requests: Array<PromiseWithResolvers<PerFileDiffPreview[] | null>> = [];
+		vi.spyOn(EDIT_MODE_STRATEGIES.apply_patch, "computeDiffPreview").mockImplementation(() => {
+			const request = deferredPreview();
+			requests.push(request);
+			return request.promise;
+		});
+		const onVisibleTranscriptMutation = vi.fn();
+		const component = new ToolExecutionComponent(
+			"apply_patch",
+			{ input: patch },
+			{ onVisibleTranscriptMutation },
+			undefined,
+			ui,
+			process.cwd(),
+		);
+		// Default state is collapsed. The result-first card renders only a header,
+		// so the preview diff is never shown — yet resolving it must still advance
+		// the logical visible projection (semantic in-flight progress).
+		await waitFor(() => requests.length === 1);
+		expect(onVisibleTranscriptMutation).not.toHaveBeenCalled();
+		requests[0]!.resolve(preview);
+		await waitFor(() => onVisibleTranscriptMutation.mock.calls.length === 1);
+
+		// A semantically identical re-resolution must NOT advance the mutation
+		// again (the projection fingerprint is unchanged).
+		const beforeSecondResolve = onVisibleTranscriptMutation.mock.calls.length;
+		component.updateArgs({ input: `${patch}\n` });
+		await waitFor(() => requests.length === 2);
+		requests[1]!.resolve(preview);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(onVisibleTranscriptMutation.mock.calls.length).toBe(beforeSecondResolve);
+		component.dispose();
+	});
+
+	it("records a mutation when a preview resolves absent then becomes available, even if the collapsed render is unchanged", async () => {
+		const requests: Array<PromiseWithResolvers<PerFileDiffPreview[] | null>> = [];
+		vi.spyOn(EDIT_MODE_STRATEGIES.apply_patch, "computeDiffPreview").mockImplementation(() => {
+			const request = deferredPreview();
+			requests.push(request);
+			return request.promise;
+		});
+		const onVisibleTranscriptMutation = vi.fn();
+		const component = new ToolExecutionComponent(
+			"apply_patch",
+			{ input: patch },
+			{ onVisibleTranscriptMutation },
+			undefined,
+			ui,
+			process.cwd(),
+		);
+		await waitFor(() => requests.length === 1);
+		// Absent resolution carries no diff fingerprint → no mutation.
+		requests[0]!.resolve(null);
+		await Promise.resolve();
+		expect(onVisibleTranscriptMutation).not.toHaveBeenCalled();
+
+		// A subsequent resolution that produces a diff must mutate, even though
+		// the collapsed header line is byte-identical before and after.
+		component.updateArgs({ input: `${patch}\n` });
+		await waitFor(() => requests.length === 2);
+		requests[1]!.resolve(preview);
+		await waitFor(() => onVisibleTranscriptMutation.mock.calls.length === 1);
+		component.dispose();
+	});
+});
+
 describe("synchronous visible revisions", () => {
 	it("does not report identical args or results", () => {
 		const component = new ToolExecutionComponent("bash", { command: "printf ok" }, {}, undefined, ui, process.cwd());

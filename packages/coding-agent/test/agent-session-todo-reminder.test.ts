@@ -143,22 +143,24 @@ describe("AgentSession todo completion reminder", () => {
 
 		await session.prompt("do the long task");
 
-		expect(reminderEvents()).toHaveLength(1);
+		expect(reminderEvents()).toHaveLength(2);
 		const reminders = injectedReminders();
-		expect(reminders).toHaveLength(1);
+		expect(reminders).toHaveLength(2);
 		expect(reminderText(reminders[0])).toContain("You stopped with 2 incomplete todo item(s)");
 		expect(reminderText(reminders[0])).toContain("(Reminder 1/2)");
+		expect(reminderText(reminders[1])).toContain("(Reminder 2/2)");
 
-		// The reminder reopened the turn: it lands between the two assistant messages.
+		// Both configured reminders are visible; the second consumes the final scripted response.
 		expect(mock.calls).toHaveLength(2);
 		const messages = session.agent.state.messages;
 		const assistantIndices = messages
 			.map((message, index) => (message.role === "assistant" ? index : -1))
 			.filter(index => index >= 0);
-		const reminderIndex = messages.findIndex(isInjectedReminder);
 		expect(assistantIndices).toHaveLength(2);
-		expect(reminderIndex).toBeGreaterThan(assistantIndices[0]!);
-		expect(reminderIndex).toBeLessThan(assistantIndices[1]!);
+		for (const reminder of reminders) {
+			const reminderIndex = messages.indexOf(reminder);
+			expect(reminderIndex).toBeGreaterThan(assistantIndices[0]!);
+		}
 	});
 
 	it("injects nothing once the todo.reminders.max budget is exhausted", async () => {

@@ -368,6 +368,7 @@ export function trimChatChildren(ctx: InteractiveModeContext): void {
 }
 
 export class UiHelpers {
+	#compactionFlushRetryScheduled = false;
 	#renderedIrcInlineComponents = new Map<string, readonly Component[]>();
 	#viewportAnchorOccurrences = new WeakMap<object, { base: string; epoch: number; id: string }>();
 	#nextViewportAnchorOccurrence = new Map<string, number>();
@@ -1217,6 +1218,23 @@ export class UiHelpers {
 	}
 
 	async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
+		if (this.ctx.session.isCompacting || this.ctx.session.isBashRunning || this.ctx.session.isEvalRunning) {
+			if (!this.#compactionFlushRetryScheduled) {
+				this.#compactionFlushRetryScheduled = true;
+				void (async () => {
+					while (
+						this.ctx.session.isCompacting ||
+						this.ctx.session.isBashRunning ||
+						this.ctx.session.isEvalRunning
+					) {
+						await Bun.sleep(50);
+					}
+					this.#compactionFlushRetryScheduled = false;
+					await this.flushCompactionQueue(options);
+				})();
+			}
+			return;
+		}
 		if (this.ctx.compactionQueuedMessages.length === 0) {
 			return;
 		}

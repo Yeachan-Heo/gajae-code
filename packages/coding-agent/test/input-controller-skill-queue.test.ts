@@ -85,6 +85,8 @@ function createStubInputControllerContext(opts: {
 	skillCommands: Map<string, Skill>;
 	isStreaming: boolean;
 	busyPromptMode?: "steer" | "queue";
+	isBashRunning?: boolean;
+	isEvalRunning?: boolean;
 }) {
 	let editorText = "";
 	const editor: StubEditor = {
@@ -116,8 +118,8 @@ function createStubInputControllerContext(opts: {
 			sessionId: "stub-session",
 			isStreaming: opts.isStreaming,
 			isCompacting: false,
-			isBashRunning: false,
-			isEvalRunning: false,
+			isBashRunning: opts.isBashRunning ?? false,
+			isEvalRunning: opts.isEvalRunning ?? false,
 			extensionRunner: undefined,
 			enqueueCustomMessageDisplay,
 			sendCustomMessage,

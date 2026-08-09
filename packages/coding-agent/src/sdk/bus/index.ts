@@ -80,6 +80,7 @@ import {
 } from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
+import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { SessionIndex } from "../broker/session-index";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
@@ -92,6 +93,7 @@ import {
 	syntheticModelInputError,
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
+import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -127,7 +129,7 @@ import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMess
 import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
-import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
+import { createPromptReconciliation } from "./prompt-reconciliation";
 import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
@@ -153,6 +155,40 @@ export {
 
 const PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT = 8;
 const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
+/**
+ * Upper bound on the failure reason copied into the local operator log. Mirrors
+ * the 512-char bound documented for reconciliation failure messages so a runaway
+ * provider error cannot flood the log file.
+ */
+const PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX = 512;
+type PromptTerminalDiagnostic = {
+	reason?: unknown;
+	loopStopReason?: string;
+	assistantStopReason?: string;
+	errorKind?: string;
+	intentionalCancellation?: boolean;
+};
+
+type PromptTerminalExtra = {
+	finalText?: string;
+	error?: { code: string; message: string };
+	diagnostic?: PromptTerminalDiagnostic;
+	diagnosticAlreadyLogged?: boolean;
+};
+
+function formatPromptTerminalFailureReason(reason: unknown): string {
+	let rawReason: string;
+	if (reason instanceof Error) rawReason = reason.message;
+	else if (typeof reason === "string") rawReason = reason;
+	else if (reason === undefined || reason === null) return "unreported";
+	else
+		try {
+			rawReason = String(reason);
+		} catch {
+			return "unreported";
+		}
+	return rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported";
+}
 
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
@@ -1170,6 +1206,8 @@ interface SessionRuntime {
 	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
 	hostStopped: boolean;
 	serverStopped: boolean;
+	/** This runtime's own host-liveness publication; only its teardown may retract it. */
+	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
 	/** Managed Telegram root registration released during terminal teardown. */
 	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken: string };
@@ -1192,11 +1230,8 @@ interface SessionRuntime {
 	terminalizePrompt: (
 		correlation: { commandId: string; turnId: string },
 		outcome: SdkPromptTerminalOutcome,
-		extra?: { finalText?: string },
+		extra?: PromptTerminalExtra,
 	) => Promise<void>;
-	/** Records a correlated prompt terminal boundary after agent unwind. */
-	/** Atomically claims a correlated prompt terminal boundary after agent unwind. */
-	recordPromptTerminal: (correlation: { commandId: string; turnId: string } | undefined) => boolean;
 	/** Transitions the authoritative reconciliation record at lifecycle ingress; terminal outcomes settle once. */
 	notePromptReconciliation: (
 		correlation: { commandId: string; turnId: string } | undefined,
@@ -3749,6 +3784,13 @@ export function createNotificationsExtension(
 				await rt.server.stopAndWait();
 				serverStopped = true;
 				rt.serverStopped = true;
+				// This runtime no longer serves an SDK endpoint, so it withdraws its
+				// own evidence — and only its own. A predecessor's deferred teardown
+				// runs while an identity successor is already serving, and clearing
+				// that live runtime's reader would manufacture "no evidence" for a
+				// host whose clients are still attached.
+				rt.evidencePublication?.retract();
+				rt.evidencePublication = undefined;
 			} catch (e) {
 				ownerReleaseFailures.push(e);
 				logger.warn(`notifications: stop failed: ${String(e)}`);
@@ -4047,7 +4089,6 @@ export function createNotificationsExtension(
 			connectionId: string;
 			abandoned: boolean;
 			failed: boolean;
-			error: unknown;
 			terminal: boolean;
 			retainCorrelation: boolean;
 			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
@@ -4246,7 +4287,6 @@ export function createNotificationsExtension(
 				connectionId: requesterConnectionId,
 				abandoned: false,
 				failed: false,
-				error: undefined,
 				terminal: false,
 				retainCorrelation: trackReconciliation,
 				createdAt: Date.now(),
@@ -4268,6 +4308,7 @@ export function createNotificationsExtension(
 						provenance: "deadline",
 					},
 					{ fence: true },
+					{ diagnostic: { reason: "Prompt deadline exceeded." } },
 				);
 			}, submission.deadlineMs);
 		};
@@ -4354,7 +4395,7 @@ export function createNotificationsExtension(
 			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
 			// so aborting there would cancel the next turn instead of fencing this one.
 			options: { fence?: boolean } = {},
-			extra?: { finalText?: string; error?: { code: string; message: string } },
+			extra?: PromptTerminalExtra,
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
@@ -4426,6 +4467,24 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation) || !runtime) return;
+			if (
+				winner.kind === "failed" &&
+				extra?.diagnostic?.intentionalCancellation !== true &&
+				extra?.diagnosticAlreadyLogged !== true
+			) {
+				const diagnostic = extra?.diagnostic;
+				logger.error("sdk_prompt_terminal_failed", {
+					sessionId: id,
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+					code: winner.code,
+					provenance: winner.provenance,
+					...(diagnostic?.loopStopReason ? { loopStopReason: diagnostic.loopStopReason } : {}),
+					...(diagnostic?.assistantStopReason ? { assistantStopReason: diagnostic.assistantStopReason } : {}),
+					...(diagnostic?.errorKind ? { errorKind: diagnostic.errorKind } : {}),
+					reason: formatPromptTerminalFailureReason(diagnostic?.reason),
+				});
+			}
 			if (winner.kind === "failed") {
 				emitPromptLifecycle(correlation, {
 					type: "agent_failed",
@@ -4445,26 +4504,41 @@ export function createNotificationsExtension(
 			}
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+			logger.error("SDK prompt submission failed", {
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+				error: formatPromptFailureForLocalLog(error),
+			});
 			const sanitized = sanitizePromptFailure(error);
+			const outcome: SdkPromptTerminalOutcome = {
+				kind: "failed",
+				code: "prompt_failed",
+				message: sanitized.message,
+				provenance: "agent_failed",
+			};
+			// This rejection bypasses `agent_end`, so record its local-only reason at
+			// the accepted submission failure boundary before terminalization begins.
+			logger.error("sdk_prompt_terminal_failed", {
+				sessionId: id,
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+				code: outcome.code,
+				provenance: outcome.provenance,
+				reason: formatPromptTerminalFailureReason(error),
+			});
 			void terminalizePrompt(
 				correlation,
-				{
-					kind: "failed",
-					code: "prompt_failed",
-					message: sanitized.message,
-					provenance: "agent_failed",
-				},
+				outcome,
 				{},
-				// The normalized outcome is the ACP contract; the wire error keeps the
-				// existing sanitized discriminator so SDK clients keep branching on it.
-				{ error: sanitized },
+				// The normalized outcome and wire error retain the fixed safe token.
+				// Mark the diagnostic as recorded so terminalization does not duplicate it.
+				{ error: sanitized, diagnostic: { reason: error }, diagnosticAlreadyLogged: true },
 			);
 		};
 		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			submission.failed = true;
-			submission.error = error;
 			removePendingPromptCorrelation(correlation);
 			if (
 				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
@@ -4894,7 +4968,6 @@ export function createNotificationsExtension(
 			bindPromptExecutionHandle,
 			peekPromptPendingOutcome: correlation => kindReconciliation.peekPendingOutcome(correlation),
 			terminalizePrompt: (correlation, outcome, extra) => terminalizePrompt(correlation, outcome, {}, extra),
-			recordPromptTerminal,
 			notePromptReconciliation: (correlation, frame) => {
 				void kindReconciliation.noteTransition("prompt", correlation, frame);
 			},
@@ -5503,6 +5576,14 @@ export function createNotificationsExtension(
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await sdkRuntime.startTransport();
+			// The native server owns the only authoritative view of this host's live
+			// SDK client sockets; publish it so a detached session host can bound its
+			// own lifetime without probing the OS (#4010). The handle is this
+			// runtime's alone, so only this runtime's teardown can retract it.
+			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
+				attachedClients: () => server.clientCount(),
+				workInFlight: () => initializedRuntime.busy || initializedRuntime.pendingPromptCorrelations.length > 0,
+			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
 				endpointDigest: endpointAuthorityDigest(endpoint.url, token),
@@ -6283,7 +6364,7 @@ export function createNotificationsExtension(
 				message =>
 					(message as { stopReason?: unknown }).stopReason === "error" ||
 					(message as { stopReason?: unknown }).stopReason === "aborted",
-			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown } | undefined;
+			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown; errorKind?: unknown } | undefined;
 			const legacyCode =
 				event.stopReason === "cancelled"
 					? "cancelled"
@@ -6292,8 +6373,25 @@ export function createNotificationsExtension(
 						: terminalAssistant?.stopReason === "aborted"
 							? "aborted"
 							: undefined;
+			// The SDK wire outcome and ACP error envelope use a fixed safe token by
+			// contract (see `sanitizePromptFailure`). Assistant failure messages may
+			// still remain in the local session transcript; terminalization copies only
+			// a bounded reason into the local operator log.
 			void rt.terminalizePrompt(correlation, outcome, {
 				...(finalText ? { finalText } : {}),
+				...(outcome.kind === "failed"
+					? {
+							diagnostic: {
+								reason: terminalAssistant?.errorMessage,
+								loopStopReason: event.stopReason ?? "none",
+								assistantStopReason: terminalAssistant?.stopReason ?? "none",
+								...(event.stopReason === "cancelled" ? { intentionalCancellation: true } : {}),
+								...(typeof terminalAssistant?.errorKind === "string"
+									? { errorKind: terminalAssistant.errorKind }
+									: {}),
+							},
+						}
+					: {}),
 				...(outcome.kind === "failed" && legacyCode
 					? {
 							// Only the legacy discriminator is preserved; provider text is never

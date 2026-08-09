@@ -6,6 +6,8 @@ import { logger } from "@gajae-code/utils";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
+import type { DiscordMessageComponent, DiscordProvider, DiscordThread } from "../src/sdk/bus/discord-provider";
+import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import type { SlackProviderClient } from "../src/sdk/bus/slack-provider";
 import { ACP_SESSION_RECONNECT } from "../src/sdk/session-reconnect";
 import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } from "./helpers/fake-sdk-transport";
@@ -28,6 +30,15 @@ const CAP_GATED_REPLAY_KINDS = new Set(["tool_activity", "reasoning_summary"]);
 
 class FakeSlackProvider implements SlackProviderClient {
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
+	readonly postAttempts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
+	/** How many upcoming posts are refused, the way a provider outage refuses them. */
+	failPosts = 0;
+	/** How many upcoming posts Slack accepts before their acknowledgements are lost. */
+	acceptThenThrowPosts = 0;
+	/** How many publication reconciliation attempts fail after an ambiguous acknowledgement. */
+	failReconciliations = 0;
+	/** Every post this provider refused, so a test can settle on the refusal itself. */
+	readonly refused: string[] = [];
 	readonly transportHealthy = true;
 
 	async start(): Promise<void> {}
@@ -64,18 +75,102 @@ class FakeSlackProvider implements SlackProviderClient {
 		threadTs?: string;
 		clientMsgId: string;
 	}): Promise<{ channel: string; ts: string; client_msg_id: string }> {
+		if (this.failPosts > 0) {
+			this.failPosts -= 1;
+			this.refused.push(input.text);
+			throw new Error("slack provider is unavailable");
+		}
+		this.postAttempts.push(input);
+		const duplicate = this.posts.findIndex(post => post.clientMsgId === input.clientMsgId);
+		if (duplicate >= 0) return { channel: input.channel, ts: `7.${duplicate + 1}`, client_msg_id: input.clientMsgId };
 		const position = this.posts.push(input);
+		if (this.acceptThenThrowPosts > 0) {
+			this.acceptThenThrowPosts -= 1;
+			this.failReconciliations = 1;
+			throw new SlackProviderError("connection", "chat.postMessage", undefined, undefined, true);
+		}
 		if (this.#publishGate) await this.#publishGate;
 		return { channel: input.channel, ts: `7.${position}`, client_msg_id: input.clientMsgId };
 	}
 
 	async findMessageByClientMsgId(): Promise<null> {
+		if (this.failReconciliations > 0) {
+			this.failReconciliations -= 1;
+			throw new Error("slack reconciliation is unavailable");
+		}
 		return null;
 	}
 
 	async findMessageByTimestamp(): Promise<null> {
 		return null;
 	}
+}
+
+class FakeDiscordProvider implements DiscordProvider {
+	readonly applicationId = "discord-app";
+	readonly botUserId = "discord-bot";
+	readonly transportHealthy = true;
+	readonly posts: Array<{ threadId: string; content: string; nonce?: string }> = [];
+	readonly postAttempts: Array<{ threadId: string; content: string; nonce?: string }> = [];
+	readonly #threadsByNonce = new Map<string, DiscordThread>();
+	readonly #messagesByNonce = new Map<string, { id: string; threadId: string }>();
+	acceptThenThrowPosts = 0;
+	reconciliationFailureNonce: string | undefined;
+
+	async start(): Promise<void> {}
+	async stop(): Promise<void> {}
+
+	async createThread(input: {
+		guildId: string;
+		parentId: string;
+		name: string;
+		nonce: string;
+	}): Promise<DiscordThread> {
+		const existing = this.#threadsByNonce.get(input.nonce);
+		if (existing) return existing;
+		const thread = {
+			id: `discord-thread-${this.#threadsByNonce.size + 1}`,
+			guildId: input.guildId,
+			parentId: input.parentId,
+			archived: false,
+		};
+		this.#threadsByNonce.set(input.nonce, thread);
+		return thread;
+	}
+
+	async findThreadByNonce(input: { guildId: string; parentId: string; nonce: string }): Promise<DiscordThread | null> {
+		return this.#threadsByNonce.get(input.nonce) ?? null;
+	}
+
+	async findMessageByNonce(input: { threadId: string; nonce: string }): Promise<{ id: string } | null> {
+		if (input.nonce === this.reconciliationFailureNonce) throw new Error("discord reconciliation is unavailable");
+		const message = this.#messagesByNonce.get(input.nonce);
+		return message?.threadId === input.threadId ? { id: message.id } : null;
+	}
+
+	async postMessage(input: {
+		threadId: string;
+		content: string;
+		nonce?: string;
+		components?: DiscordMessageComponent[];
+	}): Promise<{ id: string }> {
+		this.postAttempts.push(input);
+		const existing = input.nonce === undefined ? undefined : this.#messagesByNonce.get(input.nonce);
+		if (existing) return { id: existing.id };
+		const id = `discord-message-${this.posts.length + 1}`;
+		this.posts.push(input);
+		if (input.nonce !== undefined) this.#messagesByNonce.set(input.nonce, { id, threadId: input.threadId });
+		if (this.acceptThenThrowPosts > 0) {
+			this.acceptThenThrowPosts -= 1;
+			this.reconciliationFailureNonce = input.nonce;
+			throw new Error("discord disconnected after accepting post");
+		}
+		return { id };
+	}
+
+	async deferInteraction(): Promise<void> {}
+	async archiveThread(): Promise<void> {}
+	async unarchiveThread(): Promise<void> {}
 }
 
 /**
@@ -123,6 +218,10 @@ class FakeSessionHost {
 	 */
 	emit(text: string): Record<string, unknown> {
 		return this.#record("notice", { type: "notice", text });
+	}
+
+	emitSessionReady(): Record<string, unknown> {
+		return this.#record("session_ready", { type: "session_ready" });
 	}
 
 	/**
@@ -333,6 +432,68 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 	}
 }
 
+async function withAttachedDiscordRuntime(
+	run: (harness: {
+		runtime: ChatDaemonRuntime;
+		provider: FakeDiscordProvider;
+		reconcile: () => void;
+	}) => Promise<void>,
+): Promise<void> {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconnect-discord-"));
+	let runtime: ChatDaemonRuntime | undefined;
+	try {
+		const stateRoot = path.join(agentDir, ".gjc", "state");
+		const endpointFile = path.join(stateRoot, "sdk", `${SESSION_ID}.json`);
+		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
+		await fs.writeFile(
+			endpointFile,
+			`${JSON.stringify({ version: 1, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
+		);
+		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
+		const index = await new SessionIndex(agentDir).open();
+		await index.append({
+			type: "host_registered",
+			sessionId: SESSION_ID,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: GENERATION,
+			pid: process.pid,
+			endpointMtimeMs,
+		});
+
+		const provider = new FakeDiscordProvider();
+		let reconcileTick: (() => void) | undefined;
+		runtime = new ChatDaemonRuntime(
+			{
+				kind: "discord",
+				agentDir,
+				config: {
+					identity: "test-identity",
+					notifications: {
+						discord: {
+							botToken: "discord-not-persisted",
+							applicationId: provider.applicationId,
+							guildId: "discord-guild",
+							parentChannelId: "discord-parent",
+						},
+					},
+				},
+			},
+			{
+				createDiscordProvider: () => provider,
+				setInterval: ((callback: () => void) => {
+					reconcileTick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => undefined) as unknown as typeof clearInterval,
+			},
+		);
+		await run({ runtime, provider, reconcile: () => reconcileTick?.() });
+	} finally {
+		await runtime?.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+}
+
 /** The runtime does its index and endpoint IO before it dials, so wait for the dial. */
 async function awaitSocket(count: number): Promise<FakeWebSocket> {
 	for (let attempt = 0; attempt < 2_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
@@ -340,10 +501,30 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
 	return FakeWebSocket.instances[count - 1]!;
 }
 
-/** Delivery is observable only where it lands, so settle on the publications themselves. */
+/**
+ * Delivery is observable only where it lands, so settle on the publications themselves.
+ *
+ * A post is recorded the moment the surface is handed it, and the runtime records the
+ * sequence as delivered only once that publication returns. The settle covers that tail:
+ * a test that drops the socket the instant a post appears would otherwise be racing a
+ * cursor the runtime has not moved yet.
+ */
 async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<void> {
 	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
+	await Bun.sleep(25);
+}
+
+async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+	expect(provider.posts).toHaveLength(count);
+	await Bun.sleep(25);
+}
+
+/** A refusal is the only trace a failed publication leaves on this side of the runtime. */
+async function awaitRefusals(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 2_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
+	expect(provider.refused).toHaveLength(count);
 }
 
 /** The replay rides the socket, so settle on the request the host itself observed. */
@@ -1041,7 +1222,9 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				events: [filtered, tail],
 				gap: {
 					kind: "sequence_gap",
-					fromSeq: Number(recoverable.seq),
+					// The pinned publish leaves seq 1 undelivered, so this round asked from 0 and
+					// its answer has to concede from the first sequence it asked for.
+					fromSeq: 1,
 					toSeq: Number(recoverable.seq),
 					resyncQueries: ["Q01"],
 				},
@@ -1067,7 +1250,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				"GJC notice\ntail",
 			]);
 			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
-				`chat daemon replay conceded a retention gap (sequences 2-2 are gone from the host, 1 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+				`chat daemon replay conceded a retention gap (sequences 1-2 are gone from the host, 1 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
 			]);
 
 			// The recovered frame did not strand the cursor below the conceded range: the
@@ -1083,7 +1266,217 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			]);
 			expect(host.replayRequests).toEqual([
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+			]);
+		});
+	});
+}, 20_000);
+
+test("a frame the surface refused stays above the cursor and is re-served by the next replay", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			// One transient refusal from the surface. Nothing published this sequence, so
+			// the cursor — whose only job is recording what was delivered — must still sit
+			// below it when the next replay asks.
+			provider.failPosts = 1;
+			host.emit("two");
+			await awaitRefusals(provider, 1);
+			await Bun.sleep(50);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
 				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+
+			// The refused frame is re-served and published, once, in sequence.
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
+			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
+		});
+	});
+}, 20_000);
+
+test("an ambiguously acknowledged Slack session-ready publication is not posted twice", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			provider.acceptThenThrowPosts = 1;
+			host.emitSessionReady();
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(100);
+
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC session ready."]);
+			expect(
+				provider.postAttempts.filter(post => post.text === "GJC session ready.").map(post => post.clientMsgId),
+			).toEqual([provider.posts[0]?.clientMsgId, provider.posts[0]?.clientMsgId]);
+		});
+	});
+}, 20_000);
+test("an ambiguously acknowledged Discord session-ready publication is not posted twice", async () => {
+	await withAttachedDiscordRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			provider.acceptThenThrowPosts = 1;
+			host.emitSessionReady();
+			await awaitDiscordPosts(provider, 1);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(100);
+
+			expect(provider.posts.map(post => post.content)).toEqual(["GJC session ready."]);
+			expect(provider.posts[0]?.nonce).toBeDefined();
+		});
+	});
+}, 20_000);
+test("an ambiguously acknowledged publication is not posted twice when reconciliation fails", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			provider.acceptThenThrowPosts = 1;
+			host.emit("two");
+			await awaitPosts(provider, 2);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(50);
+
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
+			expect(
+				provider.postAttempts.filter(post => post.text === "GJC notice\ntwo").map(post => post.clientMsgId),
+			).toEqual([provider.posts[1]?.clientMsgId, provider.posts[1]?.clientMsgId]);
+		});
+	});
+}, 20_000);
+test("a surface that refuses a frame for good concedes it instead of wedging the stream", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			// The surface is down for good. Holding the cursor below seq 2 forever would
+			// cost every later frame too, so the rounds are bounded: mirrors
+			// `DELIVERY_ATTEMPT_LIMIT`, one round live and two from a rebuild's replay.
+			provider.failPosts = Number.POSITIVE_INFINITY;
+			host.emit("two");
+			for (let round = 2; round <= 3; round++) {
+				await awaitRefusals(provider, round - 1);
+				await Bun.sleep(50);
+				reconcile();
+				host.accept(await awaitSocket(round));
+			}
+			await awaitRefusals(provider, 3);
+			await Bun.sleep(50);
+
+			// Every round re-served that same sequence from the same cursor, and the last
+			// one conceded it rather than asking again.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+			expect(warnings.filter(line => line.includes("conceded seq 2"))).toHaveLength(1);
+
+			// The stream is not wedged: it resumes above the conceded frame on the socket
+			// it already holds, with no further rebuild.
+			provider.failPosts = 0;
+			host.emit("three");
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nthree"]);
+			expect(FakeWebSocket.instances).toHaveLength(3);
+		});
+	});
+}, 20_000);
+
+test("a rolled endpoint's first frame gets its own delivery budget, not the previous generation's", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile, supersede }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			// Two rounds spent on this generation's seq 1 — one short of conceding it.
+			provider.failPosts = 2;
+			host.emit("old one");
+			await awaitRefusals(provider, 1);
+			await Bun.sleep(50);
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitRefusals(provider, 2);
+			await Bun.sleep(50);
+
+			// The endpoint rolls, so the replacement attachment opens a fresh sequence space
+			// whose seq 1 is a different frame. The rounds the old stream spent buy it
+			// nothing: charging them here would concede a frame refused exactly once.
+			await supersede();
+			host.roll();
+			provider.failPosts = 1;
+			reconcile();
+			host.accept(await awaitSocket(3));
+			await awaitReplayRequests(host, 3);
+			host.emit("new one");
+			await awaitRefusals(provider, 3);
+			await Bun.sleep(50);
+			expect(warnings.filter(line => line.includes("conceded seq"))).toEqual([]);
+			expect(warnings).toContain(
+				`chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`,
+			);
+
+			// Refused once, so it still sits above the cursor and the rebuild re-serves it.
+			reconcile();
+			host.accept(await awaitSocket(4));
+			await awaitPosts(provider, 1);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\nnew one"]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
 			]);
 		});
 	});

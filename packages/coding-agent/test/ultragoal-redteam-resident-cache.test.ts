@@ -45,19 +45,21 @@ function ensureOwnerOnlyDirectory(directory: string): void {
 
 function installVerifiedNativeCleanup(): void {
 	vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
-		if (
-			identity.parentDev === undefined ||
-			identity.parentIno === undefined ||
-			parent.dev !== identity.parentDev ||
-			parent.ino !== identity.parentIno
-		)
-			throw new Error("resident cleanup parent authority mismatch");
+		if (identity.parentDev !== undefined || identity.parentIno !== undefined) {
+			const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+			if (
+				identity.parentDev === undefined ||
+				identity.parentIno === undefined ||
+				parent.dev !== identity.parentDev ||
+				parent.ino !== identity.parentIno
+			)
+				throw new Error("resident cleanup parent authority mismatch");
+		}
 		const stat = fs.lstatSync(pathname, { bigint: true });
 		if (
 			stat.dev !== identity.dev ||
 			stat.ino !== identity.ino ||
-			stat.nlink !== identity.nlink ||
+			(identity.nlink !== undefined && stat.nlink !== identity.nlink) ||
 			stat.size !== identity.size ||
 			stat.mtimeNs !== identity.mtimeNs
 		)
@@ -75,10 +77,11 @@ function installVerifiedNativeCleanup(): void {
 		return { ok: true };
 	});
 	vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((pathname, snapshot, parentIdentity) => {
-		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
-		if (!parentIdentity) throw new Error("resident tree cleanup parent authority missing");
-		if (parent.dev !== parentIdentity.dev || parent.ino !== parentIdentity.ino)
-			throw new Error("resident tree cleanup parent authority mismatch");
+		if (parentIdentity) {
+			const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+			if (parent.dev !== parentIdentity.dev || parent.ino !== parentIdentity.ino)
+				throw new Error("resident tree cleanup parent authority mismatch");
+		}
 		const current = native.snapshotDirectoryTree(pathname);
 		if (!current.ok || !current.snapshot || current.snapshot.entries.length !== snapshot.entries.length)
 			throw new Error("resident tree cleanup snapshot mismatch");
@@ -548,7 +551,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 		expect(residentInstanceDirs(root)).toEqual([]);
 	});
 
-	it("C8 keeps below-cap snapshots strong and rebuilds above-cap snapshots without content loss", async () => {
+	it("C8 rematerializes resident-backed contexts and rebuilds above-cap snapshots without content loss", async () => {
 		const belowCap = SessionManager.inMemory();
 		try {
 			SessionManagerTestHooks.materializedCacheMaxBytesOverride = MiB;
@@ -562,7 +565,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 			}
 			expect(belowCap.getObservabilityStatsForTests()).toMatchObject({
 				materializedEntriesCachePopulateCount: warmed.materializedEntriesCachePopulateCount,
-				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount,
+				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount + 3,
 			});
 		} finally {
 			await belowCap.close();

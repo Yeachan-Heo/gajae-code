@@ -870,6 +870,25 @@ describe("AgentSession durable default model selection", () => {
 		}
 	});
 
+	it("rejects a staged selection after the active leaf changes", async () => {
+		const manager = SessionManager.create(tempRoot, path.join(tempRoot, "sessions"));
+		const firstId = manager.appendMessage({ role: "user", content: "A", timestamp: Date.now() });
+		manager.appendMessage({ role: "user", content: "B", timestamp: Date.now() });
+		await manager.rewriteEntries();
+
+		try {
+			const stage = await manager.stageDefaultModelSelection("target-provider/reasoning", Effort.High, {
+				appendThinkingLevel: true,
+			});
+			manager.branch(firstId);
+
+			expect(manager.promoteDefaultModelSelection(stage)).toEqual({ kind: "not_promoted" });
+			expect(manager.getLeafId()).toBe(firstId);
+			await manager.discardDefaultModelSelectionStage(stage);
+		} finally {
+			await manager.close();
+		}
+	});
 	it("rejects a staged persisted selection after a rename and preserves the renamed header", async () => {
 		// Given
 		const manager = SessionManager.create(tempRoot, path.join(tempRoot, "sessions"));

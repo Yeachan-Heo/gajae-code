@@ -756,6 +756,7 @@ export type RawArgumentRejectionCode =
 	| "ask-deep-interview-metadata-requires-deep-interview-gate"
 	| "todo-write-unknown-root-key"
 	| "todo-write-unknown-op-entry-key"
+	| "todo-write-unknown-op-value"
 	| "todo-write-done-drop-requires-target"
 	| "todo-write-unknown-init-entry-key";
 
@@ -766,7 +767,7 @@ export type RawArgumentRejectionCode =
  * differ from the failed call.
  */
 export interface RawArgumentRejectionDetail {
-	/** Offending keys, in payload order. */
+	/** Offending keys, or the offending value, in payload order. */
 	readonly rejectedKeys?: readonly string[];
 	/**
 	 * Correction for a rejected key whose replacement is exact and
@@ -886,6 +887,27 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 * HTTPS origin automatically; known non-OpenAI providers remain excluded.
 	 */
 	supportsResponsesSessionAffinity?: boolean;
+	/**
+	 * Tool names the provider reserves for its own built-ins and refuses to
+	 * accept as custom function declarations. A colliding tool is **dropped**
+	 * from the declared tools array rather than renamed: a renamed function
+	 * tool would come back as a `function_call` under the wire alias, and that
+	 * path does not populate `Tool.customWireName`, leaving the agent-loop
+	 * dispatcher unable to route it — trading a loud 400 for a silent
+	 * unresolvable call. Dropping the declaration is intentionally a loss of
+	 * capability, leaving the agent in the same state as any provider that
+	 * simply has no such tool. The filter preserves declaration order and does
+	 * not mutate the caller's array.
+	 *
+	 * Without this, one reserved name rejects the ENTIRE tools array with a
+	 * single 400 and no tokens ever stream — every agent carrying that tool
+	 * fails 100% of the time on that provider.
+	 *
+	 * Resolution precedence: an explicit array (including `[]`) on the model's
+	 * `compat` replaces the built-in provider default, so `[]` opts a reserved
+	 * provider out of the drop entirely.
+	 */
+	reservedToolNames?: string[];
 	/**
 	 * Whether the provider's chat-completions endpoint accepts multiple
 	 * leading `system`/`developer` messages. When false, ordered system

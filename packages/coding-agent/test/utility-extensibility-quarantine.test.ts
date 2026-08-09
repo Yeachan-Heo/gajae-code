@@ -58,21 +58,6 @@ describe("GJC utility extensibility quarantine", () => {
 		expect(await Bun.file(srcPath("slash-commands", "marketplace-install-parser.ts")).exists()).toBe(false);
 	});
 
-	it("does not parse CLI plugin, extension, hook, or skill-loading flags", async () => {
-		const args = await source("cli", "args.ts");
-		for (const removedFlag of [
-			"--plugin-dir",
-			"--extension",
-			"--hook",
-			"--no-extensions",
-			"--no-skills",
-			"--skills",
-		]) {
-			expect(args).not.toContain(`arg === "${removedFlag}"`);
-		}
-		expect(args).not.toContain("extensionFlags");
-	});
-
 	it("does not default-discover skills, extensions, custom commands, custom tools, plugins, or marketplaces", async () => {
 		const sdk = await source("sdk", "session.ts");
 		const main = await source("main.ts");

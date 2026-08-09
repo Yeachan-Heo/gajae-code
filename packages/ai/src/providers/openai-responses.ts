@@ -860,10 +860,37 @@ function isForcedOpenAIResponsesToolChoice(choice: unknown): boolean {
 	return !!choice && choice !== "none" && choice !== "auto";
 }
 
+/**
+ * Tool names an OpenAI-compatible endpoint reserves for its own built-ins and
+ * refuses as custom function declarations.
+ *
+ * OpenCode Zen/Go reject `web_search` with
+ * `invalid tools in request: custom function name "web_search" is reserved`.
+ * The rejection is request-scoped: one colliding declaration fails the WHOLE
+ * tools array before any token streams, so every agent carrying that tool is
+ * permanently broken on the provider rather than losing a single capability.
+ *
+ * The collision is dropped rather than renamed. A renamed function tool would
+ * come back as a `function_call` under the wire alias, and that path does not
+ * populate `Tool.customWireName`, so the agent-loop dispatcher could not route
+ * it — trading a loud 400 for a silent unresolvable call. Dropping leaves the
+ * agent in the same state as any provider that simply has no web search.
+ */
+const PROVIDER_RESERVED_TOOL_NAMES: Record<string, readonly string[]> = {
+	"opencode-go": ["web_search"],
+	"opencode-zen": ["web_search"],
+};
+
+/** @internal Exported for tests. */
+export function resolveReservedToolNames(model: Model<"openai-responses">): readonly string[] {
+	return model.compat?.reservedToolNames ?? PROVIDER_RESERVED_TOOL_NAMES[model.provider] ?? [];
+}
 /** @internal Exported for tests. */
 export function convertTools(tools: Tool[], strictMode: boolean, model: Model<"openai-responses">): OpenAITool[] {
 	const allowFreeform = supportsFreeformApplyPatch(model);
-	const payloads = tools.map(tool => {
+	const reserved = resolveReservedToolNames(model);
+	const declarable = reserved.length === 0 ? tools : tools.filter(tool => !reserved.includes(tool.name));
+	const payloads = declarable.map(tool => {
 		if (allowFreeform && tool.customFormat) {
 			return {
 				type: "custom",

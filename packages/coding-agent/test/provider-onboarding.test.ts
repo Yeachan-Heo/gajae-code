@@ -26,6 +26,9 @@ const originalAgentDir = getAgentDir();
 
 async function tempModelsPath(): Promise<string> {
 	tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-onboarding-"));
+	// Literal `apiKey` values route through AuthStorage at getAgentDbPath(); without
+	// this the tests write real credential rows into the developer's ~/.gjc/agent/agent.db.
+	setAgentDir(path.join(tempRoot, "agent"));
 	return path.join(tempRoot, "models.yml");
 }
 

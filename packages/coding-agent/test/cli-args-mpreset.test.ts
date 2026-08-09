@@ -168,13 +168,12 @@ describe("MCP config CLI args", () => {
 		}
 	});
 
-	test("rejects non-standalone config routes during parsing", () => {
-		const rejectedArgs = [
-			["--mcp-config", "/tmp/gjc-mcp.json", "--mode", "acp"],
+	test("defers ACP config validation to the ACP startup owner", () => {
+		expect(parseArgs(["--mcp-config", "/tmp/gjc-mcp.json", "--mode", "acp"]).mcpConfig).toBe("/tmp/gjc-mcp.json");
+		for (const args of [
 			["--mcp-config", "/tmp/gjc-mcp.json", "--export", "/tmp/session.jsonl"],
 			["--mcp-config", "/tmp/gjc-mcp.json", "--list-models"],
-		];
-		for (const args of rejectedArgs) {
+		]) {
 			expect(() => parseArgs(args)).toThrow(CliParseError);
 		}
 	});

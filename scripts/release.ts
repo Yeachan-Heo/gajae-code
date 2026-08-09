@@ -314,6 +314,33 @@ async function updateChangelogsForRelease(version: string): Promise<void> {
 	}
 }
 
+export function releasedBunLockContent(content: string, previousVersion: string, version: string): string {
+	const packagesMarker = '\n  "packages": {';
+	const packagesIndex = content.indexOf(packagesMarker);
+	if (packagesIndex < 0) throw new Error('bun.lock is missing its top-level "packages" section');
+
+	const prefix = content.slice(0, packagesIndex);
+	const suffix = content.slice(packagesIndex);
+	const previousWorkspaceVersion = `"version": "${previousVersion}"`;
+	const workspaceVersionCount = prefix.split(previousWorkspaceVersion).length - 1;
+	if (workspaceVersionCount === 0) {
+		throw new Error(`bun.lock has no workspace package versions matching ${previousVersion}`);
+	}
+
+	let catalogVersionCount = 0;
+	const updatedPrefix = prefix
+		.replaceAll(previousWorkspaceVersion, `"version": "${version}"`)
+		.replace(/("@gajae-code\/[^"]+":\s*)"([^"]+)"/g, (match, key: string, currentVersion: string) => {
+			if (currentVersion !== previousVersion) return match;
+			catalogVersionCount++;
+			return `${key}"${version}"`;
+		});
+	if (catalogVersionCount === 0) {
+		throw new Error(`bun.lock has no @gajae-code catalog versions matching ${previousVersion}`);
+	}
+	return `${updatedPrefix}${suffix}`;
+}
+
 // =============================================================================
 // Subcommands
 // =============================================================================
@@ -494,15 +521,22 @@ async function cmdRelease(version: string): Promise<void> {
 
 	// Filter out private packages
 	const publicPkgPaths: string[] = [];
+	const publicPackageVersions = new Set<string>();
 	for (const pkgPath of pkgJsonPaths) {
 		const pkgJson = await Bun.file(pkgPath).json();
 		if (pkgJson.private) {
 			console.log(`  Skipping ${pkgJson.name} (private)`);
 			continue;
 		}
+		if (typeof pkgJson.version !== "string") throw new Error(`${pkgPath} is missing a string version`);
+		publicPackageVersions.add(pkgJson.version);
 		publicPkgPaths.push(pkgPath);
 	}
-
+	if (publicPackageVersions.size !== 1) {
+		throw new Error(`Public packages must share one pre-release version, received ${[...publicPackageVersions].join(", ")}`);
+	}
+	const previousVersion = publicPackageVersions.values().next().value;
+	if (previousVersion === undefined) throw new Error("No public packages found for release");
 	await $`sd '"version": "[^"]+"' ${`"version": "${version}"`} ${publicPkgPaths}`;
 
 	// Verify
@@ -575,10 +609,13 @@ async function cmdRelease(version: string): Promise<void> {
 	}
 	console.log(`  sentinel: ${sentinelName}\n`);
 
-	// 4. Regenerate lockfiles
-	console.log("Regenerating lockfiles...");
-	await $`rm -f bun.lock`;
-	await $`bun install`;
+	// 4. Update lockfiles without re-resolving unrelated dependencies. A stable
+	// release must preserve the exact third-party graph that passed review; only
+	// owned workspace versions and their root catalog pins move here.
+	console.log("Updating lockfiles...");
+	const bunLockContent = await Bun.file("bun.lock").text();
+	await Bun.write("bun.lock", releasedBunLockContent(bunLockContent, previousVersion, version));
+	await $`bun install --frozen-lockfile`;
 	// `cargo update --workspace` bumps only the workspace-member versions in
 	// Cargo.lock to match the freshly bumped Cargo.toml, keeping every resolved
 	// registry dependency exactly as tested. This intentionally does NOT do a

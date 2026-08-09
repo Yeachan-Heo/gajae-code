@@ -12,6 +12,7 @@ export type ResolvedOpenAICompat = Required<
 		| "toolStrictMode"
 		| "toolChoiceSupport"
 		| "supportsResponsesSessionAffinity"
+		| "reservedToolNames"
 	>
 > & {
 	openRouterRouting?: OpenAICompat["openRouterRouting"];

@@ -22,7 +22,6 @@ import * as agentsModule from "@gajae-code/coding-agent/task/agents";
 import * as discoveryModule from "@gajae-code/coding-agent/task/discovery";
 import * as eventBusModule from "@gajae-code/coding-agent/utils/event-bus";
 import { Snowflake } from "@gajae-code/utils";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
 function createUsage(): Usage {
 	return {
@@ -93,6 +92,26 @@ function createStaleAssistantMessage(
 		providerPayload: createStaleAssistantHistoryPayload(provider),
 		timestamp: Date.now(),
 	};
+}
+
+function rewritePersistedAssistantsAsStale(sessionFile: string, assistantTexts: readonly string[]): void {
+	let assistantIndex = 0;
+	const rewritten = fs
+		.readFileSync(sessionFile, "utf8")
+		.split("\n")
+		.map(line => {
+			if (!line) return line;
+			const record = JSON.parse(line) as SessionEntry;
+			if (record.type !== "message" || record.message.role !== "assistant") return line;
+			const assistantText = assistantTexts[assistantIndex++];
+			if (assistantText === undefined) throw new Error("Unexpected persisted assistant message");
+			record.message = { ...createStaleAssistantMessage(assistantText), timestamp: record.message.timestamp };
+			return JSON.stringify(record);
+		})
+		.join("\n");
+	if (assistantIndex !== assistantTexts.length)
+		throw new Error("Expected every stale assistant fixture to be persisted");
+	fs.writeFileSync(sessionFile, rewritten);
 }
 
 function isSessionMessageEntry(entry: SessionEntry): entry is SessionMessageEntry {
@@ -314,7 +333,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		await openedSessionManager.close();
 	});
 
-	it("batches managed persistence while sanitizing multiple stale Responses-family assistant messages on open", async () => {
+	it("sanitizes multiple stale managed assistants in memory without rewriting on open", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-managed-open-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const assistantTexts = ["First stale managed assistant", "Second stale managed assistant"];
@@ -329,8 +348,8 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			throw new Error("Expected persisted managed session file");
 		}
 		await persistedSessionManager.close();
+		rewritePersistedAssistantsAsStale(sessionFile, assistantTexts);
 
-		const appendSync = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendSync");
 		let openedSessionManager: SessionManager | undefined;
 		try {
 			const opened = await SessionManager.open(sessionFile, destination);
@@ -345,8 +364,6 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				}
 				expectAssistantReplayMetadataSanitized(message);
 			}
-
-			expect(appendSync).toHaveBeenCalledTimes(1);
 			await opened.close();
 			openedSessionManager = undefined;
 
@@ -359,24 +376,17 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				}
 				expectAssistantReplayMetadataSanitized(message);
 			}
-			expect(appendSync).toHaveBeenCalledTimes(1);
 
-			const patchRecords = fs
-				.readFileSync(sessionFile, "utf8")
-				.split("\n")
-				.filter(record => record.includes('"type":"entry_patch"'));
-			expect(patchRecords).toHaveLength(assistantTexts.length);
-			expect(patchRecords.join("\n")).not.toContain("enc_stale");
-			expect(patchRecords.map(record => (JSON.parse(record) as { entryId?: string }).entryId)).toEqual(
-				persistedAssistantEntries.map(({ id }) => id),
-			);
+			const persistedText = fs.readFileSync(sessionFile, "utf8");
+			const patchRecords = persistedText.split("\n").filter(record => record.includes('"type":"entry_patch"'));
+			expect(persistedText).toContain("enc_stale");
+			expect(patchRecords).toHaveLength(0);
 		} finally {
 			await openedSessionManager?.close();
-			appendSync.mockRestore();
 		}
 	});
 
-	it("sanitizes a managed transcript larger than 20 MiB with one durable replacement", async () => {
+	it("sanitizes a managed transcript larger than 20 MiB in memory without rewriting on open", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-large-managed-open-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const assistantTexts = Array.from(
@@ -400,14 +410,13 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		if (!sessionFile) throw new Error("Expected managed destination session file");
 		await placeholderManager.close();
 		fs.copyFileSync(sourceFile, sessionFile);
+		rewritePersistedAssistantsAsStale(sessionFile, assistantTexts);
 		expect(fs.statSync(sessionFile).size).toBeGreaterThan(20 * 1024 * 1024);
 
-		const appendSync = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendSync");
 		let openedSessionManager: SessionManager | undefined;
 		try {
 			const opened = await SessionManager.open(sessionFile, destination);
 			openedSessionManager = opened;
-			expect(appendSync).toHaveBeenCalledTimes(1);
 
 			for (const assistantText of [assistantTexts[0]!, assistantTexts.at(-1)!]) {
 				const { message } = findPersistedMessageEntry(opened, "assistant", assistantText);
@@ -419,18 +428,16 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			openedSessionManager = undefined;
 			const reopened = await SessionManager.open(sessionFile, destination);
 			openedSessionManager = reopened;
-			expect(appendSync).toHaveBeenCalledTimes(1);
-			expect(
-				fs
-					.readFileSync(sessionFile, "utf8")
-					.split("\n")
-					.filter(record => record.includes('"type":"entry_patch"')),
-			).toHaveLength(assistantTexts.length);
+			const patchRecords = fs
+				.readFileSync(sessionFile, "utf8")
+				.split("\n")
+				.filter(record => record.includes('"type":"entry_patch"'));
+			expect(patchRecords).toHaveLength(0);
+			expect(fs.readFileSync(sessionFile, "utf8")).toContain("enc_stale");
 		} finally {
 			await openedSessionManager?.close();
-			appendSync.mockRestore();
 		}
-	}, 15_000);
+	}, 30_000);
 
 	it("sanitizes stale assistant replay metadata when forking a persisted session", async () => {
 		const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-source-${Snowflake.next()}-`));
@@ -603,7 +610,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		authStorages.push(childAuthStorage);
 
 		expect(child.sessionId).not.toBe(parent.sessionId);
+		// A fork owns a new transcript and provider transport/cache affinity. It
+		// inherits only the sanitized prompt seed, never the parent's session.
+		expect(child.agent.sessionId).toBe(child.sessionId);
 		expect(child.agent.providerSessionId).toBe(child.sessionId);
+		expect(child.agent.providerSessionId).not.toBe(parent.agent.providerSessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
 		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
@@ -913,6 +924,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				"task.forkContext.enabled": true,
 			}),
 			getSessionFile: () => parent.sessionManager.getSessionFile(),
+			getSessionId: () => parent.sessionId,
 			getSessionSpawns: () => "*",
 			model: parent.model,
 			buildForkContextSeed: (opts: Parameters<AgentSession["buildForkContextSeed"]>[0]) =>
@@ -951,12 +963,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(execChild).toBeDefined();
 		expect(archChild).toBeDefined();
 
+		const expectedIds = new Map([
+			["executor", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ExecFork"])],
+			["architect", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ArchFork"])],
+		]);
 		for (const child of [execChild!, archChild!]) {
 			expect(child.forkContextSeed).toBeDefined();
-			// Seeds carry conversation content only. TaskTool must not inject a
-			// provider identity: each child derives its own from its logical session
-			// so concurrent workers never share an upstream session owner.
-			expect(child.providerSessionId).toBeUndefined();
+			expect(child.providerSessionId).toBe(expectedIds.get(child.agentDisplayName!));
+			expect(child.providerSessionId).not.toBe(parent.sessionId);
 		}
 	});
 

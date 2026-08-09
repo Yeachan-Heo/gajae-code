@@ -2,7 +2,7 @@
  * Shared utilities for Google Generative AI and Google Cloud Code Assist providers.
  */
 
-import { extractHttpStatusFromError, readSseJson } from "@gajae-code/utils";
+import { extractHttpStatusFromError, readJsonl, readSseJson } from "@gajae-code/utils";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -914,13 +914,36 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				throw new Error("Google API returned an empty response body");
 			}
 
-			const googleStream = readSseJson<GenerateContentResponse>(response.body, options?.signal, event =>
-				options?.onSseEvent?.(
-					{ event: event.event, data: event.data, raw: [...event.raw] },
-					model,
-					options?.attemptScope,
-				),
-			);
+			const mediaType = (response.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase() ?? "";
+			const isJsonLines =
+				mediaType === "application/x-ndjson" ||
+				mediaType === "application/ndjson" ||
+				mediaType === "application/jsonl" ||
+				mediaType === "application/x-jsonl";
+			const rawEventObserver = options?.onSseEvent;
+			const googleStream = isJsonLines
+				? readJsonl<GenerateContentResponse>(
+						response.body,
+						options?.signal,
+						rawEventObserver
+							? raw => {
+									if (raw.trim().length === 0) return;
+									rawEventObserver({ event: null, data: raw, raw: [raw] }, model, options?.attemptScope);
+								}
+							: undefined,
+					)
+				: readSseJson<GenerateContentResponse>(
+						response.body,
+						options?.signal,
+						rawEventObserver
+							? event =>
+									rawEventObserver(
+										{ event: event.event, data: event.data, raw: [...event.raw] },
+										model,
+										options?.attemptScope,
+									)
+							: undefined,
+					);
 
 			stream.push({ type: "start", partial: output });
 			await consumeGoogleStream({

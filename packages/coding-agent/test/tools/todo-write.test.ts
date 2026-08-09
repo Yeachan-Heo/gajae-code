@@ -281,7 +281,7 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 			validateToolArguments(tool, call({ ops: [{ op: "note", note: "why this plan" }] })),
 		);
 		expect(message).toBe(
-			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "note" (note is an op, not a key; note operations require both "task" and "text")`,
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "note" (ops[0]; note is an op, not a key; note operations require both "task" and "text")`,
 		);
 		expect(message).not.toContain('use { op: "note", text: "..." }');
 	});
@@ -299,7 +299,7 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x", bogusOpKey: "y" }] })),
 		);
 		expect(message).toBe(
-			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "bogusOpKey"`,
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "bogusOpKey" (ops[0])`,
 		);
 	});
 
@@ -308,7 +308,7 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x", alpha: 1, beta: 2 }] })),
 		);
 		expect(message).toBe(
-			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected keys: "alpha", "beta"`,
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected keys: "alpha", "beta" (ops[0])`,
 		);
 	});
 
@@ -332,7 +332,7 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 			),
 		);
 		expect(message).toBe(
-			`${REJECTED}; todo_write init list entries accept only phase and items keys; rejected key: "bogusInitKey"`,
+			`${REJECTED}; todo_write init list entries accept only phase and items keys; rejected key: "bogusInitKey" (ops[0].list[0])`,
 		);
 	});
 
@@ -373,6 +373,70 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		expect(() =>
 			validateToolArguments(tool, call({ _i: "Tracking progress", ops: [{ op: "done", task: "x" }], stray: 1 })),
 		).toThrow("todo_write root accepts only an ops array of operation entries");
+	});
+
+	it("names the legal operation vocabulary when an entry invents an op", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "retitle", task: "x" }] })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries require a known op value; rejected key: "retitle" (ops[0]; op must be one of: init, start, done, rm, drop, append, note)`,
+		);
+	});
+
+	it("reports the invented op ahead of the unknown key the same entry carries", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "retitle", task: "x", newTask: "y" }] })),
+		);
+		expect(message).toContain("todo_write operation entries require a known op value");
+		expect(message).toContain("op must be one of: init, start, done, rm, drop, append, note");
+		expect(message).not.toContain("accept only op, list, task, phase, items, and text keys");
+	});
+
+	it("names the failing entry index so the surviving entries can be resubmitted", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(
+				tool,
+				call({
+					ops: [
+						{ op: "append", phase: "Work", items: ["ship it"] },
+						{ op: "done", task: "first" },
+						{ op: "done", task: "second" },
+						{ op: "done", task: "third" },
+						{ op: "retitle", task: "third", newTask: "fourth" },
+					],
+				}),
+			),
+		);
+		expect(message).toContain("ops[4]");
+		expect(message).not.toContain("ops[0]");
+		expect(message).not.toContain("ops[3]");
+	});
+
+	it("points the newTask correction at re-init instead of a rename op", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "start", task: "x", newTask: "y" }] })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "newTask" (ops[0]; there is no rename op; re-run init with the corrected list to rename a task)`,
+		);
+		expect(message).not.toContain("retitle");
+	});
+
+	it("routes the tasks key to the items key append actually takes", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "append", phase: "Work", tasks: ["ship it"] }] })),
+		);
+		expect(message).toContain('rejected key: "tasks" (ops[0]; tasks is not a key; append operations take "items")');
+	});
+
+	it("keeps complete and completed aliased to done instead of rejecting them as unknown ops", () => {
+		for (const op of ["complete", "completed"]) {
+			const parsed = validateToolArguments(tool, call({ ops: [{ op, task: "ship it" }] })) as {
+				ops: Array<{ op: string; task?: string }>;
+			};
+			expect(parsed.ops[0]).toEqual({ op: "done", task: "ship it" });
+		}
 	});
 });
 

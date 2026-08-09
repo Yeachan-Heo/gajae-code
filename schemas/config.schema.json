@@ -1600,6 +1600,25 @@
 			},
 			"additionalProperties": false
 		},
+		"sessionMemory": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"type": "string",
+					"enum": [
+						"off",
+						"shadow",
+						"enabled"
+					],
+					"default": "shadow"
+				},
+				"contextOverflowRecovery": {
+					"type": "boolean",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"edit": {
 			"type": "object",
 			"properties": {

@@ -6,6 +6,7 @@ import { TempDir } from "@gajae-code/utils";
 import type { Args } from "../src/cli/args";
 import { parseArgs } from "../src/cli/args";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
+import type { SettingPath } from "../src/config/settings-schema";
 import {
 	BARE_RESUME_CONFLICT_ERROR,
 	BARE_RESUME_INTERACTIVE_ERROR,
@@ -312,7 +313,7 @@ describe("explicit resume destination authority", () => {
 	it("binds both direct resume path forms to the supplied explicit session directory", async () => {
 		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
 		const activeSettings = {
-			get: () => "copy-retain",
+			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "enabled" : "copy-retain"),
 			getAgentDir: () => "/managed-agent",
 		} as unknown as Settings;
 		for (const resume of ["/source/session.jsonl", "session.jsonl"]) {
@@ -328,6 +329,7 @@ describe("explicit resume destination authority", () => {
 			expect.objectContaining({ kind: "explicit", directory: "/explicit-destination" }),
 			undefined,
 			"copy-retain",
+			"enabled",
 		);
 		expect(open).toHaveBeenNthCalledWith(
 			2,
@@ -335,13 +337,14 @@ describe("explicit resume destination authority", () => {
 			expect.objectContaining({ kind: "explicit", directory: "/explicit-destination" }),
 			undefined,
 			"copy-retain",
+			"enabled",
 		);
 	});
 
 	it("binds a direct resume path without --session-dir to its parent directory", async () => {
 		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
 		const activeSettings = {
-			get: () => "copy-retain",
+			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "off" : "copy-retain"),
 			getAgentDir: () => "/managed-agent",
 		} as unknown as Settings;
 
@@ -352,6 +355,7 @@ describe("explicit resume destination authority", () => {
 			expect.objectContaining({ kind: "explicit", directory: "/source" }),
 			undefined,
 			"copy-retain",
+			"off",
 		);
 	});
 

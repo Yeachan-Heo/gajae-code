@@ -5,7 +5,7 @@ import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/ag
 import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
@@ -472,6 +472,45 @@ export class CommandController {
 			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
 			const settingLabel = setting === "auto" ? `${setting} (${provider ?? "?"})` : setting;
 			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
+		}
+		if (stats.sessionMemory) {
+			const memory = stats.sessionMemory;
+			const retirement = memory.coldRetirementActive ? theme.fg("success", "active") : theme.fg("dim", "inactive");
+			info += `\n${theme.bold("Session Memory")}\n`;
+			info += `${theme.fg("dim", "Cold Retirement:")} ${retirement}\n`;
+			info += `${theme.fg("dim", "Hot Region:")} ${formatBytes(memory.hotRegionBytes)}\n`;
+			info += `${theme.fg("dim", "Metadata:")} ${formatBytes(memory.metaDescriptorBytes)}\n`;
+			info += `${theme.fg("dim", "Accounted:")} ${formatBytes(memory.totalAccountedBytes)}\n`;
+			if (memory.coldIndexBytes > 0 || memory.coldIndexBlockCacheBytes > 0 || memory.coldEntryCacheBytes > 0) {
+				info += `${theme.fg("dim", "Cold Index/Caches:")} ${formatBytes(memory.coldIndexBytes)} / ${formatBytes(memory.coldIndexBlockCacheBytes)} / ${formatBytes(memory.coldEntryCacheBytes)}\n`;
+			}
+			if (memory.lazyReopenAttempted) {
+				const reopen = memory.lazyReopenSucceeded ? theme.fg("success", "exact") : theme.fg("warning", "fallback");
+				info += `${theme.fg("dim", "Lazy Reopen:")} ${reopen}\n`;
+			}
+			const fallbackReason = memory.retirementFallbackReason ?? memory.lazyReopenFallbackReason;
+			if (fallbackReason) info += `${theme.fg("dim", "Fallback Reason:")} ${fallbackReason}\n`;
+			if (memory.coldEntriesRetired > 0 || memory.coldEntriesReloaded > 0) {
+				info += `${theme.fg("dim", "Cold Retired/Reloaded:")} ${memory.coldEntriesRetired}/${memory.coldEntriesReloaded}\n`;
+			}
+			if (memory.rangeReadCount > 0 || memory.rangeReadGenerationMismatchCount > 0) {
+				info += `${theme.fg("dim", "Cold Range Reads:")} ${memory.rangeReadCount} (${memory.rangeReadGenerationMismatchCount} mismatched)\n`;
+			}
+			if (memory.sidecarRebuildCount > 0 || memory.transcriptGeneration > 0) {
+				info += `${theme.fg("dim", "Sidecar Rebuilds:")} ${memory.sidecarRebuildCount} (gen ${memory.transcriptGeneration})\n`;
+			}
+			if (memory.coldMutationPromotions > 0 || memory.hotOverflowTransitions > 0) {
+				info += `${theme.fg("dim", "Cold Promotions/Overflows:")} ${memory.coldMutationPromotions}/${memory.hotOverflowTransitions}\n`;
+			}
+			if (memory.labelDiskFallbackCount > 0) {
+				info += `${theme.fg("dim", "Label Disk Reads:")} ${memory.labelDiskFallbackCount}\n`;
+			}
+			if (memory.shadowParityCheckCount > 0) {
+				info += `${theme.fg("dim", "Shadow Parity:")} ${memory.shadowParityMismatchCount}/${memory.shadowParityCheckCount} mismatches\n`;
+			}
+			if (memory.autoDisabledReason) {
+				info += `${theme.fg("dim", "Auto-Disabled:")} ${theme.fg("warning", memory.autoDisabledReason)}\n`;
+			}
 		}
 		info += `${theme.bold("Tokens")}\n`;
 		info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;
