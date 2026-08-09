@@ -2953,24 +2953,40 @@ function hasMainVerticalPaneTopology(config: GjcTeamConfig, target: string): boo
 		{ stdout: "pipe", stderr: "pipe" },
 	);
 	if (result.exitCode !== 0) return false;
-	const panes = result.stdout
-		.toString()
-		.trim()
-		.split("\n")
-		.map(line =>
-			line
-				.trim()
-				.split(/\s+/)
-				.map(value => Number.parseInt(value, 10)),
-		)
-		.filter(
-			(values): values is [number, number, number, number] =>
-				values.length === 4 && values.every(Number.isSafeInteger),
-		);
-	if (panes.length < 2) return false;
+	const lines = result.stdout.toString().trim().split("\n");
+	const panes = lines.map(line =>
+		line
+			.trim()
+			.split(/\s+/)
+			.map(value => Number.parseInt(value, 10)),
+	);
+	if (
+		panes.length < 2 ||
+		panes.some(values => values.length !== 4 || values.some(value => !Number.isSafeInteger(value) || value < 0))
+	)
+		return false;
+	const geometry = panes as [number, number, number, number][];
+	if (geometry.some(([, , width, height]) => width === 0 || height === 0)) return false;
+	const right = Math.max(...geometry.map(([left, , width]) => left + width));
+	const bottom = Math.max(...geometry.map(([, top, , height]) => top + height));
+	const main = geometry.filter(
+		([left, top, width, height]) => left === 0 && top === 0 && height === bottom && width < right,
+	);
+	if (main.length !== 1) return false;
+	const mainRight = main[0]![0] + main[0]![2];
+	const stack = geometry.filter(pane => pane !== main[0]);
+	const stackLeft = stack[0]![0];
+	if (
+		stack.some(([left, , width]) => left !== stackLeft || left + width !== right) ||
+		stackLeft - mainRight < 0 ||
+		stackLeft - mainRight > 1
+	)
+		return false;
+	const ordered = [...stack].sort((a, b) => a[1] - b[1]);
 	return (
-		panes.some(([left, top, width, height]) => left === 0 && top === 0 && width > 0 && height > 0) &&
-		panes.some(([left, _top, width, height]) => left > 0 && width > 0 && height > 0)
+		ordered[0]![1] === 0 &&
+		ordered.every((pane, index) => index === 0 || pane[1] === ordered[index - 1]![1] + ordered[index - 1]![3]) &&
+		ordered.at(-1)![1] + ordered.at(-1)![3] === bottom
 	);
 }
 
