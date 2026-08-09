@@ -503,6 +503,85 @@ describe("ACP transcript replay degradation", () => {
 		expect(reported).not.toContain("tool-2");
 		for (const toolCallId of pendingToolCalls(replayed)) expect(reported).toContain(toolCallId);
 	});
+
+	// A refused close must not take the session record down before the calls behind it have
+	// been attempted: the cleanup used to publish through `#publishSessionUpdate`, which fails
+	// the session on the first rejected frame and left every later close a silent no-op (#4063).
+	it("closes the calls behind a refused mid-replay close and names the one it could not close", async () => {
+		const replayed = await loadReplayedSession(
+			[
+				{
+					id: "assistant-1",
+					role: "assistant",
+					textSummary: "Reading",
+					body: "Reading",
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "read", arguments: {} },
+						{ type: "toolCall", id: "tool-2", name: "read", arguments: {} },
+					],
+				},
+				{ id: "toolresult-1", role: "toolResult", toolCallId: "tool-1", textSummary: "Body lost" },
+			],
+			true,
+			notification => terminalToolCallId(notification) === "tool-1",
+		);
+
+		// Every published start is attempted, not only the ones ahead of the refused close.
+		expect([...new Set(attempted.map(terminalToolCallId).filter(id => id !== undefined))]).toEqual([
+			"tool-1",
+			"tool-2",
+		]);
+		// tool-2 queued behind the refusal still reaches a terminal status on the client.
+		expect(toolCallStates(replayed)).toEqual([
+			"tool_call:tool-1:pending",
+			"tool_call:tool-2:pending",
+			"tool_call_update:tool-2:failed",
+		]);
+		// tool-1 stayed in `replayTools` because its close was never accepted, so the failure
+		// `session/load` reports names it instead of dropping it on the attempt.
+		expect(pendingToolCalls(replayed)).toEqual(["tool-1"]);
+		const reported = String((loadRejection as Error).message);
+		expect(reported).toContain("ACP transcript replay could not close published tool calls: tool-1");
+		for (const toolCallId of pendingToolCalls(replayed)) expect(reported).toContain(toolCallId);
+		expect(skipBoundaries(replayed)).toEqual([{ count: 3, reason: "transcript_body_unavailable" }]);
+	});
+
+	// Same invariant on the other mid-replay close: a result row that can be read but names
+	// nothing, whose start is equally nameless (#4063).
+	it("closes the calls behind a refused close of an unnameable tool call and names it", async () => {
+		const replayed = await loadReplayedSession(
+			[
+				{
+					id: "assistant-1",
+					role: "assistant",
+					textSummary: "Reading",
+					body: "Reading",
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "", arguments: {} },
+						{ type: "toolCall", id: "tool-2", name: "read", arguments: {} },
+					],
+				},
+				{ id: "toolresult-1", role: "toolResult", toolCallId: "tool-1", textSummary: "done", body: "done" },
+			],
+			true,
+			notification => terminalToolCallId(notification) === "tool-1",
+		);
+
+		expect([...new Set(attempted.map(terminalToolCallId).filter(id => id !== undefined))]).toEqual([
+			"tool-1",
+			"tool-2",
+		]);
+		expect(toolCallStates(replayed)).toEqual([
+			"tool_call:tool-1:pending",
+			"tool_call:tool-2:pending",
+			"tool_call_update:tool-2:failed",
+		]);
+		expect(pendingToolCalls(replayed)).toEqual(["tool-1"]);
+		const reported = String((loadRejection as Error).message);
+		expect(reported).toContain("ACP transcript replay could not close published tool calls: tool-1");
+		for (const toolCallId of pendingToolCalls(replayed)) expect(reported).toContain(toolCallId);
+		expect(skipBoundaries(replayed)).toEqual([{ count: 3, reason: "transcript_tool_call_unavailable" }]);
+	});
 });
 
 describe("transcriptReplayContent", () => {
