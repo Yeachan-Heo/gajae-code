@@ -356,27 +356,27 @@ export function locatePastedImageReferenceAroundCursor(
 	if (!Number.isInteger(cursorCol) || cursorCol < 0 || cursorCol > line.length) return null;
 
 	const placeholderPattern = /\[image ([1-9]\d*)\]/g;
-	for (const match of line.matchAll(placeholderPattern)) {
+	while (true) {
+		const match = placeholderPattern.exec(line);
+		if (!match) return null;
+
 		const startCol = match.index;
 		const placeholder = match[0];
 		const imageIndex = Number.parseInt(match[1] ?? "", 10);
-		if (startCol === undefined || !Number.isSafeInteger(imageIndex)) continue;
+		if (!Number.isSafeInteger(imageIndex)) continue;
 
 		const placeholderEnd = startCol + placeholder.length;
 		const sourcePrefix = " source=";
 		if (line.startsWith(sourcePrefix, placeholderEnd)) {
 			const fullEnd = findJsonStringEnd(line, placeholderEnd + sourcePrefix.length);
-			if (fullEnd === null) {
-				if (cursorCol === placeholderEnd) return null;
-				continue;
-			}
+			if (fullEnd === null) return null;
 			if (cursorCol === placeholderEnd || cursorCol === fullEnd) {
 				return { imageIndex, startCol, endCol: fullEnd };
 			}
+			placeholderPattern.lastIndex = fullEnd;
 			continue;
 		}
 
 		if (cursorCol === placeholderEnd) return { imageIndex, startCol, endCol: placeholderEnd };
 	}
-	return null;
 }

@@ -766,6 +766,7 @@ export class InputController {
 		// Tab on an empty composer accepts the pending ghost-text prompt suggestion.
 		this.ctx.editor.onTab = (text: string) => this.ctx.promptSuggestion?.tryAcceptOnTab(text) === true;
 
+		this.ctx.editor.onUndo = text => this.#restorePendingImagesAfterPlaceholderUndo(text);
 		this.ctx.editor.onChange = (text: string) => {
 			this.#resetEscapeGestures();
 			this.ctx.promptSuggestion?.notifyEditorChanged(text);
@@ -776,7 +777,6 @@ export class InputController {
 			this.ctx.isBashMode = trimmed.startsWith("!");
 			this.ctx.isBashNoContext = trimmed.startsWith("!!");
 			this.ctx.isPythonMode = trimmed.startsWith("$") && !trimmed.startsWith("${");
-			this.#restorePendingImagesAfterPlaceholderUndo(text);
 			this.#clearPendingImagesIfPlaceholdersRemoved(text);
 			if (
 				wasBashMode !== this.ctx.isBashMode ||

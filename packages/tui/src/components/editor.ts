@@ -489,6 +489,7 @@ export class Editor implements Component, Focusable {
 	onSubmit?: (text: string) => void;
 	onAltEnter?: (text: string) => void;
 	onChange?: (text: string) => void;
+	onUndo?: (text: string) => void;
 	onAutocompleteCancel?: () => void;
 	onTabDeclined?: (text: string) => void;
 	/**
@@ -2337,6 +2338,7 @@ export class Editor implements Component, Focusable {
 		this.#preferredVisualCol = null;
 		Object.assign(this.#state, snapshot);
 		this.#bumpDocumentVersion();
+		this.onUndo?.(this.getText());
 
 		if (this.onChange) {
 			this.onChange(this.getText());

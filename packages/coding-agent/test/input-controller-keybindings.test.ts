@@ -854,6 +854,29 @@ describe("InputController keybinding setup", () => {
 			images: [image],
 		});
 	});
+	it("restores an attachment after undoing an intervening edit and the placeholder deletion", async () => {
+		const { InputController, ctx } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "image",
+			mimeType: "image/png",
+		};
+		const editor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = editor;
+		ctx.pendingImages = [image];
+		editor.setText("describe [image 1]");
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+
+		editor.handleInput("\x7f");
+		editor.insertText("x");
+		editor.handleInput("\x1b[45;5u");
+		editor.handleInput("\x1b[45;5u");
+
+		expect(editor.getText()).toBe("describe [image 1]");
+		expect(ctx.pendingImages).toEqual([image]);
+	});
 	it.each([
 		["at the reference end", false],
 		["immediately after the placeholder", true],

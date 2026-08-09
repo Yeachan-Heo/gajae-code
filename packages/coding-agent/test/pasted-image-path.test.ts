@@ -221,5 +221,17 @@ describe("locatePastedImageReferenceAroundCursor", () => {
 		});
 		expect(locatePastedImageReferenceAroundCursor('[image 3] source="unterminated', "[image 3]".length)).toBeNull();
 		expect(locatePastedImageReferenceAroundCursor('[image 3] source="/tmp/a.png"', 1)).toBeNull();
+		expect(
+			locatePastedImageReferenceAroundCursor(
+				'[image 3] source="/tmp/[image 1].png"',
+				'[image 3] source="/tmp/[image 1]'.length,
+			),
+		).toBeNull();
+		expect(
+			locatePastedImageReferenceAroundCursor(
+				'[image 3] source="/tmp/[image 1].png',
+				'[image 3] source="/tmp/[image 1]'.length,
+			),
+		).toBeNull();
 	});
 });
