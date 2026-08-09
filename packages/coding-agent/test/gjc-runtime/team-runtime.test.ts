@@ -175,6 +175,7 @@ if (command === "-V" || command === "--version") {
 } else if (command === "list-panes") {
 	if (config.paneLayout === "even-horizontal") console.log("0 0 120 20\n0 20 120 20");
 	else if (config.paneLayout === "misaligned-stack") console.log("0 0 59 40\n60 0 60 20\n61 20 59 20");
+	else if (config.paneLayout === "separated-stack") console.log("0 0 59 40\n60 0 60 19\n60 20 60 20");
 	else console.log("0 0 59 40\n60 0 60 40");
 } else if (command === "show-options" || command === "show-window-options") {
 	const name = args.at(-1);
@@ -275,7 +276,7 @@ async function createFakeTmuxBin(
 		commandName?: string;
 		versionOutput?: string;
 		windowLayout?: string;
-		paneLayout?: "main-vertical" | "even-horizontal" | "misaligned-stack";
+		paneLayout?: "main-vertical" | "even-horizontal" | "misaligned-stack" | "separated-stack";
 	} = {},
 ): Promise<string> {
 	if (!fakeTmuxRunnerPath) throw new Error("fake tmux runner was not compiled");
@@ -1350,6 +1351,25 @@ describe("native gjc team runtime", () => {
 				},
 			}),
 		).rejects.toThrow("tmux_layout_postproof_failed");
+	});
+
+	it("accepts a multi-pane right stack with a tmux row separator", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { paneLayout: "separated-stack" });
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Accept separated layout stack",
+			teamName: "layout-separated-stack-proof-team",
+			cwd: cleanupRoot,
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			},
+		});
+		expect(snapshot.phase).toBe("running");
 	});
 
 	it("fails when a multi-pane right stack is not contiguous", async () => {
