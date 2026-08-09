@@ -1400,134 +1400,148 @@ async function runGcDiskArtifacts(input: {
 	surface: GcDiskSurfaceReport;
 	survivors: GcDiskTranscript[];
 	references: GcSessionReferences;
+	agentDir: string;
 	now: number;
 	prune: boolean;
 	errors: GcDiskError[];
 }): Promise<void> {
-	const { surface, survivors, references, now, prune, errors } = input;
-
-	// Recomputed over survivors: whichever transcript the sessions surface left
-	// newest in a project directory is the `--continue` target, and a resumed
-	// session still reads its own `artifact://` handles.
-	const newestPerDirectory = new Map<string, GcDiskTranscript>();
-	for (const transcript of survivors) {
-		const current = newestPerDirectory.get(transcript.directory);
-		if (!current || transcript.mtimeMs > current.mtimeMs) newestPerDirectory.set(transcript.directory, transcript);
-	}
-
-	const families = new Map<string, GcDiskFamilyUsage>();
-	let withheld = 0;
-	let withheldBytes = 0;
-
-	for (const transcript of survivors) {
-		const directory = transcript.path.slice(0, -".jsonl".length);
-		let entries: Dirent[];
-		try {
-			entries = await fsp.readdir(directory, { withFileTypes: true });
-		} catch (error) {
-			// No artifact directory is complete evidence: this session wrote none.
-			if (!isEnoent(error)) {
-				errors.push({ surface: "artifacts", scope: directory, message: gcDiskErrorText(error) });
-			}
-			continue;
-		}
-
-		const retained = !references.complete
-			? `reference_scan_incomplete: ${references.notes.join(", ")}`
-			: references.ids.has(transcript.sessionId)
-				? "referenced_by_live_surface"
-				: newestPerDirectory.get(transcript.directory) === transcript
-					? "most_recent_resumable_session"
-					: undefined;
-
-		for (const entry of entries) {
-			if (surface.records.length >= GC_DISK_MAX_WALK_ENTRIES) {
-				errors.push({ surface: "artifacts", scope: directory, message: "artifact_walk_capped" });
-				break;
-			}
-			const target = path.join(directory, entry.name);
-			const record: GcDiskRecord = {
-				surface: "artifacts",
-				id: `${transcript.sessionId}/${entry.name}`,
-				path: target,
-				bytes: 0,
-				age_days: 0,
-				action: "keep",
-				reason: "",
-			};
-
-			// A symlink is never followed and never removed: following one is exactly
-			// how a scope cleanup reaches bytes that are not GJC's to reclaim.
-			// Anything that is not a regular file is unverified state, not an artifact.
-			if (entry.isSymbolicLink() || !entry.isFile()) {
-				record.reason = `unverified_entry: ${entry.isSymbolicLink() ? "symlink" : "not_a_regular_file"}`;
-				record.withheld = true;
-				surface.records.push(record);
-				countGcDiskArtifactFamily(families, entry.name, 0);
-				withheld++;
-				continue;
+	const { surface, survivors, references, agentDir, now, prune, errors } = input;
+	const sessionIndex = new SessionIndex(agentDir);
+	try {
+		await sessionIndex.withLocked(async () => {
+			// Recomputed over survivors: whichever transcript the sessions surface left
+			// newest in a project directory is the `--continue` target, and a resumed
+			// session still reads its own `artifact://` handles.
+			const newestPerDirectory = new Map<string, GcDiskTranscript>();
+			for (const transcript of survivors) {
+				const current = newestPerDirectory.get(transcript.directory);
+				if (!current || transcript.mtimeMs > current.mtimeMs)
+					newestPerDirectory.set(transcript.directory, transcript);
 			}
 
-			let stat: Stats;
-			try {
-				stat = await fsp.lstat(target);
-			} catch (error) {
-				// Vanished mid-walk is the opposite of withheld: it is already gone.
-				if (isEnoent(error)) continue;
-				const message = gcDiskErrorText(error);
-				errors.push({ surface: "artifacts", scope: target, message });
-				record.reason = `entry_unverifiable: ${message}`;
-				record.error = message;
-				record.withheld = true;
-				surface.records.push(record);
-				countGcDiskArtifactFamily(families, entry.name, 0);
-				withheld++;
-				continue;
-			}
+			const families = new Map<string, GcDiskFamilyUsage>();
+			let withheld = 0;
+			let withheldBytes = 0;
 
-			record.bytes = stat.size;
-			record.age_days = gcDiskAgeDays(now, stat.mtimeMs);
-			surface.records.push(record);
-			countGcDiskArtifactFamily(families, entry.name, stat.size);
-
-			if (retained !== undefined) {
-				record.reason = retained;
-				if (!references.complete) {
-					record.withheld = true;
-					withheld++;
-					withheldBytes += record.bytes;
+			for (const transcript of survivors) {
+				const directory = transcript.path.slice(0, -".jsonl".length);
+				let entries: Dirent[];
+				try {
+					entries = await fsp.readdir(directory, { withFileTypes: true });
+				} catch (error) {
+					// No artifact directory is complete evidence: this session wrote none.
+					if (!isEnoent(error)) {
+						errors.push({ surface: "artifacts", scope: directory, message: gcDiskErrorText(error) });
+					}
+					continue;
 				}
-				continue;
-			}
-			if (now - stat.mtimeMs < GC_DISK_BLOB_GRACE_MS) {
-				record.reason = "within_write_grace_window";
-				continue;
-			}
-			record.action = "would_reclaim";
-			record.reason = "unreferenced_by_any_live_session";
 
-			if (!prune) continue;
-			const removal = await removeGcDiskEntry(target, stat);
-			if (removal.removed) record.action = "reclaimed";
-			else if (removal.failed) {
-				record.action = "reclaim_failed";
-				record.reason = removal.reason;
-				record.error = removal.reason;
-			} else {
-				record.action = "keep";
-				record.reason = removal.reason;
-				if (removal.withheld) record.withheld = true;
-			}
-		}
-	}
+				const retained = !references.complete
+					? `reference_scan_incomplete: ${references.notes.join(", ")}`
+					: references.ids.has(transcript.sessionId)
+						? "referenced_by_live_surface"
+						: newestPerDirectory.get(transcript.directory) === transcript
+							? "most_recent_resumable_session"
+							: undefined;
 
-	surface.families = [...families.values()].sort((a, b) => b.bytes - a.bytes || a.family.localeCompare(b.family));
-	if (!references.complete) {
-		surface.declined = {
-			reason: `reference_scan_incomplete: ${references.notes.join(", ")}`,
-			withheld,
-			withheld_bytes: withheldBytes,
-		};
+				for (const entry of entries) {
+					if (surface.records.length >= GC_DISK_MAX_WALK_ENTRIES) {
+						errors.push({ surface: "artifacts", scope: directory, message: "artifact_walk_capped" });
+						break;
+					}
+					const target = path.join(directory, entry.name);
+					const record: GcDiskRecord = {
+						surface: "artifacts",
+						id: `${transcript.sessionId}/${entry.name}`,
+						path: target,
+						bytes: 0,
+						age_days: 0,
+						action: "keep",
+						reason: "",
+					};
+
+					// A symlink is never followed and never removed: following one is exactly
+					// how a scope cleanup reaches bytes that are not GJC's to reclaim.
+					// Anything that is not a regular file is unverified state, not an artifact.
+					if (entry.isSymbolicLink() || !entry.isFile()) {
+						record.reason = `unverified_entry: ${entry.isSymbolicLink() ? "symlink" : "not_a_regular_file"}`;
+						record.withheld = true;
+						surface.records.push(record);
+						countGcDiskArtifactFamily(families, entry.name, 0);
+						withheld++;
+						continue;
+					}
+
+					let stat: Stats;
+					try {
+						stat = await fsp.lstat(target);
+					} catch (error) {
+						// Vanished mid-walk is the opposite of withheld: it is already gone.
+						if (isEnoent(error)) continue;
+						const message = gcDiskErrorText(error);
+						errors.push({ surface: "artifacts", scope: target, message });
+						record.reason = `entry_unverifiable: ${message}`;
+						record.error = message;
+						record.withheld = true;
+						surface.records.push(record);
+						countGcDiskArtifactFamily(families, entry.name, 0);
+						withheld++;
+						continue;
+					}
+
+					record.bytes = stat.size;
+					record.age_days = gcDiskAgeDays(now, stat.mtimeMs);
+					surface.records.push(record);
+					countGcDiskArtifactFamily(families, entry.name, stat.size);
+
+					if (retained !== undefined) {
+						record.reason = retained;
+						if (!references.complete) {
+							record.withheld = true;
+							withheld++;
+							withheldBytes += record.bytes;
+						}
+						continue;
+					}
+					if (now - stat.mtimeMs < GC_DISK_BLOB_GRACE_MS) {
+						record.reason = "within_write_grace_window";
+						continue;
+					}
+					record.action = "would_reclaim";
+					record.reason = "unreferenced_by_any_live_session";
+
+					if (!prune) continue;
+					const removal = await removeGcDiskEntry(target, stat);
+					if (removal.removed) record.action = "reclaimed";
+					else if (removal.failed) {
+						record.action = "reclaim_failed";
+						record.reason = removal.reason;
+						record.error = removal.reason;
+					} else {
+						record.action = "keep";
+						record.reason = removal.reason;
+						if (removal.withheld) record.withheld = true;
+					}
+				}
+			}
+
+			surface.families = [...families.values()].sort(
+				(a, b) => b.bytes - a.bytes || a.family.localeCompare(b.family),
+			);
+			if (!references.complete) {
+				surface.declined = {
+					reason: `reference_scan_incomplete: ${references.notes.join(", ")}`,
+					withheld,
+					withheld_bytes: withheldBytes,
+				};
+			}
+		});
+	} catch (error) {
+		errors.push({
+			surface: "artifacts",
+			scope: surface.root,
+			message: `artifact_liveness_authority_unavailable: ${gcDiskErrorText(error)}`,
+		});
 	}
 }
 /** Numeric `major.minor.patch` prefix, or undefined when the name is not a version. */
@@ -1876,7 +1890,15 @@ export async function collectGcDiskReport(input: {
 		prune,
 		errors,
 	});
-	await runGcDiskArtifacts({ surface: surfaces.artifacts, survivors, references, now, prune, errors });
+	await runGcDiskArtifacts({
+		surface: surfaces.artifacts,
+		survivors,
+		references,
+		agentDir,
+		now,
+		prune,
+		errors,
+	});
 	await runGcDiskNatives({
 		surface: surfaces.natives,
 		policy,

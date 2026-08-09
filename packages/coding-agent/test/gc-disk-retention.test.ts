@@ -151,7 +151,6 @@ async function registerDirectCliSession(fixture: TestRoot, sessionId: string): P
 	});
 }
 
-
 /** Sorted `relative-path:size` listing, used to prove a dry run mutated nothing. */
 async function snapshotTree(root: string): Promise<string[]> {
 	const out: string[] = [];
@@ -1431,9 +1430,7 @@ describe("gjc gc --disk (session tool artifacts)", () => {
 
 			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
 
-			expect(reasonById(disk, "artifacts").get("leased-session/2.bash.log")).toBe(
-				"keep:referenced_by_live_surface",
-			);
+			expect(reasonById(disk, "artifacts").get("leased-session/2.bash.log")).toBe("keep:referenced_by_live_surface");
 			expect(disk.surfaces.artifacts.reclaimed).toBe(0);
 			expect(disk.surfaces.artifacts.kept_bytes).toBe(payloadBytes);
 			expect((await fsp.readdir(directory)).sort()).toEqual(Object.keys(payload).sort());

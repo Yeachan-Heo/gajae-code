@@ -544,6 +544,24 @@ export class SessionIndex {
 			});
 		});
 	}
+
+	/** Hold the canonical index lock across an authority-sensitive operation. */
+	async withLocked<T>(callback: () => Promise<T>): Promise<T> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			try {
+				await fs.stat(dirFor(this.#agentDir));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return await callback();
+				throw error;
+			}
+			return await withFileLock(logFor(this.#agentDir), async () => {
+				await this.#replayUnderLock();
+				if (this.#corruptSuffix) throw new Error("Cannot use corrupt session index for artifact reclamation");
+				return await callback();
+			});
+		});
+	}
 	async snapshot(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
