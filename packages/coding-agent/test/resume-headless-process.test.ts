@@ -84,15 +84,15 @@ describe("headless bare resume", () => {
 		expect(help.stderr).toBe("");
 	}, 15_000);
 
-	it("preserves export routing instead of opening the resume picker", async () => {
+	it("preserves export routing and reports a missing export input", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-export-"));
 		const missing = path.join(root, "missing.jsonl");
 		const output = path.join(root, "export.html");
 		try {
 			const result = await runHeadlessBareResume(["--resume", "--export", missing, output]);
-			expect(result.exitCode).toBe(0);
-			expect(result.stderr).not.toContain(headlessResumeError.trim());
-			expect(result.stdout).toContain(`Exported to: ${output}`);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain(`File not found: ${missing}`);
+			expect(result.stdout).toBe("");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
