@@ -746,6 +746,17 @@ export class ChatDaemonRuntime {
 			}
 			if (attached.barrier.held !== held) return;
 			if (!this.#attachmentLive(attached)) return;
+			// The answer rides the same socket as the live frames that preceded it, but
+			// ingress is a queue: a frame this socket already delivered can still be in
+			// flight when the answer resolves, and the hold buffer does not carry it until
+			// it lands. What live delivery already carried is therefore only readable once
+			// that queue has caught up, so the round joins it before reading its own
+			// answer — otherwise a conceded range would step the cursor over a sequence
+			// still on its way into the buffer, and that frame would be dropped as already
+			// delivered by a cursor no producer ever published it past.
+			await this.#frameTails.get(attached.sessionId)?.catch(() => undefined);
+			if (attached.barrier.held !== held) return;
+			if (!this.#attachmentLive(attached)) return;
 			// The answer's own events are read before anything is concluded from its gap: a
 			// concession is only readable against the suffix it arrived with.
 			const events = Array.isArray(replay.events)

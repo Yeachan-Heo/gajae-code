@@ -34,14 +34,39 @@ class FakeSlackProvider implements SlackProviderClient {
 	async stop(): Promise<void> {}
 	async ack(): Promise<void> {}
 
+	/**
+	 * Holds every publish after it is recorded. Publishing is what the runtime's frame
+	 * queue is made of, so a publish that never returns pins every frame delivered behind
+	 * it inside that queue — which is how a test drives the interleaving where a socket
+	 * has already carried a frame the runtime has not ingested yet.
+	 */
+	#publishGate: Promise<void> | undefined;
+	#releasePublish: (() => void) | undefined;
+
+	stallPosts(): void {
+		if (this.#publishGate) return;
+		const gate = Promise.withResolvers<void>();
+		this.#publishGate = gate.promise;
+		this.#releasePublish = gate.resolve;
+	}
+
+	/** Lets the stalled publish, and every frame queued behind it, run to completion. */
+	releasePosts(): void {
+		const release = this.#releasePublish;
+		this.#publishGate = undefined;
+		this.#releasePublish = undefined;
+		release?.();
+	}
+
 	async postMessage(input: {
 		channel: string;
 		text: string;
 		threadTs?: string;
 		clientMsgId: string;
 	}): Promise<{ channel: string; ts: string; client_msg_id: string }> {
-		this.posts.push(input);
-		return { channel: input.channel, ts: `7.${this.posts.length}`, client_msg_id: input.clientMsgId };
+		const position = this.posts.push(input);
+		if (this.#publishGate) await this.#publishGate;
+		return { channel: input.channel, ts: `7.${position}`, client_msg_id: input.clientMsgId };
 	}
 
 	async findMessageByClientMsgId(): Promise<null> {
@@ -984,6 +1009,12 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			host.accept(await awaitSocket(1));
 			await starting;
 
+			// A frame the socket has carried is not a frame the runtime has ingested: ingress
+			// is a queue, so the two producers can be interleaved either way around unless the
+			// test pins them. This publish never returns, so every frame delivered from here
+			// on is still sitting in that queue when the replay answer resolves — the exact
+			// interleaving the runtime must not lose an event under.
+			provider.stallPosts();
 			host.emit("one");
 			await awaitPosts(provider, 1);
 			host.drop();
@@ -996,8 +1027,9 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			host.accept(replacement);
 			await awaitReplayRequests(host, 2);
 
-			// All three ride the replacement socket while the barrier holds them, so the
-			// gap the answer names below covers a frame this side is already holding.
+			// All three ride the replacement socket ahead of the answer, and all three are
+			// still queued behind the stalled publish when it arrives, so the gap the answer
+			// names below covers a sequence live delivery holds and the barrier does not.
 			const recoverable = host.emit("live recoverable");
 			const filtered = host.emitStream();
 			const tail = host.emit("tail");
@@ -1017,6 +1049,15 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				lastSeq: Number(tail.seq),
 			});
 			await Bun.sleep(100);
+
+			// The pin holds: nothing has moved while the frames the answer reasons about are
+			// still in flight, so the concession below is decided against a complete picture
+			// of what live delivery carried rather than against a partially drained queue.
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
+
+			provider.releasePosts();
+			await awaitPosts(provider, 3);
+			await Bun.sleep(20);
 
 			// The host evicted the sequence, but live delivery kept it: the two producers
 			// fail independently, so the concession costs only what neither of them holds.
