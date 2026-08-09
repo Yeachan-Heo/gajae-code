@@ -6312,6 +6312,7 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#readOnlyResume = false;
+	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#recoveryPromotionTranscriptPath: string | undefined;
@@ -14264,10 +14265,11 @@ export class SessionManager {
 			if (text.length === 0) {
 				const store = this.#getManagedDraftStore();
 				if (!store) return;
-				await store.remove("draft.txt");
-				if (this.#readOnlyResume && this.#sessionFile) {
+				const removedDraft = await store.consume("draft.txt");
+				if (this.#readOnlyResume && this.#sessionFile && (removedDraft !== null || this.#resumedDraftConsumed)) {
 					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 					this.#readOnlyResume = false;
+					this.#resumedDraftConsumed = false;
 				}
 				return;
 			}
@@ -14288,14 +14290,17 @@ export class SessionManager {
 		const draftPath = this.#getDraftPath();
 		if (!draftPath || !this.persist) return;
 		if (text.length === 0) {
+			let removedDraft = false;
 			try {
 				await this.storage.unlink(draftPath);
+				removedDraft = true;
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
 			}
-			if (this.#readOnlyResume && this.#sessionFile) {
+			if (this.#readOnlyResume && this.#sessionFile && (removedDraft || this.#resumedDraftConsumed)) {
 				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 				this.#readOnlyResume = false;
+				this.#resumedDraftConsumed = false;
 			}
 			return;
 		}
@@ -14321,6 +14326,7 @@ export class SessionManager {
 	async consumeDraft(): Promise<string | null> {
 		if (this.destination.kind === "managed") {
 			const draft = await this.#getManagedDraftStore()?.consume("draft.txt");
+			if (draft && this.#readOnlyResume) this.#resumedDraftConsumed = true;
 			return draft ? Buffer.from(draft).toString("utf8") : null;
 		}
 		const draftPath = this.#getDraftPath();
@@ -14337,6 +14343,7 @@ export class SessionManager {
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}
+		if (this.#readOnlyResume) this.#resumedDraftConsumed = true;
 		return text;
 	}
 
