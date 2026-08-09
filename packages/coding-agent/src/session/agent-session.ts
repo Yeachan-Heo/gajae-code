@@ -782,8 +782,8 @@ export interface PromptOptions {
 	 */
 	onPreflightAccepted?: () => void;
 	/**
-	 * Awaitable durable-accept fence. Called after preflight and before queue mutation
-	 * or `#promptAgentWithIdleRetry`. SDK bus installs a closure that fsyncs acceptance.
+	 * Awaitable durable-accept fence. Called after preflight and immediately before
+	 * agent execution begins. SDK bus installs a closure that fsyncs acceptance.
 	 */
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
@@ -9074,16 +9074,18 @@ export class AgentSession {
 					if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
 				},
 			};
-			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			else options?.onPreflightAccepted?.();
 			if (options?.onFinalPreflight && !(await options.onFinalPreflight({ hasPendingNextTurnMessages }))) {
 				this.#resetInjectedContextSignatures();
 				return;
 			}
-			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
 				signal: preflightSignal,
 				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
+				onPreflightAccepted: () => {
+					this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+					if (options?.onPreflightAcceptCommit) return options.onPreflightAcceptCommit();
+					options?.onPreflightAccepted?.();
+				},
 			});
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
@@ -16096,13 +16098,18 @@ export class AgentSession {
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 		},
 		predecessorAgentEndHold?: symbol,
-		seam?: { signal?: AbortSignal; resourceRunId?: string },
+		seam?: {
+			signal?: AbortSignal;
+			resourceRunId?: string;
+			onPreflightAccepted?: () => void | Promise<void>;
+		},
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
 		let continuationHold = predecessorAgentEndHold;
 		// R3.2 helper-local compact-once flag: fresh per prompt; the inline retry
 		// re-runs Phase B via preSubmit after the forced compaction.
 		let overflowRetried = false;
+		let preflightAccepted = false;
 		for (;;) {
 			try {
 				const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(
@@ -16111,6 +16118,10 @@ export class AgentSession {
 				continuationHold = undefined;
 				try {
 					const messages = await preSubmit.build();
+					if (!preflightAccepted) {
+						await seam?.onPreflightAccepted?.();
+						preflightAccepted = true;
+					}
 					await this.agent.prompt(messages, options);
 					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 					return;

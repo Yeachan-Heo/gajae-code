@@ -7802,7 +7802,7 @@ export class SessionManager {
 	}
 
 	/** Initialize with a specific session file (used by factory methods). */
-	async #initSessionFile(sessionFile: string): Promise<void> {
+	async #initSessionFile(sessionFile: string, initializeMissing = false): Promise<void> {
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const sidecarRoot = resolvedSessionFile.endsWith(".jsonl")
 			? resolvedSessionFile.slice(0, -6)
@@ -7823,7 +7823,7 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
-		if (!this.storage.existsSync(resolvedSessionFile)) {
+		if (initializeMissing && !this.storage.existsSync(resolvedSessionFile)) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
@@ -13480,6 +13480,7 @@ export class SessionManager {
 				await this.#closePersistWriterInternal();
 				this.#flushed = true;
 			}
+			if (this.#needsFullRewriteOnNextPersist) await this.#rewriteFileContents();
 		});
 		this.#retireEphemeralArtifacts();
 		await this.#drainEphemeralArtifactCleanups();
@@ -14481,11 +14482,11 @@ export class SessionManager {
 				}
 				const writer = this.#ensurePersistWriter();
 				if (!writer) {
-					// `#ensurePersistWriter` returns undefined here only when the cached
-					// writer is mid-close (the `!persist`/`!sessionFile` cases are
-					// rejected above). Route through `#rewriteFile` so the entry — which
-					// is already in `#fileEntries` — persists once the close drains.
-					this.#rewriteFile().catch(() => {});
+					// The cached writer is closing. Preserve the appended in-memory entry for
+					// a full rewrite after close drains instead of queueing a rewrite that the
+					// concurrent close could release before it runs.
+					this.#needsFullRewriteOnNextPersist = true;
+					this.#flushed = false;
 					return;
 				}
 				const materializedEntry = materializeResidentEntryForPersistenceSync(
@@ -16727,7 +16728,7 @@ export class SessionManager {
 				if (inspected.error.reason === "missing") {
 					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 					manager.#sessionMemoryMode = sessionMemoryMode;
-					await manager.#initSessionFile(filePath);
+					await manager.#initSessionFile(filePath, true);
 					return manager;
 				}
 				if (inspected.error.reason === "oversized")
@@ -16752,7 +16753,7 @@ export class SessionManager {
 			if (inspected.reason === "missing") {
 				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 				manager.#sessionMemoryMode = sessionMemoryMode;
-				await manager.#initSessionFile(filePath);
+				await manager.#initSessionFile(filePath, true);
 				return manager;
 			}
 			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
