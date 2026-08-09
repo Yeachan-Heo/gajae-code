@@ -436,6 +436,78 @@ test("createConnectSubscribeSubmit permits capability-gated global replay gaps o
 	});
 });
 
+test("recovery identities redact MCP secrets while retaining recovery-safe shape", async () => {
+	await withFakeTransport(async () => {
+		const envSecret = "TEST_ONLY_MCP_ENV_SECRET";
+		const headerSecret = "TEST_ONLY_MCP_AUTH_SECRET";
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: {
+				cwd: "/repo",
+				mcpServers: {
+					private: {
+						type: "http",
+						url: "https://mcp.test",
+						env: { MCP_TOKEN: envSecret },
+						headers: { Authorization: `Bearer ${headerSecret}` },
+					},
+				},
+			},
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({
+			type: "broker_response",
+			id: create.id,
+			ok: true,
+			result: { sessionId: "session-1", generation: 1 },
+		});
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({ type: "broker_response", id: endpointRequest.id, ok: true, result: {} });
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "attachment_uncertain", identity: { sessionId: "session-1" } });
+		const serialized = JSON.stringify(result);
+		expect(serialized).not.toContain(envSecret);
+		expect(serialized).not.toContain(headerSecret);
+		if (result.kind === "failed") throw new Error("Expected recovery identity");
+		expect(result.identity.create).toEqual({
+			cwd: "/repo",
+			mcpServers: { private: { type: "http", url: "https://mcp.test" } },
+		});
+		expect(result.identity.createRedacted).toBe(true);
+		const recovery = client.reconcileCreateConnectSubmit(result.identity);
+		await flush();
+		const recoveryEndpoint = sent(broker, 2);
+		broker.message({
+			type: "broker_response",
+			id: recoveryEndpoint.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token", generation: 1 },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
+		await flush();
+		const status = sent(endpoint, 1);
+		endpoint.message({ type: "query_response", id: status.id, ok: true, result: { status: "unknown" } });
+		const reconciled = await recovery;
+		expect(reconciled).toMatchObject({ kind: "reconciled", status: { status: "unknown" } });
+		expect(JSON.stringify(reconciled)).not.toContain(envSecret);
+		expect(JSON.stringify(reconciled)).not.toContain(headerSecret);
+		await client.close();
+	});
+});
+
 test("reconcileCreateConnectSubmit rejects malformed recovery identities before broker traffic", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token");
@@ -448,6 +520,46 @@ test("reconcileCreateConnectSubmit rejects malformed recovery identities before 
 		} as never);
 		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
 		expect(FakeWebSocket.instances).toHaveLength(0);
+		await client.close();
+	});
+});
+
+test("durable create errors never serialize MCP credential values", async () => {
+	await withFakeTransport(async () => {
+		const envSecret = "TEST_ONLY_MCP_ENV_ERROR_SECRET";
+		const headerSecret = "TEST_ONLY_MCP_AUTH_ERROR_SECRET";
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: {
+				cwd: "/repo",
+				mcpServers: {
+					private: {
+						type: "http",
+						url: "https://mcp.test",
+						env: { MCP_TOKEN: envSecret },
+						headers: { Authorization: `Bearer ${headerSecret}` },
+					},
+				},
+			},
+			createIdempotencyKey: "create-error-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-error-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({
+			type: "broker_response",
+			id: create.id,
+			ok: false,
+			error: { code: "invalid_input", message: `Rejected ${envSecret} and ${headerSecret}` },
+		});
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		const serialized = JSON.stringify(result);
+		expect(serialized).not.toContain(envSecret);
+		expect(serialized).not.toContain(headerSecret);
 		await client.close();
 	});
 });

@@ -73,6 +73,8 @@ export interface SdkDurableLookupIdentity {
 	operation: "session.create";
 	createIdempotencyKey: string;
 	create: Record<string, unknown>;
+	/** The create request contained credential fields which cannot be replayed from this public identity. */
+	createRedacted?: true;
 	sessionId?: string;
 	endpointGeneration?: number;
 	endpointIncarnation?: string;
@@ -199,7 +201,7 @@ const durableCreateFields = new Set([
 ]);
 const durableTargetFields = new Set(["path", "stateRoot", "worktree"]);
 
-function canonicalRecoveryCreate(create: Record<string, unknown>): Record<string, unknown> {
+function canonicalCreate(create: Record<string, unknown>): Record<string, unknown> {
 	const canonicalize = (value: unknown, seen: Set<object>): unknown => {
 		if (value === null || typeof value === "string" || typeof value === "boolean") return value;
 		if (typeof value === "number") {
@@ -235,6 +237,30 @@ function canonicalRecoveryCreate(create: Record<string, unknown>): Record<string
 	return canonicalize(create, new Set()) as Record<string, unknown>;
 }
 
+function recoverySafeCreate(create: Record<string, unknown>): { create: Record<string, unknown>; redacted: boolean } {
+	let redacted = false;
+	const redactMcpCredentials = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map(redactMcpCredentials);
+		if (!isRecord(value)) return value;
+		const result: Record<string, unknown> = {};
+		for (const [key, nested] of Object.entries(value)) {
+			if (key === "env" || key === "headers") {
+				redacted = true;
+				continue;
+			}
+			result[key] = redactMcpCredentials(nested);
+		}
+		return result;
+	};
+	return {
+		create: {
+			...create,
+			...(create.mcpServers === undefined ? {} : { mcpServers: redactMcpCredentials(create.mcpServers) }),
+		},
+		redacted,
+	};
+}
+
 function validTimeout(value: unknown): boolean {
 	return value === undefined || (typeof value === "number" && Number.isFinite(value) && value > 0);
 }
@@ -263,11 +289,14 @@ function durableIdentity(input: SdkDurableCreateConnectSubmitInput): SdkDurableL
 	} else {
 		throw new SdkClientError("invalid_input", "Submission is invalid.");
 	}
+	const canonical = canonicalCreate(input.create);
+	const safe = recoverySafeCreate(canonical);
 	return {
 		version: 1,
 		operation: "session.create",
 		createIdempotencyKey: input.createIdempotencyKey,
-		create: canonicalRecoveryCreate(input.create),
+		create: safe.create,
+		...(safe.redacted ? { createRedacted: true } : {}),
 		submission: { kind: submission.kind, clientRef: submission.clientRef },
 	};
 }
@@ -280,7 +309,8 @@ function validDurableIdentity(identity: unknown): identity is SdkDurableLookupId
 		validClientRef(identity.createIdempotencyKey) &&
 		validClientRef(identity.submission.clientRef) &&
 		(identity.submission.kind === "prompt" || identity.submission.kind === "skill") &&
-		isRecord(identity.create)
+		isRecord(identity.create) &&
+		(identity.createRedacted === undefined || identity.createRedacted === true)
 	);
 }
 
@@ -495,14 +525,14 @@ export class SdkClient {
 		let created: Record<string, unknown>;
 		try {
 			created = responseResult(
-				await this.global("session.create", identity.create, {
+				await this.global("session.create", canonicalCreate(input.create), {
 					idempotencyKey: identity.createIdempotencyKey,
 					timeoutMs: input.timeoutMs,
 				}),
 			);
 		} catch (error) {
 			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
-				? durableFailure(error, identity)
+				? durableFailure(new SdkClientError(error.code, "Durable session creation failed."), identity)
 				: uncertain("create_uncertain", identity);
 		}
 		const sessionId = stringField(created, "sessionId");
@@ -608,6 +638,7 @@ export class SdkClient {
 			return durableFailure(new SdkClientError("invalid_input", "Invalid durable lookup identity."));
 		let recovered = identity;
 		if (!recovered.sessionId) {
+			if (recovered.createRedacted) return uncertain("create_uncertain", recovered);
 			try {
 				const created = responseResult(
 					await this.global("session.create", recovered.create, {
@@ -809,6 +840,7 @@ export class SdkClient {
 			incarnation,
 			resolve,
 			reject,
+			sent: false,
 			timer: setTimeout(
 				() =>
 					this.#settlePending(
@@ -836,6 +868,7 @@ export class SdkClient {
 					...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
 				}),
 			);
+			pending.sent = true;
 			options.onWrite?.();
 		} catch (error) {
 			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket send failed", error));
