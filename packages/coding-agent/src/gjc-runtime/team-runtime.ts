@@ -2892,13 +2892,16 @@ type TeamTmuxMutation =
 	| { type: "profile-option"; target: string; name: string; value: string }
 	| { type: "profile-window-option"; target: string; name: string; value: string };
 
+const TMUX_ENCODED_LAYOUT_PATTERN = /^[0-9a-f]{4},/i;
+
 function readTeamTmuxValue(
 	config: GjcTeamConfig,
 	command: "show-options" | "show-window-options",
 	target: string,
 	name: string,
 ): string | undefined {
-	const result = Bun.spawnSync(teamTmuxArgs(config, command, ["-qv", "-t", target, name]), {
+	const flags = command === "show-options" ? "-qv" : "-v";
+	const result = Bun.spawnSync(teamTmuxArgs(config, command, [flags, "-t", target, name]), {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -2995,7 +2998,27 @@ function executeTeamTmuxMutation(
 			teamTmuxArgs(config, "display-message", ["-p", "-t", operation.target, "#{window_layout}"]),
 			{ stdout: "pipe", stderr: "pipe" },
 		);
-		if (layout.exitCode !== 0 || layout.stdout.toString().trim() !== operation.layout)
+		const observedLayout = layout.stdout.toString().trim();
+		if (layout.exitCode !== 0 || !TMUX_ENCODED_LAYOUT_PATTERN.test(observedLayout))
+			throw new Error("tmux_layout_postproof_failed");
+		assertGjcTmuxMutationAuthoritySync(authority);
+		const replay = Bun.spawnSync(
+			[
+				...providerExecutableArgv(authority),
+				...buildTmuxProviderCommand(authority, "select-layout", ["-t", operation.target, observedLayout]),
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		assertGjcTmuxMutationAuthoritySync(authority);
+		const replayedLayout = Bun.spawnSync(
+			teamTmuxArgs(config, "display-message", ["-p", "-t", operation.target, "#{window_layout}"]),
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		if (
+			replay.exitCode !== 0 ||
+			replayedLayout.exitCode !== 0 ||
+			replayedLayout.stdout.toString().trim() !== observedLayout
+		)
 			throw new Error("tmux_layout_postproof_failed");
 	} else if (operation.type === "set-window-option" || operation.type === "profile-window-option") {
 		if (readTeamTmuxValue(config, "show-window-options", operation.target, operation.name) !== operation.value)

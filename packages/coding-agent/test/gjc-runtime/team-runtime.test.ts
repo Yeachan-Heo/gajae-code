@@ -168,10 +168,13 @@ if (command === "-V" || command === "--version") {
 		console.error("no current tmux");
 		process.exitCode = 1;
 	} else {
-		if (format === "#{window_layout}") console.log(config.windowLayout ?? "main-vertical");
+		if (format === "#{window_layout}") console.log(config.windowLayout ?? "c464,120x40,0,0{59x40,0,0,1,60x40,60,0,2}");
 		else if (format === "#{window_width}") console.log("120");
 		else console.log(displayTarget(target));
 	}
+} else if (command === "select-layout" && config.failLayoutReplay && /^[0-9a-f]{4},/i.test(args.at(-1) ?? "")) {
+	console.error("layout replay failed");
+	process.exitCode = 1;
 } else if (command === "show-options" || command === "show-window-options") {
 	const name = args.at(-1);
 	const values = await optionValues();
@@ -271,6 +274,7 @@ async function createFakeTmuxBin(
 		commandName?: string;
 		versionOutput?: string;
 		windowLayout?: string;
+		failLayoutReplay?: boolean;
 	} = {},
 ): Promise<string> {
 	if (!fakeTmuxRunnerPath) throw new Error("fake tmux runner was not compiled");
@@ -1090,9 +1094,12 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("true 'You are worker-1 in gjc team worktree-team.");
 		expect(tmuxLog).not.toContain("send-keys -l");
 		expect(tmuxLog).toContain("select-layout -t test-session:0 main-vertical");
+		expect(tmuxLog).toContain("select-layout -t test-session:0 c464,120x40,0,0{59x40,0,0,1,60x40,60,0,2}");
 		expect(tmuxLog).toContain("set-option -t test-session:0 mouse on");
 		expect(tmuxLog).toContain("set-option -t test-session:0 set-clipboard on");
 		expect(tmuxLog).toContain("set-window-option -t test-session:0 mode-style fg=colour231,bg=colour60");
+		expect(tmuxLog).toContain("show-window-options -v -t test-session:0 main-pane-width");
+		expect(tmuxLog).not.toContain("show-window-options -qv");
 		expect(tmuxLog).not.toContain("set-option -g");
 		expect(tmuxLog).not.toContain("new-session");
 		expect(tmuxLog).not.toContain("kill-session");
@@ -1299,9 +1306,9 @@ describe("native gjc team runtime", () => {
 		expect(snapshot.phase).toBe("running");
 		expect(await Bun.file(path.join(cleanupRoot, "tmux.log")).text()).toContain("split-window");
 	});
-	it("fails when the layout readback differs from the requested layout", async () => {
+	it("fails when the layout readback is not a tmux encoded layout", async () => {
 		cleanupRoot = await createGitRepo();
-		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { windowLayout: "even-horizontal" });
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { windowLayout: "main-vertical" });
 
 		await expect(
 			startGjcTeam({
@@ -1309,6 +1316,27 @@ describe("native gjc team runtime", () => {
 				agentType: "executor",
 				task: "Reject ambiguous layout",
 				teamName: "layout-proof-team",
+				cwd: cleanupRoot,
+				env: {
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					PATH: process.env.PATH ?? "",
+					GJC_TEAM_WORKER_COMMAND: "true",
+					GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				},
+			}),
+		).rejects.toThrow("tmux_layout_postproof_failed");
+	});
+
+	it("fails when tmux rejects replaying the encoded layout readback", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { failLayoutReplay: true });
+
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Reject unverified layout",
+				teamName: "layout-replay-proof-team",
 				cwd: cleanupRoot,
 				env: {
 					GJC_SESSION_ID: TEST_SESSION_ID,
