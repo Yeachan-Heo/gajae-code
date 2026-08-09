@@ -1481,3 +1481,53 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 		});
 	});
 }, 20_000);
+test("a frame queued behind a failed publication cannot advance the cursor past it", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			// A later frame is already queued behind the failing one. The rollback a
+			// naive fix would apply is defeated here: `enqueueFrame` swallows the
+			// rejection, so the later frame runs. Only retiring the attachment on
+			// failure prevents its cursor from advancing past the undelivered sequence.
+			provider.failPosts = 1;
+			host.emit("two");
+			host.emit("three");
+			await awaitRefusals(provider, 1);
+			// Wait for the runtime to retire the attachment, not just for the surface to
+			// refuse: the failure warning is the synchronous completion signal from
+			// `#failDelivery` → `#failBarrier`, and reconciling before it arrives races a
+			// replay the delayed retirement would still discard.
+			for (let attempt = 0; attempt < 2_000 && !warnings.some(line => line.includes("publication failed at seq 2")); attempt++)
+				await Bun.sleep(1);
+			expect(warnings.some(line => line.includes("publication failed at seq 2"))).toBe(true);
+
+			// The cursor sits at seq 1 — below the failed publication — not at seq 2 or 3.
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+
+			// The failed frame is re-served and published, and the frame queued behind it
+			// follows in order. Neither is permanently lost or duplicated.
+			await awaitPosts(provider, 3);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nthree",
+			]);
+			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
+		});
+	});
+}, 20_000);
