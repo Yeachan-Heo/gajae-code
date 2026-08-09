@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
+import type { DiscordMessageComponent, DiscordProvider, DiscordThread } from "../src/sdk/bus/discord-provider";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import type { SlackProviderClient } from "../src/sdk/bus/slack-provider";
@@ -105,6 +106,69 @@ class FakeSlackProvider implements SlackProviderClient {
 	}
 }
 
+class FakeDiscordProvider implements DiscordProvider {
+	readonly applicationId = "discord-app";
+	readonly botUserId = "discord-bot";
+	readonly transportHealthy = true;
+	readonly posts: Array<{ threadId: string; content: string; nonce?: string }> = [];
+	readonly postAttempts: Array<{ threadId: string; content: string; nonce?: string }> = [];
+	readonly #threadsByNonce = new Map<string, DiscordThread>();
+	readonly #messagesByNonce = new Map<string, { id: string; threadId: string }>();
+	acceptThenThrowPosts = 0;
+	reconciliationFailureNonce: string | undefined;
+
+	async start(): Promise<void> {}
+	async stop(): Promise<void> {}
+
+	async createThread(input: { guildId: string; parentId: string; name: string; nonce: string }): Promise<DiscordThread> {
+		const existing = this.#threadsByNonce.get(input.nonce);
+		if (existing) return existing;
+		const thread = {
+			id: `discord-thread-${this.#threadsByNonce.size + 1}`,
+			guildId: input.guildId,
+			parentId: input.parentId,
+			archived: false,
+		};
+		this.#threadsByNonce.set(input.nonce, thread);
+		return thread;
+	}
+
+	async findThreadByNonce(input: { guildId: string; parentId: string; nonce: string }): Promise<DiscordThread | null> {
+		return this.#threadsByNonce.get(input.nonce) ?? null;
+	}
+
+	async findMessageByNonce(input: { threadId: string; nonce: string }): Promise<{ id: string } | null> {
+		if (input.nonce === this.reconciliationFailureNonce)
+			throw new Error("discord reconciliation is unavailable");
+		const message = this.#messagesByNonce.get(input.nonce);
+		return message?.threadId === input.threadId ? { id: message.id } : null;
+	}
+
+	async postMessage(input: {
+		threadId: string;
+		content: string;
+		nonce?: string;
+		components?: DiscordMessageComponent[];
+	}): Promise<{ id: string }> {
+		this.postAttempts.push(input);
+		const existing = input.nonce === undefined ? undefined : this.#messagesByNonce.get(input.nonce);
+		if (existing) return { id: existing.id };
+		const id = `discord-message-${this.posts.length + 1}`;
+		this.posts.push(input);
+		if (input.nonce !== undefined) this.#messagesByNonce.set(input.nonce, { id, threadId: input.threadId });
+		if (this.acceptThenThrowPosts > 0) {
+			this.acceptThenThrowPosts -= 1;
+			this.reconciliationFailureNonce = input.nonce;
+			throw new Error("discord disconnected after accepting post");
+		}
+		return { id };
+	}
+
+	async deferInteraction(): Promise<void> {}
+	async archiveThread(): Promise<void> {}
+	async unarchiveThread(): Promise<void> {}
+}
+
 /**
  * The session host as `SdkClient` sees it: one socket at a time, a fresh
  * connection id per socket, a monotonic event log, and `event_replay` answered
@@ -150,6 +214,10 @@ class FakeSessionHost {
 	 */
 	emit(text: string): Record<string, unknown> {
 		return this.#record("notice", { type: "notice", text });
+	}
+
+	emitSessionReady(): Record<string, unknown> {
+		return this.#record("session_ready", { type: "session_ready" });
 	}
 
 	/**
@@ -360,6 +428,68 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 	}
 }
 
+async function withAttachedDiscordRuntime(
+	run: (harness: {
+		runtime: ChatDaemonRuntime;
+		provider: FakeDiscordProvider;
+		reconcile: () => void;
+	}) => Promise<void>,
+): Promise<void> {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconnect-discord-"));
+	let runtime: ChatDaemonRuntime | undefined;
+	try {
+		const stateRoot = path.join(agentDir, ".gjc", "state");
+		const endpointFile = path.join(stateRoot, "sdk", `${SESSION_ID}.json`);
+		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
+		await fs.writeFile(
+			endpointFile,
+			`${JSON.stringify({ version: 1, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
+		);
+		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
+		const index = await new SessionIndex(agentDir).open();
+		await index.append({
+			type: "host_registered",
+			sessionId: SESSION_ID,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: GENERATION,
+			pid: process.pid,
+			endpointMtimeMs,
+		});
+
+		const provider = new FakeDiscordProvider();
+		let reconcileTick: (() => void) | undefined;
+		runtime = new ChatDaemonRuntime(
+			{
+				kind: "discord",
+				agentDir,
+				config: {
+					identity: "test-identity",
+					notifications: {
+						discord: {
+							botToken: "discord-not-persisted",
+							applicationId: provider.applicationId,
+							guildId: "discord-guild",
+							parentChannelId: "discord-parent",
+						},
+					},
+				},
+			},
+			{
+				createDiscordProvider: () => provider,
+				setInterval: ((callback: () => void) => {
+					reconcileTick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => undefined) as unknown as typeof clearInterval,
+			},
+		);
+		await run({ runtime, provider, reconcile: () => reconcileTick?.() });
+	} finally {
+		await runtime?.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+}
+
 /** The runtime does its index and endpoint IO before it dials, so wait for the dial. */
 async function awaitSocket(count: number): Promise<FakeWebSocket> {
 	for (let attempt = 0; attempt < 2_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
@@ -376,6 +506,12 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
  * cursor the runtime has not moved yet.
  */
 async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+	expect(provider.posts).toHaveLength(count);
+	await Bun.sleep(25);
+}
+
+async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
 	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
 	await Bun.sleep(25);
@@ -1169,6 +1305,29 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 	});
 }, 20_000);
 
+test("an ambiguously acknowledged Discord session-ready publication is not posted twice", async () => {
+	await withAttachedDiscordRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			provider.acceptThenThrowPosts = 1;
+			host.emitSessionReady();
+			await awaitDiscordPosts(provider, 1);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(100);
+
+			expect(provider.posts.map(post => post.content)).toEqual(["GJC session ready."]);
+			expect(provider.posts[0]?.nonce).toBeDefined();
+		});
+	});
+}, 20_000);
 test("an ambiguously acknowledged publication is not posted twice when reconciliation fails", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
 		await withFakeTransport(async () => {
