@@ -468,3 +468,66 @@ describe("deferred shell command parentage after the transcript is cleared", () 
 		expect(harness.chatContainer.children).toEqual([parkedPython, parkedBash]);
 	});
 });
+
+describe("deferred shell persistence rebuild race", () => {
+	it("does not duplicate a deferred bash block when persistence wins the controller race", async () => {
+		const harness = createHarness({ isStreaming: true });
+		const persisted = Promise.withResolvers<void>();
+		const releaseReturn = Promise.withResolvers<void>();
+
+		harness.ctx.session.executeBash = async (_command, _onChunk, options) => {
+			// AgentSession appends the message and reports it as persisted before
+			// executeBash returns, so the controller is still suspended when the
+			// rebuilt transcript already owns the row.
+			harness.rebuiltTranscriptRows.push("printf race");
+			options?.onPersisted?.();
+			persisted.resolve();
+			await releaseReturn.promise;
+			return {
+				exitCode: 0,
+				cancelled: false,
+				output: "race",
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 4,
+				outputLines: 1,
+				outputBytes: 4,
+			};
+		};
+
+		const run = new CommandController(harness.ctx).handleBashCommand("printf race");
+		await persisted.promise;
+
+		new UiHelpers(harness.ctx).renderInitialMessages();
+		expect(harness.chatContainer.children).toHaveLength(1);
+
+		releaseReturn.resolve();
+		await run;
+
+		// The persisted transcript row is authoritative; completion must discard
+		// the superseded live component instead of appending a second copy.
+		expect(harness.chatContainer.children).toHaveLength(1);
+	});
+
+	it("keeps an unpersisted live block when the rebuild restores an older identical command", async () => {
+		const harness = createHarness({ isStreaming: true });
+		// An older run of the same command is already in the session transcript.
+		harness.rebuiltTranscriptRows.push("printf same");
+
+		const run = new CommandController(harness.ctx).handleBashCommand("printf same");
+		await settle();
+		const liveComponent = harness.ctx.pendingBashComponents[0];
+
+		new UiHelpers(harness.ctx).renderInitialMessages();
+
+		// The live result is not persisted, so the identical restored row must not
+		// supersede it.
+		expect(harness.pendingMessagesContainer.children).toEqual([liveComponent]);
+
+		harness.bashGate.resolve({ exitCode: 0, cancelled: false, output: "same", truncated: false });
+		await run;
+
+		expect(harness.chatContainer.children).toHaveLength(2);
+		expect(harness.chatContainer.children).toContain(liveComponent);
+	});
+});

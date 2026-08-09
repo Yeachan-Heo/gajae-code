@@ -1147,7 +1147,8 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		const component = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		this.ctx.bashComponent = component;
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.bashComponent);
@@ -1165,7 +1166,9 @@ export class CommandController {
 						this.ctx.bashComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext },
+				// A transcript rebuild racing this call must drop the parked block once the
+				// session owns its message, otherwise the rebuilt row is rendered twice.
+				{ excludeFromContext, onPersisted: () => component.markResultPersisted() },
 			);
 
 			if (this.ctx.bashComponent) {
@@ -1202,7 +1205,8 @@ export class CommandController {
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.pythonComponent = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		const component = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		this.ctx.pythonComponent = component;
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.pythonComponent);
@@ -1220,7 +1224,9 @@ export class CommandController {
 						this.ctx.pythonComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext },
+				// A transcript rebuild racing this call must drop the parked block once the
+				// session owns its message, otherwise the rebuilt row is rendered twice.
+				{ excludeFromContext, onPersisted: () => component.markResultPersisted() },
 			);
 
 			if (this.ctx.pythonComponent) {

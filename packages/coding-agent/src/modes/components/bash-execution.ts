@@ -51,6 +51,7 @@ export class BashExecutionComponent extends Container {
 	#chunkGate = false;
 	#contentContainer: Container;
 	#headerText: Text;
+	#resultPersisted = false;
 
 	constructor(
 		private readonly command: string,
@@ -258,5 +259,18 @@ export class BashExecutionComponent extends Container {
 	 */
 	getCommand(): string {
 		return this.command;
+	}
+
+	/**
+	 * Record that this execution's message reached session state, so a transcript
+	 * rebuild renders it from the session instead of keeping this live block parked.
+	 */
+	markResultPersisted(): void {
+		this.#resultPersisted = true;
+	}
+
+	/** Whether the session already holds this execution's message. */
+	hasPersistedResult(): boolean {
+		return this.#resultPersisted;
 	}
 }

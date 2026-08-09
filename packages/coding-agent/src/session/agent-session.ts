@@ -2015,7 +2015,7 @@ export class AgentSession {
 
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
-	#pendingBashMessages: BashExecutionMessage[] = [];
+	#pendingBashMessages: Array<{ message: BashExecutionMessage; onPersisted?: () => void }> = [];
 	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
 
 	// Python execution state
@@ -2031,7 +2031,7 @@ export class AgentSession {
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	readonly #ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
-	#pendingPythonMessages: PythonExecutionMessage[] = [];
+	#pendingPythonMessages: Array<{ message: PythonExecutionMessage; onPersisted?: () => void }> = [];
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -16086,11 +16086,13 @@ export class AgentSession {
 	 * @param command The bash command to execute
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
+	 * @param options.onPersisted Called once the execution's message is in session state
+	 *   (immediately when idle, at the post-turn flush while streaming)
 	 */
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean },
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
@@ -16145,7 +16147,11 @@ export class AgentSession {
 	 * Record a bash execution result in session history.
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
-	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+	recordBashResult(
+		command: string,
+		result: BashResult,
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+	): void {
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
@@ -16162,13 +16168,14 @@ export class AgentSession {
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
 			// Queue for later - will be flushed on agent_end
-			this.#pendingBashMessages.push(bashMessage);
+			this.#pendingBashMessages.push({ message: bashMessage, onPersisted: options?.onPersisted });
 		} else {
 			// Add to agent state immediately
 			this.agent.appendMessage(bashMessage);
 
 			// Save to session
 			this.sessionManager.appendMessage(bashMessage);
+			options?.onPersisted?.();
 		}
 	}
 
@@ -16198,12 +16205,13 @@ export class AgentSession {
 	#flushPendingBashMessages(): void {
 		if (this.#pendingBashMessages.length === 0) return;
 
-		for (const bashMessage of this.#pendingBashMessages) {
+		for (const pending of this.#pendingBashMessages) {
 			// Add to agent state
-			this.agent.appendMessage(bashMessage);
+			this.agent.appendMessage(pending.message);
 
 			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
+			this.sessionManager.appendMessage(pending.message);
+			pending.onPersisted?.();
 		}
 
 		this.#pendingBashMessages = [];
@@ -16219,11 +16227,13 @@ export class AgentSession {
 	 * @param code The Python code to execute
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
+	 * @param options.onPersisted Called once the execution's message is in session state
+	 *   (immediately when idle, at the post-turn flush while streaming)
 	 */
 	async executePython(
 		code: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean },
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<PythonResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
@@ -16291,7 +16301,11 @@ export class AgentSession {
 	/**
 	 * Record a Python execution result in session history.
 	 */
-	recordPythonResult(code: string, result: PythonResult, options?: { excludeFromContext?: boolean }): void {
+	recordPythonResult(
+		code: string,
+		result: PythonResult,
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+	): void {
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const pythonMessage: PythonExecutionMessage = {
 			role: "pythonExecution",
@@ -16307,10 +16321,11 @@ export class AgentSession {
 
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
-			this.#pendingPythonMessages.push(pythonMessage);
+			this.#pendingPythonMessages.push({ message: pythonMessage, onPersisted: options?.onPersisted });
 		} else {
 			this.agent.appendMessage(pythonMessage);
 			this.sessionManager.appendMessage(pythonMessage);
+			options?.onPersisted?.();
 		}
 	}
 
@@ -16371,9 +16386,10 @@ export class AgentSession {
 	#flushPendingPythonMessages(): void {
 		if (this.#pendingPythonMessages.length === 0) return;
 
-		for (const pythonMessage of this.#pendingPythonMessages) {
-			this.agent.appendMessage(pythonMessage);
-			this.sessionManager.appendMessage(pythonMessage);
+		for (const pending of this.#pendingPythonMessages) {
+			this.agent.appendMessage(pending.message);
+			this.sessionManager.appendMessage(pending.message);
+			pending.onPersisted?.();
 		}
 
 		this.#pendingPythonMessages = [];

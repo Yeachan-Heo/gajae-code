@@ -295,6 +295,17 @@ export function syncPendingExecutionComponents(ctx: InteractiveModeContext): voi
 	ctx.pendingPythonComponents = ctx.pendingPythonComponents.filter(component => container.hasLiveChild(component));
 }
 
+/**
+ * Whether the session already owns this execution's message, i.e. the rebuilt
+ * transcript renders the block from session state. Set by the controller when
+ * `executeBash()` / `executePython()` reports the result as persisted.
+ */
+function hasPersistedExecutionResult(component: Component): boolean {
+	if (component instanceof BashExecutionComponent) return component.hasPersistedResult();
+	if (component instanceof EvalExecutionComponent) return component.hasPersistedResult();
+	return false;
+}
+
 export function trimChatChildren(ctx: InteractiveModeContext): void {
 	const children = ctx.chatContainer.children;
 
@@ -916,9 +927,13 @@ export class UiHelpers {
 		// A still-running deferred `!`/`$` block is the only rendering of output whose
 		// message has not been published to the session yet, so the rebuild must keep it
 		// parked instead of disposing it. Finished blocks are dropped here: the rebuilt
-		// transcript renders them from the session.
+		// transcript renders them from the session. A block whose result was persisted
+		// while its controller was still suspended is finished for this purpose — keeping
+		// it would render the same execution twice.
 		const runningExecutionComponents = this.#detachPendingMessages(
-			component => component === this.ctx.bashComponent || component === this.ctx.pythonComponent,
+			component =>
+				(component === this.ctx.bashComponent || component === this.ctx.pythonComponent) &&
+				!hasPersistedExecutionResult(component),
 		);
 		this.ctx.pendingBashComponents = this.ctx.pendingBashComponents.filter(component =>
 			runningExecutionComponents.includes(component),
