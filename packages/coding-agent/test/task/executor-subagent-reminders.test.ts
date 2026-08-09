@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
 import { kNoAuth } from "../../src/config/model-registry";
@@ -11,6 +11,7 @@ import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } from "../../src/session/agent-session";
 import type { AuthStorage } from "../../src/session/auth-storage";
 import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
+import "../../src/tools/yield";
 
 import {
 	type AgentDefinition,
@@ -110,6 +111,9 @@ function mockCreateAgentSession(session: AgentSession) {
 }
 
 describe("runSubprocess yield reminders", () => {
+	beforeEach(() => {
+		AgentRegistry.resetGlobalForTests();
+	});
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
