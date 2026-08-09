@@ -235,6 +235,38 @@ function readGeneration(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
+function readSequence(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+}
+
+/**
+ * What one `event_replay_result` states about the range it could not answer.
+ *
+ * A gap is the host's own admission, not an inference this side draws:
+ * `sequence_gap` names sequences its ring has already evicted, and
+ * `generation_reset` says the stream this cursor belongs to no longer exists.
+ * Reading it whole — rather than treating every truthy `gap` alike — is what
+ * keeps a bounded, nameable loss apart from an answer nothing can be concluded
+ * from, and the two owe opposite responses.
+ */
+type ReplayGap =
+	| Readonly<{ kind: "generation_reset"; toGeneration: number }>
+	| Readonly<{ kind: "sequence_gap"; fromSeq: number; toSeq: number }>;
+
+function readReplayGap(value: unknown): ReplayGap | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const gap = value as Record<string, unknown>;
+	if (gap.kind === "generation_reset") {
+		const toGeneration = readGeneration(gap.toGeneration);
+		return toGeneration === undefined ? undefined : { kind: "generation_reset", toGeneration };
+	}
+	if (gap.kind !== "sequence_gap") return undefined;
+	const fromSeq = readSequence(gap.fromSeq);
+	const toSeq = readSequence(gap.toSeq);
+	if (fromSeq === undefined || toSeq === undefined || toSeq < fromSeq) return undefined;
+	return { kind: "sequence_gap", fromSeq, toSeq };
+}
+
 /**
  * What one representation of a frame states about an identity it owns.
  *
@@ -665,8 +697,20 @@ export class ChatDaemonRuntime {
 	 * A refused replay loses nothing either: the cursor stays where the request was
 	 * issued from, the held frames stay held, and the round re-issues on the socket
 	 * it already has. When that budget runs out the barrier fails whole and the
-	 * attachment is rebuilt from its cursor, so the gap stays re-fetchable and no
-	 * live frame can step over it in the meantime.
+	 * attachment is rebuilt from its cursor. A replay that reports a retention gap
+	 * is not a round to retry: the sequences it names are evicted at the host, so no
+	 * rebuild can re-fetch them. That round concedes them instead — loudly — carries
+	 * the cursor over them, and publishes the suffix the host did keep, so the gap
+	 * costs exactly the sequences the host lost and nothing that follows them. The
+	 * concession is what moves the cursor, not the suffix: a host that kept every
+	 * sequence above the gap can still answer with none of them, and a cursor left
+	 * below the lost range would concede it again on every later replay. A gap is
+	 * conceded only where it answers this round's own request: one that opens above
+	 * the cursor, or that the same answer returns retained events from, states no
+	 * bounded loss and is fenced like any other answer nothing can be concluded from.
+	 * What the host evicted is not what delivery lost: a sequence in the conceded
+	 * range that the replacement socket already carried is held by this round's
+	 * barrier, so it is published before the cursor steps over the rest.
 	 */
 	async #replayAttachment(attached: AttachedSession, sinceSeq: number): Promise<void> {
 		if (!this.#attachmentLive(attached)) return;
@@ -702,10 +746,83 @@ export class ChatDaemonRuntime {
 			}
 			if (attached.barrier.held !== held) return;
 			if (!this.#attachmentLive(attached)) return;
-			if (Array.isArray(replay.events))
-				for (const event of replay.events)
-					if (event && typeof event === "object" && !Array.isArray(event))
-						await this.enqueueFrame(attached, event as Record<string, unknown>, "ordered");
+			// The answer's own events are read before anything is concluded from its gap: a
+			// concession is only readable against the suffix it arrived with.
+			const events = Array.isArray(replay.events)
+				? replay.events.filter(
+						(event): event is Record<string, unknown> =>
+							!!event && typeof event === "object" && !Array.isArray(event),
+					)
+				: [];
+			if (replay.gap !== undefined) {
+				// The host answered, and its answer says part of what this cursor asked for
+				// is gone for good. Neither a retry nor a rebuild can recover an evicted
+				// sequence, so refusing to publish would trade a bounded loss for a total
+				// outage on a healthy socket, and the 2-second reconcile would rebuild into
+				// the same gap forever. Concede it instead — loudly — and publish the suffix
+				// the host did keep, so the gap costs exactly the sequences the host lost and
+				// nothing that follows them.
+				const gap = readReplayGap(replay.gap);
+				if (!gap) {
+					this.#failBarrier(attached, "replay reported a gap it did not state");
+					return;
+				}
+				if (gap.kind === "generation_reset") {
+					// A reset stream shares no sequence space with this cursor, so nothing in
+					// the answer can be ordered against it. Reconcile rebuilds against the
+					// generation the index publishes now, which is a different fence entirely.
+					this.#failBarrier(attached, `replay reported a generation reset to ${gap.toGeneration}`);
+					return;
+				}
+				// A gap is a statement about this round's own request, so it is conceded only
+				// where it answers one: it must open at the first sequence this round asked
+				// for, and the suffix the host kept must sit entirely above it. A range this
+				// cursor never asked about, or one the same answer returns events from, states
+				// no bounded loss at all, and conceding it would fence off sequences the host
+				// still holds — the one thing a retention gap must never cost.
+				if (gap.fromSeq !== sinceSeq + 1) {
+					this.#failBarrier(
+						attached,
+						`replay conceded sequences ${gap.fromSeq}-${gap.toSeq} for a request that resumed from seq ${sinceSeq}`,
+					);
+					return;
+				}
+				const retained = events
+					.map(event => readSequence(event.seq))
+					.find(seq => seq !== undefined && seq <= gap.toSeq);
+				if (retained !== undefined) {
+					this.#failBarrier(
+						attached,
+						`replay conceded sequences ${gap.fromSeq}-${gap.toSeq} while returning seq ${retained}`,
+					);
+					return;
+				}
+				// A sequence the host lost from its ring can still have arrived over the
+				// replacement socket and be sitting in this round's hold buffer: the two
+				// producers fail independently, so eviction at the host says nothing about
+				// what live delivery already carried. Those frames are published here — in
+				// sequence order, ahead of the retained suffix that sits above them — and
+				// leave the buffer, so the concession costs only the sequences neither
+				// producer holds and the drain cannot re-offer one the cursor just passed.
+				const recovered = held.filter(entry => entry.seq <= gap.toSeq).sort((left, right) => left.seq - right.seq);
+				const carried = held.filter(entry => entry.seq > gap.toSeq);
+				held.splice(0, held.length, ...carried);
+				const recoveredNote =
+					recovered.length > 0 ? `, ${recovered.length} of them recovered from live delivery` : "";
+				logger.warn(
+					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
+				);
+				for (const entry of recovered) await this.enqueueFrame(attached, entry.frame, "ordered");
+				// The concession itself carries the cursor over the rest of the lost range,
+				// because the retained suffix cannot be trusted to do it: `SessionSdkHost`
+				// drops capability-gated kinds from every replay answer, so a host that still
+				// holds every sequence above the gap can legitimately answer with none of
+				// them. A cursor left below a range no host can re-serve would resume the
+				// next replay from the same evicted sequence and concede the same permanent
+				// loss on every reconnect, forever.
+				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;
+			}
+			for (const event of events) await this.enqueueFrame(attached, event, "ordered");
 			await this.#drainHeldFrames(attached, held);
 		} finally {
 			// Only this round's own buffer is revoked: a later round or a disposal may have
@@ -736,6 +853,9 @@ export class ChatDaemonRuntime {
 	 * attachment against the same endpoint generation and hands that cursor to the
 	 * replacement, whose replay re-fetches exactly what this round could not close —
 	 * held frames are dropped only because that replay re-issues every one of them.
+	 * Only an inconclusive round retires this way: a host that names what it lost is
+	 * conceded where the answer is read, because no rebuild could recover it.
+	 *
 	 * Loud, because a barrier that cannot close is a transport fault rather than a
 	 * delivery decision.
 	 */
@@ -893,7 +1013,8 @@ export class ChatDaemonRuntime {
 					// Overflow is not a choice between frames: evicting the oldest silently
 					// skips the sequence the cursor needs next, and evicting the newest leaves
 					// a hole no drain can close. So the barrier fails whole instead, and the
-					// rebuild re-fetches the gap from this attachment's own cursor.
+					// rebuild re-fetches the gap from this attachment's own cursor — the host
+					// answers with whatever of it survived, and names the rest as lost.
 					this.#failBarrier(attached, `hold buffer overflowed at ${REPLAY_BARRIER_LIMIT} frames`);
 					return;
 				}

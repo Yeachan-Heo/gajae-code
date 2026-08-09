@@ -1,7 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
@@ -17,6 +18,13 @@ const GENERATION = 4;
  * limit leaves the flood below it, and the test fails on the frames that never arrive.
  */
 const HOLD_LIMIT = 1_024;
+
+/**
+ * Mirrors `CAP_GATED_FRAME_KINDS` in `sdk/host/host.ts`: the kinds a replay answer
+ * withholds from a connection without the tool-activity capability, which is every
+ * connection a chat daemon opens.
+ */
+const CAP_GATED_REPLAY_KINDS = new Set(["tool_activity", "reasoning_summary"]);
 
 class FakeSlackProvider implements SlackProviderClient {
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
@@ -59,10 +67,22 @@ class FakeSessionHost {
 	stallReplay = false;
 	/** Refuses this many replays with a typed error, leaving the socket that carried them open. */
 	rejectReplays = 0;
+	/** Answers with a gap that never states the range it covers, the way a malformed host would. */
+	malformedGap = false;
+	/** Answers with this gap verbatim, the way a host that miscounts its own ring would. */
+	forcedGap: Record<string, unknown> | undefined;
+	/** The id of the last replay the client asked for, so a test can answer it by hand. */
+	lastReplayId: string | undefined;
 	#generation = GENERATION;
 	#log: Array<Record<string, unknown>> = [];
 	#connections = 0;
 	#socket: FakeWebSocket | undefined;
+	#sequence = 0;
+	readonly #ringSize: number;
+
+	constructor(ringSize = Number.POSITIVE_INFINITY) {
+		this.#ringSize = ringSize;
+	}
 
 	/** Brings up the socket the client just dialed: open, then hello. */
 	accept(socket: FakeWebSocket): void {
@@ -88,16 +108,27 @@ class FakeSessionHost {
 		return this.#record("turn_stream", { type: "turn_stream", phase: "live" });
 	}
 
+	/**
+	 * Records one capability-gated event. It occupies a ring slot like any other, but
+	 * `SessionSdkHost` filters this kind out of every replay answer to a connection
+	 * that did not negotiate `tool_activity_v2` — which a chat daemon never does — so
+	 * a host that retained it still answers this cursor with nothing above its gap.
+	 */
+	emitGated(): Record<string, unknown> {
+		return this.#record("tool_activity", { type: "tool_activity" });
+	}
+
 	#record(kind: string, payload: Record<string, unknown>): Record<string, unknown> {
 		const event = {
 			type: "event",
 			kind,
 			sessionId: SESSION_ID,
 			generation: this.#generation,
-			seq: this.#log.length + 1,
+			seq: ++this.#sequence,
 			payload,
 		};
 		this.#log.push(event);
+		if (this.#log.length > this.#ringSize) this.#log.shift();
 		this.#socket?.deliver(event);
 		return event;
 	}
@@ -113,12 +144,14 @@ class FakeSessionHost {
 	roll(): void {
 		this.#generation += 1;
 		this.#log = [];
+		this.#sequence = 0;
 	}
 
 	#answer(socket: FakeWebSocket, data: string): void {
 		const frame = JSON.parse(data) as Record<string, unknown>;
 		if (frame.type !== "event_replay") return;
 		this.replayRequests.push({ sinceGeneration: frame.sinceGeneration, sinceSeq: frame.sinceSeq });
+		this.lastReplayId = typeof frame.id === "string" ? frame.id : undefined;
 		if (this.stallReplay) return;
 		if (this.rejectReplays > 0) {
 			this.rejectReplays -= 1;
@@ -134,26 +167,60 @@ class FakeSessionHost {
 		}
 		const asked = typeof frame.sinceSeq === "number" ? frame.sinceSeq : 0;
 		const sinceSeq = Math.max(0, asked - this.replayRewind);
-		const events =
+		const retained =
 			frame.sinceGeneration === this.#generation
 				? this.#log.filter(event => Number(event.seq) > sinceSeq)
 				: [...this.#log];
+		// Mirrors `SessionSdkHost`: capability-gated kinds are stripped from the answer
+		// of a connection that never negotiated `tool_activity_v2`, so a retained
+		// sequence can be missing from the suffix while the host still holds it.
+		const events = retained.filter(event => !CAP_GATED_REPLAY_KINDS.has(String(event.kind)));
+		const gap = this.#replayGap(frame.sinceGeneration, sinceSeq + 1);
 		queueMicrotask(() =>
 			socket.deliver({
 				type: "event_replay_result",
 				id: frame.id,
 				ok: true,
 				events,
+				...(gap ? { gap } : {}),
 				generation: this.#generation,
-				lastSeq: this.#log.length,
+				lastSeq: this.#sequence,
 			}),
 		);
+	}
+
+	/**
+	 * Mirrors `SessionEventStream.replay`: a stream that has rolled reports a
+	 * generation reset, an evicted prefix reports the sequences it lost, and an
+	 * answer that covers the whole request reports no gap at all.
+	 */
+	#replayGap(sinceGeneration: unknown, replayFrom: number): Record<string, unknown> | undefined {
+		const resyncQueries = ["Q01", "Q02", "Q03"];
+		if (sinceGeneration !== this.#generation)
+			return {
+				kind: "generation_reset",
+				fromGeneration: sinceGeneration,
+				toGeneration: this.#generation,
+				resyncQueries,
+			};
+		if (this.forcedGap) return this.forcedGap;
+		if (this.malformedGap) return { kind: "sequence_gap", fromSeq: replayFrom, resyncQueries };
+		const oldest = Number(this.#log[0]?.seq ?? this.#sequence + 1);
+		return replayFrom < oldest
+			? { kind: "sequence_gap", fromSeq: replayFrom, toSeq: oldest - 1, resyncQueries }
+			: undefined;
 	}
 }
 
 interface AttachedRuntimeHarness {
 	runtime: ChatDaemonRuntime;
 	provider: FakeSlackProvider;
+	/**
+	 * Every warning the runtime logged, in order. A conceded retention gap is a
+	 * permanent loss the operator only ever learns about here, so the concession is
+	 * observable exactly where the runtime states it.
+	 */
+	warnings: string[];
 	/** Fires one reconcile pass, exactly as the runtime's own interval does. */
 	reconcile: () => void;
 	/** Supersedes the indexed attachment with a newer endpoint generation. */
@@ -168,6 +235,10 @@ interface AttachedRuntimeHarness {
 async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness) => Promise<void>): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconnect-"));
 	let runtime: ChatDaemonRuntime | undefined;
+	const warnings: string[] = [];
+	const warnSpy = spyOn(logger, "warn").mockImplementation((message: string) => {
+		warnings.push(message);
+	});
 	try {
 		const stateRoot = path.join(agentDir, ".gjc", "state");
 		const endpointFile = path.join(stateRoot, "sdk", `${SESSION_ID}.json`);
@@ -217,6 +288,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		await run({
 			runtime,
 			provider,
+			warnings,
 			reconcile: () => reconcileTick?.(),
 			supersede: async () => {
 				await index.append({
@@ -231,6 +303,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		});
 	} finally {
 		await runtime?.stop();
+		warnSpy.mockRestore();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 }
@@ -581,10 +654,10 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 	});
 }, 30_000);
 
-test("a hold buffer that overflows re-fetches the gap instead of skipping the frame the cursor needs next", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+test("a real 256-frame host ring loses only the sequences the host says it evicted", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
 		await withFakeTransport(async () => {
-			const host = new FakeSessionHost();
+			const host = new FakeSessionHost(256);
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
 			await starting;
@@ -610,17 +683,166 @@ test("a hold buffer that overflows re-fetches the gap instead of skipping the fr
 			host.stallReplay = false;
 			reconcile();
 			host.accept(await awaitSocket(3));
-			await awaitPosts(provider, 4);
-			await Bun.sleep(20);
-			// Overflow re-fetches the gap from the cursor rather than evicting inside it:
-			// "flood head" is the oldest held frame and the one the cursor needs first, and
-			// it is still published, in sequence, ahead of the frame that overflowed it.
+			await awaitReplayRequests(host, 3);
+			await Bun.sleep(100);
+			// The replacement can retrieve only the newest 256 events, and the host says so:
+			// sequences 2-771 are gone, which costs "two" and "flood head" for good. No
+			// rebuild can re-fetch them, so the round concedes exactly that range and
+			// publishes everything the ring did keep behind it.
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nflood tail"]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+
+			// The eviction is stated, not inferred: the round names the exact range the host
+			// lost, once, and concedes nothing else in the stream.
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
+				`chat daemon replay conceded a retention gap (sequences 2-771 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 772.`,
+			]);
+
+			// The cursor now sits above the conceded range, so the stream continues on the
+			// socket it already has: no fourth dial, no fourth replay, and the next live
+			// frame is published rather than fenced behind a gap nothing can close.
+			host.emit("after the gap");
+			await awaitPosts(provider, 3);
+			reconcile();
+			await Bun.sleep(50);
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\none",
-				"GJC notice\ntwo",
-				"GJC notice\nflood head",
 				"GJC notice\nflood tail",
+				"GJC notice\nafter the gap",
 			]);
+			expect(FakeWebSocket.instances).toHaveLength(3);
+			expect(host.replayRequests).toHaveLength(3);
+		});
+	});
+}, 30_000);
+test("a retention gap at the initial attach keeps delivering instead of rebuilding forever", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		await withFakeTransport(async () => {
+			// A two-frame ring that has already rolled past its first event. The daemon
+			// attaches from zero, so the host answers with the suffix it still holds and
+			// states that sequence 1 is gone — a gap no retry and no rebuild can close.
+			const host = new FakeSessionHost(2);
+			host.emit("evicted one");
+			host.emit("retained two");
+			host.emit("retained three");
+
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			// The conceded sequence is the whole loss: the retained suffix publishes in
+			// order, and live delivery continues on the attachment that just conceded it.
+			await awaitPosts(provider, 2);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nretained two",
+				"GJC notice\nretained three",
+			]);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
+				`chat daemon replay conceded a retention gap (sequences 1-1 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 2.`,
+			]);
+			host.emit("future four");
+			await awaitPosts(provider, 3);
+
+			// Retiring the attachment here would be permanent: every reconcile rebuilds
+			// against the same evicted sequence, so the barrier would fail again on every
+			// round while `transportHealthy()` still reported true and nothing shipped.
+			for (let round = 0; round < 3; round++) {
+				reconcile();
+				await Bun.sleep(20);
+			}
+			expect(runtime.transportHealthy()).toBe(true);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(host.replayRequests).toEqual([{ sinceGeneration: GENERATION, sinceSeq: 0 }]);
+
+			host.emit("future five");
+			await awaitPosts(provider, 4);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nretained two",
+				"GJC notice\nretained three",
+				"GJC notice\nfuture four",
+				"GJC notice\nfuture five",
+			]);
+		});
+	});
+}, 20_000);
+test("a replay answered from a rolled generation retires the attachment instead of publishing it", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			// The host restarts its stream while this attachment is off the air, so the
+			// resume it issues names a generation the host no longer keeps a log for.
+			host.drop();
+			host.roll();
+			host.emit("after the roll");
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(50);
+			// A reset stream shares no sequence space with this cursor, so its events
+			// cannot be ordered against it: publishing them here would deliver the new
+			// generation's log once on the stale root and again on the rebuilt one.
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
+
+			await supersede();
+			reconcile();
+			host.accept(await awaitSocket(3));
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			// The rebuilt attachment owns the new generation, so the event it fenced off is
+			// published there, exactly once.
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nafter the roll"]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+			]);
+		});
+	});
+}, 20_000);
+
+test("a replay whose gap never states its range fails the barrier instead of publishing behind it", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			host.drop();
+			host.emit("two");
+			// The answer claims a gap without saying which sequences it covers. Nothing can
+			// be concluded from it — not that the range is closed, not that it is lost.
+			host.malformedGap = true;
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			await Bun.sleep(50);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
+
+			host.malformedGap = false;
+			reconcile();
+			host.accept(await awaitSocket(3));
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			// The rebuild asks the same gap from the same cursor, and a readable answer
+			// closes it: the event the unreadable one fenced off is published, once.
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 			expect(host.replayRequests).toEqual([
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
 				{ sinceGeneration: GENERATION, sinceSeq: 1 },
@@ -628,4 +850,200 @@ test("a hold buffer that overflows re-fetches the gap instead of skipping the fr
 			]);
 		});
 	});
-}, 30_000);
+}, 20_000);
+test("a gap that concedes sequences this cursor never asked about is refused, not skipped", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			host.emit("retained one");
+			host.emit("retained two");
+			// The daemon attaches from zero and the host returns both events it retained,
+			// but the gap it states covers seq 5 — a range this request never asked about.
+			// Conceding it would step the cursor to 5 and drop seq 1 and 2 as duplicates of
+			// events nobody ever published.
+			host.forcedGap = { kind: "sequence_gap", fromSeq: 5, toSeq: 5, resyncQueries: ["Q01"] };
+
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+			await awaitReplayRequests(host, 1);
+			await Bun.sleep(50);
+			// Nothing is published behind an answer that contradicts the request it answers,
+			// and the cursor stays at zero, so nothing is conceded either.
+			expect(provider.posts).toEqual([]);
+			expect(warnings).toContain(
+				`chat daemon replay barrier failed (replay conceded sequences 5-5 for a request that resumed from seq 0); rebuilding session ${SESSION_ID} at generation ${GENERATION} from seq 0.`,
+			);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([]);
+
+			host.forcedGap = undefined;
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			// The rebuild re-asks the same cursor, and a consistent answer closes it: the
+			// retained events the refused gap fenced off are published, in sequence, once.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nretained one",
+				"GJC notice\nretained two",
+			]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+			]);
+		});
+	});
+}, 20_000);
+
+test("a gap that concedes sequences the same answer returns is refused, not skipped", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			host.emit("retained one");
+			host.emit("retained two");
+			// This gap does open where the request resumed, but it claims the same two
+			// sequences the answer hands back. A host cannot have both lost and retained
+			// them, so conceding the range would discard the events it arrived with.
+			host.forcedGap = { kind: "sequence_gap", fromSeq: 1, toSeq: 2, resyncQueries: ["Q01"] };
+
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+			await awaitReplayRequests(host, 1);
+			await Bun.sleep(50);
+			expect(provider.posts).toEqual([]);
+			expect(warnings).toContain(
+				`chat daemon replay barrier failed (replay conceded sequences 1-2 while returning seq 1); rebuilding session ${SESSION_ID} at generation ${GENERATION} from seq 0.`,
+			);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([]);
+
+			host.forcedGap = undefined;
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nretained one",
+				"GJC notice\nretained two",
+			]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+			]);
+		});
+	});
+}, 20_000);
+
+test("a conceded gap carries the cursor over the loss even when the retained suffix is filtered away", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		await withFakeTransport(async () => {
+			// A two-frame ring that evicted seq 1 and kept only capability-gated
+			// sequences: the host still holds seq 2 and 3, but strips both from this
+			// connection's answer. So the concession arrives with an empty suffix, and
+			// nothing in the answer can carry the cursor over the range it named.
+			const host = new FakeSessionHost(2);
+			host.emit("evicted one");
+			host.emitGated();
+			host.emitGated();
+
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+			await awaitReplayRequests(host, 1);
+			await Bun.sleep(50);
+			expect(provider.posts).toEqual([]);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
+				`chat daemon replay conceded a retention gap (sequences 1-1 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 2.`,
+			]);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			host.emit("after gap");
+			await awaitPosts(provider, 1);
+			await Bun.sleep(20);
+
+			// The resume asks for the first sequence the host still holds, not the evicted
+			// one already conceded: a cursor left below the gap would re-ask for it on
+			// every reconnect and concede the same permanent loss again, forever.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toHaveLength(1);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\nafter gap"]);
+		});
+	});
+}, 20_000);
+test("a conceded gap publishes the sequences live delivery already carried instead of dropping them", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost(2);
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+			host.drop();
+			// The replay is answered by hand below, so the round's own answer can name a
+			// gap over a sequence the replacement socket has already delivered.
+			host.stallReplay = true;
+
+			reconcile();
+			const replacement = await awaitSocket(2);
+			host.accept(replacement);
+			await awaitReplayRequests(host, 2);
+
+			// All three ride the replacement socket while the barrier holds them, so the
+			// gap the answer names below covers a frame this side is already holding.
+			const recoverable = host.emit("live recoverable");
+			const filtered = host.emitStream();
+			const tail = host.emit("tail");
+			expect(host.lastReplayId).toBeDefined();
+			replacement.deliver({
+				type: "event_replay_result",
+				id: host.lastReplayId,
+				ok: true,
+				events: [filtered, tail],
+				gap: {
+					kind: "sequence_gap",
+					fromSeq: Number(recoverable.seq),
+					toSeq: Number(recoverable.seq),
+					resyncQueries: ["Q01"],
+				},
+				generation: GENERATION,
+				lastSeq: Number(tail.seq),
+			});
+			await Bun.sleep(100);
+
+			// The host evicted the sequence, but live delivery kept it: the two producers
+			// fail independently, so the concession costs only what neither of them holds.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\nlive recoverable",
+				"GJC notice\ntail",
+			]);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
+				`chat daemon replay conceded a retention gap (sequences 2-2 are gone from the host, 1 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+			]);
+
+			// The recovered frame did not strand the cursor below the conceded range: the
+			// stream continues on the socket it already has, in sequence, exactly once.
+			host.emit("after gap");
+			await awaitPosts(provider, 4);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\nlive recoverable",
+				"GJC notice\ntail",
+				"GJC notice\nafter gap",
+			]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+		});
+	});
+}, 20_000);
