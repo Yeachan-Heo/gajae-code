@@ -460,6 +460,9 @@ const RECOVERABLE_TRANSCRIPT_FIELDS = ["role", "body", "content", "toolCallId", 
 /** Stands in for a tool result whose transcript entry replay could not restore. */
 const TRANSCRIPT_TOOL_RESULT_UNAVAILABLE = "The transcript entry holding this tool result could not be replayed.";
 
+/** Stands in for a tool call the transcript never recorded a result for. */
+const TRANSCRIPT_TOOL_CALL_UNRESOLVED = "The session transcript ends without a result for this tool call.";
+
 function decodeTranscriptContinuation(field: string, body: string): unknown {
 	if (field !== "content" && field !== "isError") return body;
 	try {
@@ -2482,13 +2485,14 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		toolCallId: string,
 		tool: { name: string; args: unknown },
+		reason: string = TRANSCRIPT_TOOL_RESULT_UNAVAILABLE,
 	): Promise<void> {
 		for (const notification of mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
 				toolCallId,
 				toolName: tool.name,
-				result: { content: [{ type: "text", text: TRANSCRIPT_TOOL_RESULT_UNAVAILABLE }] },
+				result: { content: [{ type: "text", text: reason }] },
 				isError: true,
 			} as never,
 			id,
@@ -2608,12 +2612,24 @@ export class AcpAgent implements Agent {
 				}
 				if (message.role === "toolResult" && typeof message.toolCallId === "string") {
 					const replayTool = replayTools.get(message.toolCallId);
-					const toolName = typeof message.toolName === "string" ? message.toolName : replayTool?.name;
 					// Pairing outranks content: publishing a result whose `tool_call` start
 					// never reached the client renders an update for a call it never saw begin.
-					if (!toolName || !replayTool) {
+					if (!replayTool) {
 						unreplayableEntries++;
 						unreplayableReason ??= "transcript_tool_call_unavailable";
+						continue;
+					}
+					// The start already named the call, so a result row that lost its own name
+					// falls back to it rather than dropping a result the client can still place.
+					const toolName =
+						typeof message.toolName === "string" && message.toolName ? message.toolName : replayTool.name;
+					// A start with no usable name anywhere still has to reach a terminal status:
+					// skipping it here is what left the call spinning at `pending` forever.
+					if (!toolName) {
+						unreplayableEntries++;
+						unreplayableReason ??= "transcript_tool_call_unavailable";
+						replayTools.delete(message.toolCallId);
+						await this.#closeUnresolvedReplayToolCall(id, adapter, record.cwd, message.toolCallId, replayTool);
 						continue;
 					}
 					const resultContent = richContent
@@ -2657,6 +2673,21 @@ export class AcpAgent implements Agent {
 			}
 			cursor = typeof page?.continuationCursor === "string" ? page.continuationCursor : undefined;
 			if (cursor) continue;
+			// Every start still parked here outlived its result row, so replay ends it
+			// instead of handing the client a tool call nothing will ever complete.
+			for (const [toolCallId, tool] of replayTools) {
+				unreplayableEntries++;
+				unreplayableReason ??= "transcript_tool_call_unavailable";
+				await this.#closeUnresolvedReplayToolCall(
+					id,
+					adapter,
+					record.cwd,
+					toolCallId,
+					tool,
+					TRANSCRIPT_TOOL_CALL_UNRESOLVED,
+				);
+			}
+			replayTools.clear();
 			// An entry without its production body is skipped, never fatal: losing one
 			// transcript row must not revoke `session/load` for the whole session.
 			if (unreplayableReason)

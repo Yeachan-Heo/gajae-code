@@ -63,6 +63,29 @@ function textChunks(notifications: SessionNotification[]): Array<Record<string, 
 	return chunks;
 }
 
+/** Every tool-call lifecycle update the client saw, in order, as `id:status`. */
+function toolCallStates(notifications: SessionNotification[]): string[] {
+	const states: string[] = [];
+	for (const notification of notifications) {
+		const update = notification.update as { sessionUpdate: string; toolCallId?: string; status?: string };
+		if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") continue;
+		states.push(`${update.sessionUpdate}:${update.toolCallId}:${update.status}`);
+	}
+	return states;
+}
+
+/** Tool calls the client is still showing as unfinished after replay returned. */
+function pendingToolCalls(notifications: SessionNotification[]): string[] {
+	const status = new Map<string, string>();
+	for (const notification of notifications) {
+		const update = notification.update as { sessionUpdate: string; toolCallId?: string; status?: string };
+		if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") continue;
+		if (typeof update.toolCallId !== "string") continue;
+		status.set(update.toolCallId, String(update.status));
+	}
+	return [...status].filter(([, value]) => value !== "completed" && value !== "failed").map(([id]) => id);
+}
+
 describe("ACP transcript replay degradation", () => {
 	let tempDir: TempDir;
 	let connectionAbort: AbortController;
@@ -267,6 +290,94 @@ describe("ACP transcript replay degradation", () => {
 			gjcTranscriptImageReplay: { available: false, reason: "historical_transcript_images_unavailable" },
 		});
 		expect(skipBoundaries(replayed)).toEqual([]);
+	});
+
+	// A `tool_call` start is published before its result is read, so every path that
+	// passes over the matching `toolResult` owes the client an end event: a skipped
+	// row otherwise leaves the call at `pending` for the life of the session (#4063).
+	it("names a replayed tool result from its start when the result row lost the name", async () => {
+		const replayed = await loadReplayedSession([
+			{
+				id: "assistant-1",
+				role: "assistant",
+				textSummary: "Reading",
+				body: "Reading",
+				content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "missing.ts" } }],
+			},
+			{
+				id: "result-1",
+				role: "toolResult",
+				textSummary: "File not found",
+				body: "File not found",
+				content: [{ type: "text", text: "File not found" }],
+				toolCallId: "tool-1",
+				toolName: "",
+			},
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:completed"]);
+		expect(pendingToolCalls(replayed)).toEqual([]);
+		expect(skipBoundaries(replayed)).toEqual([]);
+	});
+
+	it("fails a replayed tool call that no transcript field can name", async () => {
+		const replayed = await loadReplayedSession([
+			{
+				id: "assistant-1",
+				role: "assistant",
+				textSummary: "Reading",
+				body: "Reading",
+				content: [{ type: "toolCall", id: "tool-1", name: "", arguments: {} }],
+			},
+			{
+				id: "result-1",
+				role: "toolResult",
+				textSummary: "File not found",
+				body: "File not found",
+				content: [{ type: "text", text: "File not found" }],
+				toolCallId: "tool-1",
+			},
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:failed"]);
+		expect(pendingToolCalls(replayed)).toEqual([]);
+		expect(JSON.stringify(replayed)).toContain("could not be replayed");
+		expect(skipBoundaries(replayed)).toEqual([{ count: 1, reason: "transcript_tool_call_unavailable" }]);
+	});
+
+	it("fails a replayed tool call the transcript never resolved", async () => {
+		const replayed = await loadReplayedSession([
+			{
+				id: "assistant-1",
+				role: "assistant",
+				textSummary: "Reading",
+				body: "Reading",
+				content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "missing.ts" } }],
+			},
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:failed"]);
+		expect(pendingToolCalls(replayed)).toEqual([]);
+		expect(JSON.stringify(replayed)).toContain("without a result for this tool call");
+		expect(skipBoundaries(replayed)).toEqual([{ count: 1, reason: "transcript_tool_call_unavailable" }]);
+	});
+
+	it("drops a tool result whose call was never published without stranding one", async () => {
+		const replayed = await loadReplayedSession([
+			{ id: "user-1", role: "user", textSummary: "Earlier request", body: "Earlier request" },
+			{
+				id: "result-1",
+				role: "toolResult",
+				textSummary: "File not found",
+				body: "File not found",
+				content: [{ type: "text", text: "File not found" }],
+				toolCallId: "ghost-tool",
+			},
+		]);
+
+		expect(toolCallStates(replayed)).toEqual([]);
+		expect(pendingToolCalls(replayed)).toEqual([]);
+		expect(skipBoundaries(replayed)).toEqual([{ count: 1, reason: "transcript_tool_call_unavailable" }]);
 	});
 });
 
