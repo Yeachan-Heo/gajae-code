@@ -88,6 +88,17 @@ function takeFlagValue(args: readonly string[], index: number, flag: string, all
 	return value;
 }
 
+function takePromptValue(
+	args: readonly string[],
+	index: number,
+	flag: string,
+	allowInlineDashPrefixed: boolean,
+): string {
+	const value = args[index + 1];
+	const allowSeparatedDashPrefixed = value === "-" || value?.startsWith("- ") === true;
+	return takeFlagValue(args, index, flag, allowInlineDashPrefixed || allowSeparatedDashPrefixed);
+}
+
 export function parseArgs(args: string[]): Args {
 	const result: Args = {
 		messages: [],
@@ -173,9 +184,9 @@ export function parseArgs(args: string[]): Args {
 			}
 			result.credential = args[++i];
 		} else if (arg === "--system-prompt") {
-			result.systemPrompt = takeFlagValue(args, i++, "--system-prompt", hasInlineValue);
+			result.systemPrompt = takePromptValue(args, i++, "--system-prompt", hasInlineValue);
 		} else if (arg === "--append-system-prompt") {
-			result.appendSystemPrompt = takeFlagValue(args, i++, "--append-system-prompt", hasInlineValue);
+			result.appendSystemPrompt = takePromptValue(args, i++, "--append-system-prompt", hasInlineValue);
 		} else if (arg === "--clipboard-transport") {
 			const next = args[i + 1];
 			if (!next || next.startsWith("-")) {
@@ -284,7 +295,7 @@ export function parseArgs(args: string[]): Args {
 	}
 
 	if (result.default && !result.mpreset) {
-		throw new Error("--default requires --mpreset <name>");
+		throw new CliParseError("--default requires --mpreset <name>");
 	}
 	if (
 		result.mcpConfig !== undefined &&

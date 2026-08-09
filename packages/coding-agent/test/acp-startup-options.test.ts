@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
+import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { type CliConfig, CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
+import Acp from "../src/commands/acp";
 import { resolveAcpStartupOptions } from "../src/main";
 import {
 	acpProviderRegistrations,
@@ -21,6 +24,26 @@ import {
 } from "../src/sdk/acp/final-text";
 
 const model = { provider: "openai-codex", id: "gpt-5.6" } as CreateAgentSessionOptions["model"];
+
+const TEST_CONFIG: CliConfig = {
+	bin: "gjc",
+	version: "0.0.0-test",
+	commands: new Map(),
+};
+
+async function runAcpCli(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const proc = Bun.spawn({
+		cmd: [process.execPath, path.join(import.meta.dir, "../src/cli.ts"), "acp", ...args],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stdout, stderr] = await Promise.all([
+		proc.exited,
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+	]);
+	return { exitCode, stdout, stderr };
+}
 
 function providerNames(capabilities: unknown, env: NodeJS.ProcessEnv = {}): string[] {
 	return acpProviderRegistrations(capabilities as never, env).map(provider => provider.capability);
@@ -507,20 +530,57 @@ test("ACP rejects unknown flags instead of silently ignoring them", () => {
 	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: extension flags");
 });
 
+test("--default without --mpreset is a typed CLI parse error", () => {
+	expect(() => parseArgs(["--default"])).toThrow(CliParseError);
+	expect(() => parseArgs(["--default"])).toThrow("--default requires --mpreset <name>");
+});
+
+test("ACP command maps invalid argv to typed CLI usage errors", async () => {
+	await expect(new Acp(["--mpresett"], TEST_CONFIG).run()).rejects.toBeInstanceOf(CliParseError);
+	await expect(new Acp(["--mpresett"], TEST_CONFIG).run()).rejects.toThrow("Unknown ACP option: --mpresett");
+
+	for (const modeArgs of [
+		["--acp-terminal-auth", "--mode", "text"],
+		["--acp-terminal-auth", "--mode=text"],
+	]) {
+		await expect(new Acp(modeArgs, TEST_CONFIG).run()).rejects.toBeInstanceOf(CliParseError);
+		await expect(new Acp(modeArgs, TEST_CONFIG).run()).rejects.toThrow(
+			"--acp-terminal-auth only supports --mode acp",
+		);
+	}
+});
+
+test("ACP command renders usage and exits nonzero for invalid argv", async () => {
+	for (const [args, message] of [
+		[["--mpresett"], "Unknown ACP option: --mpresett"],
+		[["--default"], "--default requires --mpreset <name>"],
+		[["--acp-terminal-auth", "--mode", "text"], "--acp-terminal-auth only supports --mode acp"],
+	] as const) {
+		const result = await runAcpCli([...args]);
+		expect(result.exitCode).toBe(2);
+		expect(result.stderr).toContain(message);
+		expect(result.stdout).toContain("USAGE");
+	}
+}, 15_000);
+
 test("ACP option values cannot consume dash-prefixed unknown flags", () => {
 	for (const args of [
 		["--mpreset", "--mystery"],
 		["--mpreset=--mystery"],
 		["--tools", "--mystery"],
 		["--model", "--mystery"],
+		["--system-prompt", "--mystery"],
+		["--append-system-prompt", "--mystery"],
 	]) {
 		expect(() => parseArgs(args)).toThrow(/requires a value/);
 	}
 });
 
-test("inline opaque prompt values may start with a dash", () => {
+test("opaque prompt values may start with a dash in explicit or separated form", () => {
 	expect(parseArgs(["--system-prompt=-literal"]).systemPrompt).toBe("-literal");
 	expect(parseArgs(["--append-system-prompt=-literal"]).appendSystemPrompt).toBe("-literal");
+	expect(parseArgs(["--system-prompt", "- Be concise"]).systemPrompt).toBe("- Be concise");
+	expect(parseArgs(["--append-system-prompt", "- Be concise"]).appendSystemPrompt).toBe("- Be concise");
 });
 test("ACP rejects --mcp-config instead of ignoring it", () => {
 	const parsed = parseArgs(["--mcp-config", "/tmp/gjc-mcp.json"]);

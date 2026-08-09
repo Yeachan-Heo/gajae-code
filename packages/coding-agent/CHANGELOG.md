@@ -5,6 +5,7 @@
 ### Fixed
 
 - Shadow-mode cold-session builds now compare the actual sidecar-derived provider context against the authoritative eager context and expose check/mismatch counters in `/session`; corrupt provider metadata produces a counted mismatch without weakening transcript authority. Cold branch activation now resolves compacted 10k-entry branches through one bounded ordinal-index scan and one bounded transcript range read instead of scanning a dictionary partition for every ancestor, and cold dictionary lookup skips unrelated JSON decoding while retaining full partition-digest verification. Bounded first-open, exact-reopen, and lazy cold-entry paths apply the same stale OpenAI Responses replay-metadata sanitation as eager resume.
+- ACP startup now rejects unrecognized command flags and incompatible terminal-auth modes through the normal CLI usage-error path, while preserving separate dash-leading system-prompt text.
 
 ### Added
 
