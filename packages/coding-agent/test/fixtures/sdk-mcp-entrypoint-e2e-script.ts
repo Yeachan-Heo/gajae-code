@@ -1,8 +1,9 @@
 // Entrypoint-level proof: `gjc mcp-serve sdk` speaks JSON-RPC over stdio and its
 // session control reaches a recorded SDK WebSocket (no coordinator paths).
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Broker } from "../../src/sdk/broker/broker";
 
 // fixtures/ -> test/ -> package root (packages/coding-agent)
 const packageRoot = path.resolve(import.meta.dir, "..", "..");
@@ -12,6 +13,7 @@ const repo = await mkdtemp(path.join(tmpdir(), "mcp-sdk-e2e-"));
 const received: string[] = [];
 let server: ReturnType<typeof Bun.serve> | undefined;
 let child: ReturnType<typeof Bun.spawn> | undefined;
+let broker: Broker | undefined;
 
 const cleanup = async () => {
 	if (child) {
@@ -34,6 +36,10 @@ const cleanup = async () => {
 			// ignore
 		}
 		server = undefined;
+	}
+	if (broker) {
+		await broker.stop();
+		broker = undefined;
 	}
 	await rm(repo, { recursive: true, force: true });
 };
@@ -64,11 +70,33 @@ try {
 			},
 		},
 	});
-	await mkdir(path.join(repo, ".gjc", "state", "sdk"), { recursive: true });
+	const stateRoot = path.join(repo, ".gjc", "state");
+	const endpointPath = path.join(stateRoot, "sdk", "s1.json");
+	await mkdir(path.dirname(endpointPath), { recursive: true });
 	await writeFile(
-		path.join(repo, ".gjc", "state", "sdk", "s1.json"),
-		JSON.stringify({ url: `ws://127.0.0.1:${server.port}`, token: "tok" }),
+		endpointPath,
+		JSON.stringify({ sessionId: "s1", url: `ws://127.0.0.1:${server.port}`, token: "tok", pid: process.pid }),
 	);
+	const agentDir = path.join(repo, "agent");
+	broker = new Broker({ agentDir, packageGeneration: "test" });
+	await broker.start();
+	await broker.index.append({
+		type: "host_registered",
+		sessionId: "s1",
+		locator: { repo, stateRoot },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs: (await stat(endpointPath)).mtimeMs,
+	});
+	await broker.index.append({
+		type: "host_heartbeat",
+		sessionId: "s1",
+		locator: { repo, stateRoot },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs: (await stat(endpointPath)).mtimeMs,
+		activity: { state: "idle", at: Date.now() },
+	});
 
 	// Default: package source under test (CI monorepo with natives).
 	// Override with GJC_MCP_E2E_BIN for local machines lacking matching natives.
@@ -82,7 +110,7 @@ try {
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
-		env: process.env,
+		env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 	});
 	child = proc;
 	proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" })}\n`);

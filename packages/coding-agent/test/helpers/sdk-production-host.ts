@@ -19,7 +19,7 @@ export async function startProductionSdkHost(
 	cwd: string,
 	options: { acceptPromptPreflightWithoutExecution?: boolean } = {},
 ): Promise<{
-	endpoint: { url: string; token: string };
+	endpoint: { url: string; token: string; pid: number };
 	sessionId: string;
 	endpointMtimeMs: number;
 	observed: Array<{ kind: "control" | "query"; operation: string }>;
@@ -113,7 +113,7 @@ export async function startProductionSdkHost(
 				if (Date.now() > deadline) throw new Error("Timed out starting production SDK host");
 				await Bun.sleep(10);
 			}
-			const endpoint = JSON.parse(fs.readFileSync(file, "utf8")) as { url: string; token: string };
+			const endpoint = JSON.parse(fs.readFileSync(file, "utf8")) as { url: string; token: string; pid: number };
 			const endpointMtimeMs = fs.statSync(file).mtimeMs;
 			const triggerAsk = (question: string, options: string[]) => {
 				const authority = session.getAskAnswerSource();

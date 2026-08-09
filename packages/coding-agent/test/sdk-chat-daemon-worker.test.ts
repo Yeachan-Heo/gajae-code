@@ -1368,8 +1368,17 @@ describe("chat daemon worker", () => {
 					sessionId: host.sessionId,
 					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
 					endpointGeneration: 1,
-					pid: process.pid,
+					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
+				});
+				await index.append({
+					type: "host_heartbeat",
+					sessionId: host.sessionId,
+					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+					endpointGeneration: 1,
+					pid: host.endpoint.pid,
+					endpointMtimeMs: host.endpointMtimeMs,
+					activity: { state: "idle", at: Date.now() },
 				});
 				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
 				const rootKey = slackConversationKey({ teamId: "team", channelId: "channel", rootTs: "root" });
@@ -1409,8 +1418,17 @@ describe("chat daemon worker", () => {
 					sessionId: host.sessionId,
 					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
 					endpointGeneration: 2,
-					pid: process.pid,
+					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
+				});
+				await index.append({
+					type: "host_heartbeat",
+					sessionId: host.sessionId,
+					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+					endpointGeneration: 2,
+					pid: host.endpoint.pid,
+					endpointMtimeMs: host.endpointMtimeMs,
+					activity: { state: "idle", at: Date.now() },
 				});
 				await store.transact(rootKey, current =>
 					current
