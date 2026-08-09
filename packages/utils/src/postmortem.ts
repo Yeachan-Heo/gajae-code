@@ -224,30 +224,32 @@ function readErrorLike(reason: unknown): { name: string; message: string; stack?
 	if (typeof reason !== "object" || reason === null) return undefined;
 	const name = readErrorField(reason, "name");
 	const message = readErrorField(reason, "message");
-	// A field whose accessor throws is still a field the throwable carries; it
-	// just cannot hand over the value. Both must be carried for error shape: a
-	// refusal is evidence of the field, an absence is not. A throwable that
-	// refuses every field stays error-shaped and is recorded as unreadable —
-	// serializing it instead renders an `Error` as `{}`, which is silence.
-	if (name === undefined || message === undefined) return undefined;
-	const shaped = { name: name ?? UNREADABLE_FIELD, message: message ?? UNREADABLE_FIELD };
-
 	const stack = readErrorField(reason, "stack");
-	if (typeof stack === "string") return { ...shaped, stack };
-	// An accessor that refuses to answer is still evidence of error shape,
-	// exactly like a real `Error` is: the throwable carries the field, it just
-	// cannot hand over the value. So whatever was readable stays the diagnostic
-	// instead of being dropped for a serialization.
-	if (stack === null || name === null || message === null) return shaped;
-	try {
-		if (Object.prototype.toString.call(reason) === "[object Error]") return shaped;
-	} catch {
-		// A `Symbol.toStringTag` that throws answers nothing about error shape,
-		// and must never escape: this read is the last thing standing between a
-		// hostile throwable and a suppressed crash record. Fall through to the
-		// serialization, which still keeps the payload.
+
+	// Read every field before deciding whether this is error-shaped. A missing
+	// name or message cannot discard a readable trace, and one refusing accessor
+	// cannot prevent either sibling from being attempted.
+	const carriesErrorField =
+		(name !== undefined && message !== undefined) || name === null || message === null || stack !== undefined;
+	if (!carriesErrorField) {
+		try {
+			if (Object.prototype.toString.call(reason) !== "[object Error]") return undefined;
+		} catch {
+			// A `Symbol.toStringTag` that throws answers nothing about error shape,
+			// so fall through to serialization rather than losing the payload.
+			return undefined;
+		}
 	}
-	return undefined;
+
+	const shaped = {
+		name: name === null ? UNREADABLE_FIELD : (name ?? "Error"),
+		message: message === null ? UNREADABLE_FIELD : (message ?? "(no message)"),
+	};
+	if (typeof stack === "string") return { ...shaped, stack };
+	if (stack === null) {
+		return { ...shaped, stack: `${shaped.name}: ${shaped.message}\n${UNREADABLE_FIELD}` };
+	}
+	return shaped;
 }
 
 /**
@@ -293,8 +295,9 @@ const UNREADABLE_THROWABLE = "[unreadable throwable]";
  * the guard lives here instead of at each consumer: the crash log, stderr and
  * the structured log all receive plain strings they can read unconditionally.
  *
- * Total by contract: it always returns a diagnostic and never throws. Whatever
- * answered is kept; whatever refused is reported as unreadable.
+ * Total by contract: it always returns a diagnostic and never throws. Each
+ * field is attempted independently: answers survive and only refusals are
+ * reported as unreadable.
  */
 function describeFatal(reason: unknown): FatalDiagnostic {
 	try {

@@ -49,6 +49,17 @@ const throwables: readonly Throwables[] = [
 		keeps: ["LazyFailure: [unreadable]", "postmortem-unreadable-throwables.test.ts"],
 	},
 	{
+		what: "same-realm Error whose name refuses while stack remains readable",
+		build: () => {
+			const error = new Error("discarded message");
+			Object.defineProperty(error, "name", refusingAccessor("name"));
+			Object.defineProperty(error, "message", { configurable: true, value: undefined });
+			error.stack = "Error\n    at load-bearing-frame";
+			return error;
+		},
+		keeps: ["[unreadable]: (no message)", "load-bearing-frame"],
+	},
+	{
 		what: "same-realm Error whose name, message and stack getters all throw",
 		build: () => errorRefusing(["name", "message", "stack"]),
 		// Nothing answered. Reported as unreadable, which is a fact; serializing
@@ -71,7 +82,7 @@ const throwables: readonly Throwables[] = [
 					},
 				},
 			),
-		keeps: ["HostileFailure: hostile fatal survives"],
+		keeps: ["HostileFailure: hostile fatal survives", "\n[unreadable]\n"],
 	},
 	{
 		what: "Proxy that answers nothing at all",
