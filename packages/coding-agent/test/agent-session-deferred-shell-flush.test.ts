@@ -177,6 +177,57 @@ describe("deferred shell execution publication boundary", () => {
 		expect(persistedShellMessages(harness.sessionManager, "pythonExecution")).toHaveLength(1);
 		expect(harness.session.hasPendingPythonMessages).toBe(false);
 	});
+	it("reports partial publication and retries persistence without duplicating agent state", async () => {
+		const harness = createHarness(sessions);
+		const first = await harness.startTurn("hello");
+
+		const persistedCalls: string[] = [];
+		harness.session.recordBashResult("printf retry", shellResult("retry"), {
+			onPersisted: () => persistedCalls.push("bash"),
+		});
+		harness.session.recordPythonResult("print('still flushes')", shellResult("python"), {
+			onPersisted: () => persistedCalls.push("python"),
+		});
+		await harness.session.respondAsBackground({ from: "0-Main", message: "ping", awaitReply: false });
+
+		const appendMessage = harness.sessionManager.appendMessage.bind(harness.sessionManager);
+		let failBashOnce = true;
+		vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation(message => {
+			if (message.role === "bashExecution" && failBashOnce) {
+				failBashOnce = false;
+				throw new Error("transient bash persistence failure");
+			}
+			return appendMessage(message);
+		});
+
+		first.turn.finish();
+		await expect(first.prompt).rejects.toThrow(
+			"Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry",
+		);
+
+		expect(shellMessages(harness.agent.state.messages, "bashExecution")).toHaveLength(1);
+		expect(persistedShellMessages(harness.sessionManager, "bashExecution")).toHaveLength(0);
+		expect(harness.session.hasPendingBashMessages).toBe(true);
+
+		expect(shellMessages(harness.agent.state.messages, "pythonExecution")).toHaveLength(1);
+		expect(persistedShellMessages(harness.sessionManager, "pythonExecution")).toHaveLength(1);
+		expect(harness.session.hasPendingPythonMessages).toBe(false);
+		expect(persistedCalls).toEqual(["python"]);
+		expect(
+			harness.agent.state.messages.filter(
+				message => message.role === "custom" && String(message.customType).startsWith("irc:"),
+			),
+		).toHaveLength(1);
+
+		const second = await harness.startTurn("again");
+		second.turn.finish();
+		await second.prompt;
+
+		expect(shellMessages(harness.agent.state.messages, "bashExecution")).toHaveLength(1);
+		expect(persistedShellMessages(harness.sessionManager, "bashExecution")).toHaveLength(1);
+		expect(harness.session.hasPendingBashMessages).toBe(false);
+		expect(persistedCalls).toEqual(["python", "bash"]);
+	});
 
 	it("does not republish a turn-end-published block on the following prompt", async () => {
 		const harness = createHarness(sessions);

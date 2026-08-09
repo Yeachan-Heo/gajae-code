@@ -2029,7 +2029,11 @@ export class AgentSession {
 
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
-	#pendingBashMessages: Array<{ message: BashExecutionMessage; onPersisted?: () => void }> = [];
+	#pendingBashMessages: Array<{
+		message: BashExecutionMessage;
+		onPersisted?: () => void;
+		appendedToAgent: boolean;
+	}> = [];
 	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
 
 	// Python execution state
@@ -2046,7 +2050,11 @@ export class AgentSession {
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	readonly #ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
-	#pendingPythonMessages: Array<{ message: PythonExecutionMessage; onPersisted?: () => void }> = [];
+	#pendingPythonMessages: Array<{
+		message: PythonExecutionMessage;
+		onPersisted?: () => void;
+		appendedToAgent: boolean;
+	}> = [];
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -2604,16 +2612,41 @@ export class AgentSession {
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
 			this.#refreshTeamWorkerHeartbeat();
-			// The turn is over, so nothing can split a tool_use/tool_result pair any
-			// more: a `!`/`$` block that finished mid-stream must own its place in
-			// agent state and the session now, not at the next prompt. Until it does,
-			// the TUI shows output the transcript lacks and `onPersisted` stays unfired,
-			// so a rebuild in that gap drops the only rendering of the execution.
-			this.#flushPendingBashMessages();
-			this.#flushPendingPythonMessages();
-			this.#flushPendingBackgroundExchanges();
+			let flushError: unknown;
+			try {
+				// The turn is over, so nothing can split a tool_use/tool_result pair any
+				// more: a `!`/`$` block that finished mid-stream must own its place in
+				// agent state and the session now, not at the next prompt. Until it does,
+				// the TUI shows output the transcript lacks and `onPersisted` stays unfired,
+				// so a rebuild in that gap drops the only rendering of the execution.
+				this.#flushPendingPromptMessages();
+			} catch (error) {
+				flushError = error;
+			}
 			this.#flushPendingAgentEnd();
+			if (flushError) throw flushError;
 		}
+	}
+
+	#flushPendingPromptMessages(): void {
+		const errors: unknown[] = [];
+		try {
+			this.#flushPendingBashMessages();
+		} catch (error) {
+			errors.push(error);
+		}
+		try {
+			this.#flushPendingPythonMessages();
+		} catch (error) {
+			errors.push(error);
+		}
+		try {
+			this.#flushPendingBackgroundExchanges();
+		} catch (error) {
+			errors.push(error);
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Multiple deferred prompt messages failed to flush");
 	}
 
 	#refreshTeamWorkerHeartbeat(): void {
@@ -8831,10 +8864,8 @@ export class AgentSession {
 				this.#overflowMaintenanceAttempts = 0;
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			}
-			// Flush any pending bash messages before the new prompt
-			this.#flushPendingBashMessages();
-			this.#flushPendingPythonMessages();
-			this.#flushPendingBackgroundExchanges();
+			// Retry anything whose previous post-turn persistence failed before the new prompt.
+			this.#flushPendingPromptMessages();
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
@@ -16342,7 +16373,11 @@ export class AgentSession {
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
 			// Queue for later - will be flushed on agent_end
-			this.#pendingBashMessages.push({ message: bashMessage, onPersisted: options?.onPersisted });
+			this.#pendingBashMessages.push({
+				message: bashMessage,
+				onPersisted: options?.onPersisted,
+				appendedToAgent: false,
+			});
 		} else {
 			// Add to agent state immediately
 			this.agent.appendMessage(bashMessage);
@@ -16377,18 +16412,7 @@ export class AgentSession {
 	 * Called after agent turn completes to maintain proper message ordering.
 	 */
 	#flushPendingBashMessages(): void {
-		if (this.#pendingBashMessages.length === 0) return;
-
-		for (const pending of this.#pendingBashMessages) {
-			// Add to agent state
-			this.agent.appendMessage(pending.message);
-
-			// Save to session
-			this.sessionManager.appendMessage(pending.message);
-			pending.onPersisted?.();
-		}
-
-		this.#pendingBashMessages = [];
+		this.#flushPendingExecutionMessages(this.#pendingBashMessages, "bash");
 	}
 
 	// =========================================================================
@@ -16495,7 +16519,11 @@ export class AgentSession {
 
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
-			this.#pendingPythonMessages.push({ message: pythonMessage, onPersisted: options?.onPersisted });
+			this.#pendingPythonMessages.push({
+				message: pythonMessage,
+				onPersisted: options?.onPersisted,
+				appendedToAgent: false,
+			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
 			this.sessionManager.appendMessage(pythonMessage);
@@ -16558,15 +16586,54 @@ export class AgentSession {
 	 * Flush pending Python messages to agent state and session.
 	 */
 	#flushPendingPythonMessages(): void {
-		if (this.#pendingPythonMessages.length === 0) return;
+		this.#flushPendingExecutionMessages(this.#pendingPythonMessages, "python");
+	}
 
-		for (const pending of this.#pendingPythonMessages) {
-			this.agent.appendMessage(pending.message);
-			this.sessionManager.appendMessage(pending.message);
-			pending.onPersisted?.();
+	#flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		kind: "bash" | "python",
+	): void {
+		if (pendingMessages.length === 0) return;
+
+		const total = pendingMessages.length;
+		const remaining: typeof pendingMessages = [];
+		const errors: unknown[] = [];
+		let callbackFailureCount = 0;
+		for (const pending of pendingMessages) {
+			try {
+				if (!pending.appendedToAgent) {
+					this.agent.appendMessage(pending.message);
+					pending.appendedToAgent = true;
+				}
+				this.sessionManager.appendMessage(pending.message);
+			} catch (error) {
+				remaining.push(pending);
+				errors.push(error);
+				continue;
+			}
+
+			try {
+				pending.onPersisted?.();
+			} catch (error) {
+				callbackFailureCount++;
+				errors.push(error);
+			}
 		}
 
-		this.#pendingPythonMessages = [];
+		pendingMessages.splice(0, pendingMessages.length, ...remaining);
+		if (errors.length === 0) return;
+
+		const persistedCount = total - remaining.length;
+		const persistenceFailureCount = remaining.length;
+		const persistenceSummary =
+			persistenceFailureCount > 0
+				? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
+				: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
+		const callbackSummary =
+			callbackFailureCount > 0
+				? `; ${callbackFailureCount} onPersisted callback${callbackFailureCount === 1 ? "" : "s"} failed`
+				: "";
+		throw new AggregateError(errors, `${persistenceSummary}${callbackSummary}`);
 	}
 
 	// =========================================================================
