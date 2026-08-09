@@ -2607,25 +2607,37 @@ export class AgentSession {
 		}
 	}
 
-	#endInFlight(): void {
+	#endInFlight(): unknown {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
-		if (this.#promptInFlightCount === 0) {
-			this.#releasePowerAssertion();
-			this.#refreshTeamWorkerHeartbeat();
-			let flushError: unknown;
-			try {
-				// The turn is over, so nothing can split a tool_use/tool_result pair any
-				// more: a `!`/`$` block that finished mid-stream must own its place in
-				// agent state and the session now, not at the next prompt. Until it does,
-				// the TUI shows output the transcript lacks and `onPersisted` stays unfired,
-				// so a rebuild in that gap drops the only rendering of the execution.
-				this.#flushPendingPromptMessages();
-			} catch (error) {
-				flushError = error;
-			}
-			this.#flushPendingAgentEnd();
-			if (flushError) throw flushError;
+		if (this.#promptInFlightCount !== 0) return undefined;
+
+		this.#releasePowerAssertion();
+		this.#refreshTeamWorkerHeartbeat();
+		let flushError: unknown;
+		try {
+			// The turn is over, so nothing can split a tool_use/tool_result pair any
+			// more: a `!`/`$` block that finished mid-stream must own its place in
+			// agent state and the session now, not at the next prompt. Until it does,
+			// the TUI shows output the transcript lacks and `onPersisted` stays unfired,
+			// so a rebuild in that gap drops the only rendering of the execution.
+			this.#flushPendingPromptMessages();
+		} catch (error) {
+			flushError = error;
 		}
+		this.#flushPendingAgentEnd();
+		return flushError;
+	}
+	async #settleEndedInFlight(promptWait?: "publication" | "full"): Promise<void> {
+		const flushError = this.#endInFlight();
+		if (promptWait === "publication") {
+			await this.#agentEndPublicationPromise;
+		} else if (promptWait === "full") {
+			await this.#agentEndHandlingPromise;
+			await this.#waitForPostPromptRecovery();
+			await this.#agentEndPublicationPromise;
+		}
+		await this.#waitForSessionSettlement();
+		if (flushError) throw flushError;
 	}
 
 	#flushPendingPromptMessages(): void {
@@ -7669,8 +7681,7 @@ export class AgentSession {
 			await this.#waitForPostPromptRecovery();
 		} finally {
 			this.#removeEphemeralCustomMessages();
-			this.#endInFlight();
-			await this.#waitForSessionSettlement();
+			await this.#settleEndedInFlight();
 		}
 	}
 
@@ -9157,14 +9168,7 @@ export class AgentSession {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-			this.#endInFlight();
-			if (options?.skipPostPromptRecoveryWait) {
-				await this.#agentEndPublicationPromise;
-			} else {
-				await this.#agentEndHandlingPromise;
-				await this.#waitForPostPromptRecovery();
-				await this.#agentEndPublicationPromise;
-			}
+			await this.#settleEndedInFlight(options?.skipPostPromptRecoveryWait ? "publication" : "full");
 		}
 	}
 
@@ -16598,20 +16602,46 @@ export class AgentSession {
 		const total = pendingMessages.length;
 		const remaining: typeof pendingMessages = [];
 		const errors: unknown[] = [];
+		const persisted: string[] = [];
 		let callbackFailureCount = 0;
+		let persistenceBlocked = false;
+		let agentAppendBlocked = false;
 		for (const pending of pendingMessages) {
-			try {
-				if (!pending.appendedToAgent) {
+			if (!pending.appendedToAgent) {
+				if (agentAppendBlocked) {
+					remaining.push(pending);
+					continue;
+				}
+				try {
 					this.agent.appendMessage(pending.message);
 					pending.appendedToAgent = true;
+				} catch (error) {
+					agentAppendBlocked = true;
+					persistenceBlocked = true;
+					remaining.push(pending);
+					errors.push(error);
+					continue;
 				}
+			}
+
+			if (persistenceBlocked) {
+				remaining.push(pending);
+				continue;
+			}
+
+			try {
 				this.sessionManager.appendMessage(pending.message);
 			} catch (error) {
+				// Session entries form a leaf-linked transcript. Once one append fails,
+				// later entries must remain queued behind it or a retry would append the
+				// failed entry after messages that originally followed it.
+				persistenceBlocked = true;
 				remaining.push(pending);
 				errors.push(error);
 				continue;
 			}
 
+			persisted.push("command" in pending.message ? pending.message.command : pending.message.code);
 			try {
 				pending.onPersisted?.();
 			} catch (error) {
@@ -16633,7 +16663,11 @@ export class AgentSession {
 			callbackFailureCount > 0
 				? `; ${callbackFailureCount} onPersisted callback${callbackFailureCount === 1 ? "" : "s"} failed`
 				: "";
-		throw new AggregateError(errors, `${persistenceSummary}${callbackSummary}`);
+		const pending = remaining.map(item => ("command" in item.message ? item.message.command : item.message.code));
+		throw new AggregateError(
+			errors,
+			`${persistenceSummary}${callbackSummary}; persisted: ${JSON.stringify(persisted)}; pending: ${JSON.stringify(pending)}`,
+		);
 	}
 
 	// =========================================================================

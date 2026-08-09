@@ -119,6 +119,14 @@ function persistedShellMessages(
 		.map(entry => (entry as { message: AgentMessage }).message)
 		.filter(message => message.role === role);
 }
+function bashCommands(messages: readonly AgentMessage[]): string[] {
+	return messages
+		.filter(
+			(message): message is AgentMessage & { role: "bashExecution"; command: string } =>
+				message.role === "bashExecution",
+		)
+		.map(message => message.command);
+}
 
 describe("deferred shell execution publication boundary", () => {
 	const sessions: AgentSession[] = [];
@@ -202,7 +210,7 @@ describe("deferred shell execution publication boundary", () => {
 
 		first.turn.finish();
 		await expect(first.prompt).rejects.toThrow(
-			"Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry",
+			'Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry; persisted: []; pending: ["printf retry"]',
 		);
 
 		expect(shellMessages(harness.agent.state.messages, "bashExecution")).toHaveLength(1);
@@ -229,6 +237,107 @@ describe("deferred shell execution publication boundary", () => {
 		expect(persistedCalls).toEqual(["python", "bash"]);
 	});
 
+	it("retries failed bash blocks without reordering the persisted transcript", async () => {
+		const harness = createHarness(sessions);
+		const first = await harness.startTurn("hello");
+
+		for (let index = 1; index <= 5; index++) {
+			harness.session.recordBashResult(`cmd${index}`, shellResult(`out${index}`), {});
+		}
+
+		const appendMessage = harness.sessionManager.appendMessage.bind(harness.sessionManager);
+		let failCmd3Once = true;
+		vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation(message => {
+			if (message.role === "bashExecution" && message.command === "cmd3" && failCmd3Once) {
+				failCmd3Once = false;
+				throw new Error("transient cmd3 persistence failure");
+			}
+			return appendMessage(message);
+		});
+
+		first.turn.finish();
+		await expect(first.prompt).rejects.toThrow(
+			'Failed to persist 3 of 5 deferred bash execution messages; 2 persisted, failed messages remain pending for retry; persisted: ["cmd1","cmd2"]; pending: ["cmd3","cmd4","cmd5"]',
+		);
+
+		expect(bashCommands(harness.agent.state.messages)).toEqual(["cmd1", "cmd2", "cmd3", "cmd4", "cmd5"]);
+		expect(bashCommands(persistedShellMessages(harness.sessionManager, "bashExecution"))).toEqual(["cmd1", "cmd2"]);
+
+		const second = await harness.startTurn("again");
+		second.turn.finish();
+		await second.prompt;
+
+		expect(bashCommands(harness.agent.state.messages)).toEqual(["cmd1", "cmd2", "cmd3", "cmd4", "cmd5"]);
+		expect(bashCommands(persistedShellMessages(harness.sessionManager, "bashExecution"))).toEqual([
+			"cmd1",
+			"cmd2",
+			"cmd3",
+			"cmd4",
+			"cmd5",
+		]);
+	});
+
+	it("preserves bash block order across multiple persistence failures", async () => {
+		const harness = createHarness(sessions);
+		const first = await harness.startTurn("hello");
+
+		for (let index = 1; index <= 5; index++) {
+			harness.session.recordBashResult(`cmd${index}`, shellResult(`out${index}`), {});
+		}
+
+		const appendMessage = harness.sessionManager.appendMessage.bind(harness.sessionManager);
+		const remainingFailures = new Set(["cmd2", "cmd4"]);
+		vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation(message => {
+			if (message.role === "bashExecution" && remainingFailures.delete(message.command)) {
+				throw new Error(`transient ${message.command} persistence failure`);
+			}
+			return appendMessage(message);
+		});
+
+		first.turn.finish();
+		await expect(first.prompt).rejects.toThrow(
+			'Failed to persist 4 of 5 deferred bash execution messages; 1 persisted, failed messages remain pending for retry; persisted: ["cmd1"]; pending: ["cmd2","cmd3","cmd4","cmd5"]',
+		);
+
+		await expect(harness.session.prompt("again")).rejects.toThrow(
+			'Failed to persist 2 of 4 deferred bash execution messages; 2 persisted, failed messages remain pending for retry; persisted: ["cmd2","cmd3"]; pending: ["cmd4","cmd5"]',
+		);
+
+		const third = await harness.startTurn("again");
+		third.turn.finish();
+		await third.prompt;
+
+		expect(bashCommands(harness.agent.state.messages)).toEqual(["cmd1", "cmd2", "cmd3", "cmd4", "cmd5"]);
+		expect(bashCommands(persistedShellMessages(harness.sessionManager, "bashExecution"))).toEqual([
+			"cmd1",
+			"cmd2",
+			"cmd3",
+			"cmd4",
+			"cmd5",
+		]);
+	});
+
+	it("publishes agent_end before a deferred persistence rejection settles", async () => {
+		const harness = createHarness(sessions);
+		const events: string[] = [];
+		harness.session.subscribe(event => events.push(event.type));
+		const first = await harness.startTurn("hello");
+		harness.session.recordBashResult("cmd1", shellResult("out1"), {});
+
+		const appendMessage = harness.sessionManager.appendMessage.bind(harness.sessionManager);
+		vi.spyOn(harness.sessionManager, "appendMessage").mockImplementation(message => {
+			if (message.role === "bashExecution") throw new Error("transient persistence failure");
+			return appendMessage(message);
+		});
+
+		first.turn.finish();
+		await expect(first.prompt).rejects.toThrow(
+			'Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry; persisted: []; pending: ["cmd1"]',
+		);
+
+		expect(events.at(-1)).toBe("agent_end");
+		expect(events.indexOf("turn_end")).toBeLessThan(events.indexOf("agent_end"));
+	});
 	it("does not republish a turn-end-published block on the following prompt", async () => {
 		const harness = createHarness(sessions);
 		const first = await harness.startTurn("hello");
