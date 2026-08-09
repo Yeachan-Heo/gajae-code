@@ -83,9 +83,10 @@ function argsCanBeSharedWithRenderer(toolName: string, tool: AgentTool | undefin
 	return !tool?.renderCall && !tool?.renderResult && READONLY_ARG_RENDERER_TOOLS.has(toolName);
 }
 
-function partialJsonLength(args: unknown): number {
-	const value = args && typeof args === "object" ? (args as { __partialJson?: unknown }).__partialJson : undefined;
-	return typeof value === "string" ? value.length : -1;
+function previewPayloadKey(args: unknown): string | undefined {
+	const partialJson =
+		args && typeof args === "object" ? (args as { __partialJson?: unknown }).__partialJson : undefined;
+	return typeof partialJson === "string" ? `${partialJson.length}:${partialJson}` : undefined;
 }
 
 /**
@@ -236,6 +237,7 @@ export class ToolExecutionComponent extends Container {
 	#editDiffLastArgsKey?: string;
 	#argsIdentityVersion = 0;
 	#lastArgsReference: any;
+
 	#shareArgsWithRenderer = false;
 	// Cached converted images for Kitty protocol (which requires PNG), keyed by index and source.
 	#convertedImages: Map<number, { data: string; mimeType: string; source: string }> = new Map();
@@ -314,6 +316,7 @@ export class ToolExecutionComponent extends Container {
 	updateArgs(args: any, _toolCallId?: string): void {
 		const argsChanged = !Bun.deepEquals(this.#args, args);
 		if (!argsChanged && !this.#editMode) return;
+
 		if (args !== this.#lastArgsReference) {
 			this.#lastArgsReference = args;
 			this.#argsIdentityVersion += 1;
@@ -354,11 +357,12 @@ export class ToolExecutionComponent extends Container {
 			effectiveArgs = args;
 		}
 
-		// Coalesce duplicate computes without serializing multi-KB streamed args every delta.
+		// The streamed partial JSON is the exact payload snapshot. Its length alone
+		// cannot distinguish same-size replacements. Completed calls lack that
+		// snapshot, so retain identity invalidation for their distinct arg objects.
 		const argsKey = [
 			this.#toolName,
-			this.#argsIdentityVersion,
-			partialJsonLength(args),
+			previewPayloadKey(args) ?? `identity:${this.#argsIdentityVersion}`,
 			this.#argsComplete ? 1 : 0,
 		].join(":");
 		if (argsKey === this.#editDiffLastArgsKey) return;

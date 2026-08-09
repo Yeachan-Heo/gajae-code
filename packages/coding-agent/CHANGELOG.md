@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Streamed edit preview coalescing now keys on the complete partial-JSON payload rather than its length, so same-size in-place argument replacements recompute and render while repeated payloads remain cached.
+
 ## [0.12.21] - 2026-08-09
 
 ### Fixed
