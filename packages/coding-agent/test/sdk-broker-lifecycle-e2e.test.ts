@@ -3405,7 +3405,14 @@ test("production post-registration startup failure proves cleanup and exact repl
 		const failure = response.ok ? undefined : response.startupFailure;
 		if (!failure) throw new Error("Expected persisted startup failure evidence.");
 		const sessions = await broker.handleRequest("session.list", {});
-		expect(sessions).toMatchObject({ ok: true, result: { sessions: [] } });
+		expect(sessions).toMatchObject({
+			ok: true,
+			result: {
+				sessions: [
+					expect.objectContaining({ terminal: true, lifecycleRequestId: expect.any(String), live: false }),
+				],
+			},
+		});
 		const sdkDir = path.join(root, ".gjc", "state", "sdk");
 		const entries = await fs.readdir(sdkDir);
 		// Retained `.gjc-delete-*` quarantines are typed cleanup evidence; only
