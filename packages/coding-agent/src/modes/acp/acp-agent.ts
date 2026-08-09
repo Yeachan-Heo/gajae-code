@@ -43,6 +43,7 @@ import {
 	type AcpReverseConnection,
 	AcpSdkAdapter,
 	AcpSdkAdapterError,
+	acpMcpLaunchFailure,
 } from "../../sdk/acp";
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
@@ -3010,24 +3011,7 @@ export class AcpAgent implements Agent {
 		try {
 			return await (await this.#brokerAdapter()).global(operation, input, idempotencyKey);
 		} catch (error) {
-			const code =
-				typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
-					? error.code
-					: undefined;
-			if (
-				mcpServers.length === 0 ||
-				code === "invalid_input" ||
-				code === "authentication_failed" ||
-				code === "unknown_model_profile" ||
-				code === "model_profile_registry_error"
-			)
-				throw error;
-			const names = mcpServers
-				.slice(0, 8)
-				.map(server => server.name)
-				.join(", ");
-			const suffix = mcpServers.length > 8 ? `, and ${mcpServers.length - 8} more` : "";
-			throw new AcpSdkAdapterError("unavailable", `MCP server request failed to start (${names}${suffix}).`);
+			throw acpMcpLaunchFailure(error, mcpServers);
 		}
 	}
 

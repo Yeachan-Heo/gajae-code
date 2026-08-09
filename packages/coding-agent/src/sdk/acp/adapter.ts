@@ -5,6 +5,7 @@ import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-l
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { ACP_SESSION_RECONNECT } from "../session-reconnect";
+import type { SessionLifecycleMcpServer } from "./mcp";
 
 type JsonObject = Record<string, unknown>;
 
@@ -38,6 +39,39 @@ export class AcpSdkAdapterError extends Error {
 		this.name = "AcpSdkAdapterError";
 		this.code = code;
 	}
+}
+
+/**
+ * Lifecycle failures the ACP MCP launch wrapper must report verbatim. Everything else
+ * is re-attributed to the configured MCP servers, which is the useful answer for a
+ * launch that actually reached them — but a startup the broker refused before
+ * admission never opened an MCP handshake, so blaming the servers would hide both the
+ * real authority reason and the fact that the request is safely retryable.
+ */
+const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
+	"invalid_input",
+	"authentication_failed",
+	"unknown_model_profile",
+	"model_profile_registry_error",
+	"startup_admission_refused",
+]);
+
+/**
+ * The error an ACP session launch must throw once a lifecycle request that carried MCP
+ * servers has failed.
+ */
+export function acpMcpLaunchFailure(error: unknown, mcpServers: SessionLifecycleMcpServer[]): unknown {
+	const code =
+		typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+			? error.code
+			: undefined;
+	if (mcpServers.length === 0 || (code !== undefined && ACP_MCP_PRESERVED_LAUNCH_CODES.has(code))) return error;
+	const names = mcpServers
+		.slice(0, 8)
+		.map(server => server.name)
+		.join(", ");
+	const suffix = mcpServers.length > 8 ? `, and ${mcpServers.length - 8} more` : "";
+	return new AcpSdkAdapterError("unavailable", `MCP server request failed to start (${names}${suffix}).`);
 }
 
 export type AcpReconnectFailedHandler = (error: SdkClientError) => void;

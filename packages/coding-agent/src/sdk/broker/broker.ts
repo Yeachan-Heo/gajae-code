@@ -555,7 +555,7 @@ const BROKER_SETTLEMENT_MS = 2_000;
 
 export interface StartupAdmissionTiming {
 	now(): number;
-	sleep(ms: number): Promise<void>;
+	sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
 export type StartupAdmissionResult<T> =
@@ -600,18 +600,24 @@ export class StartupAdmissionQueue {
 		const ready = Promise.withResolvers<void>();
 		const waiter: StartupAdmissionWaiter = { state: "waiting", ready };
 		this.#waiters.push(waiter);
-		const outcome = await Promise.race([
-			ready.promise.then(() => (waiter.state === "refused" ? ("refused" as const) : ("admitted" as const))),
-			timing.sleep(queueWaitMs).then(() => {
-				if (waiter.state === "admitted") return "admitted" as const;
-				if (waiter.state === "refused") return "refused" as const;
-				if (waiter.state === "timed_out") return "timed_out" as const;
-				waiter.state = "timed_out";
-				const index = this.#waiters.indexOf(waiter);
-				if (index >= 0) this.#waiters.splice(index, 1);
-				return "timed_out" as const;
-			}),
-		]);
+		const cutoff = new AbortController();
+		let outcome: "admitted" | "timed_out" | "refused";
+		try {
+			outcome = await Promise.race([
+				ready.promise.then(() => (waiter.state === "refused" ? ("refused" as const) : ("admitted" as const))),
+				timing.sleep(queueWaitMs, cutoff.signal).then(() => {
+					if (waiter.state === "admitted") return "admitted" as const;
+					if (waiter.state === "refused") return "refused" as const;
+					if (waiter.state === "timed_out") return "timed_out" as const;
+					waiter.state = "timed_out";
+					const index = this.#waiters.indexOf(waiter);
+					if (index >= 0) this.#waiters.splice(index, 1);
+					return "timed_out" as const;
+				}),
+			]);
+		} finally {
+			cutoff.abort();
+		}
 		if (outcome === "timed_out") return { status: "admission_timeout", reason: "admission_timeout" };
 		if (outcome === "refused") return { status: "admission_refused", reason: "admission_refused" };
 		return this.#runGranted(waiter.admissionEpoch!, timing, task);
