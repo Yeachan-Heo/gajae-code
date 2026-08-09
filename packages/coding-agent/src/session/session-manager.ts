@@ -12419,7 +12419,7 @@ export class SessionManager {
 					("parentId" in record && entry.parentId !== record.parentId)
 				)
 					throw new Error("cold_index_identity_mismatch");
-				residentizePersistedBlobRefs(entry);
+				residentizePersistedBlobRefs(sanitizeLoadedSessionEntryReplayMetadata(entry));
 				rebuilt.push(entry);
 			}
 			const transition = this.#prepareResidentTextStoreTransition(
@@ -15356,10 +15356,14 @@ export class SessionManager {
 					if (record.type === "session") return;
 					if (record.type === "header_patch" || record.type === "entry_patch") return false;
 					if (typeof record.id !== "string") return false;
+					const entry = sanitizeLoadedSessionEntryReplayMetadata(
+						materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+					);
+					residentizePersistedBlobRefs(entry);
 					visitor(
 						cloneSessionEntry(
 							rehydrateColdSpillEntry(
-								materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+								entry,
 								this.#coldSpillReadStore(),
 								this.#residentBlobStoresForColdRehydrate(),
 							),
