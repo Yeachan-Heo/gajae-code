@@ -14273,6 +14273,10 @@ export class SessionManager {
 			const store = this.#getManagedDraftStore();
 			if (!store) return;
 			await store.replace("draft.txt", Buffer.from(text, "utf8"));
+			if (this.#readOnlyResume && this.#sessionFile) {
+				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
+			}
 			return;
 		}
 		const draftPath = this.#getDraftPath();
@@ -14293,6 +14297,10 @@ export class SessionManager {
 		const artifactManager = this.#getOrCreateArtifactManager();
 		if (!artifactManager) return;
 		await artifactManager.replaceNamed("draft.txt", text);
+		if (this.#readOnlyResume && this.#sessionFile) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 	}
 
 	/**
