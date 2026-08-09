@@ -312,8 +312,7 @@ export class RevisionStore {
 	readonly #onReadRange?: (start: number, end: number) => void;
 	#closing = false;
 	#closePromise: Promise<void> | undefined;
-	#writesInFlight = 0;
-	#writesDrained: PromiseWithResolvers<void> | undefined;
+	readonly #pendingWrites = new Set<Promise<void>>();
 
 	constructor(
 		readonly sessionId: string,
@@ -326,10 +325,11 @@ export class RevisionStore {
 
 	createRevision(resourceKind: string, resourceId: string, payload: unknown): Promise<string> {
 		if (this.#closing) return Promise.reject(new RevisionStoreError("resource_gone", "snapshot store is closing"));
-		this.#writesInFlight++;
+		const settled = Promise.withResolvers<void>();
+		this.#pendingWrites.add(settled.promise);
 		return this.#createRevision(resourceKind, resourceId, payload).finally(() => {
-			this.#writesInFlight--;
-			if (this.#writesInFlight === 0) this.#writesDrained?.resolve();
+			this.#pendingWrites.delete(settled.promise);
+			settled.resolve();
 		});
 	}
 
@@ -548,10 +548,7 @@ export class RevisionStore {
 		if (this.#closePromise) return this.#closePromise;
 		this.#closing = true;
 		this.#closePromise = (async () => {
-			if (this.#writesInFlight > 0) {
-				this.#writesDrained ??= Promise.withResolvers<void>();
-				await this.#writesDrained.promise;
-			}
+			await Promise.all(this.#pendingWrites);
 			this.#resources.clear();
 			this.#pinIndex.clear();
 			this.#memoryBytes = 0;

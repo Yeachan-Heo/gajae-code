@@ -13,7 +13,7 @@
 ### Fixed
 
 - SDK snapshot spill writes now retry once with a fresh temporary file when Bun reports `EBADF` during write or `fsync` under heavily contended descriptor teardown, and no longer fail when `close()` reports `EBADF` after a successful write and sync. The atomic writer removes the abandoned attempt before retrying, preserves primary I/O failures, accepts only the proven already-closed close case, and keeps every non-`EBADF` error or repeated descriptor failure fatal.
-- ACP now imports the synthetic model-profile provider namespace from a dependency-free SDK constant module, keeping the machine entrypoint out of model-registry, session-host, MCP-manager, and extension-runner closures enforced by `check:runtime`.
+- Discord Gateway ingestion now decodes text and binary WebSocket payloads, resolves a thread's missing parent-channel metadata through Discord's REST API, and stops reconnecting after terminal authentication, sharding, version, or intent close codes.
 
 ## [0.12.17] - 2026-08-08
 

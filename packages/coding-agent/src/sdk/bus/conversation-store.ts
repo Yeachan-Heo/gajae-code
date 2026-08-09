@@ -349,7 +349,7 @@ export class ConversationStore<T extends ConversationRecord> {
 		try {
 			await this.#fs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			await this.#fs.chmod(temporary, 0o600);
-			const handle = await this.#fs.open(temporary, "r");
+			const handle = await this.#fs.open(temporary, "r+");
 			try {
 				await handle.sync();
 			} finally {

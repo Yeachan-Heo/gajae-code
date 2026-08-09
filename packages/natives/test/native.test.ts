@@ -459,6 +459,44 @@ describe("pi-natives", () => {
 			expect(result.matches).toHaveLength(0);
 		});
 
+		it("should bound sorted callbacks and keep the newest matches", async () => {
+			const scopedDir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-glob-bounded-"));
+			try {
+				const baseTime = Date.now() - 10_000;
+				for (let index = 0; index < 100; index++) {
+					const filePath = path.join(scopedDir, `entry-${index.toString().padStart(3, "0")}.txt`);
+					await fs.writeFile(filePath, "");
+					const timestamp = new Date(baseTime + index);
+					await fs.utimes(filePath, timestamp, timestamp);
+				}
+				const callbacks: GlobMatch[] = [];
+				const result = await glob(
+					{
+						pattern: "*.txt",
+						path: scopedDir,
+						maxResults: 3,
+						sortByMtime: true,
+						timeoutMs: 1000,
+					},
+					(error, match) => {
+						expect(error).toBeNull();
+						callbacks.push(match);
+					},
+				);
+
+				await Bun.sleep(25);
+				expect(result.matches.map(match => match.path)).toEqual([
+					"entry-099.txt",
+					"entry-098.txt",
+					"entry-097.txt",
+				]);
+				expect(callbacks.length).toBeGreaterThan(0);
+				expect(callbacks.length).toBeLessThanOrEqual(33 * 3);
+			} finally {
+				await fs.rm(scopedDir, { recursive: true, force: true });
+			}
+		});
+
 		it("should fast-recheck empty cached results when threshold is reached", async () => {
 			const fileName = "cache-empty-recheck-target.txt";
 			const filePath = path.join(testDir, fileName);
