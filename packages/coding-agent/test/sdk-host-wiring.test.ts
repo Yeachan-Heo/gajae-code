@@ -2435,9 +2435,6 @@ test("SDK host rolls back canonical skill ownership when durable acceptance fail
 	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
-	fs.rmSync(storeDirectory, { recursive: true, force: true });
-	fs.writeFileSync(storeDirectory, "block reconciliation persistence");
 
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 	const frames: Record<string, unknown>[] = [];
@@ -2448,6 +2445,31 @@ test("SDK host rolls back canonical skill ownership when durable acceptance fail
 		socket.addEventListener("open", () => resolve(), { once: true });
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
+
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-readiness-probe",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "readiness probe" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-readiness-probe"),
+		"skill readiness probe",
+	);
+	const readinessResponse = frames.find(
+		frame => frame.type === "control_response" && frame.id === "skill-readiness-probe",
+	) as { ok?: boolean; result?: { commandId?: string } };
+	expect(readinessResponse).toMatchObject({ ok: true, result: { commandId: expect.any(String) } });
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await Promise.resolve();
+	frames.length = 0;
+	executionCount = 0;
+
+	const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
+	fs.rmSync(storeDirectory, { recursive: true, force: true });
+	fs.writeFileSync(storeDirectory, "block reconciliation persistence");
 
 	const clientRef = "skill-acceptance-failure-ref";
 	socket.send(
