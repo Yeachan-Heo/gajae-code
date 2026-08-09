@@ -266,7 +266,8 @@ export function resolveAcpStartupOptions(
 		...(parsed.tmux ? ["--tmux"] : []),
 		...(parsed.tools?.length ? ["--tools"] : []),
 		...(parsed.extensions?.length ? ["--extension"] : []),
-		...(parsed.unknownFlags.size > 0 ? ["extension flags"] : []),
+		...(parsed.hooks?.length ? ["--hook"] : []),
+		...(parsed.unknownFlags.size > 0 ? [`unknown flags: ${[...parsed.unknownFlags.keys()].join(" ")}`] : []),
 	];
 	if (unsupported.length > 0) {
 		throw new Error(

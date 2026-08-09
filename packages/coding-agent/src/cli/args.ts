@@ -236,6 +236,21 @@ export function parseArgs(args: string[]): Args {
 			result.noPty = true;
 		} else if (arg === "--tmux") {
 			result.tmux = true;
+		} else if (arg === "--extension" || arg === "-e") {
+			const extension = takeFlagValue(args, i++, "--extension");
+			result.extensions = [...(result.extensions ?? []), extension];
+		} else if (arg === "--hook") {
+			const hook = takeFlagValue(args, i++, "--hook");
+			result.hooks = [...(result.hooks ?? []), hook];
+		} else if (arg === "--no-extensions") {
+			result.noExtensions = true;
+		} else if (arg === "--no-skills") {
+			result.noSkills = true;
+		} else if (arg === "--skills") {
+			result.skills = takeFlagValue(args, i++, "--skills")
+				.split(",")
+				.map(s => s.trim())
+				.filter(Boolean);
 		} else if (arg === "--tools") {
 			const toolNames = takeFlagValue(args, i++, "--tools")
 				.split(",")
