@@ -28,6 +28,10 @@ const CAP_GATED_REPLAY_KINDS = new Set(["tool_activity", "reasoning_summary"]);
 
 class FakeSlackProvider implements SlackProviderClient {
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
+	/** How many upcoming posts are refused, the way a provider outage refuses them. */
+	failPosts = 0;
+	/** Every post this provider refused, so a test can settle on the refusal itself. */
+	readonly refused: string[] = [];
 	readonly transportHealthy = true;
 
 	async start(): Promise<void> {}
@@ -64,6 +68,11 @@ class FakeSlackProvider implements SlackProviderClient {
 		threadTs?: string;
 		clientMsgId: string;
 	}): Promise<{ channel: string; ts: string; client_msg_id: string }> {
+		if (this.failPosts > 0) {
+			this.failPosts -= 1;
+			this.refused.push(input.text);
+			throw new Error("slack provider is unavailable");
+		}
 		const position = this.posts.push(input);
 		if (this.#publishGate) await this.#publishGate;
 		return { channel: input.channel, ts: `7.${position}`, client_msg_id: input.clientMsgId };
@@ -340,10 +349,24 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
 	return FakeWebSocket.instances[count - 1]!;
 }
 
-/** Delivery is observable only where it lands, so settle on the publications themselves. */
+/**
+ * Delivery is observable only where it lands, so settle on the publications themselves.
+ *
+ * A post is recorded the moment the surface is handed it, and the runtime records the
+ * sequence as delivered only once that publication returns. The settle covers that tail:
+ * a test that drops the socket the instant a post appears would otherwise be racing a
+ * cursor the runtime has not moved yet.
+ */
 async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<void> {
 	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
+	await Bun.sleep(25);
+}
+
+/** A refusal is the only trace a failed publication leaves on this side of the runtime. */
+async function awaitRefusals(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 2_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
+	expect(provider.refused).toHaveLength(count);
 }
 
 /** The replay rides the socket, so settle on the request the host itself observed. */
@@ -1041,7 +1064,9 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				events: [filtered, tail],
 				gap: {
 					kind: "sequence_gap",
-					fromSeq: Number(recoverable.seq),
+					// The pinned publish leaves seq 1 undelivered, so this round asked from 0 and
+					// its answer has to concede from the first sequence it asked for.
+					fromSeq: 1,
 					toSeq: Number(recoverable.seq),
 					resyncQueries: ["Q01"],
 				},
@@ -1067,7 +1092,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				"GJC notice\ntail",
 			]);
 			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
-				`chat daemon replay conceded a retention gap (sequences 2-2 are gone from the host, 1 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+				`chat daemon replay conceded a retention gap (sequences 1-2 are gone from the host, 1 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
 			]);
 
 			// The recovered frame did not strand the cursor below the conceded range: the
@@ -1083,8 +1108,91 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			]);
 			expect(host.replayRequests).toEqual([
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+			]);
+		});
+	});
+}, 20_000);
+
+test("a frame the surface refused stays above the cursor and is re-served by the next replay", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			// One transient refusal from the surface. Nothing published this sequence, so
+			// the cursor — whose only job is recording what was delivered — must still sit
+			// below it when the next replay asks.
+			provider.failPosts = 1;
+			host.emit("two");
+			await awaitRefusals(provider, 1);
+			await Bun.sleep(50);
+
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
 				{ sinceGeneration: GENERATION, sinceSeq: 1 },
 			]);
+
+			// The refused frame is re-served and published, once, in sequence.
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
+			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
+		});
+	});
+}, 20_000);
+
+test("a surface that refuses a frame for good concedes it instead of wedging the stream", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			// The surface is down for good. Holding the cursor below seq 2 forever would
+			// cost every later frame too, so the rounds are bounded: mirrors
+			// `DELIVERY_ATTEMPT_LIMIT`, one round live and two from a rebuild's replay.
+			provider.failPosts = Number.POSITIVE_INFINITY;
+			host.emit("two");
+			for (let round = 2; round <= 3; round++) {
+				await awaitRefusals(provider, round - 1);
+				await Bun.sleep(50);
+				reconcile();
+				host.accept(await awaitSocket(round));
+			}
+			await awaitRefusals(provider, 3);
+			await Bun.sleep(50);
+
+			// Every round re-served that same sequence from the same cursor, and the last
+			// one conceded it rather than asking again.
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+			expect(warnings.filter(line => line.includes("conceded seq 2"))).toHaveLength(1);
+
+			// The stream is not wedged: it resumes above the conceded frame on the socket
+			// it already holds, with no further rebuild.
+			provider.failPosts = 0;
+			host.emit("three");
+			await awaitPosts(provider, 2);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nthree"]);
+			expect(FakeWebSocket.instances).toHaveLength(3);
 		});
 	});
 }, 20_000);
