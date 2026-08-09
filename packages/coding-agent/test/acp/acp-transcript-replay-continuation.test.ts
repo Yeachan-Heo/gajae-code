@@ -112,6 +112,7 @@ describe("ACP transcript replay continuation recovery", () => {
 	/** `${itemId}:${field}` -> full field value the host would serve over `resource.body`. */
 	let continuationFields = new Map<string, string>();
 	let continuationFailure: string | undefined;
+	let continuationFailureField: string | undefined;
 	let resourceBodyQueries: Array<Record<string, unknown>> = [];
 	let updates: SessionNotification[] = [];
 	let agentDir = "";
@@ -123,6 +124,7 @@ describe("ACP transcript replay continuation recovery", () => {
 		transcriptItems = [];
 		continuationFields = new Map();
 		continuationFailure = undefined;
+		continuationFailureField = undefined;
 		resourceBodyQueries = [];
 		updates = [];
 		agentDir = path.join(tempDir.path(), "agent");
@@ -176,7 +178,11 @@ describe("ACP transcript replay continuation recovery", () => {
 								...input,
 								...(frame.cursor === undefined ? {} : { cursor: frame.cursor }),
 							});
-							if (continuationFailure !== undefined) {
+							if (
+								continuationFailure !== undefined ||
+								(continuationFailureField !== undefined &&
+									(frame.input as Record<string, unknown> | undefined)?.field === continuationFailureField)
+							) {
 								socket.send(
 									JSON.stringify({
 										type: "query_response",
@@ -325,6 +331,7 @@ describe("ACP transcript replay continuation recovery", () => {
 		continuationFields.set("result-big:body", "Oversized tool output");
 		continuationFields.set("result-big:toolCallId", "tool-1");
 		continuationFields.set("result-big:toolName", "read");
+		continuationFields.set("result-big:isError", "false");
 		const replayed = await loadReplayedSession([
 			{
 				id: "assistant-1",
@@ -333,7 +340,7 @@ describe("ACP transcript replay continuation recovery", () => {
 				body: "Reading",
 				content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { file_path: "big.ts" } }],
 			},
-			oversizedRow("result-big", ["id", "role", "body", "toolCallId", "toolName"]),
+			oversizedRow("result-big", ["id", "role", "body", "toolCallId", "toolName", "isError"]),
 		]);
 
 		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:completed"]);
@@ -460,5 +467,110 @@ describe("ACP transcript replay continuation recovery", () => {
 		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:completed"]);
 		expect(skipBoundaries(replayed)).toEqual([]);
 		expect(resourceBodyQueries).toEqual([]);
+	});
+	it("recovers typed content when an oversized assistant entry owns a tool call", async () => {
+		const toolCall = { type: "toolCall", id: "tool-1", name: "read", arguments: { file_path: "large.ts" } };
+		continuationFields.set("assistant-big:role", "assistant");
+		continuationFields.set("assistant-big:body", "Reading a very large file");
+		continuationFields.set("assistant-big:content", JSON.stringify([toolCall]));
+		const replayed = await loadReplayedSession([
+			oversizedRow("assistant-big", ["id", "role", "body", "content"]),
+			{
+				id: "result-1",
+				role: "toolResult",
+				textSummary: "File read",
+				body: "File read",
+				content: [{ type: "text", text: "File read" }],
+				toolCallId: "tool-1",
+				toolName: "read",
+			},
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:completed"]);
+		expect(skipBoundaries(replayed)).toEqual([]);
+	});
+
+	it("preserves typed failure status for an oversized tool result", async () => {
+		continuationFields.set("result-big:role", "toolResult");
+		continuationFields.set("result-big:body", "Permission denied");
+		continuationFields.set("result-big:toolCallId", "tool-1");
+		continuationFields.set("result-big:toolName", "read");
+		continuationFields.set("result-big:isError", "true");
+		const replayed = await loadReplayedSession([
+			{
+				id: "assistant-1",
+				role: "assistant",
+				textSummary: "Reading",
+				body: "Reading",
+				content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { file_path: "secret.ts" } }],
+			},
+			oversizedRow("result-big", ["id", "role", "body", "toolCallId", "toolName", "isError"]),
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:failed"]);
+		expect(skipBoundaries(replayed)).toEqual([]);
+	});
+
+	it("retains recovered tool identity when only the oversized result body fails", async () => {
+		continuationFields.set("result-big:role", "toolResult");
+		continuationFields.set("result-big:toolCallId", "tool-1");
+		continuationFields.set("result-big:toolName", "read");
+		continuationFields.set("result-big:isError", "false");
+		continuationFailureField = "body";
+		const replayed = await loadReplayedSession([
+			{
+				id: "assistant-1",
+				role: "assistant",
+				textSummary: "Reading",
+				body: "Reading",
+				content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { file_path: "big.ts" } }],
+			},
+			oversizedRow("result-big", ["id", "role", "body", "toolCallId", "toolName", "isError"]),
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:failed"]);
+		expect(pendingToolCalls(replayed)).toEqual([]);
+	});
+	it("keeps a successful oversized tool result successful when the row advertises no isError", async () => {
+		continuationFields.set("result-big:role", "toolResult");
+		continuationFields.set("result-big:body", "Successful tool output");
+		continuationFields.set("result-big:toolCallId", "tool-1");
+		continuationFields.set("result-big:toolName", "read");
+		const replayed = await loadReplayedSession([
+			{
+				id: "assistant-1",
+				role: "assistant",
+				textSummary: "Reading",
+				body: "Reading",
+				content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { file_path: "ok.ts" } }],
+			},
+			oversizedRow("result-big", ["id", "role", "body", "toolCallId", "toolName"]),
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:completed"]);
+		expect(JSON.stringify(replayed)).toContain("Successful tool output");
+		expect(skipBoundaries(replayed)).toEqual([]);
+	});
+
+	it("fails an oversized tool result whose advertised isError continuation cannot be read", async () => {
+		continuationFields.set("result-big:role", "toolResult");
+		continuationFields.set("result-big:body", "Tool output of unproven outcome");
+		continuationFields.set("result-big:toolCallId", "tool-1");
+		continuationFields.set("result-big:toolName", "read");
+		continuationFields.set("result-big:isError", "false");
+		continuationFailureField = "isError";
+		const replayed = await loadReplayedSession([
+			{
+				id: "assistant-1",
+				role: "assistant",
+				textSummary: "Reading",
+				body: "Reading",
+				content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: { file_path: "big.ts" } }],
+			},
+			oversizedRow("result-big", ["id", "role", "body", "toolCallId", "toolName", "isError"]),
+		]);
+
+		expect(toolCallStates(replayed)).toEqual(["tool_call:tool-1:pending", "tool_call_update:tool-1:failed"]);
+		expect(pendingToolCalls(replayed)).toEqual([]);
 	});
 });

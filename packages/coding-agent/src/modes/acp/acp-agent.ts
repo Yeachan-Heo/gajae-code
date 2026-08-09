@@ -427,10 +427,21 @@ export interface TranscriptContinuation {
 }
 
 /** Fields replay consumes; `textSummary` and the rest stay unread so recovery costs one query per used field. */
-const RECOVERABLE_TRANSCRIPT_FIELDS = ["role", "body", "toolCallId", "toolName"] as const;
+const RECOVERABLE_TRANSCRIPT_FIELDS = ["role", "body", "content", "toolCallId", "toolName", "isError"] as const;
 
 /** Stands in for a tool result whose transcript entry replay could not restore. */
 const TRANSCRIPT_TOOL_RESULT_UNAVAILABLE = "The transcript entry holding this tool result could not be replayed.";
+
+function decodeTranscriptContinuation(field: string, body: string): unknown {
+	if (field !== "content" && field !== "isError") return body;
+	try {
+		const value: unknown = JSON.parse(body);
+		if (field === "content") return Array.isArray(value) ? value : undefined;
+		return typeof value === "boolean" ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 export function transcriptContinuations(entry: unknown): TranscriptContinuation[] {
 	const record = object(entry);
@@ -2220,20 +2231,28 @@ export class AcpAgent implements Agent {
 	/**
 	 * Reassembles a body-less `item_too_large` entry from the `continuations` the
 	 * producer already published, reading each field replay consumes through the same
-	 * `resource.body` query the descriptor names. Returns undefined only when the entry
-	 * is genuinely unrecoverable: no readable body, or no role to place it with.
+	 * `resource.body` query the descriptor names. Partial recovery is retained so a
+	 * failed body continuation cannot discard tool-call identity needed to close an
+	 * already-published pending call.
 	 */
-	async #recoverTranscriptEntry(adapter: AcpSdkAdapter, entry: JsonObject): Promise<JsonObject | undefined> {
+	async #recoverTranscriptEntry(adapter: AcpSdkAdapter, entry: JsonObject): Promise<JsonObject> {
 		const continuations = transcriptContinuations(entry);
-		if (continuations.length === 0) return undefined;
 		const recovered: JsonObject = { ...entry };
 		for (const field of RECOVERABLE_TRANSCRIPT_FIELDS) {
 			const continuation = continuations.find(candidate => candidate.field === field);
 			if (!continuation) continue;
-			const value = await this.#readContinuation(adapter, continuation);
-			if (value !== undefined) recovered[field] = value;
+			const body = await this.#readContinuation(adapter, continuation);
+			const value = body === undefined ? undefined : decodeTranscriptContinuation(field, body);
+			// A row that advertises `isError` but will not yield it leaves the outcome
+			// unproven, so replay reports failure rather than claiming a success it cannot
+			// read back. A row that never advertised the field simply had no error flag.
+			if (value === undefined) {
+				if (field === "isError") recovered.isError = true;
+				continue;
+			}
+			recovered[field] = value;
 		}
-		return typeof recovered.body === "string" && typeof recovered.role === "string" ? recovered : undefined;
+		return recovered;
 	}
 
 	/** Follows one continuation to its end, joining every page of that field's bytes. */
@@ -2320,8 +2339,7 @@ export class AcpAgent implements Agent {
 				// A body-less row is usually an oversized message, not a malformed entry:
 				// its `continuations` say exactly how to read it back, so replay follows
 				// them instead of dropping the largest message in the session.
-				const message =
-					typeof raw.body === "string" ? raw : ((await this.#recoverTranscriptEntry(adapter, raw)) ?? raw);
+				const message = typeof raw.body === "string" ? raw : await this.#recoverTranscriptEntry(adapter, raw);
 				const replay = transcriptReplayContent(message);
 				if (!replay.replayable) {
 					unreplayableEntries++;
