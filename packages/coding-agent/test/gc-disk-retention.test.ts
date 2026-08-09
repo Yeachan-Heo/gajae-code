@@ -734,6 +734,38 @@ describe("gjc gc --disk (natives retention)", () => {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
 	});
+	test("withholds a version whose tree could not be fully read instead of half-deleting it", async () => {
+		const fixture = await makeTestRoot();
+		const locked = path.join(fixture.nativesDir, "0.1.0", "locked");
+		try {
+			for (const version of ["0.1.0", "0.2.0", "0.3.0"]) await writeNativesVersion(fixture, version);
+			// An unreadable subdirectory makes the size walk blind, and makes a
+			// recursive remove impossible to complete: it can only destroy the
+			// readable half.
+			await fsp.mkdir(locked, { recursive: true });
+			await Bun.write(path.join(locked, "inner.bin"), "z".repeat(2048));
+			await fsp.chmod(locked, 0o000);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy({ natives_keep_versions: 1 }),
+				prune: true,
+				runningVersion: "0.3.0",
+			});
+
+			expect(reasonById(disk, "natives").get("0.1.0")).toBe("keep:withheld_evidence_incomplete: tree_unreadable");
+			expect(disk.surfaces.natives.records.find(record => record.id === "0.1.0")?.withheld).toBe(true);
+			expect(disk.surfaces.natives.reclaimed).toBe(0);
+			expect(disk.surfaces.natives.failed).toBe(0);
+			// The readable half is what a half-completed remove destroys first.
+			expect(await Bun.file(path.join(fixture.nativesDir, "0.1.0", "pi-natives.node")).exists()).toBe(true);
+			expect((await fsp.readdir(fixture.nativesDir)).sort()).toEqual(["0.1.0", "0.2.0", "0.3.0"]);
+		} finally {
+			await fsp.chmod(locked, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("gjc gc --disk (backups retention)", () => {
@@ -770,6 +802,105 @@ describe("gjc gc --disk (backups retention)", () => {
 			expect((await fsp.lstat(fixture.agentDir)).isDirectory()).toBe(true);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+	test("withholds a backup whose tree could not be fully read instead of half-deleting it", async () => {
+		const fixture = await makeTestRoot();
+		const locked = path.join(fixture.backupsDir, "natives-0.1.0-before-update", "locked");
+		try {
+			const backup = path.join(fixture.backupsDir, "natives-0.1.0-before-update");
+			await fsp.mkdir(locked, { recursive: true });
+			await Bun.write(path.join(backup, "payload.bin"), "x".repeat(64));
+			await Bun.write(path.join(locked, "inner.bin"), "z".repeat(2048));
+			await fsp.chmod(locked, 0o000);
+			await backdate(backup, 40);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy(),
+				prune: true,
+			});
+
+			expect(reasonById(disk, "backups").get("natives-0.1.0-before-update")).toBe(
+				"keep:withheld_evidence_incomplete: tree_unreadable",
+			);
+			expect(
+				disk.surfaces.backups.records.find(record => record.id === "natives-0.1.0-before-update")?.withheld,
+			).toBe(true);
+			expect(disk.surfaces.backups.reclaimed).toBe(0);
+			expect(disk.surfaces.backups.failed).toBe(0);
+			// A recursive remove destroys the readable entries before it fails on
+			// the unreadable one, leaving a backup that is neither intact nor gone.
+			expect(await Bun.file(path.join(backup, "payload.bin")).exists()).toBe(true);
+		} finally {
+			await fsp.chmod(locked, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a fully readable backup is still reclaimed when its size walk skipped a symlink", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const backup = path.join(fixture.backupsDir, "gjc-update-old");
+			await fsp.mkdir(backup, { recursive: true });
+			await Bun.write(path.join(backup, "payload.bin"), "x".repeat(64));
+			// A skipped symlink makes `bytes` a floor, but nothing was unreadable,
+			// so the reclaim must still go through.
+			await fsp.symlink(path.join(backup, "payload.bin"), path.join(backup, "alias"));
+			await backdate(backup, 40);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy(),
+				prune: true,
+			});
+
+			const record = disk.surfaces.backups.records.find(entry => entry.id === "gjc-update-old");
+			expect(record?.partial).toBe(true);
+			expect(record?.withheld).toBeUndefined();
+			expect(reasonById(disk, "backups").get("gjc-update-old")).toBe("reclaimed:older_than_max_age(14d)");
+			expect(await fsp.readdir(fixture.backupsDir)).toEqual([]);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("dry run and prune agree that an unreadable backup tree is withheld", async () => {
+		const dry = await makeTestRoot();
+		const wet = await makeTestRoot();
+		try {
+			for (const fixture of [dry, wet]) {
+				const backup = path.join(fixture.backupsDir, "gjc-update-old");
+				await fsp.mkdir(path.join(backup, "locked"), { recursive: true });
+				await Bun.write(path.join(backup, "payload.bin"), "x".repeat(64));
+				await fsp.chmod(path.join(backup, "locked"), 0o000);
+				await backdate(backup, 40);
+			}
+
+			const dryDisk = await collectGcDiskReport({
+				agentDir: dry.agentDir,
+				env: dry.env,
+				policy: policy(),
+				prune: false,
+			});
+			const wetDisk = await collectGcDiskReport({
+				agentDir: wet.agentDir,
+				env: wet.env,
+				policy: policy(),
+				prune: true,
+			});
+
+			expect(dryDisk.surfaces.backups.reclaimable).toBe(0);
+			expect(wetDisk.surfaces.backups.reclaimed).toBe(dryDisk.surfaces.backups.reclaimable);
+			expect(wetDisk.surfaces.backups.reclaimed_bytes).toBe(dryDisk.surfaces.backups.reclaimable_bytes);
+			expect(await Bun.file(path.join(wet.backupsDir, "gjc-update-old", "payload.bin")).exists()).toBe(true);
+		} finally {
+			for (const fixture of [dry, wet]) {
+				await fsp.chmod(path.join(fixture.backupsDir, "gjc-update-old", "locked"), 0o700).catch(() => {});
+				await fsp.rm(fixture.root, { recursive: true, force: true });
+			}
 		}
 	});
 });

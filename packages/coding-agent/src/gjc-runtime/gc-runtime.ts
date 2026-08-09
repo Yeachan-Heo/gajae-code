@@ -753,11 +753,20 @@ function summarizeGcDiskSurface(report: GcDiskSurfaceReport): void {
 	}
 }
 
-/** Recursive, bounded byte count. Symlinks are never followed and never counted. */
-async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial: boolean }> {
+/**
+ * Recursive, bounded byte count. Symlinks are never followed and never counted.
+ *
+ * `partial` means `bytes` is only a floor. `unreadable` is the narrower, harder
+ * fact: some entry in the tree could not be enumerated or stat'd, so the walk is
+ * blind to part of what it just measured. A caller about to remove the tree must
+ * treat that as incomplete evidence — a recursive remove cannot finish past an
+ * unreadable entry, so it would destroy the readable half and leave the rest.
+ */
+async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial: boolean; unreadable: boolean }> {
 	let bytes = 0;
 	let visited = 0;
 	let partial = false;
+	let unreadable = false;
 	const stack: string[] = [root];
 	while (stack.length > 0) {
 		const dir = stack.pop()!;
@@ -765,11 +774,14 @@ async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial
 		try {
 			entries = await fsp.readdir(dir, { withFileTypes: true });
 		} catch (error) {
-			if (!isEnoent(error)) partial = true;
+			if (!isEnoent(error)) {
+				partial = true;
+				unreadable = true;
+			}
 			continue;
 		}
 		for (const entry of entries) {
-			if (visited >= GC_DISK_MAX_WALK_ENTRIES) return { bytes, partial: true };
+			if (visited >= GC_DISK_MAX_WALK_ENTRIES) return { bytes, partial: true, unreadable };
 			visited++;
 			const child = path.join(dir, entry.name);
 			if (entry.isSymbolicLink()) {
@@ -785,10 +797,11 @@ async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial
 				bytes += (await fsp.lstat(child)).size;
 			} catch {
 				partial = true;
+				unreadable = true;
 			}
 		}
 	}
-	return { bytes, partial };
+	return { bytes, partial, unreadable };
 }
 
 /**
@@ -1376,7 +1389,13 @@ async function runGcDiskNatives(input: {
 		if (!entry.version) record.reason = "unrecognized_version_directory";
 		else if (entry.name === runningVersion) record.reason = "running_version";
 		else if (keep.has(entry.name)) record.reason = `retained_version(keepVersions=${policy.natives_keep_versions})`;
-		else {
+		else if (usage.unreadable) {
+			// The walk could not read part of the tree this reclaim would remove, so
+			// a recursive remove cannot finish: it would destroy the readable half
+			// and leave the rest. Partial knowledge is never a licence to delete.
+			record.reason = "withheld_evidence_incomplete: tree_unreadable";
+			record.withheld = true;
+		} else {
 			record.action = "would_reclaim";
 			record.reason = `beyond_keep_versions(${policy.natives_keep_versions})`;
 		}
@@ -1468,7 +1487,9 @@ async function runGcDiskBackups(input: {
 			continue;
 		}
 		if (stat.isSymbolicLink()) continue;
-		const usage = stat.isDirectory() ? await measureGcDiskTree(candidate.path) : { bytes: stat.size, partial: false };
+		const usage = stat.isDirectory()
+			? await measureGcDiskTree(candidate.path)
+			: { bytes: stat.size, partial: false, unreadable: false };
 		const record: GcDiskRecord = {
 			surface: "backups",
 			id: candidate.id,
@@ -1480,7 +1501,13 @@ async function runGcDiskBackups(input: {
 			...(usage.partial ? { partial: true as const } : {}),
 		};
 		if (now - stat.mtimeMs < maxAgeMs) record.reason = `newer_than_max_age(${policy.backups_max_age_days}d)`;
-		else {
+		else if (usage.unreadable) {
+			// The walk could not read part of the tree this reclaim would remove, so
+			// a recursive remove cannot finish: it would destroy the readable half
+			// and leave the rest. Partial knowledge is never a licence to delete.
+			record.reason = "withheld_evidence_incomplete: tree_unreadable";
+			record.withheld = true;
+		} else {
 			record.action = "would_reclaim";
 			record.reason = `older_than_max_age(${policy.backups_max_age_days}d)`;
 		}
