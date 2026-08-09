@@ -69,6 +69,7 @@ describe("ToolExecutionComponent visible preview revisions", () => {
 			ui,
 			process.cwd(),
 		);
+		component.setExpanded(true);
 
 		component.updateArgs({ input: patch });
 		component.setArgsComplete();
@@ -100,6 +101,7 @@ describe("ToolExecutionComponent visible preview revisions", () => {
 			ui,
 			process.cwd(),
 		);
+		component.setExpanded(true);
 
 		component.updateArgs({ input: patch });
 		await waitFor(() => requests.length >= 2);
@@ -123,6 +125,7 @@ describe("ToolExecutionComponent visible preview revisions", () => {
 			ui,
 			process.cwd(),
 		);
+		component.setExpanded(true);
 
 		await waitFor(() => requests.length === 1);
 		requests[0]!.resolve(preview);
@@ -158,6 +161,7 @@ describe("ToolExecutionComponent visible preview revisions", () => {
 			ui,
 			process.cwd(),
 		);
+		component.setExpanded(true);
 
 		await waitFor(() => requests.length === 1);
 		requests[0]!.resolve(preview);
@@ -194,6 +198,7 @@ describe("ToolExecutionComponent visible preview revisions", () => {
 			ui,
 			process.cwd(),
 		);
+		component.setExpanded(true);
 
 		component.updateArgs({ input: patch });
 		component.setArgsComplete();

@@ -176,7 +176,9 @@ export function getEditRequestTargetInventory(
 		return { paths: orderedDistinctPaths([topLevelPath]) };
 	}
 
-	if (editMode === "apply_patch") {
+	// Legacy call sites render the shared edit card without threading `renderContext.editMode`;
+	// a free-form `input` string is only ever an apply_patch envelope there.
+	if (editMode === "apply_patch" || (editMode === undefined && typeof values.input === "string")) {
 		const input = typeof values.input === "string" ? values.input : "";
 		try {
 			return applyPatchEntryInventory(expandApplyPatchToEntries({ input }));

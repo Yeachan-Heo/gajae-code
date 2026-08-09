@@ -170,7 +170,6 @@ describe("editToolRenderer", () => {
 			uiTheme,
 		);
 
-
 		expect(Bun.stripANSI(partial.render(160).join("\n"))).not.toContain("*** End Patch");
 		expect(Bun.stripANSI(complete.render(160).join("\n"))).toContain("*** End Patch");
 	});
@@ -712,9 +711,9 @@ describe("editToolRenderer", () => {
 
 	it("sanitizes single-file preview errors on expanded result cards", async () => {
 		const uiTheme = await getUiTheme();
-		const error = 'File not found: \x1b]8;;https://attacker.invalid\x07evil.ts\x1b]8;;\x07\r\ninjected';
+		const error = "File not found: \x1b]8;;https://attacker.invalid\x07evil.ts\x1b]8;;\x07\r\ninjected";
 		const component = editToolRenderer.renderResult(
-			{ content: [], details: { path: "target.ts" } },
+			{ content: [], details: { path: "target.ts", diff: "" } },
 			{
 				expanded: true,
 				isPartial: false,

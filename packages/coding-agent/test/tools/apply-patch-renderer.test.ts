@@ -44,7 +44,6 @@ describe("apply_patch rendering", () => {
 			uiStub,
 		);
 
-		component.setExpanded(true);
 		component.updateResult(
 			{
 				content: [{ type: "text", text: "" }],
@@ -57,10 +56,16 @@ describe("apply_patch rendering", () => {
 			false,
 		);
 
-		const rendered = Bun.stripANSI(component.render(140).join("\n"));
-		expect(rendered).toContain("src/demo.ts");
-		expect(rendered).toContain("+new");
-		expect(rendered).not.toContain("(no output)");
+		const collapsed = Bun.stripANSI(component.render(140).join("\n"));
+		expect(collapsed).toContain("src/demo.ts");
+		expect(collapsed).not.toContain("+new");
+		expect(collapsed).not.toContain("(no output)");
+
+		component.setExpanded(true);
+		const expanded = Bun.stripANSI(component.render(140).join("\n"));
+		expect(expanded).toContain("src/demo.ts");
+		expect(expanded).toContain("+new");
+		expect(expanded).not.toContain("(no output)");
 	});
 	it("derives call path, operation, and file-count hints from apply_patch input", async () => {
 		const uiTheme = await getUiTheme();
@@ -108,7 +113,7 @@ describe("apply_patch rendering", () => {
 
 		const component = editToolRenderer.renderCall(
 			{ input: malformedInput },
-			{ expanded: true, isPartial: true, renderContext: { editMode: "apply_patch" } },
+			{ expanded: true, isPartial: true },
 			uiTheme,
 		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
@@ -133,6 +138,7 @@ describe("apply_patch rendering", () => {
 			].join("\n");
 
 			const component = new ToolExecutionComponent("apply_patch", { input }, {}, undefined, uiStub, tmpDir);
+			component.setExpanded(true);
 			const before = Bun.stripANSI(component.render(160).join("\n"));
 			expect(before).not.toContain("(preview)");
 
@@ -206,6 +212,7 @@ describe("apply_patch rendering", () => {
 			false,
 		);
 
+		component.setExpanded(true);
 		const rendered = Bun.stripANSI(component.render(220).join("\n"));
 		expect(rendered).toContain("  10│}");
 		expect(rendered).toContain(" +11│import");
