@@ -68,6 +68,7 @@ import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } fr
 import {
 	FirstEventTimeoutError,
 	getProviderFirstEventTimeoutFallbackMs,
+	getProviderStreamIdleTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
@@ -1579,7 +1580,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				truncatedToolCalls.clear();
 				sawTerminalStopReason = false;
 			};
-			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const idleTimeoutMs =
+				options?.streamIdleTimeoutMs ??
+				getStreamIdleTimeoutMs(getProviderStreamIdleTimeoutFallbackMs(model.provider));
 			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
