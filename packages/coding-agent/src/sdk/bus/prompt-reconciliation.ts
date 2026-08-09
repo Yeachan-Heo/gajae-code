@@ -16,7 +16,9 @@
  *   Session-scoped durable retention (kind-aware store) is provided by reconciliation-store.ts (#3032).
  * - The clientRef index is session-runtime scoped; a ref conflicts only while
  *   retained and must never be reused as a retry mechanism.
- * - Terminal transitions settle once: the first terminal outcome wins.
+ * - Terminal transitions settle once: first terminal outcome wins. A late
+ *   `agent_failed` may still attach its sanitized reason to an already-terminal
+ *   record that has none, but never changes status, terminalAt, or retention.
  */
 
 import { PROMPT_FAILURE_CODE_MAX, sanitizePromptFailure } from "../prompt-failure";
@@ -67,6 +69,8 @@ export type TurnPromptReconciliation =
 			acceptedAt: number;
 			startedAt?: number;
 			terminalAt: number;
+			/** Present when a late `agent_failed` supplied the only failure reason. */
+			error?: { code: string; message: string };
 	  }
 	| {
 			status: "failed";
@@ -184,7 +188,17 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 	) => {
 		if (!correlation) return;
 		const record = records.get(keyOf(correlation));
-		if (!record || record.terminalAt !== undefined) return;
+		if (!record) return;
+		if (record.terminalAt !== undefined) {
+			// The terminal is claimed by one path while the reason arrives on another,
+			// so ordering is not the caller's to control. A late agent_failed enriches
+			// the settled record instead of being dropped; it must not resurrect it,
+			// so status, terminalAt, retention order, and clientRefIndex stay as-is.
+			// First reason wins: a late generic frame never overwrites a specific one.
+			if (frame.type === "agent_failed" && record.error === undefined)
+				record.error = sanitizePromptFailure(frame.error);
+			return;
+		}
 		if (frame.type === "agent_start") {
 			if (record.status === "accepted") {
 				record.status = "in_flight";
@@ -227,7 +241,12 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 			...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
 			terminalAt: record.terminalAt as number,
 		};
-		if (record.status === "terminal_ok") return { status: "terminal_ok", ...terminal };
+		if (record.status === "terminal_ok")
+			return {
+				status: "terminal_ok",
+				...terminal,
+				...(record.error !== undefined ? { error: record.error } : {}),
+			};
 		return { status: "failed", ...terminal, error: record.error ?? sanitizePromptFailure(undefined) };
 	};
 

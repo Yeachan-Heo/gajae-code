@@ -254,6 +254,90 @@ describe("prompt reconciliation record", () => {
 		for (let n = 1; n <= PROMPT_RECONCILIATION_ACTIVE_CAPACITY - 1; n++) rec.admit();
 		expect(() => rec.admit()).toThrowError(/Too many active/);
 	});
+
+	it("surfaces a late agent_failed reason on a record already made terminal by agent_end", () => {
+		const clock = clocked();
+		const rec = createPromptReconciliation({ now: clock.now });
+		rec.noteAccepted(correlation(), "ref-late");
+		rec.noteTransition(correlation(), { type: "agent_start" });
+		rec.noteTransition(correlation(), { type: "agent_end" });
+		const settled = rec.lookup({ clientRef: "ref-late" });
+		if (settled.status !== "terminal_ok") throw new Error("expected terminal_ok");
+		expect(settled.error).toBeUndefined();
+		const activeBefore = rec.activeCount();
+		// The reason arrives from a different path than the one that claimed the terminal.
+		clock.advance(5_000);
+		rec.noteTransition(correlation(), {
+			type: "agent_failed",
+			error: Object.assign(new Error("socket closed"), { code: "transport_reset" }),
+		});
+		const enriched = rec.lookup({ clientRef: "ref-late" });
+		if (enriched.status !== "terminal_ok") throw new Error("expected the terminal outcome to be preserved");
+		expect(enriched.error).toEqual({ code: "transport_reset", message: "Prompt submission failed." });
+		// Enrichment only: no resurrection, no re-timestamping, no new active slot.
+		expect(enriched.terminalAt).toBe(settled.terminalAt);
+		expect(rec.activeCount()).toBe(activeBefore);
+		expect(rec.activeCount()).toBe(0);
+	});
+
+	it("keeps the first recorded reason when later agent_failed frames disagree", () => {
+		const rec = createPromptReconciliation();
+		rec.noteAccepted(correlation(1), "ref-first");
+		rec.noteTransition(correlation(1), { type: "agent_end" });
+		rec.noteTransition(correlation(1), {
+			type: "agent_failed",
+			error: Object.assign(new Error("first"), { code: "transport_reset" }),
+		});
+		rec.noteTransition(correlation(1), {
+			type: "agent_failed",
+			error: Object.assign(new Error("second"), { code: "generic_late" }),
+		});
+		const enriched = rec.lookup({ clientRef: "ref-first" });
+		if (enriched.status !== "terminal_ok") throw new Error("expected terminal_ok");
+		expect(enriched.error?.code).toBe("transport_reset");
+		// A record that already failed with a specific reason is equally immune.
+		rec.noteAccepted(correlation(2));
+		rec.noteTransition(correlation(2), {
+			type: "agent_failed",
+			error: Object.assign(new Error("specific"), { code: "provider_down" }),
+		});
+		rec.noteTransition(correlation(2), {
+			type: "agent_failed",
+			error: Object.assign(new Error("generic"), { code: "generic_late" }),
+		});
+		const failed = rec.lookup(correlation(2));
+		if (failed.status !== "failed") throw new Error("expected failed");
+		expect(failed.error.code).toBe("provider_down");
+	});
+
+	it("ignores agent_start and agent_end after terminal while keeping the enriched reason", () => {
+		const clock = clocked();
+		const rec = createPromptReconciliation({ now: clock.now });
+		rec.noteAccepted(correlation(3), "ref-frozen");
+		rec.noteTransition(correlation(3), { type: "agent_start" });
+		const startedAt = clock.now();
+		clock.advance(10);
+		rec.noteTransition(correlation(3), { type: "agent_end" });
+		const terminalAt = clock.now();
+		rec.noteTransition(correlation(3), {
+			type: "agent_failed",
+			error: Object.assign(new Error("late"), { code: "transport_reset" }),
+		});
+		clock.advance(60_000);
+		rec.noteTransition(correlation(3), { type: "agent_start" });
+		rec.noteTransition(correlation(3), { type: "agent_end" });
+		expect(rec.lookup({ clientRef: "ref-frozen" })).toEqual({
+			status: "terminal_ok",
+			commandId: "command-3",
+			turnId: "turn-3",
+			clientRef: "ref-frozen",
+			acceptedAt: startedAt,
+			startedAt,
+			terminalAt,
+			error: { code: "transport_reset", message: "Prompt submission failed." },
+		});
+		expect(rec.activeCount()).toBe(0);
+	});
 });
 
 function surface(getPromptStatus?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown) {
