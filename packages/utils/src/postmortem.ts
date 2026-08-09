@@ -191,7 +191,9 @@ function installProcessStdoutWriteClassifier(): void {
 }
 
 function errorForDiagnostic(reason: unknown): Error {
-	return reason instanceof Error ? reason : new Error(String(reason));
+	if (reason instanceof Error) return reason;
+	const described = describeFailureReason(reason);
+	return new Error(described.message || String(reason));
 }
 
 // Register signal and error event handlers to trigger cleanup before exit.
@@ -246,7 +248,144 @@ function redactCrashSecrets(text: string): string {
 		/(?<![A-Za-z0-9_])(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
 		"$1«redacted»",
 	);
+	// `scheme://user:pass@host` carries the credential in the authority, where
+	// none of the labeled-value rules above can see it. A failed request URL is
+	// a normal thing to find in an error message, so this must be covered.
+	redacted = redacted.replace(/\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]*@/g, "$1«redacted-url-credential»@");
 	return redacted;
+}
+
+/** Bound for one reported failure reason; long provider payloads are truncated, never dropped. */
+const FAILURE_REASON_MAX_LENGTH = 512;
+/** Depth bound for the `cause` chain so a self-referential cause cannot spin. */
+const FAILURE_REASON_CAUSE_DEPTH = 3;
+
+/** One described failure reason: always readable, never `[object Object]`. */
+interface FailureReason {
+	/**
+	 * Bounded, single-line, secret-redacted reason. Empty only when the value
+	 * carried no readable reason at all (`undefined`, `null`, `""`, `{}`); the
+	 * caller supplies its own surface-appropriate constant in that case.
+	 */
+	message: string;
+	/** Raw `code` the value exposed, when it exposed a readable one. Not validated here. */
+	code?: string;
+}
+
+/** Read one property without ever propagating a throwing or reentrant getter. */
+function readProperty(value: object, key: string): unknown {
+	try {
+		return (value as Record<string, unknown>)[key];
+	} catch {
+		return undefined;
+	}
+}
+
+/** Scalar rendering that never invokes a user-defined `toString`. */
+function scalarText(value: unknown): string | undefined {
+	switch (typeof value) {
+		case "string":
+			return value.trim() || undefined;
+		case "number":
+			return Number.isFinite(value) ? String(value) : undefined;
+		case "bigint":
+		case "boolean":
+			return String(value);
+		case "symbol":
+			try {
+				return value.description?.trim() || undefined;
+			} catch {
+				return undefined;
+			}
+		default:
+			return undefined;
+	}
+}
+
+/** Surfaced by `describeFailureReason` on their own, so never repeated inline. */
+const REASON_FIELDS_HANDLED_SEPARATELY = new Set(["message", "code", "cause", "stack"]);
+
+/**
+ * Render the own scalar fields of a payload. `String({ phase, reason })` yields
+ * `[object Object]`, which destroys the only diagnostic the value had, and
+ * keeping just `message` silently drops the discriminators (`phase`, `reason`)
+ * that distinguish a provider error from an auth expiry.
+ */
+function recordText(value: object): string | undefined {
+	let keys: string[];
+	try {
+		keys = Object.keys(value);
+	} catch {
+		return undefined;
+	}
+	const parts: string[] = [];
+	for (const key of keys) {
+		if (REASON_FIELDS_HANDLED_SEPARATELY.has(key)) continue;
+		const entry = scalarText(readProperty(value, key));
+		if (entry !== undefined) parts.push(`${key}=${entry}`);
+		if (parts.length >= 8) break;
+	}
+	return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+/** Own text of one value, before the `cause` chain is appended. */
+function ownReasonText(value: object): string | undefined {
+	const message = scalarText(readProperty(value, "message"));
+	const record = recordText(value);
+	if (message !== undefined) return record === undefined ? message : `${message} (${record})`;
+	if (record !== undefined) return record;
+	const name = scalarText(readProperty(value, "name"));
+	if (name !== undefined) return name;
+	if (Array.isArray(value)) return undefined;
+	let constructorName: string | undefined;
+	try {
+		constructorName = scalarText((value as { constructor?: { name?: unknown } }).constructor?.name);
+	} catch {
+		constructorName = undefined;
+	}
+	return constructorName === "Object" ? undefined : constructorName;
+}
+
+/**
+ * Total description of an arbitrary thrown/rejected value for a failure report.
+ *
+ * Three properties every caller depends on and none may reimplement:
+ * - it never throws (a hostile or lazily computed `message`/`name`/`code`
+ *   getter must not turn a failure report into a second failure),
+ * - a non-`Error` payload never collapses to `[object Object]`,
+ * - the result is single-line, length-bounded and credential-redacted, so it is
+ *   safe to persist in a durable record and hand to a client.
+ */
+export function describeFailureReason(value: unknown): FailureReason {
+	const segments: string[] = [];
+	let code: string | undefined;
+	let current: unknown = value;
+	for (let depth = 0; depth <= FAILURE_REASON_CAUSE_DEPTH && current !== undefined && current !== null; depth++) {
+		const scalar = scalarText(current);
+		if (scalar !== undefined) {
+			segments.push(scalar);
+			break;
+		}
+		if (typeof current !== "object" && typeof current !== "function") break;
+		const own = ownReasonText(current as object);
+		if (own !== undefined) segments.push(own);
+		code ??= scalarText(readProperty(current as object, "code"));
+		const cause = readProperty(current as object, "cause");
+		if (cause === current) break;
+		current = cause;
+	}
+	const joined = segments.join("; caused by: ");
+	// Control characters would break single-line log correlation; secrets must
+	// never reach a durable record. Both are handled here so no caller repeats it.
+	const flattened = redactCrashSecrets(joined)
+		.replace(/[\u0000-\u001f\u007f]+/g, " ")
+		.replace(/\s{2,}/g, " ")
+		.trim();
+	const message =
+		flattened.length > FAILURE_REASON_MAX_LENGTH
+			? `${flattened.slice(0, FAILURE_REASON_MAX_LENGTH - 1)}…`
+			: flattened;
+	return code === undefined ? { message } : { message, code };
 }
 
 /**

@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
+import { describeFailureReason } from "@gajae-code/utils/postmortem";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { type ModelProfileDefinition, resolveProfileBindings } from "../../config/model-profiles";
 import { resolveModelChainWithAuth } from "../../config/model-resolver";
@@ -265,6 +266,7 @@ export interface InvocationReconciliation {
 	hydrate(): Promise<void>;
 }
 
+/** Kind-aware invocation reconciliation for the SDK host session (prompt + skill). */
 function createInvocationReconciliation(
 	options: { stateRoot?: string; sessionId?: string } = {},
 ): InvocationReconciliation {
@@ -416,7 +418,23 @@ function createInvocationReconciliation(
 			} else {
 				record.status = frame.type === "agent_failed" ? "failed" : "terminal_ok";
 				record.terminalAt = Date.now();
-				if (frame.type === "agent_failed") record.error = { code: "prompt_failed", message: "Invocation failed." };
+				// The frame is the only place the failure reason exists. Discarding it
+				// left every failed invocation indistinguishable at the client and left
+				// nothing in the log to correlate against (#4068).
+				if (frame.type === "agent_failed") {
+					const reason = describeFailureReason(frame.error);
+					record.error = {
+						code: reason.code ?? "prompt_failed",
+						message: reason.message || "Invocation failed.",
+					};
+					logger.warn("sdk invocation prompt_failed", {
+						kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						code: record.error.code,
+						message: record.error.message,
+					});
+				}
 			}
 			await persist();
 		},
@@ -955,8 +973,7 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
-						if (kind === "skill")
-							void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
+						void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 						return;
 					}
 					settled = true;

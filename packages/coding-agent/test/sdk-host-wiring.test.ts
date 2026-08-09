@@ -1959,7 +1959,8 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 			type: "agent_failed",
 			sessionId,
 			...correlation,
-			error: { code: "unavailable", message: "Prompt submission failed." },
+			// #4068: the reason the agent_failed frame carried reaches the requester.
+			error: { code: "unavailable", message: "synchronous accepted failure" },
 		}),
 	]);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
@@ -2221,7 +2222,8 @@ test("SDK host delivers accepted prompt failures after their acknowledgement", a
 		type: "agent_failed",
 		commandId: acknowledgement.result?.commandId,
 		turnId: acknowledgement.result?.turnId,
-		error: { code: "unavailable", message: "Prompt submission failed." },
+		// #4068: the reason the agent_failed frame carried reaches the requester.
+		error: { code: "unavailable", message: "prompt failed after preflight" },
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
@@ -6026,7 +6028,8 @@ test("accepted-then-failed submission retains its reconciliation record and bloc
 	await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "correlated agent_failed frame");
 	const failedFrame = frames.find(frame => frame.type === "agent_failed");
 	expect(failedFrame).toMatchObject({
-		error: { code: "unavailable", message: "Prompt submission failed." },
+		// #4068: the reason the agent_failed frame carried reaches the requester.
+		error: { code: "unavailable", message: "synchronous accepted failure" },
 	});
 
 	// The reconciliation record is retained with the failed outcome, not released.
@@ -6136,7 +6139,7 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 	);
 
 	// Authoritative settlement fired at lifecycle ingress even though the delivery
-	// buffer expired, and the provider error is retained only as a safe failed code.
+	// buffer expired, and the provider error is now reported instead of a constant (#4068).
 	const settled = await request({
 		type: "query_request",
 		id: "long-settled",
@@ -6145,7 +6148,10 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 	});
 	expect(settled).toMatchObject({
 		ok: true,
-		result: { status: "failed", error: { code: "agent_error", message: "Prompt submission failed." } },
+		result: {
+			status: "failed",
+			error: { code: "agent_error", message: "private prompt /home/alice secret-token" },
+		},
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });

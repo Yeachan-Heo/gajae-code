@@ -19,6 +19,8 @@
  * - Terminal transitions settle once: the first terminal outcome wins.
  */
 
+import { describeFailureReason } from "@gajae-code/utils/postmortem";
+
 export const PROMPT_RECONCILIATION_ACTIVE_CAPACITY = 128;
 export const PROMPT_RECONCILIATION_TERMINAL_CAPACITY = 256;
 export const PROMPT_RECONCILIATION_TERMINAL_TTL_MS = 15 * 60_000;
@@ -94,12 +96,20 @@ export interface PromptReconciliation {
 	activeCount(): number;
 }
 
-/** Safe-token code capped at 64; arbitrary failure text is never retained. */
+/**
+ * Bounded failure metadata retained for a failed prompt.
+ *
+ * The code is a safe token capped at 64 characters. The message is the reason
+ * the frame actually carried, read by the single total reader in
+ * `@gajae-code/utils/postmortem`: single-line, credential-redacted and length
+ * bounded, but no longer replaced by a constant that made a provider error, a
+ * tool crash, an auth expiry and an internal assertion indistinguishable (#4068).
+ */
 export function sanitizePromptFailure(error: unknown): { code: string; message: string } {
-	const candidate = error as { code?: unknown } | undefined;
-	const rawCode = typeof candidate?.code === "string" ? candidate.code : "";
+	const reason = describeFailureReason(error);
+	const rawCode = reason.code ?? "";
 	const code = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode) ? rawCode : "internal";
-	return { code, message: "Prompt submission failed." };
+	return { code, message: reason.message || "Prompt submission failed." };
 }
 
 export function createPromptReconciliation(options: { now?: () => number } = {}): PromptReconciliation {

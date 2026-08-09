@@ -71,17 +71,27 @@ describe("prompt reconciliation record", () => {
 		expect(result.terminalAt).toBeGreaterThan(0);
 	});
 
-	it("retains only a safe-token code and never exposes arbitrary failure text", () => {
-		for (const error of [
-			undefined,
+	it("retains a safe-token code and a credential-redacted reason, never an opaque constant", () => {
+		// #4068: the reason is the only thing that tells a provider error, a tool
+		// crash, an auth expiry and an internal assertion apart at the client.
+		// Credential material is still redacted; the reason itself is retained.
+		const leaky = sanitizePromptFailure(
 			new Error("prompt text /home/alice/private bearer sk-secret https://user:pass@example.com?q=token"),
-			Object.assign(new Error("provider payload"), { code: `bad code! ${"x".repeat(100)}` }),
-		]) {
-			expect(sanitizePromptFailure(error)).toEqual({ code: "internal", message: "Prompt submission failed." });
-		}
+		);
+		expect(leaky.code).toBe("internal");
+		expect(leaky.message).toContain("«redacted-auth»");
+		expect(leaky.message).toContain("«redacted-url-credential»");
+		expect(leaky.message).not.toContain("sk-secret");
+		expect(leaky.message).not.toContain("user:pass");
+		// An unsafe code token is still refused, and the reason still survives.
+		expect(
+			sanitizePromptFailure(Object.assign(new Error("provider payload"), { code: `bad code! ${"x".repeat(100)}` })),
+		).toEqual({ code: "internal", message: "provider payload" });
+		// Only a frame that carried no reason at all falls back to the constant.
+		expect(sanitizePromptFailure(undefined)).toEqual({ code: "internal", message: "Prompt submission failed." });
 		expect(sanitizePromptFailure(Object.assign(new Error("boom"), { code: "ok_code-1.2" }))).toEqual({
 			code: "ok_code-1.2",
-			message: "Prompt submission failed.",
+			message: "boom",
 		});
 	});
 
