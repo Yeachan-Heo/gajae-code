@@ -260,7 +260,15 @@ const FAILURE_REASON_MAX_LENGTH = 512;
 /** Depth bound for the `cause` chain so a self-referential cause cannot spin. */
 const FAILURE_REASON_CAUSE_DEPTH = 3;
 
-/** One described failure reason: always readable, never `[object Object]`. */
+/**
+ * One described failure reason: always readable, never `[object Object]`.
+ *
+ * Deliberately message-only. An earlier revision also returned the raw `code`
+ * harvested from the value and its `cause` chain, and the SDK wire consumed it
+ * — which widened the emitted `code` domain. The reason is a local diagnostic;
+ * wire codes are produced by the wire's own validator from the value's own
+ * `code`, never from here.
+ */
 interface FailureReason {
 	/**
 	 * Bounded, single-line, secret-redacted reason. Empty only when the value
@@ -268,8 +276,6 @@ interface FailureReason {
 	 * caller supplies its own surface-appropriate constant in that case.
 	 */
 	message: string;
-	/** Raw `code` the value exposed, when it exposed a readable one. Not validated here. */
-	code?: string;
 }
 
 /** Read one property without ever propagating a throwing or reentrant getter. */
@@ -302,8 +308,13 @@ function scalarText(value: unknown): string | undefined {
 	}
 }
 
-/** Surfaced by `describeFailureReason` on their own, so never repeated inline. */
-const REASON_FIELDS_HANDLED_SEPARATELY = new Set(["message", "code", "cause", "stack"]);
+/**
+ * Surfaced by `describeFailureReason` on their own, so never repeated inline.
+ * `code` is deliberately absent: it is rendered inline as `code=<value>`, so a
+ * provider's discriminator survives in the local reason instead of being
+ * dropped. Nothing here is a wire value.
+ */
+const REASON_FIELDS_HANDLED_SEPARATELY = new Set(["message", "cause", "stack"]);
 
 /**
  * Render the own scalar fields of a payload. `String({ phase, reason })` yields
@@ -362,7 +373,6 @@ function ownReasonText(value: object): string | undefined {
  */
 export function describeFailureReason(value: unknown): FailureReason {
 	const segments: string[] = [];
-	let code: string | undefined;
 	let current: unknown = value;
 	for (let depth = 0; depth <= FAILURE_REASON_CAUSE_DEPTH && current !== undefined && current !== null; depth++) {
 		const scalar = scalarText(current);
@@ -373,7 +383,6 @@ export function describeFailureReason(value: unknown): FailureReason {
 		if (typeof current !== "object" && typeof current !== "function") break;
 		const own = ownReasonText(current as object);
 		if (own !== undefined) segments.push(own);
-		code ??= scalarText(readProperty(current as object, "code"));
 		const cause = readProperty(current as object, "cause");
 		if (cause === current) break;
 		current = cause;
@@ -389,7 +398,7 @@ export function describeFailureReason(value: unknown): FailureReason {
 		flattened.length > FAILURE_REASON_MAX_LENGTH
 			? `${flattened.slice(0, FAILURE_REASON_MAX_LENGTH - 1)}…`
 			: flattened;
-	return code === undefined ? { message } : { message, code };
+	return { message };
 }
 
 /**

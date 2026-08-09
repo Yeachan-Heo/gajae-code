@@ -14,7 +14,6 @@ import { normalizeModelSelectorValue } from "../../config/model-selector-value";
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { parseThinkingLevel } from "../../thinking";
-import { sanitizePromptFailureCode } from "../bus/prompt-reconciliation";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -359,24 +358,12 @@ function createInvocationReconciliation(
 					record.status === "terminal_ok" ||
 					record.status === "failed")
 			) {
-				const hydrated = { ...record };
-				if (
-					hydrated.terminalAt === undefined &&
-					(hydrated.status === "accepted" || hydrated.status === "in_flight")
-				) {
-					hydrated.status = "failed";
-					hydrated.terminalAt = Date.now();
-					hydrated.error = {
-						code: "process_restart",
-						message: "Reconciliation incomplete after process restart.",
-					};
-				} else if (hydrated.error !== undefined) {
-					hydrated.error = {
-						code: sanitizePromptFailureCode(hydrated.error.code, "prompt_failed"),
-						message: describeFailureReason(hydrated.error.message).message || "Invocation failed.",
-					};
+				if (record.terminalAt === undefined && (record.status === "accepted" || record.status === "in_flight")) {
+					record.status = "failed";
+					record.terminalAt = Date.now();
+					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
 				}
-				records.set(key(hydrated.kind, hydrated), hydrated);
+				records.set(key(record.kind, record), { ...record });
 			}
 		}
 		cleanup();
@@ -424,27 +411,34 @@ function createInvocationReconciliation(
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
 			const record = records.get(key(kind, correlation));
-			if (!record || record.terminalAt !== undefined) return;
+			if (!record) return;
+			// `agent_end` says the agent loop stopped, not that this invocation
+			// succeeded: the submission promise settles afterwards and is the only
+			// carrier of the failure reason. So a failure supersedes a terminal that
+			// `agent_end` claimed, and never the reverse — a record already claimed
+			// by a failure is final. The record still settles once on a real outcome
+			// and can never flap back from failed to terminal_ok.
+			const supersedesLoopEnd = frame.type === "agent_failed" && record.status === "terminal_ok";
+			if (record.terminalAt !== undefined && !supersedesLoopEnd) return;
 			if (frame.type === "agent_start") {
 				record.status = "in_flight";
 				record.startedAt = Date.now();
 			} else {
 				record.status = frame.type === "agent_failed" ? "failed" : "terminal_ok";
 				record.terminalAt = Date.now();
-				// The frame is the only place the failure reason exists. Keep the
-				// bounded reason in the local record and operator log, never on the wire.
+				// The frame is the only place the failure reason exists. The local
+				// record and the operator log keep the bounded reason; the code and
+				// the message `lookup` projects stay the constants the wire expects.
 				if (frame.type === "agent_failed") {
-					const reason = describeFailureReason(frame.error);
 					record.error = {
-						code: sanitizePromptFailureCode(reason.code, "prompt_failed"),
-						message: reason.message || "Invocation failed.",
+						code: "prompt_failed",
+						message: describeFailureReason(frame.error).message || "Invocation failed.",
 					};
 					logger.warn("sdk invocation prompt_failed", {
 						kind,
 						commandId: correlation.commandId,
 						turnId: correlation.turnId,
-						code: record.error.code,
-						message: record.error.message,
+						reason: record.error.message,
 					});
 				}
 			}

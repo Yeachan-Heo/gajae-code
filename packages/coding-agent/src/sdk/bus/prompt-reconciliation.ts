@@ -19,8 +19,6 @@
  * - Terminal transitions settle once: the first terminal outcome wins.
  */
 
-import { describeFailureReason } from "@gajae-code/utils/postmortem";
-
 export const PROMPT_RECONCILIATION_ACTIVE_CAPACITY = 128;
 export const PROMPT_RECONCILIATION_TERMINAL_CAPACITY = 256;
 export const PROMPT_RECONCILIATION_TERMINAL_TTL_MS = 15 * 60_000;
@@ -96,21 +94,20 @@ export interface PromptReconciliation {
 	activeCount(): number;
 }
 
-/** Safe-token code capped at 64; credential-shaped and arbitrary text is refused. */
-export function sanitizePromptFailureCode(value: unknown, fallback: string): string {
-	const rawCode = typeof value === "string" ? value : "";
-	const isSafeToken = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode);
-	const isSecretSafe = isSafeToken && describeFailureReason(rawCode).message === rawCode;
-	return isSecretSafe ? rawCode : fallback;
-}
-
-/** Arbitrary failure text never crosses the SDK/ACP wire boundary. */
+/**
+ * Safe-token code capped at 64; arbitrary failure text is never retained.
+ *
+ * The emitted domain is exactly: the value's own `code`, when that is a string
+ * of 1..64 characters drawn from `[A-Za-z0-9._-]`, and otherwise `"internal"`.
+ * Nothing else may reach the wire — no `cause`-chain lookup, no coercion of a
+ * non-string `code`, no derived text. `sdk-q26-prompt-status.test.ts` pins the
+ * domain, both for values that must pass through and for values that must not.
+ */
 export function sanitizePromptFailure(error: unknown): { code: string; message: string } {
-	const reason = describeFailureReason(error);
-	return {
-		code: sanitizePromptFailureCode(reason.code, "internal"),
-		message: "Prompt submission failed.",
-	};
+	const candidate = error as { code?: unknown } | undefined;
+	const rawCode = typeof candidate?.code === "string" ? candidate.code : "";
+	const code = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode) ? rawCode : "internal";
+	return { code, message: "Prompt submission failed." };
 }
 
 export function createPromptReconciliation(options: { now?: () => number } = {}): PromptReconciliation {

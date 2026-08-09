@@ -69,22 +69,40 @@ describe("prompt reconciliation record", () => {
 		expect(result.terminalAt).toBeGreaterThan(0);
 	});
 
-	it("never carries arbitrary failure text or credential-shaped codes on the wire", () => {
-		expect(
-			sanitizePromptFailure(
-				Object.assign(new Error("prompt text bearer sk-secret https://user:pass@example.com?q=token"), {
-					code: "sk-abcdefghijklmnop",
-				}),
-			),
-		).toEqual({ code: "internal", message: "Prompt submission failed." });
-		expect(
-			sanitizePromptFailure(Object.assign(new Error("provider payload"), { code: `bad code! ${"x".repeat(100)}` })),
-		).toEqual({ code: "internal", message: "Prompt submission failed." });
-		expect(sanitizePromptFailure(undefined)).toEqual({ code: "internal", message: "Prompt submission failed." });
-		expect(sanitizePromptFailure(Object.assign(new Error("boom"), { code: "ok_code-1.2" }))).toEqual({
-			code: "ok_code-1.2",
-			message: "Prompt submission failed.",
-		});
+	it("emits a wire code only from the value's own safe-token code, never from anywhere else", () => {
+		// The emitted domain is closed. Left column passes through verbatim;
+		// everything else collapses to "internal". A change that lets any other
+		// value reach `code` — a `cause`-chain lookup, a coercion of a non-string
+		// `code`, a derived token — fails here instead of reaching a reviewer.
+		const passesThrough = ["ok_code-1.2", "sk-abcdefghijklmnop", "a".repeat(64), "429", "_", "."];
+		for (const code of passesThrough)
+			expect(sanitizePromptFailure(Object.assign(new Error("provider payload"), { code }))).toEqual({
+				code,
+				message: "Prompt submission failed.",
+			});
+
+		const collapsesToInternal: unknown[] = [
+			undefined,
+			null,
+			"provider_down",
+			{},
+			new Error("prompt text bearer sk-secret https://user:pass@example.com?q=token"),
+			{ code: "" },
+			{ code: "a".repeat(65) },
+			{ code: `bad code! ${"x".repeat(100)}` },
+			{ code: "has/slash" },
+			{ code: "tenant:9f2b" },
+			{ code: 429 },
+			{ code: 10n },
+			{ code: true },
+			{ code: Symbol("tenant_9f2b.acct-8817") },
+			{ code: { toString: () => "acct-8817" } },
+			{ message: "outer", cause: { code: "tenant_9f2b.acct-8817" } },
+			{ message: "outer", cause: { cause: { cause: { code: "deep_secret_9f2b" } } } },
+			Object.assign(new Error("outer"), { cause: Object.assign(new Error("inner"), { code: "from_cause" }) }),
+		];
+		for (const error of collapsesToInternal)
+			expect(sanitizePromptFailure(error)).toEqual({ code: "internal", message: "Prompt submission failed." });
 	});
 
 	it("reports unknown for a wrong commandId/turnId pair even when the commandId exists", () => {

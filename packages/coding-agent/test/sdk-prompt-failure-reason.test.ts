@@ -69,19 +69,28 @@ function memoryTransport(sessionId: string, stateRoot: string, token: string): M
 
 async function failedPrompt(
 	error: unknown,
+	options: { driveAgentLoop?: boolean } = {},
 ): Promise<{ client: FailedOutcome; persisted: FailedOutcome; recordBytes: number }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-failure-reason-"));
 	temporaryRoots.push(root);
 	const sessionId = `failure-reason-${crypto.randomUUID()}`;
 	const handlers = new Map<string, (event: unknown, context: ExtensionContext) => void | Promise<void>>();
 	let transport: MemoryTransport | undefined;
+	let context: ExtensionContext | undefined;
 	const api = {
 		on(event: string, handler: (event: unknown, context: ExtensionContext) => void | Promise<void>) {
 			handlers.set(event, handler);
 		},
-		sendUserMessage(_content: unknown, options?: PromptSubmissionOptions) {
-			const accepted = options?.onPreflightAcceptCommit?.() ?? Promise.resolve();
-			return accepted.then(() => {
+		sendUserMessage(_content: unknown, submission?: PromptSubmissionOptions) {
+			const accepted = submission?.onPreflightAcceptCommit?.() ?? Promise.resolve();
+			return accepted.then(async () => {
+				// The ordinary path: the agent loop starts and ends, and only then does
+				// the prompt promise reject. `agent_end` therefore claims a terminal
+				// before the reason exists.
+				if (options.driveAgentLoop) {
+					await handlers.get("agent_start")?.({}, context as ExtensionContext);
+					await handlers.get("agent_end")?.({}, context as ExtensionContext);
+				}
 				throw error;
 			});
 		},
@@ -92,7 +101,7 @@ async function failedPrompt(
 			return transport;
 		},
 	});
-	const context = {
+	context = {
 		cwd: root,
 		workflowGate: undefined,
 		sdkBindings: () => [],
@@ -153,18 +162,14 @@ async function failedPrompt(
 }
 
 describe("SDK prompt failure reason observable boundaries", () => {
-	it("keeps the accepted failure reason local while returning the constant wire message", async () => {
+	it("keeps the accepted failure reason local while returning the constant wire code and message", async () => {
 		const { client, persisted } = await failedPrompt(
 			Object.assign(new Error("anthropic returned 529 overloaded_error"), { code: "provider_overloaded" }),
 		);
-		expect(client.error).toEqual({
-			code: "provider_overloaded",
-			message: "Invocation failed.",
-		});
-		expect(persisted.error).toEqual({
-			code: "provider_overloaded",
-			message: "anthropic returned 529 overloaded_error",
-		});
+		expect(client.error).toEqual({ code: "prompt_failed", message: "Invocation failed." });
+		expect(persisted.error.code).toBe("prompt_failed");
+		expect(persisted.error.message).toContain("anthropic returned 529 overloaded_error");
+		expect(persisted.error.message).toContain("code=provider_overloaded");
 	});
 
 	it("persists readable plain failure records without exposing them to SDK clients", async () => {
@@ -180,14 +185,27 @@ describe("SDK prompt failure reason observable boundaries", () => {
 		expect(persisted.error.message).not.toContain("[object Object]");
 	});
 
-	it("rejects credential-shaped and oversized codes before persistence or wire return", async () => {
+	it("bounds an oversized code instead of dropping it, and never returns it to the client", async () => {
 		const { client, persisted, recordBytes } = await failedPrompt({
 			code: `sk-${"a".repeat(1024 * 1024)}`,
 			message: "provider request failed after credential refresh",
 		});
 		expect(client.error).toEqual({ code: "prompt_failed", message: "Invocation failed." });
 		expect(persisted.error.code).toBe("prompt_failed");
-		expect(persisted.error.message).toBe("provider request failed after credential refresh");
+		expect(persisted.error.message).toContain("provider request failed after credential refresh");
+		expect(persisted.error.message.length).toBeLessThanOrEqual(512);
 		expect(recordBytes).toBeLessThan(4096);
+	});
+
+	it("records the reason even when the agent loop already claimed a terminal for the prompt", async () => {
+		const { client, persisted } = await failedPrompt(
+			Object.assign(new Error("stream closed before the first token"), { code: "provider_stream_closed" }),
+			{ driveAgentLoop: true },
+		);
+		expect(client.status).toBe("failed");
+		expect(client.error).toEqual({ code: "prompt_failed", message: "Invocation failed." });
+		expect(persisted.status).toBe("failed");
+		expect(persisted.error.message).toContain("stream closed before the first token");
+		expect(persisted.error.message).toContain("code=provider_stream_closed");
 	});
 });

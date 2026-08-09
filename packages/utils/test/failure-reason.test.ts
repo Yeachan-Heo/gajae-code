@@ -31,6 +31,18 @@ describe("postmortem observable failure diagnostics", () => {
 		expect(record).not.toContain("[object Object]");
 	});
 
+	it("keeps a provider code and a cause code in the reason it describes", async () => {
+		const record = await crashRecord({
+			message: "prompt turn aborted",
+			code: "provider_overloaded",
+			cause: { message: "upstream refused", code: "tenant_9f2b" },
+		});
+		expect(record).toContain("prompt turn aborted");
+		expect(record).toContain("code=provider_overloaded");
+		expect(record).toContain("upstream refused");
+		expect(record).toContain("code=tenant_9f2b");
+	});
+
 	it("does not let hostile getters hide the remaining diagnostic", async () => {
 		const record = await crashRecord({
 			phase: "auth_refresh",
