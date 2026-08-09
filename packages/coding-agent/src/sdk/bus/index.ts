@@ -4058,7 +4058,6 @@ export function createNotificationsExtension(
 			connectionId: string;
 			abandoned: boolean;
 			failed: boolean;
-			error: unknown;
 			terminal: boolean;
 			retainCorrelation: boolean;
 			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
@@ -4257,7 +4256,6 @@ export function createNotificationsExtension(
 				connectionId: requesterConnectionId,
 				abandoned: false,
 				failed: false,
-				error: undefined,
 				terminal: false,
 				retainCorrelation: trackReconciliation,
 				createdAt: Date.now(),
@@ -4480,7 +4478,6 @@ export function createNotificationsExtension(
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			submission.failed = true;
-			submission.error = error;
 			removePendingPromptCorrelation(correlation);
 			if (
 				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
