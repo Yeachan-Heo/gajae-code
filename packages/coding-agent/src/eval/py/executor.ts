@@ -353,20 +353,47 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 		}),
 	};
 	sessions.set(sessionId, initializing);
+	let cancellationTimer: NodeJS.Timeout | undefined;
+	const retireCancelledInitialization = (timedOut: boolean): void => {
+		if (initializing.cancelled) return;
+		initializing.cancelled = new PythonExecutionCancelledError(timedOut);
+		if (sessions.get(sessionId) === initializing) sessions.delete(sessionId);
+	};
+	const onAbort = (): void => {
+		options.signal?.removeEventListener("abort", onAbort);
+		retireCancelledInitialization(isTimedOutCancellation(options.signal?.reason, options.signal));
+	};
+	if (options.signal?.aborted) {
+		onAbort();
+	} else if (options.signal) {
+		options.signal.addEventListener("abort", onAbort, { once: true });
+	}
+	const remainingMs = getRemainingTimeoutMs(options.deadlineMs);
+	if (remainingMs !== undefined) {
+		if (remainingMs <= 0) {
+			retireCancelledInitialization(true);
+		} else {
+			cancellationTimer = setTimeout(() => retireCancelledInitialization(true), remainingMs);
+			cancellationTimer.unref();
+		}
+	}
+	void initializing.promise
+		.finally(() => {
+			options.signal?.removeEventListener("abort", onAbort);
+			if (cancellationTimer) clearTimeout(cancellationTimer);
+		})
+		.catch(() => undefined);
 	try {
 		const session = await waitForPromiseWithCancellation(initializing.promise, options);
 		attachOwner(session, sessionId, options.kernelOwnerId);
 		ensurePythonResourceCleanup();
 		return session;
 	} catch (err) {
-		if (sessions.get(sessionId) === initializing) {
-			if (isCancellationError(err)) {
-				initializing.cancelled = new PythonExecutionCancelledError(isTimedOutCancellation(err, options.signal));
-				sessions.delete(sessionId);
-				await initializing.promise.catch(() => undefined);
-			} else {
-				sessions.delete(sessionId);
-			}
+		if (isCancellationError(err)) {
+			retireCancelledInitialization(isTimedOutCancellation(err, options.signal));
+			await initializing.promise.catch(() => undefined);
+		} else if (sessions.get(sessionId) === initializing) {
+			sessions.delete(sessionId);
 		}
 		throw err;
 	}

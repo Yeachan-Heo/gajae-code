@@ -13,8 +13,8 @@ const originalStart = PythonKernel.start;
 const READINESS_TIMEOUT_MS = 1_000;
 const PROCESS_EXIT_TIMEOUT_MS = 2_000;
 const CLEANUP_TIMEOUT_MS = 9_000;
-// Python startup is bounded to 10s; readiness plus cancellation can consume at most 10s.
-const LIFECYCLE_TEST_TIMEOUT_MS = 20_000;
+// Kernel startup permits two 10s phases; readiness and cleanup consume up to 10s more.
+const LIFECYCLE_TEST_TIMEOUT_MS = 35_000;
 
 const OK_RESULT: KernelExecuteResult = {
 	status: "ok",
@@ -294,7 +294,6 @@ describe("python eval lifecycle red-team", () => {
 				});
 				await startupCalled.promise;
 				controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
-				await Bun.sleep(0);
 				expect(listeners.count()).toBe(0);
 
 				const successor = executePython("print('successor')", {
