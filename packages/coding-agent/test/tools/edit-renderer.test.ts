@@ -115,6 +115,13 @@ describe("editToolRenderer", () => {
 		]);
 		expect(
 			getEditRequestTargetInventory(
+				{ path: "fallback.ts", input: "§actual.ts\n»BOF\n+x" },
+				"hashline",
+				{ isPartial: true },
+			).paths,
+		).toEqual(["actual.ts"]);
+		expect(
+			getEditRequestTargetInventory(
 				{ input: "*** Begin Patch\n*** Update File: a\n@@\n-old\n+new\n*** Update File: b" },
 				"apply_patch",
 				{ isPartial: true },
@@ -618,5 +625,22 @@ describe("editToolRenderer", () => {
 		expect(liveRaw).not.toContain("https://bad");
 		expect(completeRaw).not.toContain("https://bad");
 		expect(completeText).not.toContain("\nunsafe.ts");
+	});
+	it("sanitizes expanded single-file preview errors", async () => {
+		const uiTheme = await getUiTheme();
+		const previewError = "failed \x1b]8;;https://bad\x07\nunsafe.ts";
+		const component = editToolRenderer.renderResult(
+			{ content: [], details: { path: "safe.ts", diff: "" } },
+			{
+				expanded: true,
+				isPartial: true,
+				renderContext: { editMode: "replace", editDiffPreview: { error: previewError } },
+			},
+			uiTheme,
+			{ path: "safe.ts" },
+		);
+		const rendered = component.render(160).join("\n");
+		expect(rendered).not.toContain("https://bad");
+		expect(rendered).not.toContain("\x1b]8;;");
 	});
 });

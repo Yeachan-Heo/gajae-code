@@ -149,7 +149,8 @@ export function getEditRequestTargetInventory(
 
 	if (editMode === "hashline") {
 		const input = typeof values.input === "string" ? values.input : "";
-		return { paths: orderedDistinctPaths([topLevelPath, ...getHashlineTargetPaths(input)]) };
+		const headerPaths = getHashlineTargetPaths(input);
+		return { paths: orderedDistinctPaths(headerPaths.length > 0 ? headerPaths : [topLevelPath]) };
 	}
 
 	if (editMode === "apply_patch") {

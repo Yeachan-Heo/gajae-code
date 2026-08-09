@@ -544,7 +544,7 @@ function renderSingleFileResult(
 					text += renderDiffSection(details.diff, identity.path, true, uiTheme, renderDiffFn);
 				} else if (preview) {
 					if ("error" in preview) {
-						text += `\n\n${uiTheme.fg("error", replaceTabs(preview.error, identity.path))}`;
+						text += `\n\n${uiTheme.fg("error", replaceTabs(sanitizeText(preview.error), identity.path))}`;
 					} else if (preview.diff) {
 						text += renderDiffSection(preview.diff, identity.path, true, uiTheme, renderDiffFn);
 					}
