@@ -220,7 +220,7 @@ test("createConnectSubscribeSubmit replays and writes one prompt on the validate
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
 		const pending = client.createConnectSubscribeSubmit({
-			create: { cwd: "/repo" },
+			create: { cwd: "/repo", token: "create-token", nested: { secret: "must-not-retain" } },
 			createIdempotencyKey: "create-identity",
 			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
 		});
@@ -256,7 +256,7 @@ test("createConnectSubscribeSubmit replays and writes one prompt on the validate
 			id: replay.id,
 			ok: true,
 			generation: 1,
-			lastSeq: 1,
+			lastSeq: 2,
 			events: [{ type: "event", generation: 1, seq: 1, name: "session_ready" }],
 		});
 		await flush();
@@ -278,6 +278,7 @@ test("createConnectSubscribeSubmit replays and writes one prompt on the validate
 			identity: {
 				createIdempotencyKey: "create-identity",
 				submission: { kind: "prompt", clientRef: "prompt-work" },
+				create: { cwd: "/repo" },
 			},
 		});
 		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(1);
@@ -362,7 +363,7 @@ test("createConnectSubscribeSubmit rejects replay generation resets and sequence
 	}
 });
 
-test("createConnectSubscribeSubmit rejects interleaved live replay sequence gaps without ordered control", async () => {
+test("createConnectSubscribeSubmit permits capability-gated global replay gaps on the validated incarnation", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
 		const pending = client.createConnectSubscribeSubmit({
@@ -392,12 +393,31 @@ test("createConnectSubscribeSubmit rejects interleaved live replay sequence gaps
 		const replay = sent(endpoint);
 		endpoint.message({ type: "event", generation: 1, seq: 2, name: "live" });
 		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 2, events: [] });
-		await expect(pending).resolves.toMatchObject({ kind: "subscription_uncertain", prohibitResubmission: true });
-		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(0);
+		await flush();
+		const control = sent(endpoint, 1);
+		expect(control).toMatchObject({ type: "control_request", operation: "turn.prompt" });
+		endpoint.message({ type: "control_response", id: control.id, ok: true, result: { commandId: "command-1" } });
+		await expect(pending).resolves.toMatchObject({ kind: "accepted" });
+		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(1);
 		await client.close();
 	});
 });
 
+test("reconcileCreateConnectSubmit rejects malformed submission identities before broker traffic", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const result = await client.reconcileCreateConnectSubmit({
+			version: 1,
+			operation: "session.create",
+			createIdempotencyKey: "create-key",
+			create: { cwd: "/repo" },
+			submission: { kind: "not-a-submission", clientRef: "work" },
+		} as never);
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		expect(FakeWebSocket.instances).toHaveLength(0);
+		await client.close();
+	});
+});
 test("reconcileCreateConnectSubmit queries status despite a replay gap and never submits ordered work", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });

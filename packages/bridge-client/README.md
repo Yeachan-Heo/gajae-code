@@ -30,10 +30,10 @@ It is SDK v3 only. The historical BridgeClient/backend-bridge protocol, RPC ingr
 
 `@gajae-code/coding-agent/sdk` re-exports this package for compatibility; both entrypoints expose the same `SdkClient` class identity.
 
-## Atomic create, attach, and submit
+## Durable create, attach, and submit orchestration
 
-`SdkClient.createConnectSubscribeSubmit()` is a recovery-oriented convenience operation over broker create and endpoint controls. It requires a fresh `createIdempotencyKey` and a fresh, kind-scoped 1–128 character `clientRef`. It retains both identities before crossing the transport boundary and returns a `SdkAtomicLookupIdentity` without endpoint credentials.
+`SdkClient.createConnectSubscribeSubmit()` is a durable client-side orchestration convenience operation over broker create and endpoint controls. It requires a fresh `createIdempotencyKey` and a fresh, kind-scoped 1–128 character `clientRef`. Its safe canonical recovery identity retains only create fields needed to reconcile `session.create`; it excludes credentials, secrets, submission payloads, and endpoint credentials.
 
-The operation creates, opens an operation-owned endpoint socket, completes event replay on that exact socket incarnation, then writes at most one `turn.prompt` or `skill.invoke`. Ordered work is never retried. A transport failure after the write returns `submission_uncertain`, not a successful or non-executed result.
+The create key and submission reference are durably recorded by their existing respective authorities. There is no single-authority transactional atomicity guarantee across process failure: restart recovery uses `reconcileCreateConnectSubmit()` to resolve the composite outcome. The operation opens an operation-owned endpoint socket, completes same-incarnation replay on that socket, then writes at most one `turn.prompt` or `skill.invoke`. Ordered work is never retried. A transport failure after the write returns `submission_uncertain`, not a successful or non-executed result.
 
 Use `reconcileCreateConnectSubmit(identity)` for recovery. It may replay the durable create request with the same key and queries the matching prompt or skill status, but never sends an ordered control. `unknown` means the reconciliation authority or retention cannot establish the outcome; it is not proof that the work did not execute.
