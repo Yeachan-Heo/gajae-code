@@ -603,7 +603,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		authStorages.push(childAuthStorage);
 
 		expect(child.sessionId).not.toBe(parent.sessionId);
+		// A fork owns a new transcript and provider transport/cache affinity. It
+		// inherits only the sanitized prompt seed, never the parent's session.
+		expect(child.agent.sessionId).toBe(child.sessionId);
 		expect(child.agent.providerSessionId).toBe(child.sessionId);
+		expect(child.agent.providerSessionId).not.toBe(parent.agent.providerSessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
 		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
