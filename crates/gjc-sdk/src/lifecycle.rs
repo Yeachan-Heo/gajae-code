@@ -15,20 +15,28 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Lifecycle state observed by reconciliation.
+/// Canonical lifecycle state observed by reconciliation and lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LifecycleState { Pending, Running, Succeeded, Failed, Closed }
+pub enum LifecycleState {
+	Accepted,
+	EffectStarted,
+	AwaitingReady,
+	TerminalOk,
+	TerminalError,
+	TerminalUncertain,
+}
 
-/// Status indicating that side effects may have occurred but confirmation is unavailable.
+/// Status indicating that side effects may have occurred but confirmation is
+/// unavailable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UncertainStatus {
-	pub reason: String,
+	pub reason:      String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub observed_at: Option<u64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub detail: Option<String>,
+	pub detail:      Option<String>,
 }
 
 /// Where a `session_create` should run. Tagged by `kind` on the wire.

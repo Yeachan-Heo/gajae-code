@@ -20,6 +20,7 @@
 ### Added
 
 - `SdkClientOptions.reconnectMaxBackoffMs` caps each exponential reconnect sleep (default 2s). A client configured with a long reconnect budget now keeps probing every couple of seconds instead of sleeping for tens of seconds on its final attempts. The `reconnectAttempts`/`reconnectBackoffMs` defaults (3 attempts, 25ms base, 100ms maximum sleep) are unchanged and stay below the new cap, so no existing caller changes behavior.
+- Lifecycle requests now retain a normalized reconciliation fingerprint after an uncertain send. Callers can use `lookupLifecycle` to distinguish the durable accepted/terminal outcome without resending ordered work.
 
 ## [0.12.15] - 2026-08-06
 

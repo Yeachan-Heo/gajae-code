@@ -26,7 +26,8 @@ pub mod server;
 pub use actions::{ActionIdentity, ActionRegistry, ReplyClassification, ReplyOutcome};
 pub use broker_protocol::{
 	BrokerClientFrame, BrokerError, BrokerHello, BrokerOperation, BrokerRequest, BrokerResponse,
-	BrokerServerFrame, PROTOCOL_MAJOR,
+	BrokerServerFrame, LifecycleLookupRequest, LifecycleLookupResponse, PROTOCOL_MAJOR,
+	ReconciliationSelector,
 };
 pub use control::{
 	ControlClientFrame, ControlError, ControlRequest, ControlResponse, ControlServerFrame,
@@ -39,9 +40,10 @@ pub use discovery::{
 };
 pub use lifecycle::{
 	LifecycleClientMessage, LifecycleEndpoint, LifecycleErrorReason, LifecycleServerMessage,
-	LifecycleStatus, MatchedBy, ResumeCandidate, ResumeMode, SessionClose, SessionCloseResponse,
-	SessionCloseTarget, SessionCreate, SessionCreateResponse, SessionCreateTarget,
-	SessionLifecycleError, SessionResume, SessionResumeResponse, SessionResumeTarget,
+	LifecycleState, LifecycleStatus, MatchedBy, ResumeCandidate, ResumeMode, SessionClose,
+	SessionCloseResponse, SessionCloseTarget, SessionCreate, SessionCreateResponse,
+	SessionCreateTarget, SessionLifecycleError, SessionResume, SessionResumeResponse,
+	SessionResumeTarget,
 };
 pub use protocol::{
 	ActionKind, ActionNeeded, ActionResolved, ActionUnavailable, ActionUnavailableReason,

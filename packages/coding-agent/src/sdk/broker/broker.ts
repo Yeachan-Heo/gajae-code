@@ -1411,6 +1411,7 @@ export class Broker {
 		elevationRequestId?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		const fingerprint = canonicalJson({ operation, input });
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		const approvedInput = input;
@@ -1462,7 +1463,7 @@ export class Broker {
 			const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
 			const entry = this.ledger.get(identity);
 			if (!entry) return error("not_found", "lifecycle operation was not found");
-			if (entry.requestHash !== fingerprint)
+			if (entry.fingerprint !== fingerprint)
 				return error("idempotency_conflict", "lifecycle request fingerprint differs");
 			return {
 				ok: true,
@@ -1593,6 +1594,7 @@ export class Broker {
 			const beforeBegin = this.ledger.get(identity);
 			const begun = await this.ledger.begin(identity, requestHash, {
 				operationKey: `${operation}\0${idempotencyKey}`,
+				fingerprint,
 			});
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;

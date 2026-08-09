@@ -123,6 +123,21 @@ function parseFrame(value: unknown): Frame {
 	throw new SdkClientError("protocol_error", "SDK server sent a malformed frame.");
 }
 
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+
+function lifecycleFingerprint(operation: string, input: unknown): string {
+	return canonicalJson({ operation, input });
+}
+
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */
 export class SdkClient {
 	readonly #url: string;
@@ -244,6 +259,7 @@ export class SdkClient {
 		for (const [id, pending] of this.#pending)
 			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"));
 		await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
+		this.#sentRecords.clear();
 	}
 
 	async control(
@@ -355,7 +371,10 @@ export class SdkClient {
 					id,
 					operation: typeof frame.operation === "string" ? frame.operation : undefined,
 					idempotencyKey: options.idempotencyKey,
-					fingerprint: JSON.stringify(frame.input ?? {}),
+					fingerprint:
+						typeof frame.operation === "string"
+							? lifecycleFingerprint(frame.operation, frame.input ?? {})
+							: canonicalJson(frame.input ?? {}),
 					brokerSelector:
 						typeof frame.input === "object" && frame.input !== null
 							? (frame.input as Record<string, unknown>).selector
@@ -615,7 +634,6 @@ export class SdkClient {
 			)
 				return;
 			this.connectionId = frame.connectionId;
-			this.#notifyReconnectHandlers();
 			this.#notifyReconnectHandlers();
 		}
 		if (!this.#isActive(incarnation)) return;

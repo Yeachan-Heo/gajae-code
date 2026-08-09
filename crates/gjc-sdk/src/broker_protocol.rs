@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::lifecycle::{LifecycleState, UncertainStatus};
+
 /// Current broker protocol major version.
 pub const PROTOCOL_MAJOR: u32 = 3;
 
@@ -51,23 +53,23 @@ pub enum BrokerOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcceptedResponse {
-	pub id: String,
-	pub accepted: bool,
+	pub id:            String,
+	pub accepted:      bool,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub submission_id: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub state: Option<LifecycleReconciliationState>,
+	pub state:         Option<LifecycleState>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub uncertain: Option<UncertainStatus>,
+	pub uncertain:     Option<UncertainStatus>,
 }
 
 /// Stable selector used to reconcile a lifecycle submission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconciliationSelector {
-	pub session_id: String,
+	pub session_id:    String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub request_id: Option<String>,
+	pub request_id:    Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub submission_id: Option<String>,
 }
@@ -83,34 +85,11 @@ pub struct LifecycleLookupRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleLookupResponse {
-	pub found: bool,
+	pub found:     bool,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub state: Option<LifecycleReconciliationState>,
+	pub state:     Option<LifecycleState>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub uncertain: Option<UncertainStatus>,
-}
-
-/// Lifecycle state observed by reconciliation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LifecycleReconciliationState {
-	Accepted,
-	EffectStarted,
-	AwaitingReady,
-	TerminalOk,
-	TerminalError,
-	TerminalUncertain,
-}
-
-/// Status indicating that side effects may have occurred but confirmation is unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UncertainStatus {
-	pub reason: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub observed_at: Option<u64>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

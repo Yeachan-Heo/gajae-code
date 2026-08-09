@@ -3064,7 +3064,9 @@ async function revalidateCloseGeneration(
 function isTransportFailure(error: unknown): error is SdkClientError {
 	return (
 		error instanceof SdkClientError &&
-		["unavailable", "timeout", "connection_closed", "reconnect_exhausted"].includes(error.code)
+		["unavailable", "timeout", "connection_closed", "uncertain_after_send", "reconnect_exhausted"].includes(
+			error.code,
+		)
 	);
 }
 

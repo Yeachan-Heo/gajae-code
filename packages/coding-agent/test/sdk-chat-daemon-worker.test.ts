@@ -1189,7 +1189,7 @@ describe("chat daemon worker", () => {
 			firstClient.requests.push(frame);
 			if (frame.type === "event_replay")
 				return { events: [{ type: "event", name: "session_ready", sessionId: "session", generation: 1 }] };
-			throw new SdkClientError("connection_closed", "SDK connection closed after accepting the control request");
+			throw new SdkClientError("uncertain_after_send", "SDK connection closed after accepting the control request");
 		};
 		const firstRuntime = new ChatDaemonRuntime(runtimeInput, {
 			...timerDeps,

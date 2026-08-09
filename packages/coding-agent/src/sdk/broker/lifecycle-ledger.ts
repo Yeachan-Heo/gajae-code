@@ -691,11 +691,19 @@ export class LifecycleLedger {
 		this.#byteCount += line.length;
 		return entry;
 	}
-	async begin(identity: string, requestHash: string, metadata: { operationKey?: string } = {}): Promise<BeginResult> {
+	async begin(
+		identity: string,
+		requestHash: string,
+		metadata: { operationKey?: string; fingerprint?: string } = {},
+	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
 
-	async #begin(identity: string, requestHash: string, metadata: { operationKey?: string }): Promise<BeginResult> {
+	async #begin(
+		identity: string,
+		requestHash: string,
+		metadata: { operationKey?: string; fingerprint?: string },
+	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
 			return {
@@ -705,7 +713,7 @@ export class LifecycleLedger {
 					identity,
 					requestHash,
 					operationKey: metadata.operationKey,
-					fingerprint: requestHash,
+					fingerprint: metadata.fingerprint,
 					state: "accepted",
 					ts: Date.now(),
 				}),
@@ -718,8 +726,7 @@ export class LifecycleLedger {
 		if (terminal(prior.state) || (prior.state === "effect_started" && this.#isCleanupPending(prior)))
 			return { kind: "replay", entry: prior };
 		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };
-		// An accepted row has no durable side effect. Target serialization makes retrying it safe.
-		if (prior.state === "accepted") return { kind: "new", entry: prior };
+		if (prior.state === "accepted") return { kind: "in_progress", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
 	async transition(
