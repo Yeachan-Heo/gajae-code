@@ -2947,6 +2947,33 @@ function assertTeamTmuxMutationPreproof(config: GjcTeamConfig, operation: TeamTm
 	// alone is never treated as delivery proof.
 }
 
+function hasMainVerticalPaneTopology(config: GjcTeamConfig, target: string): boolean {
+	const result = Bun.spawnSync(
+		teamTmuxArgs(config, "list-panes", ["-t", target, "-F", "#{pane_left} #{pane_top} #{pane_width} #{pane_height}"]),
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	if (result.exitCode !== 0) return false;
+	const panes = result.stdout
+		.toString()
+		.trim()
+		.split("\n")
+		.map(line =>
+			line
+				.trim()
+				.split(/\s+/)
+				.map(value => Number.parseInt(value, 10)),
+		)
+		.filter(
+			(values): values is [number, number, number, number] =>
+				values.length === 4 && values.every(Number.isSafeInteger),
+		);
+	if (panes.length < 2) return false;
+	return (
+		panes.some(([left, top, width, height]) => left === 0 && top === 0 && width > 0 && height > 0) &&
+		panes.some(([left, _top, width, height]) => left > 0 && width > 0 && height > 0)
+	);
+}
+
 function executeTeamTmuxMutation(
 	config: GjcTeamConfig,
 	operation: TeamTmuxMutation,
@@ -2999,25 +3026,10 @@ function executeTeamTmuxMutation(
 			{ stdout: "pipe", stderr: "pipe" },
 		);
 		const observedLayout = layout.stdout.toString().trim();
-		if (layout.exitCode !== 0 || !TMUX_ENCODED_LAYOUT_PATTERN.test(observedLayout))
-			throw new Error("tmux_layout_postproof_failed");
-		assertGjcTmuxMutationAuthoritySync(authority);
-		const replay = Bun.spawnSync(
-			[
-				...providerExecutableArgv(authority),
-				...buildTmuxProviderCommand(authority, "select-layout", ["-t", operation.target, observedLayout]),
-			],
-			{ stdout: "pipe", stderr: "pipe" },
-		);
-		assertGjcTmuxMutationAuthoritySync(authority);
-		const replayedLayout = Bun.spawnSync(
-			teamTmuxArgs(config, "display-message", ["-p", "-t", operation.target, "#{window_layout}"]),
-			{ stdout: "pipe", stderr: "pipe" },
-		);
 		if (
-			replay.exitCode !== 0 ||
-			replayedLayout.exitCode !== 0 ||
-			replayedLayout.stdout.toString().trim() !== observedLayout
+			layout.exitCode !== 0 ||
+			!TMUX_ENCODED_LAYOUT_PATTERN.test(observedLayout) ||
+			!hasMainVerticalPaneTopology(config, operation.target)
 		)
 			throw new Error("tmux_layout_postproof_failed");
 	} else if (operation.type === "set-window-option" || operation.type === "profile-window-option") {

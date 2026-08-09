@@ -172,6 +172,9 @@ if (command === "-V" || command === "--version") {
 		else if (format === "#{window_width}") console.log("120");
 		else console.log(displayTarget(target));
 	}
+} else if (command === "list-panes") {
+	if (config.paneLayout === "even-horizontal") console.log("0 0 120 20\n0 20 120 20");
+	else console.log("0 0 59 40\n60 0 60 40");
 } else if (command === "select-layout" && config.failLayoutReplay && /^[0-9a-f]{4},/i.test(args.at(-1) ?? "")) {
 	console.error("layout replay failed");
 	process.exitCode = 1;
@@ -274,7 +277,7 @@ async function createFakeTmuxBin(
 		commandName?: string;
 		versionOutput?: string;
 		windowLayout?: string;
-		failLayoutReplay?: boolean;
+		paneLayout?: "main-vertical" | "even-horizontal";
 	} = {},
 ): Promise<string> {
 	if (!fakeTmuxRunnerPath) throw new Error("fake tmux runner was not compiled");
@@ -1094,7 +1097,10 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("true 'You are worker-1 in gjc team worktree-team.");
 		expect(tmuxLog).not.toContain("send-keys -l");
 		expect(tmuxLog).toContain("select-layout -t test-session:0 main-vertical");
-		expect(tmuxLog).toContain("select-layout -t test-session:0 c464,120x40,0,0{59x40,0,0,1,60x40,60,0,2}");
+		expect(tmuxLog).not.toContain("select-layout -t test-session:0 c464,120x40,0,0{59x40,0,0,1,60x40,60,0,2}");
+		expect(tmuxLog).toContain(
+			"list-panes -t test-session:0 -F #{pane_left} #{pane_top} #{pane_width} #{pane_height}",
+		);
 		expect(tmuxLog).toContain("set-option -t test-session:0 mouse on");
 		expect(tmuxLog).toContain("set-option -t test-session:0 set-clipboard on");
 		expect(tmuxLog).toContain("set-window-option -t test-session:0 mode-style fg=colour231,bg=colour60");
@@ -1327,16 +1333,16 @@ describe("native gjc team runtime", () => {
 		).rejects.toThrow("tmux_layout_postproof_failed");
 	});
 
-	it("fails when tmux rejects replaying the encoded layout readback", async () => {
+	it("fails when the encoded readback has horizontal pane topology", async () => {
 		cleanupRoot = await createGitRepo();
-		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { failLayoutReplay: true });
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { paneLayout: "even-horizontal" });
 
 		await expect(
 			startGjcTeam({
 				workerCount: 1,
 				agentType: "executor",
-				task: "Reject unverified layout",
-				teamName: "layout-replay-proof-team",
+				task: "Reject horizontal layout",
+				teamName: "layout-topology-proof-team",
 				cwd: cleanupRoot,
 				env: {
 					GJC_SESSION_ID: TEST_SESSION_ID,
