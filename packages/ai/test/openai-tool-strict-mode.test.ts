@@ -431,3 +431,61 @@ describe("OpenAI tool strict mode", () => {
 		expect(payload.tools?.[0]?.strict).toBe(true);
 	});
 });
+
+const reservedNameContext: Context = {
+	...testContext,
+	tools: [
+		testTool,
+		{
+			name: "web_search",
+			description: "Search the web",
+			parameters: z.object({ query: z.string() }),
+		},
+		{
+			name: "report_finding",
+			description: "Report a review finding",
+			parameters: z.object({ note: z.string() }),
+		},
+	],
+};
+
+describe("provider-reserved tool declarations", () => {
+	it("omits reserved declarations but keeps every other tool on opencode-go openai-responses", async () => {
+		const model = getBundledModel("opencode-go", "grok-4.5") as Model<"openai-responses">;
+
+		const payload = (await captureResponsesPayload(model, reservedNameContext)) as {
+			tools?: Array<{ name?: string }>;
+		};
+		expect(payload.tools?.map(tool => tool.name)).toEqual(["echo", "report_finding"]);
+	});
+
+	it("omits reserved declarations but keeps every other tool on opencode-go openai-completions", async () => {
+		const model = getBundledModel("opencode-go", "kimi-k2.5") as Model<"openai-completions">;
+
+		const payload = (await captureCompletionsPayload(model, reservedNameContext)) as {
+			tools?: Array<{ function?: { name?: string } }>;
+		};
+		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["echo", "report_finding"]);
+	});
+
+	it("keeps web_search on an openai-responses provider that does not reserve it", async () => {
+		const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
+
+		const payload = (await captureResponsesPayload(model, reservedNameContext)) as {
+			tools?: Array<{ name?: string }>;
+		};
+		expect(payload.tools?.map(tool => tool.name)).toEqual(["echo", "web_search", "report_finding"]);
+	});
+
+	it("keeps web_search on an openai-completions provider that does not reserve it", async () => {
+		const model: Model<"openai-completions"> = {
+			...(getBundledModel("openai", "gpt-4o-mini") as unknown as Model<"openai-completions">),
+			api: "openai-completions",
+		};
+
+		const payload = (await captureCompletionsPayload(model, reservedNameContext)) as {
+			tools?: Array<{ function?: { name?: string } }>;
+		};
+		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["echo", "web_search", "report_finding"]);
+	});
+});

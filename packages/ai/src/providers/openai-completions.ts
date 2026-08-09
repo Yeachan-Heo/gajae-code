@@ -84,6 +84,7 @@ import {
 	wrapFetchForOpenAIRequestTransform,
 } from "./openai-request-transform";
 import { createInitialResponsesAssistantMessage } from "./openai-responses-shared";
+import { filterProviderReservedTools } from "./provider-reserved-tools";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -1343,7 +1344,8 @@ function buildParams(
 	}
 
 	if (context.tools?.length) {
-		const builtTools = convertTools(context.tools, compat, toolStrictModeOverride);
+		const tools = filterProviderReservedTools(context.tools, model.provider);
+		const builtTools = convertTools(tools, compat, toolStrictModeOverride);
 		params.tools = builtTools.tools;
 		toolStrictMode = builtTools.toolStrictMode;
 	} else if (context.tools === undefined && hasToolHistory(context.messages)) {

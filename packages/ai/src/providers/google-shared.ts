@@ -39,6 +39,7 @@ import type {
 	ThinkingConfig,
 	ThinkingLevel,
 } from "./google-types";
+import { filterProviderReservedTools } from "./provider-reserved-tools";
 import { transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -378,7 +379,8 @@ export function convertTools(
 	tools: Tool[],
 	model: Model<"google-generative-ai" | "google-gemini-cli" | "google-vertex">,
 ): { functionDeclarations: Record<string, unknown>[] }[] | undefined {
-	if (tools.length === 0) return undefined;
+	const declaredTools = filterProviderReservedTools(tools, model.provider);
+	if (declaredTools.length === 0) return undefined;
 
 	/**
 	 * Anthropic model models on Cloud Code Assist need the legacy `parameters` field;
@@ -388,7 +390,7 @@ export function convertTools(
 
 	return [
 		{
-			functionDeclarations: tools.map(tool => ({
+			functionDeclarations: declaredTools.map(tool => ({
 				name: tool.name,
 				description: tool.description || "",
 				...(useParameters

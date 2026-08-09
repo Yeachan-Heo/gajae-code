@@ -92,6 +92,7 @@ import {
 	processResponsesStream,
 	repairOrphanResponsesToolOutputs,
 } from "./openai-responses-shared";
+import { filterProviderReservedTools } from "./provider-reserved-tools";
 import { transformMessages } from "./transform-messages";
 
 /**
@@ -684,7 +685,8 @@ function buildParams(
 	// `StreamOptions.frequencyPenalty` is intentionally dropped for this provider.
 
 	if (context.tools) {
-		params.tools = convertTools(context.tools, supportsStrictMode(model), model);
+		const tools = filterProviderReservedTools(context.tools, model.provider);
+		params.tools = convertTools(tools, supportsStrictMode(model), model);
 		if (options?.toolChoice) {
 			const toolChoice = resolveToolChoice(model, options.toolChoice);
 			if (toolChoice.degraded && toolChoice.supportSource === "runtime") {
@@ -695,7 +697,7 @@ function buildParams(
 					reason: toolChoice.reason,
 				});
 			}
-			params.tool_choice = mapOpenAIResponsesToolChoiceForTools(toolChoice.resolvedChoice, context.tools, model);
+			params.tool_choice = mapOpenAIResponsesToolChoiceForTools(toolChoice.resolvedChoice, tools, model);
 		}
 		// The apply_patch spec §1 marks only `apply_patch` itself as
 		// `supports_parallel_tool_calls = false`. OpenAI's Responses API

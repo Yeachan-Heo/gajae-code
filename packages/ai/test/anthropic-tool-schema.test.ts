@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { normalizeAnthropicToolSchema } from "@gajae-code/ai/providers/anthropic";
+import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
+import { getBundledModel } from "@gajae-code/ai/models";
+import { normalizeAnthropicToolSchema, streamAnthropic } from "@gajae-code/ai/providers/anthropic";
+import type { Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 import { flattenToolRootCombinators } from "@gajae-code/ai/utils/schema";
 
 describe("normalizeAnthropicToolSchema — SDK whitelist", () => {
@@ -528,5 +531,48 @@ describe("normalizeAnthropicToolSchema — parity with anthropic-sdk-python tran
 		expect(out.type).toBe("object");
 		const props = out.properties as Record<string, unknown>;
 		expect(props.self).toBe(out); // memoized → same reference
+	});
+});
+
+function reservedNameContext(): Context {
+	const parameters = { type: "object", properties: {} } as TJsonSchema;
+	return {
+		messages: [{ role: "user", content: "Continue", timestamp: 1 }],
+		tools: [
+			{ name: "read", description: "Read a file", parameters },
+			{ name: "web_search", description: "Search the web", parameters },
+			{ name: "irc", description: "Message a peer", parameters },
+		],
+	};
+}
+
+function captureToolNames(model: Model<"anthropic-messages">): Promise<string[]> {
+	const { promise, resolve } = Promise.withResolvers<string[]>();
+	const controller = new AbortController();
+	controller.abort();
+	streamAnthropic(model, reservedNameContext(), {
+		apiKey: "sk-ant-api-test",
+		isOAuth: false,
+		signal: controller.signal,
+		onPayload: payload => {
+			const { tools } = payload as MessageCreateParamsStreaming;
+			resolve((tools ?? []).map(tool => tool.name));
+			return undefined;
+		},
+	});
+	return promise;
+}
+
+describe("anthropic-messages provider-reserved tool declarations", () => {
+	it("omits reserved declarations but keeps every other tool on opencode-go", async () => {
+		const model = getBundledModel("opencode-go", "minimax-m2.5") as Model<"anthropic-messages">;
+
+		expect(await captureToolNames(model)).toEqual(["read", "irc"]);
+	});
+
+	it("keeps web_search on a provider that does not reserve it", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5") as Model<"anthropic-messages">;
+
+		expect(await captureToolNames(model)).toEqual(["read", "web_search", "irc"]);
 	});
 });

@@ -98,6 +98,7 @@ import {
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
+import { filterProviderReservedTools } from "./provider-reserved-tools";
 import { transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -2620,7 +2621,7 @@ function buildParams(
 
 	if (context.tools) {
 		params.tools = convertTools(
-			context.tools,
+			filterProviderReservedTools(context.tools, model.provider),
 			isOAuthToken,
 			// The Claude Code OAuth surface mishandles `strict: true` tools:
 			// streamed tool_use blocks arrive with empty/undefined arguments and

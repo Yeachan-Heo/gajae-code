@@ -130,3 +130,30 @@ describe("Google shared tool choice", () => {
 		expect(result.stopReason).toBe("error");
 	});
 });
+
+// `opencode-go`'s own api-resolution rules route an `@ai-sdk/google` catalog row
+// to `google-generative-ai`, so this assembly path is reachable for a provider
+// that reserves tool names.
+describe("Google shared provider-reserved tool declarations", () => {
+	const reservedContext: Context = {
+		messages: [{ role: "user", content: "hi", timestamp: 1 }],
+		tools: [
+			tool,
+			{ name: "web_search", description: "Search the web", parameters: { type: "object", properties: {} } },
+			{ name: "irc", description: "Message a peer", parameters: { type: "object", properties: {} } },
+		],
+	};
+
+	function declaredNames(target: Model<"google-generative-ai">): unknown {
+		const params = buildGoogleGenerateContentParams(target, reservedContext, {});
+		return params.config?.tools?.[0]?.functionDeclarations?.map(declaration => declaration.name);
+	}
+
+	it("omits reserved declarations but keeps every other tool on opencode-go", () => {
+		expect(declaredNames({ ...model, provider: "opencode-go" })).toEqual(["read", "irc"]);
+	});
+
+	it("keeps web_search on a provider that does not reserve it", () => {
+		expect(declaredNames(model)).toEqual(["read", "web_search", "irc"]);
+	});
+});
