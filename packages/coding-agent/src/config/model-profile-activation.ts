@@ -61,6 +61,8 @@ type ModelProfileActivationSession = Pick<
 		| "getAvailable"
 		| "lookupAliasExists"
 		| "resolveModelByLookupAlias"
+		| "authStorage"
+		| "isCredentiallessProvider"
 	>;
 	getConfiguredModelChainState?: (role: string) => ConfiguredModelChainState | undefined;
 };
@@ -239,12 +241,18 @@ function concretizeMaterializedAssignmentValues(
 	const credentialSessionId = options.session.credentialSessionId ?? sessionId;
 	if (!modelRegistry || !sessionId) return assignments;
 	const availableModels = modelRegistry.getAvailable();
+	const authenticatedModels = availableModels.filter(model => {
+		const isCredentiallessProvider = modelRegistry.isCredentiallessProvider?.bind(modelRegistry);
+		const hasUsableAuth = modelRegistry.authStorage?.hasUsableAuth?.bind(modelRegistry.authStorage);
+		if (!isCredentiallessProvider || !hasUsableAuth) return true;
+		return isCredentiallessProvider(model.provider) || hasUsableAuth(model.provider);
+	});
 	return Object.fromEntries(
 		Object.entries(assignments).map(([role, selectorValue]) => {
 			const concrete = normalizeModelSelectorValue(selectorValue)
 				.map(selector => {
 					if (splitSelectorThinkingSuffix(selector).selector.includes("/")) return selector;
-					const resolved = resolveModelRoleValue(selector, availableModels, {
+					const resolved = resolveModelRoleValue(selector, authenticatedModels, {
 						settings: options.settings as Settings,
 						modelRegistry,
 						sessionId,
@@ -1195,6 +1203,7 @@ export async function materializeModelProfileForDeletion(
 			);
 		}
 		await prepared.settings.flushOrThrow();
+		prepared.session.clearProfileInstalledOverrides?.();
 	} catch (error) {
 		const previousChain = prepared.previousDefaultChainState;
 		const rollbackErrors: unknown[] = [];

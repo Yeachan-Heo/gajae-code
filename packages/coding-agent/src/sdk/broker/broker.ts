@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
@@ -62,6 +63,7 @@ export type BrokerErrorCode =
 	| "resource_gone"
 	| "invalid_input"
 	| "spawn_failed"
+	| "startup_admission_timeout"
 	| "readiness_timeout"
 	| "close_refused"
 	| "not_found"
@@ -406,6 +408,96 @@ const BROKER_PUBLICATION_GRACE_MS = 15_000;
 // longer than the loss grace.
 const BROKER_AMBIGUITY_GRACE_MS = 120_000;
 const BROKER_SETTLEMENT_MS = 2_000;
+
+export interface StartupAdmissionTiming {
+	now(): number;
+	sleep(ms: number): Promise<void>;
+}
+
+export type StartupAdmissionResult<T> =
+	| { status: "completed"; admittedAt: number; value: T }
+	| { status: "admission_timeout"; reason: "admission_timeout" };
+
+interface StartupAdmissionWaiter {
+	state: "waiting" | "admitted" | "timed_out";
+	ready: PromiseWithResolvers<void>;
+}
+
+// Host startup is CPU/IO bursty, so scale with the machine without allowing a full-core launch stampede.
+export function sdkHostStartupConcurrency(availableParallelism = os.availableParallelism()): number {
+	if (!Number.isSafeInteger(availableParallelism) || availableParallelism < 1)
+		throw new Error("SDK host startup parallelism must be a positive safe integer.");
+	return Math.max(1, Math.floor(Math.sqrt(availableParallelism)));
+}
+
+export class StartupAdmissionQueue {
+	#inFlight = 0;
+	#waiters: StartupAdmissionWaiter[] = [];
+
+	constructor(readonly limit: number) {
+		if (!Number.isSafeInteger(limit) || limit < 1)
+			throw new Error("SDK host startup concurrency must be a positive safe integer.");
+	}
+
+	async run<T>(
+		queueWaitMs: number,
+		timing: StartupAdmissionTiming,
+		task: (admittedAt: number) => Promise<T>,
+	): Promise<StartupAdmissionResult<T>> {
+		if (!Number.isSafeInteger(queueWaitMs) || queueWaitMs < 1)
+			throw new Error("SDK host startup queue wait must be a positive safe integer.");
+		if (this.#inFlight < this.limit) return this.#runAdmitted(timing, task);
+
+		const ready = Promise.withResolvers<void>();
+		const waiter: StartupAdmissionWaiter = { state: "waiting", ready };
+		this.#waiters.push(waiter);
+		const outcome = await Promise.race([
+			ready.promise.then(() => "admitted" as const),
+			timing.sleep(queueWaitMs).then(() => {
+				if (waiter.state === "admitted") return "admitted" as const;
+				if (waiter.state === "timed_out") return "timed_out" as const;
+				waiter.state = "timed_out";
+				const index = this.#waiters.indexOf(waiter);
+				if (index >= 0) this.#waiters.splice(index, 1);
+				return "timed_out" as const;
+			}),
+		]);
+		if (outcome === "timed_out") return { status: "admission_timeout", reason: "admission_timeout" };
+		return this.#runGranted(timing, task);
+	}
+
+	async #runAdmitted<T>(
+		timing: StartupAdmissionTiming,
+		task: (admittedAt: number) => Promise<T>,
+	): Promise<StartupAdmissionResult<T>> {
+		this.#inFlight += 1;
+		return this.#runGranted(timing, task);
+	}
+
+	async #runGranted<T>(
+		timing: StartupAdmissionTiming,
+		task: (admittedAt: number) => Promise<T>,
+	): Promise<StartupAdmissionResult<T>> {
+		const admittedAt = timing.now();
+		try {
+			return { status: "completed", admittedAt, value: await task(admittedAt) };
+		} finally {
+			this.#inFlight -= 1;
+			this.#grantNext();
+		}
+	}
+
+	#grantNext(): void {
+		while (this.#inFlight < this.limit) {
+			const waiter = this.#waiters.shift();
+			if (!waiter) return;
+			if (waiter.state !== "waiting") continue;
+			waiter.state = "admitted";
+			this.#inFlight += 1;
+			waiter.ready.resolve();
+		}
+	}
+}
 type BrokerPublicationState =
 	| "healthy-owned"
 	| "suspect-unpublished"
@@ -427,6 +519,7 @@ export class Broker {
 	#owner = randomBytes(12).toString("hex");
 	#chains = new Map<string, Promise<void>>();
 	#admitted = new Set<Promise<void>>();
+	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 	#publication: RetainedBrokerDiscovery | null = null;
 	#publicationState: BrokerPublicationState = "healthy-owned";
 	#lossAt: bigint | null = null;
@@ -453,6 +546,13 @@ export class Broker {
 		this.#completion = completion.promise;
 		this.#resolveCompletion = completion.resolve;
 		this.#rejectCompletion = completion.reject;
+	}
+	runStartup<T>(
+		queueWaitMs: number,
+		timing: StartupAdmissionTiming,
+		task: (admittedAt: number) => Promise<T>,
+	): Promise<StartupAdmissionResult<T>> {
+		return this.#startupAdmissions.run(queueWaitMs, timing, task);
 	}
 	#lockRecordPath(): string {
 		return path.join(this.#lock, BROKER_LOCK_RECORD);

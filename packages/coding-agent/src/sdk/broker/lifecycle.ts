@@ -51,7 +51,11 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
-import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
+import {
+	normalizeSdkStartupFailure,
+	type SdkStartupFailure,
+	type SdkStartupRollbackResult,
+} from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
@@ -136,6 +140,8 @@ type LifecycleCommand = SdkInternalSpawnCommand | { file: string; args: string[]
 type LifecycleCommandResolver = () => LifecycleCommand;
 const lifecycleCommandResolversForTest = new WeakMap<Broker, LifecycleCommandResolver>();
 const lifecycleCleanupHooksForTest = new WeakMap<Broker, () => void>();
+const startupAdmittedInputs = new WeakSet<Input>();
+const startupLaunchInputs = new WeakMap<Input, SessionLaunch>();
 
 /** Test-only hook for simulating a crash immediately after one exact lifecycle detach. */
 export function setLifecycleCleanupHookForTest(broker: Broker, hook: (() => void) | undefined): void {
@@ -976,6 +982,7 @@ function isSdkStartupFailure(value: unknown): value is SdkStartupFailure {
 			failure.reason !== "ineligible" &&
 			failure.reason !== "factory_absent" &&
 			failure.reason !== "runner_absent" &&
+			failure.reason !== "admission_timeout" &&
 			failure.reason !== "pending" &&
 			failure.reason !== "failed") ||
 		typeof failure.message !== "string" ||
@@ -3109,15 +3116,51 @@ async function executeLifecycleResponse(
 			}
 		}
 		const timing = lifecycleTiming(broker);
+		const admissionGranted = startupAdmittedInputs.has(input);
+		if (!admissionGranted) {
+			const suppliedDeadlineFields = [
+				input.receivedAt,
+				input.requestedReadinessTimeoutMs,
+				input.semanticReadyDeadlineAt,
+				input.terminationStartDeadlineAt,
+				input.lifecycleCleanupDeadlineAt,
+			];
+			let queueWaitMs: number;
+			if (suppliedDeadlineFields.some(value => value !== undefined)) {
+				const supplied = lifecycleDeadlines(input, timing.now());
+				if ("ok" in supplied) return supplied;
+				queueWaitMs = supplied.requestedReadinessTimeoutMs;
+			} else {
+				const timeout = readinessTimeout(input);
+				if (typeof timeout !== "number") return timeout;
+				queueWaitMs = timeout;
+			}
+			const launch = await launchInput(broker, operation, input);
+			if ("ok" in launch) return launch;
+			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
+				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, queueWaitMs) };
+				startupAdmittedInputs.add(admittedInput);
+				startupLaunchInputs.set(admittedInput, launch);
+				try {
+					return await executeLifecycleResponse(broker, operation, admittedInput, identity, cleanup);
+				} finally {
+					startupLaunchInputs.delete(admittedInput);
+					startupAdmittedInputs.delete(admittedInput);
+				}
+			});
+			if (admitted.status === "completed") return admitted.value;
+			const failure = normalizeSdkStartupFailure("startup", admitted.reason);
+			return fail("startup_admission_timeout", failure.message);
+		}
 
-		const deadlines = lifecycleDeadlines(input, timing.now());
+		const deadlines = lifecycleDeadlines(input, input.receivedAt as number);
 
 		if ("ok" in deadlines) return deadlines;
 		const lifecycleDeadline = deadlines.lifecycleCleanupDeadlineAt;
 		const readinessDeadline = deadlines.semanticReadyDeadlineAt;
 		const terminationStartDeadline = deadlines.terminationStartDeadlineAt;
 
-		const launch = await launchInput(broker, operation, input);
+		const launch = startupLaunchInputs.get(input) ?? (await launchInput(broker, operation, input));
 		if ("ok" in launch) return launch;
 		if (!hasProcessIncarnationAuthority())
 			return fail(
