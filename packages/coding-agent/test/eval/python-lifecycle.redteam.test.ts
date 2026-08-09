@@ -227,7 +227,10 @@ describe("python eval lifecycle red-team", () => {
 		async () => {
 			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
-			const unrelated = Bun.spawn(["/bin/sh", "-c", "sleep 30"], { stdout: "ignore", stderr: "ignore" });
+			const unrelated = Bun.spawn([process.execPath, "-e", "setTimeout(() => {}, 30_000)"], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
 			const kernelStarted = Promise.withResolvers<void>();
 			const startupError = new Error("kernel startup failed");
 			PythonKernel.start = async () => {
