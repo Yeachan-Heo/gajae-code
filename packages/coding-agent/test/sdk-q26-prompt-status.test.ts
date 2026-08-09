@@ -53,7 +53,7 @@ describe("prompt reconciliation record", () => {
 		});
 	});
 
-	it("records failed with bounded sanitized error metadata and first terminal wins", () => {
+	it("records failed with a safe code and constant wire message, with first terminal winning", () => {
 		const rec = createPromptReconciliation();
 		rec.noteAccepted(correlation());
 		rec.noteTransition(correlation(), {
@@ -65,33 +65,25 @@ describe("prompt reconciliation record", () => {
 		const result = rec.lookup({ commandId: "command-1", turnId: "turn-1" });
 		expect(result.status).toBe("failed");
 		if (result.status !== "failed") throw new Error("expected failed");
-		expect(result.error.code).toBe("provider_down");
-		expect(result.error.message).not.toMatch(/[\t\r\n]/);
-		expect(result.error.message.length).toBeLessThanOrEqual(512);
+		expect(result.error).toEqual({ code: "provider_down", message: "Prompt submission failed." });
 		expect(result.terminalAt).toBeGreaterThan(0);
 	});
 
-	it("retains a safe-token code and a credential-redacted reason, never an opaque constant", () => {
-		// #4068: the reason is the only thing that tells a provider error, a tool
-		// crash, an auth expiry and an internal assertion apart at the client.
-		// Credential material is still redacted; the reason itself is retained.
-		const leaky = sanitizePromptFailure(
-			new Error("prompt text /home/alice/private bearer sk-secret https://user:pass@example.com?q=token"),
-		);
-		expect(leaky.code).toBe("internal");
-		expect(leaky.message).toContain("«redacted-auth»");
-		expect(leaky.message).toContain("«redacted-url-credential»");
-		expect(leaky.message).not.toContain("sk-secret");
-		expect(leaky.message).not.toContain("user:pass");
-		// An unsafe code token is still refused, and the reason still survives.
+	it("never carries arbitrary failure text or credential-shaped codes on the wire", () => {
+		expect(
+			sanitizePromptFailure(
+				Object.assign(new Error("prompt text bearer sk-secret https://user:pass@example.com?q=token"), {
+					code: "sk-abcdefghijklmnop",
+				}),
+			),
+		).toEqual({ code: "internal", message: "Prompt submission failed." });
 		expect(
 			sanitizePromptFailure(Object.assign(new Error("provider payload"), { code: `bad code! ${"x".repeat(100)}` })),
-		).toEqual({ code: "internal", message: "provider payload" });
-		// Only a frame that carried no reason at all falls back to the constant.
+		).toEqual({ code: "internal", message: "Prompt submission failed." });
 		expect(sanitizePromptFailure(undefined)).toEqual({ code: "internal", message: "Prompt submission failed." });
 		expect(sanitizePromptFailure(Object.assign(new Error("boom"), { code: "ok_code-1.2" }))).toEqual({
 			code: "ok_code-1.2",
-			message: "boom",
+			message: "Prompt submission failed.",
 		});
 	});
 

@@ -336,7 +336,11 @@ function ownReasonText(value: object): string | undefined {
 	if (record !== undefined) return record;
 	const name = scalarText(readProperty(value, "name"));
 	if (name !== undefined) return name;
-	if (Array.isArray(value)) return undefined;
+	try {
+		if (Array.isArray(value)) return undefined;
+	} catch {
+		return undefined;
+	}
 	let constructorName: string | undefined;
 	try {
 		constructorName = scalarText((value as { constructor?: { name?: unknown } }).constructor?.name);
@@ -354,7 +358,7 @@ function ownReasonText(value: object): string | undefined {
  *   getter must not turn a failure report into a second failure),
  * - a non-`Error` payload never collapses to `[object Object]`,
  * - the result is single-line, length-bounded and credential-redacted, so it is
- *   safe to persist in a durable record and hand to a client.
+ *   safe for local durable records and operator diagnostics.
  */
 export function describeFailureReason(value: unknown): FailureReason {
 	const segments: string[] = [];

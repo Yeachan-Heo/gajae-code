@@ -46,6 +46,13 @@ describe("postmortem observable failure diagnostics", () => {
 		expect(record).not.toContain("[object Object]");
 	});
 
+	it("records a failure whose cause is a revoked proxy", async () => {
+		const { proxy, revoke } = Proxy.revocable({}, {});
+		revoke();
+		const record = await crashRecord({ message: "outer failure", cause: proxy });
+		expect(record).toContain("outer failure");
+	});
+
 	it("redacts credentials before persisting a plain failure record", async () => {
 		const record = await crashRecord({
 			phase: "provider_request",

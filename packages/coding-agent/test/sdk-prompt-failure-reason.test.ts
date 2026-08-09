@@ -67,7 +67,9 @@ function memoryTransport(sessionId: string, stateRoot: string, token: string): M
 	};
 }
 
-async function failedPrompt(error: unknown): Promise<{ client: FailedOutcome; persisted: FailedOutcome }> {
+async function failedPrompt(
+	error: unknown,
+): Promise<{ client: FailedOutcome; persisted: FailedOutcome; recordBytes: number }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-failure-reason-"));
 	temporaryRoots.push(root);
 	const sessionId = `failure-reason-${crypto.randomUUID()}`;
@@ -145,38 +147,47 @@ async function failedPrompt(error: unknown): Promise<{ client: FailedOutcome; pe
 		return document.records[0]?.status === "failed";
 	}, "persisted failed prompt outcome");
 	const document = JSON.parse(await fs.readFile(recordPath, "utf8")) as { records: FailedOutcome[] };
+	const recordBytes = (await fs.stat(recordPath)).size;
 	await handlers.get("session_shutdown")?.({}, context);
-	return { client: response.result, persisted: document.records[0] as FailedOutcome };
+	return { client: response.result, persisted: document.records[0] as FailedOutcome, recordBytes };
 }
 
 describe("SDK prompt failure reason observable boundaries", () => {
-	it("reports and persists the reason carried by an accepted prompt failure", async () => {
+	it("keeps the accepted failure reason local while returning the constant wire message", async () => {
 		const { client, persisted } = await failedPrompt(
 			Object.assign(new Error("anthropic returned 529 overloaded_error"), { code: "provider_overloaded" }),
 		);
 		expect(client.error).toEqual({
 			code: "provider_overloaded",
+			message: "Invocation failed.",
+		});
+		expect(persisted.error).toEqual({
+			code: "provider_overloaded",
 			message: "anthropic returned 529 overloaded_error",
 		});
-		expect(persisted.error).toEqual(client.error);
 	});
 
-	it("keeps plain failure records distinguishable instead of returning a constant", async () => {
+	it("persists readable plain failure records without exposing them to SDK clients", async () => {
 		const { client, persisted } = await failedPrompt({
 			phase: "tool_dispatch",
 			reason: "worker_exit",
 			message: "bash tool worker exited with signal SIGSEGV",
 		});
-		expect(client.error.code).toBe("prompt_failed");
-		expect(client.error.message).toContain("bash tool worker exited with signal SIGSEGV");
-		expect(client.error.message).toContain("phase=tool_dispatch");
-		expect(client.error.message).toContain("reason=worker_exit");
-		expect(client.error.message).not.toContain("[object Object]");
-		expect(persisted.error).toEqual(client.error);
+		expect(client.error).toEqual({ code: "prompt_failed", message: "Invocation failed." });
+		expect(persisted.error.message).toContain("bash tool worker exited with signal SIGSEGV");
+		expect(persisted.error.message).toContain("phase=tool_dispatch");
+		expect(persisted.error.message).toContain("reason=worker_exit");
+		expect(persisted.error.message).not.toContain("[object Object]");
 	});
 
-	it("uses the constant only when the accepted failure carried no reason", async () => {
-		const { client } = await failedPrompt(undefined);
+	it("rejects credential-shaped and oversized codes before persistence or wire return", async () => {
+		const { client, persisted, recordBytes } = await failedPrompt({
+			code: `sk-${"a".repeat(1024 * 1024)}`,
+			message: "provider request failed after credential refresh",
+		});
 		expect(client.error).toEqual({ code: "prompt_failed", message: "Invocation failed." });
+		expect(persisted.error.code).toBe("prompt_failed");
+		expect(persisted.error.message).toBe("provider request failed after credential refresh");
+		expect(recordBytes).toBeLessThan(4096);
 	});
 });

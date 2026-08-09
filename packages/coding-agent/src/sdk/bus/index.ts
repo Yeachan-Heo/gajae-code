@@ -6250,14 +6250,6 @@ export function createNotificationsExtension(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
 			) as Array<{ stopReason?: unknown; errorKind?: unknown }>;
 			const finalAssistant = assistants[0];
-			// Read before the outcome is built: the terminal assistant carries the only
-			// text distinguishing a provider error, a tool crash, an auth expiry and an
-			// internal assertion at this boundary (#4068).
-			const terminalAssistant = assistants.find(
-				message =>
-					(message as { stopReason?: unknown }).stopReason === "error" ||
-					(message as { stopReason?: unknown }).stopReason === "aborted",
-			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown } | undefined;
 			const pendingOutcome = rt.peekPromptPendingOutcome(correlation);
 			let outcome: SdkPromptTerminalOutcome;
 			if (pendingOutcome) outcome = pendingOutcome;
@@ -6274,21 +6266,24 @@ export function createNotificationsExtension(
 				finalAssistant?.stopReason !== "aborted"
 			)
 				outcome = { kind: "stopped", reason: "end_turn", provenance: "agent" };
-			else {
-				const reason = postmortem.describeFailureReason(terminalAssistant?.errorMessage);
+			else
 				outcome = {
 					kind: "failed",
 					code: "prompt_failed",
-					message: reason.message || "Prompt submission failed.",
+					message: "Prompt submission failed.",
 					provenance: "agent_failed",
 				};
-			}
 			const successAssistant = assistants.find(
 				message => (message as { stopReason?: unknown }).stopReason === "stop",
 			);
 			const finalText = successAssistant ? acpFinalTextFromMessage(successAssistant).text : "";
 			// The normalized outcome is the ACP contract; existing SDK clients keep the
 			// legacy failure discriminator on the wire and in the reconciliation record.
+			const terminalAssistant = assistants.find(
+				message =>
+					(message as { stopReason?: unknown }).stopReason === "error" ||
+					(message as { stopReason?: unknown }).stopReason === "aborted",
+			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown } | undefined;
 			const legacyCode =
 				event.stopReason === "cancelled"
 					? "cancelled"
@@ -6301,9 +6296,9 @@ export function createNotificationsExtension(
 				...(finalText ? { finalText } : {}),
 				...(outcome.kind === "failed" && legacyCode
 					? {
-							// Only the legacy discriminator is remapped; the retained message is
-							// the same reason the normalized outcome carries.
-							error: { code: legacyCode, message: outcome.message },
+							// Only the legacy discriminator is preserved; provider text is never
+							// retained, matching `sanitizePromptFailure`.
+							error: { code: legacyCode, message: "Prompt submission failed." },
 						}
 					: {}),
 			});

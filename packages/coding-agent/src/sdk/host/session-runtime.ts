@@ -14,6 +14,7 @@ import { normalizeModelSelectorValue } from "../../config/model-selector-value";
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { parseThinkingLevel } from "../../thinking";
+import { sanitizePromptFailureCode } from "../bus/prompt-reconciliation";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -358,12 +359,24 @@ function createInvocationReconciliation(
 					record.status === "terminal_ok" ||
 					record.status === "failed")
 			) {
-				if (record.terminalAt === undefined && (record.status === "accepted" || record.status === "in_flight")) {
-					record.status = "failed";
-					record.terminalAt = Date.now();
-					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
+				const hydrated = { ...record };
+				if (
+					hydrated.terminalAt === undefined &&
+					(hydrated.status === "accepted" || hydrated.status === "in_flight")
+				) {
+					hydrated.status = "failed";
+					hydrated.terminalAt = Date.now();
+					hydrated.error = {
+						code: "process_restart",
+						message: "Reconciliation incomplete after process restart.",
+					};
+				} else if (hydrated.error !== undefined) {
+					hydrated.error = {
+						code: sanitizePromptFailureCode(hydrated.error.code, "prompt_failed"),
+						message: describeFailureReason(hydrated.error.message).message || "Invocation failed.",
+					};
 				}
-				records.set(key(record.kind, record), { ...record });
+				records.set(key(hydrated.kind, hydrated), hydrated);
 			}
 		}
 		cleanup();
@@ -418,13 +431,12 @@ function createInvocationReconciliation(
 			} else {
 				record.status = frame.type === "agent_failed" ? "failed" : "terminal_ok";
 				record.terminalAt = Date.now();
-				// The frame is the only place the failure reason exists. Discarding it
-				// left every failed invocation indistinguishable at the client and left
-				// nothing in the log to correlate against (#4068).
+				// The frame is the only place the failure reason exists. Keep the
+				// bounded reason in the local record and operator log, never on the wire.
 				if (frame.type === "agent_failed") {
 					const reason = describeFailureReason(frame.error);
 					record.error = {
-						code: reason.code ?? "prompt_failed",
+						code: sanitizePromptFailureCode(reason.code, "prompt_failed"),
 						message: reason.message || "Invocation failed.",
 					};
 					logger.warn("sdk invocation prompt_failed", {
@@ -449,12 +461,14 @@ function createInvocationReconciliation(
 			};
 			if (record.status === "accepted") return { status: "accepted", ...identity };
 			if (record.status === "in_flight") return { status: "in_flight", ...identity, startedAt: record.startedAt };
+			const error =
+				record.error === undefined ? undefined : { code: record.error.code, message: "Invocation failed." };
 			return {
 				status: record.status,
 				...identity,
 				...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }),
 				terminalAt: record.terminalAt,
-				...(record.error === undefined ? {} : { error: record.error }),
+				...(error === undefined ? {} : { error }),
 			};
 		},
 		hydrate,

@@ -96,20 +96,21 @@ export interface PromptReconciliation {
 	activeCount(): number;
 }
 
-/**
- * Bounded failure metadata retained for a failed prompt.
- *
- * The code is a safe token capped at 64 characters. The message is the reason
- * the frame actually carried, read by the single total reader in
- * `@gajae-code/utils/postmortem`: single-line, credential-redacted and length
- * bounded, but no longer replaced by a constant that made a provider error, a
- * tool crash, an auth expiry and an internal assertion indistinguishable (#4068).
- */
+/** Safe-token code capped at 64; credential-shaped and arbitrary text is refused. */
+export function sanitizePromptFailureCode(value: unknown, fallback: string): string {
+	const rawCode = typeof value === "string" ? value : "";
+	const isSafeToken = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode);
+	const isSecretSafe = isSafeToken && describeFailureReason(rawCode).message === rawCode;
+	return isSecretSafe ? rawCode : fallback;
+}
+
+/** Arbitrary failure text never crosses the SDK/ACP wire boundary. */
 export function sanitizePromptFailure(error: unknown): { code: string; message: string } {
 	const reason = describeFailureReason(error);
-	const rawCode = reason.code ?? "";
-	const code = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode) ? rawCode : "internal";
-	return { code, message: reason.message || "Prompt submission failed." };
+	return {
+		code: sanitizePromptFailureCode(reason.code, "internal"),
+		message: "Prompt submission failed.",
+	};
 }
 
 export function createPromptReconciliation(options: { now?: () => number } = {}): PromptReconciliation {
