@@ -356,8 +356,8 @@ export const editToolRenderer = {
 		});
 		const firstEdit = Array.isArray(editArgs.edits) && editArgs.edits.length > 0 ? editArgs.edits[0] : undefined;
 		const rawPath = inventory.paths[0] ?? "";
-		const rename = editArgs.rename || firstEdit?.rename || firstEdit?.move;
-		const op = editArgs.op || firstEdit?.op || inventory.firstOp;
+		const rename = editArgs.rename || firstEdit?.rename || firstEdit?.move || inventory.rename;
+		const op = editArgs.op || firstEdit?.op || inventory.op;
 		const { description } = formatEditDescription(rawPath, uiTheme, options.expanded ? { rename } : undefined);
 		const spinner =
 			options?.spinnerFrame !== undefined ? formatStatusIcon("running", uiTheme, options.spinnerFrame) : "";

@@ -81,6 +81,10 @@ export interface EditRequestTargetInventory {
 	 * parsed entry, not on the top-level args). */
 	firstOp?: Operation;
 	parseError?: string;
+	/** First envelope entry operation, for free-form modes that carry no structured `edits`. */
+	op?: PatchEditEntry["op"];
+	/** First envelope entry rename target, for free-form modes that carry no structured `edits`. */
+	rename?: string;
 }
 const MISSING_APPLY_PATCH_END_ERROR = `The last line of the patch must be '${END_PATCH_MARKER}'`;
 
@@ -135,6 +139,19 @@ function getHashlineTargetPaths(input: string): string[] {
 	return paths.filter(Boolean);
 }
 
+/**
+ * `apply_patch` carries operation metadata inside the envelope rather than in structured `edits`,
+ * so the collapsed card has to read op/rename off the first parsed entry to stay accurate while live.
+ */
+function applyPatchEntryInventory(entries: readonly ApplyPatchEntry[]): EditRequestTargetInventory {
+	const first = entries[0];
+	return {
+		paths: orderedDistinctPaths(entries.map(entry => entry.path)),
+		op: first?.op,
+		rename: first?.rename,
+	};
+}
+
 export function getEditRequestTargetInventory(
 	args: unknown,
 	editMode: EditMode | undefined,
@@ -154,22 +171,20 @@ export function getEditRequestTargetInventory(
 	if (editMode === "hashline") {
 		const input = typeof values.input === "string" ? values.input : "";
 		const headerPaths = getHashlineTargetPaths(input);
-		return { paths: orderedDistinctPaths(headerPaths.length > 0 ? headerPaths : [topLevelPath]) };
+		// `path` is only a fallback for headerless input; explicit §PATH headers are the full target set.
+		if (headerPaths.length > 0) return { paths: orderedDistinctPaths(headerPaths) };
+		return { paths: orderedDistinctPaths([topLevelPath]) };
 	}
 
 	if (editMode === "apply_patch") {
 		const input = typeof values.input === "string" ? values.input : "";
 		try {
-			const entries = expandApplyPatchToEntries({ input });
-			return { paths: orderedDistinctPaths(entries.map(entry => entry.path)), firstOp: entries[0]?.op };
+			return applyPatchEntryInventory(expandApplyPatchToEntries({ input }));
 		} catch (err) {
 			const parseError = err instanceof Error ? err.message : String(err);
-			const previewEntries = expandApplyPatchToPreviewEntries({ input });
-			const paths = orderedDistinctPaths(previewEntries.map(entry => entry.path));
-			if (options.isPartial && parseError === MISSING_APPLY_PATCH_END_ERROR) {
-				return { paths, firstOp: previewEntries[0]?.op };
-			}
-			return { paths, firstOp: previewEntries[0]?.op, parseError };
+			const inventory = applyPatchEntryInventory(expandApplyPatchToPreviewEntries({ input }));
+			if (options.isPartial && parseError === MISSING_APPLY_PATCH_END_ERROR) return inventory;
+			return { ...inventory, parseError };
 		}
 	}
 

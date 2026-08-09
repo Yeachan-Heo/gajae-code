@@ -656,4 +656,78 @@ describe("editToolRenderer", () => {
 		expect(rendered).not.toContain("https://bad");
 		expect(rendered).not.toContain("\x1b]8;;");
 	});
+
+	it("treats the top-level path as a hashline fallback only when no explicit headers exist", () => {
+		const explicitSingle = getEditRequestTargetInventory(
+			{ path: "default.ts", input: "§actual.ts\n»BOF\n+x" },
+			"hashline",
+			{ isPartial: false },
+		);
+		const explicitMulti = getEditRequestTargetInventory(
+			{ path: "default.ts", input: "§a.ts\n»BOF\n+x\n§b.ts\n»BOF\n+y" },
+			"hashline",
+			{ isPartial: false },
+		);
+		const headerless = getEditRequestTargetInventory({ path: "default.ts", input: "»BOF\n+x" }, "hashline", {
+			isPartial: false,
+		});
+
+		expect(explicitSingle.paths).toEqual(["actual.ts"]);
+		expect(explicitMulti.paths).toEqual(["a.ts", "b.ts"]);
+		expect(headerless.paths).toEqual(["default.ts"]);
+	});
+
+	it("does not advertise extra targets for single-header hashline input with a fallback path", async () => {
+		const uiTheme = await getUiTheme();
+		const component = editToolRenderer.renderCall(
+			{ path: "default.ts", input: "§actual.ts\n»BOF\n+x" },
+			{ expanded: false, isPartial: true, renderContext: { editMode: "hashline" } },
+			uiTheme,
+		);
+		const rendered = Bun.stripANSI(component.render(160).join("\n"));
+		expect(rendered).toContain("actual.ts");
+		expect(rendered).not.toContain("more)");
+		expect(rendered).not.toContain("default.ts");
+	});
+
+	it("keeps apply_patch operation and rename metadata on live cards", async () => {
+		const uiTheme = await getUiTheme();
+		const deleted = editToolRenderer.renderCall(
+			{ input: "*** Begin Patch\n*** Delete File: old.ts\n*** End Patch" },
+			{ expanded: false, isPartial: false, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+		const moved = editToolRenderer.renderCall(
+			{ input: "*** Begin Patch\n*** Update File: old.ts\n*** Move to: new.ts\n@@\n-a\n+b\n*** End Patch" },
+			{ expanded: true, isPartial: false, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+		const deletedText = Bun.stripANSI(deleted.render(160).join("\n"));
+		const movedText = Bun.stripANSI(moved.render(160).join("\n"));
+
+		expect(deletedText).toContain("Delete");
+		expect(deletedText).toContain("old.ts");
+		expect(movedText).toContain("new.ts");
+	});
+
+	it("sanitizes single-file preview errors on expanded result cards", async () => {
+		const uiTheme = await getUiTheme();
+		const error = 'File not found: \x1b]8;;https://attacker.invalid\x07evil.ts\x1b]8;;\x07\r\ninjected';
+		const component = editToolRenderer.renderResult(
+			{ content: [], details: { path: "target.ts" } },
+			{
+				expanded: true,
+				isPartial: false,
+				renderContext: { editMode: "replace", editDiffPreview: { error } },
+			},
+			uiTheme,
+			{ path: "target.ts" },
+		);
+		const raw = component.render(160).join("\n");
+
+		expect(raw).toContain("File not found");
+		expect(raw).not.toContain("https://attacker.invalid");
+		expect(raw).not.toContain("\x1b]8;;");
+		expect(raw).not.toContain("\r");
+	});
 });
