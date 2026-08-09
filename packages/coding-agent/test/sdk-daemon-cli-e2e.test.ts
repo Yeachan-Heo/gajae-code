@@ -412,7 +412,7 @@ describe("SDK session CLI (gjc sdk session)", () => {
 			return await originalHandleRequest(operation, input, idempotencyKey);
 		};
 
-		const result = await runCli(root, agentDir, ["list"]);
+		const result = await runCli(root, agentDir, ["sdk", "session", "list"]);
 		expect(result.exitCode).toBe(0);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: true,
@@ -434,7 +434,7 @@ describe("SDK session CLI (gjc sdk session)", () => {
 			return await originalHandleRequest(operation, input, idempotencyKey);
 		};
 
-		const result = await runCli(root, agentDir, ["list"]);
+		const result = await runCli(root, agentDir, ["sdk", "session", "list"]);
 		expect(result.exitCode).toBe(1);
 		const output = JSON.parse(result.stdout);
 		expect(output).toMatchObject({ ok: false, error: { code: "continuation_failed", message: "page two failed" } });
@@ -456,7 +456,7 @@ describe("SDK session CLI (gjc sdk session)", () => {
 				endpointMtimeMs: (await fs.stat(path.join(stateRoot, "sdk", "live.json"))).mtimeMs,
 			});
 
-			const result = await runCli(root, agentDir, ["list", "--agent-dir", alternateAgentDir]);
+			const result = await runCli(root, agentDir, ["sdk", "session", "list", "--agent-dir", alternateAgentDir]);
 			expect(result.exitCode).toBe(0);
 			expect(
 				(JSON.parse(result.stdout).result.sessions as Array<{ sessionId: string }>).map(
@@ -468,7 +468,6 @@ describe("SDK session CLI (gjc sdk session)", () => {
 		}
 	}, 60_000);
 
-	it("requires a caller lifecycle idempotency key before broker connection", async () => {
 	it("SDK-L-G06: requires a caller lifecycle idempotency key before broker connection", async () => {
 		const result = await runCli(root, agentDir, [
 			"sdk",

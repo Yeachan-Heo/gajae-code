@@ -52,9 +52,8 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
-import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
 import { OperationReceiptLedger, operationReceiptDigest } from "./operation-receipt-ledger";
-import { type IndexedSession, SessionIndex } from "./session-index";
+import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {

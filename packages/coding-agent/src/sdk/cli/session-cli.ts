@@ -256,7 +256,6 @@ async function paginatedSessionList(client: SdkClient, input: JsonRecord = {}): 
 	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
 }
 
-async function runList(repo: string, agentDir: string): Promise<unknown> {
 /**
  * Broker-bound session endpoint resolution (C10): the broker validates the
  * indexed session against its durable endpoint record and returns the
@@ -353,7 +352,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 async function runList(agentDir: string): Promise<unknown> {
 	const client = await connectBroker(agentDir);
 	try {
-		const response = await client.global("session.list", {});
+		const response = await paginatedSessionList(client);
 		const result = resultObject(response) ?? {};
 		const sessions = arrayOf(result.sessions).map(toSessionRowV1);
 		return {
