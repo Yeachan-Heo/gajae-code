@@ -317,14 +317,14 @@ let warnedStopSequencesTrim = false;
 const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 
 /**
- * Scope of the replayed-thinking repair currently applied to this session:
- * `latest` drops native thinking from the newest assistant turn, `all` stops
- * replaying native thinking entirely. Persisted across stream re-invocations so
- * a repair that keeps being rejected is not re-attempted from scratch on every
- * turn (issue #4011), and released again by the first stream that completes: the
- * masked `api_error` that can trigger a repair is unclassifiable and may have
- * been transient, so an escalation that no completed request ever confirmed must
- * not pin the rest of the session to a degraded replay.
+ * Scope of a classified replayed-thinking repair currently applied to this
+ * session: `latest` drops native thinking from the newest assistant turn, `all`
+ * stops replaying native thinking entirely. Persisted across stream
+ * re-invocations so a repair that keeps being rejected is not re-attempted from
+ * scratch on every turn (issue #4011), and released again by the first stream
+ * that completes. Unclassifiable masked `api_error` repairs remain local to the
+ * current stream invocation because a transient masked failure must not degrade
+ * later turns.
  */
 type AnthropicThinkingReplayRepairScope = "none" | "latest" | "all";
 
@@ -1974,6 +1974,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					const thinkingSignatureInvalid = isAnthropicThinkingSignatureInvalidError(streamFailure);
 					const thinkingBlocksImmutable = isAnthropicThinkingBlockMutationError(streamFailure);
+					const maskedProxyRejection = isAnthropicMaskedProxyRejection(streamFailure);
 					if (
 						!options?.fallbackManaged &&
 						thinkingReplayRepairScope !== "all" &&
@@ -1984,7 +1985,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							// Masked proxy rejection: unclassifiable on its own, so the replayed
 							// request shape is the evidence. Without signed thinking blocks in
 							// flight there is nothing to repair and the error must surface.
-							(isAnthropicMaskedProxyRejection(streamFailure) && hasNativeThinkingBlocks(params.messages)))
+							(maskedProxyRejection && hasNativeThinkingBlocks(params.messages)))
 					) {
 						// "cannot be modified" means the cited blocks must be replayed byte for
 						// byte, so editing that turn again can never converge — the only recovery
@@ -2004,8 +2005,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						});
 						thinkingReplayRepairScope = nextScope;
 						if (providerSessionState) {
-							providerSessionState.thinkingReplayRepairScope = nextScope;
 							providerSessionState.thinkingReplayRepairAttempts = thinkingReplayRepairAttempts;
+							if (!maskedProxyRejection) {
+								providerSessionState.thinkingReplayRepairScope = nextScope;
+							}
 						}
 						params = await prepareParams();
 						// The provider retry budget is deliberately NOT reset here: a repair that

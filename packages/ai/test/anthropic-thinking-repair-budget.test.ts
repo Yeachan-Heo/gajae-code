@@ -233,9 +233,9 @@ describe("Anthropic thinking-replay repair budget (issue #4011)", () => {
 		expect(second.stopReason).toBe("error");
 		expect(second.errorMessage).toContain("An error occurred while processing the request.");
 		expect(requestBodies).toHaveLength(4);
-		// The degradation the first call converged on is still applied: nothing
-		// completed, so nothing released the escalation.
-		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual([]);
+		// The spent budget remains session-scoped, but the unclassifiable masked
+		// rejection does not carry its speculative degradation into the next turn.
+		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual(["thinking", "thinking"]);
 	});
 
 	it("stays bounded across three turns that never complete a stream", async () => {
