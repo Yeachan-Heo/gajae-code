@@ -18,10 +18,13 @@ const repoRoot = path.join(import.meta.dir, "..");
 const skillsRoot = path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills");
 const skills = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
+type AdvisorySkill = "gjc-sdk-session" | "gjc-sdk-guides";
+type DocumentedSkill = CanonicalGjcWorkflowSkill | AdvisorySkill;
+
 interface CommandRef {
 	file: string;
 	line: number;
-	skill: CanonicalGjcWorkflowSkill;
+	skill: DocumentedSkill;
 	verb: string;
 	command: string;
 	valid: boolean;
