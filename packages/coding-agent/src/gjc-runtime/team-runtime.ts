@@ -2954,18 +2954,19 @@ function hasMainVerticalPaneTopology(config: GjcTeamConfig, target: string): boo
 	);
 	if (result.exitCode !== 0) return false;
 	const lines = result.stdout.toString().trim().split("\n");
-	const panes = lines.map(line =>
-		line
-			.trim()
-			.split(/\s+/)
-			.map(value => Number.parseInt(value, 10)),
-	);
+	const tokens = lines.map(line => line.trim().split(/\s+/));
 	if (
-		panes.length < 2 ||
-		panes.some(values => values.length !== 4 || values.some(value => !Number.isSafeInteger(value) || value < 0))
+		tokens.length < 2 ||
+		tokens.some(values => values.length !== 4 || values.some(value => !/^(?:0|[1-9]\d*)$/.test(value)))
 	)
 		return false;
-	const geometry = panes as [number, number, number, number][];
+	const geometry = tokens.map(values => values.map(value => Number.parseInt(value, 10))) as [
+		number,
+		number,
+		number,
+		number,
+	][];
+	if (geometry.some(values => values.some(value => !Number.isSafeInteger(value) || value < 0))) return false;
 	if (geometry.some(([, , width, height]) => width === 0 || height === 0)) return false;
 	const right = Math.max(...geometry.map(([left, , width]) => left + width));
 	const bottom = Math.max(...geometry.map(([, top, , height]) => top + height));

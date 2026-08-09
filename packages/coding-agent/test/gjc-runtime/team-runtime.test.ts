@@ -175,9 +175,6 @@ if (command === "-V" || command === "--version") {
 } else if (command === "list-panes") {
 	if (config.paneLayout === "even-horizontal") console.log("0 0 120 20\n0 20 120 20");
 	else console.log("0 0 59 40\n60 0 60 40");
-} else if (command === "select-layout" && config.failLayoutReplay && /^[0-9a-f]{4},/i.test(args.at(-1) ?? "")) {
-	console.error("layout replay failed");
-	process.exitCode = 1;
 } else if (command === "show-options" || command === "show-window-options") {
 	const name = args.at(-1);
 	const values = await optionValues();
