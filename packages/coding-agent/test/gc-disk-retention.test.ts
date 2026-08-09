@@ -352,6 +352,65 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
 	});
+
+	test("a session created while the store is being measured keeps its blob", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			// Older than the write grace window, so the only thing that can save it is
+			// a reference — and that reference is written after the session walk has
+			// already enumerated the store.
+			const blob = await writeBlob(fixture, "payload referenced by a session that starts mid-sweep", 10);
+			const survivor = await writeSession(fixture, "repo-a", "survivor", { ageDays: 0 });
+			// A wide artifact tree keeps the session walk busy long enough for the
+			// late session to land after enumeration and before the blob sweep.
+			const artifacts = survivor.slice(0, -".jsonl".length);
+			await fsp.mkdir(artifacts, { recursive: true });
+			for (let index = 0; index < 6000; index++) await Bun.write(path.join(artifacts, `entry-${index}`), "x");
+
+			const run = runGjcGcCommand(["--disk", "--prune", "--json"], fixture.root, fixture.env, [], policy());
+			await Bun.sleep(10);
+			await writeSession(fixture, "repo-b", "late-session", { ageDays: 0, blobRefs: [blob] });
+
+			const disk = requireDisk(JSON.parse((await run).stdout) as GcReport);
+			expect(reasonById(disk, "blobs").get(blob)).toBe("keep:referenced_by_surviving_session");
+			expect(await Bun.file(path.join(fixture.blobsDir, blob)).exists()).toBe(true);
+			expect(disk.errors).toEqual([]);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	}, 30000);
+
+	test("withholds the sweep when a transcript keeps changing under the mark", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const orphan = await writeBlob(fixture, "orphan payload under a moving mark", 10);
+			const transcript = await writeSession(fixture, "repo-a", "busy-session", { ageDays: 0 });
+
+			let appending = true;
+			const appender = (async () => {
+				for (let index = 0; appending && index < 20000; index++) {
+					await fsp.appendFile(
+						transcript,
+						`${JSON.stringify({ type: "message", role: "user", content: index })}\n`,
+					);
+					await Bun.sleep(0);
+				}
+			})();
+			const report = await runGjcGcCommand(["--disk", "--prune", "--json"], fixture.root, fixture.env, [], policy());
+			appending = false;
+			await appender;
+
+			const disk = requireDisk(JSON.parse(report.stdout) as GcReport);
+			expect(reasonById(disk, "blobs").get(orphan)).toBe(
+				"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+			);
+			expect(disk.surfaces.blobs.declined?.reason).toBe("evidence_incomplete: sessions_changed_during_mark");
+			expect(disk.surfaces.blobs.reclaimable).toBe(0);
+			expect(await Bun.file(path.join(fixture.blobsDir, orphan)).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	}, 30000);
 });
 
 describe("gjc gc --disk --prune (blob sweep on incomplete evidence)", () => {
@@ -490,6 +549,65 @@ describe("gjc gc --disk dry-run parity", () => {
 			expect(await Bun.file(corrupt).exists()).toBe(true);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a hard-linked transcript is neither promised by the dry run nor retired by prune", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			// The verified delete authority refuses anything but a single-link
+			// transcript, so the age policy alone must not report it as reclaimable.
+			const linked = await writeSession(fixture, "repo-a", "linked-old", { ageDays: 120 });
+			const artifacts = linked.slice(0, -".jsonl".length);
+			await fsp.mkdir(artifacts, { recursive: true });
+			await Bun.write(path.join(artifacts, "attachment"), "artifact bytes");
+			await fsp.link(linked, path.join(fixture.sessionsRoot, "repo-a", "linked-old.alias"));
+			await writeSession(fixture, "repo-a", "newest", { ageDays: 0 });
+
+			const dryDisk = requireDisk(await runDisk(fixture, ["--disk", "--json"]));
+			expect(reasonById(dryDisk, "sessions").get("linked-old")).toBe(
+				"keep:retention_declined: transcript_not_single_link",
+			);
+			expect(dryDisk.surfaces.sessions.reclaimable).toBe(0);
+
+			const wetDisk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			expect(wetDisk.surfaces.sessions.reclaimed).toBe(dryDisk.surfaces.sessions.reclaimable);
+			expect(wetDisk.surfaces.sessions.reclaimed_bytes).toBe(dryDisk.surfaces.sessions.reclaimable_bytes);
+			expect(await Bun.file(linked).exists()).toBe(true);
+			// The refusal lands before the artifact phase, so nothing of the session
+			// is destroyed on the way to a keep.
+			expect(await Bun.file(path.join(artifacts, "attachment")).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("a blob whose only reference is a retiring transcript stays reclaimable in the dry run", async () => {
+		// The dry run leaves the retiring transcript on disk, so the blob sweep must
+		// not treat it as live evidence and quietly under-report what prune removes.
+		const dry = await makeTestRoot();
+		const wet = await makeTestRoot();
+		const blobs: string[] = [];
+		try {
+			for (const fixture of [dry, wet]) {
+				const blob = await writeBlob(fixture, "payload referenced only by an aged session", 10);
+				blobs.push(blob);
+				await writeSession(fixture, "repo-a", "aged-session", { ageDays: 120, blobRefs: [blob] });
+				await writeSession(fixture, "repo-a", "newest", { ageDays: 0 });
+			}
+
+			const dryDisk = requireDisk(await runDisk(dry, ["--disk", "--json"]));
+			const wetDisk = requireDisk(await runDisk(wet, ["--disk", "--prune", "--json"]));
+
+			expect(dryDisk.surfaces.sessions.reclaimable).toBe(1);
+			expect(dryDisk.surfaces.blobs.reclaimable).toBe(1);
+			expect(wetDisk.surfaces.sessions.reclaimed).toBe(dryDisk.surfaces.sessions.reclaimable);
+			expect(wetDisk.surfaces.blobs.reclaimed).toBe(dryDisk.surfaces.blobs.reclaimable);
+			expect(await Bun.file(path.join(wet.blobsDir, blobs[1]!)).exists()).toBe(false);
+			expect(await Bun.file(path.join(dry.blobsDir, blobs[0]!)).exists()).toBe(true);
+		} finally {
+			await fsp.rm(dry.root, { recursive: true, force: true });
+			await fsp.rm(wet.root, { recursive: true, force: true });
 		}
 	});
 });

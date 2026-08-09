@@ -665,6 +665,14 @@ const GC_DISK_DAY_MS = 24 * 60 * 60 * 1000;
  */
 const GC_DISK_BLOB_GRACE_MS = GC_DISK_DAY_MS;
 
+/**
+ * How many extra times the blob mark may re-absorb transcripts that appeared or
+ * grew while it was running. Ordinary concurrent session activity settles in one
+ * extra round; a store that still will not settle is not evidence anyone can
+ * sweep on, so the sweep withholds instead.
+ */
+const GC_DISK_MARK_REMARK_ROUNDS = 2;
+
 /** Bound every recursive size walk so a pathological tree cannot stall `gjc gc`. */
 const GC_DISK_MAX_WALK_ENTRIES = 200_000;
 
@@ -898,21 +906,32 @@ interface GcDiskTranscriptScan {
 	evidence: GcDiskEvidence;
 }
 
-async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskError[]): Promise<GcDiskTranscriptScan> {
-	const evidence: GcDiskEvidence = { complete: true, notes: [] };
+/**
+ * Walk every managed session transcript under `sessionsRoot` through exactly one
+ * enumeration filter. Discovery and the blob sweep's staleness re-check both go
+ * through here, so their two views of the store are comparable by construction;
+ * anything the walk cannot read degrades `evidence` instead of quietly
+ * shrinking the result.
+ */
+async function walkGcDiskTranscripts(input: {
+	sessionsRoot: string;
+	surface: GcDiskSurface;
+	evidence: GcDiskEvidence;
+	errors: GcDiskError[];
+	visit: (transcriptPath: string, directory: string, stat: Stats) => Promise<void> | void;
+}): Promise<void> {
+	const { sessionsRoot, surface, evidence, errors, visit } = input;
 	let projectDirs: Dirent[];
 	try {
 		projectDirs = await fsp.readdir(sessionsRoot, { withFileTypes: true });
 	} catch (error) {
 		// A missing sessions root is complete evidence: there are no transcripts.
-		if (!isEnoent(error)) {
-			errors.push({ surface: "sessions", scope: sessionsRoot, message: gcDiskErrorText(error) });
-			markGcDiskEvidenceIncomplete(evidence, "sessions_root_unreadable");
-		}
-		return { transcripts: [], evidence };
+		if (isEnoent(error)) return;
+		errors.push({ surface, scope: sessionsRoot, message: gcDiskErrorText(error) });
+		markGcDiskEvidenceIncomplete(evidence, "sessions_root_unreadable");
+		return;
 	}
 
-	const transcripts: GcDiskTranscript[] = [];
 	for (const projectDir of projectDirs) {
 		if (!projectDir.isDirectory() || projectDir.isSymbolicLink()) continue;
 		const directory = path.join(sessionsRoot, projectDir.name);
@@ -920,7 +939,7 @@ async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskErr
 		try {
 			files = await fsp.readdir(directory, { withFileTypes: true });
 		} catch (error) {
-			errors.push({ surface: "sessions", scope: directory, message: gcDiskErrorText(error) });
+			errors.push({ surface, scope: directory, message: gcDiskErrorText(error) });
 			markGcDiskEvidenceIncomplete(evidence, "session_project_dir_unreadable");
 			continue;
 		}
@@ -931,21 +950,35 @@ async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskErr
 			try {
 				stat = await fsp.lstat(transcriptPath);
 			} catch (error) {
-				errors.push({ surface: "sessions", scope: transcriptPath, message: gcDiskErrorText(error) });
+				errors.push({ surface, scope: transcriptPath, message: gcDiskErrorText(error) });
 				markGcDiskEvidenceIncomplete(evidence, "transcript_unstattable");
 				continue;
 			}
+			await visit(transcriptPath, directory, stat);
+		}
+	}
+}
+
+async function discoverGcDiskTranscripts(sessionsRoot: string, errors: GcDiskError[]): Promise<GcDiskTranscriptScan> {
+	const evidence: GcDiskEvidence = { complete: true, notes: [] };
+	const transcripts: GcDiskTranscript[] = [];
+	await walkGcDiskTranscripts({
+		sessionsRoot,
+		surface: "sessions",
+		evidence,
+		errors,
+		visit: async (transcriptPath, directory, stat) => {
 			const artifacts = await measureGcDiskTree(transcriptPath.slice(0, -".jsonl".length));
 			transcripts.push({
-				sessionId: file.name.slice(0, -".jsonl".length),
+				sessionId: path.basename(transcriptPath, ".jsonl"),
 				path: transcriptPath,
 				directory,
 				bytes: stat.size + artifacts.bytes,
 				mtimeMs: stat.mtimeMs,
 				partial: artifacts.partial,
 			});
-		}
-	}
+		},
+	});
 	return { transcripts, evidence };
 }
 
@@ -1095,6 +1128,73 @@ async function markGcDiskBlobReferences(transcriptPath: string, into: Set<string
 	}
 }
 
+/** What a completed mark read: the exact transcript bytes its references came from. */
+interface GcDiskMarkedTranscript {
+	size: number;
+	mtimeMs: number;
+}
+
+/**
+ * Read one transcript's blob references and bind the result to the bytes that
+ * produced it. An append landing after this lstat can introduce a reference the
+ * pass never saw, which is precisely what the drift check below looks for.
+ */
+async function markGcDiskTranscript(
+	transcriptPath: string,
+	referenced: Set<string>,
+	marked: Map<string, GcDiskMarkedTranscript>,
+	evidence: GcDiskEvidence,
+	errors: GcDiskError[],
+): Promise<void> {
+	if (!(await markGcDiskBlobReferences(transcriptPath, referenced))) {
+		markGcDiskEvidenceIncomplete(evidence, "transcript_unreadable_during_mark");
+		errors.push({ surface: "blobs", scope: transcriptPath, message: "transcript_unreadable_during_mark" });
+		return;
+	}
+	try {
+		const stat = await fsp.lstat(transcriptPath);
+		marked.set(transcriptPath, { size: stat.size, mtimeMs: stat.mtimeMs });
+	} catch (error) {
+		markGcDiskEvidenceIncomplete(evidence, "transcript_unstattable_after_mark");
+		errors.push({ surface: "blobs", scope: transcriptPath, message: gcDiskErrorText(error) });
+	}
+}
+
+/**
+ * Transcripts the store holds that nobody has accounted for: created after the
+ * session walk enumerated the store, or written to after their own bytes were
+ * read.
+ *
+ * `accounted` is the session walk's enumeration. A transcript in it that is not
+ * in the mark set is one the session surface decided to retire, and a dry run
+ * leaves those on disk — re-marking them would make the dry run promise fewer
+ * reclaimable blobs than `--prune` actually removes.
+ */
+async function findGcDiskMarkDrift(input: {
+	sessionsRoot: string;
+	accounted: ReadonlySet<string>;
+	marked: Map<string, GcDiskMarkedTranscript>;
+	evidence: GcDiskEvidence;
+	errors: GcDiskError[];
+}): Promise<string[]> {
+	const drifted: string[] = [];
+	await walkGcDiskTranscripts({
+		sessionsRoot: input.sessionsRoot,
+		surface: "blobs",
+		evidence: input.evidence,
+		errors: input.errors,
+		visit: (transcriptPath, _directory, stat) => {
+			const mark = input.marked.get(transcriptPath);
+			if (mark) {
+				if (mark.size !== stat.size || mark.mtimeMs !== stat.mtimeMs) drifted.push(transcriptPath);
+				return;
+			}
+			if (!input.accounted.has(transcriptPath)) drifted.push(transcriptPath);
+		},
+	});
+	return drifted;
+}
+
 /**
  * Mark and sweep the content-addressed blob store.
  *
@@ -1104,16 +1204,25 @@ async function markGcDiskBlobReferences(transcriptPath: string, into: Set<string
  * fails to stream here degrades it further. On incomplete evidence the sweep
  * still reports what it would have reclaimed and reclaims nothing, even under
  * `--prune`: an unproven reference is treated as a real one.
+ *
+ * The session walk is a snapshot, and a snapshot goes stale: a session started
+ * or appended to while `gjc gc` was measuring the store can reference a blob the
+ * mark never saw. So the mark re-walks the store, absorbs whatever appeared or
+ * grew, and only sweeps once the store stops moving under it. Drift that
+ * outlasts {@link GC_DISK_MARK_REMARK_ROUNDS} is incomplete evidence, not a
+ * licence to delete.
  */
 async function runGcDiskBlobs(input: {
 	surface: GcDiskSurfaceReport;
+	sessionsRoot: string;
+	accounted: ReadonlySet<string>;
 	survivors: GcDiskTranscript[];
 	discovery: GcDiskEvidence;
 	now: number;
 	prune: boolean;
 	errors: GcDiskError[];
 }): Promise<void> {
-	const { surface, survivors, discovery, now, prune, errors } = input;
+	const { surface, sessionsRoot, accounted, survivors, discovery, now, prune, errors } = input;
 	const evidence: GcDiskEvidence = { complete: discovery.complete, notes: [...discovery.notes] };
 	let blobs: CanonicalBlobEntry[];
 	try {
@@ -1125,10 +1234,21 @@ async function runGcDiskBlobs(input: {
 	if (blobs.length === 0) return;
 
 	const referenced = new Set<string>();
-	for (const transcript of survivors) {
-		if (await markGcDiskBlobReferences(transcript.path, referenced)) continue;
-		markGcDiskEvidenceIncomplete(evidence, "transcript_unreadable_during_mark");
-		errors.push({ surface: "blobs", scope: transcript.path, message: "transcript_unreadable_during_mark" });
+	const marked = new Map<string, GcDiskMarkedTranscript>();
+	let pending = survivors.map(transcript => transcript.path);
+	for (let round = 0; ; round++) {
+		for (const transcriptPath of pending) {
+			await markGcDiskTranscript(transcriptPath, referenced, marked, evidence, errors);
+		}
+		// Already-incomplete evidence withholds the sweep anyway; re-walking would
+		// only re-report the same failure.
+		if (!evidence.complete) break;
+		pending = await findGcDiskMarkDrift({ sessionsRoot, accounted, marked, evidence, errors });
+		if (pending.length === 0 || !evidence.complete) break;
+		if (round === GC_DISK_MARK_REMARK_ROUNDS) {
+			markGcDiskEvidenceIncomplete(evidence, "sessions_changed_during_mark");
+			break;
+		}
 	}
 
 	let withheld = 0;
@@ -1413,7 +1533,16 @@ export async function collectGcDiskReport(input: {
 		now,
 		prune,
 	});
-	await runGcDiskBlobs({ surface: surfaces.blobs, survivors, discovery: scan.evidence, now, prune, errors });
+	await runGcDiskBlobs({
+		surface: surfaces.blobs,
+		sessionsRoot: surfaces.sessions.root,
+		accounted: new Set(scan.transcripts.map(transcript => transcript.path)),
+		survivors,
+		discovery: scan.evidence,
+		now,
+		prune,
+		errors,
+	});
 	await runGcDiskNatives({
 		surface: surfaces.natives,
 		policy,

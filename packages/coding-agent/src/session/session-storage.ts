@@ -1861,6 +1861,15 @@ function planSessionRetirement(
 		return { kind: "kept", reason: "transcript_header_unusable" };
 	}
 
+	// The verified delete authority only unlinks a single-link transcript, so a
+	// hard-linked one can never be retired. Refusing here keeps the dry run from
+	// promising bytes prune cannot release, and — because this runs before the
+	// artifact phase — keeps a doomed retirement from destroying the artifact
+	// tree of a session whose transcript will survive anyway.
+	if (snapshot.stat.nlink === undefined || snapshot.stat.nlink !== 1n) {
+		return { kind: "kept", reason: "transcript_not_single_link" };
+	}
+
 	const directory = path.dirname(transcriptPath);
 	return {
 		kind: "retirable",
