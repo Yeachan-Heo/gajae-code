@@ -65,6 +65,7 @@ export type BrokerErrorCode =
 	| "invalid_input"
 	| "spawn_failed"
 	| "startup_admission_timeout"
+	| "startup_admission_refused"
 	| "readiness_timeout"
 	| "close_refused"
 	| "not_found"
@@ -559,10 +560,11 @@ export interface StartupAdmissionTiming {
 
 export type StartupAdmissionResult<T> =
 	| { status: "completed"; admittedAt: number; value: T }
-	| { status: "admission_timeout"; reason: "admission_timeout" };
+	| { status: "admission_timeout"; reason: "admission_timeout" }
+	| { status: "admission_refused"; reason: "admission_refused" };
 
 interface StartupAdmissionWaiter {
-	state: "waiting" | "admitted" | "timed_out";
+	state: "waiting" | "admitted" | "timed_out" | "refused";
 	ready: PromiseWithResolvers<void>;
 }
 
@@ -575,6 +577,7 @@ export function sdkHostStartupConcurrency(availableParallelism = os.availablePar
 
 export class StartupAdmissionQueue {
 	#inFlight = 0;
+	#closed = false;
 	#waiters: StartupAdmissionWaiter[] = [];
 
 	constructor(readonly limit: number) {
@@ -589,15 +592,17 @@ export class StartupAdmissionQueue {
 	): Promise<StartupAdmissionResult<T>> {
 		if (!Number.isSafeInteger(queueWaitMs) || queueWaitMs < 1)
 			throw new Error("SDK host startup queue wait must be a positive safe integer.");
+		if (this.#closed) return { status: "admission_refused", reason: "admission_refused" };
 		if (this.#inFlight < this.limit) return this.#runAdmitted(timing, task);
 
 		const ready = Promise.withResolvers<void>();
 		const waiter: StartupAdmissionWaiter = { state: "waiting", ready };
 		this.#waiters.push(waiter);
 		const outcome = await Promise.race([
-			ready.promise.then(() => "admitted" as const),
+			ready.promise.then(() => (waiter.state === "refused" ? ("refused" as const) : ("admitted" as const))),
 			timing.sleep(queueWaitMs).then(() => {
 				if (waiter.state === "admitted") return "admitted" as const;
+				if (waiter.state === "refused") return "refused" as const;
 				if (waiter.state === "timed_out") return "timed_out" as const;
 				waiter.state = "timed_out";
 				const index = this.#waiters.indexOf(waiter);
@@ -606,6 +611,7 @@ export class StartupAdmissionQueue {
 			}),
 		]);
 		if (outcome === "timed_out") return { status: "admission_timeout", reason: "admission_timeout" };
+		if (outcome === "refused") return { status: "admission_refused", reason: "admission_refused" };
 		return this.#runGranted(timing, task);
 	}
 
@@ -637,6 +643,21 @@ export class StartupAdmissionQueue {
 			if (waiter.state !== "waiting") continue;
 			waiter.state = "admitted";
 			this.#inFlight += 1;
+			waiter.ready.resolve();
+		}
+	}
+
+	/**
+	 * Refuse every queued startup and every later one. A broker that can no longer
+	 * prove it owns the published root must not spawn children through slots that
+	 * free up after it stops, and a waiter must never be silently granted or left
+	 * pending, so each one is woken with an explicit non-success outcome.
+	 */
+	close(): void {
+		this.#closed = true;
+		for (const waiter of this.#waiters.splice(0)) {
+			if (waiter.state !== "waiting") continue;
+			waiter.state = "refused";
 			waiter.ready.resolve();
 		}
 	}
@@ -1005,6 +1026,13 @@ export class Broker {
 		if (this.#completionTask) return this.#completionTask;
 		this.#stopping = true;
 		this.#publicationState = "stopping";
+		// A lost-root broker has been fenced: it no longer owns the published root, and
+		// its settlement is bounded, so any startup still queued behind it would be
+		// granted after completion and spawn a child the broker has no authority over.
+		// An owned-root stop keeps the queue open on purpose: the broker still owns
+		// everything it admitted, and completion waits unbounded for those startups, so
+		// draining would abandon work that is about to finish correctly.
+		if (mode === "lost-root") this.#startupAdmissions.close();
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
