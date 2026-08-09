@@ -1,3 +1,22 @@
+/** Readiness budget the broker grants a lifecycle request that does not size one itself. */
+export const DEFAULT_READINESS_TIMEOUT_MS = 10_000;
+
+/**
+ * Slack a caller adds over the broker-side budget so that a startup which runs to the
+ * very edge of its window is reported as the broker's own terminal result rather than
+ * as the caller's timeout.
+ */
+const CALLER_DEADLINE_SLACK_MS = 1_000;
+
+/**
+ * Whether a broker operation waits in the host-startup admission queue before it runs.
+ * Only these spawn a host, so only these can be parked behind a full queue; the other
+ * lifecycle operations start their readiness clock as soon as they are received.
+ */
+export function isStartupLifecycleOperation(operation: string): boolean {
+	return operation === "session.create" || operation === "session.fork" || operation === "session.resume";
+}
+
 /**
  * Bounded time a lifecycle startup may wait for a host-startup admission slot. It
  * is the readiness budget itself: a startup still queued after that long has spent
@@ -17,4 +36,22 @@ export function startupQueueWaitMs(requestedReadinessTimeoutMs: number): number 
  */
 export function lifecycleStartupBudgetMs(requestedReadinessTimeoutMs: number): number {
 	return startupQueueWaitMs(requestedReadinessTimeoutMs) + requestedReadinessTimeoutMs;
+}
+
+/**
+ * Request deadline a caller MUST grant a broker operation, or `undefined` when the
+ * operation carries no readiness budget of its own and the client default already
+ * covers it.
+ *
+ * A request that omits `readinessTimeoutMs` is sized against the broker's default
+ * rather than left unextended: the broker queues it for exactly as long as one that
+ * asked, so the common path would otherwise fail client-side while the broker runs
+ * the startup to a durably persisted terminal result.
+ */
+export function lifecycleRequestTimeoutMs(operation: string, input: Record<string, unknown>): number | undefined {
+	const requested = input.readinessTimeoutMs;
+	const supplied = typeof requested === "number" && Number.isSafeInteger(requested) ? requested : undefined;
+	if (isStartupLifecycleOperation(operation))
+		return lifecycleStartupBudgetMs(supplied ?? DEFAULT_READINESS_TIMEOUT_MS) + CALLER_DEADLINE_SLACK_MS;
+	return supplied === undefined ? undefined : supplied + CALLER_DEADLINE_SLACK_MS;
 }

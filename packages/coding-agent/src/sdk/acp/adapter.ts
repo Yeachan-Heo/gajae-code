@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lifecycleStartupBudgetMs } from "../broker/startup-budget";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError, type SdkFrame } from "../client";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
@@ -188,16 +188,15 @@ export class AcpSdkAdapter {
 		this.#assertGenericDisposition("global", operation);
 		if (isLifecycleOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
-		const readinessTimeoutMs =
-			typeof input.readinessTimeoutMs === "number" && Number.isSafeInteger(input.readinessTimeoutMs)
-				? input.readinessTimeoutMs
-				: undefined;
+		// The broker may hold a startup in its admission queue before the readiness
+		// clock even starts, so the caller deadline covers the queue wait too; sizing
+		// it on readiness alone times out requests the broker is still running. A
+		// request that named no readiness budget is queued for the default one, so it
+		// needs the same extension rather than the client's generic request deadline.
+		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 		return await this.#client.global(operation, input, {
 			idempotencyKey,
-			// The broker may hold a startup in its admission queue before the readiness
-			// clock even starts, so the caller deadline covers the queue wait too; sizing
-			// it on readiness alone times out requests the broker is still running.
-			...(readinessTimeoutMs ? { timeoutMs: lifecycleStartupBudgetMs(readinessTimeoutMs) + 1_000 } : {}),
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		});
 	}
 

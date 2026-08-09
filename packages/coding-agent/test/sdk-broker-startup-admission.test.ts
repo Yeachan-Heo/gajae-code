@@ -15,7 +15,11 @@ import {
 	setLifecycleCommandResolverForTest,
 	setLifecycleTimingForTest,
 } from "../src/sdk/broker/lifecycle";
-import { startupQueueWaitMs } from "../src/sdk/broker/startup-budget";
+import {
+	DEFAULT_READINESS_TIMEOUT_MS,
+	lifecycleStartupBudgetMs,
+	startupQueueWaitMs,
+} from "../src/sdk/broker/startup-budget";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 
 function controlledTiming(now: () => number): {
@@ -313,37 +317,188 @@ test("a broker that lost the root refuses queued startups instead of spawning ch
 	}
 }, 15_000);
 
-test("the ACP caller deadline covers admission wait, not only the readiness budget", async () => {
-	const readinessTimeoutMs = 4_000;
-	const sdk = new TimeoutCapturingSdkClient();
-	const adapter = new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never });
-	await adapter.global("session.create", { cwd: "/workspace", readinessTimeoutMs }, "late-admission");
-	const callerDeadlineMs = sdk.timeoutMs;
-	if (callerDeadlineMs === undefined) throw new Error("ACP caller did not bound the lifecycle request.");
-
-	// The broker parks the request, then starts the readiness clock at admission, so its
-	// terminal instant is measured from `admittedAt` and not from when the caller sent it.
-	let now = 0;
-	const queue = new StartupAdmissionQueue(1);
+test("a stop that cannot prove it still owns the root drains the queued startups", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-unproven-stop-"));
+	const agentDir = path.join(root, "agent");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const broker = new Broker({ agentDir });
 	const release = Promise.withResolvers<void>();
-	const { timing } = controlledTiming(() => now);
-	const holder = queue.run(startupQueueWaitMs(readinessTimeoutMs), timing, () => release.promise);
-	const queued = queue.run(startupQueueWaitMs(readinessTimeoutMs), timing, async admittedAt =>
-		deriveLifecycleDeadlines(admittedAt, readinessTimeoutMs),
+	const parked: StartupAdmissionTiming = { now: Date.now, sleep: () => Promise.withResolvers<void>().promise };
+	const queuedInAdmission = Promise.withResolvers<void>();
+	let spawnCalls = 0;
+	try {
+		delete process.env.GJC_SDK_SESSION_COMMAND;
+		await broker.start();
+		setLifecycleCommandResolverForTest(broker, () => {
+			spawnCalls += 1;
+			throw new Error("SDK internal launch refused: a broker that lost the root must not spawn.");
+		});
+		// Hold every startup slot so the lifecycle request has to queue behind them.
+		const holders = Array.from({ length: sdkHostStartupConcurrency() }, () =>
+			broker.runStartup(4_000, parked, async () => {
+				await release.promise;
+			}),
+		);
+		await Promise.resolve();
+		// The queued request may only be woken by a drain, never by its own cutoff.
+		setLifecycleTimingForTest(broker, {
+			now: Date.now,
+			sleep: () => {
+				queuedInAdmission.resolve();
+				return Promise.withResolvers<void>().promise;
+			},
+		});
+		const queued = broker.handleRequest(
+			"session.create",
+			{ cwd: root, stateRoot: path.join(root, ".gjc", "state"), readinessTimeoutMs: 4_000 },
+			"queued-behind-replaced-root",
+		);
+		await queuedInAdmission.promise;
+
+		// A replacement already owns the published root. The watchdog runs on a 5s cadence
+		// and has not observed it, so the broker's cached publication state is still healthy
+		// and only a fresh observation can tell the stop what it may still claim.
+		setPublicationObservationForTest(broker, "replaced");
+		const stopped = broker.stop();
+
+		// Slots only free up once the stop has already decided what it owns.
+		release.resolve();
+		await Promise.all(holders);
+		expect(await queued).toEqual({
+			ok: false,
+			error: {
+				code: "startup_admission_refused",
+				message: "SDK host startup was refused because the broker no longer owns the session root.",
+			},
+		});
+		expect(spawnCalls).toBe(0);
+		await stopped;
+
+		// A drained queue refuses every later startup, so a restart must not inherit it.
+		setPublicationObservationForTest(broker, undefined);
+		await broker.start();
+		const restarted = await broker.runStartup(
+			4_000,
+			{ now: Date.now, sleep: async () => undefined },
+			async () => "ready",
+		);
+		if (restarted.status !== "completed") throw new Error(`restart refused its own startup: ${restarted.status}.`);
+		expect(restarted.value).toBe("ready");
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		setLifecycleTimingForTest(broker, undefined);
+		setPublicationObservationForTest(broker, undefined);
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		release.resolve();
+		await broker.stop().catch(() => undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("the ACP caller deadline covers the admission wait even when readiness is defaulted", async () => {
+	const defaulted = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: defaulted as never }).global(
+		"session.create",
+		{ cwd: "/workspace" },
+		"defaulted-readiness",
 	);
-	await Promise.resolve();
+	expect(defaulted.timeoutMs).toBe(lifecycleStartupBudgetMs(DEFAULT_READINESS_TIMEOUT_MS) + 1_000);
 
-	now = 3_700;
-	release.resolve();
-	const admitted = await queued;
-	await holder;
-	if (admitted.status !== "completed") throw new Error(`expected a late admission, got ${admitted.status}.`);
-	expect(admitted.value.receivedAt).toBe(3_700);
-	expect(admitted.value.lifecycleCleanupDeadlineAt).toBe(7_700);
+	const requested = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: requested as never }).global(
+		"session.create",
+		{ cwd: "/workspace", readinessTimeoutMs: 4_000 },
+		"requested-readiness",
+	);
+	expect(requested.timeoutMs).toBe(lifecycleStartupBudgetMs(4_000) + 1_000);
 
-	// The broker runs to that instant and persists a terminal result there, so a caller
-	// that stopped listening earlier abandons a request that is still going to finish.
-	expect(admitted.value.lifecycleCleanupDeadlineAt).toBeLessThanOrEqual(callerDeadlineMs);
-	// Worst case: admitted at the very edge of the queue wait.
-	expect(callerDeadlineMs).toBeGreaterThanOrEqual(startupQueueWaitMs(readinessTimeoutMs) + readinessTimeoutMs);
+	// An operation that never queues for a startup slot keeps its own readiness sizing.
+	const closing = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: closing as never }).global(
+		"session.close",
+		{ sessionId: "s", readinessTimeoutMs: 4_000 },
+		"closing",
+	);
+	expect(closing.timeoutMs).toBe(5_000);
 });
+
+test("a default startup admitted late by the production broker stays inside the ACP caller deadline", async () => {
+	const sdk = new TimeoutCapturingSdkClient();
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never }).global(
+		"session.create",
+		{ cwd: "/workspace" },
+		"default-late-admission",
+	);
+	const callerDeadlineMs = sdk.timeoutMs;
+	if (callerDeadlineMs === undefined) throw new Error("ACP caller did not bound the default lifecycle request.");
+
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-late-admission-"));
+	const agentDir = path.join(root, "agent");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const broker = new Broker({ agentDir });
+	const release = Promise.withResolvers<void>();
+	const parked: StartupAdmissionTiming = { now: Date.now, sleep: () => Promise.withResolvers<void>().promise };
+	const admissionParked = Promise.withResolvers<void>();
+	const receivedAt = 1_000_000;
+	let now = receivedAt;
+	let observedQueueWaitMs: number | undefined;
+	let spawnCalls = 0;
+	try {
+		delete process.env.GJC_SDK_SESSION_COMMAND;
+		await broker.start();
+		setLifecycleCommandResolverForTest(broker, () => {
+			spawnCalls += 1;
+			throw new Error("SDK internal launch refused: this test only needs to reach the spawn seam.");
+		});
+		const holders = Array.from({ length: sdkHostStartupConcurrency() }, () =>
+			broker.runStartup(startupQueueWaitMs(DEFAULT_READINESS_TIMEOUT_MS), parked, async () => {
+				await release.promise;
+			}),
+		);
+		await Promise.resolve();
+		setLifecycleTimingForTest(broker, {
+			now: () => now,
+			sleep: ms => {
+				observedQueueWaitMs ??= ms;
+				admissionParked.resolve();
+				return Promise.withResolvers<void>().promise;
+			},
+		});
+		// No `readinessTimeoutMs`: the default request every ACP caller sends.
+		const queued = broker.handleRequest(
+			"session.create",
+			{ cwd: root, stateRoot: path.join(root, ".gjc", "state") },
+			"default-late-admission",
+		);
+		await admissionParked.promise;
+		expect(observedQueueWaitMs).toBe(startupQueueWaitMs(DEFAULT_READINESS_TIMEOUT_MS));
+
+		// Admit at the last instant the queue allows.
+		const admittedAt = receivedAt + startupQueueWaitMs(DEFAULT_READINESS_TIMEOUT_MS) - 1;
+		now = admittedAt;
+		release.resolve();
+		await Promise.all(holders);
+		const response = await queued;
+
+		// Reaching the spawn seam here proves readiness is granted fresh at admission:
+		// measured from arrival the readiness deadline had already passed, and the broker
+		// would have returned `readiness_timeout` before resolving any command.
+		expect(spawnCalls).toBe(1);
+		expect(response).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+
+		// So the broker's own terminal instant for this admission, derived by the same
+		// function its startup path uses, must still fit inside the deadline the ACP caller
+		// granted the identical default request.
+		const terminalAt = deriveLifecycleDeadlines(admittedAt, DEFAULT_READINESS_TIMEOUT_MS).lifecycleCleanupDeadlineAt;
+		expect(terminalAt - receivedAt).toBeLessThanOrEqual(callerDeadlineMs);
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		setLifecycleTimingForTest(broker, undefined);
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		release.resolve();
+		await broker.stop().catch(() => undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 15_000);

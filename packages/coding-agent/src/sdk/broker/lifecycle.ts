@@ -72,7 +72,7 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import { startupQueueWaitMs } from "./startup-budget";
+import { DEFAULT_READINESS_TIMEOUT_MS, startupQueueWaitMs } from "./startup-budget";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -81,7 +81,6 @@ export {
 	processIncarnation,
 };
 
-const READY_TIMEOUT_MS = 10_000;
 const MIN_READY_TIMEOUT_MS = 4_000;
 const MAX_READY_TIMEOUT_MS = 60_000;
 const POLL_MS = 50;
@@ -493,7 +492,7 @@ export function validateBrokerModelPresetForTest(agentDir: string, requestedProf
 
 function readinessTimeout(input: Input): number | BrokerResponse {
 	const value = input.readinessTimeoutMs;
-	if (value === undefined) return READY_TIMEOUT_MS;
+	if (value === undefined) return DEFAULT_READINESS_TIMEOUT_MS;
 	if (
 		typeof value !== "number" ||
 		!Number.isSafeInteger(value) ||

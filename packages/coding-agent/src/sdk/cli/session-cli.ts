@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import {
 	listSdkSessionEndpoints,
 	readSdkBrokerDiscovery,
@@ -242,7 +243,13 @@ export async function runSdkSessionCli(
 				throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
 			const client = await connectBroker(agentDir);
 			try {
-				writeOutput(await client.global(operation, input, { idempotencyKey }));
+				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+				writeOutput(
+					await client.global(operation, input, {
+						idempotencyKey,
+						...(timeoutMs === undefined ? {} : { timeoutMs }),
+					}),
+				);
 			} finally {
 				await client.close();
 			}
