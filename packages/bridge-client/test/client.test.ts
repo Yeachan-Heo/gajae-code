@@ -186,15 +186,46 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 	});
 });
 
-test("createConnectSubscribeSubmit rejects invalid logical identities before broker traffic", async () => {
+const invalidDurableInputs = [
+	{
+		create: { unsupported: true },
+		createIdempotencyKey: "create-key",
+		submission: { kind: "prompt", text: "hello", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		timeoutMs: 0,
+		submission: { kind: "prompt", text: "hello", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		replaySinceSeq: -1,
+		submission: { kind: "prompt", text: "hello", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		submission: { kind: "prompt", text: "hello", name: "mixed", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		submission: { kind: "prompt", text: "hello", clientRef: " invalid " },
+	},
+];
+
+test("createConnectSubscribeSubmit rejects invalid durable inputs before broker traffic", async () => {
 	await withFakeTransport(async () => {
-		const client = new SdkClient("ws://sdk.test", "token");
-		const result = await client.createConnectSubscribeSubmit({
-			create: {},
-			createIdempotencyKey: "create-key",
-			submission: { kind: "prompt", text: "hello", clientRef: " invalid " },
-		});
-		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		for (const input of invalidDurableInputs) {
+			const client = new SdkClient("ws://sdk.test", "token");
+			await expect(client.createConnectSubscribeSubmit(input as never)).resolves.toMatchObject({
+				kind: "failed",
+				error: { code: "invalid_input" },
+			});
+			await client.close();
+		}
 		expect(FakeWebSocket.instances).toHaveLength(0);
 	});
 });
@@ -220,7 +251,7 @@ test("createConnectSubscribeSubmit replays and writes one prompt on the validate
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
 		const pending = client.createConnectSubscribeSubmit({
-			create: { cwd: "/repo", token: "create-token", nested: { secret: "must-not-retain" } },
+			create: { cwd: "/repo", readiness: "immediate", target: { worktree: { name: "work" } } },
 			createIdempotencyKey: "create-identity",
 			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
 		});
@@ -272,14 +303,12 @@ test("createConnectSubscribeSubmit replays and writes one prompt on the validate
 			ok: true,
 			result: { commandId: "command-1", turnId: "turn-1" },
 		});
-		await expect(pending).resolves.toMatchObject({
-			kind: "accepted",
-			sessionId: "session-1",
-			identity: {
-				createIdempotencyKey: "create-identity",
-				submission: { kind: "prompt", clientRef: "prompt-work" },
-				create: { cwd: "/repo" },
-			},
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "accepted", sessionId: "session-1" });
+		expect(result.kind === "accepted" && result.identity.create).toEqual({
+			cwd: "/repo",
+			readiness: "immediate",
+			target: { worktree: { name: "work" } },
 		});
 		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(1);
 		await client.close();
@@ -317,7 +346,11 @@ test("createConnectSubscribeSubmit never sends after replay incarnation closes b
 		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
 		endpoint.readyState = FakeWebSocket.CLOSED;
 		endpoint.emit("close");
-		await expect(pending).resolves.toMatchObject({ kind: "attachment_uncertain", prohibitResubmission: true });
+		await expect(pending).resolves.toMatchObject({
+			kind: "attachment_uncertain",
+			nextLegalLookupAction: "reconcileCreateConnectSubmit",
+			prohibitResubmission: true,
+		});
 		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(0);
 		await client.close();
 	});
@@ -403,7 +436,7 @@ test("createConnectSubscribeSubmit permits capability-gated global replay gaps o
 	});
 });
 
-test("reconcileCreateConnectSubmit rejects malformed submission identities before broker traffic", async () => {
+test("reconcileCreateConnectSubmit rejects malformed recovery identities before broker traffic", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token");
 		const result = await client.reconcileCreateConnectSubmit({
@@ -413,6 +446,21 @@ test("reconcileCreateConnectSubmit rejects malformed submission identities befor
 			create: { cwd: "/repo" },
 			submission: { kind: "not-a-submission", clientRef: "work" },
 		} as never);
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		expect(FakeWebSocket.instances).toHaveLength(0);
+		await client.close();
+	});
+});
+
+/** Recovery must replay exactly what the broker hashed, never a redacted subset. */
+test("reconcileCreateConnectSubmit replays unknown create fields only by rejecting them before creation", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const result = await client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo", unknown: "would-change-broker-hash" },
+			createIdempotencyKey: "create-key",
+			submission: { kind: "prompt", text: "hello", clientRef: "work" },
+		});
 		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
 		expect(FakeWebSocket.instances).toHaveLength(0);
 		await client.close();
