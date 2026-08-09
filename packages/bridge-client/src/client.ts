@@ -78,7 +78,17 @@ type Pending = {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
+	sent: boolean;
 };
+
+/**
+ * Transport facts attached to an SdkClientError with code "timeout" for a request.
+ * `requestSent` proves only that WebSocket.send() returned; it never proves server acceptance.
+ */
+export interface SdkRequestTimeoutDetails {
+	requestId: string;
+	requestSent: boolean;
+}
 
 function errorFrom(frame: Frame): SdkClientError {
 	const error = frame.error;
@@ -272,12 +282,16 @@ export class SdkClient {
 				incarnation,
 				resolve,
 				reject,
+				sent: false,
 				timer: setTimeout(
 					() =>
 						this.#settlePending(
 							id,
 							pending,
-							new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`),
+							new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`, {
+								requestId: id,
+								requestSent: pending.sent,
+							} satisfies SdkRequestTimeoutDetails),
 						),
 					timeoutMs,
 				),
@@ -295,6 +309,7 @@ export class SdkClient {
 						...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
 					}),
 				);
+				pending.sent = true;
 			} catch (error) {
 				this.#settlePending(
 					id,
