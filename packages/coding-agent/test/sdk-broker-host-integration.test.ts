@@ -79,6 +79,7 @@ test("broker session.list returns bounded stable cursor pages", async () => {
 		expect(firstPage.continuationCursor).toEqual(expect.any(String));
 
 		await busIndex.append(event("host_registered", "four", stateRoot));
+		await fs.appendFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), '{"version":999}\n');
 		const second = await broker.handleRequest("session.list", { cursor: firstPage.continuationCursor });
 		expect(second).toMatchObject({
 			ok: true,
@@ -96,6 +97,29 @@ test("broker session.list returns bounded stable cursor pages", async () => {
 	}
 });
 
+test("broker session.list keeps cursor warnings snapshot-stable", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-warning-snapshot-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		const busIndex = await new SessionIndex(agentDir).open();
+		await busIndex.append(event("host_registered", "one", stateRoot));
+		await busIndex.append(event("host_registered", "two", stateRoot));
+		const first = await broker.handleRequest("session.list", { limit: 1 });
+		expect(first.ok).toBe(true);
+		if (!first.ok) throw new Error(first.error.message);
+		const firstPage = first.result as { continuationCursor?: string; warnings: string[] };
+		expect(firstPage.warnings).toEqual([]);
+		await fs.appendFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "not json\n");
+		const second = await broker.handleRequest("session.list", { cursor: firstPage.continuationCursor });
+		expect(second).toMatchObject({ ok: true, result: { sessions: [{ sessionId: "two" }], warnings: [] } });
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("broker session.list rejects a new cursor stream at capacity without evicting active cursors", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-cursor-capacity-"));
 	const stateRoot = path.join(agentDir, "state");
@@ -103,7 +127,7 @@ test("broker session.list rejects a new cursor stream at capacity without evicti
 	await broker.start();
 	try {
 		const busIndex = await new SessionIndex(agentDir).open();
-		const sessionIds = Array.from({ length: 33 }, (_, index) => `session-${index + 1}`);
+		const sessionIds = Array.from({ length: 2 }, (_, index) => `session-${index + 1}`);
 		for (const sessionId of sessionIds) await busIndex.append(event("host_registered", sessionId, stateRoot));
 
 		const cursors: string[] = [];
@@ -124,12 +148,16 @@ test("broker session.list rejects a new cursor stream at capacity without evicti
 		const continued = await broker.handleRequest("session.list", { cursor: cursors[0] });
 		expect(continued).toMatchObject({
 			ok: true,
-			result: { sessions: [{ sessionId: "session-2" }], continuationCursor: expect.any(String) },
+			result: { sessions: [{ sessionId: "session-2" }] },
 		});
 		if (!continued.ok) throw new Error(continued.error.message);
 		expect(await broker.handleRequest("session.list", { cursor: cursors[0] })).toEqual({
 			ok: false,
 			error: { code: "invalid_input", message: "cursor is expired or invalid" },
+		});
+		expect(await broker.handleRequest("session.list", { limit: 1 })).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "session-1" }], continuationCursor: expect.any(String) },
 		});
 	} finally {
 		await broker.stop();
