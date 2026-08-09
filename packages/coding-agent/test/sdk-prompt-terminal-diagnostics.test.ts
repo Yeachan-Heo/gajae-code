@@ -187,6 +187,73 @@ test("SDK host logs a bounded reason from a reachable provider failure", async (
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("SDK host logs a bounded reason from an accepted sendUserMessage rejection", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-accepted-rejection-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-terminal-accepted-rejection-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const reason = `Accepted sendUserMessage rejected after commit: ${"y".repeat(600)}`;
+	const handlers = start(sessionContext, async () => {
+		throw new Error(reason);
+	});
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+
+	const diagnostics: Record<string, unknown>[] = [];
+	const errorSpy = spyOn(logger, "error").mockImplementation((...args: unknown[]) => {
+		if (args[0] === "sdk_prompt_terminal_failed") diagnostics.push(args[1] as Record<string, unknown>);
+	});
+
+	try {
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "accepted-rejection",
+				operation: "turn.prompt",
+				input: { text: "fail after acceptance" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "accepted-rejection"),
+			"accepted prompt acknowledgement",
+		);
+		await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "accepted rejection terminal");
+
+		const acknowledgement = frames.find(
+			frame => frame.type === "control_response" && frame.id === "accepted-rejection",
+		) as { result?: { commandId?: unknown; turnId?: unknown } };
+		const failure = frames.find(frame => frame.type === "agent_failed") as Record<string, unknown>;
+		expect(failure).toMatchObject({
+			commandId: acknowledgement.result?.commandId,
+			turnId: acknowledgement.result?.turnId,
+			error: { code: "internal", message: "Prompt submission failed." },
+			outcome: { kind: "failed", code: "prompt_failed", message: "Prompt submission failed." },
+		});
+		expect(JSON.stringify(failure)).not.toContain("Accepted sendUserMessage rejected");
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({
+			sessionId,
+			commandId: acknowledgement.result?.commandId,
+			turnId: acknowledgement.result?.turnId,
+			reason: reason.slice(0, 512),
+		});
+		expect(diagnostics[0]?.reason).toHaveLength(512);
+	} finally {
+		errorSpy.mockRestore();
+	}
+
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
 test("SDK host does not log a client cancellation as a prompt terminal failure", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-cancel-"));
 	dirs.push(cwd);

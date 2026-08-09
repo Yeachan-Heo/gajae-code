@@ -161,6 +161,33 @@ const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
  * provider error cannot flood the log file.
  */
 const PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX = 512;
+type PromptTerminalDiagnostic = {
+	reason?: unknown;
+	loopStopReason?: string;
+	assistantStopReason?: string;
+	errorKind?: string;
+	intentionalCancellation?: boolean;
+};
+
+type PromptTerminalExtra = {
+	finalText?: string;
+	error?: { code: string; message: string };
+	diagnostic?: PromptTerminalDiagnostic;
+};
+
+function formatPromptTerminalFailureReason(reason: unknown): string {
+	let rawReason: string;
+	if (reason instanceof Error) rawReason = reason.message;
+	else if (typeof reason === "string") rawReason = reason;
+	else if (reason === undefined || reason === null) return "unreported";
+	else
+		try {
+			rawReason = String(reason);
+		} catch {
+			return "unreported";
+		}
+	return rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported";
+}
 
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
@@ -1202,11 +1229,8 @@ interface SessionRuntime {
 	terminalizePrompt: (
 		correlation: { commandId: string; turnId: string },
 		outcome: SdkPromptTerminalOutcome,
-		extra?: { finalText?: string },
+		extra?: PromptTerminalExtra,
 	) => Promise<void>;
-	/** Records a correlated prompt terminal boundary after agent unwind. */
-	/** Atomically claims a correlated prompt terminal boundary after agent unwind. */
-	recordPromptTerminal: (correlation: { commandId: string; turnId: string } | undefined) => boolean;
 	/** Transitions the authoritative reconciliation record at lifecycle ingress; terminal outcomes settle once. */
 	notePromptReconciliation: (
 		correlation: { commandId: string; turnId: string } | undefined,
@@ -4283,6 +4307,7 @@ export function createNotificationsExtension(
 						provenance: "deadline",
 					},
 					{ fence: true },
+					{ diagnostic: { reason: "Prompt deadline exceeded." } },
 				);
 			}, submission.deadlineMs);
 		};
@@ -4369,7 +4394,7 @@ export function createNotificationsExtension(
 			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
 			// so aborting there would cancel the next turn instead of fencing this one.
 			options: { fence?: boolean } = {},
-			extra?: { finalText?: string; error?: { code: string; message: string } },
+			extra?: PromptTerminalExtra,
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
@@ -4441,6 +4466,20 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation) || !runtime) return;
+			if (winner.kind === "failed" && extra?.diagnostic?.intentionalCancellation !== true) {
+				const diagnostic = extra?.diagnostic;
+				logger.error("sdk_prompt_terminal_failed", {
+					sessionId: id,
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+					code: winner.code,
+					provenance: winner.provenance,
+					...(diagnostic?.loopStopReason ? { loopStopReason: diagnostic.loopStopReason } : {}),
+					...(diagnostic?.assistantStopReason ? { assistantStopReason: diagnostic.assistantStopReason } : {}),
+					...(diagnostic?.errorKind ? { errorKind: diagnostic.errorKind } : {}),
+					reason: formatPromptTerminalFailureReason(diagnostic?.reason),
+				});
+			}
 			if (winner.kind === "failed") {
 				emitPromptLifecycle(correlation, {
 					type: "agent_failed",
@@ -4475,9 +4514,9 @@ export function createNotificationsExtension(
 					provenance: "agent_failed",
 				},
 				{},
-				// The normalized outcome is the ACP contract; the wire error keeps the
-				// existing sanitized discriminator so SDK clients keep branching on it.
-				{ error: sanitized },
+				// The raw reason is local-only diagnostic input. The normalized outcome
+				// and wire error retain the fixed safe token required by SDK/ACP.
+				{ error: sanitized, diagnostic: { reason: error } },
 			);
 		};
 		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
@@ -4913,7 +4952,6 @@ export function createNotificationsExtension(
 			bindPromptExecutionHandle,
 			peekPromptPendingOutcome: correlation => kindReconciliation.peekPendingOutcome(correlation),
 			terminalizePrompt: (correlation, outcome, extra) => terminalizePrompt(correlation, outcome, {}, extra),
-			recordPromptTerminal,
 			notePromptReconciliation: (correlation, frame) => {
 				void kindReconciliation.noteTransition("prompt", correlation, frame);
 			},
@@ -6321,24 +6359,23 @@ export function createNotificationsExtension(
 							: undefined;
 			// The SDK wire outcome and ACP error envelope use a fixed safe token by
 			// contract (see `sanitizePromptFailure`). Assistant failure messages may
-			// still remain in the local session transcript; this bounded operator log
-			// preserves diagnostics without widening the SDK/ACP redaction boundary.
-			// Client cancellation is intent, not a defect, so it is not logged as an error.
-			if (outcome.kind === "failed" && event.stopReason !== "cancelled") {
-				const rawReason = typeof terminalAssistant?.errorMessage === "string" ? terminalAssistant.errorMessage : "";
-				const errorKind = typeof terminalAssistant?.errorKind === "string" ? terminalAssistant.errorKind : "";
-				logger.error("sdk_prompt_terminal_failed", {
-					sessionId: id,
-					commandId: correlation.commandId,
-					turnId: correlation.turnId,
-					loopStopReason: event.stopReason ?? "none",
-					assistantStopReason: terminalAssistant?.stopReason ?? "none",
-					...(errorKind ? { errorKind } : {}),
-					reason: rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported",
-				});
-			}
+			// still remain in the local session transcript; terminalization copies only
+			// a bounded reason into the local operator log.
 			void rt.terminalizePrompt(correlation, outcome, {
 				...(finalText ? { finalText } : {}),
+				...(outcome.kind === "failed"
+					? {
+							diagnostic: {
+								reason: terminalAssistant?.errorMessage,
+								loopStopReason: event.stopReason ?? "none",
+								assistantStopReason: terminalAssistant?.stopReason ?? "none",
+								...(event.stopReason === "cancelled" ? { intentionalCancellation: true } : {}),
+								...(typeof terminalAssistant?.errorKind === "string"
+									? { errorKind: terminalAssistant.errorKind }
+									: {}),
+							},
+						}
+					: {}),
 				...(outcome.kind === "failed" && legacyCode
 					? {
 							// Only the legacy discriminator is preserved; provider text is never
