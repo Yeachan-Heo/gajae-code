@@ -116,6 +116,7 @@ interface PythonSession {
 interface InitializingPythonSession {
 	sessionId: string;
 	promise: Promise<PythonSession>;
+	cancelled?: PythonExecutionCancelledError;
 }
 
 let pythonResourceCleanupRegistered = false;
@@ -324,6 +325,10 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 		sessionId,
 		promise: Promise.resolve().then(async () => {
 			const kernel = await startKernel(cwd, options);
+			if (initializing.cancelled) {
+				await kernel.shutdown().catch(() => undefined);
+				throw initializing.cancelled;
+			}
 			const current = sessions.get(sessionId);
 			if (current !== initializing) {
 				await kernel.shutdown().catch(() => undefined);
@@ -354,7 +359,13 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 		ensurePythonResourceCleanup();
 		return session;
 	} catch (err) {
-		if (sessions.get(sessionId) === initializing) sessions.delete(sessionId);
+		if (sessions.get(sessionId) === initializing) {
+			if (isCancellationError(err)) {
+				initializing.cancelled = new PythonExecutionCancelledError(isTimedOutCancellation(err, options.signal));
+				await initializing.promise.catch(() => undefined);
+			}
+			if (sessions.get(sessionId) === initializing) sessions.delete(sessionId);
+		}
 		throw err;
 	}
 }

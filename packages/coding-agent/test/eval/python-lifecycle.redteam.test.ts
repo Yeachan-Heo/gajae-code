@@ -173,9 +173,19 @@ describe("python eval lifecycle red-team", () => {
 			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 			const unrelated = Bun.spawn(["/bin/sh", "-c", "sleep 30"], { stdout: "ignore", stderr: "ignore" });
+			const startupGate = Promise.withResolvers<void>();
+			const startupCalled = Promise.withResolvers<void>();
+			const kernelStarted = Promise.withResolvers<void>();
 			const controller = new AbortController();
 			let execution: Promise<PythonResult> | undefined;
 			try {
+				PythonKernel.start = async options => {
+					startupCalled.resolve();
+					await startupGate.promise;
+					const kernel = await originalStart(options);
+					kernelStarted.resolve();
+					return kernel;
+				};
 				const pidFile = `${tempDir.path()}/owned-child.pid`;
 				execution = executePython(`%%bash\n(sleep 30) &\nprintf '%s' "$!" > "${pidFile}"\nwait`, {
 					cwd: tempDir.path(),
@@ -183,6 +193,9 @@ describe("python eval lifecycle red-team", () => {
 					kernelMode: "session",
 					signal: controller.signal,
 				});
+				await startupCalled.promise;
+				startupGate.resolve();
+				await kernelStarted.promise;
 				const childPid = await waitForOwnedProcess(pidFile);
 				controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
 				const result = await execution;
@@ -190,14 +203,15 @@ describe("python eval lifecycle red-team", () => {
 				expect(await waitForProcessGone(childPid)).toBe(true);
 				expect(isProcessAlive(unrelated.pid)).toBe(true);
 			} finally {
+				startupGate.resolve();
+				controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
+				await execution?.catch(() => undefined);
 				try {
 					unrelated.kill("SIGKILL");
 				} catch {
 					// ignore cleanup races
 				}
 				await unrelated.exited.catch(() => undefined);
-				controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
-				await execution?.catch(() => undefined);
 			}
 		},
 		LIFECYCLE_TEST_TIMEOUT_MS,
@@ -260,21 +274,45 @@ describe("python eval lifecycle red-team", () => {
 			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 			const controller = new AbortController();
+			const startup = Promise.withResolvers<void>();
+			const startupCalled = Promise.withResolvers<void>();
+			const kernel = new FakeKernel();
+			let startupFinished = false;
+			let executionSettled = false;
+			PythonKernel.start = async () => {
+				startupCalled.resolve();
+				await startup.promise;
+				startupFinished = true;
+				return kernel as unknown as PythonKernel;
+			};
 			const execution = executePython("import time\ntime.sleep(60)", {
 				cwd: tempDir.path(),
 				sessionId: "redteam-readiness-failure-cleanup",
 				kernelMode: "session",
 				signal: controller.signal,
 			});
+			void execution.then(() => {
+				executionSettled = true;
+			});
+			await startupCalled.promise;
 			try {
 				await expect(waitForFile(`${tempDir.path()}/never-created`)).rejects.toThrow(
 					"Timed out waiting for readiness file",
 				);
 			} finally {
 				controller.abort(new DOMException("Python execution timed out", "TimeoutError"));
-				expect(await settlesWithin(execution, CLEANUP_TIMEOUT_MS)).toBe(true);
-				await execution;
+				await Bun.sleep(0);
+				expect(executionSettled).toBe(false);
+				startup.resolve();
+				const settled = await settlesWithin(execution, CLEANUP_TIMEOUT_MS);
+				try {
+					expect(settled).toBe(true);
+				} finally {
+					await execution;
+				}
 			}
+			expect(startupFinished).toBe(true);
+			expect(kernel.shutdownCalls).toBe(1);
 		},
 		LIFECYCLE_TEST_TIMEOUT_MS,
 	);
