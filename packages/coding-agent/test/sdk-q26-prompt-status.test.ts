@@ -7,6 +7,7 @@ import {
 	sanitizePromptFailure,
 } from "../src/sdk/bus/prompt-reconciliation";
 import { CursorRegistry, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
+import { formatPromptFailureForLocalLog } from "../src/sdk/prompt-failure";
 
 const correlation = (n = 1) => ({ commandId: `command-${n}`, turnId: `turn-${n}` });
 
@@ -83,6 +84,18 @@ describe("prompt reconciliation record", () => {
 			code: "ok_code-1.2",
 			message: "Prompt submission failed.",
 		});
+		const throwingCode = Object.create(null, {
+			code: {
+				get() {
+					throw new Error("code accessor failed");
+				},
+			},
+		});
+		expect(sanitizePromptFailure(throwingCode)).toEqual({ code: "internal", message: "Prompt submission failed." });
+		expect(formatPromptFailureForLocalLog(new Error("provider unavailable"))).toContain("provider unavailable");
+		const malformedError = new Error("provider unavailable");
+		Object.defineProperty(malformedError, "stack", { value: { invalid: true } });
+		expect(formatPromptFailureForLocalLog(malformedError)).toBe("provider unavailable");
 	});
 
 	it("reports unknown for a wrong commandId/turnId pair even when the commandId exists", () => {
