@@ -223,11 +223,11 @@ function capturedValue(field: FieldRead): unknown {
 
 /**
  * Serializes one already-captured value without letting a hostile sibling cost
- * the rest of the record. Returning `undefined` matches JSON's treatment of
- * unsupported object-property values.
+ * the rest of the record. Values JSON cannot represent as object properties are
+ * stringified explicitly instead of disappearing.
  */
 function serializeCapturedValue(value: unknown): string | undefined {
-	if (value === undefined || typeof value === "function" || typeof value === "symbol") return undefined;
+	if (value === undefined) return undefined;
 	try {
 		const serialized = JSON.stringify(value);
 		if (typeof serialized === "string") return serialized;
@@ -255,24 +255,19 @@ function capturePayload(reason: object, fields: Readonly<Record<ErrorField, Fiel
 	}
 
 	const entries: [string, unknown][] = [];
-	const seen = new Set(keys);
 	let hasContext = false;
 
-	for (const key of keys) {
-		if (!ERROR_FIELDS.includes(key as ErrorField)) hasContext = true;
-		const value = ERROR_FIELDS.includes(key as ErrorField)
-			? capturedValue(fields[key as ErrorField])
-			: capturedValue(readField(reason, key));
-		entries.push([key, value]);
-	}
-
-	// Error fields are often non-enumerable. When another own field makes the
-	// complete payload the useful output, append every special field that yielded
-	// information so none of the successful reads disappears.
+	// Identifying fields lead the payload so they survive when an oversized
+	// context field forces the bounded crash record to keep only its head.
 	for (const key of ERROR_FIELDS) {
-		if (seen.has(key)) continue;
 		const value = capturedValue(fields[key]);
 		if (value !== undefined) entries.push([key, value]);
+	}
+
+	for (const key of keys) {
+		if (ERROR_FIELDS.includes(key as ErrorField)) continue;
+		hasContext = true;
+		entries.push([key, capturedValue(readField(reason, key))]);
 	}
 
 	const properties: string[] = [];
@@ -288,20 +283,19 @@ function fieldText(field: FieldRead, fallback: string): string {
 	return field.kind === "value" && typeof field.value === "string" ? field.value || fallback : fallback;
 }
 
-/** A throwable reduced to plain strings; the only shape the rest of this module reads. */
+/** A throwable reduced to captured text; the rest of this module reads nothing else. */
 interface FatalDiagnostic {
 	name: string;
 	message: string;
 	stack: string;
+	payload?: string;
 }
 
 /**
  * The single read of an unknown throwable, and the only one this module has.
  *
- * There is no error-shape gate. Objects are captured first. A complete payload
- * is rendered whenever context or a non-string special field would otherwise be
- * lost; the compact error form is only used when those three strings are the
- * whole useful output.
+ * Objects always retain the named diagnostic fields independently from their
+ * optional payload. Context never replaces a readable message or stack.
  */
 function describeFatal(reason: unknown): FatalDiagnostic {
 	try {
@@ -330,22 +324,26 @@ function describeFatal(reason: unknown): FatalDiagnostic {
 			return field.kind === "unreadable" || (field.kind === "value" && typeof field.value === "string");
 		});
 
-		if (payload && (payload.hasContext || hasNonStringSpecial || !hasErrorText)) {
-			return { name: "Error", message: payload.serialized || "{}", stack: "" };
-		}
-
 		const name = fieldText(fields.name, "Error");
 		const message = fieldText(fields.message, "(no message)");
+		let stack = "";
 		if (fields.stack.kind === "unreadable") {
-			return { name, message, stack: `${name}: ${message}\n${UNREADABLE_FIELD}` };
+			stack = `${name}: ${message}\n${UNREADABLE_FIELD}`;
+		} else if (fields.stack.kind === "value" && typeof fields.stack.value === "string") {
+			stack = fields.stack.value.includes("\n") ? fields.stack.value : `${name}: ${message}\n${fields.stack.value}`;
 		}
-		if (fields.stack.kind === "value" && typeof fields.stack.value === "string") {
-			const stack = fields.stack.value.includes("\n")
-				? fields.stack.value
-				: `${name}: ${message}\n${fields.stack.value}`;
-			return { name, message, stack };
-		}
-		return { name, message, stack: "" };
+
+		const renderedPayload =
+			payload && (payload.hasContext || hasNonStringSpecial || !hasErrorText)
+				? payload.serialized || "{}"
+				: undefined;
+		const payloadIsMessage = !hasErrorText && renderedPayload !== undefined;
+		return {
+			name: payloadIsMessage ? "Error" : name,
+			message: payloadIsMessage ? renderedPayload : message,
+			stack,
+			payload: payloadIsMessage ? undefined : renderedPayload,
+		};
 	} catch {
 		return { name: "Error", message: UNREADABLE_THROWABLE, stack: "" };
 	}
@@ -367,7 +365,8 @@ let inspectorOpened = false;
 function formatFatalError(label: string, fatal: FatalDiagnostic): string {
 	const stackLines = fatal.stack.split("\n").slice(1);
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
-	return `\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}\n`;
+	const formattedPayload = fatal.payload ? `\n${fatal.payload}` : "";
+	return `\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}${formattedPayload}\n`;
 }
 /** Cap for the durable crash log; it is reset past this so a crash loop cannot fill the disk. */
 export const CRASH_LOG_MAX_BYTES = 512 * 1024;
@@ -457,10 +456,12 @@ function writeCrashRecord(
 	try {
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
+		const payload = fatal.payload ? `${redactCrashSecrets(fatal.payload)}\n` : "";
 		const report = boundCrashRecord(
 			`${now.toISOString()} pid=${process.pid} [${label}] ` +
 				`${fatal.name}: ${redactCrashSecrets(fatal.message)}\n` +
-				`${redactCrashSecrets(fatal.stack)}\n\n`,
+				`${redactCrashSecrets(fatal.stack)}\n` +
+				`${payload}\n`,
 		);
 		fs.mkdirSync(path.dirname(target), { recursive: true });
 		let existingSize = 0;

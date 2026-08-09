@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
 import { recordFatalCrash } from "../src/postmortem";
+import { NonZeroExitError } from "../src/ptree";
 
 /**
  * The crash reader is the only place this module turns an unknown throwable
@@ -31,6 +32,15 @@ function errorRefusing(fields: readonly ("name" | "message" | "stack")[]): Error
 	error.name = "LazyFailure";
 	for (const field of fields) Object.defineProperty(error, field, refusingAccessor(field));
 	return error;
+}
+
+function missingFileError(): unknown {
+	try {
+		fs.readFileSync("/definitely/not/here");
+	} catch (error) {
+		return error;
+	}
+	throw new Error("missing-file probe unexpectedly succeeded");
 }
 
 interface Throwables {
@@ -113,11 +123,30 @@ const throwables: readonly Throwables[] = [
 		keeps: ["Error: cross-realm boom", "CrossRealmStack"],
 	},
 	{
+		what: "Node system error with enumerable context and a real stack",
+		build: missingFileError,
+		keeps: ["ENOENT", '"code":"ENOENT"', "/definitely/not/here", "postmortem-unreadable-throwables.test.ts"],
+	},
+	{
+		what: "NonZeroExitError with own fields and a load-bearing stack",
+		build: () => {
+			const error = new NonZeroExitError(7, "child stderr survives");
+			error.stack = `${error.name}: ${error.message}\n    at load-bearing-nonzero-frame`;
+			return error;
+		},
+		keeps: [
+			"NonZeroExitError: Process exited with code 7:",
+			"load-bearing-nonzero-frame",
+			'"exitCode":7',
+			'"stderr":"child stderr survives"',
+		],
+	},
+	{
 		what: "plain record thrown instead of an Error",
 		build: () => ({ phase: "startup", reason: "broker-spawn", message: "record fatal" }),
 		// No `name`, so this is payload rather than an error shape: the whole
 		// record is kept instead of collapsing to `[object Object]`.
-		keeps: ['{"phase":"startup","reason":"broker-spawn","message":"record fatal"}'],
+		keeps: ['{"message":"record fatal","phase":"startup","reason":"broker-spawn"}'],
 	},
 	{
 		what: "plain record carrying a readable stack and crash context",
@@ -127,7 +156,7 @@ const throwables: readonly Throwables[] = [
 			exitCode: 7,
 			stack: "at spawnBroker (broker.ts:1:1)",
 		}),
-		keeps: ['{"phase":"startup","reason":"broker-spawn","exitCode":7,"stack":"at spawnBroker (broker.ts:1:1)"}'],
+		keeps: ['{"stack":"at spawnBroker (broker.ts:1:1)","phase":"startup","reason":"broker-spawn","exitCode":7}'],
 	},
 	{
 		what: "named error record carrying HTTP response context",
@@ -166,6 +195,31 @@ const throwables: readonly Throwables[] = [
 			after: () => expect(reads).toEqual(["name", "message", "stack"]),
 		};
 	})(),
+	{
+		what: "Error with an oversized own field",
+		build: () => Object.assign(new Error("upstream refused the connection"), { body: "X".repeat(70_000) }),
+		keeps: [
+			"upstream refused the connection",
+			"postmortem-unreadable-throwables.test.ts",
+			"[crash record truncated]",
+		],
+		after: contents => {
+			const body = contents.indexOf('"body"');
+			expect(contents.indexOf('"name"')).toBeLessThan(body);
+			expect(contents.indexOf('"message"')).toBeLessThan(body);
+			expect(contents.indexOf('"stack"')).toBeLessThan(body);
+		},
+	},
+	{
+		what: "record whose symbol message must not disappear",
+		build: () => ({ message: Symbol("lost") }),
+		keeps: ['{"message":"Symbol(lost)"}'],
+	},
+	{
+		what: "record whose function message must not disappear",
+		build: () => ({ message: () => "x" }),
+		keeps: ['{"message":"() => \\"x\\""}'],
+	},
 	{
 		what: "thrown string primitive",
 		build: () => "plain string boom",
