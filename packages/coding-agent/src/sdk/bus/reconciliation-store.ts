@@ -12,6 +12,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
+import { TURN_RESULT_CONTENT_MAX_BYTES, type TurnResultContent } from "../turn-result";
+
 import type { PromptCorrelation } from "./prompt-reconciliation";
 
 export const RECONCILIATION_STORE_VERSION = 1;
@@ -32,6 +34,7 @@ export interface DurableReconciliationRecord extends PromptCorrelation {
 	pendingOutcome?: SdkPromptTerminalOutcome;
 	/** Skill-only safe token; never skill args bodies. */
 	skillName?: string;
+	content?: TurnResultContent;
 }
 
 export interface ReconciliationStoreDocument {
@@ -111,6 +114,19 @@ function isValidRecord(value: unknown): boolean {
 	if (value.error !== undefined) {
 		if (!isRecord(value.error)) return false;
 		if (typeof value.error.code !== "string" || typeof value.error.message !== "string") return false;
+	}
+	if (value.content !== undefined) {
+		if (
+			!isRecord(value.content) ||
+			value.content.version !== 1 ||
+			value.content.type !== "text" ||
+			typeof value.content.text !== "string" ||
+			typeof value.content.byteLength !== "number" ||
+			typeof value.content.truncated !== "boolean" ||
+			new TextEncoder().encode(value.content.text).length !== value.content.byteLength ||
+			value.content.byteLength > TURN_RESULT_CONTENT_MAX_BYTES
+		)
+			return false;
 	}
 	return [outcome, pendingOutcome].every(candidate => {
 		if (candidate === undefined) return true;

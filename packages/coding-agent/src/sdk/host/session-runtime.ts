@@ -270,6 +270,7 @@ export interface InvocationReconciliation {
 		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
 	): Promise<void>;
 	lookup(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
+	lookupResult(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
 	hydrate(): Promise<void>;
 }
 
@@ -473,6 +474,10 @@ export function createInvocationReconciliation(
 				...(record.error === undefined ? {} : { error: record.error }),
 			};
 		},
+		lookupResult(kind, selector) {
+			const result = this.lookup(kind, selector) as Record<string, unknown>;
+			return result.status === "unknown" ? result : { kind, ...result };
+		},
 		hydrate,
 	};
 }
@@ -487,8 +492,12 @@ export interface SdkSurfaceFactoryOptions {
 	configOverrides?: ReadonlyMap<string, unknown>;
 	/** Session settings; used for model-usage preferences in profile-limit resolution. */
 	settings?: Settings;
-	promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
-	skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+	turnResultLookup?: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown;
 	hostTools?: boolean | (() => boolean);
 	/** Q30 event-ring watermark source (the live session event stream); synchronous. */
 	getEventWatermark?: () => { generation: number; seq: number };
@@ -513,8 +522,12 @@ function createQuerySurface(
 		configOverrides?: ReadonlyMap<string, unknown>;
 		/** Session settings; used for model-usage preferences in profile-limit resolution. */
 		settings?: Settings;
-		promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
-		skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+		turnResultLookup?: (selector: {
+			kind: "prompt" | "skill";
+			commandId?: string;
+			turnId?: string;
+			clientRef?: string;
+		}) => unknown;
 		hostTools?: boolean | (() => boolean);
 		/** Q30 event-ring watermark source (the live session event stream); synchronous. */
 		getEventWatermark?: () => { generation: number; seq: number };
@@ -782,9 +795,15 @@ function createQuerySurface(
 		getArtifactRange: (artifactId, offset, length) => ctx.getArtifactRange?.(artifactId, offset, length),
 		getJobs: () => ctx.getJobs(),
 		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			(options.promptStatusLookup ?? (value => reconciliation.lookup("prompt", value)))(selector),
+			reconciliation.lookup("prompt", selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			(options.skillStatusLookup ?? (value => reconciliation.lookup("skill", value)))(selector),
+			reconciliation.lookup("skill", selector),
+		getTurnResult: (selector: {
+			kind: "prompt" | "skill";
+			commandId?: string;
+			turnId?: string;
+			clientRef?: string;
+		}) => (options.turnResultLookup ?? (value => reconciliation.lookupResult(value.kind, value)))(selector),
 		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
 			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
@@ -845,8 +864,7 @@ export function createSdkSurfaceFactory(
 		getLiveState: options.getLiveState,
 		configOverrides: options.configOverrides,
 		settings: options.settings,
-		promptStatusLookup: options.promptStatusLookup,
-		skillStatusLookup: options.skillStatusLookup,
+		turnResultLookup: options.turnResultLookup,
 		hostTools: options.hostTools,
 		getEventWatermark: options.getEventWatermark,
 	});
@@ -1039,7 +1057,7 @@ function createControlSurface(
 		run: (options: {
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
-		}) => Promise<void>,
+		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
 		allowCompletionFallback = false,
 	): Promise<unknown> => {
@@ -1071,9 +1089,15 @@ function createControlSurface(
 				}),
 			);
 			void submission.then(
-				() => {
+				result => {
 					if (settled) {
-						if (kind === "skill") void reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
+						if (kind === "skill")
+							void reconciliation.noteTransition(kind, correlation, {
+								type: "agent_end",
+								...(typeof result === "string"
+									? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
+									: {}),
+							});
 						return;
 					}
 					if (allowCompletionFallback) {
@@ -1168,7 +1192,7 @@ function createControlSurface(
 						onSkillPrepared: meta => {
 							prepared = meta;
 						},
-					}).then(() => undefined),
+					}).then(result => result),
 				() => ({
 					name: prepared?.name ?? String(name),
 					path: prepared?.path ?? "",
@@ -1413,8 +1437,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			id: sessionId,
 			api,
 			reconciliation,
-			promptStatusLookup: selector => reconciliation.lookup("prompt", selector),
-			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
+			turnResultLookup: selector => reconciliation.lookupResult(selector.kind, selector),
 			configOverrides: options.configOverrides,
 			settings: options.settings,
 			getEventWatermark: () => eventWatermarkSource(),

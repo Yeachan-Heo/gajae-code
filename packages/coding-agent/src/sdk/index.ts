@@ -25,3 +25,4 @@ export * from "./prompt-status";
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
 export * from "./session";
 export * from "./session-directory";
+export * from "./turn-result";

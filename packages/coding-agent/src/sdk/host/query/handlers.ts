@@ -55,6 +55,12 @@ export interface SessionSurface {
 		turnId?: string;
 		clientRef?: string;
 	}): unknown | Promise<unknown>;
+	getTurnResult?(selector: {
+		kind: "prompt" | "skill";
+		clientRef?: string;
+		commandId?: string;
+		turnId?: string;
+	}): unknown | Promise<unknown>;
 	/** Q27 effective model-profile catalog from the live session registry. */
 	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/**
@@ -167,7 +173,7 @@ const names = [
 	"resource.body",
 	"artifact.read",
 	"runtime.jobs.list",
-	"turn.prompt_status",
+	"turn.result",
 	"models.profiles.list",
 	"skill.invoke_status",
 	"providers.list/active",
@@ -183,11 +189,35 @@ export class QueryHandlers {
 	) {}
 	async dispatch(request: QueryRequest): Promise<QueryResponse> {
 		try {
+			if (request.query === "turn.result") {
+				if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("turn.result"))
+					return this.#error(
+						request,
+						"operation_not_session_owned",
+						false,
+						"turn.result is not installed for this session.",
+					);
+				return await this.#turnResult(request);
+			}
+			if (request.query === "turn.prompt_status") return await this.#promptTurnResult(request);
+			if (request.query === "skill.invoke_status") return await this.#skillTurnResult(request);
+
 			const query = request.query.startsWith("Q")
 				? request.query
 				: request.query === "models.list" || request.query === "models.current"
 					? "Q10"
 					: `Q${String(names.indexOf(request.query) + 1).padStart(2, "0")}`;
+			if (query === "Q26") {
+				if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("turn.result"))
+					return this.#error(
+						request,
+						"operation_not_session_owned",
+						false,
+						"turn.result is not installed for this session.",
+					);
+				return await this.#turnResult(request);
+			}
+			if (query === "Q28") return await this.#skillTurnResult(request);
 			if (
 				this.surface.installedQueries instanceof Set &&
 				!this.surface.installedQueries.has(names[Number(query.slice(1)) - 1] ?? "")
@@ -220,8 +250,6 @@ export class QueryHandlers {
 			}
 			if (query === "Q02") return await this.#transcriptBody(request);
 			if (query === "Q23") return await this.#resourceBody(request);
-			if (query === "Q26") return await this.#promptStatus(request);
-			if (query === "Q28") return await this.#skillInvokeStatus(request);
 			if (query === "Q24") return await this.#artifact(request);
 			if (query === "Q30") return await this.#checkpoint(request);
 			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
@@ -532,6 +560,35 @@ export class QueryHandlers {
 		if (!range) return this.#error(request, "resource_gone");
 		return this.#chunkRange(request, "transcript", "default", revision, range, selector, { entryId, highWatermark });
 	}
+	async #turnResult(request: QueryRequest): Promise<QueryResponse> {
+		const input = request.input ?? {};
+		const keys = Object.keys(input);
+		const kind = input.kind;
+		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
+		const clientRef = rawClientRef?.trim();
+		const hasClient = clientRef !== undefined;
+		const hasPair = typeof input.commandId === "string" && typeof input.turnId === "string";
+		if (
+			(kind !== "prompt" && kind !== "skill") ||
+			hasClient === hasPair ||
+			keys.some(k => !["kind", "clientRef", "commandId", "turnId"].includes(k)) ||
+			(hasClient && (!clientRef || clientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH || keys.length !== 2)) ||
+			(hasPair && (!input.commandId || !input.turnId || keys.length !== 3))
+		)
+			return this.#error(request, "invalid_request", false, "turn.result requires kind and exactly one selector");
+		// Turn results carry bounded content (≤ TURN_RESULT_CONTENT_MAX_BYTES, 16 KiB)
+		// and fit inline within a single query response. Cursored continuation is
+		// unreachable: the bounded content cap is well under both RESPONSE_CEILING_BYTES
+		// and TARGET_PAGE_BYTES, so no revision is ever created. Reject cursors
+		// upfront instead of advertising a continuation path that can never fire.
+		if (request.cursor) return this.#error(request, "invalid_cursor", false, "turn.result does not support cursors.");
+		if (typeof this.surface.getTurnResult !== "function") return this.#error(request, "unavailable");
+		const result = await this.surface.getTurnResult({
+			kind,
+			...(hasClient ? { clientRef } : { commandId: input.commandId as string, turnId: input.turnId as string }),
+		});
+		return { id: request.id, ok: true, result };
+	}
 
 	async #resourceBody(request: QueryRequest): Promise<QueryResponse> {
 		let selector = selectorFor("Q23", request.input);
@@ -566,6 +623,32 @@ export class QueryHandlers {
 		});
 	}
 
+	async #promptTurnResult(request: QueryRequest): Promise<QueryResponse> {
+		if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("turn.result"))
+			return this.#error(
+				request,
+				"operation_not_session_owned",
+				false,
+				"turn.result is not installed for this session.",
+			);
+		const input = request.input ?? {};
+		if (input.kind !== undefined && input.kind !== "prompt")
+			return this.#error(request, "invalid_request", false, "turn.prompt_status only accepts prompt selectors.");
+		return await this.#turnResult({ ...request, input: { ...input, kind: "prompt" } });
+	}
+	async #skillTurnResult(request: QueryRequest): Promise<QueryResponse> {
+		if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("skill.invoke_status"))
+			return this.#error(
+				request,
+				"operation_not_session_owned",
+				false,
+				"skill.invoke_status is not installed for this session.",
+			);
+		const input = request.input ?? {};
+		if (input.kind !== undefined && input.kind !== "skill")
+			return this.#error(request, "invalid_request", false, "skill.invoke_status only accepts skill selectors.");
+		return await this.#turnResult({ ...request, input: { ...input, kind: "skill" } });
+	}
 	async #artifact(request: QueryRequest): Promise<QueryResponse> {
 		const input = request.input ?? {};
 		const artifactId = String(input.artifactId ?? "");
@@ -696,102 +779,6 @@ export class QueryHandlers {
 		return { id: request.id, ok: true, page };
 	}
 
-	async #skillInvokeStatus(request: QueryRequest): Promise<QueryResponse> {
-		if (request.cursor)
-			return this.#error(request, "invalid_request", false, "skill.invoke_status does not support cursors.");
-		const input = request.input ?? {};
-		for (const key of Object.keys(input))
-			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
-				return this.#error(
-					request,
-					"invalid_request",
-					false,
-					`skill.invoke_status does not accept selector field "${key}".`,
-				);
-		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
-		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
-		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
-		const trimmedClientRef = rawClientRef?.trim();
-		if (rawClientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"clientRef must be a non-empty string of at most 128 characters.",
-			);
-		const clientRef = trimmedClientRef || undefined;
-		if ((commandId === undefined) !== (turnId === undefined))
-			return this.#error(request, "invalid_request", false, "commandId and turnId must be provided together.");
-		if (commandId !== undefined && clientRef !== undefined)
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"Provide exactly one selector: a commandId/turnId pair or a clientRef.",
-			);
-		if (commandId === undefined && clientRef === undefined)
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"skill.invoke_status requires a commandId/turnId pair or a clientRef.",
-			);
-		if (typeof this.surface.getSkillInvokeStatus !== "function")
-			return this.#error(request, "unavailable", false, "skill.invoke_status is unavailable for this session.");
-		const result = await this.surface.getSkillInvokeStatus(
-			clientRef !== undefined ? { clientRef } : { commandId: commandId!, turnId: turnId! },
-		);
-		return { id: request.id, ok: true, result };
-	}
-
-	async #promptStatus(request: QueryRequest): Promise<QueryResponse> {
-		if (request.cursor)
-			return this.#error(request, "invalid_request", false, "turn.prompt_status does not support cursors.");
-		const input = request.input ?? {};
-		for (const key of Object.keys(input))
-			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
-				return this.#error(
-					request,
-					"invalid_request",
-					false,
-					`turn.prompt_status does not accept selector field "${key}".`,
-				);
-		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
-		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
-		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
-		const trimmedClientRef = rawClientRef?.trim();
-		if (rawClientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"clientRef must be a non-empty string of at most 128 characters.",
-			);
-		const clientRef = trimmedClientRef || undefined;
-		if ((commandId === undefined) !== (turnId === undefined))
-			return this.#error(request, "invalid_request", false, "commandId and turnId must be provided together.");
-		if (commandId !== undefined && clientRef !== undefined)
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"Provide exactly one selector: a commandId/turnId pair or a clientRef.",
-			);
-		if (commandId === undefined && clientRef === undefined)
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"turn.prompt_status requires a commandId/turnId pair or a clientRef.",
-			);
-		if (typeof this.surface.getPromptStatus !== "function")
-			return this.#error(request, "unavailable", false, "turn.prompt_status is unavailable for this session.");
-		const result = await this.surface.getPromptStatus(
-			clientRef !== undefined ? { clientRef } : { commandId: commandId!, turnId: turnId! },
-		);
-		return { id: request.id, ok: true, result };
-	}
-
 	#error(request: QueryRequest, code: string, restartQuery = false, message = code, details?: unknown): QueryResponse {
 		return {
 			id: request.id,
@@ -802,7 +789,19 @@ export class QueryHandlers {
 }
 function selectorFor(queryId: string, input: Record<string, unknown> | undefined): CursorSelector {
 	const selector: CursorSelector = { queryId };
-	for (const key of ["entryId", "field", "fileId", "hunkId", "resourceKind", "resourceId", "itemId"] as const)
+	for (const key of [
+		"entryId",
+		"field",
+		"fileId",
+		"hunkId",
+		"resourceKind",
+		"resourceId",
+		"itemId",
+		"kind",
+		"clientRef",
+		"commandId",
+		"turnId",
+	] as const)
 		if (input?.[key] !== undefined) selector[key] = String(input[key]);
 	return selector;
 }

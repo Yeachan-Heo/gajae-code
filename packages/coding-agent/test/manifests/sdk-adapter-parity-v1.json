@@ -8365,7 +8365,7 @@
 		},
 		{
 			"adapterTestId": "AD-T-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "telegram",
 			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8381,7 +8381,7 @@
 		},
 		{
 			"adapterTestId": "AD-D-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "discord",
 			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8397,7 +8397,7 @@
 		},
 		{
 			"adapterTestId": "AD-S-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "slack",
 			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8413,7 +8413,7 @@
 		},
 		{
 			"adapterTestId": "AD-M-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8429,7 +8429,7 @@
 		},
 		{
 			"adapterTestId": "AD-A-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "acp",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8445,7 +8445,7 @@
 		},
 		{
 			"adapterTestId": "AD-L-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",

@@ -116,8 +116,7 @@ import {
 } from "../sdk/bus/config";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
-import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
-import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
+
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
@@ -2119,7 +2118,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true);
 		const notificationAdapterService = createLazyService({
 			id: "sdk.notifications.adapters",
-			enabled: () => notificationsExtensionEligible,
+			enabled: () => notificationsExtensionEligible || sdkHostEligible,
 			initialize: async () => ({
 				value: (await import("../sdk/bus")).createNotificationsExtension,
 			}),
@@ -2130,7 +2129,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
-					if (notificationsExtensionEligible) {
+					if (notificationsExtensionEligible || sdkHostEligible) {
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
 							settings,
@@ -2147,15 +2146,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								});
 								return { replyText };
 							},
-						});
-					} else if (sdkHostEligible) {
-						registerSdkOnlyNotificationCommand(api);
-						createSdkSessionRuntimeExtension(api, {
-							agentDir,
-							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
-							createTransport: input => createSdkWebSocketTransport(input),
-							settings,
-							configOverrides: new Map(),
 						});
 					}
 				} catch (error) {

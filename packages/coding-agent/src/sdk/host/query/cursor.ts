@@ -32,6 +32,10 @@ export interface CursorSelector {
 	resourceKind?: string;
 	resourceId?: string;
 	itemId?: string;
+	kind?: string;
+	clientRef?: string;
+	commandId?: string;
+	turnId?: string;
 }
 
 export interface CursorPosition {

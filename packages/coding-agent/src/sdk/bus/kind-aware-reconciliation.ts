@@ -5,6 +5,8 @@
 
 import { sanitizePromptFailure } from "../prompt-failure";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome, TurnPromptReconciliation } from "../prompt-status";
+import { sanitizeTurnResultContent, type TurnResultContent, type TurnResultPage } from "../turn-result";
+
 import {
 	PROMPT_RECONCILIATION_ACTIVE_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_CAPACITY,
@@ -17,6 +19,7 @@ export type { ReconciliationKind };
 
 export interface KindCorrelation extends PromptCorrelation {
 	kind: ReconciliationKind;
+	content?: TurnResultContent;
 }
 
 export interface KindAwareReconciliation {
@@ -31,7 +34,9 @@ export interface KindAwareReconciliation {
 	noteTransition(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation | undefined,
-		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+		frame:
+			| { type: "agent_start" | "agent_end"; content?: TurnResultContent }
+			| { type: "agent_failed"; error: unknown; content?: TurnResultContent },
 	): Promise<void>;
 	claimPendingOutcome(
 		correlation: PromptCorrelation,
@@ -41,12 +46,17 @@ export interface KindAwareReconciliation {
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
 		recordError?: { code: string; message: string },
+		content?: unknown,
 	): Promise<void>;
 	peekPendingOutcome(correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
 	lookup(
 		kind: ReconciliationKind,
 		selector: { commandId?: string; turnId?: string; clientRef?: string },
 	): TurnPromptReconciliation;
+	lookupResult(
+		kind: ReconciliationKind,
+		selector: { commandId?: string; turnId?: string; clientRef?: string },
+	): TurnResultPage;
 	cleanup(): void;
 	activeCount(kind: ReconciliationKind): number;
 	/** Hydrate from durable store (call once at session host start). */
@@ -190,7 +200,9 @@ export function createKindAwareReconciliation(
 	const noteTransition = async (
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation | undefined,
-		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+		frame:
+			| { type: "agent_start" | "agent_end"; content?: TurnResultContent }
+			| { type: "agent_failed"; error: unknown; content?: TurnResultContent },
 	) => {
 		if (!correlation) return;
 		await queueMutation(candidate => {
@@ -214,9 +226,13 @@ export function createKindAwareReconciliation(
 				if (record.status !== "accepted") return { value: undefined, changed: false };
 				record.status = "in_flight";
 				record.startedAt = now();
+				if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
+
 				return { value: undefined, changed: true };
 			}
 			record.terminalAt = now();
+			if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
+
 			if (frame.type === "agent_failed") {
 				record.status = "failed";
 				record.error = sanitizePromptFailure(frame.error);
@@ -243,6 +259,7 @@ export function createKindAwareReconciliation(
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
 		recordError?: { code: string; message: string },
+		content?: unknown,
 	) => {
 		await queueMutation(candidate => {
 			const record = candidate.get(keyOf("prompt", correlation));
@@ -254,6 +271,7 @@ export function createKindAwareReconciliation(
 				record.status = "failed";
 				record.error = recordError ?? { code: finalOutcome.code, message: finalOutcome.message };
 			} else record.status = "terminal_ok";
+			record.content = sanitizeTurnResultContent(content);
 			record.outcome = finalOutcome;
 			record.pendingOutcome = undefined;
 			cleanupRecords(candidate);
@@ -301,6 +319,37 @@ export function createKindAwareReconciliation(
 		return { status: "failed", ...terminal, error: record.error ?? sanitizePromptFailure(undefined) };
 	};
 
+	const lookupResult = (
+		kind: ReconciliationKind,
+		selector: { commandId?: string; turnId?: string; clientRef?: string },
+	): TurnResultPage => {
+		cleanup();
+		const key =
+			selector.clientRef !== undefined
+				? clientRefIndex.get(refKey(kind, selector.clientRef))
+				: selector.commandId !== undefined && selector.turnId !== undefined
+					? keyOf(kind, { commandId: selector.commandId, turnId: selector.turnId })
+					: undefined;
+		const record = key === undefined ? undefined : records.get(key);
+		if (!record) return { status: "unknown" };
+		const identity = {
+			kind: record.kind,
+			commandId: record.commandId,
+			turnId: record.turnId,
+			...(record.clientRef !== undefined ? { clientRef: record.clientRef } : {}),
+			acceptedAt: record.acceptedAt,
+		};
+		if (record.status === "accepted") return { status: "accepted", ...identity };
+		if (record.status === "in_flight") return { status: "in_flight", ...identity, startedAt: record.startedAt };
+		const terminal = {
+			...identity,
+			...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+			terminalAt: record.terminalAt as number,
+			...(record.content !== undefined ? { content: record.content } : {}),
+		};
+		if (record.status === "terminal_ok") return { status: "terminal_ok", ...terminal };
+		return { status: "failed", ...terminal, error: record.error ?? sanitizePromptFailure(undefined) };
+	};
 	const hydrateFromStore = async () => {
 		if (!store) return;
 		const run = async () => {
@@ -328,6 +377,7 @@ export function createKindAwareReconciliation(
 		finalizePromptOutcome,
 		peekPendingOutcome,
 		lookup,
+		lookupResult,
 		cleanup,
 		activeCount,
 		hydrateFromStore,

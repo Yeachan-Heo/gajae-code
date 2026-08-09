@@ -155,15 +155,10 @@ const queries = [
 	["resource.body", "Read a bounded resource continuation."],
 	["artifact.read", "Read a bounded artifact range."],
 	["runtime.jobs.list", "List managed jobs."],
-	[
-		"turn.prompt_status",
-		"Read the authoritative reconciliation status of a submitted prompt by command/turn IDs or clientRef.",
-	],
+	["turn.result", "Read the authoritative durable result of a submitted turn by command/turn IDs or clientRef."],
 	["models.profiles.list", "List the effective built-in and configured model profiles for this session."],
-	[
-		"skill.invoke_status",
-		"Read the authoritative reconciliation status of a skill.invoke by command/turn IDs or clientRef.",
-	],
+	["skill.invoke_status", "Legacy alias for the authoritative turn result query."],
+
 	["providers.list/active", "List active providers."],
 	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
 ] as const;
@@ -240,6 +235,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 	if (["Q01", "Q02"].includes(id)) return "stable_prefix";
 	if (["Q04", "Q05", "Q06", "Q07", "Q08", "Q11", "Q12", "Q13", "Q20", "Q21", "Q22", "Q23", "Q27", "Q30"].includes(id))
 		return "retained_revision";
+
 	if (id === "Q24") return "content_addressed";
 	return "scalar_snapshot";
 }
@@ -306,10 +302,10 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: "idempotent" as const,
 			errorCodes:
-				id === "Q27"
-					? ["invalid_request", "resource_gone", "model_profile_registry_error"]
-					: id === "Q29"
-						? ["invalid_request", "resource_gone", "internal"]
+				id === "Q29"
+					? ["invalid_request", "resource_gone", "internal"]
+					: id === "Q27"
+						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
 						: ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
 			adapterDispositions: queryDisposition(id),

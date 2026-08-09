@@ -340,7 +340,14 @@ describe("prompt reconciliation record", () => {
 	});
 });
 
-function surface(getPromptStatus?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown) {
+function surface(
+	getTurnResult?: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown,
+) {
 	return {
 		getTranscriptEntries: () => [],
 		getContextSnapshot: () => ({}),
@@ -362,50 +369,75 @@ function surface(getPromptStatus?: (selector: { commandId?: string; turnId?: str
 		getQueueMessages: () => [],
 		getExtensions: () => [],
 		getJobs: () => [],
-		...(getPromptStatus ? { getPromptStatus } : {}),
+		...(getTurnResult ? { getTurnResult } : {}),
 	};
 }
 
 function handlers(
-	getPromptStatus?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
+	getTurnResult?: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown,
 ) {
 	const store = new RevisionStore("s1");
 	const cursors = new CursorRegistry("token", store);
-	return new QueryHandlers(surface(getPromptStatus) as never, "s1", store, cursors);
+	return new QueryHandlers(surface(getTurnResult) as never, "s1", store, cursors);
 }
 
-describe("Q26 turn.prompt_status query handler", () => {
-	it("resolves by commandId/turnId pair and returns the surface result", async () => {
+describe("turn.result query handler and retained aliases", () => {
+	it("delegates the prompt alias with an injected prompt kind", async () => {
 		const seen: unknown[] = [];
 		const h = handlers(selector => {
 			seen.push(selector);
-			return { status: "in_flight", commandId: "c1", turnId: "t1", acceptedAt: 1, startedAt: 2 };
+			return { kind: "prompt", status: "in_flight", commandId: "c1", turnId: "t1", acceptedAt: 1, startedAt: 2 };
 		});
 		const response = await h.dispatch({
 			query: "turn.prompt_status",
 			input: { commandId: "c1", turnId: "t1" },
 			connectionId: "c",
 		});
-		expect(response).toMatchObject({ ok: true, result: { status: "in_flight" } });
-		expect(seen).toEqual([{ commandId: "c1", turnId: "t1" }]);
+		expect(response).toMatchObject({ ok: true, result: { kind: "prompt", status: "in_flight" } });
+		expect(seen).toEqual([{ kind: "prompt", commandId: "c1", turnId: "t1" }]);
 	});
 
-	it("resolves by clientRef and by the Q26 numeric alias", async () => {
+	it("requires kind on the canonical Q26 query", async () => {
 		const seen: unknown[] = [];
 		const h = handlers(selector => {
 			seen.push(selector);
-			return { status: "accepted", commandId: "c1", turnId: "t1", clientRef: "ref-1", acceptedAt: 1 };
+			return {
+				kind: "prompt",
+				status: "accepted",
+				commandId: "c1",
+				turnId: "t1",
+				clientRef: "ref-1",
+				acceptedAt: 1,
+			};
 		});
-		const response = await h.dispatch({ query: "Q26", input: { clientRef: "ref-1" }, connectionId: "c" });
-		expect(response).toMatchObject({ ok: true, result: { status: "accepted", clientRef: "ref-1" } });
-		expect(seen).toEqual([{ clientRef: "ref-1" }]);
+		const missingKind = await h.dispatch({ query: "Q26", input: { clientRef: "ref-1" }, connectionId: "c" });
+		expect(missingKind).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+		const response = await h.dispatch({
+			query: "Q26",
+			input: { kind: "prompt", clientRef: "ref-1" },
+			connectionId: "c",
+		});
+		expect(response).toMatchObject({ ok: true, result: { kind: "prompt", status: "accepted", clientRef: "ref-1" } });
+		expect(seen).toEqual([{ kind: "prompt", clientRef: "ref-1" }]);
 	});
 
-	it("normalizes a padded clientRef selector before lookup", async () => {
+	it("normalizes a padded clientRef before alias delegation", async () => {
 		const seen: unknown[] = [];
 		const h = handlers(selector => {
 			seen.push(selector);
-			return { status: "accepted", commandId: "c1", turnId: "t1", clientRef: "ref-1", acceptedAt: 1 };
+			return {
+				kind: "prompt",
+				status: "accepted",
+				commandId: "c1",
+				turnId: "t1",
+				clientRef: "ref-1",
+				acceptedAt: 1,
+			};
 		});
 		const response = await h.dispatch({
 			query: "turn.prompt_status",
@@ -413,7 +445,7 @@ describe("Q26 turn.prompt_status query handler", () => {
 			connectionId: "c",
 		});
 		expect(response.ok).toBe(true);
-		expect(seen).toEqual([{ clientRef: "ref-1" }]);
+		expect(seen).toEqual([{ kind: "prompt", clientRef: "ref-1" }]);
 	});
 
 	it("rejects a partial commandId/turnId pair", async () => {
@@ -441,7 +473,7 @@ describe("Q26 turn.prompt_status query handler", () => {
 		}
 	});
 
-	it("prohibits cursors on the keyed lookup", async () => {
+	it("rejects cursors as unreachable continuation", async () => {
 		const h = handlers(() => ({}));
 		const response = await h.dispatch({
 			query: "turn.prompt_status",
@@ -449,7 +481,7 @@ describe("Q26 turn.prompt_status query handler", () => {
 			cursor: "any-cursor",
 			connectionId: "c",
 		});
-		expect(response).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
 	});
 
 	it("gates on installedQueries", async () => {

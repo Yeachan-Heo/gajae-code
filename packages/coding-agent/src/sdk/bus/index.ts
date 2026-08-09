@@ -2293,12 +2293,12 @@ function sdkQuerySurface(
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
 	settings: Settings | undefined = undefined,
-	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
-		status: "unknown",
-	}),
-	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
-		status: "unknown",
-	}),
+	turnResultLookup: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown = () => ({ status: "unknown" }),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2308,8 +2308,7 @@ function sdkQuerySurface(
 		getLiveState,
 		configOverrides,
 		settings,
-		promptStatusLookup,
-		skillStatusLookup,
+		turnResultLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 	}).query;
 }
@@ -2945,7 +2944,12 @@ function sdkControlSurface(
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
 					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_end" });
+						void skillRecon.noteTransition(correlation, {
+							type: "agent_end",
+							...(typeof result === "string"
+								? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
+								: {}),
+						});
 					}
 					return result;
 				},
@@ -4172,8 +4176,6 @@ export function createNotificationsExtension(
 		) => {
 			await kindReconciliation.noteAccepted("prompt", correlation, clientRef);
 		};
-		const lookupPromptStatus = (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			kindReconciliation.lookup("prompt", selector);
 		const releasePromptAdmission = (clientRef?: string) => kindReconciliation.releaseAdmission("prompt", clientRef);
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
@@ -4491,7 +4493,7 @@ export function createNotificationsExtension(
 				}
 			}
 			try {
-				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error);
+				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error, extra?.finalText);
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
@@ -4609,8 +4611,7 @@ export function createNotificationsExtension(
 				},
 				configOverrides,
 				settings,
-				lookupPromptStatus,
-				selector => kindReconciliation.lookup("skill", selector),
+				selector => kindReconciliation.lookupResult(selector.kind, selector),
 			),
 			id,
 			revisions,

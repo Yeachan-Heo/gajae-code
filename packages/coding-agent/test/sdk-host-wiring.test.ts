@@ -3812,11 +3812,20 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		...context(cwd, sessionId),
 		getSkillState: () => activeSkills,
 		getGoalState: () => goal,
-		invokeSkill: async (name: string, args?: string) => {
+		invokeSkill: async (
+			name: string,
+			args?: string,
+			options?: {
+				onSkillPrepared?: (meta: { name: string; path: string }) => void;
+				onPreflightAcceptCommit?: () => Promise<void>;
+			},
+		) => {
 			if (name !== "fixture-skill")
 				throw Object.assign(new Error(`Skill ${name} was not found.`), { code: "invalid_input" });
+			options?.onSkillPrepared?.({ name, path: "fixture-skill.md" });
+			await options?.onPreflightAcceptCommit?.();
 			activeSkills.push({ name, args });
-			return { name, args };
+			return "production skill completion";
 		},
 		setPlanMode: (on: boolean) => {
 			plan = on ? { enabled: true, planFilePath: "local://PLAN.md" } : undefined;
@@ -3880,13 +3889,22 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			type: "control_request",
 			id: "skill",
 			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "run" },
+			input: { name: "fixture-skill", args: "run", clientRef: "skill-result" },
 		}),
 	).toMatchObject({ ok: true });
 	expect(await request("q11", { type: "query_request", id: "q11", query: "Q11" })).toMatchObject({
 		ok: true,
 		page: { items: [{ name: "fixture-skill", args: "run" }] },
 	});
+	await Bun.sleep(50);
+	expect(
+		await request("turn-result", {
+			type: "query_request",
+			id: "turn-result",
+			query: "turn.result",
+			input: { kind: "skill", clientRef: "skill-result" },
+		}),
+	).toMatchObject({ ok: true, result: { status: "terminal_ok", content: { text: "production skill completion" } } });
 	expect(
 		await request("plan", { type: "control_request", id: "plan", operation: "mode.plan.set", input: { on: true } }),
 	).toMatchObject({ ok: true, result: { state: { enabled: true, planFilePath: "local://PLAN.md" } } });
@@ -5956,7 +5974,7 @@ test("turn.prompt_status validates selectors and rejects invalid clientRef input
 			input: { clientRef: "r" },
 			cursor: "x",
 		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
 	expect(
 		await request({
 			type: "query_request",

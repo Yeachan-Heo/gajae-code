@@ -32,4 +32,29 @@ describe("kind-aware reconciliation", () => {
 		});
 		await fs.rm(root, { recursive: true, force: true });
 	});
+	test("retains bounded Unicode terminal content across restart", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-recon-content-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		const rec = createKindAwareReconciliation({ store });
+		rec.admit("skill", "ref-content");
+		await rec.noteAccepted("skill", { commandId: "c1", turnId: "t1" }, "ref-content");
+		await rec.noteTransition(
+			"skill",
+			{ commandId: "c1", turnId: "t1" },
+			{
+				type: "agent_end",
+				content: { version: 1, type: "text", text: "😀".repeat(10_000), byteLength: 40_000, truncated: false },
+			},
+		);
+		const reopened = createKindAwareReconciliation({
+			store: createReconciliationStore({ sessionFile, sessionId: "s1" }),
+		});
+		await reopened.hydrateFromStore();
+		const result = reopened.lookupResult("skill", { clientRef: "ref-content" });
+		expect(result).toMatchObject({ status: "terminal_ok", content: { truncated: true } });
+		expect(new TextEncoder().encode(result.content?.text).length).toBeLessThanOrEqual(16_384);
+		await fs.rm(root, { recursive: true, force: true });
+	});
 });
