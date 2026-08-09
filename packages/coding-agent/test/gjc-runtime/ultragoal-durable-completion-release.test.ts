@@ -15,6 +15,7 @@ import {
 	createUltragoalPlan,
 	hashStructuredValue,
 	readUltragoalPlan,
+	recordUltragoalCriticVerdict,
 	startNextUltragoalGoal,
 	type UltragoalCompletionVerification,
 	type UltragoalGoal,
@@ -326,6 +327,42 @@ describe("ultragoal durable completion release state", () => {
 		const root = await tempDir();
 		await createTwoGoalPlan(root);
 		await completeGoal(root, "G001");
+		await completeGoal(root, "G002");
+
+		const diagnostic = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
+
+		expect(diagnostic.state).toBe("active_verified_complete");
+		expect(isReleaseAllowed(diagnostic.state)).toBe(true);
+	});
+	it("keeps an earlier goal's per-goal receipt fresh after a later out-of-band critic_verdict names that goal's id (#regression)", async () => {
+		// Reproduces a real production incident: an agent iterating on a LATER
+		// goal's terminal-critic gate accidentally (or deliberately, while
+		// re-confirming evidence) calls `record-critic-verdict --goal-id G001`
+		// where G001 is an EARLIER goal that is already `complete` (and
+		// therefore immutable — it cannot be re-checkpointed). That
+		// critic_verdict ledger row is purely additive audit evidence; it does
+		// not and cannot change G001's `goals.json` row. Before the fix,
+		// `latestRelevantLedgerEventId` treated any ledger row carrying
+		// `goalId: "G001"` as proof "G001 changed", which permanently staled
+		// G001's own per-goal receipt (the recomputed
+		// `latestRelevantLedgerEventIdBeforeCheckpoint` could never again match
+		// the value stored at G001's original checkpoint). Because G002's
+		// final-aggregate receipt validation walks every required prior goal
+		// and demands a fresh per-goal receipt for each one, G001's permanent
+		// staleness permanently blocked the whole run's completion with no
+		// actionable diagnostic pointing at the actual cause.
+		const root = await tempDir();
+		await createTwoGoalPlan(root);
+		await completeGoal(root, "G001");
+
+		await recordUltragoalCriticVerdict({
+			cwd: root,
+			terminus: "completion",
+			verdict: "OKAY",
+			evidence: "Re-confirming G001's evidence while iterating on a later goal's completion gate.",
+			goalId: "G001",
+		});
+
 		await completeGoal(root, "G002");
 
 		const diagnostic = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });

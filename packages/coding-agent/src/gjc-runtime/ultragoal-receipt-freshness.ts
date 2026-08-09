@@ -169,8 +169,23 @@ function ledgerEventId(event: UltragoalLedgerEvent): string | null {
 	return typeof event.eventId === "string" && event.eventId.trim().length > 0 ? event.eventId : null;
 }
 
+/**
+ * Events that never mutate a goal's `goals.json` row and must not be treated
+ * as "this goal changed" for receipt-freshness purposes. `nudge` is a pure
+ * give-up-budget bookkeeping row. `critic_verdict` is also purely additive
+ * audit evidence recorded via `record-critic-verdict` — it can legitimately
+ * be recorded against an already-`complete` (and therefore immutable) goal,
+ * for example while iterating on a different goal's terminal-critic gate and
+ * re-confirming an earlier goal's evidence, or while diagnosing a pause
+ * terminus. Without this exclusion, one `critic_verdict` event carrying an
+ * older goal's id permanently stales that goal's own per-goal receipt (the
+ * recomputed `latestRelevantLedgerEventIdBeforeCheckpoint` can never match
+ * the stored one again), which in turn blocks every later final-aggregate
+ * receipt that depends on that goal via `validateCompletionReceipt`'s
+ * `priorGoal` loop — with no actionable diagnostic pointing at the cause.
+ */
 function isReceiptFreshnessBookkeepingEvent(event: UltragoalLedgerEvent): boolean {
-	return event.event === "nudge";
+	return event.event === "nudge" || event.event === CRITIC_VERDICT_EVENT;
 }
 
 function latestRelevantLedgerEventId(
