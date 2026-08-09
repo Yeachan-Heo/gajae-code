@@ -122,12 +122,20 @@ async function writeSessionHtml(
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
 	const sourcePath = sm.getSessionFile();
 	if (sourcePath) {
-		const sourceIdentity = await fs.stat(sourcePath);
+		const sourceIdentity = await fs.stat(sourcePath).catch(error => {
+			if (isEnoent(error)) return undefined;
+			throw error;
+		});
 		const outputIdentity = await fs.stat(outputPath).catch(error => {
 			if (isEnoent(error)) return undefined;
 			throw error;
 		});
-		if (outputIdentity && sourceIdentity.dev === outputIdentity.dev && sourceIdentity.ino === outputIdentity.ino)
+		if (
+			sourceIdentity &&
+			outputIdentity &&
+			sourceIdentity.dev === outputIdentity.dev &&
+			sourceIdentity.ino === outputIdentity.ino
+		)
 			throw new Error("HTML export output must not overwrite the source transcript");
 	}
 	const sink = Bun.file(outputPath).writer();
