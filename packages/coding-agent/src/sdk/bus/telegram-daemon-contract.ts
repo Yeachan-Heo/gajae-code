@@ -100,9 +100,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * sidecar rename is retried bounded under the ownership-lock fence and an
  * exhausted publication keeps the daemon alive as `publish_failed` instead of
  * escaping as an uncaught exception, while only a proven state/lock mismatch
- * (`not_owner`) stops the owner (#4200).
+ * (`not_owner`) stops the owner (#4200). Generation 61 keeps authenticated
+ * same-session transports attached while predecessor archival converges and
+ * settles non-forum close responses.
  */
-export const DAEMON_GENERATION = 60;
+export const DAEMON_GENERATION = 61;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

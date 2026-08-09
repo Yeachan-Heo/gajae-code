@@ -3129,7 +3129,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 55 lazy native authority", () => {
+	test("keeps wire protocol 3 through generation 61 fenced transport recovery", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3163,7 +3163,8 @@ describe("telegram daemon", () => {
 		// Generation 59 publishes the attached OPEN-socket count in the heartbeat sidecar (#4128).
 		// Generation 60 contains transient heartbeat-sidecar publication failures
 		// under the ownership-lock fence instead of crashing the daemon (#4200).
-		expect(DAEMON_GENERATION).toBe(60);
+		// Generation 61 keeps fenced same-session transports attached.
+		expect(DAEMON_GENERATION).toBe(61);
 	});
 	test.each([
 		"1",
