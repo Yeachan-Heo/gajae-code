@@ -118,6 +118,26 @@ describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
 		expect(after).toBe(`${beforeBytes.toString("utf8")}stale-race\n`);
 		expect(after.includes('"id":"m-race"')).toBe(false);
 	});
+
+	it("streams a 32 MiB predecessor without a transcript-sized resident buffer", async () => {
+		const { store, filePath, relativePath } = await createStore({ withoutNativeAuthority: true });
+		const fd = fs.openSync(filePath, "a");
+		try {
+			const chunk = Buffer.alloc(64 * 1024, 0x61);
+			for (let written = 0; written < 32 * 1024 * 1024; written += chunk.byteLength) fs.writeSync(fd, chunk);
+			fs.fsyncSync(fd);
+		} finally {
+			fs.closeSync(fd);
+		}
+		Bun.gc(true);
+		const before = process.memoryUsage();
+		const record = Buffer.from("\n", "utf8");
+		store.appendSync(relativePath, record);
+		Bun.gc(true);
+		const after = process.memoryUsage();
+		expect(after.heapUsed + after.external - before.heapUsed - before.external).toBeLessThanOrEqual(16 * 1024 * 1024);
+		expect(fs.statSync(filePath).size).toBeGreaterThanOrEqual(32 * 1024 * 1024 + record.byteLength);
+	});
 });
 
 describe.skipIf(process.platform !== "darwin")(

@@ -1,8 +1,9 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
 import { APP_NAME, isEnoent } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
-import { type SessionEntry, type SessionHeader, SessionManager } from "../../session/session-manager";
+import { SessionManager } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
 import { TEMPLATE } from "./template.generated";
 
@@ -90,26 +91,72 @@ async function generateThemeVars(themeName?: string): Promise<string> {
 	return lines.join(" ");
 }
 
-interface SessionData {
-	header: SessionHeader | null;
-	entries: SessionEntry[];
-	leafId: string | null;
-	systemPrompt?: string;
-	tools?: { name: string; description: string }[];
+class Base64StreamEncoder {
+	#carry = Buffer.alloc(0);
+
+	write(value: string): string {
+		const incoming = Buffer.from(value, "utf8");
+		const bytes = this.#carry.byteLength === 0 ? incoming : Buffer.concat([this.#carry, incoming]);
+		const completeLength = bytes.byteLength - (bytes.byteLength % 3);
+		this.#carry = bytes.subarray(completeLength);
+		return completeLength === 0 ? "" : bytes.subarray(0, completeLength).toString("base64");
+	}
+
+	finish(): string {
+		const final = this.#carry.toString("base64");
+		this.#carry = Buffer.alloc(0);
+		return final;
+	}
 }
 
-/** Generate HTML from bundled template with runtime substitutions. */
-async function generateHtml(sessionData: SessionData, themeName?: string): Promise<string> {
+async function writeSessionHtml(
+	sm: SessionManager,
+	state: AgentState | undefined,
+	outputPath: string,
+	themeName?: string,
+): Promise<void> {
 	const themeVars = await generateThemeVars(themeName);
-	const sessionDataBase64 = Buffer.from(JSON.stringify(sessionData)).toBase64();
-
-	// Use function replacements so `$'`, `$&`, `$$`, `$n`, etc. in the
-	// substituted CSS/base64 are not interpreted as substitution patterns
-	// (see https://mdn.io/String.replace).
-	return TEMPLATE.replace("<theme-vars/>", () => `<style>:root { ${themeVars} }</style>`).replace(
-		"{{SESSION_DATA}}",
-		() => sessionDataBase64,
-	);
+	const themedTemplate = TEMPLATE.replace("<theme-vars/>", () => `<style>:root { ${themeVars} }</style>`);
+	const marker = "{{SESSION_DATA}}";
+	const markerOffset = themedTemplate.indexOf(marker);
+	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
+	const sourcePath = sm.getSessionFile();
+	if (sourcePath) {
+		const sourceIdentity = await fs.realpath(sourcePath).catch(() => path.resolve(sourcePath));
+		const outputIdentity = await fs.realpath(outputPath).catch(() => path.resolve(outputPath));
+		if (sourceIdentity === outputIdentity)
+			throw new Error("HTML export output must not overwrite the source transcript");
+	}
+	const sink = Bun.file(outputPath).writer();
+	const encoder = new Base64StreamEncoder();
+	const writeEncoded = (value: string): void => {
+		const encoded = encoder.write(value);
+		if (encoded) sink.write(encoded);
+	};
+	try {
+		sink.write(themedTemplate.slice(0, markerOffset));
+		writeEncoded(`{"header":${JSON.stringify(sm.getHeader())},"entries":[`);
+		let first = true;
+		sm.visitEntriesForExport(entry => {
+			writeEncoded(`${first ? "" : ","}${JSON.stringify(entry)}`);
+			first = false;
+		});
+		writeEncoded(`],"leafId":${JSON.stringify(sm.getLeafId())}`);
+		if (state?.systemPrompt !== undefined)
+			writeEncoded(`,"systemPrompt":${JSON.stringify(state.systemPrompt.join("\n\n"))}`);
+		if (state?.tools !== undefined)
+			writeEncoded(
+				`,"tools":${JSON.stringify(state.tools.map(tool => ({ name: tool.name, description: tool.description })))}`,
+			);
+		writeEncoded("}");
+		const final = encoder.finish();
+		if (final) sink.write(final);
+		sink.write(themedTemplate.slice(markerOffset + marker.length));
+		await sink.end();
+	} catch (error) {
+		await sink.end();
+		throw error;
+	}
 }
 
 /** Export session to HTML using SessionManager and AgentState. */
@@ -123,18 +170,8 @@ export async function exportSessionToHtml(
 	const sessionFile = sm.getSessionFile();
 	if (!sessionFile) throw new Error("Cannot export in-memory session to HTML");
 
-	const sessionData: SessionData = {
-		header: sm.getHeader(),
-		entries: sm.getEntriesForExport(),
-		leafId: sm.getLeafId(),
-		systemPrompt: state?.systemPrompt.join("\n\n"),
-		tools: state?.tools?.map(t => ({ name: t.name, description: t.description })),
-	};
-
-	const html = await generateHtml(sessionData, opts.themeName);
 	const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(sessionFile, ".jsonl")}.html`;
-
-	await Bun.write(outputPath, html);
+	await writeSessionHtml(sm, state, outputPath, opts.themeName);
 	return outputPath;
 }
 
@@ -143,24 +180,30 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
 
 	let sm: SessionManager;
+	const artifactRoot = inputPath.endsWith(".jsonl") ? inputPath.slice(0, -6) : inputPath;
+	const hasExistingSidecars = (
+		await Promise.all(
+			["idx", "tail", "commit"].map(kind =>
+				Bun.file(path.join(artifactRoot, `.session-memory.spill.${kind}`)).exists(),
+			),
+		)
+	).some(Boolean);
 	try {
-		sm = await SessionManager.open(inputPath);
+		sm = await SessionManager.open(
+			inputPath,
+			undefined,
+			undefined,
+			"copy-retain",
+			hasExistingSidecars ? "off" : "enabled",
+		);
 	} catch (err) {
 		if (isEnoent(err)) throw new Error(`File not found: ${inputPath}`);
 		throw err;
 	}
 
 	try {
-		const sessionData: SessionData = {
-			header: sm.getHeader(),
-			entries: sm.getEntriesForExport(),
-			leafId: sm.getLeafId(),
-		};
-
-		const html = await generateHtml(sessionData, opts.themeName);
 		const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(inputPath, ".jsonl")}.html`;
-
-		await Bun.write(outputPath, html);
+		await writeSessionHtml(sm, undefined, outputPath, opts.themeName);
 		return outputPath;
 	} finally {
 		await sm.close();

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 
 import * as os from "node:os";
 import * as path from "node:path";
-
+import * as util from "node:util";
 import { type AgentMessage, canContinuePersistedHistory } from "@gajae-code/agent-core";
 import type { ConfiguredModelChainEntry as SharedConfiguredModelChainEntry } from "@gajae-code/agent-core/compaction";
 import type {
@@ -85,6 +85,7 @@ import {
 	captureManagedFileNoFollow,
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	type ManagedBoundedAppendExpectation,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
@@ -93,6 +94,64 @@ import {
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
+import {
+	applyReducerDelta,
+	type BaseAnchor,
+	BoundedDictionaryArtifactBuilder,
+	BoundedDictionaryIdSet,
+	BoundedLabelsPinsStore,
+	BoundedParentArtifactBuilder,
+	BoundedParentChildrenIndex,
+	type CommitMarkerContents,
+	type CommittedTail,
+	classifyReopen,
+	coldBranchOrdinalRunWithinPrefetchBounds,
+	computeLineDigest,
+	computeTailRecordChecksum,
+	type DescriptorSnapshot,
+	DICTIONARY_PARTITION_BUFFER_BYTES,
+	DICTIONARY_PARTITION_COUNT,
+	type DictionaryArtifactBuildResult,
+	type DictionaryArtifactCommit,
+	type DictionaryArtifactFlushTarget,
+	type DictionaryPartitionCommit,
+	dictionaryArtifactRuntimeBytes,
+	dictionaryPartitionForId,
+	FixedCacheAccount,
+	finalizeDictionaryArtifactCommit,
+	getLastModelChangeRole as getReducerLastModelChangeRole,
+	isDerivedSessionMemoryFile,
+	isValidMetadataDeltaCommit,
+	LABELS_PINS_BUDGET_BYTES,
+	MAX_REDUCER_INLINE_BYTES,
+	type MetadataDeltaArtifactCommit,
+	type MetadataDeltaValue,
+	metadataDeltaDescriptorResidentBytes,
+	PARENT_CHILDREN_BUCKET_COUNT,
+	PARENT_CHILDREN_BUDGET_BYTES,
+	PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT,
+	type ParentArtifactCommit,
+	type ParentBucketCommit,
+	parentArtifactRuntimeBytes,
+	parentBucketForId,
+	parseDictionaryPartitionRecord,
+	parseParentBucketRecord,
+	REDUCER_BUDGET_BYTES,
+	type ReducerState,
+	type ReopenClassification,
+	RollingTailChainBuilder,
+	residentRecordBytes,
+	residentStringBytes,
+	SessionMemoryAccountant,
+	sameDescriptor,
+	serializeDictionaryPartitionRecord,
+	serializeParentBucketRecord,
+	type TailRecord,
+	type TailRecordKind,
+	tailRecordResidentBytes,
+	validateCommit,
+	validateTailChain,
+} from "./internal/session-memory-sidecar";
 import { SessionMigrationBusyError } from "./internal/session-open-errors";
 import {
 	hasOnlyKeys as hasOnlyMemoryGuardKeys,
@@ -111,7 +170,6 @@ import {
 	memoryGuardCanonicalJson,
 	memoryGuardSha256Hex,
 } from "./memory-guard-checkpoint-participant";
-
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -132,10 +190,19 @@ import type {
 	SessionStorageStat,
 	SessionStorageWriter,
 	SessionStorageWriterCloseState,
+	StagedStreamingWriter,
 	VerifiedSessionDeleteResult,
 	VerifiedSessionDeleteTarget,
 } from "./session-storage";
-import { createManagedSessionSecurityContext, FileSessionStorage, MemorySessionStorage } from "./session-storage";
+import {
+	createManagedSessionSecurityContext,
+	createSessionCommitMarkerCheckedSync,
+	FileSessionStorage,
+	MemorySessionStorage,
+	readSessionCommitMarkerSync,
+	replaceSessionCommitMarkerCheckedSync,
+	SESSION_RANGE_READ_MAX_BYTES,
+} from "./session-storage";
 
 export const CURRENT_SESSION_VERSION = 5;
 
@@ -228,13 +295,42 @@ interface ResidentTransitionInput {
 
 class PreparedResidentStoreTransition {
 	#active = true;
+	#entries: FileEntry[] | undefined;
+	#store: BlobStore | undefined;
+	#index: PreparedSessionIndex | undefined;
 
 	constructor(
-		readonly entries: FileEntry[],
-		readonly store: BlobStore,
-		readonly index: PreparedSessionIndex,
+		entries: FileEntry[],
+		store: BlobStore,
+		index: PreparedSessionIndex,
 		private readonly ownsStore: boolean,
-	) {}
+	) {
+		this.#entries = entries;
+		this.#store = store;
+		this.#index = index;
+	}
+
+	get entries(): FileEntry[] {
+		if (!this.#entries) throw new Error("resident_transition_released");
+		return this.#entries;
+	}
+
+	get store(): BlobStore {
+		if (!this.#store) throw new Error("resident_transition_released");
+		return this.#store;
+	}
+
+	get index(): PreparedSessionIndex {
+		if (!this.#index) throw new Error("resident_transition_released");
+		return this.#index;
+	}
+
+	releaseReferences(): void {
+		if (this.#active) throw new Error("resident_transition_still_active");
+		this.#entries = undefined;
+		this.#store = undefined;
+		this.#index = undefined;
+	}
 
 	dispose(): void {
 		if (!this.#active) return;
@@ -349,6 +445,49 @@ export interface SessionManagerObservabilityStats {
 	materializedEntriesCachePopulateCount: number;
 	materializedCacheDemotedCount: number;
 	pathOnlyContextBuildCount: number;
+}
+
+export interface SessionMemoryStats {
+	sidecarEnabled: boolean;
+	coldRetirementActive: boolean;
+	sidecarIneligible: boolean;
+	hotRegionBytes: number;
+	metaDescriptorBytes: number;
+	totalAccountedBytes: number;
+	lastReopenTransition: ReopenClassification | undefined;
+	currentCommitTransition: ReopenClassification | undefined;
+	lazyReopenAttempted: boolean;
+	lazyReopenSucceeded: boolean;
+	lazyReopenFallbackReason: string | undefined;
+	retirementFallbackReason: string | undefined;
+	autoDisabledReason: string | undefined;
+	consecutiveBuildFailures: number;
+	/** Persistent bounded parent→children artifact is adopted and usable. */
+	parentArtifactEnabled: boolean;
+	/** Persistent bounded dictionary artifact is adopted and usable. */
+	dictionaryArtifactEnabled: boolean;
+	/** Reducer-bucket bytes retained by metadata-delta descriptors (fixed accounting). */
+	metadataDeltaDescriptorBytes: number;
+	/** Live cold index bytes (descriptor size when proven, else 0). */
+	coldIndexBytes: number;
+	/** Live cold block-cache allocated bytes. */
+	coldIndexBlockCacheBytes: number;
+	/** Live cold entry-cache allocated bytes. */
+	coldEntryCacheBytes: number;
+	/** Live observability counters (P7 contract). */
+	coldEntriesRetired: number;
+	coldEntriesReloaded: number;
+	rangeReadCount: number;
+	rangeReadGenerationMismatchCount: number;
+	sidecarRebuildCount: number;
+	coldMutationPromotions: number;
+	hotOverflowTransitions: number;
+	labelDiskFallbackCount: number;
+	/** Shadow-mode eager-vs-sidecar parity mismatches observed at build time (AC10 telemetry). */
+	shadowParityMismatchCount: number;
+	/** Shadow-mode parity comparisons performed at build time (AC10 telemetry). */
+	shadowParityCheckCount: number;
+	transcriptGeneration: number;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -608,15 +747,780 @@ export type SessionPatchRecord = HeaderPatchRecord | EntryPatchRecord;
 
 /** Resolved file entries; patch records are applied by parseSessionEntries(). */
 export type FileEntry = SessionHeader | SessionEntry;
+/**
+ * Cold-region placeholder envelope for a retired entry. The heavy payload was moved
+ * out of RAM into the disposable `.spill.idx`/`.spill.tail` cold region; the exact
+ * transcript byte range is recorded so the entry can be lazily resolved by
+ * `ordinal`/`id`. Never persisted; used only while a cold sidecar region is active.
+ */
+export interface SessionColdRefEntry extends SessionEntryBase {
+	type: "session_cold_ref";
+	ordinal: number;
+	seq: number;
+	byteOffset: number;
+	byteLength: number;
+}
+
+/** One cold entry's transcript location, keyed by entry id. */
+export interface ColdEntryIndex {
+	ordinal: number;
+	seq: number;
+	byteOffset: number;
+	byteLength: number;
+	recordDigest: string;
+	parentId?: string | null;
+	entryType?: string;
+}
+
+export interface SessionMemorySidecarRuntime {
+	/** Transcript v5 remains authoritative; sidecars are disposable/rebuildable. */
+	enabled: boolean;
+	/** Set when duplicate record IDs were detected; session stays eager. */
+	sidecarIneligible: boolean;
+	base: BaseAnchor;
+	tail: CommittedTail;
+	/** Bounded hot index cache; authoritative lookup falls back to the disk index. */
+	coldEntries: Map<string, ColdEntryIndex>;
+	indexPath: string;
+	tailPath: string;
+	commitPath: string;
+	/** Directory prefix of the persistent `.spill.parent-<bucket>` bucket files. */
+	parentPathPrefix: string;
+	/** Directory prefix of the persistent `.spill.dict-part-<partition>` partition files. */
+	dictionaryPathPrefix: string;
+	/** Path of the persistent `.spill.dict-meta` finalization file. */
+	dictionaryMetaPath: string;
+	/** Path of the persistent `.spill.metadata-delta` section. */
+	metadataDeltaPath: string;
+	retirementFirstKeptEntryId: string | undefined;
+	/** Hot-suffix byte total (accountant-bounded to ≤ 16 MiB). */
+	hotSuffixBytes: number;
+	accountant: SessionMemoryAccountant;
+	reducer: ReducerState;
+	/** Resident inline provider-affecting entries (merged order minus demoted slots). */
+	providerStateEntries: SessionEntry[];
+	/** Merged provider-list order as keys (inline + demoted); reopened/appended slots stay exact. */
+	providerStateOrder: string[];
+	blockCache: FixedCacheAccount;
+	parentChildrenCache: Map<
+		string,
+		{
+			ids: readonly string[];
+			bytes: number;
+			descriptor: SessionStorageStat;
+			bucketDescriptor?: SessionStorageStat;
+			bucketIndex?: number;
+		}
+	>;
+	entryCache: FixedCacheAccount;
+	tailCache: FixedCacheAccount;
+	labelsPins: BoundedLabelsPinsStore;
+	terminalTransition: ReopenClassification | undefined;
+	reopenTransition: ReopenClassification | undefined;
+	/** SHA-256 over the exact `.spill.idx` bytes this runtime has written/adopted ("" until proven). */
+	indexDigest: string;
+	/** Descriptor of the exact index bytes whose digest was validated for cache use. */
+	validatedIndexDescriptor?: SessionStorageStat;
+	/** Live running hash of the index bytes; updated on every index append. */
+	indexHash: crypto.Hash;
+	/** Persistent bounded parent→children artifact state; absent = parent lookups fail closed. */
+	parentArtifact?: ParentArtifactRuntimeState;
+	/** Persistent bounded dictionary artifact state; absent = dictionary lookups fail closed to the cold scan. */
+	dictionary?: DictionaryArtifactRuntimeState;
+	/** Persistent metadata-delta section state; absent = no demoted provider values. */
+	metadataDelta?: MetadataDeltaArtifactRuntimeState;
+	/** Lazily built 24-bit fingerprints for O(1) fail-closed ID generation when no persistent dictionary exists. */
+	coldIdHashes?: BoundedColdIdHashSet;
+	coldIdHashesDescriptor?: SessionStorageStat;
+	/** Live observability counters (P7 live-only contract). */
+	coldEntriesRetired: number;
+	coldEntriesReloaded: number;
+	rangeReadCount: number;
+	rangeReadGenerationMismatchCount: number;
+	sidecarRebuildCount: number;
+	coldMutationPromotions: number;
+	hotOverflowTransitions: number;
+	labelDiskFallbackCount: number;
+	/** Shadow-mode eager-vs-sidecar parity mismatches observed at build time (AC10 telemetry). */
+	shadowParityMismatchCount: number;
+	/** Shadow-mode parity comparisons performed at build time (AC10 telemetry). */
+	shadowParityCheckCount: number;
+	transcriptGeneration: number;
+}
+
+/** Retained runtime state of the disposable parent→children artifact (block-cache charged). */
+interface ParentArtifactRuntimeState {
+	/** Exact `.spill.idx` digest the artifact covers; artifact lookups require `indexDigest === runtime.indexDigest`. */
+	indexDigest: string;
+	/** Committed per-bucket exact-byte size + sha256, updated incrementally on append. */
+	buckets: ParentBucketCommit[];
+	/** Total artifact bytes (sum of bucket sizes). */
+	totalBytes: number;
+	/** Block-cache bytes charged for this retained state; released on invalidation/wholesale release. */
+	chargedBytes: number;
+	/** On-disk byte cap enforced on append; fixed at `PARENT_CHILDREN_BUDGET_BYTES` unless a test shrinks it. */
+	budgetBytes: number;
+}
+
+/** Retained runtime state of the disposable dictionary artifact (block-cache charged). */
+interface DictionaryArtifactRuntimeState {
+	/** Exact `.spill.idx` digest the artifact covers; lookups require `indexDigest === runtime.indexDigest`. */
+	indexDigest: string;
+	/** Committed per-partition exact-byte size + sha256, updated incrementally on append. */
+	partitions: DictionaryPartitionCommit[];
+	/** Exact `.spill.dict-meta` bytes (size + digest). */
+	metaSize: number;
+	metaDigest: string;
+	recordCount: number;
+	uniqueTerms: number;
+	totalBytes: number;
+	/** Bounded duplicate-id diagnostics; non-empty ⇒ the artifact is never adopted. */
+	duplicateIds: readonly string[];
+	sidecarIneligible: boolean;
+	/** Block-cache bytes charged for this retained state; released on invalidation. */
+	chargedBytes: number;
+	/** On-disk byte cap for a single partition append; fixed unless a test shrinks it. */
+	budgetBytes: number;
+	/** Running per-partition hashes/sizes/records for append-time rebinding. */
+	partitionHashes: crypto.Hash[];
+	partitionSizes: number[];
+	partitionRecords: number[];
+	/** Descriptor of the exact meta bytes whose digest was validated for artifact use. */
+	validatedDescriptor?: SessionStorageStat;
+}
+
+/** Retained runtime state of the disposable metadata-delta section (reducer-bucket accounting). */
+interface MetadataDeltaArtifactRuntimeState {
+	/** Exact `.spill.idx` digest the sidecar set was built with. */
+	indexDigest: string;
+	/** Exact bytes of the `.spill.metadata-delta` file. */
+	size: number;
+	sha256: string;
+	/** Live running hash of the delta bytes; updated on every value append. */
+	hash: crypto.Hash;
+	/** Demoted value descriptors keyed by provider key (positions derived at marker time). */
+	byKey: Map<string, Omit<MetadataDeltaValue, "key" | "position">>;
+	/** Reducer-bucket bytes retained by the descriptors (fixed accounting, reported in stats). */
+	descriptorBytes: number;
+	/** Fixed on-disk byte cap for the section. */
+	budgetBytes: number;
+	/** Descriptor of the exact delta bytes whose digest was validated. */
+	validatedDescriptor?: SessionStorageStat;
+}
+
+/** Bucket file paths for the disposable parent artifact derived from an index path. */
+function parentBucketPaths(indexPath: string, bucketCount = PARENT_CHILDREN_BUCKET_COUNT): string[] {
+	const prefix = indexPath.replace(/\.spill\.idx$/, ".spill.parent-");
+	return Array.from({ length: bucketCount }, (_, bucket) => `${prefix}${bucket.toString().padStart(4, "0")}`);
+}
+
+/** Partition file paths for the disposable dictionary artifact derived from an index path. */
+function dictionaryPartitionPaths(indexPath: string, partitionCount = DICTIONARY_PARTITION_COUNT): string[] {
+	const prefix = indexPath.replace(/\.spill\.idx$/, ".spill.dict-part-");
+	return Array.from({ length: partitionCount }, (_, partition) => `${prefix}${partition.toString().padStart(4, "0")}`);
+}
+
+/** Path of the disposable dictionary meta file derived from an index path. */
+function dictionaryMetaPathFor(indexPath: string): string {
+	return indexPath.replace(/\.spill\.idx$/, ".spill.dict-meta");
+}
+
+/** Path of the disposable metadata-delta section derived from an index path. */
+function metadataDeltaPathFor(indexPath: string): string {
+	return indexPath.replace(/\.spill\.idx$/, ".spill.metadata-delta");
+}
+
+/** Count one parent's records inside a verified bucket byte range. */
+function countParentBucketRecords(bytes: Uint8Array, parentId: string): number {
+	let count = 0;
+	const text = new TextDecoder("utf-8").decode(bytes);
+	for (const line of text.split("\n")) {
+		if (!line) continue;
+		const record = parseParentBucketRecord(line);
+		if (record?.parentId === parentId) count++;
+	}
+	return count;
+}
+
+interface SessionMemoryCommitContents extends CommitMarkerContents {
+	retirementFirstKeptEntryId?: string;
+	leafId?: string;
+	reducer?: ReducerState;
+	/** Resident inline provider-affecting entries only; oversized values live in `metadataDelta`. */
+	providerStateEntries?: SessionEntry[];
+	labels?: Array<[string, string]>;
+	usageStatistics?: UsageStatistics;
+
+	/** SHA-256 over the exact `.spill.idx` bytes the marker's sidecar set was built with. */
+	indexDigest?: string;
+	/** Bounded parent→children artifact binding; absent when no artifact was published for this marker. */
+	parentIndex?: ParentArtifactCommit;
+	/** Bounded dictionary artifact binding; absent when no dictionary was published for this marker. */
+	dictionary?: DictionaryArtifactCommit;
+	/** Metadata-delta section binding; absent when no provider value was demoted. */
+	metadataDelta?: MetadataDeltaArtifactCommit;
+}
+
+function isValidPersistedReducerState(value: ReducerState): boolean {
+	const latest = value.modelChange?.latest;
+	return (
+		(latest === undefined ||
+			(Number.isSafeInteger(latest.ordinal) && (latest.role === undefined || typeof latest.role === "string"))) &&
+		[value.ttsr?.count, value.ttsr?.rulesCount, value.ttsr?.recordsCount, value.ttsr?.largestOrdinal].every(
+			item => typeof item === "number" && Number.isSafeInteger(item),
+		)
+	);
+}
+
+function isProviderStateEntry(entry: SessionEntry): boolean {
+	return [
+		"thinking_level_change",
+		"model_change",
+		"configured_model_chain",
+		"service_tier_change",
+		"mcp_tool_selection",
+		"discovered_builtin_tool_selection",
+		"mode_change",
+		"ttsr_injection",
+	].includes(entry.type);
+}
+
+function providerStateEntryKey(entry: SessionEntry): string | undefined {
+	if (!isProviderStateEntry(entry)) return undefined;
+	return entry.type === "configured_model_chain" ? `${entry.type}:${entry.role}` : entry.type;
+}
+/** Map a session entry to its rolling-tail record kind. */
+function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
+	switch (entry.type) {
+		case "message":
+			return entry.message.role === "user" ? "user" : entry.message.role === "assistant" ? "assistant" : "tool";
+		case "custom_message":
+			return entry.display ? "other" : "internal";
+		case "model_change":
+			return "model_change";
+		case "ttsr_injection":
+			return "ttsr_injection";
+		default:
+			return "other";
+	}
+}
+
+/**
+ * Bounded first-open transcript scan limits. The eager authoritative path handles
+ * anything outside these bounds; the bounded path only ever fails closed to it.
+ */
+const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
+const FORK_PATCH_OVERLAY_BUDGET_BYTES = 8 * 1024 * 1024;
+const COLD_ID_HASH_CAPACITY = 1_250_003;
+const COLD_ID_HASH_BYTES = COLD_ID_HASH_CAPACITY * 3;
+
+class BoundedColdIdHashSet {
+	readonly #high = new Uint8Array(COLD_ID_HASH_CAPACITY);
+	readonly #low = new Uint16Array(COLD_ID_HASH_CAPACITY);
+	#size = 0;
+
+	#hash(value: string, seed: number): number {
+		let hash = seed >>> 0;
+		for (let index = 0; index < value.length; index++) {
+			hash ^= value.charCodeAt(index);
+			hash = Math.imul(hash, 0x01000193) >>> 0;
+		}
+		return hash;
+	}
+
+	#fingerprint(value: string): [number, number] {
+		let fingerprint = this.#hash(value, 0x811c9dc5) & 0xffffff;
+		if (fingerprint === 0) fingerprint = 1;
+		return [(fingerprint >>> 16) & 0xff, fingerprint & 0xffff];
+	}
+
+	has(value: string): boolean {
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === 0 && existingLow === 0) return false;
+			if (existingHigh === high && existingLow === low) return true;
+			slot++;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
+		}
+		return true;
+	}
+
+	add(value: string): boolean {
+		if (this.#size >= 1_000_000) return false;
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === 0 && existingLow === 0) {
+				this.#high[slot] = high;
+				this.#low[slot] = low;
+				this.#size++;
+				return true;
+			}
+			slot++;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
+		}
+		return false;
+	}
+	addUnique(value: string): boolean {
+		if (this.#size >= 1_000_000) return false;
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === high && existingLow === low) return false;
+			if (existingHigh === 0 && existingLow === 0) {
+				this.#high[slot] = high;
+				this.#low[slot] = low;
+				this.#size++;
+				return true;
+			}
+			slot++;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
+		}
+		return false;
+	}
+}
+
+class DiskBackedIdUniquenessCheck {
+	static readonly BUCKETS = 64;
+	static readonly BUFFER_BYTES = 4096;
+	readonly #buffers = Array.from({ length: DiskBackedIdUniquenessCheck.BUCKETS }, () =>
+		Buffer.allocUnsafe(DiskBackedIdUniquenessCheck.BUFFER_BYTES),
+	);
+	readonly #positions = new Uint16Array(DiskBackedIdUniquenessCheck.BUCKETS);
+	readonly #fds = new Map<number, number>();
+	#failed = false;
+
+	constructor() {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-index-ids-"));
+		try {
+			for (let bucket = 0; bucket < DiskBackedIdUniquenessCheck.BUCKETS; bucket++) {
+				const bucketPath = path.join(root, bucket.toString(16).padStart(2, "0"));
+				const fd = fs.openSync(bucketPath, "w+", 0o600);
+				fs.unlinkSync(bucketPath);
+				this.#fds.set(bucket, fd);
+			}
+			fs.rmdirSync(root);
+		} catch (error) {
+			for (const fd of this.#fds.values()) {
+				try {
+					fs.closeSync(fd);
+				} catch {
+					// Preserve the constructor failure.
+				}
+			}
+			this.#fds.clear();
+			fs.rmSync(root, { recursive: true, force: true });
+			throw error;
+		}
+	}
+
+	#hash(value: string, seed: number): number {
+		let hash = seed >>> 0;
+		for (let index = 0; index < value.length; index++) {
+			hash ^= value.charCodeAt(index);
+			hash = Math.imul(hash, 0x01000193) >>> 0;
+		}
+		return hash;
+	}
+
+	#flush(bucket: number): void {
+		const length = this.#positions[bucket]!;
+		if (length === 0) return;
+		fs.writeSync(this.#fds.get(bucket)!, this.#buffers[bucket]!, 0, length);
+		this.#positions[bucket] = 0;
+	}
+
+	add(value: string): boolean {
+		if (this.#failed) return false;
+		try {
+			const high = this.#hash(value, 0x811c9dc5);
+			const low = this.#hash(value, 0x9e3779b9);
+			const bucket = low & (DiskBackedIdUniquenessCheck.BUCKETS - 1);
+			if (this.#positions[bucket]! + 8 > DiskBackedIdUniquenessCheck.BUFFER_BYTES) this.#flush(bucket);
+			const offset = this.#positions[bucket]!;
+			this.#buffers[bucket]!.writeUInt32LE(high, offset);
+			this.#buffers[bucket]!.writeUInt32LE(low, offset + 4);
+			this.#positions[bucket] = offset + 8;
+			return true;
+		} catch {
+			this.#failed = true;
+			return false;
+		}
+	}
+
+	#hasDuplicate(bytes: Buffer): boolean {
+		const words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+		const count = words.length / 2;
+		const greater = (left: number, right: number): boolean => {
+			const leftHigh = words[left * 2]!;
+			const rightHigh = words[right * 2]!;
+			return leftHigh === rightHigh ? words[left * 2 + 1]! > words[right * 2 + 1]! : leftHigh > rightHigh;
+		};
+		const swap = (left: number, right: number): void => {
+			const leftOffset = left * 2;
+			const rightOffset = right * 2;
+			const high = words[leftOffset]!;
+			const low = words[leftOffset + 1]!;
+			words[leftOffset] = words[rightOffset]!;
+			words[leftOffset + 1] = words[rightOffset + 1]!;
+			words[rightOffset] = high;
+			words[rightOffset + 1] = low;
+		};
+		const siftDown = (start: number, end: number): void => {
+			let root = start;
+			for (;;) {
+				const child = root * 2 + 1;
+				if (child > end) return;
+				let candidate = root;
+				if (greater(child, candidate)) candidate = child;
+				if (child + 1 <= end && greater(child + 1, candidate)) candidate = child + 1;
+				if (candidate === root) return;
+				swap(root, candidate);
+				root = candidate;
+			}
+		};
+		for (let start = Math.floor((count - 2) / 2); start >= 0; start--) siftDown(start, count - 1);
+		for (let end = count - 1; end > 0; end--) {
+			swap(0, end);
+			siftDown(0, end - 1);
+		}
+		for (let index = 1; index < count; index++) {
+			const offset = index * 2;
+			const previous = offset - 2;
+			if (words[offset] === words[previous] && words[offset + 1] === words[previous + 1]) return true;
+		}
+		return false;
+	}
+
+	finish(): boolean {
+		try {
+			for (let bucket = 0; bucket < DiskBackedIdUniquenessCheck.BUCKETS; bucket++) this.#flush(bucket);
+			if (this.#failed) return false;
+			for (const fd of this.#fds.values()) {
+				const size = fs.fstatSync(fd).size;
+				if (size % 8 !== 0) return false;
+				const bytes = Buffer.allocUnsafe(size);
+				let offset = 0;
+				while (offset < size) {
+					const read = fs.readSync(fd, bytes, offset, size - offset, offset);
+					if (read === 0) return false;
+					offset += read;
+				}
+				if (this.#hasDuplicate(bytes)) return false;
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	dispose(): void {
+		for (const fd of this.#fds.values()) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Best-effort scratch cleanup.
+			}
+		}
+		this.#fds.clear();
+	}
+}
+/** Persistent secondary artifacts stay optional beyond this fixed build envelope. */
+const PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS = 64 * 1024;
+const PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
+const residentHotEntryBytes = (serializedBytes: number): number => residentRecordBytes(serializedBytes * 2 + 256);
+
+/** State the bounded first-open scan derives without building an entry graph. */
+interface BoundedFirstOpenDiscovery {
+	/** Exactly one current-version header on the first line. */
+	header: SessionHeader;
+	/** Id of the last session entry (leaf of the strictly linear chain). */
+	leafId: string;
+	/** First entry retained by the latest reachable compaction (retirement boundary). */
+	retirementFirstKeptEntryId: string;
+	/** Latest model-change / TTSR reducer state over the linear chain. */
+	reducer: ReducerState;
+	/** Aggregated assistant/task usage totals over the linear chain. */
+	usageStatistics: UsageStatistics;
+	/** Number of non-header transcript records proven by the semantic pass. */
+	recordCount: number;
+	/** Current label state derived from `label` entries in chain order. */
+	labels: Array<[string, string]>;
+	/** Latest provider-affecting entries with exact ordinals, bounded by the reducer reservation. */
+	providerState: Array<{ ordinal: number; entry: SessionEntry }>;
+}
+
+type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" | "aborted";
+
+/**
+ * Stream a JSONL transcript in bounded 64 KiB range reads without materializing
+ * the whole file or building an entry graph. `visit(lineStart, lineBytes)` is
+ * invoked for every newline-terminated line with its exact absolute byte offset
+ * and exact bytes including the trailing "\n"; returning `false` aborts with
+ * `"aborted"`. Returns a failure reason when the file is not exactly
+ * newline-terminated, any line exceeds `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES`, or a
+ * range read fails — the caller then fails closed to the eager authoritative
+ * path. Returns `undefined` only after every byte was consumed as a complete
+ * newline-terminated line.
+ */
+function decodeBoundedJsonLine(lineBytes: Uint8Array): string {
+	const length = lineBytes.at(-1) === 0x0a ? lineBytes.byteLength - 1 : lineBytes.byteLength;
+	return Buffer.from(lineBytes.buffer, lineBytes.byteOffset, length).toString("utf8");
+}
+
+function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined): {
+	consume(chunk: Buffer, chunkStart: number): BoundedLineScanFailure | undefined;
+	hasLargePendingLine(): boolean;
+	finish(includeUnterminated?: boolean): BoundedLineScanFailure | undefined;
+} {
+	let pendingChunks: Buffer[] = [];
+	let pendingBytes = 0;
+	let pendingStart = 0;
+	return {
+		consume(chunk, chunkStart) {
+			let consumed = 0;
+			for (;;) {
+				const newline = chunk.indexOf(0x0a, consumed);
+				if (newline < 0) break;
+				const segment = chunk.subarray(consumed, newline + 1);
+				const lineStart = pendingChunks.length === 0 ? chunkStart + consumed : pendingStart;
+				const lineBytes = pendingBytes + segment.byteLength;
+				if (lineBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				let line = segment;
+				if (pendingChunks.length > 0) {
+					pendingChunks.push(segment);
+					line = Buffer.concat(pendingChunks, lineBytes);
+				}
+				pendingChunks = [];
+				pendingBytes = 0;
+				if (visit(lineStart, line) === false) return "aborted";
+				consumed = newline + 1;
+			}
+			if (consumed < chunk.byteLength) {
+				if (pendingChunks.length === 0) pendingStart = chunkStart + consumed;
+				const remainder = chunk.subarray(consumed);
+				pendingBytes += remainder.byteLength;
+				if (pendingBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				pendingChunks.push(remainder);
+			}
+			return undefined;
+		},
+		hasLargePendingLine() {
+			return pendingBytes >= 256 * 1024;
+		},
+		finish(includeUnterminated = false) {
+			if (pendingBytes === 0) return undefined;
+			if (!includeUnterminated) return "unterminated";
+			const line = Buffer.concat(pendingChunks, pendingBytes);
+			pendingChunks = [];
+			pendingBytes = 0;
+			return visit(pendingStart, line) === false ? "aborted" : undefined;
+		},
+	};
+}
+
+function createReusableBoundedLineChunkConsumer(
+	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
+): {
+	consume(chunk: Buffer, chunkStart: number): BoundedLineScanFailure | undefined;
+	hasLargePendingLine(): boolean;
+	finish(includeUnterminated?: boolean): BoundedLineScanFailure | undefined;
+} {
+	let pendingBuffer: Buffer | undefined;
+	let pendingBytes = 0;
+	let pendingStart = 0;
+	const ensureCapacity = (required: number): Buffer => {
+		if (pendingBuffer && pendingBuffer.byteLength >= required) return pendingBuffer;
+		let capacity = pendingBuffer?.byteLength ?? 64 * 1024;
+		while (capacity < required) capacity = Math.min(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES, capacity * 2);
+		const grown = Buffer.allocUnsafe(capacity);
+		if (pendingBuffer && pendingBytes > 0) pendingBuffer.copy(grown, 0, 0, pendingBytes);
+		pendingBuffer = grown;
+		return grown;
+	};
+	return {
+		consume(chunk, chunkStart) {
+			let consumed = 0;
+			for (;;) {
+				const newline = chunk.indexOf(0x0a, consumed);
+				if (newline < 0) break;
+				const segment = chunk.subarray(consumed, newline + 1);
+				const lineStart = pendingBytes === 0 ? chunkStart + consumed : pendingStart;
+				const lineBytes = pendingBytes + segment.byteLength;
+				if (lineBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				let line = segment;
+				if (pendingBytes > 0) {
+					const assembled = ensureCapacity(lineBytes);
+					segment.copy(assembled, pendingBytes);
+					line = assembled.subarray(0, lineBytes);
+				}
+				pendingBytes = 0;
+				if (visit(lineStart, line) === false) return "aborted";
+				consumed = newline + 1;
+			}
+			if (consumed < chunk.byteLength) {
+				if (pendingBytes === 0) pendingStart = chunkStart + consumed;
+				const remainder = chunk.subarray(consumed);
+				const nextBytes = pendingBytes + remainder.byteLength;
+				if (nextBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				const assembled = ensureCapacity(nextBytes);
+				remainder.copy(assembled, pendingBytes);
+				pendingBytes = nextBytes;
+			}
+			return undefined;
+		},
+		hasLargePendingLine: () => pendingBytes >= 256 * 1024,
+		finish(includeUnterminated = false) {
+			if (pendingBytes === 0) return undefined;
+			if (!includeUnterminated) return "unterminated";
+			const line = pendingBuffer!.subarray(0, pendingBytes);
+			pendingBytes = 0;
+			return visit(pendingStart, line) === false ? "aborted" : undefined;
+		},
+	};
+}
+
+function scanTranscriptLinesBounded(
+	storage: SessionStorage,
+	filePath: string,
+	size: number,
+	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
+	result?: { stat?: SessionStorageStat },
+	allowUnterminated = false,
+	reuseLineAssembly = false,
+): BoundedLineScanFailure | undefined {
+	const chunkBytes =
+		size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
+			? reuseLineAssembly
+				? 320 * 1024
+				: 256 * 1024
+			: TRANSCRIPT_CAPTURE_CHUNK_BYTES;
+	if (storage instanceof FileSessionStorage) {
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(filePath, flags);
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile() || before.nlink > 1 || Number(before.size) < size) return "read_failed";
+			const consumer = reuseLineAssembly
+				? createReusableBoundedLineChunkConsumer(visit)
+				: createBoundedLineChunkConsumer(visit);
+			let pos = 0;
+			let useLargeRecordCadence = false;
+			let bytesSinceGc = 0;
+
+			while (pos < size) {
+				const length = Math.min(chunkBytes, size - pos);
+				const chunk = Buffer.allocUnsafe(length);
+				let offset = 0;
+				while (offset < length) {
+					const count = fs.readSync(fd, chunk, offset, length - offset, pos + offset);
+					if (count === 0) return "read_failed";
+					offset += count;
+				}
+				const failure = consumer.consume(chunk, pos);
+				if (failure) return failure;
+				pos += length;
+				useLargeRecordCadence ||= consumer.hasLargePendingLine();
+				const gcIntervalBytes = useLargeRecordCadence
+					? size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
+						? reuseLineAssembly
+							? 60 * 1024 * 1024
+							: 32 * 1024 * 1024
+						: 23 * 1024 * 1024
+					: 4 * 1024 * 1024;
+				bytesSinceGc += length;
+				if (bytesSinceGc >= gcIntervalBytes) {
+					Bun.gc(true);
+					bytesSinceGc = 0;
+				}
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(filePath, { bigint: true });
+			if (
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.nlink !== before.nlink ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino
+			)
+				return "read_failed";
+			if (result) {
+				result.stat = {
+					dev: after.dev,
+					ino: after.ino,
+					nlink: after.nlink,
+					size: Number(after.size),
+					mtimeNs: after.mtimeNs,
+					ctimeNs: after.ctimeNs,
+					mtimeMs: Number(after.mtimeMs),
+					mtime: new Date(Number(after.mtimeMs)),
+					isFile: after.isFile(),
+				};
+			}
+			return consumer.finish(allowUnterminated);
+		} catch {
+			return "read_failed";
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+	const consumer = reuseLineAssembly
+		? createReusableBoundedLineChunkConsumer(visit)
+		: createBoundedLineChunkConsumer(visit);
+	let pos = 0;
+	let useLargeRecordCadence = false;
+	let bytesSinceGc = 0;
+	while (pos < size) {
+		const length = Math.min(chunkBytes, size - pos);
+		let chunk: Uint8Array;
+		try {
+			chunk = storage.readRangeSync!(filePath, pos, length).bytes;
+		} catch {
+			return "read_failed";
+		}
+		const failure = consumer.consume(Buffer.from(chunk), pos);
+		if (failure) return failure;
+		pos += length;
+		useLargeRecordCadence ||= consumer.hasLargePendingLine();
+		const gcIntervalBytes = useLargeRecordCadence
+			? size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
+				? 32 * 1024 * 1024
+				: 23 * 1024 * 1024
+			: 4 * 1024 * 1024;
+		bytesSinceGc += length;
+		if (bytesSinceGc >= gcIntervalBytes) {
+			Bun.gc(true);
+			bytesSinceGc = 0;
+		}
+	}
+	return consumer.finish(allowUnterminated);
+}
 
 export type DefaultModelSelectionStage = {
 	readonly entryRevision: number;
+	readonly leafRevision: number;
 	readonly headerExportRevision: number;
 	readonly sessionId: string;
 	readonly sessionFile: string | undefined;
 	readonly entries: readonly FileEntry[];
 	readonly tempPath: string | undefined;
 	readonly persistsToExistingFile: boolean;
+	readonly boundedCold: boolean;
+	readonly appendEntries: readonly SessionEntry[];
+	readonly sourceDescriptor: DescriptorSnapshot | undefined;
+	readonly sourceStat: SessionStorageStat | undefined;
+	readonly sourceSha256: string | undefined;
+	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
@@ -725,6 +1629,37 @@ function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set()
 		collectCheckpointBlobRefs(item, refs, childKey);
 	}
 	return refs;
+}
+
+const FORK_BLOB_VERIFY_MAX_BYTES = 16 * 1024 * 1024;
+
+function verifyForkBlobRefsBounded(value: unknown): boolean {
+	for (const ref of collectCheckpointBlobRefs(value)) {
+		const hash = parseBlobRef(ref);
+		if (!hash) return false;
+		const blobPath = path.join(getBlobsDir(), hash);
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(blobPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			const stat = fs.fstatSync(fd);
+			if (!stat.isFile() || stat.size > FORK_BLOB_VERIFY_MAX_BYTES) return false;
+			const digest = crypto.createHash("sha256");
+			const chunk = Buffer.allocUnsafe(64 * 1024);
+			let offset = 0;
+			while (offset < stat.size) {
+				const read = fs.readSync(fd, chunk, 0, Math.min(chunk.byteLength, stat.size - offset), offset);
+				if (read <= 0) return false;
+				digest.update(chunk.subarray(0, read));
+				offset += read;
+			}
+			if (digest.digest("hex") !== hash) return false;
+		} catch {
+			return false;
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+	return true;
 }
 
 function decodeCheckpointUtf8(data: Uint8Array): string | null {
@@ -924,21 +1859,24 @@ export interface ResumeTailTerminal {
 
 export interface ResumeTailError {
 	kind: "error";
-	reason: "missing" | "malformed" | "unstable" | "read-failed" | "legacy_migration_disabled" | "oversized";
+	reason:
+		| "missing"
+		| "malformed"
+		| "unstable"
+		| "read-failed"
+		| "legacy_migration_disabled"
+		| "oversized"
+		| "context_too_large";
 	size?: number;
 }
 
 export type SessionDirectoryMigrationPolicy = ManagedMigrationPolicy;
 export type SessionAppendPersistenceFailurePhase = "current_append" | "prior_failure";
 
-/**
- * Safety bound for resuming a single transcript file. Matches the managed-storage
- * per-file artifact limit (`MANAGED_ARTIFACT_MAX_FILE_BYTES`): transcripts at or above
- * this size are not loaded into memory wholesale because the decode + per-line JSON
- * parse + identity hash would OOM or stall the process (#3851). The bound is a
- * load-time guard only; it does not raise the on-disk managed-storage limit.
- */
+/** Safety bound for eager resume compatibility and managed per-file artifacts. */
 export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
+const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 1024 * 1024 * 1024;
+const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 
 export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
 	"The selected session transcript is too large to resume safely. Use `gjc export <session-file>` to export its content into a new session, or remove/archive it after confirming its content is no longer needed.";
@@ -996,6 +1934,32 @@ export class SessionTranscriptOversizedError extends Error {
 		this.size = size;
 	}
 }
+/** Operation-peak budget for one synchronous session-context materialization. */
+export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Thrown by the synchronous session-context builders when the materialized graph
+ * exceeds the operation budget. `instanceof`-stable across module boundaries:
+ * consumers map with `error instanceof SessionContextTooLargeError`, never by name
+ * string. The over-budget graph is never retained — the builder releases scratch
+ * before throwing and public synchronous signatures are unchanged.
+ */
+export class SessionContextTooLargeError extends Error {
+	readonly code = "context_too_large" as const;
+	readonly measuredBytes: number;
+	readonly budgetBytes: number;
+
+	constructor(
+		measuredBytes: number,
+		budgetBytes: number = SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES,
+		options?: ErrorOptions,
+	) {
+		super(`Session context exceeds the materialization budget (${measuredBytes} > ${budgetBytes} bytes)`, options);
+		this.name = "SessionContextTooLargeError";
+		this.measuredBytes = measuredBytes;
+		this.budgetBytes = budgetBytes;
+	}
+}
 
 export type ResumeTailInspection = ResumeTailResumable | ResumeTailTerminal | ResumeTailError;
 export interface StrictSessionOpenSuccess {
@@ -1015,17 +1979,40 @@ export interface StrictSessionOpenFailure {
 	size?: number;
 }
 
-/** Exact transcript bytes and authority captured from one descriptor-bound read. */
-export interface CapturedSessionTranscriptSnapshot {
-	sourcePath: string;
-	identity: ResumeSessionIdentity;
-	content: Uint8Array;
-	storage: SessionStorage;
+/**
+ * Descriptor-bound strict-capture handle. Bounded recorded-length range reads
+ * revalidate the live source against the captured identity on every pass; no
+ * whole-transcript buffer is ever materialized by capture or fork.
+ */
+export interface TranscriptSnapshotHandle {
+	readonly sourcePath: string;
+	readonly identity: ResumeSessionIdentity;
+	readonly storage: SessionStorage;
+	/**
+	 * Iterate every transcript line in bounded recorded-length reads. Each line
+	 * is delivered without its trailing newline; returning `false` aborts the
+	 * pass. A completed pass re-validates the running content hash against the
+	 * captured identity and throws `identity-mismatch` on divergence.
+	 */
+	forEachLine(callback: (line: Uint8Array) => boolean | undefined): boolean;
+	/** Descriptor captured after the most recent complete line pass, when supported. */
+	getLastReadStat(): SessionStorageStat | undefined;
+	/** Revalidate the live source against the captured identity (bounded). */
+	revalidate(): { kind: "valid" } | StrictSessionOpenFailure;
+	/** Idempotent close; subsequent reads throw. */
+	close(): void;
+	/**
+	 * Rehydrate the full transcript bytes for bounded-full-return consumers.
+	 * This is an explicit compatibility escape hatch, never used by fork/capture
+	 * publication itself.
+	 */
+	materialize(): Uint8Array;
 }
 
-export type StrictSessionCaptureResult =
-	| { kind: "captured"; snapshot: CapturedSessionTranscriptSnapshot }
-	| ResumeTailError;
+/** @deprecated Use {@link TranscriptSnapshotHandle}; retained for call-site compatibility. */
+export type CapturedSessionTranscriptSnapshot = TranscriptSnapshotHandle;
+
+export type StrictSessionCaptureResult = { kind: "captured"; snapshot: TranscriptSnapshotHandle } | ResumeTailError;
 
 export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager } | StrictSessionOpenFailure;
 
@@ -1241,7 +2228,11 @@ function generateId(byId: { has(id: string): boolean }): string {
 		const id = crypto.randomUUID().slice(-8);
 		if (!byId.has(id)) return id;
 	}
-	return Snowflake.next(); // fallback to full snowflake id
+	for (let i = 0; i < 100; i++) {
+		const id = Snowflake.next();
+		if (!byId.has(id)) return id;
+	}
+	throw new Error("Unable to generate a unique session entry id");
 }
 
 /** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
@@ -1353,34 +2344,7 @@ function isSupportedSessionVersion(version: unknown): boolean {
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
-	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
-	if (!isSupportedSessionVersion(rawHeader?.version)) {
-		throw new Error(`Unsupported session version: ${String(rawHeader?.version)}`);
-	}
-	const entries: FileEntry[] = [];
-	const entriesById = new Map<string, SessionEntry>();
-	let header: SessionHeader | undefined;
-
-	for (const record of records) {
-		// Patch records are valid in v4 and v5 only. Ignore patches before a valid
-		// header so malformed prefixes cannot affect later records.
-		if (record.type === "header_patch") {
-			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
-				applyHeaderPatch(header, record.patch);
-			continue;
-		}
-		if (record.type === "entry_patch") {
-			if (header?.version !== undefined && header.version >= 4 && isEntryPatchRecord(record)) {
-				const entry = entriesById.get(record.entryId);
-				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
-			}
-			continue;
-		}
-		entries.push(record);
-		if (record.type === "session") header ??= record;
-		else entriesById.set(record.id, record);
-	}
-	return entries;
+	return buildFileEntriesFromRecords(records);
 }
 
 function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchRecord {
@@ -1456,6 +2420,41 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
+/**
+ * Retained-byte estimate for one JSON-like value, matching the accountant's
+ * resident formula (string = 2 × chars + 16 B; array = 8 B/slot + elements;
+ * record = 48 B overhead + fields; scalars = 8 B). Shared/cyclic references are
+ * counted once via a visited set so the estimate reflects the materialized graph,
+ * not an unbounded expansion.
+ */
+function measureJsonLikeBytes(value: unknown, visited = new Set<object>()): number {
+	if (value === null || value === undefined) return 0;
+	if (typeof value === "string") return 2 * value.length + 16;
+	if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return 8;
+	if (typeof value !== "object") return 0;
+	if (visited.has(value)) return 0;
+	visited.add(value);
+	if (Array.isArray(value)) {
+		let bytes = value.length * 8;
+		for (const item of value) bytes += measureJsonLikeBytes(item, visited);
+		return bytes;
+	}
+	let bytes = 48;
+	for (const key of Object.keys(value)) {
+		bytes += 2 * key.length + 16;
+		bytes += measureJsonLikeBytes((value as Record<string, unknown>)[key], visited);
+	}
+	return bytes;
+}
+
+/** Measure one materialized {@link SessionContext} and throw when over the budget. */
+function assertSessionContextWithinBudget(context: SessionContext): SessionContext {
+	const measuredBytes = measureJsonLikeBytes(context);
+	if (measuredBytes > SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES) {
+		throw new SessionContextTooLargeError(measuredBytes);
+	}
+	return context;
+}
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -1553,6 +2552,10 @@ export function buildSessionContext(
 	// server-side model downgrades both produce assistant messages tagged
 	// with the wrong model id, which previously clobbered the user's pick on
 	// resume (issue #849).
+	// Legacy assistant-inference gate ONLY (see `getLastModelChangeRole` below): an
+	// explicit `model_change` with role="default" blocks later assistant-message
+	// inference into `models.default`. This flag never feeds `getLastModelChangeRole`,
+	// which is keyed solely on the nearest `model_change` entry (R1).
 	let hasExplicitDefaultModel = false;
 
 	for (const entry of path) {
@@ -1723,7 +2726,7 @@ export function buildSessionContext(
 		}
 	}
 
-	return {
+	return assertSessionContextWithinBudget({
 		messages,
 		thinkingLevel,
 		serviceTier,
@@ -1740,7 +2743,7 @@ export function buildSessionContext(
 		hasPersistedDiscoveredBuiltinToolSelection,
 		mode,
 		modeData,
-	};
+	});
 }
 
 function cloneSessionContext(context: SessionContext): SessionContext {
@@ -1842,33 +2845,31 @@ type ForkTranscriptPublication =
 			readonly kind: "managed";
 			readonly store: ManagedSessionDescendantStore;
 			readonly relativePath: string;
-			/** Bytes successfully installed by no-replace publication. */
-			readonly publishedBytes: Buffer;
-			/** Absent only while post-publication identity capture is failing. */
-			readonly snapshot?: ManagedFileSnapshot;
+			readonly sessionFile: string;
+			/** SHA-256 of the bytes installed by no-replace publication. */
+			readonly publishedSha256: string;
 	  }
 	| {
 			readonly kind: "explicit-file";
 			readonly sessionFile: string;
-			/** Bytes successfully installed by no-replace publication. */
-			readonly publishedBytes: Buffer;
-			/** Absent only while post-publication identity capture is failing. */
-			readonly snapshot?: ManagedFileSnapshot;
+			/** SHA-256 of the bytes installed by no-replace publication. */
+			readonly publishedSha256: string;
 	  }
 	| {
 			readonly kind: "explicit-storage";
 			readonly sessionFile: string;
-			/** Bytes successfully installed by transcript publication. */
-			readonly publishedBytes: Buffer;
-			/** Absent only while post-publication identity capture is failing. */
-			readonly snapshot?: SessionStorageSnapshot;
+			/** SHA-256 of the bytes installed by transcript publication. */
+			readonly publishedSha256: string;
 	  };
 
 function pruneResidentCacheEntries(snapshot: native.NativeDirectoryTreeSnapshot): native.NativeDirectoryTreeSnapshot {
 	return {
 		...snapshot,
 		entries: snapshot.entries.filter(
-			entry => entry.relativePath !== "resident-cache" && !entry.relativePath.startsWith("resident-cache/"),
+			entry =>
+				entry.relativePath !== "resident-cache" &&
+				!entry.relativePath.startsWith("resident-cache/") &&
+				!isDerivedSessionMemoryFile(entry.relativePath),
 		),
 	};
 }
@@ -2230,10 +3231,6 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 	);
 }
 
-function sameSessionStorageSnapshot(left: SessionStorageSnapshot, right: SessionStorageSnapshot): boolean {
-	return sameResumeStat(left.stat, right.stat) && Buffer.from(left.bytes).equals(Buffer.from(right.bytes));
-}
-
 interface ResumeInspectionSnapshot {
 	identity: ResumeSessionIdentity;
 	content: Uint8Array;
@@ -2254,7 +3251,7 @@ function resumeReadFailure(error: unknown, storage: SessionStorage, path: string
 	return { kind: "error", reason: missing ? "missing" : "read-failed" };
 }
 
-function hasStrictSessionSchema(entries: FileEntry[]): boolean {
+function hasStrictSessionSchema(entries: readonly FileEntry[]): boolean {
 	for (const entry of entries) {
 		const value = entry as unknown as Record<string, unknown>;
 		if (typeof value.type !== "string") return false;
@@ -2434,9 +3431,377 @@ function inspectResumeSessionFile(
 			sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
 		};
 		return { identity, content: bytes, entries, context, migrationApplied };
-	} catch {
+	} catch (error) {
+		// A synchronous builder overflow is a typed, non-malformed result: the
+		// transcript parsed and migrated cleanly but its materialized context
+		// exceeds the operation budget. Startup must fail closed with the typed
+		// reason and never misreport it as a corrupt transcript.
+		if (error instanceof SessionContextTooLargeError) {
+			return { kind: "error", reason: "context_too_large", size: error.measuredBytes };
+		}
 		return { kind: "error", reason: "malformed" };
 	}
+}
+export const TRANSCRIPT_CAPTURE_CHUNK_BYTES = 64 * 1024;
+const TRANSCRIPT_LINE_TERMINATOR = Buffer.from("\n", "utf8");
+
+interface BoundedTranscriptInspection {
+	identity: ResumeSessionIdentity;
+	cwd: string | undefined;
+}
+
+/**
+ * Bounded strict transcript inspection that never materializes the whole file.
+ * Header and identity are derived from descriptor-validated range reads; the
+ * running content hash covers the exact captured bytes.
+ */
+function inspectTranscriptBounded(
+	filePath: string,
+	storage: SessionStorage,
+	maxBytes = RESUME_TRANSCRIPT_MAX_BYTES,
+): { ok: true; inspection: BoundedTranscriptInspection } | { ok: false; error: ResumeTailError } {
+	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
+	let before: SessionStorageStat;
+	try {
+		before = storage.statSync(canonicalPath);
+	} catch (error) {
+		return { ok: false, error: resumeReadFailure(error, storage, canonicalPath) };
+	}
+	if (!before.isFile || typeof storage.readRangeSync !== "function") {
+		return { ok: false, error: { kind: "error", reason: "read-failed" } };
+	}
+	if (before.size > maxBytes) {
+		return { ok: false, error: { kind: "error", reason: "oversized", size: before.size } };
+	}
+
+	const hash = crypto.createHash("sha256");
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	let carry = "";
+	let sessionId: string | undefined;
+	let cwd: string | undefined;
+	try {
+		for (let offset = 0; offset < before.size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, before.size - offset);
+			const chunk = storage.readRangeSync(canonicalPath, offset, length).bytes;
+			hash.update(chunk);
+			const text = decoder.decode(chunk, { stream: offset + length < before.size });
+			const combined = carry + text;
+			const lines = combined.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (line.length === 0) continue;
+				const parsed = JSON.parse(line) as SessionHeader;
+				if (sessionId === undefined) {
+					if (parsed.type !== "session" || typeof parsed.id !== "string")
+						return { ok: false, error: { kind: "error", reason: "malformed" } };
+					sessionId = parsed.id;
+					cwd = typeof parsed.cwd === "string" ? parsed.cwd : undefined;
+				}
+			}
+			if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+		}
+	} catch {
+		return { ok: false, error: { kind: "error", reason: "malformed" } };
+	}
+	if (sessionId === undefined) return { ok: false, error: { kind: "error", reason: "malformed" } };
+
+	let after: SessionStorageStat;
+	try {
+		after = storage.statSync(canonicalPath);
+	} catch (error) {
+		return { ok: false, error: resumeReadFailure(error, storage, canonicalPath) };
+	}
+	if (!sameResumeStat(before, after)) return { ok: false, error: { kind: "error", reason: "unstable" } };
+
+	const identity: ResumeSessionIdentity = {
+		canonicalPath,
+		sessionId,
+		dev: before.dev,
+		ino: before.ino,
+		nlink: before.nlink,
+		size: before.size,
+		mtimeMs: before.mtimeMs,
+		mtimeNs: before.mtimeNs,
+		ctimeNs: before.ctimeNs,
+		sha256: hash.digest("hex"),
+	};
+	return { ok: true, inspection: { identity, cwd } };
+}
+
+/** Bounded source revalidation comparing the live file to a captured identity. */
+function revalidateTranscriptIdentityBounded(
+	filePath: string,
+	storage: SessionStorage,
+	expected: ResumeSessionIdentity,
+): { kind: "valid" } | StrictSessionOpenFailure {
+	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
+	if (storage instanceof FileSessionStorage) {
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(canonicalPath, flags);
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (
+				!before.isFile() ||
+				before.dev !== expected.dev ||
+				before.ino !== expected.ino ||
+				(expected.nlink !== undefined && before.nlink !== expected.nlink) ||
+				Number(before.size) !== expected.size ||
+				before.mtimeNs !== expected.mtimeNs ||
+				(expected.ctimeNs !== undefined && before.ctimeNs !== expected.ctimeNs)
+			)
+				return { kind: "error", reason: "identity-mismatch" };
+			const hash = crypto.createHash("sha256");
+			const chunk = Buffer.allocUnsafe(1024 * 1024);
+			let offset = 0;
+			while (offset < expected.size) {
+				const length = Math.min(chunk.byteLength, expected.size - offset);
+				const count = fs.readSync(fd, chunk, 0, length, offset);
+				if (count !== length) return { kind: "error", reason: "read-failed" };
+				hash.update(chunk.subarray(0, count));
+				offset += count;
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(canonicalPath, { bigint: true });
+			if (
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.nlink !== before.nlink ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				hash.digest("hex") !== expected.sha256
+			)
+				return { kind: "error", reason: "identity-mismatch" };
+			return { kind: "valid" };
+		} catch (error) {
+			return resumeReadFailure(error, storage, canonicalPath);
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+	let before: SessionStorageStat;
+	try {
+		before = storage.statSync(canonicalPath);
+	} catch (error) {
+		return resumeReadFailure(error, storage, canonicalPath);
+	}
+	if (!before.isFile || typeof storage.readRangeSync !== "function") {
+		return { kind: "error", reason: "read-failed" };
+	}
+	if (before.size !== expected.size) return { kind: "error", reason: "identity-mismatch" };
+	const hash = crypto.createHash("sha256");
+	try {
+		for (let offset = 0; offset < before.size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, before.size - offset);
+			hash.update(storage.readRangeSync(canonicalPath, offset, length).bytes);
+			if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+		}
+	} catch (error) {
+		return resumeReadFailure(error, storage, canonicalPath);
+	}
+	let after: SessionStorageStat;
+	try {
+		after = storage.statSync(canonicalPath);
+	} catch (error) {
+		return resumeReadFailure(error, storage, canonicalPath);
+	}
+	if (!sameResumeStat(before, after)) return { kind: "error", reason: "unstable" };
+	const observed: ResumeSessionIdentity = {
+		canonicalPath,
+		sessionId: expected.sessionId,
+		dev: before.dev,
+		ino: before.ino,
+		nlink: before.nlink,
+		size: before.size,
+		mtimeMs: before.mtimeMs,
+		mtimeNs: before.mtimeNs,
+		ctimeNs: before.ctimeNs,
+		sha256: hash.digest("hex"),
+	};
+	return sameResumeIdentity(expected, observed) ? { kind: "valid" } : { kind: "error", reason: "identity-mismatch" };
+}
+
+function createTranscriptSnapshotHandle(
+	inspection: BoundedTranscriptInspection,
+	filePath: string,
+	storage: SessionStorage,
+): TranscriptSnapshotHandle {
+	const canonicalPath = inspection.identity.canonicalPath;
+	const size = inspection.identity.size;
+	const readRangeSync = storage.readRangeSync?.bind(storage);
+	if (!readRangeSync) throw new Error("bounded_range_read_unavailable");
+	let closed = false;
+	let lastReadStat: SessionStorageStat | undefined;
+
+	const readAllLines = (callback: (line: Uint8Array) => boolean | undefined): boolean => {
+		if (closed) throw new Error("transcript_handle_closed");
+		const hash = crypto.createHash("sha256");
+		let aborted = false;
+		const scanResult: { stat?: SessionStorageStat } = {};
+		const failure = scanTranscriptLinesBounded(
+			storage,
+			canonicalPath,
+			size,
+			(_offset, line) => {
+				hash.update(line);
+				const body = line[line.byteLength - 1] === 0x0a ? line.subarray(0, line.byteLength - 1) : line;
+				if (body.byteLength === 0) return;
+				if (callback(body) === false) {
+					aborted = true;
+					return false;
+				}
+			},
+			scanResult,
+			true,
+			true,
+		);
+		if (failure && !(failure === "aborted" && aborted)) throw new Error(`transcript_scan_${failure}`);
+		if (aborted) return false;
+		if (
+			scanResult.stat &&
+			(scanResult.stat.dev !== inspection.identity.dev ||
+				scanResult.stat.ino !== inspection.identity.ino ||
+				(inspection.identity.nlink !== undefined && scanResult.stat.nlink !== inspection.identity.nlink) ||
+				scanResult.stat.size !== inspection.identity.size ||
+				scanResult.stat.mtimeNs !== inspection.identity.mtimeNs ||
+				(inspection.identity.ctimeNs !== undefined && scanResult.stat.ctimeNs !== inspection.identity.ctimeNs))
+		)
+			throw new Error("identity-mismatch");
+		lastReadStat = scanResult.stat;
+		if (hash.digest("hex") !== inspection.identity.sha256) throw new Error("identity-mismatch");
+		return true;
+	};
+
+	return {
+		sourcePath: path.resolve(filePath),
+		identity: inspection.identity,
+		storage,
+		forEachLine: readAllLines,
+		getLastReadStat: () => lastReadStat,
+		revalidate(): { kind: "valid" } | StrictSessionOpenFailure {
+			if (closed) throw new Error("transcript_handle_closed");
+			return revalidateTranscriptIdentityBounded(canonicalPath, storage, inspection.identity);
+		},
+		close(): void {
+			closed = true;
+		},
+		materialize(): Uint8Array {
+			if (closed) throw new Error("transcript_handle_closed");
+			if (size > SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES - TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+				throw new SessionContextTooLargeError(size, SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES);
+			}
+			const output = Buffer.allocUnsafe(size);
+			for (let offset = 0; offset < size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+				const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - offset);
+				Buffer.from(readRangeSync(canonicalPath, offset, length).bytes).copy(output, offset);
+			}
+			return output;
+		},
+	};
+}
+
+/**
+ * Apply header/entry patch records to a parsed record array. Mirrors the
+ * record-processing tail of {@link parseSessionEntries} so bounded fork parsing
+ * never needs to reconstruct a whole-transcript string.
+ */
+function buildFileEntriesFromRecords(records: Array<FileEntry | SessionPatchRecord>): FileEntry[] {
+	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
+	if (!isSupportedSessionVersion(rawHeader?.version)) {
+		throw new Error(`Unsupported session version: ${String(rawHeader?.version)}`);
+	}
+	const entries: FileEntry[] = [];
+	const entriesById = new Map<string, SessionEntry>();
+	let header: SessionHeader | undefined;
+	for (const record of records) {
+		if (record.type === "header_patch") {
+			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
+				applyHeaderPatch(header, record.patch);
+			continue;
+		}
+		if (record.type === "entry_patch") {
+			if (header?.version !== undefined && header.version >= 4 && isEntryPatchRecord(record)) {
+				const entry = entriesById.get(record.entryId);
+				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
+			}
+			continue;
+		}
+		entries.push(record);
+		if (record.type === "session") header ??= record;
+		else entriesById.set(record.id, record);
+	}
+	return entries;
+}
+
+/**
+ * Publish a fork transcript through the storage staged writer in bounded
+ * passes. Each entry is serialized independently (no whole-transcript
+ * string/Buffer) and installed with no-replace publication. Returns the
+ * SHA-256 of the exact bytes published for post-publication verification.
+ */
+function publishForkTranscriptStreaming(
+	storage: SessionStorage,
+	sessionFile: string,
+	destination: SessionDestination,
+	entries: readonly FileEntry[],
+	persist: (entry: FileEntry) => FileEntry,
+): string {
+	if (typeof storage.openStagedWriter !== "function") throw new Error("fork_publication_storage_unsupported");
+	const staged: StagedStreamingWriter = storage.openStagedWriter(sessionFile, {
+		securityContext: destination.kind === "managed" ? destination.securityContext : undefined,
+	});
+	const hash = crypto.createHash("sha256");
+	try {
+		for (const entry of entries) {
+			const persisted = persist(entry);
+			const line = Buffer.from(JSON.stringify(persisted), "utf8");
+			staged.writeLine(line);
+			hash.update(line);
+			hash.update(TRANSCRIPT_LINE_TERMINATOR);
+		}
+		staged.fsync();
+		staged.closeSync();
+		staged.publishNoReplace();
+	} catch (error) {
+		try {
+			staged.closeSync();
+		} catch {
+			// Preserve the primary publication failure.
+		}
+		throw error;
+	}
+	return hash.digest("hex");
+}
+
+/** Bounded read-back verification that an installed fork transcript matches the intended bytes. */
+function verifyForkTranscriptPublishedBounded(
+	storage: SessionStorage,
+	sessionFile: string,
+	expectedSha256: string,
+): void {
+	const readRangeSync = storage.readRangeSync?.bind(storage);
+	if (!readRangeSync) throw new Error("bounded_range_read_unavailable");
+	let size: number;
+	try {
+		size = storage.statSync(sessionFile).size;
+	} catch {
+		throw new Error("fork_transcript_changed");
+	}
+	const hash = crypto.createHash("sha256");
+	try {
+		for (let offset = 0; offset < size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - offset);
+			hash.update(readRangeSync(sessionFile, offset, length).bytes);
+		}
+	} catch {
+		throw new Error("fork_transcript_changed");
+	}
+	if (hash.digest("hex") !== expectedSha256) throw new Error("fork_transcript_changed");
 }
 
 function fsyncResumeSessionIdentity(expected: ResumeSessionIdentity): void {
@@ -3435,6 +4800,14 @@ function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 	return cloned;
 }
 
+/** Match eager-resume replay sanitation whenever an entry is loaded from a bounded sidecar path. */
+function sanitizeLoadedSessionEntryReplayMetadata(entry: SessionEntry): SessionEntry {
+	if (entry.type === "message" && entry.message.role === "assistant") {
+		entry.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
+	}
+	return entry;
+}
+
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
 	if (entry.type === "compaction") {
 		const cache = new Map<string, string>();
@@ -4081,6 +5454,26 @@ class NdjsonFileWriter {
 		const line = `${JSON.stringify(entry)}\n`;
 		try {
 			this.#writer.writeLineSync(line);
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+	fsyncSync(): void {
+		if (this.#closed || this.#closing) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		if (!this.#writer.fsyncSync) throw new Error("Synchronous session writer fsync is unavailable");
+		try {
+			this.#writer.fsyncSync();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+	statSync(): SessionStorageStat {
+		if (this.#closed || this.#closing) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		if (!this.#writer.statSync) throw new Error("Synchronous session writer descriptor capture is unavailable");
+		try {
+			return this.#writer.statSync();
 		} catch (err) {
 			throw this.#recordError(err);
 		}
@@ -4824,6 +6217,7 @@ export const SessionManagerTestHooks: {
 	beforeResidentTransitionIndexBuild?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
+	beforePersistPatchFence?: (attempt: number) => void;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -4844,6 +6238,25 @@ type ManagedDestinationTransition = {
 	rollback(): void;
 	dispose(): void;
 };
+/**
+ * Freshness snapshot captured with every async whole-session persistence
+ * preparation. Immediately before the synchronous persistence transaction, the
+ * live values are compared: a `sessionFile`/`lifecycleId` change aborts (lifecycle
+ * switch); a revision change discards the prepared bytes and re-prepares (bounded),
+ * so a stale snapshot is never published.
+ */
+export interface PersistenceInputToken {
+	/** Canonical session file path the prepared bytes target. */
+	sessionFile: string;
+	/** Per-manager lifecycle identity (`sessionId@sessionFile`); changes on switch/open/reset. */
+	lifecycleId: string;
+	/** Revision of #fileEntries affecting persisted bytes. */
+	entryRevision: number;
+	/** Header/version revision affecting persisted bytes. */
+	headerRevision: number;
+	/** Resident/blob store revision affecting persisted bytes. */
+	residentBlobRevision: number;
+}
 
 type EvictedToolOutputHandle = import("../tools/output-meta").EvictedToolOutputHandle;
 
@@ -4921,8 +6334,24 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
+	#persistenceFenceDepth = 0;
+	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
+	#commitGen = 0;
 	/** Failed staged persistence retains its exact writer and temporary pathname for retryable cleanup. */
 	#preparedNewSessionCleanupInProgress = false;
+	/** Active cold-sidecar runtime (retirement + lazy resolution). Undefined when disabled. */
+	#sidecarRuntime: SessionMemorySidecarRuntime | undefined = undefined;
+	#consecutiveSidecarBuildFailures = 0;
+	#sessionMemoryAutoDisabledReason: string | undefined;
+	#sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow";
+	#lazyReopenAttempted = false;
+	#lazyReopenSucceeded = false;
+	#lazyReopenFallbackReason: string | undefined;
+	#retirementFallbackReason: string | undefined;
+	#sidecarBranchActivationDirty = false;
+	/** Hot-suffix maintenance budget: 16 MiB steady-state (provider-invisible overrides allowed). */
+	#sidecarHotSuffixBudgetBytes = 16 * 1024 * 1024;
 
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
@@ -4950,9 +6379,12 @@ export class SessionManager {
 	/** Label-view cache invalidation contract; consumers may arrive after the revision field. */
 	#labelRevision = 0;
 	#replayMetadataRevision = 0;
+	/** Resident/blob store revision affecting persisted bytes; bumped when the store identity changes. */
+	#residentBlobRevision = 0;
 	#materializedEntriesRevision = -1;
 	#materializedEntriesCache: MaterializedCacheReference<SessionEntry[]> | undefined;
 	#sessionContextCache: MaterializedCacheReference<SessionContext> | undefined;
+	#sessionContextCacheOversized = false;
 	#materializedCachesWeaklyHeld = false;
 	#sessionContextEntryRevision = -1;
 	#sessionContextLeafRevision = -1;
@@ -5222,6 +6654,7 @@ export class SessionManager {
 		this.#materializedEntriesCache = undefined;
 		this.#materializedCachesWeaklyHeld = false;
 		this.#sessionContextCache = undefined;
+		this.#sessionContextCacheOversized = false;
 		this.#sessionContextEntryRevision = -1;
 		this.#sessionContextLeafRevision = -1;
 		this.#sessionContextReplayMetadataRevision = -1;
@@ -5279,46 +6712,27 @@ export class SessionManager {
 
 	async #cleanupForkTranscriptPublication(publication: ForkTranscriptPublication): Promise<void> {
 		if (publication.kind === "managed") {
-			const snapshot = publication.snapshot ?? publication.store.readExpected(publication.relativePath);
+			const snapshot = publication.store.readExpected(publication.relativePath);
 			if (!snapshot) return;
-			if (!snapshot.bytes.equals(publication.publishedBytes)) throw new Error("fork_transcript_changed");
+			if (snapshot.identity.sha256 !== publication.publishedSha256) throw new Error("fork_transcript_changed");
 			publication.store.removeExpected(publication.relativePath, snapshot);
 			return;
 		}
 		if (publication.kind === "explicit-storage") {
-			if (publication.snapshot) {
-				const current = this.storage.readSnapshotSync?.(publication.sessionFile);
-				if (
-					!current ||
-					!sameSessionStorageSnapshot(current, publication.snapshot) ||
-					!Buffer.from(current.bytes).equals(publication.publishedBytes)
-				) {
-					throw new Error("fork_transcript_changed");
-				}
-			} else {
-				if (!this.storage.existsSync(publication.sessionFile)) return;
-				const current = Buffer.from(this.storage.readTextSync(publication.sessionFile), "utf8");
-				if (!current.equals(publication.publishedBytes)) throw new Error("fork_transcript_changed");
-			}
+			if (!this.storage.existsSync(publication.sessionFile)) return;
+			verifyForkTranscriptPublishedBounded(this.storage, publication.sessionFile, publication.publishedSha256);
 			await this.storage.unlink(publication.sessionFile);
 			return;
 		}
-		let snapshot = publication.snapshot;
-		if (!snapshot) {
-			try {
-				snapshot = captureManagedFileNoFollow(publication.sessionFile);
-			} catch (error) {
-				if (isEnoent(error)) return;
-				throw error;
-			}
-		}
-		if (!snapshot.bytes.equals(publication.publishedBytes)) throw new Error("fork_transcript_changed");
+		if (!this.storage.existsSync(publication.sessionFile)) return;
+		verifyForkTranscriptPublishedBounded(this.storage, publication.sessionFile, publication.publishedSha256);
+		const named = fs.lstatSync(publication.sessionFile, { bigint: true });
 		const removed = nativeSessionManager().exactUnlink(publication.sessionFile, {
-			dev: snapshot.identity.dev,
-			ino: snapshot.identity.ino,
-			size: BigInt(snapshot.identity.size),
-			mtimeNs: snapshot.identity.mtimeNs,
-			sha256: snapshot.identity.sha256,
+			dev: named.dev,
+			ino: named.ino,
+			size: BigInt(named.size),
+			mtimeNs: named.mtimeNs,
+			sha256: publication.publishedSha256,
 			quarantineName: `.gjc-fork-${process.pid}-${crypto.randomUUID()}`,
 		});
 		if (
@@ -5355,17 +6769,24 @@ export class SessionManager {
 		}
 	}
 
-	#commitResidentTextStoreTransition(prepared: PreparedResidentStoreTransition): void {
+	#commitResidentTextStoreTransition(prepared: PreparedResidentStoreTransition, rebuildSidecars = true): void {
 		const predecessor = this.#residentTextBlobStore;
+		const successor = prepared.store;
 		this.#fileEntries = prepared.entries;
-		this.#residentTextBlobStore = prepared.store;
+		this.#residentTextBlobStore = successor;
 		this.#byId = prepared.index.byId;
 		this.#labelsById = prepared.index.labelsById;
 		this.#leafId = prepared.index.leafId;
 		this.#usageStatistics = prepared.index.usageStatistics;
 		this.#bumpAllRevisions();
+		this.#residentBlobRevision++;
 		prepared.adopt();
-		if (predecessor !== prepared.store) this.#disposeResidentTextStore(predecessor);
+		if (rebuildSidecars && this.persist && this.#sessionFile) {
+			this.#buildDisposableSidecars(this.#fileEntries);
+			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+		}
+		if (predecessor !== successor) this.#disposeResidentTextStore(predecessor);
+		prepared.releaseReferences();
 	}
 
 	#releaseResidentTextStore(): void {
@@ -5373,6 +6794,7 @@ export class SessionManager {
 		this.#residentTextBlobStore = new MemoryBlobStore();
 		this.#resetMaterializedCaches();
 		this.#disposeResidentTextStore(predecessor);
+		this.#residentBlobRevision++;
 	}
 
 	#demoteResidentTextStoreAfterTrustReject(error: ResidentCacheTrustError): void {
@@ -5436,6 +6858,7 @@ export class SessionManager {
 	}
 
 	captureState(): SessionManagerStateSnapshot {
+		this.#ensureFullHotView();
 		const materializedFileEntries = materializeResidentEntriesForReadSync(
 			this.#fileEntries,
 			this.#residentBlobStores(),
@@ -5556,9 +6979,852 @@ export class SessionManager {
 		);
 	}
 
+	async #tryInitSessionFileFromSidecar(sessionFile: string): Promise<boolean> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof this.storage.readRangeSync !== "function"
+		)
+			return false;
+		this.#lazyReopenAttempted = true;
+		this.#lazyReopenSucceeded = false;
+		this.#lazyReopenFallbackReason = "proof_invalid";
+		this.#sessionFile = sessionFile;
+		const runtime = this.#resetSidecarRuntime();
+		runtime.enabled = true;
+		let initialized = false;
+		try {
+			const commit = this.#readSessionCommitContents();
+			const descriptor = this.#managedDescriptorSnapshotOrNull();
+			if (
+				!commit ||
+				!descriptor ||
+				!commit.retirementFirstKeptEntryId ||
+				!commit.leafId ||
+				!commit.reducer ||
+				!Array.isArray(commit.providerStateEntries) ||
+				!commit.usageStatistics ||
+				!Array.isArray(commit.labels) ||
+				typeof commit.indexDigest !== "string" ||
+				!sameDescriptor(commit.descriptor, descriptor) ||
+				!this.#validateColdBase(commit.base)
+			)
+				return false;
+			const tailSize = this.storage.statSync(runtime.tailPath).size;
+			if (tailSize > runtime.tailCache.budgetBytes) return false;
+			const tailText = Buffer.from(this.storage.readRangeSync(runtime.tailPath, 0, tailSize).bytes).toString("utf8");
+			const records = tailText
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as TailRecord);
+			const validation = validateCommit(commit, records, {
+				descriptor,
+				baseValid: true,
+				tailValid: validateTailChain(commit.base, records).valid,
+				terminalMarkerValid: true,
+			});
+			if (validation.kind !== "valid") return false;
+			const fullBaseEmptyTail =
+				records.length === 0 &&
+				commit.base.baseEndOffset === descriptor.size &&
+				commit.transcriptSize === descriptor.size;
+			if (
+				(!fullBaseEmptyTail &&
+					(records.length === 0 ||
+						commit.leafId !== records.at(-1)?.id ||
+						commit.retirementFirstKeptEntryId !== records[0]?.id)) ||
+				!commit.labels.every(
+					entry => Array.isArray(entry) && entry.length === 2 && entry.every(value => typeof value === "string"),
+				) ||
+				!isValidPersistedReducerState(commit.reducer) ||
+				commit.providerStateEntries.length > 256 ||
+				Buffer.byteLength(JSON.stringify(commit.providerStateEntries), "utf8") > 4 * 1024 * 1024 ||
+				!commit.providerStateEntries.every(isProviderStateEntry) ||
+				![
+					commit.usageStatistics.input,
+					commit.usageStatistics.output,
+					commit.usageStatistics.cacheRead,
+					commit.usageStatistics.cacheWrite,
+					commit.usageStatistics.premiumRequests,
+					commit.usageStatistics.cost,
+				].every(isFiniteNonNegativeNumber)
+			)
+				return false;
+
+			// The commit authenticates base + tail but not the index; prove the exact
+			// `.spill.idx` bytes before any cold lookup may trust it. Absent or
+			// mismatched digests fail closed to the eager authoritative path.
+			let indexDescriptor: SessionStorageStat;
+			try {
+				indexDescriptor = this.storage.statSync(runtime.indexPath);
+			} catch {
+				return false;
+			}
+			if (!this.#validateColdIndexCoverage(sessionFile, descriptor.size, commit.indexDigest)) {
+				if (this.#lazyReopenFallbackReason !== "index_digest_mismatch")
+					this.#lazyReopenFallbackReason = "index_coverage_invalid";
+				return false;
+			}
+			Bun.gc(true);
+			if (fullBaseEmptyTail) {
+				let leafOrdinal: number | undefined;
+				let boundaryOrdinal: number | undefined;
+				const indexSize = this.storage.statSync(runtime.indexPath).size;
+				const scanFailure = scanTranscriptLinesBounded(
+					this.storage,
+					runtime.indexPath,
+					indexSize,
+					(_offset, lineBytes) => {
+						try {
+							const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as { id?: unknown; ordinal?: unknown };
+							if (typeof record.id !== "string" || !Number.isSafeInteger(record.ordinal)) return false;
+							if (record.id === commit.leafId) leafOrdinal = record.ordinal as number;
+							if (record.id === commit.retirementFirstKeptEntryId) boundaryOrdinal = record.ordinal as number;
+						} catch {
+							return false;
+						}
+					},
+				);
+				if (
+					scanFailure ||
+					leafOrdinal === undefined ||
+					boundaryOrdinal === undefined ||
+					boundaryOrdinal > leafOrdinal
+				)
+					return false;
+			}
+			runtime.indexDigest = commit.indexDigest;
+			runtime.validatedIndexDescriptor = indexDescriptor;
+			// The dictionary artifact is disposable acceleration: adoption failure
+			// only disables the fast path; the idx remains authoritative.
+			this.#adoptCommittedDictionary(commit.dictionary);
+			this.#adoptCommittedParentArtifact(commit.parentIndex);
+			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
+			const headerEnd = headerWindow.indexOf(10);
+			if (headerEnd < 0) return false;
+			const header = JSON.parse(Buffer.from(headerWindow.subarray(0, headerEnd)).toString("utf8")) as SessionHeader;
+			if (header.type !== "session" || header.version !== CURRENT_SESSION_VERSION) return false;
+			const hotEntries: SessionEntry[] = [];
+			for (const record of records) {
+				const line = this.storage.readRangeSync(sessionFile, record.byteOffset, record.byteLength).bytes;
+				if (computeLineDigest(line) !== record.recordDigest) return false;
+				const entry = JSON.parse(Buffer.from(line).toString("utf8")) as SessionEntry;
+				if (entry.id !== record.id || entry.type !== record.type) return false;
+				if (entry.parentId !== record.parentId) return false;
+				hotEntries.push(sanitizeLoadedSessionEntryReplayMetadata(entry));
+			}
+			const entries: FileEntry[] = [header, ...hotEntries];
+			await resolveBlobRefsInEntries(entries, this.#blobStore);
+			const tailResidentBytes = records.reduce((total, record) => total + tailRecordResidentBytes(record), 0);
+			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) return false;
+			const hotSuffixBytes = records.reduce((total, record) => total + record.byteLength, 0);
+			const hotResidentBytes = records.reduce(
+				(total, record) => total + residentHotEntryBytes(record.byteLength),
+				0,
+			);
+			const fixedReservedBytes =
+				runtime.blockCache.budgetBytes +
+				runtime.entryCache.budgetBytes +
+				runtime.tailCache.budgetBytes +
+				REDUCER_BUDGET_BYTES +
+				LABELS_PINS_BUDGET_BYTES +
+				1024 * 1024;
+			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotResidentBytes)) return false;
+			for (const [id, label] of commit.labels) if (!runtime.labelsPins.setLabel(id, label)) return false;
+			const prepared = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: header.id, sessionFile },
+					primary: {
+						mode: "materialize",
+						sourceEntries: entries,
+						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						missingPolicy: "placeholder",
+					},
+				},
+				"memory-fallback",
+			);
+			const terminalDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (!terminalDescriptor || !sameDescriptor(descriptor, terminalDescriptor)) {
+				prepared.dispose();
+				return false;
+			}
+			this.#sessionId = header.id;
+			this.#sessionName = header.title;
+			this.#titleSource = header.titleSource;
+			this.#needsFullRewriteOnNextPersist = false;
+			runtime.base = commit.base;
+			runtime.tail = {
+				base: commit.base,
+				records,
+				terminalChecksum: commit.terminalChecksum,
+				terminalSeq: commit.terminalSeq,
+				transcriptSize: commit.transcriptSize,
+			};
+			runtime.retirementFirstKeptEntryId = commit.retirementFirstKeptEntryId;
+			runtime.reducer = commit.reducer;
+			runtime.providerStateEntries = commit.providerStateEntries ?? [];
+			// Metadata-delta adoption is authoritative for provider state: any
+			// ambiguity in the binding or rehydration fails closed to the eager path.
+			if (!this.#adoptCommittedMetadataDelta(commit.metadataDelta)) return false;
+			runtime.hotSuffixBytes = hotSuffixBytes;
+			runtime.reopenTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
+			runtime.terminalTransition = runtime.reopenTransition;
+			this.#commitResidentTextStoreTransition(prepared, false);
+			this.#commitGen = commit.gen;
+			this.#usageStatistics = commit.usageStatistics;
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+			this.#lazyReopenSucceeded = true;
+			this.#lazyReopenFallbackReason = undefined;
+			initialized = true;
+			return true;
+		} catch {
+			return false;
+		} finally {
+			if (!initialized) {
+				this.#sidecarRuntime = undefined;
+				this.#sessionFile = undefined;
+			}
+		}
+	}
+
+	/**
+	 * Bounded first-open startup for `sessionMemoryMode: "enabled"` when no valid
+	 * reusable commit marker exists. Limited to ordinary current-version linear
+	 * transcript-v5 JSONL with no patch records, duplicate ids, branches,
+	 * migrations, or unsupported storage authority. Scans the transcript in
+	 * bounded 64 KiB ranges (two passes max) without `loadEntriesFromFile`,
+	 * `readText*`, `readBytesSync`, or a full entry graph, builds the disposable
+	 * `.spill.idx`/`.spill.tail`/`.spill.commit` set from exact raw bytes, and
+	 * materializes only header + hot suffix. Any malformed line, duplicate id,
+	 * patch record, unsupported shape, invalid compaction boundary, oversized
+	 * line, descriptor change, budget failure, or schema uncertainty cleans
+	 * partial sidecars/state and returns `false` so the caller falls back to the
+	 * existing eager authoritative path.
+	 */
+	async #tryBoundedFirstOpen(sessionFile: string): Promise<boolean> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof this.storage.readRangeSync !== "function"
+		)
+			return false;
+		this.#lazyReopenAttempted = true;
+		this.#lazyReopenSucceeded = false;
+		this.#sessionFile = sessionFile;
+		const runtime = this.#resetSidecarRuntime();
+		// A pre-existing commit marker means a sidecar set was previously published;
+		// stale/corrupt marker recovery (transcript_ahead, tail_ahead, rebuild)
+		// stays on the eager authoritative path so its classifications are preserved.
+		if (this.storage.existsSync(runtime.commitPath)) {
+			this.#sidecarRuntime = undefined;
+			this.#sessionFile = undefined;
+			return false;
+		}
+		this.#lazyReopenFallbackReason = "bounded_first_open_failed";
+		let initialized = false;
+		try {
+			const before = this.#managedDescriptorSnapshotOrNull();
+			if (!before || before.size === 0 || before.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES) {
+				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
+				return false;
+			}
+			const discovery = this.#scanBoundedTranscriptForFirstOpen(sessionFile, before);
+			if (!discovery) return false;
+			// The semantic pass's fixed duplicate table is no longer needed. Collect it
+			// before allocating publication buffers for ordinary-size transcripts; the
+			// one-GiB fork lane skips this pause to preserve its latency gate.
+			if (before.size < 512 * 1024 * 1024) Bun.gc(true);
+			const built = this.#buildBoundedFirstOpenSidecars(sessionFile, before, discovery);
+			if (!built) return false;
+			runtime.enabled = true;
+			this.#leafId = discovery.leafId;
+			this.#usageStatistics = discovery.usageStatistics;
+			this.#publishCommitMarkerFromCurrentTranscriptSync();
+			const publishedTransition = this.#classifySidecarReopen();
+			if (publishedTransition.kind !== "exact") {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return false;
+			}
+			const terminalDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (!terminalDescriptor || !sameDescriptor(before, terminalDescriptor)) {
+				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
+				return false;
+			}
+			const entries: FileEntry[] = [discovery.header, ...built.hotEntries];
+			await resolveBlobRefsInEntries(entries, this.#blobStore);
+			const prepared = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: discovery.header.id, sessionFile },
+					primary: {
+						mode: "materialize",
+						sourceEntries: entries,
+						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						missingPolicy: "placeholder",
+					},
+				},
+				"memory-fallback",
+			);
+			const finalDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (!finalDescriptor || !sameDescriptor(before, finalDescriptor)) {
+				prepared.dispose();
+				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
+				return false;
+			}
+			this.#sessionId = discovery.header.id;
+			this.#sessionName = discovery.header.title;
+			this.#titleSource = discovery.header.titleSource;
+			this.#needsFullRewriteOnNextPersist = false;
+			this.#commitResidentTextStoreTransition(prepared, false);
+			this.#usageStatistics = discovery.usageStatistics;
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+			runtime.reopenTransition = { kind: "rebuild", reason: "bounded_first_open" };
+			runtime.terminalTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
+			this.#lazyReopenSucceeded = true;
+			this.#lazyReopenFallbackReason = undefined;
+			initialized = true;
+			return true;
+		} catch {
+			return false;
+		} finally {
+			if (!initialized) {
+				for (const sidecarPath of this.#disposableSidecarPaths()) {
+					if (!sidecarPath) continue;
+					try {
+						this.storage.unlinkSync(sidecarPath);
+					} catch {
+						// Disposable sidecar cleanup is best-effort; the transcript remains authoritative.
+					}
+				}
+				this.#sidecarRuntime = undefined;
+				this.#sessionFile = undefined;
+			}
+		}
+	}
+
+	/**
+	 * Bounded first-open validation pass: verify an ordinary current-version
+	 * linear v5 transcript and derive the sidecar-relevant state (reducer, usage
+	 * totals, labels, retirement boundary) without materializing the file or
+	 * building an entry graph. Every malformed line, duplicate id, patch record,
+	 * unsupported shape, invalid compaction boundary, oversized line, budget
+	 * failure, or schema uncertainty sets the lazy fallback reason and returns
+	 * `undefined`.
+	 */
+	#scanBoundedTranscriptForFirstOpen(
+		sessionFile: string,
+		descriptor: DescriptorSnapshot,
+	): BoundedFirstOpenDiscovery | undefined {
+		const seenIds = new BoundedDictionaryIdSet();
+		const labelsById = new Map<string, string>();
+		let labelsBytes = 0;
+		const providerState = new Map<string, { ordinal: number; entry: SessionEntry; bytes: number }>();
+		let providerStateBytes = 0;
+		const usageStatistics: UsageStatistics = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			premiumRequests: 0,
+			cost: 0,
+		};
+		const addUsage = (totals: ValidatedUsageTotals | null): boolean => {
+			if (!totals) return false;
+			const next = {
+				input: usageStatistics.input + totals.input,
+				output: usageStatistics.output + totals.output,
+				cacheRead: usageStatistics.cacheRead + totals.cacheRead,
+				cacheWrite: usageStatistics.cacheWrite + totals.cacheWrite,
+				premiumRequests: usageStatistics.premiumRequests + totals.premiumRequests,
+				cost: usageStatistics.cost + totals.cost,
+			};
+			if (Object.values(next).some(value => !Number.isFinite(value))) return false;
+			Object.assign(usageStatistics, next);
+			return true;
+		};
+		const fail = (reason: string): false => {
+			this.#lazyReopenFallbackReason = reason;
+			return false;
+		};
+		let header: SessionHeader | undefined;
+		let ordinal = -1;
+		let lastId: string | undefined;
+		let latestModelChange: { ordinal: number; role: string | undefined } | undefined;
+		let latestTtsr: { ordinal: number; rulesCount: number; recordsCount: number; count: number } | undefined;
+		let latestCompactionBoundary: { firstKeptEntryId: string } | undefined;
+		let scannedBytes = 0;
+		const scanFailure = scanTranscriptLinesBounded(
+			this.storage,
+			sessionFile,
+			descriptor.size,
+			(lineStart, lineBytes) => {
+				scannedBytes = lineStart + lineBytes.byteLength;
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
+				} catch {
+					return fail("bounded_scan_malformed");
+				}
+				if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+					return fail("bounded_scan_malformed");
+				const record = parsed as Record<string, unknown>;
+				if (typeof record.type !== "string" || typeof record.id !== "string") return fail("bounded_scan_malformed");
+				if (!hasStrictSessionSchema([record as unknown as FileEntry])) return fail("bounded_scan_unsupported");
+				if (lineStart === 0) {
+					if (
+						record.type !== "session" ||
+						record.version !== CURRENT_SESSION_VERSION ||
+						typeof record.timestamp !== "string" ||
+						typeof record.cwd !== "string"
+					)
+						return fail("bounded_scan_unsupported");
+					header = record as unknown as SessionHeader;
+					return;
+				}
+				if (record.type === "session") return fail("bounded_scan_unsupported");
+				if (record.type === "header_patch" || record.type === "entry_patch")
+					return fail("bounded_scan_unsupported");
+				if (typeof record.timestamp !== "string") return fail("bounded_scan_malformed");
+				const parentId = record.parentId;
+				if (parentId !== null && typeof parentId !== "string") return fail("bounded_scan_malformed");
+				ordinal++;
+				if (ordinal === 0 ? parentId !== null : parentId !== lastId) return fail("bounded_scan_branch");
+				const idAdd = seenIds.add(record.id);
+				if (idAdd === "duplicate") return fail("bounded_scan_duplicate");
+				if (idAdd === "full") return fail("bounded_scan_budget");
+				if (record.type === "compaction") {
+					if (
+						typeof record.firstKeptEntryId !== "string" ||
+						record.firstKeptEntryId === record.id ||
+						!seenIds.has(record.firstKeptEntryId)
+					)
+						return fail("bounded_scan_invalid_compaction");
+					latestCompactionBoundary = { firstKeptEntryId: record.firstKeptEntryId };
+				} else if (record.type === "model_change") {
+					latestModelChange = { ordinal, role: typeof record.role === "string" ? record.role : undefined };
+				} else if (record.type === "ttsr_injection") {
+					if (!Array.isArray(record.injectedRules)) return fail("bounded_scan_unsupported");
+					const injectedRuleRecords = record.injectedRuleRecords;
+					if (injectedRuleRecords !== undefined && !Array.isArray(injectedRuleRecords))
+						return fail("bounded_scan_unsupported");
+					const ttsrMessageCount = record.ttsrMessageCount;
+					if (ttsrMessageCount !== undefined && typeof ttsrMessageCount !== "number")
+						return fail("bounded_scan_unsupported");
+					latestTtsr = {
+						ordinal,
+						rulesCount: record.injectedRules.length,
+						recordsCount: injectedRuleRecords === undefined ? 0 : injectedRuleRecords.length,
+						count: ttsrMessageCount ?? 0,
+					};
+				} else if (record.type === "label") {
+					if (typeof record.targetId !== "string") return fail("bounded_scan_unsupported");
+					const label = record.label;
+					if (label !== undefined && typeof label !== "string") return fail("bounded_scan_unsupported");
+					if (label) {
+						const existing = labelsById.get(record.targetId);
+						const existingBytes =
+							existing === undefined
+								? 0
+								: residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
+						const nextBytes = residentStringBytes(record.targetId) + residentStringBytes(label) + 48;
+						if (labelsBytes - existingBytes + nextBytes > LABELS_PINS_BUDGET_BYTES)
+							return fail("bounded_scan_budget");
+						labelsBytes += nextBytes - existingBytes;
+						labelsById.set(record.targetId, label);
+					} else {
+						const existing = labelsById.get(record.targetId);
+						if (existing !== undefined)
+							labelsBytes -= residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
+						labelsById.delete(record.targetId);
+					}
+				} else if (record.type === "message") {
+					if (record.message === null || typeof record.message !== "object")
+						return fail("bounded_scan_unsupported");
+					const message = record.message as Record<string, unknown>;
+					let usage: unknown;
+					if (message.role === "assistant") {
+						usage = message.usage;
+					} else if (message.role === "toolResult" && message.toolName === "task") {
+						usage = getTaskToolUsage(message.details);
+					}
+					if (usage !== undefined && !addUsage(validatePersistedUsageTotals(usage)))
+						return fail("bounded_scan_unsupported");
+				}
+				const providerEntry = record as unknown as SessionEntry;
+				const providerKey = providerStateEntryKey(providerEntry);
+				if (providerKey) {
+					const bytes = lineBytes.byteLength + 64;
+					const previous = providerState.get(providerKey);
+					const nextBytes = providerStateBytes - (previous?.bytes ?? 0) + bytes;
+					if (providerState.size >= 256 && !previous) return fail("bounded_scan_budget");
+					if (nextBytes > REDUCER_BUDGET_BYTES) return fail("bounded_scan_budget");
+					providerStateBytes = nextBytes;
+					providerState.set(providerKey, { ordinal, entry: providerEntry, bytes });
+				}
+				lastId = record.id;
+				if ((ordinal & 4095) === 0) Bun.gc(true);
+			},
+		);
+		if (scanFailure) {
+			if (scanFailure === "oversized_line") this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
+			else if (scanFailure === "unterminated") this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+			else if (scanFailure === "read_failed") this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
+			// "aborted": the callback already recorded a specific reason.
+			return undefined;
+		}
+		if (!header || ordinal < 0) {
+			this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+			return undefined;
+		}
+		if (scannedBytes !== descriptor.size) {
+			this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+			return undefined;
+		}
+		if (!latestCompactionBoundary) {
+			this.#lazyReopenFallbackReason = "bounded_scan_invalid_compaction";
+			return undefined;
+		}
+		const reducer: ReducerState = {
+			modelChange: { latest: latestModelChange },
+			ttsr: {
+				count: latestTtsr?.count ?? 0,
+				rulesCount: latestTtsr?.rulesCount ?? 0,
+				recordsCount: latestTtsr?.recordsCount ?? 0,
+				largestOrdinal: latestTtsr?.ordinal ?? -1,
+			},
+		};
+		if (!isValidPersistedReducerState(reducer)) {
+			this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
+			return undefined;
+		}
+		return {
+			header,
+			leafId: lastId!,
+			recordCount: ordinal + 1,
+			retirementFirstKeptEntryId: latestCompactionBoundary.firstKeptEntryId,
+			reducer,
+			usageStatistics,
+			labels: [...labelsById],
+			providerState: [...providerState.values()]
+				.sort((left, right) => left.ordinal - right.ordinal)
+				.map(item => ({ ordinal: item.ordinal, entry: item.entry })),
+		};
+	}
+
+	/**
+	 * Bounded first-open build pass: write the disposable `.spill.idx`/`.spill.tail`
+	 * set from exact raw transcript bytes and collect the hot suffix entries.
+	 * Digests/offsets cover the exact file bytes (including newlines) so the
+	 * existing authenticated reopen path validates them. Any inconsistency or
+	 * budget failure returns `undefined`; the caller then cleans partial sidecars
+	 * and falls back to the eager authoritative path.
+	 */
+	#buildBoundedFirstOpenSidecars(
+		sessionFile: string,
+		descriptor: DescriptorSnapshot,
+		discovery: BoundedFirstOpenDiscovery,
+	): { hotEntries: SessionEntry[]; hotSuffixBytes: number } | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.indexPath || !runtime.tailPath) return undefined;
+		let indexWriter: SessionStorageWriter | undefined;
+		let tailWriter: SessionStorageWriter | undefined;
+		const baseHash = crypto.createHash("sha256");
+		let tailBuilder: RollingTailChainBuilder | undefined;
+		let ordinal = -1;
+		let previousId: string | undefined;
+		let tailSeq = 0;
+		let inTail = false;
+		let baseEndOffset = 0;
+		let baseDigest = "";
+		let hotSuffixBytes = 0;
+		let hotResidentBytes = 0;
+		let tailResidentBytes = 0;
+		let scannedBytes = 0;
+		const hotEntries: SessionEntry[] = [];
+		let buildFailed = false;
+		let secondaryArtifactsEligible =
+			descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES &&
+			discovery.recordCount <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS;
+		const parentBuilder = new BoundedParentArtifactBuilder();
+		// Persistent dictionary scratch stays below the 20 MiB acceptance cap.
+		// Oversized inputs retain the authenticated flat-index fallback instead.
+		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
+		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const partitionRecords = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const dictionaryBuilder = new BoundedDictionaryArtifactBuilder({
+			detector: new BoundedDictionaryIdSet(),
+			target: this.#createDictionaryFlushTarget(partitionHashes, partitionSizes, partitionRecords),
+		});
+		// Metadata-delta section state (fixed 4 MiB reducer budget).
+		const metadataDeltaState = this.#createMetadataDeltaRuntimeState();
+		runtime.metadataDelta = metadataDeltaState;
+		try {
+			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
+			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
+			const scanFailure = scanTranscriptLinesBounded(
+				this.storage,
+				sessionFile,
+				descriptor.size,
+				(lineStart, lineBytes) => {
+					scannedBytes = lineStart + lineBytes.byteLength;
+					let parsed: unknown;
+					try {
+						parsed = JSON.parse(Buffer.from(lineBytes).toString("utf8"));
+					} catch {
+						buildFailed = true;
+						return false;
+					}
+					if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+						buildFailed = true;
+						return false;
+					}
+					const record = parsed as Record<string, unknown>;
+					if (typeof record.id !== "string" || typeof record.type !== "string") {
+						buildFailed = true;
+						return false;
+					}
+					if (ordinal === -1) {
+						if (record.type !== "session") {
+							buildFailed = true;
+							return false;
+						}
+						baseHash.update(lineBytes);
+						ordinal = 0;
+						return;
+					}
+					const parentId = record.parentId;
+					if (parentId !== null && typeof parentId !== "string") {
+						buildFailed = true;
+						return false;
+					}
+					if (ordinal === 0 ? parentId !== null : parentId !== previousId) {
+						buildFailed = true;
+						return false;
+					}
+					const recordDigest = computeLineDigest(lineBytes);
+					const byteLength = lineBytes.byteLength;
+					if (!inTail && record.id === discovery.retirementFirstKeptEntryId) {
+						inTail = true;
+						baseEndOffset = lineStart;
+						baseDigest = baseHash.digest("hex");
+						tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
+					}
+					const indexLine = `${JSON.stringify({
+						id: record.id,
+						ordinal,
+						seq: ordinal,
+						byteOffset: lineStart,
+						byteLength,
+						recordDigest,
+						parentId,
+						entryType: record.type,
+					})}\n`;
+					indexWriter!.writeLineSync(indexLine);
+					runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+					if (ordinal >= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS) secondaryArtifactsEligible = false;
+					if (secondaryArtifactsEligible) {
+						const dictionaryAdd = dictionaryBuilder.add({
+							id: record.id,
+							ordinal,
+							seq: ordinal,
+							byteOffset: lineStart,
+							byteLength,
+							recordDigest,
+							parentId,
+							entryType: record.type,
+						});
+						if (dictionaryAdd.kind !== "ok") {
+							buildFailed = true;
+							return false;
+						}
+						if (typeof parentId === "string") {
+							parentBuilder.add({
+								parentId,
+								childId: record.id,
+								ordinal,
+								seq: ordinal,
+								byteOffset: lineStart,
+								byteLength,
+								recordDigest,
+								entryType: record.type,
+							});
+						}
+					}
+					if (inTail) {
+						const entry = parsed as SessionEntry;
+						hotEntries.push(sanitizeLoadedSessionEntryReplayMetadata(entry));
+						hotSuffixBytes += byteLength;
+						hotResidentBytes += residentHotEntryBytes(byteLength);
+						if (hotSuffixBytes > this.#sidecarHotSuffixBudgetBytes) {
+							buildFailed = true;
+							return false;
+						}
+						const tailRecord = tailBuilder?.append({
+							seq: tailSeq,
+							kind: tailRecordKindForEntry(entry),
+							ordinal,
+							id: record.id,
+							parentId: parentId as string | null,
+							type: record.type,
+							byteOffset: lineStart,
+							byteLength,
+							recordDigest,
+						});
+						if (!tailRecord) {
+							buildFailed = true;
+							return false;
+						}
+						tailWriter!.writeLineSync(`${JSON.stringify(tailRecord)}\n`);
+						tailSeq++;
+						tailResidentBytes += tailRecordResidentBytes(tailRecord);
+					} else {
+						baseHash.update(lineBytes);
+					}
+					ordinal++;
+					previousId = record.id;
+					if ((ordinal & 4095) === 0) Bun.gc(true);
+				},
+			);
+			if (scanFailure || buildFailed) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			if (scannedBytes !== descriptor.size || !inTail || !tailBuilder) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			const tail = tailBuilder.build();
+			if (tail.transcriptSize !== descriptor.size || tail.records.length === 0) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			if (!indexWriter?.fsyncSync || !tailWriter?.fsyncSync)
+				throw new Error("Synchronous sidecar fsync is unavailable");
+			indexWriter.fsyncSync();
+			tailWriter.fsyncSync();
+			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) {
+				this.#lazyReopenFallbackReason = "bounded_scan_budget";
+				return undefined;
+			}
+			const fixedReservedBytes =
+				runtime.blockCache.budgetBytes +
+				runtime.entryCache.budgetBytes +
+				runtime.tailCache.budgetBytes +
+				REDUCER_BUDGET_BYTES +
+				LABELS_PINS_BUDGET_BYTES +
+				1024 * 1024;
+			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotResidentBytes)) {
+				this.#lazyReopenFallbackReason = "bounded_scan_budget";
+				return undefined;
+			}
+			runtime.base = { baseDigest, baseEndOffset };
+			runtime.tail = tail;
+			runtime.retirementFirstKeptEntryId = discovery.retirementFirstKeptEntryId;
+			runtime.reducer = discovery.reducer;
+			runtime.hotSuffixBytes = hotSuffixBytes;
+
+			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+			metadataDeltaState.indexDigest = runtime.indexDigest;
+			if (secondaryArtifactsEligible) {
+				const dictionaryResult = dictionaryBuilder.finish(discovery.header.id, runtime.indexDigest);
+				if (dictionaryResult.kind !== "ok" || dictionaryResult.commit.sidecarIneligible) {
+					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+					return undefined;
+				}
+				if (
+					!this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords)
+				) {
+					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+					return undefined;
+				}
+			} else {
+				runtime.dictionary = undefined;
+			}
+			// Provider state with oversized-value demotion: values over
+			// MAX_REDUCER_INLINE_BYTES are persisted to the metadata-delta section
+			// (before the marker binds their descriptors) with exact location+digest
+			// and are NOT retained resident — only a 24 B descriptor is kept. The
+			// merged provider order is tracked explicitly so reopen reproduces the
+			// exact slot sequence.
+			runtime.providerStateEntries = [];
+			runtime.providerStateOrder = [];
+			for (const provider of discovery.providerState) {
+				const providerKey = providerStateEntryKey(provider.entry);
+				if (!providerKey) continue;
+				runtime.providerStateOrder.push(providerKey);
+				const persistedLine = Buffer.from(`${JSON.stringify(provider.entry)}\n`, "utf8");
+				if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
+					const stored = this.#appendMetadataDeltaValue(persistedLine);
+					if (stored) {
+						metadataDeltaState.byKey.set(providerKey, {
+							kind: provider.entry.type,
+							ordinal: provider.ordinal,
+							...stored,
+						});
+					} else {
+						metadataDeltaState.byKey.delete(providerKey);
+						runtime.providerStateEntries.push(cloneSessionEntry(provider.entry));
+					}
+				} else {
+					runtime.providerStateEntries.push(cloneSessionEntry(provider.entry));
+				}
+			}
+			this.#syncMetadataDeltaDescriptorBytes();
+			if (secondaryArtifactsEligible) this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+			else runtime.parentArtifact = undefined;
+			try {
+				const validated = this.storage.statSync(runtime.indexPath);
+				runtime.validatedIndexDescriptor = validated;
+			} catch {
+				// A missing index falls back to the authoritative digest re-verification path.
+			}
+			for (const [id, label] of discovery.labels) {
+				if (!runtime.labelsPins.setLabel(id, label)) {
+					this.#lazyReopenFallbackReason = "bounded_scan_budget";
+					return undefined;
+				}
+			}
+			return { hotEntries, hotSuffixBytes };
+		} finally {
+			try {
+				indexWriter?.closeSync();
+			} catch {
+				// Best-effort writer cleanup; partial sidecars are unlinked by the caller.
+			}
+			try {
+				tailWriter?.closeSync();
+			} catch {
+				// Best-effort writer cleanup; partial sidecars are unlinked by the caller.
+			}
+		}
+	}
+
 	/** Initialize with a specific session file (used by factory methods). */
 	async #initSessionFile(sessionFile: string): Promise<void> {
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		const sidecarRoot = resolvedSessionFile.endsWith(".jsonl")
+			? resolvedSessionFile.slice(0, -6)
+			: resolvedSessionFile;
+		const publishedSidecarWasPresent =
+			this.#sessionMemoryMode === "enabled" &&
+			this.storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
+		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
+			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			return;
+		}
+
+		if (await this.#tryBoundedFirstOpen(resolvedSessionFile)) {
+			if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
+				this.#sessionMemoryMode = "shadow";
+				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
+			}
+			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			return;
+		}
+		const eagerStat = this.storage.statSync(resolvedSessionFile);
+		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
 		const entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
 		if (entries.length === 0) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
@@ -5598,6 +7864,10 @@ export class SessionManager {
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
+			this.#sessionMemoryMode = "shadow";
+			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
+		}
 	}
 
 	async #hydrateExistingSession(
@@ -5736,6 +8006,7 @@ export class SessionManager {
 					prepared.dispose();
 					throw error;
 				}
+				entries.length = 0;
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 				managedTransition?.settle();
 				this.#pendingStrictAdoption = undefined;
@@ -6039,6 +8310,7 @@ export class SessionManager {
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
+		this.#ensureFullHotView();
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
 		const timestamp = new Date().toISOString();
@@ -6397,6 +8669,7 @@ export class SessionManager {
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.persist || !this.#sessionFile) return undefined;
+		this.#ensureFullHotView();
 
 		const oldSessionFile = this.#sessionFile;
 		const oldSessionId = this.#sessionId;
@@ -6434,38 +8707,40 @@ export class SessionManager {
 		let transition: PreparedResidentStoreTransition | undefined;
 		try {
 			forkArtifactPublication = await this.copyArtifactsForFork(oldSessionFile, newSessionFile);
-			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
-			const contentBytes = Buffer.from(content, "utf8");
+			// Publish each already-materialized entry through the staged writer without
+			// joining the transcript into another whole-file string/Buffer. Retired cold
+			// history was rehydrated above and is therefore not omitted.
+			const publishedSha256 = publishForkTranscriptStreaming(
+				this.storage,
+				newSessionFile,
+				this.destination,
+				entries,
+				entry => prepareEntryForPersistenceSync(entry, this.#blobStore),
+			);
 			if (this.destination.kind === "managed") {
 				const store = this.#managedTranscriptStore(newSessionFile);
 				const relativePath = path.basename(newSessionFile);
-				await store.publishNoReplace(relativePath, contentBytes);
-				const publication = { kind: "managed" as const, store, relativePath, publishedBytes: contentBytes };
-				forkTranscriptPublication = publication;
 				const snapshot = store.readExpected(relativePath);
 				if (!snapshot) throw new Error("managed_fork_transcript_publish_missing");
-				forkTranscriptPublication = { ...publication, snapshot };
+				forkTranscriptPublication = {
+					kind: "managed",
+					store,
+					relativePath,
+					sessionFile: newSessionFile,
+					publishedSha256: snapshot.identity.sha256,
+				};
 			} else if (this.storage instanceof FileSessionStorage) {
-				await writeOwnerOnlyFileNoReplace(newSessionFile, content);
-				const publication = {
-					kind: "explicit-file" as const,
+				forkTranscriptPublication = {
+					kind: "explicit-file",
 					sessionFile: newSessionFile,
-					publishedBytes: contentBytes,
+					publishedSha256,
 				};
-				forkTranscriptPublication = publication;
-				forkTranscriptPublication = { ...publication, snapshot: captureManagedFileNoFollow(newSessionFile) };
 			} else {
-				if (this.storage.existsSync(newSessionFile)) throw new Error("destination_conflict");
-				await this.storage.writeText(newSessionFile, content);
-				const publication = {
-					kind: "explicit-storage" as const,
+				forkTranscriptPublication = {
+					kind: "explicit-storage",
 					sessionFile: newSessionFile,
-					publishedBytes: contentBytes,
+					publishedSha256,
 				};
-				forkTranscriptPublication = publication;
-				const snapshot = this.storage.readSnapshotSync?.(newSessionFile);
-				if (!snapshot) throw new Error("fork_transcript_identity_unavailable");
-				forkTranscriptPublication = { ...publication, snapshot };
 			}
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
@@ -6487,13 +8762,12 @@ export class SessionManager {
 			}
 
 			if (forkTranscriptPublication?.kind === "managed") {
-				const snapshot = forkTranscriptPublication.snapshot;
 				const terminalTranscript = forkTranscriptPublication.store.readExpected(
 					forkTranscriptPublication.relativePath,
 				);
 				if (
-					!snapshot?.bytes.equals(forkTranscriptPublication.publishedBytes) ||
-					!managedFileSnapshotEquals(terminalTranscript, snapshot ?? null)
+					!terminalTranscript ||
+					terminalTranscript.identity.sha256 !== forkTranscriptPublication.publishedSha256
 				) {
 					throw new Error("managed_fork_transcript_changed");
 				}
@@ -6596,7 +8870,11 @@ export class SessionManager {
 					recursive: true,
 					filter: source => {
 						const relativePath = path.relative(sourceDir, source);
-						return relativePath !== "resident-cache" && !relativePath.startsWith(`resident-cache${path.sep}`);
+						return (
+							relativePath !== "resident-cache" &&
+							!relativePath.startsWith(`resident-cache${path.sep}`) &&
+							!isDerivedSessionMemoryFile(relativePath)
+						);
 					},
 				});
 				const capturedStaging = nativeSessionManager().snapshotDirectoryTree(stagingDir);
@@ -7098,6 +9376,10 @@ export class SessionManager {
 		const malformedUsageSample: string[] = [];
 		for (const entry of fileEntries) {
 			if (entry.type === "session") continue;
+			if (entry.parentId !== null) {
+				const canonicalParent = byId.get(entry.parentId);
+				if (canonicalParent) entry.parentId = canonicalParent.id;
+			}
 			byId.set(entry.id, entry);
 			leafId = entry.id;
 			if (entry.type === "label") {
@@ -7198,6 +9480,52 @@ export class SessionManager {
 			this.#recordPersistError(err);
 		});
 		return next;
+	}
+	/**
+	 * Non-yielding same-session persistence fence. One owner serializes the critical
+	 * mutation transaction (transcript append/rewrite, descriptor capture, commit
+	 * expected-state check/publication). Async work may await BEFORE entering; once
+	 * entered the transaction is fully synchronous with no intermediate await.
+	 * Reentrant nested calls use a depth counter; the guard is never held across an
+	 * await; no cross-fence acquisition. External/cross-process protection stays with
+	 * the managed authority (RecoveryFsRoot, identity checks, exactReplacePath).
+	 */
+	#withSessionPersistenceFenceSync<T>(operation: () => T): T {
+		if (this.#persistenceFenceDepth > 0) return operation();
+		this.#persistenceFenceDepth = 1;
+		try {
+			return operation();
+		} finally {
+			this.#persistenceFenceDepth = 0;
+		}
+	}
+
+	/** Freshness snapshot for the current whole-session persistence input. */
+	#capturePersistenceInputToken(): PersistenceInputToken {
+		return {
+			sessionFile: this.#sessionFile ?? "",
+			lifecycleId: `${this.#sessionId}@${this.#sessionFile ?? ""}`,
+			entryRevision: this.#entryRevision,
+			headerRevision: this.#headerExportRevision,
+			residentBlobRevision: this.#residentBlobRevision,
+		};
+	}
+
+	/**
+	 * Compares a captured preparation snapshot against live state. A lifecycle/session
+	 * switch aborts (throws); a revision change returns false so the caller discards
+	 * the prepared bytes and re-prepares. A stale snapshot is never published.
+	 */
+	#persistenceInputTokenMatches(token: PersistenceInputToken): boolean {
+		const live = this.#capturePersistenceInputToken();
+		if (live.sessionFile !== token.sessionFile || live.lifecycleId !== token.lifecycleId) {
+			throw new Error("session_persistence_lifecycle_changed");
+		}
+		return (
+			live.entryRevision === token.entryRevision &&
+			live.headerRevision === token.headerRevision &&
+			live.residentBlobRevision === token.residentBlobRevision
+		);
 	}
 
 	#ensurePersistWriter(): NdjsonFileWriter | undefined {
@@ -7463,68 +9791,3242 @@ export class SessionManager {
 		this.#managedTranscriptStoreCache = { directory: sessionDir, store };
 		return store;
 	}
+	/**
+	 * Mutable commit-marker publication for managed destinations, executed inside the
+	 * persistence fence. The transcript is authoritative; the marker is disposable.
+	 * Checked create-while-missing / replace-only-on-exact-present (raw hash +
+	 * descriptor identity) guarantee stale bytes are never published; a diverging
+	 * marker (cross-process mutation) aborts and is left untouched for reopen
+	 * classification. `gen` is the publication fence counter only.
+	 */
+	#publishSessionCommitMarkerSync(descriptor: SessionStorageStat): boolean {
+		if (this.#sidecarBranchActivationDirty) return false;
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return false;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || runtime.tail.transcriptSize !== descriptor.size) return false;
+		const options =
+			this.destination.kind === "managed" ? { securityContext: this.destination.securityContext } : undefined;
+		return this.#withSessionPersistenceFenceSync(() => {
+			const markerPath = runtime.commitPath;
+			const gen = this.#commitGen + 1;
+			const metadataDeltaCommit = this.#buildMetadataDeltaCommit();
+			const record = {
+				gen,
+				descriptor: {
+					dev: descriptor.dev.toString(),
+					ino: descriptor.ino.toString(),
+					...(descriptor.nlink !== undefined ? { nlink: descriptor.nlink.toString() } : {}),
+					size: descriptor.size,
+					mtimeNs: descriptor.mtimeNs.toString(),
+					ctimeNs: descriptor.ctimeNs.toString(),
+				},
+				base: runtime.base,
+				terminalChecksum: runtime.tail.terminalChecksum,
+				terminalSeq: runtime.tail.terminalSeq,
+				transcriptSize: runtime.tail.transcriptSize,
+				retirementFirstKeptEntryId: runtime.retirementFirstKeptEntryId,
+				leafId: this.#leafId,
+				reducer: runtime.reducer,
+				providerStateEntries: this.#markerProviderStateEntries(),
+				labels: [...runtime.labelsPins.labelsEntries()],
+				usageStatistics: this.#usageStatistics,
 
-	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
-		if (!this.#sessionFile) return;
+				indexDigest: runtime.indexDigest,
+				...(runtime.parentArtifact
+					? {
+							parentIndex: {
+								bucketCount: runtime.parentArtifact.buckets.length,
+								indexDigest: runtime.parentArtifact.indexDigest,
+								buckets: runtime.parentArtifact.buckets.map(bucket => ({
+									size: bucket.size,
+									digest: bucket.digest,
+									complete: bucket.complete,
+								})),
+							},
+						}
+					: {}),
+				...(runtime.dictionary
+					? {
+							dictionary: {
+								header: {
+									version: 2,
+									sessionId: this.#sessionId ?? "",
+									sidecarIneligible: runtime.dictionary.sidecarIneligible,
+								},
+								indexDigest: runtime.dictionary.indexDigest,
+								partitions: runtime.dictionary.partitions.map(partition => ({
+									size: partition.size,
+									digest: partition.digest,
+									records: partition.records,
+									complete: partition.complete,
+								})),
+								metaSize: runtime.dictionary.metaSize,
+								metaDigest: runtime.dictionary.metaDigest,
+								recordCount: runtime.dictionary.recordCount,
+								uniqueTerms: runtime.dictionary.uniqueTerms,
+								totalBytes: runtime.dictionary.totalBytes,
+								duplicateIds: [...runtime.dictionary.duplicateIds],
+								sidecarIneligible: runtime.dictionary.sidecarIneligible,
+							},
+						}
+					: {}),
+				...(metadataDeltaCommit ? { metadataDelta: metadataDeltaCommit } : {}),
+			};
+			const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+			try {
+				const current =
+					this.destination.kind === "managed"
+						? readSessionCommitMarkerSync(this.storage, markerPath)
+						: !this.storage.existsSync(markerPath)
+							? ({ kind: "missing" } as const)
+							: (() => {
+									if (!this.storage.readRangeSync) throw new Error("commit_marker_range_read_unavailable");
+									const stat = this.storage.statSync(markerPath);
+									if (stat.size > 8 * 1024 * 1024) throw new Error("commit_marker_oversized");
+									const markerBytes = this.storage.readRangeSync(markerPath, 0, stat.size).bytes;
+									return {
+										kind: "present" as const,
+										rawBytesSha256: crypto.createHash("sha256").update(markerBytes).digest("hex"),
+										stat,
+									};
+								})();
+				if (current.kind === "missing") {
+					createSessionCommitMarkerCheckedSync(this.storage, markerPath, bytes, options);
+				} else {
+					replaceSessionCommitMarkerCheckedSync(
+						this.storage,
+						markerPath,
+						bytes,
+						{ rawBytesSha256: current.rawBytesSha256, descriptorIdentity: current.stat },
+						options,
+					);
+				}
+				this.#commitGen = gen;
+				return true;
+			} catch {
+				// A diverging sidecar never fails the authoritative transcript write.
+				return false;
+			}
+		});
+	}
+
+	/** Capture the current transcript descriptor after a rewrite and publish the commit. */
+	#publishCommitMarkerFromCurrentTranscriptSync(): boolean {
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return false;
+		const descriptor =
+			this.destination.kind === "managed"
+				? this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile))
+				: (() => {
+						try {
+							return this.storage.statSync(sessionFile);
+						} catch {
+							return null;
+						}
+					})();
+		if (!descriptor) return false;
+		return this.#publishSessionCommitMarkerSync(descriptor);
+	}
+	// =========================================================================
+	// Cold-sidecar runtime (P2/P3/P4 primitives integration)
+	// =========================================================================
+
+	/** Create (or reset) the sidecar runtime for the current lifecycle. */
+	#resetSidecarRuntime(ineligible = false): SessionMemorySidecarRuntime {
+		this.#sidecarBranchActivationDirty = false;
+		if (this.#sessionFile) {
+			for (const legacyPath of [
+				`${this.#sessionFile}.spill.idx`,
+				`${this.#sessionFile}.spill.tail`,
+				`${this.#sessionFile}.spill.commit`,
+				...parentBucketPaths(`${this.#sessionFile}.spill.idx`),
+				...dictionaryPartitionPaths(`${this.#sessionFile}.spill.idx`),
+				dictionaryMetaPathFor(`${this.#sessionFile}.spill.idx`),
+				metadataDeltaPathFor(`${this.#sessionFile}.spill.idx`),
+			]) {
+				try {
+					this.storage.unlinkSync(legacyPath);
+				} catch {
+					// Legacy sidecars are disposable and may be absent.
+				}
+			}
+		}
+		const sidecarRoot = this.#sessionFile?.endsWith(".jsonl") ? this.#sessionFile.slice(0, -6) : this.#sessionFile;
+		const parentPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.parent-` : "";
+		const dictionaryPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-part-` : "";
+		const dictionaryMetaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-meta` : "";
+		const metadataDeltaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.metadata-delta` : "";
+		if (sidecarRoot) {
+			for (const candidate of this.storage.listFilesSync(sidecarRoot, ".*")) {
+				const name = path.basename(candidate);
+				const orphaned =
+					name.endsWith(".tmp") ||
+					name.includes(".spill.capture-") ||
+					name.includes(".spill.fork-") ||
+					name.includes(".spill.overlay-");
+				if (!orphaned || !isDerivedSessionMemoryFile(candidate)) continue;
+				try {
+					this.storage.unlinkSync(candidate);
+				} catch {
+					// Derived crash debris is best-effort cleanup; authoritative startup continues.
+				}
+			}
+		}
+		const runtime: SessionMemorySidecarRuntime = {
+			enabled: false,
+			sidecarIneligible: ineligible,
+			base: { baseDigest: "", baseEndOffset: 0 },
+			tail: {
+				base: { baseDigest: "", baseEndOffset: 0 },
+				records: [],
+				terminalChecksum: "",
+				terminalSeq: -1,
+				transcriptSize: 0,
+			},
+
+			indexDigest: "",
+			indexHash: crypto.createHash("sha256"),
+			coldEntries: new Map(),
+			indexPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.idx` : "",
+			tailPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.tail` : "",
+			commitPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.commit` : "",
+			parentPathPrefix,
+			dictionaryPathPrefix,
+			dictionaryMetaPath,
+			metadataDeltaPath,
+			retirementFirstKeptEntryId: undefined,
+			hotSuffixBytes: 0,
+			accountant: new SessionMemoryAccountant(),
+			reducer: {
+				modelChange: { latest: undefined },
+				ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
+			},
+			providerStateEntries: [],
+			providerStateOrder: [],
+			blockCache: new FixedCacheAccount(8 * 1024 * 1024),
+			parentChildrenCache: new Map(),
+			entryCache: new FixedCacheAccount(28 * 1024 * 1024),
+			tailCache: new FixedCacheAccount(4 * 1024 * 1024),
+			labelsPins: new BoundedLabelsPinsStore(),
+			reopenTransition: undefined,
+			terminalTransition: undefined,
+			coldEntriesRetired: 0,
+			coldEntriesReloaded: 0,
+			rangeReadCount: 0,
+			rangeReadGenerationMismatchCount: 0,
+			sidecarRebuildCount: 0,
+			coldMutationPromotions: 0,
+			hotOverflowTransitions: 0,
+			labelDiskFallbackCount: 0,
+			shadowParityMismatchCount: 0,
+			shadowParityCheckCount: 0,
+			transcriptGeneration: 0,
+		};
+		this.#sidecarRuntime = runtime;
+		return runtime;
+	}
+
+	/** Serialize side-effect-free candidate bytes for one header/session entry. */
+	#serializeEntryLine(entry: FileEntry): Buffer {
+		const materialized = materializeResidentEntryForPersistenceSync(entry, this.#residentBlobStores(), new Map());
+		return Buffer.from(JSON.stringify(materialized), "utf8");
+	}
+
+	#transcriptContainsPatchRecords(): boolean {
+		if (!this.#sessionFile || typeof this.storage.readRangeSync !== "function") return true;
+		const readRangeSync = this.storage.readRangeSync.bind(this.storage);
+		let size: number;
+		try {
+			size = this.storage.statSync(this.#sessionFile).size;
+		} catch {
+			return true;
+		}
+		let carry = "";
+		for (let offset = 0; offset < size; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, size - offset);
+			const text = carry + Buffer.from(readRangeSync(this.#sessionFile, offset, length).bytes).toString("utf8");
+			if (/"type"\s*:\s*"(?:header|entry)_patch"/.test(text)) return true;
+			carry = text.slice(-128);
+		}
+		return false;
+	}
+
+	/** Build a fresh disposable `.spill.idx`/`.spill.tail`/`.spill.commit` set from the transcript. */
+	#buildDisposableSidecars(entries: readonly FileEntry[]): void {
 		if (this.destination.kind === "managed") {
-			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-			this.#managedTranscriptStore().replaceSync(path.basename(this.#sessionFile), bytes);
+			// Retained managed authority does not expose bounded range or staged sidecar APIs.
+			// Keep managed sessions on the eager transcript path rather than publishing
+			// disposable proof through generic pathname-based storage operations.
+			this.#sidecarRuntime = undefined;
 			return;
 		}
-		const dir = path.resolve(this.#sessionFile, "..");
-		const tempPath = path.join(dir, `.${path.basename(this.#sessionFile)}.${Snowflake.next()}.tmp`);
-		const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+		if (this.#sessionMemoryMode === "off") {
+			this.#sidecarRuntime = undefined;
+			return;
+		}
 		try {
-			for (const entry of entries) {
-				writer.writeSync(entry);
+			this.#buildDisposableSidecarsUnsafe(entries);
+			const runtime = this.#sidecarRuntime;
+			if (this.#sessionMemoryMode === "shadow" && runtime?.parentArtifact) {
+				runtime.blockCache.release(runtime.parentArtifact.chargedBytes);
+				runtime.parentArtifact = undefined;
 			}
-			writer.closeSync();
-			const replacement = this.#replaceSessionFileSync(tempPath, this.#sessionFile);
-			if (replacement.kind === "restored_previous") throw replacement.error;
-		} catch (err) {
-			// closeSync is now truthful and may throw; wrap the best-effort cleanup so
-			// the original error (write/close failure) is the one surfaced, not the
-			// cleanup failure. The rename above was already skipped because closeSync
-			// threw before it.
-			try {
-				writer.closeSync();
-			} catch {
-				// Best-effort cleanup of the temp writer's descriptor.
+			if (this.#sessionMemoryMode === "shadow" && runtime?.enabled && !runtime.sidecarIneligible) {
+				this.#compareShadowParity(runtime, entries);
 			}
-			void this.storage.unlink(tempPath).catch(() => {});
-			throw toError(err);
+			if (runtime?.enabled && !runtime.sidecarIneligible) this.#consecutiveSidecarBuildFailures = 0;
+		} catch (error) {
+			this.#consecutiveSidecarBuildFailures++;
+			if (this.#consecutiveSidecarBuildFailures >= 2) {
+				this.#sessionMemoryAutoDisabledReason = "sidecar_build_failures";
+				this.#sessionMemoryMode = "shadow";
+			}
+			const runtime = this.#sidecarRuntime;
+			if (runtime) {
+				runtime.enabled = false;
+				runtime.sidecarIneligible = true;
+				runtime.hotSuffixBytes = 0;
+				for (const sidecarPath of this.#disposableSidecarPaths()) {
+					if (!sidecarPath) continue;
+					try {
+						this.storage.unlinkSync(sidecarPath);
+					} catch {
+						// Disposable cleanup is best-effort; the transcript remains authoritative.
+					}
+				}
+			}
+			logger.warn("Session memory sidecar build failed; preserving eager transcript state", {
+				sessionFile: this.#sessionFile,
+				error: toError(error).message,
+				consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
+				autoDisabled: this.#sessionMemoryAutoDisabledReason !== undefined,
+			});
 		}
 	}
-	async #writeEntriesAtomically(entries: FileEntry[]): Promise<void> {
-		if (!this.#sessionFile) return;
-		if (this.destination.kind === "managed") {
-			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-			await this.#managedTranscriptStore().replace(path.basename(this.#sessionFile), bytes);
+
+	/**
+	 * Shadow-mode parity telemetry (AC10). After a successful shadow sidecar build,
+	 * materialize the provider context through both authoritative eager traversal and
+	 * the exact sidecar reducer/provider-state + hot-suffix path used after retirement.
+	 * Any mismatch increments the live counter and warns; the eager transcript remains
+	 * authoritative and no sidecar result is returned to the caller.
+	 */
+	#compareShadowParity(runtime: SessionMemorySidecarRuntime, entries: readonly FileEntry[]): void {
+		const eagerEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+		const eagerContext = buildSessionContext(
+			eagerEntries.map(cloneSessionEntry),
+			this.#leafId,
+			undefined,
+			this.#sessionId,
+		);
+		const resolvedProviderState = this.#resolvedProviderStateEntries();
+		let sidecarContext: SessionContext | undefined;
+		if (resolvedProviderState) {
+			const providerEntries = this.#getActivePathEntriesForProviderContext(undefined, true).map(cloneSessionEntry);
+			const providerStateEntries = resolvedProviderState.map(cloneSessionEntry);
+			let syntheticParentId: string | null = null;
+			for (const entry of providerStateEntries) {
+				entry.parentId = syntheticParentId;
+				syntheticParentId = entry.id;
+			}
+			if (providerEntries[0] && syntheticParentId) providerEntries[0].parentId = syntheticParentId;
+			sidecarContext = buildSessionContext(
+				[...providerStateEntries, ...providerEntries],
+				this.#leafId,
+				undefined,
+				this.#sessionId,
+			);
+		}
+		runtime.shadowParityCheckCount++;
+		const eagerRole = this.getLastModelChangeRole();
+		const reducerRole = getReducerLastModelChangeRole(runtime.reducer);
+		if (!sidecarContext || reducerRole !== eagerRole || !util.isDeepStrictEqual(sidecarContext, eagerContext)) {
+			runtime.shadowParityMismatchCount++;
+			logger.warn("Session memory shadow parity mismatch", {
+				sessionFile: this.#sessionFile,
+				reducerRole,
+				eagerRole,
+				sidecarContextAvailable: sidecarContext !== undefined,
+			});
+		}
+	}
+
+	#buildDisposableSidecarsUnsafe(entries: readonly FileEntry[]): void {
+		const runtime = this.#resetSidecarRuntime();
+		if (
+			!this.#sessionFile ||
+			!runtime.indexPath ||
+			!runtime.tailPath ||
+			typeof this.storage.readRangeSync !== "function"
+		)
+			return;
+		const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+		if (!hasStrictSessionSchema(entries)) {
+			runtime.sidecarIneligible = true;
 			return;
 		}
-		const dir = path.resolve(this.#sessionFile, "..");
-		const tempPath = path.join(dir, `.${path.basename(this.#sessionFile)}.${Snowflake.next()}.tmp`);
-		const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+		if (this.#transcriptContainsPatchRecords()) {
+			runtime.sidecarIneligible = true;
+			return;
+		}
+		let activeCompaction: CompactionEntry | undefined;
+		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
+		let activeSteps = 0;
+		const providerState = new Map<string, { order: number; ordinal: number; entry: SessionEntry }>();
+		let providerStateBytes = 0;
+		while (active && activeSteps <= sessionEntries.length) {
+			const ordinal = sessionEntries.length - activeSteps - 1;
+			if (!activeCompaction && active.type === "compaction") activeCompaction = active;
+			const providerKey = providerStateEntryKey(active);
+			if (providerKey && !providerState.has(providerKey)) {
+				const bytes = Buffer.byteLength(JSON.stringify(active), "utf8") + 64;
+				if (providerStateBytes + bytes > REDUCER_BUDGET_BYTES) {
+					runtime.sidecarIneligible = true;
+					return;
+				}
+				providerStateBytes += bytes;
+				providerState.set(providerKey, { order: activeSteps, ordinal, entry: cloneSessionEntry(active) });
+			}
+			if (active.type === "model_change" && runtime.reducer.modelChange.latest === undefined) {
+				runtime.reducer = applyReducerDelta(runtime.reducer, {
+					kind: "latest_model_change",
+					ordinal,
+					role: active.role,
+				});
+			} else if (active.type === "ttsr_injection" && runtime.reducer.ttsr.largestOrdinal < 0) {
+				runtime.reducer = applyReducerDelta(runtime.reducer, {
+					kind: "ttsr_injection",
+					ordinal,
+					rulesCount: active.injectedRules.length,
+					recordsCount: active.injectedRuleRecords?.length ?? 0,
+					count: active.ttsrMessageCount ?? 0,
+				});
+			}
+			active = active.parentId ? this.#byId.get(active.parentId) : undefined;
+			activeSteps++;
+		}
+		const sortedProviderState = [...providerState.values()].sort((left, right) => right.order - left.order);
+		runtime.providerStateOrder = sortedProviderState.map(item => providerStateEntryKey(item.entry)!);
+		runtime.providerStateEntries = [];
+		// Inline entries are added after the delta decision below (demoted
+		// values stay resident only as descriptors).
+		if (!activeCompaction) return;
+		const tailStartOrdinal = sessionEntries.findIndex(entry => entry.id === activeCompaction.firstKeptEntryId);
+		if (tailStartOrdinal < 0) return;
+		runtime.retirementFirstKeptEntryId = activeCompaction.firstKeptEntryId;
+		const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
+		const headerBytes = header
+			? Buffer.concat([this.#serializeEntryLine(header), Buffer.from("\n")])
+			: Buffer.alloc(0);
+		const baseHash = crypto.createHash("sha256");
+		baseHash.update(headerBytes);
+		const fullHash = crypto.createHash("sha256");
+		fullHash.update(headerBytes);
+		let baseEndOffset = headerBytes.byteLength;
+		for (let ordinal = 0; ordinal < tailStartOrdinal; ordinal++) {
+			const persistedLine = Buffer.concat([this.#serializeEntryLine(sessionEntries[ordinal]), Buffer.from("\n")]);
+			baseHash.update(persistedLine);
+			baseEndOffset += persistedLine.byteLength;
+		}
+		const baseDigest = baseHash.digest("hex");
+		const hasDuplicateIds = sessionEntries.some(entry => this.#byId.get(entry.id) !== entry);
+		if (hasDuplicateIds) {
+			runtime.sidecarIneligible = true;
+			return;
+		}
+		const tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
+		const fsyncWriter = (writer: SessionStorageWriter | undefined): void => {
+			if (!writer) return;
+			if (!writer.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+			writer.fsyncSync();
+		};
+		let indexWriter: SessionStorageWriter | undefined;
+		let tailWriter: SessionStorageWriter | undefined;
+		let runningOffset = headerBytes.byteLength;
+		let tailSeq = 0;
+		let buildFailed = false;
+		let tailOverflow = false;
+		let operationError: unknown;
+		let closeError: unknown;
+		const parentBuilder = new BoundedParentArtifactBuilder();
+		const enabledBuild = this.#sessionMemoryMode === "enabled";
+		const secondaryArtifactsEligible =
+			enabledBuild &&
+			sessionEntries.length <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
+			this.storage.statSync(this.#sessionFile).size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
+		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
+		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const partitionRecords = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const dictionaryBuilder = new BoundedDictionaryArtifactBuilder({
+			detector: new BoundedDictionaryIdSet(),
+			target: this.#createDictionaryFlushTarget(partitionHashes, partitionSizes, partitionRecords),
+		});
 		try {
-			for (const entry of entries) {
-				await writer.write(entry);
+			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
+			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
+			runtime.metadataDelta = this.#createMetadataDeltaRuntimeState();
+			for (const item of sortedProviderState) {
+				const key = providerStateEntryKey(item.entry)!;
+				const persistedLine = Buffer.from(`${JSON.stringify(item.entry)}\n`, "utf8");
+				if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
+					const stored = this.#appendMetadataDeltaValue(persistedLine);
+					if (stored) {
+						runtime.metadataDelta.byKey.set(key, {
+							kind: item.entry.type,
+							ordinal: item.ordinal,
+							...stored,
+						});
+					} else {
+						runtime.metadataDelta.byKey.delete(key);
+						runtime.providerStateEntries.push(cloneSessionEntry(item.entry));
+					}
+				} else {
+					runtime.providerStateEntries.push(cloneSessionEntry(item.entry));
+				}
 			}
-			await writer.flush();
-			await writer.fsync();
-			await writer.close();
-			await this.#replaceSessionFile(tempPath, this.#sessionFile);
-		} catch (err) {
+			this.#syncMetadataDeltaDescriptorBytes();
+			for (let ordinal = 0; ordinal < sessionEntries.length; ordinal++) {
+				const entry = sessionEntries[ordinal];
+				const persistedLine = Buffer.concat([this.#serializeEntryLine(entry), Buffer.from("\n")]);
+				fullHash.update(persistedLine);
+				const recordDigest = computeLineDigest(persistedLine);
+				const indexLine = `${JSON.stringify({
+					id: entry.id,
+					ordinal,
+					seq: ordinal,
+					byteOffset: runningOffset,
+					byteLength: persistedLine.byteLength,
+					recordDigest,
+					parentId: entry.parentId,
+					entryType: entry.type,
+				})}\n`;
+				indexWriter!.writeLineSync(indexLine);
+				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+				if (secondaryArtifactsEligible) {
+					const dictionaryAdd = dictionaryBuilder.add({
+						id: entry.id,
+						ordinal,
+						seq: ordinal,
+						byteOffset: runningOffset,
+						byteLength: persistedLine.byteLength,
+						recordDigest,
+						parentId: entry.parentId,
+						entryType: entry.type,
+					});
+					if (dictionaryAdd.kind !== "ok") {
+						buildFailed = true;
+						throw new Error("dictionary_artifact_build_failed");
+					}
+				}
+				if (secondaryArtifactsEligible && typeof entry.parentId === "string") {
+					parentBuilder.add({
+						parentId: entry.parentId,
+						childId: entry.id,
+						ordinal,
+						seq: ordinal,
+						byteOffset: runningOffset,
+						byteLength: persistedLine.byteLength,
+						recordDigest,
+						entryType: entry.type,
+					});
+				}
+				if (ordinal >= tailStartOrdinal && !tailOverflow) {
+					const record = tailBuilder.append({
+						seq: tailSeq,
+						kind: tailRecordKindForEntry(entry),
+						ordinal,
+						id: entry.id,
+						parentId: entry.parentId,
+						type: entry.type,
+						byteOffset: runningOffset,
+						byteLength: persistedLine.byteLength,
+						recordDigest,
+					});
+					if (!record) {
+						tailOverflow = true;
+					} else {
+						tailWriter!.writeLineSync(`${JSON.stringify(record)}\n`);
+						tailSeq++;
+					}
+				}
+				runningOffset += persistedLine.byteLength;
+			}
+		} catch (error) {
+			operationError = error;
+		} finally {
 			try {
-				await writer.close();
-			} catch {
-				// Ignore cleanup errors
+				fsyncWriter(indexWriter);
+			} catch (error) {
+				closeError = error;
 			}
 			try {
-				await this.storage.unlink(tempPath);
-			} catch {
-				// Ignore cleanup errors
+				indexWriter?.closeSync();
+			} catch (error) {
+				closeError ??= error;
 			}
-			throw toError(err);
+			try {
+				fsyncWriter(tailWriter);
+			} catch (error) {
+				closeError ??= error;
+			}
+			try {
+				tailWriter?.closeSync();
+			} catch (error) {
+				closeError ??= error;
+			}
+		}
+		if (operationError ?? closeError) throw operationError ?? closeError;
+		if (tailOverflow) {
+			const truncateTail = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			let durabilityError: unknown;
+			try {
+				if (!truncateTail.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+				truncateTail.fsyncSync();
+			} catch (error) {
+				durabilityError = error;
+			}
+			try {
+				truncateTail.closeSync();
+			} catch (error) {
+				durabilityError ??= error;
+			}
+			if (durabilityError) throw durabilityError;
+		}
+		for (const [id, label] of this.#labelsById) {
+			if (!runtime.labelsPins.setLabel(id, label)) {
+				buildFailed = true;
+				break;
+			}
+		}
+		if (buildFailed) {
+			for (const sidecarPath of [
+				runtime.indexPath,
+				runtime.tailPath,
+				runtime.dictionaryMetaPath,
+				runtime.metadataDeltaPath,
+				...dictionaryPartitionPaths(runtime.indexPath),
+			]) {
+				try {
+					this.storage.unlinkSync(sidecarPath);
+				} catch {
+					// Disposable sidecar cleanup is best-effort; eager transcript state remains authoritative.
+				}
+			}
+			runtime.dictionary = undefined;
+			runtime.metadataDelta = undefined;
+			return;
+		}
+		runtime.enabled = true;
+		if (tailOverflow) {
+			runtime.base = { baseDigest: fullHash.digest("hex"), baseEndOffset: runningOffset };
+			runtime.tail = new RollingTailChainBuilder(runtime.base).build();
+		} else {
+			runtime.base = { baseDigest, baseEndOffset };
+			runtime.tail = tailBuilder.build();
+		}
+
+		runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+		if (runtime.metadataDelta) runtime.metadataDelta.indexDigest = runtime.indexDigest;
+		if (enabledBuild) {
+			if (secondaryArtifactsEligible) {
+				const dictionaryResult = dictionaryBuilder.finish(this.#sessionId ?? "", runtime.indexDigest);
+				if (dictionaryResult.kind === "ok" && !dictionaryResult.commit.sidecarIneligible) {
+					this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords);
+				}
+				this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+			} else {
+				runtime.parentArtifact = undefined;
+				runtime.dictionary = undefined;
+			}
+			this.#syncMetadataDeltaDescriptorBytes();
+		} else {
+			this.#cleanupParentArtifactFiles();
+			this.#cleanupDictionaryArtifactFiles();
+			runtime.parentArtifact = undefined;
+			runtime.dictionary = undefined;
+			// Keep the bounded metadata delta live through the shadow parity comparison;
+			// parent/dictionary artifacts remain disabled because shadow never retires.
+		}
+		try {
+			const validated = this.storage.statSync(runtime.indexPath);
+			runtime.validatedIndexDescriptor = validated;
+		} catch {
+			// A missing index falls back to the authoritative digest re-verification path.
+		}
+		runtime.reopenTransition = this.#classifySidecarReopen();
+		this.#publishCommitMarkerFromCurrentTranscriptSync();
+		runtime.terminalTransition = this.#classifySidecarReopen();
+	}
+
+	// =========================================================================
+	// Persistent bounded parent→children artifact
+	// =========================================================================
+
+	/** Path of one parent bucket file (`.spill.parent-<bucket>`). */
+	#parentBucketPath(bucket: number): string {
+		const runtime = this.#sidecarRuntime;
+		return runtime ? `${runtime.parentPathPrefix}${bucket.toString().padStart(4, "0")}` : "";
+	}
+
+	/** Best-effort unlink of every derived parent bucket file. */
+	#cleanupParentArtifactFiles(): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.parentPathPrefix) return;
+		for (const path of parentBucketPaths(runtime.indexPath)) {
+			try {
+				this.storage.unlinkSync(path);
+			} catch {
+				// Disposable buckets are best-effort cleanup; transcript authority is unaffected.
+			}
+		}
+	}
+
+	/**
+	 * Write the built parent artifact bucket files (fsync before any marker
+	 * publication), then adopt the committed metadata into the runtime. Any
+	 * build/write failure or block-cache rejection disables the artifact (parent
+	 * lookups then fail closed to the authoritative cold scan); the session's
+	 * index/tail sidecars remain fully usable.
+	 */
+	#publishParentArtifact(builder: BoundedParentArtifactBuilder, indexDigest: string): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		const cleanup = (): void => {
+			this.#cleanupParentArtifactFiles();
+			runtime.parentArtifact = undefined;
+		};
+		if (builder.distinctParents === 0) {
+			cleanup();
+			return;
+		}
+		const result = builder.finish(indexDigest);
+		try {
+			for (let bucket = 0; bucket < result.buckets.length; bucket++) {
+				const records = result.buckets[bucket];
+				if (records.length === 0) {
+					try {
+						this.storage.unlinkSync(this.#parentBucketPath(bucket));
+					} catch {
+						// An absent bucket is fine; an unlink failure is best-effort.
+					}
+					continue;
+				}
+				const writer = this.storage.openWriter(this.#parentBucketPath(bucket), { flags: "w" });
+				try {
+					for (const line of records) writer.writeLineSync(line);
+					if (!writer.fsyncSync) throw new Error("Synchronous parent bucket fsync is unavailable");
+					writer.fsyncSync();
+				} finally {
+					writer.closeSync();
+				}
+			}
+		} catch {
+			cleanup();
+			return;
+		}
+		const charged = parentArtifactRuntimeBytes(result.metadata.bucketCount);
+		if (!runtime.blockCache.tryAllocate(charged)) {
+			cleanup();
+			return;
+		}
+		const totalBytes = result.metadata.buckets.reduce((total, bucket) => total + bucket.size, 0);
+		runtime.parentArtifact = {
+			indexDigest: result.metadata.indexDigest,
+			buckets: result.metadata.buckets.map(bucket => ({
+				size: bucket.size,
+				digest: bucket.digest,
+				complete: bucket.complete,
+			})),
+			totalBytes,
+			chargedBytes: charged,
+			budgetBytes: PARENT_CHILDREN_BUDGET_BYTES,
+		};
+	}
+
+	/**
+	 * Fail closed: delete the bucket files and drop the retained artifact state.
+	 * A marker published after this call binds no parent metadata, so lookups
+	 * never trust a stale/partial artifact and fall back to the authoritative
+	 * cold scan.
+	 */
+	#invalidateParentArtifact(): void {
+		const runtime = this.#sidecarRuntime;
+		const artifact = runtime?.parentArtifact;
+		if (!artifact) return;
+		this.#cleanupParentArtifactFiles();
+		runtime.parentArtifact = undefined;
+		if (artifact.chargedBytes > 0) runtime.blockCache.release(artifact.chargedBytes);
+	}
+
+	/**
+	 * Adopt the parent artifact binding from a validated commit marker. Bucket
+	 * bytes are verified lazily (one bounded bucket read per lookup); any
+	 * structural, binding, or budget inconsistency disables the artifact and the
+	 * session still reopens exactly on index/tail proof.
+	 */
+	#adoptCommittedParentArtifact(parentIndex: ParentArtifactCommit | undefined): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		const reject = (): void => {
+			runtime.parentArtifact = undefined;
+		};
+		if (!parentIndex) return reject();
+		if (
+			parentIndex.bucketCount !== PARENT_CHILDREN_BUCKET_COUNT ||
+			parentIndex.indexDigest !== runtime.indexDigest ||
+			parentIndex.buckets.length !== PARENT_CHILDREN_BUCKET_COUNT
+		)
+			return reject();
+		let totalBytes = 0;
+		for (const bucket of parentIndex.buckets) {
+			if (!Number.isSafeInteger(bucket.size) || bucket.size < 0) return reject();
+			if (typeof bucket.digest !== "string" || !/^[0-9a-f]{64}$/.test(bucket.digest)) return reject();
+			if (typeof bucket.complete !== "boolean") return reject();
+			totalBytes += bucket.size;
+		}
+		if (totalBytes > PARENT_CHILDREN_BUDGET_BYTES) return reject();
+		const charged = parentArtifactRuntimeBytes(parentIndex.bucketCount);
+		if (!runtime.blockCache.tryAllocate(charged)) return reject();
+		runtime.parentArtifact = {
+			indexDigest: parentIndex.indexDigest,
+			buckets: parentIndex.buckets.map(bucket => ({
+				size: bucket.size,
+				digest: bucket.digest,
+				complete: bucket.complete,
+			})),
+			totalBytes,
+			chargedBytes: charged,
+			budgetBytes: PARENT_CHILDREN_BUDGET_BYTES,
+		};
+	}
+
+	/** Strictly parse the marker's parent-artifact binding; invalid → absent (fail closed). */
+	#parseParentIndexValue(value: unknown): ParentArtifactCommit | undefined {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const parentIndex = value as Record<string, unknown>;
+		if (typeof parentIndex.bucketCount !== "number" || !Number.isSafeInteger(parentIndex.bucketCount))
+			return undefined;
+		if (typeof parentIndex.indexDigest !== "string" || parentIndex.indexDigest.length !== 64) return undefined;
+		if (!Array.isArray(parentIndex.buckets)) return undefined;
+		const buckets: ParentBucketCommit[] = [];
+		for (const candidate of parentIndex.buckets) {
+			if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+			const bucket = candidate as Record<string, unknown>;
+			if (typeof bucket.size !== "number" || !Number.isSafeInteger(bucket.size) || bucket.size < 0) return undefined;
+			if (typeof bucket.digest !== "string" || !/^[0-9a-f]{64}$/.test(bucket.digest)) return undefined;
+			if (typeof bucket.complete !== "boolean") return undefined;
+			buckets.push({ size: bucket.size, digest: bucket.digest, complete: bucket.complete });
+		}
+		return { bucketCount: parentIndex.bucketCount, indexDigest: parentIndex.indexDigest, buckets };
+	}
+
+	// =========================================================================
+	// Persistent bounded dictionary artifact (hash-partitioned flat index)
+	// =========================================================================
+
+	/** Path of one dictionary partition file (`.spill.dict-part-<partition>`). */
+	#dictionaryPartitionPath(partition: number): string {
+		const runtime = this.#sidecarRuntime;
+		return runtime ? `${runtime.dictionaryPathPrefix}${partition.toString().padStart(4, "0")}` : "";
+	}
+
+	/** Best-effort unlink of every dictionary partition + meta file. */
+	#cleanupDictionaryArtifactFiles(): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		for (const path of [runtime.dictionaryMetaPath, ...dictionaryPartitionPaths(runtime.indexPath)]) {
+			try {
+				this.storage.unlinkSync(path);
+			} catch {
+				// Disposable dictionary files are best-effort cleanup; transcript authority is unaffected.
+			}
+		}
+	}
+
+	/** Truncate dictionary files for an eligible fresh secondary-artifact build. */
+	#truncateDerivedArtifactFiles(includeDictionary: boolean): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime || !includeDictionary) return;
+		const paths = [runtime.dictionaryMetaPath, ...dictionaryPartitionPaths(runtime.indexPath)];
+		for (const path of paths) {
+			try {
+				const writer = this.storage.openWriter(path, { flags: "w" });
+				try {
+					if (!writer.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+					writer.fsyncSync();
+				} finally {
+					writer.closeSync();
+				}
+			} catch {
+				// Truncation failures surface at the first write; disposable artifacts remain best-effort.
+			}
+		}
+	}
+
+	/** Persist one flushed batch of dictionary partition lines (append + fsync). */
+	#writeDictionaryPartitionLines(partition: number, lines: readonly string[]): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return false;
+		try {
+			const writer = this.storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
+			try {
+				for (const line of lines) writer.writeLineSync(line);
+				if (!writer.fsyncSync) throw new Error("Synchronous dictionary partition fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Flush target for the streaming dictionary build (owns exact bytes + running digests). */
+	#createDictionaryFlushTarget(
+		hashes: crypto.Hash[],
+		sizes: number[],
+		records: number[],
+	): DictionaryArtifactFlushTarget {
+		return {
+			writePartitionLines: (partition, lines) => {
+				if (!this.#writeDictionaryPartitionLines(partition, lines)) return false;
+				for (const line of lines) {
+					const bytes = Buffer.from(line, "utf8");
+					hashes[partition]!.update(bytes);
+					sizes[partition]! += bytes.byteLength;
+					records[partition]! += 1;
+				}
+				return true;
+			},
+			getPartitionCommit: partition => ({
+				size: sizes[partition]!,
+				digest: hashes[partition]!.copy().digest("hex"),
+				records: records[partition]!,
+				complete: true,
+			}),
+		};
+	}
+
+	/**
+	 * Persist the finalized dictionary meta file (fsynced before any marker
+	 * publication) and adopt the artifact into the runtime. Any write or
+	 * block-cache rejection disables the artifact (lookups fail closed to the
+	 * authoritative cold scan); the session's index/tail sidecars remain fully
+	 * usable.
+	 */
+	#adoptBuiltDictionaryArtifact(
+		result: Extract<DictionaryArtifactBuildResult, { kind: "ok" }>,
+		partitionHashes: crypto.Hash[],
+		partitionSizes: number[],
+		partitionRecords: number[],
+	): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return false;
+		const meta = finalizeDictionaryArtifactCommit(result.commit);
+		try {
+			const writer = this.storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
+			try {
+				writer.writeLineSync(meta.bytes);
+				if (!writer.fsyncSync) throw new Error("Synchronous dictionary meta fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+		} catch {
+			return false;
+		}
+		const charged = dictionaryArtifactRuntimeBytes(result.commit.partitions.length);
+		if (!runtime.blockCache.tryAllocate(charged)) return false;
+		runtime.dictionary = {
+			indexDigest: result.commit.indexDigest,
+			partitions: result.commit.partitions.map(partition => ({ ...partition })),
+			metaSize: meta.commit.metaSize,
+			metaDigest: meta.commit.metaDigest,
+			recordCount: result.commit.recordCount,
+			uniqueTerms: result.commit.uniqueTerms,
+			totalBytes: result.commit.totalBytes,
+			duplicateIds: [...result.commit.duplicateIds],
+			sidecarIneligible: result.commit.sidecarIneligible,
+			chargedBytes: charged,
+			budgetBytes: DICTIONARY_PARTITION_BUFFER_BYTES,
+			partitionHashes,
+			partitionSizes,
+			partitionRecords,
+		};
+		try {
+			runtime.dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+		} catch {
+			// A missing meta falls back to the authoritative digest re-verification path.
+		}
+		return true;
+	}
+
+	/** Strictly parse the marker's dictionary-artifact binding; invalid → absent (fail closed). */
+	#parseDictionaryCommitValue(value: unknown): DictionaryArtifactCommit | undefined {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const record = value as Record<string, unknown>;
+		const header = record.header;
+		if (header === null || typeof header !== "object" || Array.isArray(header)) return undefined;
+		const headerRecord = header as Record<string, unknown>;
+		if (headerRecord.version !== 2) return undefined;
+		if (typeof headerRecord.sessionId !== "string") return undefined;
+		if (typeof headerRecord.sidecarIneligible !== "boolean") return undefined;
+		if (typeof record.indexDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.indexDigest)) return undefined;
+		if (!Array.isArray(record.partitions) || record.partitions.length !== DICTIONARY_PARTITION_COUNT)
+			return undefined;
+		const partitions: DictionaryPartitionCommit[] = [];
+		for (const candidate of record.partitions) {
+			if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+			const partition = candidate as Record<string, unknown>;
+			if (!Number.isSafeInteger(partition.size) || (partition.size as number) < 0) return undefined;
+			if (typeof partition.digest !== "string" || !/^[0-9a-f]{64}$/.test(partition.digest)) return undefined;
+			if (!Number.isSafeInteger(partition.records) || (partition.records as number) < 0) return undefined;
+			if (typeof partition.complete !== "boolean") return undefined;
+			partitions.push({
+				size: partition.size as number,
+				digest: partition.digest,
+				records: partition.records as number,
+				complete: partition.complete,
+			});
+		}
+		if (!Number.isSafeInteger(record.recordCount) || (record.recordCount as number) < 0) return undefined;
+		if (!Number.isSafeInteger(record.uniqueTerms) || (record.uniqueTerms as number) < 0) return undefined;
+		if (!Number.isSafeInteger(record.totalBytes) || (record.totalBytes as number) < 0) return undefined;
+		if (!Array.isArray(record.duplicateIds) || record.duplicateIds.some(candidate => typeof candidate !== "string"))
+			return undefined;
+		if (typeof record.sidecarIneligible !== "boolean") return undefined;
+		const candidate: Omit<DictionaryArtifactCommit, "metaSize" | "metaDigest"> = {
+			header: {
+				version: 2,
+				sessionId: headerRecord.sessionId,
+				sidecarIneligible: headerRecord.sidecarIneligible,
+			},
+			indexDigest: record.indexDigest,
+			partitions,
+			recordCount: record.recordCount as number,
+			uniqueTerms: record.uniqueTerms as number,
+			totalBytes: record.totalBytes as number,
+			duplicateIds: record.duplicateIds as string[],
+			sidecarIneligible: record.sidecarIneligible,
+		};
+		return finalizeDictionaryArtifactCommit(candidate).commit;
+	}
+
+	/**
+	 * Adopt the dictionary artifact binding from a validated commit marker. The
+	 * exact meta bytes and every partition byte range are re-hashed once (bounded
+	 * 64 KiB chunk reads); any structural, binding, digest, or budget
+	 * inconsistency disables the dictionary and the session still reopens
+	 * exactly on index/tail proof.
+	 */
+	#adoptCommittedDictionary(dictionary: DictionaryArtifactCommit | undefined): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		const reject = (): void => {
+			runtime.dictionary = undefined;
+		};
+		const parsed = this.#parseDictionaryCommitValue(dictionary);
+		if (!parsed) return reject();
+		if (parsed.indexDigest !== runtime.indexDigest) return reject();
+		if (parsed.sidecarIneligible || parsed.duplicateIds.length > 0) return reject();
+		if (parsed.partitions.some(partition => !partition.complete)) return reject();
+		if (typeof this.storage.readRangeSync !== "function") return reject();
+		try {
+			const metaStat = this.storage.statSync(runtime.dictionaryMetaPath);
+			if (metaStat.size !== parsed.metaSize) return reject();
+			const metaHash = crypto.createHash("sha256");
+			for (let offset = 0; offset < parsed.metaSize; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, parsed.metaSize - offset);
+				metaHash.update(this.storage.readRangeSync(runtime.dictionaryMetaPath, offset, length).bytes);
+			}
+			if (metaHash.digest("hex") !== parsed.metaDigest) return reject();
+		} catch {
+			return reject();
+		}
+		const adoptedHashes: crypto.Hash[] = [];
+		const adoptedSizes: number[] = [];
+		const adoptedRecords: number[] = [];
+		for (let partition = 0; partition < parsed.partitions.length; partition++) {
+			const committed = parsed.partitions[partition]!;
+			try {
+				const stat = this.storage.statSync(this.#dictionaryPartitionPath(partition));
+				if (stat.size !== committed.size) return reject();
+				// The verification hash keeps the full partition byte state so it
+				// doubles as the append-time running hash (seeded with exact bytes).
+				const hash = crypto.createHash("sha256");
+				for (let offset = 0; offset < committed.size; offset += 64 * 1024) {
+					const length = Math.min(64 * 1024, committed.size - offset);
+					hash.update(this.storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes);
+					if ((offset & (4 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+				}
+				if (hash.copy().digest("hex") !== committed.digest) return reject();
+				adoptedHashes.push(hash);
+				adoptedSizes.push(committed.size);
+				adoptedRecords.push(committed.records);
+			} catch {
+				return reject();
+			}
+		}
+		const charged = dictionaryArtifactRuntimeBytes(parsed.partitions.length);
+		if (!runtime.blockCache.tryAllocate(charged)) return reject();
+		runtime.dictionary = {
+			indexDigest: parsed.indexDigest,
+			partitions: parsed.partitions.map(partition => ({ ...partition })),
+			metaSize: parsed.metaSize,
+			metaDigest: parsed.metaDigest,
+			recordCount: parsed.recordCount,
+			uniqueTerms: parsed.uniqueTerms,
+			totalBytes: parsed.totalBytes,
+			duplicateIds: [...parsed.duplicateIds],
+			sidecarIneligible: parsed.sidecarIneligible,
+			chargedBytes: charged,
+			budgetBytes: DICTIONARY_PARTITION_BUFFER_BYTES,
+			partitionHashes: adoptedHashes,
+			partitionSizes: adoptedSizes,
+			partitionRecords: adoptedRecords,
+		};
+		try {
+			runtime.dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+		} catch {
+			// Re-verification happens on first use.
+		}
+	}
+
+	/**
+	 * Incrementally maintain the dictionary artifact for one appended entry:
+	 * append the partition line (fsync), rewrite the meta (fsync), and rebind
+	 * the running digests before the commit marker is published. Any failure
+	 * invalidates the whole artifact; the marker is then published without
+	 * dictionary metadata and lookups fall back to the authoritative cold scan.
+	 */
+	#appendDictionaryRecord(index: {
+		id: string;
+		ordinal: number;
+		seq: number;
+		byteOffset: number;
+		byteLength: number;
+		recordDigest: string;
+		parentId: string | null;
+		entryType: string;
+	}): boolean {
+		const runtime = this.#sidecarRuntime;
+		const dictionary = runtime?.dictionary;
+		if (!dictionary) return true;
+		const partition = dictionaryPartitionForId(index.id, dictionary.partitions.length);
+		const partitionState = dictionary.partitions[partition];
+		if (!partitionState) return false;
+		const recordLine = serializeDictionaryPartitionRecord({
+			term: index.id,
+			dictId: dictionary.uniqueTerms,
+			ordinal: index.ordinal,
+			seq: index.seq,
+			byteOffset: index.byteOffset,
+			byteLength: index.byteLength,
+			recordDigest: index.recordDigest,
+			parentId: index.parentId,
+			entryType: index.entryType,
+		});
+		const recordBytes = Buffer.byteLength(recordLine, "utf8");
+		if (recordBytes > dictionary.budgetBytes) return false;
+		try {
+			const writer = this.storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
+			try {
+				writer.writeLineSync(recordLine);
+				if (!writer.fsyncSync) throw new Error("Synchronous dictionary partition fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+		} catch {
+			return false;
+		}
+		dictionary.partitionHashes[partition]!.update(Buffer.from(recordLine, "utf8"));
+		dictionary.partitionSizes[partition]! += recordBytes;
+		dictionary.partitionRecords[partition]! += 1;
+		partitionState.size = dictionary.partitionSizes[partition]!;
+		partitionState.digest = dictionary.partitionHashes[partition]!.copy().digest("hex");
+		partitionState.records = dictionary.partitionRecords[partition]!;
+		dictionary.recordCount += 1;
+		dictionary.uniqueTerms += 1;
+		dictionary.totalBytes += Buffer.byteLength(index.id, "utf8");
+		dictionary.indexDigest = runtime.indexDigest;
+		const commit: Omit<DictionaryArtifactCommit, "metaSize" | "metaDigest"> = {
+			header: {
+				version: 2,
+				sessionId: this.#sessionId ?? "",
+				sidecarIneligible: dictionary.sidecarIneligible,
+			},
+			indexDigest: runtime.indexDigest,
+			partitions: dictionary.partitions.map(partition => ({
+				size: partition.size,
+				digest: partition.digest,
+				records: partition.records,
+				complete: partition.complete,
+			})),
+			recordCount: dictionary.recordCount,
+			uniqueTerms: dictionary.uniqueTerms,
+			totalBytes: dictionary.totalBytes,
+			duplicateIds: [...dictionary.duplicateIds],
+			sidecarIneligible: dictionary.sidecarIneligible,
+		};
+		const meta = finalizeDictionaryArtifactCommit(commit);
+		try {
+			const metaWriter = this.storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
+			try {
+				metaWriter.writeLineSync(meta.bytes);
+				if (!metaWriter.fsyncSync) throw new Error("Synchronous dictionary meta fsync is unavailable");
+				metaWriter.fsyncSync();
+			} finally {
+				metaWriter.closeSync();
+			}
+		} catch {
+			return false;
+		}
+		dictionary.metaSize = meta.commit.metaSize;
+		dictionary.metaDigest = meta.commit.metaDigest;
+		try {
+			dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+		} catch {
+			// Re-verification happens on first use.
+		}
+		return true;
+	}
+
+	/** Fail closed: drop the retained dictionary state (files stay disposable; lookups use the idx scan). */
+	#invalidateDictionaryArtifact(): void {
+		const runtime = this.#sidecarRuntime;
+		const dictionary = runtime?.dictionary;
+		if (!dictionary) return;
+		runtime.dictionary = undefined;
+		if (dictionary.chargedBytes > 0) runtime.blockCache.release(dictionary.chargedBytes);
+	}
+
+	/** Serve one cold entry index from the persistent dictionary artifact (bounded partition read). */
+	#findColdEntryIndexFromDictionary(id: string): ColdEntryIndex | undefined {
+		const runtime = this.#sidecarRuntime;
+		const dictionary = runtime?.dictionary;
+		if (!dictionary || typeof this.storage.readRangeSync !== "function") return undefined;
+		if (dictionary.indexDigest !== runtime.indexDigest) return undefined;
+		let indexStat: SessionStorageStat;
+		try {
+			indexStat = this.storage.statSync(runtime.indexPath);
+		} catch {
+			return undefined;
+		}
+		if (!runtime.validatedIndexDescriptor || !sameDescriptor(runtime.validatedIndexDescriptor, indexStat))
+			return undefined;
+		const partition = dictionaryPartitionForId(id, dictionary.partitions.length);
+		const committed = dictionary.partitions[partition];
+		if (!committed?.complete || committed.size === 0) return undefined;
+		let partitionStat: SessionStorageStat;
+		try {
+			partitionStat = this.storage.statSync(this.#dictionaryPartitionPath(partition));
+		} catch {
+			return undefined;
+		}
+		if (partitionStat.size !== committed.size) return undefined;
+		// One bounded chunked pass: incrementally hash the exact bytes while
+		// locating the lossless term; the record is trusted only after the whole
+		// partition verifies against the committed digest.
+		const hash = crypto.createHash("sha256");
+		const decoder = new TextDecoder("utf-8");
+		let carry = "";
+		let carryBytes: Uint8Array | undefined;
+		let found: ColdEntryIndex | undefined;
+		const targetPrefix = `{"t":${JSON.stringify(id)},`;
+		let residentBytes = 0;
+		for (let offset = 0; offset < committed.size; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, committed.size - offset);
+			let bytes: Uint8Array;
+			try {
+				bytes = this.storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes;
+			} catch {
+				return undefined;
+			}
+			hash.update(bytes);
+			const text = decoder.decode(bytes, { stream: offset + length < committed.size });
+			let lineStart = 0;
+			let newline = text.indexOf("\n");
+			const dispatchLine = (line: string): boolean => {
+				// The committed digest authenticates every byte in this immutable partition;
+				// parse only the exact target term instead of JSON-decoding every unrelated
+				// record in the partition's bounded verification pass.
+				if (!line.startsWith(targetPrefix)) return true;
+				const record = parseDictionaryPartitionRecord(line);
+				if (!record || record.term !== id) return false;
+				if (record.dictId < 0) return false;
+				found = {
+					ordinal: record.ordinal,
+					seq: record.seq,
+					byteOffset: record.byteOffset,
+					byteLength: record.byteLength,
+					recordDigest: record.recordDigest,
+					parentId: record.parentId,
+					...(record.entryType.length > 0 ? { entryType: record.entryType } : {}),
+				};
+				residentBytes = line.length * 2 + 48;
+				return true;
+			};
+			while (newline >= 0) {
+				const line =
+					carry === "" && carryBytes === undefined
+						? text.slice(lineStart, newline)
+						: `${carry}${text.slice(lineStart, newline)}`;
+				carry = "";
+				carryBytes = undefined;
+				if (!dispatchLine(line)) return undefined;
+				lineStart = newline + 1;
+				newline = text.indexOf("\n", lineStart);
+			}
+			carry = `${carry}${text.slice(lineStart)}`;
+		}
+		if (carry !== "") return undefined;
+		if (hash.digest("hex") !== committed.digest) return undefined;
+		if (!found) return undefined;
+		if (!runtime.coldEntries.has(id) && runtime.blockCache.tryAllocate(residentBytes))
+			runtime.coldEntries.set(id, found);
+		return found;
+	}
+
+	// =========================================================================
+	// Persistent metadata-delta section (demoted reducer/provider values)
+	// =========================================================================
+
+	/** Fresh metadata-delta runtime state for a build or adoption. */
+	#createMetadataDeltaRuntimeState(): MetadataDeltaArtifactRuntimeState {
+		return {
+			indexDigest: "",
+			size: 0,
+			sha256: "",
+			hash: crypto.createHash("sha256"),
+			byKey: new Map(),
+			descriptorBytes: 0,
+			budgetBytes: REDUCER_BUDGET_BYTES,
+		};
+	}
+
+	/** Resident bytes of one retained delta descriptor (key + kind + sha256 + object + descriptor). */
+	#metadataDeltaDescriptorCharge(key: string, kind: string): number {
+		return metadataDeltaDescriptorResidentBytes(key) + residentStringBytes(kind) + 2 * 64 + 16 + 8;
+	}
+
+	/** Reconcile the reducer-bucket descriptor accounting with the current byKey set. */
+	#syncMetadataDeltaDescriptorBytes(): void {
+		const delta = this.#sidecarRuntime?.metadataDelta;
+		if (!delta) return;
+		let total = 0;
+		for (const [key, value] of delta.byKey) total += this.#metadataDeltaDescriptorCharge(key, value.kind);
+		delta.descriptorBytes = total;
+	}
+
+	/**
+	 * Append one provider value's exact line bytes to the metadata-delta section
+	 * (fsync before returning). Returns the exact value location + digest, or
+	 * `undefined` when the fixed 4 MiB reducer budget would be exceeded or the
+	 * write fails — the caller then keeps the value inline (fail closed to the
+	 * pre-demotion eager marker semantics).
+	 */
+	#appendMetadataDeltaValue(lineBytes: Uint8Array): { offset: number; length: number; sha256: string } | undefined {
+		const runtime = this.#sidecarRuntime;
+		const delta = runtime?.metadataDelta;
+		if (!delta) return undefined;
+		if (delta.size + lineBytes.byteLength > delta.budgetBytes) return undefined;
+		try {
+			const writer = this.storage.openWriter(runtime.metadataDeltaPath, { flags: delta.size === 0 ? "w" : "a" });
+			try {
+				writer.writeLineSync(Buffer.from(lineBytes).toString("utf8"));
+				if (!writer.fsyncSync) throw new Error("Synchronous metadata-delta fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+		} catch {
+			return undefined;
+		}
+		const offset = delta.size;
+		delta.hash.update(Buffer.from(lineBytes));
+		delta.size += lineBytes.byteLength;
+		delta.sha256 = delta.hash.copy().digest("hex");
+		return { offset, length: lineBytes.byteLength, sha256: computeLineDigest(Buffer.from(lineBytes)) };
+	}
+
+	/**
+	 * Derive the marker's metadata-delta binding from the current runtime state.
+	 * Positions are the merged provider-list indices, so reopen reproduces the
+	 * exact ordered provider list. Absent when no value is demoted.
+	 */
+	#buildMetadataDeltaCommit(): MetadataDeltaArtifactCommit | undefined {
+		const runtime = this.#sidecarRuntime;
+		const delta = runtime?.metadataDelta;
+		if (!delta || delta.byKey.size === 0) return undefined;
+		const values: MetadataDeltaValue[] = [];
+		runtime.providerStateOrder.forEach((key, position) => {
+			const stored = delta.byKey.get(key);
+			if (!stored) return;
+			values.push({ key, ...stored, position });
+		});
+		if (values.length === 0) return undefined;
+		return { indexDigest: delta.indexDigest, size: delta.size, sha256: delta.sha256, values };
+	}
+
+	/**
+	 * The marker's inline provider list: the merged provider order minus the
+	 * demoted entries (those are carried as metadata-delta descriptors with
+	 * their exact merged positions, so reopen reproduces the merged order).
+	 */
+	#markerProviderStateEntries(): SessionEntry[] {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return [];
+		const delta = runtime.metadataDelta;
+		if (!delta || delta.byKey.size === 0) return runtime.providerStateEntries.map(cloneSessionEntry);
+		const inlineByKey = new Map<string, SessionEntry>();
+		for (const entry of runtime.providerStateEntries) {
+			const key = providerStateEntryKey(entry);
+			if (key) inlineByKey.set(key, entry);
+		}
+		const inline: SessionEntry[] = [];
+		for (const key of runtime.providerStateOrder) {
+			const entry = inlineByKey.get(key);
+			if (entry) inline.push(cloneSessionEntry(entry));
+		}
+		return inline;
+	}
+
+	/** Read one demoted value's exact bytes, verify its digest, and parse it strictly. */
+	#rehydrateMetadataDeltaValue(fileBytes: Uint8Array, value: MetadataDeltaValue): SessionEntry | undefined {
+		if (value.offset + value.length > fileBytes.byteLength) return undefined;
+		const bytes = fileBytes.subarray(value.offset, value.offset + value.length);
+		if (computeLineDigest(bytes) !== value.sha256) return undefined;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(Buffer.from(bytes).toString("utf8"));
+		} catch {
+			return undefined;
+		}
+		if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+		const candidate = entry as SessionEntry;
+		if (candidate.type !== value.kind) return undefined;
+		if (!isProviderStateEntry(candidate)) return undefined;
+		if (providerStateEntryKey(candidate) !== value.key) return undefined;
+		return candidate;
+	}
+
+	/**
+	 * Verify the committed metadata-delta binding (exact size + SHA-256 over the
+	 * file bytes + covered index digest), validate every demoted value's bytes
+	 * (transient rehydration), and rebuild the exact merged provider order as
+	 * keys. Demoted values are NOT retained resident — only their descriptors
+	 * are kept, and the provider context rehydrates them on demand. Any
+	 * ambiguity fails closed (returns false → the caller falls back to the
+	 * eager authoritative path).
+	 */
+	#adoptCommittedMetadataDelta(commit: MetadataDeltaArtifactCommit | undefined): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) {
+			return false;
+		}
+		if (commit === undefined) {
+			const providerKeys = new Set<string>();
+			for (const entry of runtime.providerStateEntries) {
+				const key = providerStateEntryKey(entry);
+				if (!key || providerKeys.has(key)) return false;
+				providerKeys.add(key);
+			}
+			runtime.metadataDelta = undefined;
+			runtime.providerStateOrder = runtime.providerStateEntries
+				.map(providerStateEntryKey)
+				.filter((key): key is string => key !== undefined);
+			return true;
+		}
+		if (!isValidMetadataDeltaCommit(commit)) return false;
+		if (commit.indexDigest !== runtime.indexDigest) return false;
+		if (commit.size > REDUCER_BUDGET_BYTES) return false;
+		if (commit.values.length + runtime.providerStateEntries.length > 256) return false;
+		if (Buffer.byteLength(JSON.stringify(runtime.providerStateEntries), "utf8") + commit.size > REDUCER_BUDGET_BYTES)
+			return false;
+		const providerKeys = new Set<string>();
+		for (const entry of runtime.providerStateEntries) {
+			const key = providerStateEntryKey(entry);
+			if (!key || providerKeys.has(key)) return false;
+			providerKeys.add(key);
+		}
+		for (const value of commit.values) {
+			if (providerKeys.has(value.key)) return false;
+			providerKeys.add(value.key);
+		}
+		if (typeof this.storage.readRangeSync !== "function") return false;
+		let fileBytes: Uint8Array;
+		try {
+			const stat = this.storage.statSync(runtime.metadataDeltaPath);
+			if (stat.size !== commit.size) return false;
+			fileBytes = this.storage.readRangeSync(runtime.metadataDeltaPath, 0, commit.size).bytes;
+		} catch {
+			return false;
+		}
+		if (computeLineDigest(fileBytes) !== commit.sha256) return false;
+		// Transient validation: every demoted value's exact bytes must parse to a
+		// matching provider entry. The parsed entries are not retained.
+		for (const value of commit.values) {
+			if (!this.#rehydrateMetadataDeltaValue(fileBytes, value)) return false;
+		}
+		// Merge the exact slot sequence: demoted keys occupy their positions;
+		// inline keys (marker order) fill the remaining slots in order.
+		const slots: Array<string | undefined> = new Array(
+			runtime.providerStateEntries.length + commit.values.length,
+		).fill(undefined);
+		for (const value of commit.values) {
+			if (value.position < 0 || value.position >= slots.length || slots[value.position] !== undefined) return false;
+			slots[value.position] = value.key;
+		}
+		let inlineIndex = 0;
+		for (let slot = 0; slot < slots.length; slot++) {
+			if (slots[slot] !== undefined) continue;
+			if (inlineIndex >= runtime.providerStateEntries.length) return false;
+			const key = providerStateEntryKey(runtime.providerStateEntries[inlineIndex++]!);
+			if (!key) return false;
+			slots[slot] = key;
+		}
+		if (inlineIndex !== runtime.providerStateEntries.length) return false;
+		const delta = this.#createMetadataDeltaRuntimeState();
+		delta.indexDigest = commit.indexDigest;
+		delta.size = commit.size;
+		delta.sha256 = commit.sha256;
+		delta.hash = crypto.createHash("sha256").update(fileBytes);
+		for (const value of commit.values) {
+			delta.byKey.set(value.key, {
+				kind: value.kind,
+				ordinal: value.ordinal,
+				offset: value.offset,
+				length: value.length,
+				sha256: value.sha256,
+			});
+		}
+		runtime.metadataDelta = delta;
+		this.#syncMetadataDeltaDescriptorBytes();
+		try {
+			delta.validatedDescriptor = this.storage.statSync(runtime.metadataDeltaPath);
+		} catch {
+			// Re-verification happens on first use.
+		}
+		runtime.providerStateOrder = slots as string[];
+		return true;
+	}
+
+	/**
+	 * The merged provider list for the provider-context builder: inline entries
+	 * in merged order plus on-demand bounded rehydration of demoted values from
+	 * the authenticated metadata-delta section. Returns `undefined` on any
+	 * inconsistency (callers fall back to the authoritative eager path).
+	 */
+	#resolvedProviderStateEntries(): SessionEntry[] | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return undefined;
+		const delta = runtime.metadataDelta;
+		const inlineByKey = new Map<string, SessionEntry>();
+		for (const entry of runtime.providerStateEntries) {
+			const key = providerStateEntryKey(entry);
+			if (key) inlineByKey.set(key, entry);
+		}
+		if (!delta || delta.byKey.size === 0) {
+			// No demoted values: the merged order equals the inline list.
+			return runtime.providerStateOrder
+				.map(key => inlineByKey.get(key))
+				.filter((entry): entry is SessionEntry => entry !== undefined);
+		}
+		if (typeof this.storage.readRangeSync !== "function") return undefined;
+		let fileBytes: Uint8Array;
+		try {
+			const stat = this.storage.statSync(runtime.metadataDeltaPath);
+			if (stat.size !== delta.size) return undefined;
+			fileBytes = this.storage.readRangeSync(runtime.metadataDeltaPath, 0, delta.size).bytes;
+		} catch {
+			return undefined;
+		}
+		if (computeLineDigest(fileBytes) !== delta.sha256) return undefined;
+		const resolved: SessionEntry[] = [];
+		for (const key of runtime.providerStateOrder) {
+			const inline = inlineByKey.get(key);
+			if (inline) {
+				resolved.push(inline);
+				continue;
+			}
+			const stored = delta.byKey.get(key);
+			if (!stored) return undefined;
+			const value: MetadataDeltaValue = { key, ...stored, position: -1 };
+			const entry = this.#rehydrateMetadataDeltaValue(fileBytes, value);
+			if (!entry) return undefined;
+			resolved.push(entry);
+		}
+		return resolved;
+	}
+
+	/**
+	 * Incrementally maintain the parent artifact for one appended entry. The
+	 * bucket record is appended and fsynced BEFORE the commit marker is
+	 * published, so a marker never claims parent metadata that lacks the new
+	 * edge. Returns false when the artifact cannot safely cover the append
+	 * (bound exceeded, external bucket mutation, or I/O failure); the caller
+	 * then invalidates the whole artifact and the marker is published without
+	 * parent metadata.
+	 */
+	#appendParentArtifactRecord(
+		parentId: string,
+		index: {
+			childId: string;
+			ordinal: number;
+			seq: number;
+			byteOffset: number;
+			byteLength: number;
+			recordDigest: string;
+			entryType?: string;
+		},
+	): boolean {
+		const runtime = this.#sidecarRuntime;
+		const artifact = runtime?.parentArtifact;
+		if (!artifact) return true;
+		const bucket = parentBucketForId(parentId, artifact.buckets.length);
+		const bucketState = artifact.buckets[bucket];
+		if (!bucketState) return false;
+		if (!bucketState.complete) return false;
+		const recordLine = serializeParentBucketRecord({
+			parentId,
+			childId: index.childId,
+			ordinal: index.ordinal,
+			seq: index.seq,
+			byteOffset: index.byteOffset,
+			byteLength: index.byteLength,
+			recordDigest: index.recordDigest,
+			entryType: index.entryType,
+		});
+		const recordBytes = Buffer.byteLength(recordLine, "utf8");
+		try {
+			if (typeof this.storage.readRangeSync !== "function") return false;
+			let currentBytes: Uint8Array;
+			try {
+				const current = this.storage.statSync(this.#parentBucketPath(bucket));
+				if (current.size !== bucketState.size || current.size > PARENT_CHILDREN_BUDGET_BYTES) return false;
+				currentBytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, current.size).bytes;
+			} catch {
+				if (bucketState.size !== 0) return false;
+				currentBytes = Buffer.alloc(0);
+			}
+			const digest = crypto.createHash("sha256").update(currentBytes).digest("hex");
+			if (digest !== bucketState.digest || currentBytes.byteLength !== bucketState.size) return false;
+			const childCount = countParentBucketRecords(currentBytes, parentId);
+			if (childCount >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
+			if (artifact.totalBytes + recordBytes > artifact.budgetBytes) return false;
+			const writer = this.storage.openWriter(this.#parentBucketPath(bucket), { flags: "a" });
+			try {
+				writer.writeLineSync(recordLine);
+				if (!writer.fsyncSync) throw new Error("Synchronous parent bucket fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+			const after = this.storage.statSync(this.#parentBucketPath(bucket));
+			const afterBytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, after.size).bytes;
+			bucketState.size = after.size;
+			bucketState.digest = crypto.createHash("sha256").update(afterBytes).digest("hex");
+			artifact.totalBytes = artifact.buckets.reduce((total, bucket) => total + bucket.size, 0);
+			// The artifact now covers the exact index bytes (including the appended
+			// line); rebind so the next marker's parentIndex matches its indexDigest.
+			artifact.indexDigest = runtime.indexDigest;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Serve one parent's direct children from the persistent artifact: read a
+	 * single bucket (bounded), verify its exact bytes against the committed
+	 * digest, filter hash collisions by parent id, then resolve every child
+	 * from the transcript. Any malformed/corrupt/missing/stale evidence returns
+	 * undefined so the caller falls back to the authoritative cold scan.
+	 */
+	#readParentChildrenFromArtifact(parentId: string, indexStat: SessionStorageStat): SessionEntry[] | undefined {
+		const runtime = this.#sidecarRuntime;
+		const artifact = runtime?.parentArtifact;
+		if (!artifact) return undefined;
+		const fail = (): undefined => {
+			this.#invalidateParentArtifact();
+			return undefined;
+		};
+		if (typeof this.storage.readRangeSync !== "function") return undefined;
+		const bucket = parentBucketForId(parentId, artifact.buckets.length);
+		const committed = artifact.buckets[bucket];
+		if (!committed) return undefined;
+		if (!committed.complete) return fail();
+
+		let bucketStat: SessionStorageStat;
+		let bytes: Uint8Array;
+		try {
+			bucketStat = this.storage.statSync(this.#parentBucketPath(bucket));
+			if (bucketStat.size !== committed.size || bucketStat.size > PARENT_CHILDREN_BUDGET_BYTES) return fail();
+			bytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, bucketStat.size).bytes;
+		} catch {
+			return fail();
+		}
+		const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+		if (digest !== committed.digest) return fail();
+		const records: Array<{ childId: string; index: ColdEntryIndex; residentBytes: number }> = [];
+		const decoder = new TextDecoder("utf-8");
+		let carry = "";
+		let malformed = false;
+		for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, bytes.byteLength - offset);
+			const text =
+				carry +
+				decoder.decode(bytes.subarray(offset, offset + length), {
+					stream: offset + length < bytes.byteLength,
+				});
+			const lines = text.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line) {
+					malformed = true;
+					break;
+				}
+				const record = parseParentBucketRecord(line);
+				if (!record) {
+					malformed = true;
+					break;
+				}
+				if (record.parentId !== parentId) continue;
+				records.push({
+					childId: record.childId,
+					index: {
+						ordinal: record.ordinal,
+						seq: record.seq,
+						byteOffset: record.byteOffset,
+						byteLength: record.byteLength,
+						recordDigest: record.recordDigest,
+						parentId,
+						...(record.entryType !== undefined ? { entryType: record.entryType } : {}),
+					},
+					residentBytes: line.length * 2 + 48,
+				});
+			}
+			if (malformed) break;
+		}
+		if (carry.length > 0) malformed = true;
+		if (malformed || records.length > PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return fail();
+		for (const record of records) {
+			if (!runtime.coldEntries.has(record.childId) && runtime.blockCache.tryAllocate(record.residentBytes))
+				runtime.coldEntries.set(record.childId, record.index);
+		}
+		const cache = new Map<string, string>();
+		const children: SessionEntry[] = [];
+		for (const record of records) {
+			const entry = this.#resolveColdChild(record.childId, record.index, parentId);
+			if (!entry) return fail();
+			children.push(
+				cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+			);
+		}
+		const cacheBytes =
+			residentStringBytes(parentId) +
+			48 +
+			records.reduce((total, record) => total + residentStringBytes(record.childId) + 8, 0);
+		if (runtime.blockCache.tryAllocate(cacheBytes)) {
+			runtime.parentChildrenCache.set(parentId, {
+				ids: records.map(record => record.childId),
+				bytes: cacheBytes,
+				descriptor: indexStat,
+				bucketDescriptor: bucketStat,
+				bucketIndex: bucket,
+			});
+		}
+		return children;
+	}
+
+	/** Resolve one artifact-referenced child from the transcript, verifying parent identity. */
+	#resolveColdChild(id: string, index: ColdEntryIndex, parentId: string): SessionEntry | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return undefined;
+		const bytes = this.#readColdEntryRange(index);
+		if (!bytes || computeLineDigest(bytes) !== index.recordDigest) return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+		} catch {
+			return undefined;
+		}
+		if (parsed === null || typeof parsed !== "object") return undefined;
+		const entry = parsed as SessionEntry;
+		if (
+			entry.id !== id ||
+			entry.parentId !== parentId ||
+			(typeof index.entryType === "string" && entry.type !== index.entryType)
+		)
+			return undefined;
+		residentizePersistedBlobRefs(entry);
+		if (!runtime.entryCache.tryAllocate(bytes.byteLength)) return entry;
+		this.#byId.set(id, entry);
+		return entry;
+	}
+
+	/** True when the bucket backing an artifact-seeded cache entry still matches its validated descriptor. */
+	#parentBucketDescriptorMatches(descriptor: SessionStorageStat, bucketIndex: number | undefined): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.parentPathPrefix || bucketIndex === undefined) return false;
+		try {
+			const current = this.storage.statSync(this.#parentBucketPath(bucketIndex));
+			return sameDescriptor(current, descriptor);
+		} catch {
+			return false;
+		}
+	}
+
+	/** Every disposable sidecar path, including persistent dictionary/metadata artifacts. */
+	#disposableSidecarPaths(): string[] {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return [];
+		return [
+			runtime.indexPath,
+			runtime.tailPath,
+			runtime.commitPath,
+			runtime.dictionaryMetaPath,
+			runtime.metadataDeltaPath,
+			...dictionaryPartitionPaths(runtime.indexPath),
+			...parentBucketPaths(runtime.indexPath),
+		];
+	}
+
+	#validateColdBase(base = this.#sidecarRuntime?.base): boolean {
+		const runtime = this.#sidecarRuntime;
+		const sessionFile = this.#sessionFile;
+		if (!runtime?.enabled || !base || !sessionFile || typeof this.storage.readRangeSync !== "function") return false;
+		const hash = crypto.createHash("sha256");
+		try {
+			for (let offset = 0; offset < base.baseEndOffset; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, base.baseEndOffset - offset);
+				hash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+				if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+			}
+		} catch {
+			return false;
+		}
+		return hash.digest("hex") === base.baseDigest;
+	}
+
+	/**
+	 * Retire the provider-invisible prefix of `#fileEntries`/`#byId` into the cold
+	 * region, keeping a bounded hot suffix (≤ 16 MiB / post-compaction boundary).
+	 * Returns the count of retired entries. Fails closed (retires nothing) when the
+	 * sidecar is unavailable or ineligible.
+	 */
+	#retireColdEntries(hotSuffixBytes = this.#sidecarHotSuffixBudgetBytes): number {
+		const runtime = this.#sidecarRuntime;
+		const fail = (reason: string): 0 => {
+			this.#retirementFallbackReason = reason;
+			return 0;
+		};
+		if (!runtime?.enabled || runtime.sidecarIneligible || this.#fileEntries.length === 0)
+			return fail("sidecar_unavailable");
+		const retirementFirstKeptEntryId = runtime.retirementFirstKeptEntryId;
+		if (!retirementFirstKeptEntryId) return fail("boundary_unavailable");
+		const firstKeptIndex = this.#fileEntries.findIndex(
+			entry => entry.type !== "session" && entry.id === retirementFirstKeptEntryId,
+		);
+		if (firstKeptIndex <= 0) return fail("boundary_not_retirable");
+		if (!this.#fileEntries.slice(0, firstKeptIndex).some(entry => entry.type !== "session"))
+			return fail("no_cold_entries");
+		if (!this.#validateColdBase()) return fail("base_invalid");
+		const activeHotIds = new Set<string>();
+		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
+		let reachedBoundary = false;
+		while (active) {
+			activeHotIds.add(active.id);
+			if (active.id === retirementFirstKeptEntryId) {
+				reachedBoundary = true;
+				break;
+			}
+			active = active.parentId ? this.#byId.get(active.parentId) : undefined;
+		}
+		if (!reachedBoundary) return fail("boundary_not_active");
+		let retainedBytes = 0;
+		let retainedAccountedBytes = 0;
+		for (const entry of this.#fileEntries) {
+			if (entry.type === "session" || !activeHotIds.has(entry.id)) continue;
+			const serializedBytes = this.#serializeEntryLine(entry).byteLength;
+			retainedBytes += serializedBytes;
+			retainedAccountedBytes += residentHotEntryBytes(serializedBytes);
+			if (retainedBytes > hotSuffixBytes) return fail("hot_suffix_budget");
+		}
+		const fixedReservedBytes =
+			runtime.blockCache.budgetBytes +
+			runtime.entryCache.budgetBytes +
+			runtime.tailCache.budgetBytes +
+			REDUCER_BUDGET_BYTES +
+			LABELS_PINS_BUDGET_BYTES +
+			1024 * 1024;
+		const targetAccountedBytes = fixedReservedBytes + retainedAccountedBytes;
+		const accountedDelta = targetAccountedBytes - runtime.accountant.totalBytes;
+		if (accountedDelta > 0 && !runtime.accountant.tryCharge(accountedDelta)) return fail("accounting_budget");
+		if (accountedDelta < 0) runtime.accountant.release(-accountedDelta);
+		let retired = 0;
+		for (const entry of this.#fileEntries) {
+			if (entry.type !== "session" && !activeHotIds.has(entry.id)) retired++;
+		}
+		runtime.coldEntriesRetired += retired;
+		runtime.transcriptGeneration++;
+		runtime.sidecarRebuildCount++;
+		this.#fileEntries = this.#fileEntries.filter(entry => entry.type === "session" || activeHotIds.has(entry.id));
+		this.#byId = new Map(
+			this.#fileEntries
+				.filter((entry): entry is SessionEntry => entry.type !== "session")
+				.map(entry => [entry.id, entry]),
+		);
+		this.#resetMaterializedCaches();
+		const aggregateUsageStatistics = this.#usageStatistics;
+		const transition = this.#prepareResidentTextStoreTransition(
+			{
+				target: { sessionId: this.#sessionId, sessionFile: this.#sessionFile ?? "" },
+				primary: {
+					mode: "materialize",
+					sourceEntries: this.#fileEntries,
+					sourceStores: {
+						textStore: this.#residentTextBlobStore,
+						imageStore: this.#residentImageBlobStore,
+					},
+				},
+			},
+			"memory-fallback",
+		);
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#usageStatistics = aggregateUsageStatistics;
+		runtime.hotSuffixBytes = retainedBytes;
+		this.#retirementFallbackReason = undefined;
+		return retired;
+	}
+
+	#coldIndexDigestValid(): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return false;
+		let descriptor: SessionStorageStat;
+		try {
+			descriptor = this.storage.statSync(runtime.indexPath);
+			const hash = crypto.createHash("sha256");
+			for (let offset = 0; offset < descriptor.size; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, descriptor.size - offset);
+				hash.update(this.storage.readRangeSync(runtime.indexPath, offset, length).bytes);
+			}
+			const valid = hash.digest("hex") === runtime.indexDigest;
+			if (valid) runtime.validatedIndexDescriptor = descriptor;
+			return valid;
+		} catch {
+			return false;
+		}
+	}
+
+	#coldTailMatchesDisk(): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.tailPath || typeof this.storage.readRangeSync !== "function") return false;
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.tailPath).size;
+		} catch {
+			return false;
+		}
+		if (size > runtime.tailCache.budgetBytes) return false;
+		let ordinal = 0;
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.tailPath, size, (_offset, lineBytes) => {
+			const expected = runtime.tail.records[ordinal++];
+			if (!expected) return false;
+			try {
+				const actual = JSON.parse(decodeBoundedJsonLine(lineBytes));
+				if (JSON.stringify(actual) !== JSON.stringify(expected)) return false;
+			} catch {
+				return false;
+			}
+		});
+		return failure === undefined && ordinal === runtime.tail.records.length;
+	}
+
+	#findColdEntryIndex(id: string, cacheLocality = true): ColdEntryIndex | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		const cached = runtime.coldEntries.get(id);
+		if (cached) {
+			try {
+				const current = this.storage.statSync(runtime.indexPath);
+				if (runtime.validatedIndexDescriptor && sameDescriptor(runtime.validatedIndexDescriptor, current))
+					return cached;
+			} catch {
+				return undefined;
+			}
+			runtime.coldEntries.clear();
+			runtime.parentChildrenCache.clear();
+			runtime.parentArtifact = undefined;
+			runtime.blockCache.release(runtime.blockCache.allocatedBytes);
+			runtime.validatedIndexDescriptor = undefined;
+		}
+		const dictionaryIndex = this.#findColdEntryIndexFromDictionary(id);
+		if (dictionaryIndex) return dictionaryIndex;
+		if (!this.#coldIndexDigestValid()) return undefined;
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.indexPath).size;
+		} catch {
+			return undefined;
+		}
+		const decoder = new TextDecoder("utf-8");
+		let carry = "";
+		const recent = new Map<string, { index: ColdEntryIndex; bytes: number }>();
+		let recentBytes = 0;
+		for (let offset = 0; offset < size; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, size - offset);
+			let bytes: Uint8Array;
+			try {
+				bytes = this.storage.readRangeSync(runtime.indexPath, offset, length).bytes;
+			} catch {
+				return undefined;
+			}
+			const text = carry + decoder.decode(bytes, { stream: offset + length < size });
+			const lines = text.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line) continue;
+				try {
+					const value = JSON.parse(line) as Partial<ColdEntryIndex> & { id?: unknown };
+					if (
+						typeof value.id === "string" &&
+						typeof value.ordinal === "number" &&
+						typeof value.seq === "number" &&
+						typeof value.byteOffset === "number" &&
+						typeof value.byteLength === "number" &&
+						typeof value.recordDigest === "string"
+					) {
+						const found: ColdEntryIndex = {
+							ordinal: value.ordinal,
+							seq: value.seq,
+							byteOffset: value.byteOffset,
+							byteLength: value.byteLength,
+							recordDigest: value.recordDigest,
+							...(value.parentId === null || typeof value.parentId === "string"
+								? { parentId: value.parentId }
+								: {}),
+							...(typeof value.entryType === "string" ? { entryType: value.entryType } : {}),
+						};
+						if (cacheLocality) {
+							const residentBytes = line.length * 2 + 48;
+							recent.set(value.id, { index: found, bytes: residentBytes });
+							recentBytes += residentBytes;
+							while (recentBytes > runtime.blockCache.budgetBytes && recent.size > 1) {
+								const oldestId = recent.keys().next().value;
+								if (typeof oldestId !== "string") break;
+								const removed = recent.get(oldestId);
+								recent.delete(oldestId);
+								if (removed) recentBytes -= removed.bytes;
+							}
+						}
+						if (value.id === id) {
+							if (cacheLocality)
+								for (const [candidateId, candidate] of recent) {
+									if (!runtime.coldEntries.has(candidateId) && runtime.blockCache.tryAllocate(candidate.bytes))
+										runtime.coldEntries.set(candidateId, candidate.index);
+								}
+							return found;
+						}
+					}
+				} catch {
+					// A corrupt disposable index line is ignored; transcript remains authoritative.
+				}
+			}
+		}
+		return undefined;
+	}
+
+	#validateColdIndexCoverage(sessionFile: string, transcriptSize: number, expectedDigest: string): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.indexPath || typeof this.storage.readRangeSync !== "function") return false;
+		const memoryIds = this.storage instanceof FileSessionStorage ? undefined : new BoundedColdIdHashSet();
+		let diskIds: DiskBackedIdUniquenessCheck | undefined;
+		try {
+			if (this.storage instanceof FileSessionStorage) diskIds = new DiskBackedIdUniquenessCheck();
+		} catch {
+			return false;
+		}
+		let ordinal = 0;
+		let expectedOffset: number | undefined;
+		let firstOffset: number | undefined;
+		let valid = true;
+		const indexHash = crypto.createHash("sha256");
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.indexPath).size;
+		} catch {
+			diskIds?.dispose();
+			return false;
+		}
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+			indexHash.update(lineBytes);
+			try {
+				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as Partial<ColdEntryIndex> & { id?: unknown };
+				if (
+					typeof value.id !== "string" ||
+					typeof value.ordinal !== "number" ||
+					!Number.isSafeInteger(value.ordinal) ||
+					typeof value.seq !== "number" ||
+					!Number.isSafeInteger(value.seq) ||
+					typeof value.byteOffset !== "number" ||
+					!Number.isSafeInteger(value.byteOffset) ||
+					typeof value.byteLength !== "number" ||
+					!Number.isSafeInteger(value.byteLength) ||
+					typeof value.recordDigest !== "string" ||
+					!/^[0-9a-f]{64}$/.test(value.recordDigest) ||
+					(value.parentId !== null && typeof value.parentId !== "string") ||
+					typeof value.entryType !== "string" ||
+					value.ordinal !== ordinal ||
+					value.byteLength <= 0 ||
+					(expectedOffset === undefined ? value.byteOffset <= 0 : value.byteOffset !== expectedOffset) ||
+					!(diskIds ? diskIds.add(value.id) : memoryIds!.addUnique(value.id))
+				) {
+					valid = false;
+					return false;
+				}
+				firstOffset ??= value.byteOffset;
+				expectedOffset = value.byteOffset + value.byteLength;
+				ordinal++;
+			} catch {
+				valid = false;
+				return false;
+			}
+		});
+		const idsUnique = diskIds ? diskIds.finish() : true;
+		const digestValid = indexHash.copy().digest("hex") === expectedDigest;
+		if (!digestValid) this.#lazyReopenFallbackReason = "index_digest_mismatch";
+		diskIds?.dispose();
+		if (
+			failure ||
+			!valid ||
+			!idsUnique ||
+			!digestValid ||
+			ordinal === 0 ||
+			expectedOffset !== transcriptSize ||
+			firstOffset === undefined
+		)
+			return false;
+		if (firstOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return false;
+		try {
+			const headerBytes = this.storage.readRangeSync(sessionFile, 0, firstOffset).bytes;
+			const headerValid =
+				headerBytes.byteLength === firstOffset &&
+				headerBytes.at(-1) === 0x0a &&
+				Buffer.from(headerBytes).indexOf(0x0a) === headerBytes.byteLength - 1;
+			if (headerValid) runtime.indexHash = indexHash;
+			return headerValid;
+		} catch {
+			return false;
+		}
+	}
+
+	#readAllColdEntryIndexes(): Array<ColdEntryIndex & { id: string }> {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function")
+			throw new Error("cold_index_unavailable");
+		if (!this.#coldIndexDigestValid()) throw new Error("cold_index_invalid");
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.indexPath).size;
+		} catch {
+			throw new Error("cold_index_unavailable");
+		}
+		const result: Array<ColdEntryIndex & { id: string }> = [];
+		const ids = new Set<string>();
+		const decoder = new TextDecoder("utf-8");
+		let carry = "";
+		for (let offset = 0; offset < size; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, size - offset);
+			const bytes = this.storage.readRangeSync(runtime.indexPath, offset, length).bytes;
+			const lines = (carry + decoder.decode(bytes, { stream: offset + length < size })).split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line) throw new Error("cold_index_malformed");
+				try {
+					const value = JSON.parse(line) as Partial<ColdEntryIndex> & { id?: unknown };
+					if (
+						typeof value.id !== "string" ||
+						typeof value.ordinal !== "number" ||
+						!Number.isSafeInteger(value.ordinal) ||
+						typeof value.seq !== "number" ||
+						!Number.isSafeInteger(value.seq) ||
+						typeof value.byteOffset !== "number" ||
+						!Number.isSafeInteger(value.byteOffset) ||
+						typeof value.byteLength !== "number" ||
+						!Number.isSafeInteger(value.byteLength) ||
+						typeof value.recordDigest !== "string" ||
+						!/^[0-9a-f]{64}$/.test(value.recordDigest) ||
+						(value.parentId !== null && typeof value.parentId !== "string") ||
+						typeof value.entryType !== "string"
+					)
+						throw new Error("cold_index_malformed");
+					const previous = result.at(-1);
+					if (
+						value.ordinal !== result.length ||
+						value.byteOffset < 0 ||
+						value.byteLength <= 0 ||
+						(previous ? previous.byteOffset + previous.byteLength !== value.byteOffset : value.byteOffset <= 0) ||
+						ids.has(value.id)
+					)
+						throw new Error("cold_index_incomplete");
+					ids.add(value.id);
+					result.push(value as ColdEntryIndex & { id: string });
+				} catch {
+					throw new Error("cold_index_malformed");
+				}
+			}
+		}
+		if (carry.length > 0) throw new Error("cold_index_unterminated");
+		const first = result[0];
+		if (!first || first.byteOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES || !this.#sessionFile)
+			throw new Error("cold_index_incomplete");
+		const headerBytes = this.storage.readRangeSync(this.#sessionFile, 0, first.byteOffset).bytes;
+		if (
+			headerBytes.byteLength !== first.byteOffset ||
+			headerBytes.at(-1) !== 0x0a ||
+			Buffer.from(headerBytes).indexOf(0x0a) !== headerBytes.byteLength - 1
+		)
+			throw new Error("cold_index_incomplete");
+		const last = result.at(-1);
+		if (!last || last.byteOffset + last.byteLength !== runtime.tail.transcriptSize)
+			throw new Error("cold_index_incomplete");
+		return result;
+	}
+
+	/** Lazily resolve a possibly-cold entry by its full transcript byte range. */
+	#readColdEntryRange(index: ColdEntryIndex): Uint8Array | undefined {
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return undefined;
+		try {
+			if (typeof this.storage.readRangeSync === "function") {
+				const runtime = this.#sidecarRuntime;
+				if (runtime) runtime.rangeReadCount++;
+				const snapshot = this.storage.readRangeSync(sessionFile, index.byteOffset, index.byteLength);
+				return snapshot.bytes;
+			}
+			if (this.destination.kind === "managed") {
+				const snapshot = this.#managedTranscriptStore(sessionFile).readExpected(path.basename(sessionFile));
+				if (!snapshot) return undefined;
+				return snapshot.bytes.subarray(index.byteOffset, index.byteOffset + index.byteLength);
+			}
+		} catch {
+			return undefined;
+		}
+		return undefined;
+	}
+
+	/** Rehydrate one cold entry back into the hot map (bounded by the entry cache). */
+	#resolveEntry(id: string): SessionEntry | undefined {
+		const hot = this.#byId.get(id);
+		if (hot) return hot;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) return undefined;
+		const fail = (): SessionEntry | undefined => {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return this.#byId.get(id);
+		};
+		const index = this.#findColdEntryIndex(id);
+		if (!index) return fail();
+		const bytes = this.#readColdEntryRange(index);
+		if (!bytes) return fail();
+		if (computeLineDigest(bytes) !== index.recordDigest) return fail();
+		let parsed: unknown;
+		try {
+			const text = new TextDecoder("utf-8").decode(bytes);
+			parsed = JSON.parse(text);
+		} catch {
+			return fail();
+		}
+		if (parsed === null || typeof parsed !== "object" || typeof (parsed as { id?: unknown }).id !== "string") {
+			return fail();
+		}
+		if (
+			(parsed as { id?: unknown }).id !== id ||
+			(typeof index.entryType === "string" && (parsed as SessionEntry).type !== index.entryType) ||
+			("parentId" in index && (parsed as SessionEntry).parentId !== index.parentId)
+		)
+			return fail();
+		const entry = sanitizeLoadedSessionEntryReplayMetadata(parsed as SessionEntry);
+		residentizePersistedBlobRefs(entry);
+		// Bound the entry cache; a full cache rejects the rehydration (still correct via rebuild).
+		if (!runtime.entryCache.tryAllocate(bytes.byteLength)) return entry;
+		this.#byId.set(id, entry);
+		runtime.coldEntriesReloaded++;
+		return entry;
+	}
+
+	#parseColdBranchEntry(
+		id: string,
+		index: ColdEntryIndex,
+		recordBytes?: Uint8Array,
+	): { entry: SessionEntry; index: ColdEntryIndex } | undefined {
+		if (!("parentId" in index) || typeof index.entryType !== "string") return undefined;
+		const bytes = recordBytes ?? this.#readColdEntryRange(index);
+		if (!bytes || computeLineDigest(bytes) !== index.recordDigest) return undefined;
+		try {
+			const parsed = JSON.parse(new TextDecoder("utf-8").decode(bytes)) as SessionEntry;
+			if (
+				!parsed ||
+				typeof parsed !== "object" ||
+				parsed.id !== id ||
+				parsed.type !== index.entryType ||
+				parsed.parentId !== index.parentId
+			)
+				return undefined;
+			const entry = sanitizeLoadedSessionEntryReplayMetadata(parsed);
+			residentizePersistedBlobRefs(entry);
+			return { entry, index };
+		} catch {
+			return undefined;
+		}
+	}
+
+	#readColdBranchEntry(id: string): { entry: SessionEntry; index: ColdEntryIndex } | undefined {
+		const index = this.#findColdEntryIndex(id);
+		return index ? this.#parseColdBranchEntry(id, index) : undefined;
+	}
+
+	/**
+	 * Prefetch one compacted cold branch by ordinal run. The index is ordered one
+	 * line per transcript ordinal, so the scan skips JSON parsing outside the
+	 * boundary..leaf interval and retains only that bounded interval. This avoids
+	 * one persistent-dictionary partition scan per ancestor on 10k-entry switches.
+	 */
+	#prefetchColdBranchOrdinalRun(
+		leafId: string,
+	): Map<string, { entry: SessionEntry; index: ColdEntryIndex }> | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		const leaf = this.#readColdBranchEntry(leafId);
+		if (leaf?.entry.type !== "compaction") return undefined;
+		const boundaryIndex = this.#findColdEntryIndex(leaf.entry.firstKeptEntryId);
+		if (!boundaryIndex || boundaryIndex.ordinal > leaf.index.ordinal) return undefined;
+		const transcriptStart = boundaryIndex.byteOffset;
+		const transcriptEnd = leaf.index.byteOffset + leaf.index.byteLength;
+		const transcriptLength = transcriptEnd - transcriptStart;
+		if (
+			!coldBranchOrdinalRunWithinPrefetchBounds({
+				boundaryOrdinal: boundaryIndex.ordinal,
+				leafOrdinal: leaf.index.ordinal,
+				transcriptStart,
+				transcriptEnd,
+				maxTranscriptBytes: SESSION_RANGE_READ_MAX_BYTES,
+			})
+		)
+			return undefined;
+		let indexSize: number;
+		try {
+			indexSize = this.storage.statSync(runtime.indexPath).size;
+		} catch {
+			return undefined;
+		}
+		const indexes = new Map<string, ColdEntryIndex>();
+		let ordinal = 0;
+		let valid = true;
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, indexSize, (_offset, lineBytes) => {
+			const currentOrdinal = ordinal++;
+			if (currentOrdinal < boundaryIndex.ordinal || currentOrdinal > leaf.index.ordinal) return;
+			try {
+				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as Partial<ColdEntryIndex> & { id?: unknown };
+				if (
+					typeof value.id !== "string" ||
+					value.ordinal !== currentOrdinal ||
+					typeof value.seq !== "number" ||
+					typeof value.byteOffset !== "number" ||
+					typeof value.byteLength !== "number" ||
+					typeof value.recordDigest !== "string" ||
+					(value.parentId !== null && typeof value.parentId !== "string") ||
+					typeof value.entryType !== "string"
+				) {
+					valid = false;
+					return false;
+				}
+				indexes.set(value.id, value as ColdEntryIndex);
+			} catch {
+				valid = false;
+				return false;
+			}
+		});
+		if (failure || !valid) return undefined;
+		if (!this.#sessionFile) return undefined;
+		let transcriptBytes: Uint8Array;
+		try {
+			runtime.rangeReadCount++;
+			transcriptBytes = this.storage.readRangeSync(this.#sessionFile, transcriptStart, transcriptLength).bytes;
+			if (transcriptBytes.byteLength !== transcriptLength) return undefined;
+		} catch {
+			return undefined;
+		}
+		const prefetched = new Map<string, { entry: SessionEntry; index: ColdEntryIndex }>();
+		let currentId: string | null = leafId;
+		let priorOrdinal = Number.POSITIVE_INFINITY;
+		while (currentId !== null) {
+			const index = indexes.get(currentId);
+			if (!index || index.ordinal >= priorOrdinal) return undefined;
+			priorOrdinal = index.ordinal;
+			const recordBytes = transcriptBytes?.subarray(
+				index.byteOffset - transcriptStart,
+				index.byteOffset - transcriptStart + index.byteLength,
+			);
+			const resolved = this.#parseColdBranchEntry(currentId, index, recordBytes);
+			if (!resolved) return undefined;
+			prefetched.set(currentId, resolved);
+			if (currentId === leaf.entry.firstKeptEntryId) return prefetched;
+			currentId = resolved.entry.parentId;
+		}
+		return undefined;
+	}
+
+	#activateColdBranch(leafId: string): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (
+			!this.#coldSidecarActive() ||
+			!runtime ||
+			!this.#coldIndexDigestValid() ||
+			!this.#coldTailMatchesDisk() ||
+			!this.#validateColdBase(runtime.base)
+		)
+			return false;
+		const retainedLeafToBoundary: SessionEntry[] = [];
+		let retainedBytes = 0;
+		let retainedAccountedBytes = 0;
+		const prefetched = this.#prefetchColdBranchOrdinalRun(leafId);
+		let currentId: string | null = leafId;
+		let priorOrdinal = Number.POSITIVE_INFINITY;
+		let boundaryId: string | undefined;
+		let boundaryReached = false;
+		const reducer: ReducerState = {
+			modelChange: { latest: undefined },
+			ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
+		};
+		const providerState = new Map<string, { order: number; entry: SessionEntry }>();
+		let providerStateBytes = 0;
+		while (currentId !== null) {
+			const resolved: { entry: SessionEntry; index: ColdEntryIndex } | undefined =
+				prefetched?.get(currentId) ?? this.#readColdBranchEntry(currentId);
+			if (!resolved || resolved.index.ordinal >= priorOrdinal) return false;
+			priorOrdinal = resolved.index.ordinal;
+			const entry: SessionEntry = resolved.entry;
+			const index: ColdEntryIndex = resolved.index;
+			const providerKey = providerStateEntryKey(entry);
+			if (providerKey && !providerState.has(providerKey)) {
+				if (providerState.size >= 256) return false;
+				const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8") + 64;
+				if (providerStateBytes + entryBytes > REDUCER_BUDGET_BYTES) return false;
+				providerStateBytes += entryBytes;
+				providerState.set(providerKey, { order: index.ordinal, entry: cloneSessionEntry(entry) });
+			}
+			if (!boundaryReached) {
+				retainedLeafToBoundary.push(entry);
+				retainedBytes += index.byteLength;
+				retainedAccountedBytes += residentHotEntryBytes(index.byteLength);
+				if (retainedBytes > this.#sidecarHotSuffixBudgetBytes) return false;
+			}
+			if (entry.type === "model_change" && reducer.modelChange.latest === undefined) {
+				reducer.modelChange.latest = { ordinal: index.ordinal, role: entry.role };
+			} else if (entry.type === "ttsr_injection" && reducer.ttsr.largestOrdinal < 0) {
+				reducer.ttsr = {
+					count: entry.ttsrMessageCount ?? 0,
+					rulesCount: entry.injectedRules.length,
+					recordsCount: entry.injectedRuleRecords?.length ?? 0,
+					largestOrdinal: index.ordinal,
+				};
+			}
+			if (!boundaryId && entry.type === "compaction") boundaryId = entry.firstKeptEntryId;
+			if (boundaryId && entry.id === boundaryId) boundaryReached = true;
+			currentId = entry.parentId;
+		}
+		if (!boundaryId || !boundaryReached) return false;
+		const header = this.#fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		if (!header) return false;
+		const fixedReservedBytes =
+			runtime.blockCache.budgetBytes +
+			runtime.entryCache.budgetBytes +
+			runtime.tailCache.budgetBytes +
+			REDUCER_BUDGET_BYTES +
+			LABELS_PINS_BUDGET_BYTES +
+			1024 * 1024;
+		const targetAccountedBytes = fixedReservedBytes + retainedAccountedBytes;
+		if (targetAccountedBytes > runtime.accountant.snapshot().budgetBytes) return false;
+		const nextEntries: FileEntry[] = [header, ...retainedLeafToBoundary.reverse()];
+		let transition: PreparedResidentStoreTransition;
+		try {
+			transition = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: this.#sessionId, sessionFile: this.#sessionFile ?? "" },
+					primary: {
+						mode: "materialize",
+						sourceEntries: nextEntries,
+						sourceStores: {
+							textStore: this.#residentTextBlobStore,
+							imageStore: this.#residentImageBlobStore,
+						},
+					},
+				},
+				"memory-fallback",
+			);
+		} catch {
+			return false;
+		}
+		const accountedDelta = targetAccountedBytes - runtime.accountant.totalBytes;
+		if (accountedDelta > 0 && !runtime.accountant.tryCharge(accountedDelta)) {
+			transition.dispose();
+			return false;
+		}
+		if (accountedDelta < 0) runtime.accountant.release(-accountedDelta);
+		const aggregateUsageStatistics = this.#usageStatistics;
+		this.#fileEntries = nextEntries;
+		this.#byId = new Map(
+			nextEntries.filter((entry): entry is SessionEntry => entry.type !== "session").map(entry => [entry.id, entry]),
+		);
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#usageStatistics = aggregateUsageStatistics;
+		this.#leafId = leafId;
+		runtime.reducer = reducer;
+		const sortedBranchProvider = [...providerState.values()].sort((left, right) => left.order - right.order);
+		runtime.providerStateOrder = sortedBranchProvider.map(item => providerStateEntryKey(item.entry)!);
+		runtime.providerStateEntries = sortedBranchProvider.map(item => cloneSessionEntry(item.entry));
+		// Branch provider state is not republished (marker publication is fenced
+		// while the branch is dirty), so the metadata-delta binding must stay
+		// exactly as published: drop the in-memory delta state and keep every
+		// branch provider value resident inline.
+		runtime.metadataDelta = undefined;
+		runtime.hotSuffixBytes = retainedBytes;
+		runtime.retirementFirstKeptEntryId = boundaryId;
+		runtime.terminalTransition = { kind: "rebuild", reason: "branch_activation_unpublished" };
+		this.#sidecarBranchActivationDirty = true;
+		this.#retirementFallbackReason = undefined;
+		return true;
+	}
+
+	#clearColdRuntimeAfterHydration(runtime: SessionMemorySidecarRuntime): void {
+		runtime.enabled = false;
+		runtime.accountant.release(runtime.accountant.totalBytes);
+		runtime.coldEntries.clear();
+		runtime.tail = { ...runtime.tail, records: [] };
+		runtime.labelsPins.clear();
+		runtime.parentChildrenCache.clear();
+		runtime.parentArtifact = undefined;
+		runtime.dictionary = undefined;
+		runtime.metadataDelta = undefined;
+		runtime.coldIdHashes = undefined;
+		runtime.coldIdHashesDescriptor = undefined;
+		runtime.providerStateEntries = [];
+		runtime.providerStateOrder = [];
+		runtime.reducer = {
+			modelChange: { latest: undefined },
+			ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
+		};
+		runtime.hotSuffixBytes = 0;
+		runtime.blockCache.release(runtime.blockCache.allocatedBytes);
+		runtime.entryCache.release(runtime.entryCache.allocatedBytes);
+		runtime.tailCache.release(runtime.tailCache.allocatedBytes);
+		for (const sidecarPath of this.#disposableSidecarPaths()) {
+			if (!sidecarPath) continue;
+			try {
+				this.storage.unlinkSync(sidecarPath);
+			} catch {
+				// Derived sidecars are disposable after authoritative hydration.
+			}
+		}
+		this.#sidecarBranchActivationDirty = false;
+	}
+
+	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
+		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
+		const entries = parseSessionEntries(this.storage.readTextSync(this.#sessionFile));
+		const header = entries[0];
+		if (header?.type !== "session" || header.version !== CURRENT_SESSION_VERSION) {
+			throw new Error("cold_transcript_header_invalid");
+		}
+		if (!hasStrictSessionSchema(entries)) throw new Error("cold_transcript_schema_invalid");
+		const migrationApplied = migrateToCurrentVersion(entries);
+		for (const entry of entries) residentizePersistedBlobRefs(entry);
+		const transition = this.#prepareResidentTextStoreTransition(
+			{
+				target: { sessionId: header.id, sessionFile: this.#sessionFile },
+				primary: {
+					mode: "materialize",
+					sourceEntries: entries,
+					sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+					missingPolicy: "placeholder",
+				},
+			},
+			"memory-fallback",
+		);
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#sessionId = header.id;
+		this.#sessionName = header.title;
+		this.#titleSource = header.titleSource;
+		if (migrationApplied) this.#needsFullRewriteOnNextPersist = true;
+		this.#clearColdRuntimeAfterHydration(runtime);
+	}
+
+	/** Rehydrate the full hot view (for persistence/materialization paths). */
+	#ensureFullHotView(): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) return;
+		if (!this.#validateColdBase(runtime.base) || !this.#coldTailMatchesDisk()) {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		if (this.#sessionFile && this.storage.statSync(this.#sessionFile).size !== runtime.tail.transcriptSize) {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		let records: Array<ColdEntryIndex & { id: string }>;
+		try {
+			records = this.#readAllColdEntryIndexes();
+		} catch {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		const header = this.#fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		if (!header) {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		try {
+			const rebuilt: FileEntry[] = [header];
+			for (const record of records) {
+				const bytes = this.#readColdEntryRange(record);
+				if (!bytes || computeLineDigest(bytes) !== record.recordDigest)
+					throw new Error("cold_index_digest_mismatch");
+				const entry = JSON.parse(Buffer.from(bytes).toString("utf8")) as SessionEntry;
+				if (
+					!entry ||
+					typeof entry !== "object" ||
+					entry.id !== record.id ||
+					(typeof record.entryType === "string" && entry.type !== record.entryType) ||
+					("parentId" in record && entry.parentId !== record.parentId)
+				)
+					throw new Error("cold_index_identity_mismatch");
+				residentizePersistedBlobRefs(entry);
+				rebuilt.push(entry);
+			}
+			const transition = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: this.#sessionId, sessionFile: this.#sessionFile ?? "" },
+					primary: {
+						mode: "materialize",
+						sourceEntries: rebuilt,
+						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						missingPolicy: "placeholder",
+					},
+				},
+				"memory-fallback",
+			);
+			this.#commitResidentTextStoreTransition(transition, false);
+			this.#clearColdRuntimeAfterHydration(runtime);
+		} catch {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+		}
+	}
+
+	/** True when the cold sidecar region is active and usable. */
+	#coldSidecarActive(): boolean {
+		const runtime = this.#sidecarRuntime;
+		return Boolean(
+			runtime?.enabled &&
+				!runtime.sidecarIneligible &&
+				(runtime.hotSuffixBytes > 0 ||
+					(runtime.tail.records.length === 0 && runtime.base.baseEndOffset === runtime.tail.transcriptSize)),
+		);
+	}
+
+	#deactivateColdForBranchMutation(): void {
+		if (!this.#coldSidecarActive()) return;
+		this.#ensureFullHotView();
+		this.#sidecarRuntime && this.#sidecarRuntime.coldMutationPromotions++;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		runtime.enabled = false;
+		runtime.sidecarIneligible = true;
+		runtime.hotSuffixBytes = 0;
+		runtime.accountant = new SessionMemoryAccountant();
+		runtime.dictionary = undefined;
+		runtime.metadataDelta = undefined;
+		runtime.coldIdHashes = undefined;
+		runtime.coldIdHashesDescriptor = undefined;
+		for (const sidecarPath of this.#disposableSidecarPaths()) {
+			if (!sidecarPath) continue;
+			try {
+				this.storage.unlinkSync(sidecarPath);
+			} catch {
+				// Derived sidecars are disposable; the fully hydrated transcript is authoritative.
+			}
+		}
+	}
+
+	#nextColdOrdinal(): number {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) throw new Error("cold_sidecar_unavailable");
+		const previous = runtime.tail.records.at(-1);
+		if (previous) return previous.ordinal + 1;
+		if (runtime.dictionary) return runtime.dictionary.recordCount;
+		return this.#readAllColdEntryIndexes().length;
+	}
+
+	#ensureColdIdHashes(): BoundedColdIdHashSet | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath) return undefined;
+		if (runtime.coldIdHashes) {
+			try {
+				if (
+					runtime.coldIdHashesDescriptor &&
+					sameDescriptor(this.storage.statSync(runtime.indexPath), runtime.coldIdHashesDescriptor)
+				)
+					return runtime.coldIdHashes;
+			} catch {
+				// Fall through to authoritative hydration.
+			}
+			runtime.coldIdHashes = undefined;
+			runtime.coldIdHashesDescriptor = undefined;
+			runtime.accountant.release(COLD_ID_HASH_BYTES);
+			return undefined;
+		}
+		if (!this.#coldIndexDigestValid()) return undefined;
+		if (!runtime.accountant.tryCharge(COLD_ID_HASH_BYTES)) return undefined;
+		const hashes = new BoundedColdIdHashSet();
+		let complete = true;
+		try {
+			const size = this.storage.statSync(runtime.indexPath).size;
+			const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+				try {
+					const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as { id?: unknown };
+					if (typeof value.id !== "string" || !hashes.add(value.id)) {
+						complete = false;
+						return false;
+					}
+				} catch {
+					complete = false;
+					return false;
+				}
+			});
+			if (failure || !complete) return undefined;
+			runtime.coldIdHashes = hashes;
+			runtime.coldIdHashesDescriptor = this.storage.statSync(runtime.indexPath);
+			return hashes;
+		} finally {
+			if (!runtime.coldIdHashes) runtime.accountant.release(COLD_ID_HASH_BYTES);
+		}
+	}
+
+	#generateEntryId(): string {
+		const runtime = this.#sidecarRuntime;
+		if (!this.#coldSidecarActive() || !runtime) return generateId(this.#byId);
+		if (runtime.dictionary && this.#coldIndexDigestValid())
+			return generateId({ has: id => this.#byId.has(id) || this.#findColdEntryIndex(id, false) !== undefined });
+		const hashes = this.#ensureColdIdHashes();
+		if (!hashes) {
+			this.#ensureFullHotView();
+			return generateId(this.#byId);
+		}
+		return generateId({ has: id => this.#byId.has(id) || hashes.has(id) });
+	}
+
+	/** Wire reducer deltas for one appended entry (R1 latest-model-change + TTSR latest-wins). */
+	#applySidecarReducerDelta(entry: SessionEntry, ordinal: number): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) return false;
+		const providerKey = providerStateEntryKey(entry);
+		if (providerKey) {
+			const existed = runtime.providerStateOrder.includes(providerKey);
+			if (!existed && runtime.providerStateOrder.length >= 256) return false;
+			const demoted = this.#persistProviderStateValue(entry, ordinal);
+			const nextProviderEntries = [
+				...runtime.providerStateEntries.filter(candidate => providerStateEntryKey(candidate) !== providerKey),
+				...(demoted ? [] : [cloneSessionEntry(entry)]),
+			];
+			const providerBytes =
+				Buffer.byteLength(JSON.stringify(nextProviderEntries), "utf8") + (runtime.metadataDelta?.size ?? 0);
+			if (providerBytes > REDUCER_BUDGET_BYTES) return false;
+			runtime.providerStateOrder = [...runtime.providerStateOrder.filter(key => key !== providerKey), providerKey];
+			runtime.providerStateEntries = nextProviderEntries;
+		}
+		if (entry.type === "model_change") {
+			runtime.reducer = applyReducerDelta(runtime.reducer, {
+				kind: "latest_model_change",
+				ordinal,
+				role: entry.role,
+			});
+		} else if (entry.type === "ttsr_injection") {
+			runtime.reducer = applyReducerDelta(runtime.reducer, {
+				kind: "ttsr_injection",
+				ordinal,
+				rulesCount: entry.injectedRules.length,
+				recordsCount: entry.injectedRuleRecords?.length ?? 0,
+				count: entry.ttsrMessageCount ?? 0,
+			});
+		}
+		return true;
+	}
+
+	/**
+	 * Persist one provider-state entry's value into the metadata-delta section
+	 * when it exceeds `MAX_REDUCER_INLINE_BYTES`; otherwise keep it inline. The
+	 * value bytes are fsynced before the descriptor is retained, so the marker
+	 * only ever binds descriptors pointing at durable authenticated bytes. When
+	 * the fixed 4 MiB reducer budget or the write fails, the value stays inline
+	 * (fail closed to the pre-demotion eager marker semantics). Returns whether
+	 * the value was demoted (the caller then keeps only the 24 B descriptor
+	 * resident instead of the full entry).
+	 */
+	#persistProviderStateValue(entry: SessionEntry, ordinal: number): boolean {
+		const runtime = this.#sidecarRuntime;
+		const delta = runtime?.metadataDelta;
+		if (!delta) return false;
+		const key = providerStateEntryKey(entry);
+		if (!key) return false;
+		const persistedLine = Buffer.from(`${JSON.stringify(entry)}\n`, "utf8");
+		if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
+			const stored = this.#appendMetadataDeltaValue(persistedLine);
+			if (stored) {
+				delta.byKey.set(key, { kind: entry.type, ordinal, ...stored });
+				this.#syncMetadataDeltaDescriptorBytes();
+				return true;
+			}
+			delta.byKey.delete(key);
+		} else {
+			delta.byKey.delete(key);
+		}
+		this.#syncMetadataDeltaDescriptorBytes();
+		return false;
+	}
+
+	#advanceColdTailBoundary(firstKeptEntryId: string): boolean {
+		const runtime = this.#sidecarRuntime;
+		const sessionFile = this.#sessionFile;
+		if (!runtime?.enabled || !sessionFile || !runtime.tailPath || !this.storage.readRangeSync) return false;
+		const firstIndex = runtime.tail.records.findIndex(record => record.id === firstKeptEntryId);
+		if (firstIndex < 0) return false;
+		const firstRecord = runtime.tail.records[firstIndex];
+		const baseHash = crypto.createHash("sha256");
+		try {
+			for (let offset = 0; offset < firstRecord.byteOffset; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, firstRecord.byteOffset - offset);
+				baseHash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+			}
+			const base: BaseAnchor = { baseDigest: baseHash.digest("hex"), baseEndOffset: firstRecord.byteOffset };
+			const builder = new RollingTailChainBuilder(base);
+			for (let index = firstIndex; index < runtime.tail.records.length; index++) {
+				const prior = runtime.tail.records[index];
+				const appended = builder.append({
+					gen: prior.gen,
+					seq: index - firstIndex,
+					kind: prior.kind,
+					ordinal: prior.ordinal,
+					id: prior.id,
+					parentId: prior.parentId,
+					type: prior.type,
+					byteOffset: prior.byteOffset,
+					byteLength: prior.byteLength,
+					recordDigest: prior.recordDigest,
+				});
+				if (!appended) return false;
+			}
+			const tail = builder.build();
+			const writer = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			try {
+				for (const record of tail.records) writer.writeLineSync(`${JSON.stringify(record)}\n`);
+				if (!writer.fsyncSync) return false;
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+			runtime.base = base;
+			runtime.tail = tail;
+			runtime.tailCache.release(runtime.tailCache.allocatedBytes);
+			for (const record of tail.records) {
+				if (!runtime.tailCache.tryAllocate(tailRecordResidentBytes(record))) return false;
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	#appendColdSidecarRecord(
+		entry: SessionEntry,
+		persistedLine: Buffer,
+		transcriptDescriptor?: SessionStorageStat,
+		ordinal = this.#nextColdOrdinal(),
+	): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || runtime.sidecarIneligible) return false;
+		const cachedChildren = entry.parentId ? runtime.parentChildrenCache.get(entry.parentId) : undefined;
+		if (entry.parentId && cachedChildren) {
+			runtime.parentChildrenCache.delete(entry.parentId);
+			runtime.blockCache.release(cachedChildren.bytes);
+		}
+		const previous = runtime.tail.records.at(-1);
+		const seq = previous ? previous.seq + 1 : 0;
+		const byteOffset = runtime.tail.transcriptSize;
+		const byteLength = persistedLine.byteLength;
+		const recordDigest = computeLineDigest(persistedLine);
+		const recordWithoutChecksum = {
+			gen: this.#commitGen + 1,
+			seq,
+			kind: tailRecordKindForEntry(entry),
+			ordinal,
+			id: entry.id,
+			parentId: entry.parentId,
+			type: entry.type,
+			byteOffset,
+			byteLength,
+			recordDigest,
+		};
+		const checksum = computeTailRecordChecksum(runtime.base, previous?.checksum, recordWithoutChecksum);
+		const record: TailRecord = { ...recordWithoutChecksum, checksum };
+		try {
+			const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "a" });
+			try {
+				const indexLine = `${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest, parentId: entry.parentId, entryType: entry.type })}\n`;
+				indexWriter.writeLineSync(indexLine);
+				if (!indexWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+				indexWriter.fsyncSync();
+				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+				if (runtime.coldIdHashes && !runtime.coldIdHashes.add(entry.id)) return false;
+				runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+				if (runtime.metadataDelta) runtime.metadataDelta.indexDigest = runtime.indexDigest;
+			} finally {
+				indexWriter.closeSync();
+			}
+			const tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "a" });
+			try {
+				tailWriter.writeLineSync(`${JSON.stringify(record)}\n`);
+				if (!tailWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+				tailWriter.fsyncSync();
+			} finally {
+				tailWriter.closeSync();
+			}
+		} catch {
+			this.#deactivateColdForBranchMutation();
+			return false;
+		}
+		const secondaryArtifactsEligible =
+			record.ordinal < PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
+			byteOffset + byteLength <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
+		if (!secondaryArtifactsEligible) {
+			this.#invalidateParentArtifact();
+			this.#invalidateDictionaryArtifact();
+		} else {
+			if (typeof entry.parentId === "string") {
+				if (
+					!this.#appendParentArtifactRecord(entry.parentId, {
+						childId: entry.id,
+						ordinal: record.ordinal,
+						seq,
+						byteOffset,
+						byteLength,
+						recordDigest,
+						entryType: entry.type,
+					})
+				)
+					this.#invalidateParentArtifact();
+			}
+			if (entry.parentId === null && runtime.parentArtifact) this.#invalidateParentArtifact();
+			if (
+				!this.#appendDictionaryRecord({
+					id: entry.id,
+					ordinal: record.ordinal,
+					seq,
+					byteOffset,
+					byteLength,
+					recordDigest,
+					parentId: entry.parentId,
+					entryType: entry.type,
+				})
+			)
+				this.#invalidateDictionaryArtifact();
+		}
+		try {
+			const refreshed = this.storage.statSync(runtime.indexPath);
+			runtime.validatedIndexDescriptor = refreshed;
+			runtime.coldIdHashesDescriptor = runtime.coldIdHashes ? refreshed : undefined;
+		} catch {
+			// The next cold lookup re-verifies the index digest before trusting caches.
+		}
+		const records = runtime.tail.records as TailRecord[];
+		records.push(record);
+		runtime.tail = {
+			base: runtime.base,
+			records,
+			terminalChecksum: checksum,
+			terminalSeq: seq,
+			transcriptSize: byteOffset + byteLength,
+		};
+		if (
+			transcriptDescriptor
+				? this.#publishSessionCommitMarkerSync(transcriptDescriptor)
+				: this.#publishCommitMarkerFromCurrentTranscriptSync()
+		) {
+			runtime.terminalTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
+		} else {
+			runtime.terminalTransition = { kind: "rebuild", reason: "commit_marker_publication_failed" };
+		}
+		return true;
+	}
+
+	#readSessionCommitContents(): SessionMemoryCommitContents | undefined {
+		const markerPath = this.#sidecarRuntime?.commitPath;
+		if (!markerPath || !this.storage.readRangeSync) return undefined;
+		try {
+			const markerSize = this.storage.statSync(markerPath).size;
+			if (markerSize > 8 * 1024 * 1024) return undefined;
+			const value = JSON.parse(
+				Buffer.from(this.storage.readRangeSync(markerPath, 0, markerSize).bytes).toString("utf8"),
+			) as {
+				gen?: unknown;
+				descriptor?: Record<string, unknown>;
+				base?: Record<string, unknown>;
+				terminalChecksum?: unknown;
+				terminalSeq?: unknown;
+				transcriptSize?: unknown;
+				retirementFirstKeptEntryId?: unknown;
+				leafId?: unknown;
+				reducer?: unknown;
+				providerStateEntries?: unknown;
+				labels?: unknown;
+				usageStatistics?: unknown;
+				indexDigest?: unknown;
+				parentIndex?: unknown;
+				dictionary?: unknown;
+				metadataDelta?: unknown;
+			};
+			const descriptor = value.descriptor;
+			const base = value.base;
+			if (
+				typeof value.gen !== "number" ||
+				!descriptor ||
+				typeof descriptor.dev !== "string" ||
+				typeof descriptor.ino !== "string" ||
+				typeof descriptor.size !== "number" ||
+				typeof descriptor.mtimeNs !== "string" ||
+				typeof descriptor.ctimeNs !== "string" ||
+				!base ||
+				typeof base.baseDigest !== "string" ||
+				typeof base.baseEndOffset !== "number" ||
+				typeof value.terminalChecksum !== "string" ||
+				typeof value.terminalSeq !== "number" ||
+				typeof value.transcriptSize !== "number" ||
+				typeof value.indexDigest !== "string"
+			)
+				return undefined;
+			if (Object.hasOwn(value, "metadataDelta") && !isValidMetadataDeltaCommit(value.metadataDelta))
+				return undefined;
+			return {
+				gen: value.gen,
+				descriptor: {
+					dev: BigInt(descriptor.dev),
+					ino: BigInt(descriptor.ino),
+					...(typeof descriptor.nlink === "string" ? { nlink: BigInt(descriptor.nlink) } : {}),
+					size: descriptor.size,
+					mtimeNs: BigInt(descriptor.mtimeNs),
+					ctimeNs: BigInt(descriptor.ctimeNs),
+				},
+				base: { baseDigest: base.baseDigest, baseEndOffset: base.baseEndOffset },
+				terminalChecksum: value.terminalChecksum,
+				terminalSeq: value.terminalSeq,
+				transcriptSize: value.transcriptSize,
+				...(typeof value.retirementFirstKeptEntryId === "string"
+					? { retirementFirstKeptEntryId: value.retirementFirstKeptEntryId }
+					: {}),
+				...(typeof value.leafId === "string" ? { leafId: value.leafId } : {}),
+				...(value.reducer && typeof value.reducer === "object" ? { reducer: value.reducer as ReducerState } : {}),
+				...(Array.isArray(value.providerStateEntries)
+					? { providerStateEntries: value.providerStateEntries as SessionEntry[] }
+					: {}),
+				...(Array.isArray(value.labels) ? { labels: value.labels as Array<[string, string]> } : {}),
+				...(value.usageStatistics && typeof value.usageStatistics === "object"
+					? { usageStatistics: value.usageStatistics as UsageStatistics }
+					: {}),
+
+				indexDigest: value.indexDigest,
+				...(this.#parseParentIndexValue(value.parentIndex) !== undefined
+					? { parentIndex: this.#parseParentIndexValue(value.parentIndex) }
+					: {}),
+				...(this.#parseDictionaryCommitValue(value.dictionary) !== undefined
+					? { dictionary: this.#parseDictionaryCommitValue(value.dictionary) }
+					: {}),
+				...(isValidMetadataDeltaCommit(value.metadataDelta) ? { metadataDelta: value.metadataDelta } : {}),
+			};
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Classify the current reopen state against the committed `.spill.commit` marker. */
+	#classifySidecarReopen(): ReopenClassification {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || runtime.sidecarIneligible) return { kind: "rebuild", reason: "sidecar_unavailable" };
+		let markerPresent = false;
+		try {
+			markerPresent = this.storage.existsSync(runtime.commitPath);
+		} catch {
+			return { kind: "rebuild", reason: "commit_marker_read_failed" };
+		}
+		if (!markerPresent) return { kind: "stale_commit", reason: "no_commit_marker" };
+		const commit = this.#readSessionCommitContents();
+		if (!commit) return { kind: "rebuild", reason: "commit_marker_invalid" };
+		const descriptor = this.#managedDescriptorSnapshotOrNull();
+		if (!descriptor) return { kind: "rebuild", reason: "descriptor_unavailable" };
+		const baseValid = this.#validateColdBase(commit.base);
+		const tailValid = validateTailChain(commit.base, runtime.tail.records).valid;
+		const terminalMarkerValid =
+			commit.terminalChecksum === runtime.tail.terminalChecksum &&
+			commit.terminalSeq === runtime.tail.terminalSeq &&
+			commit.transcriptSize === runtime.tail.transcriptSize;
+		const descriptorExact = sameDescriptor(commit.descriptor, descriptor);
+		const sameObject =
+			commit.descriptor.dev === descriptor.dev &&
+			commit.descriptor.ino === descriptor.ino &&
+			(commit.descriptor.nlink ?? 0n) === (descriptor.nlink ?? 0n);
+		const sameSize = commit.descriptor.size === descriptor.size;
+		const timesChanged =
+			commit.descriptor.mtimeNs !== descriptor.mtimeNs || commit.descriptor.ctimeNs !== descriptor.ctimeNs;
+		const timesAdvanced =
+			descriptor.mtimeNs >= commit.descriptor.mtimeNs && descriptor.ctimeNs >= commit.descriptor.ctimeNs;
+		const classification = classifyReopen({
+			markerPresent,
+			descriptorExact,
+			sameObject,
+			sameSize,
+			sizeGrew: sameObject && descriptor.size > commit.descriptor.size,
+			sizeShrank: sameObject && descriptor.size < commit.descriptor.size,
+			withinScanWindow: Math.abs(descriptor.size - commit.descriptor.size) <= 4 * 1024 * 1024,
+			timesAdvanced,
+			timesChanged,
+			baseValid,
+			tailValid,
+			terminalMarkerValid,
+		});
+		if (descriptorExact) {
+			const validation = validateCommit(commit, runtime.tail.records, {
+				descriptor,
+				baseValid,
+				tailValid,
+				terminalMarkerValid,
+			});
+			if (validation.kind === "invalid") return { kind: "rebuild", reason: validation.reason };
+		}
+		runtime.terminalTransition = classification;
+		return classification;
+	}
+
+	/** Current transcript descriptor, or null when unavailable. */
+	#managedDescriptorSnapshotOrNull(): DescriptorSnapshot | null {
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return null;
+		try {
+			const descriptor =
+				this.destination.kind === "managed"
+					? this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile))
+					: this.storage.statSync(sessionFile);
+			if (!descriptor) return null;
+			return {
+				dev: descriptor.dev,
+				ino: descriptor.ino,
+				nlink: descriptor.nlink,
+				size: descriptor.size,
+				mtimeNs: descriptor.mtimeNs,
+				ctimeNs: descriptor.ctimeNs,
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
+		// A full rewrite must see the complete transcript; rehydrate retired cold
+		// entries into the hot view before materializing the persisted bytes.
+		this.#ensureFullHotView();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return;
+		this.#withSessionPersistenceFenceSync(() => {
+			if (this.destination.kind === "managed") {
+				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+				this.#managedTranscriptStore(sessionFile).replaceSync(path.basename(sessionFile), bytes);
+				this.#publishCommitMarkerFromCurrentTranscriptSync();
+				return;
+			}
+			const dir = path.resolve(sessionFile, "..");
+			const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.tmp`);
+			const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+			try {
+				for (const entry of entries) {
+					writer.writeSync(entry);
+				}
+				writer.fsyncSync();
+				writer.closeSync();
+				const replacement = this.#replaceSessionFileSync(tempPath, sessionFile);
+				if (replacement.kind === "restored_previous") throw replacement.error;
+			} catch (err) {
+				// closeSync is now truthful and may throw; wrap the best-effort cleanup so
+				// the original error (write/close failure) is the one surfaced, not the
+				// cleanup failure. The rename above was already skipped because closeSync
+				// threw before it.
+				try {
+					writer.closeSync();
+				} catch {
+					// Best-effort cleanup of the temp writer's descriptor.
+				}
+				void this.storage.unlink(tempPath).catch(() => {});
+				throw toError(err);
+			}
+		});
+	}
+
+	async #writeBoundedDefaultModelSelection(
+		appendEntries: readonly SessionEntry[],
+		sessionFile: string,
+		sourceDescriptor: DescriptorSnapshot,
+	): Promise<{ tempPath: string; sourceSha256: string }> {
+		if (this.destination.kind === "managed" || typeof this.storage.openStagedWriter !== "function")
+			throw new Error("bounded_default_selection_unsupported");
+		const dir = path.resolve(sessionFile, "..");
+		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.default-selection.tmp`);
+		const staged = this.storage.openStagedWriter(tempPath);
+		const sourceHash = crypto.createHash("sha256");
+		try {
+			const scanFailure = scanTranscriptLinesBounded(
+				this.storage,
+				sessionFile,
+				sourceDescriptor.size,
+				(_offset, lineBytes) => {
+					staged.writeLine(lineBytes.subarray(0, lineBytes.byteLength - 1));
+					sourceHash.update(lineBytes);
+				},
+			);
+			if (scanFailure) throw new Error(`bounded_default_selection_${scanFailure}`);
+			for (const entry of appendEntries) {
+				const persisted = prepareEntryForPersistenceSync(entry, this.#blobStore);
+				staged.writeLine(Buffer.from(JSON.stringify(persisted), "utf8"));
+			}
+			staged.fsync();
+			staged.closeSync();
+			staged.publishNoReplace();
+			const after = this.#managedDescriptorSnapshotOrNull();
+			if (!after || !sameDescriptor(sourceDescriptor, after))
+				throw new Error("bounded_default_selection_source_changed");
+			return { tempPath, sourceSha256: sourceHash.digest("hex") };
+		} catch (error) {
+			try {
+				staged.closeSync();
+			} catch {
+				// Preserve the staging failure.
+			}
+			try {
+				this.storage.unlinkSync(tempPath);
+			} catch {
+				// A successfully published temp may already have been removed by cleanup.
+			}
+			throw toError(error);
 		}
 	}
 
@@ -7565,16 +13067,34 @@ export class SessionManager {
 
 	async #rewriteFileContents(): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
-		await this.#closePersistWriterInternal();
-		const entries = await Promise.all(
-			materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
-				prepareEntryForPersistence(entry, this.#blobStore),
-			),
-		);
-		await this.#writeEntriesAtomically(entries);
+		// Bounded freshness loop: prepare whole-session bytes, then enter the
+		// non-yielding fence with a live-token check. A revision change discards the
+		// prepared bytes and re-prepares (≤ 2 re-preparations); a lifecycle switch
+		// aborts. A stale snapshot is never published.
+		let written = false;
+		for (let attempt = 0; attempt <= 2 && !written; attempt++) {
+			this.#ensureFullHotView();
+			const token = this.#capturePersistenceInputToken();
+			await this.#closePersistWriterInternal();
+			const entries = await Promise.all(
+				materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
+					prepareEntryForPersistence(entry, this.#blobStore),
+				),
+			);
+			written = this.#withSessionPersistenceFenceSync(() => {
+				if (!this.#persistenceInputTokenMatches(token)) return false;
+				this.#writeEntriesAtomicallySync(entries);
+				return true;
+			});
+		}
+		if (!written) throw new Error("session_persistence_input_stale");
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		if (this.#sessionMemoryMode !== "off") {
+			this.#buildDisposableSidecars(this.#fileEntries);
+			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+		}
 	}
 
 	async #rewriteFile(): Promise<void> {
@@ -7585,14 +13105,26 @@ export class SessionManager {
 
 	#rewriteFileSync(): void {
 		if (!this.persist || !this.#sessionFile) return;
-		this.#closePersistWriterInternalSync();
-		const entries = materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(
-			entry => prepareEntryForPersistenceSync(entry, this.#blobStore),
-		);
-		this.#writeEntriesAtomicallySync(entries);
-		this.#needsFullRewriteOnNextPersist = false;
-		this.#flushed = true;
-		this.#ensuredOnDisk = true;
+		this.#withSessionPersistenceFenceSync(() => {
+			this.#ensureFullHotView();
+			// Sync lane: capture and check the token immediately (always fresh absent
+			// a reentrant mutation); a lifecycle switch aborts before any write.
+			if (!this.#persistenceInputTokenMatches(this.#capturePersistenceInputToken()))
+				throw new Error("session_persistence_input_stale");
+			this.#closePersistWriterInternalSync();
+			const entries = materializeResidentEntriesForPersistenceSync(
+				this.#fileEntries,
+				this.#residentBlobStores(),
+			).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
+			this.#writeEntriesAtomicallySync(entries);
+			this.#needsFullRewriteOnNextPersist = false;
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+		});
+		if (this.#sessionMemoryMode !== "off") {
+			this.#buildDisposableSidecars(this.#fileEntries);
+			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+		}
 	}
 
 	isPersisted(): boolean {
@@ -7604,11 +13136,36 @@ export class SessionManager {
 		thinkingLevel: string | undefined,
 		options?: { readonly appendThinkingLevel: boolean },
 	): Promise<DefaultModelSelectionStage> {
+		const sessionFile = this.#sessionFile;
+		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.storage.existsSync(sessionFile);
+		const managedAppendExpectation =
+			persistsToExistingFile && this.#coldSidecarActive() && this.destination.kind === "managed"
+				? this.#managedTranscriptStore(sessionFile).captureBoundedAppendExpectation(path.basename(sessionFile))
+				: undefined;
+		const boundedExplicit =
+			this.destination.kind !== "managed" &&
+			typeof this.storage.openStagedWriter === "function" &&
+			typeof this.storage.readRangeSync === "function";
+		const boundedCold =
+			persistsToExistingFile &&
+			this.#coldSidecarActive() &&
+			!this.#sidecarBranchActivationDirty &&
+			(boundedExplicit || managedAppendExpectation !== undefined);
+		if (!boundedCold) this.#ensureFullHotView();
 		const entryRevision = this.#entryRevision;
+		const leafRevision = this.#leafRevision;
 		const headerExportRevision = this.#headerExportRevision;
 		const sessionId = this.#sessionId;
-		const sessionFile = this.#sessionFile;
-		const entryIds = new Map(this.#byId);
+		const generatedIds = new Set<string>();
+		const entryIds = {
+			has: (id: string): boolean =>
+				generatedIds.has(id) ||
+				this.#byId.has(id) ||
+				(boundedCold && this.#findColdEntryIndex(id, false) !== undefined),
+			set: (id: string, _entry?: SessionEntry): void => {
+				generatedIds.add(id);
+			},
+		};
 		let parentId = this.#leafId;
 		const entries = [...this.#fileEntries];
 		const temporaryEntry: ModelChangeEntry = {
@@ -7643,29 +13200,60 @@ export class SessionManager {
 			role: "default",
 		};
 		entries.push(modelEntry);
-		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.storage.existsSync(sessionFile);
-		const tempPath = persistsToExistingFile
-			? await this.#writeStagedDefaultModelSelection(entries, sessionFile)
-			: undefined;
+		const sourceDescriptor = boundedCold ? (this.#managedDescriptorSnapshotOrNull() ?? undefined) : undefined;
+		if (boundedCold && !sourceDescriptor) throw new Error("bounded_default_selection_source_unavailable");
+		if (boundedCold && (!this.#coldIndexDigestValid() || !this.#coldTailMatchesDisk()))
+			throw new Error("bounded_default_selection_sidecar_changed");
+		const appendEntries = entries.slice(this.#fileEntries.length) as SessionEntry[];
+		const sourceStat =
+			boundedCold && this.destination.kind !== "managed" ? this.storage.statSync(sessionFile) : undefined;
+		const boundedStage =
+			boundedCold && this.destination.kind !== "managed"
+				? await this.#writeBoundedDefaultModelSelection(appendEntries, sessionFile, sourceDescriptor!)
+				: undefined;
+		const tempPath =
+			persistsToExistingFile && this.destination.kind !== "managed"
+				? (boundedStage?.tempPath ?? (await this.#writeStagedDefaultModelSelection(entries, sessionFile)))
+				: undefined;
+		const sourceSha256 = boundedStage?.sourceSha256;
 		return {
 			entryRevision,
+			leafRevision,
 			headerExportRevision,
 			sessionId,
 			sessionFile,
 			entries,
 			tempPath,
 			persistsToExistingFile,
+			boundedCold,
+			appendEntries,
+			sourceDescriptor,
+			sourceStat,
+			sourceSha256,
+			managedAppendExpectation,
 		};
 	}
 
 	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
 		if (
 			stage.entryRevision !== this.#entryRevision ||
+			stage.leafRevision !== this.#leafRevision ||
 			stage.headerExportRevision !== this.#headerExportRevision ||
 			stage.sessionId !== this.#sessionId ||
 			stage.sessionFile !== this.#sessionFile
 		) {
 			return { kind: "not_promoted" };
+		}
+		if (stage.boundedCold) {
+			const currentDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (
+				!stage.sourceDescriptor ||
+				!currentDescriptor ||
+				!sameDescriptor(stage.sourceDescriptor, currentDescriptor) ||
+				!this.#coldIndexDigestValid() ||
+				!this.#coldTailMatchesDisk()
+			)
+				return { kind: "not_promoted" };
 		}
 		let transition: PreparedResidentStoreTransition;
 		try {
@@ -7690,11 +13278,28 @@ export class SessionManager {
 			}
 			if (this.destination.kind === "managed") {
 				try {
-					const persistedEntries = materializeResidentEntriesForPersistenceSync(
-						[...stage.entries],
-						this.#residentBlobStores(),
-					).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
-					this.#writeEntriesAtomicallySync(persistedEntries);
+					if (stage.boundedCold) {
+						if (!stage.managedAppendExpectation) throw new Error("Managed bounded append expectation is missing");
+						const bytes = Buffer.concat(
+							stage.appendEntries.map(entry =>
+								Buffer.from(
+									`${JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))}\n`,
+									"utf8",
+								),
+							),
+						);
+						this.#managedTranscriptStore(this.#sessionFile).appendExpectedSync(
+							path.basename(this.#sessionFile),
+							bytes,
+							stage.managedAppendExpectation,
+						);
+					} else {
+						const persistedEntries = materializeResidentEntriesForPersistenceSync(
+							[...stage.entries],
+							this.#residentBlobStores(),
+						).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
+						this.#writeEntriesAtomicallySync(persistedEntries);
+					}
 				} catch (error) {
 					transition.dispose();
 					return { kind: "unknown", error: toError(error) };
@@ -7706,10 +13311,26 @@ export class SessionManager {
 				}
 				try {
 					this.#closePersistWriterInternalSync();
-					const replacement = this.#replaceSessionFileSync(stage.tempPath, this.#sessionFile);
-					if (replacement.kind === "restored_previous") {
-						transition.dispose();
-						return { kind: "not_promoted", error: replacement.error };
+					if (stage.boundedCold) {
+						if (!this.storage.replaceExactSync || !stage.sourceStat || !stage.sourceSha256) {
+							transition.dispose();
+							return { kind: "unknown", error: new Error("Exact staged replacement is unavailable") };
+						}
+						if (
+							!this.storage.replaceExactSync(stage.tempPath, this.#sessionFile, {
+								stat: stage.sourceStat,
+								sha256: stage.sourceSha256,
+							})
+						) {
+							transition.dispose();
+							return { kind: "not_promoted" };
+						}
+					} else {
+						const replacement = this.#replaceSessionFileSync(stage.tempPath, this.#sessionFile);
+						if (replacement.kind === "restored_previous") {
+							transition.dispose();
+							return { kind: "not_promoted", error: replacement.error };
+						}
 					}
 				} catch (error) {
 					transition.dispose();
@@ -7723,7 +13344,60 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = stage.persistsToExistingFile;
 		this.#ensuredOnDisk = stage.persistsToExistingFile;
-		this.#commitResidentTextStoreTransition(transition);
+		if (!stage.boundedCold) {
+			this.#commitResidentTextStoreTransition(transition);
+			return { kind: "promoted" };
+		}
+		const aggregateUsage = this.#usageStatistics;
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#usageStatistics = aggregateUsage;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) return { kind: "promoted" };
+		const persisted = stage.appendEntries.map(entry => ({
+			entry,
+			line: Buffer.from(`${JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))}\n`, "utf8"),
+		}));
+		const appendBytes = persisted.reduce((total, item) => total + item.line.byteLength, 0);
+		const accountedBytes = persisted.reduce((total, item) => total + residentHotEntryBytes(item.line.byteLength), 0);
+		const tailBytes = persisted.reduce(
+			(total, item) =>
+				total +
+				tailRecordResidentBytes({
+					seq: 0,
+					kind: tailRecordKindForEntry(item.entry),
+					ordinal: 0,
+					id: item.entry.id,
+					parentId: item.entry.parentId,
+					type: item.entry.type,
+					byteOffset: 0,
+					byteLength: item.line.byteLength,
+					recordDigest: "0".repeat(64),
+				}),
+			0,
+		);
+		if (
+			runtime.hotSuffixBytes + appendBytes > this.#sidecarHotSuffixBudgetBytes ||
+			!runtime.accountant.tryCharge(accountedBytes) ||
+			!runtime.tailCache.tryAllocate(tailBytes)
+		) {
+			runtime.hotOverflowTransitions++;
+			this.#ensureFullHotView();
+			return { kind: "promoted" };
+		}
+		for (const item of persisted) {
+			const ordinal = this.#nextColdOrdinal();
+			if (!this.#applySidecarReducerDelta(item.entry, ordinal)) {
+				this.#ensureFullHotView();
+				return { kind: "promoted" };
+			}
+			if (!this.#appendColdSidecarRecord(item.entry, item.line, undefined, ordinal)) {
+				this.#ensureFullHotView();
+				return { kind: "promoted" };
+			}
+			runtime.hotSuffixBytes += item.line.byteLength;
+		}
+		this.#publishCommitMarkerFromCurrentTranscriptSync();
+		runtime.terminalTransition = this.#classifySidecarReopen();
 		return { kind: "promoted" };
 	}
 
@@ -7758,6 +13432,25 @@ export class SessionManager {
 		if (this.#persistError) throw this.#persistError;
 	}
 
+	#releaseClosedSessionState(): void {
+		const runtime = this.#sidecarRuntime;
+		if (runtime) {
+			runtime.enabled = false;
+			runtime.accountant.release(runtime.accountant.totalBytes);
+			runtime.coldEntries.clear();
+			runtime.tail = { ...runtime.tail, records: [] };
+			runtime.labelsPins.clear();
+			runtime.blockCache.release(runtime.blockCache.allocatedBytes);
+			runtime.entryCache.release(runtime.entryCache.allocatedBytes);
+			runtime.tailCache.release(runtime.tailCache.allocatedBytes);
+			this.#sidecarRuntime = undefined;
+		}
+		this.#fileEntries = [];
+		this.#byId.clear();
+		this.#labelsById.clear();
+		this.#resetMaterializedCaches();
+	}
+
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
 		// Drain any uncommitted prepared successors before releasing resources so
@@ -7779,6 +13472,7 @@ export class SessionManager {
 		await this.#drainEphemeralArtifactCleanups();
 		this.#releaseResidentTextStore();
 		this.#releaseOwnedManagedAuthority();
+		this.#releaseClosedSessionState();
 		if (this.#persistError) throw this.#persistError;
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
@@ -7842,6 +13536,8 @@ export class SessionManager {
 			} catch (error) {
 				outcome = { kind: "close_unknown", error: toError(error) };
 			}
+			this.#releaseOwnedManagedAuthority();
+			this.#releaseClosedSessionState();
 		}
 		return outcome;
 	}
@@ -7895,6 +13591,123 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
+	getSessionMemoryStats(): SessionMemoryStats {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) {
+			return {
+				sidecarEnabled: false,
+				coldRetirementActive: false,
+				sidecarIneligible: false,
+				hotRegionBytes: 0,
+				metaDescriptorBytes: 0,
+				totalAccountedBytes: 0,
+				lastReopenTransition: undefined,
+				currentCommitTransition: undefined,
+				lazyReopenAttempted: this.#lazyReopenAttempted,
+				lazyReopenSucceeded: this.#lazyReopenSucceeded,
+				lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
+				retirementFallbackReason: this.#retirementFallbackReason,
+				autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
+				consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
+				parentArtifactEnabled: false,
+				dictionaryArtifactEnabled: false,
+				metadataDeltaDescriptorBytes: 0,
+				coldIndexBytes: 0,
+				coldIndexBlockCacheBytes: 0,
+				coldEntryCacheBytes: 0,
+				coldEntriesRetired: 0,
+				coldEntriesReloaded: 0,
+				rangeReadCount: 0,
+				rangeReadGenerationMismatchCount: 0,
+				sidecarRebuildCount: 0,
+				coldMutationPromotions: 0,
+				hotOverflowTransitions: 0,
+				labelDiskFallbackCount: 0,
+				shadowParityMismatchCount: 0,
+				shadowParityCheckCount: 0,
+				transcriptGeneration: 0,
+			};
+		}
+		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
+		const metaDescriptorBytes =
+			runtime.blockCache.allocatedBytes +
+			runtime.entryCache.allocatedBytes +
+			runtime.tailCache.allocatedBytes +
+			runtime.labelsPins.totalBytes +
+			reducerBytes +
+			(runtime.metadataDelta?.descriptorBytes ?? 0);
+		return {
+			sidecarEnabled: runtime.enabled,
+			coldRetirementActive: this.#coldSidecarActive(),
+			sidecarIneligible: runtime.sidecarIneligible,
+			hotRegionBytes: runtime.hotSuffixBytes,
+			metaDescriptorBytes,
+			totalAccountedBytes: runtime.accountant.totalBytes,
+			lastReopenTransition: runtime.reopenTransition,
+			currentCommitTransition: runtime.terminalTransition,
+			lazyReopenAttempted: this.#lazyReopenAttempted,
+			lazyReopenSucceeded: this.#lazyReopenSucceeded,
+			lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
+			retirementFallbackReason: this.#retirementFallbackReason,
+			autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
+			consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
+			parentArtifactEnabled: runtime.parentArtifact !== undefined,
+			dictionaryArtifactEnabled: runtime.dictionary !== undefined,
+			metadataDeltaDescriptorBytes: runtime.metadataDelta?.descriptorBytes ?? 0,
+			coldIndexBytes: runtime.validatedIndexDescriptor?.size ?? 0,
+			coldIndexBlockCacheBytes: runtime.blockCache.allocatedBytes,
+			coldEntryCacheBytes: runtime.entryCache.allocatedBytes,
+			coldEntriesRetired: runtime.coldEntriesRetired,
+			coldEntriesReloaded: runtime.coldEntriesReloaded,
+			rangeReadCount: runtime.rangeReadCount,
+			rangeReadGenerationMismatchCount: runtime.rangeReadGenerationMismatchCount,
+			sidecarRebuildCount: runtime.sidecarRebuildCount,
+			coldMutationPromotions: runtime.coldMutationPromotions,
+			hotOverflowTransitions: runtime.hotOverflowTransitions,
+			labelDiskFallbackCount: runtime.labelDiskFallbackCount,
+			shadowParityMismatchCount: runtime.shadowParityMismatchCount,
+			shadowParityCheckCount: runtime.shadowParityCheckCount,
+			transcriptGeneration: runtime.transcriptGeneration,
+		};
+	}
+
+	setSessionMemoryMode(mode: "off" | "shadow" | "enabled"): void {
+		const retainedColdRuntime = this.#coldSidecarActive();
+		this.#sessionMemoryMode = mode;
+		if (mode === "off") {
+			this.#consecutiveSidecarBuildFailures = 0;
+			this.#sessionMemoryAutoDisabledReason = undefined;
+			// Rollback is non-materializing: already-retired entries remain lazily readable
+			// from the proven sidecar for this process. A subsequent off-mode process open
+			// ignores derived state and restores the ordinary eager path.
+			if (retainedColdRuntime) return;
+			const runtime = this.#sidecarRuntime;
+			if (runtime) {
+				for (const sidecarPath of this.#disposableSidecarPaths()) {
+					if (!sidecarPath) continue;
+					try {
+						this.storage.unlinkSync(sidecarPath);
+					} catch {
+						// Sidecars are disposable; off mode remains eager even if best-effort cleanup fails.
+					}
+				}
+			}
+			this.#sidecarRuntime = undefined;
+			return;
+		}
+		if (mode === "shadow" && retainedColdRuntime) return;
+		if (
+			(!this.#sidecarRuntime?.enabled ||
+				this.#sidecarRuntime.sidecarIneligible ||
+				(mode === "enabled" && !this.#sidecarRuntime.dictionary)) &&
+			this.persist &&
+			this.#sessionFile
+		) {
+			this.#buildDisposableSidecars(this.#fileEntries);
+		}
+		if (mode === "enabled") this.#retireColdEntries();
+	}
+
 	acquireMemoryGuardParticipantIngressLease(): MemoryGuardParticipantIngressLease {
 		if (this.#memoryGuardParticipantIngressToken)
 			throw new Error("memory_guard_participant_ingress_lease_already_held");
@@ -7926,6 +13739,7 @@ export class SessionManager {
 		}
 		this.#residentImageBlobStore = stagedImageStore;
 		this.#memoryGuardCheckpointBlobs = blobs;
+		this.#residentBlobRevision++;
 	}
 
 	async createMemoryGuardCheckpoint(
@@ -7938,9 +13752,10 @@ export class SessionManager {
 		if (captured.kind !== "captured") {
 			throw new Error(`memory_guard_checkpoint_capture_failed:${captured.reason}`);
 		}
-		if (captured.snapshot.content.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
+		const capturedBytes = captured.snapshot.materialize();
+		if (capturedBytes.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
 			throw new Error("memory_guard_checkpoint_transcript_capacity_exceeded");
-		const transcriptText = decodeCheckpointUtf8(captured.snapshot.content);
+		const transcriptText = decodeCheckpointUtf8(capturedBytes);
 		if (transcriptText === null) throw new Error("memory_guard_checkpoint_transcript_unreadable");
 		const entries = parseSessionEntries(transcriptText);
 		const sessionId = this.getSessionId();
@@ -7995,7 +13810,7 @@ export class SessionManager {
 			}
 		};
 		await ensureOwnerOnlyDirectory(participantRoot);
-		await publishCheckpointFile(path.join(input.checkpointRoot, transcriptRelativePath), captured.snapshot.content);
+		await publishCheckpointFile(path.join(input.checkpointRoot, transcriptRelativePath), capturedBytes);
 		for (const write of blobWrites)
 			await publishCheckpointFile(
 				path.join(input.checkpointRoot, blobRootRelativePath, write.relativePath),
@@ -8020,7 +13835,7 @@ export class SessionManager {
 			session_id: sessionId,
 			session_name: sessionName,
 			transcript: {
-				bytes: String(captured.snapshot.content.byteLength),
+				bytes: String(capturedBytes.byteLength),
 				relative_path: transcriptRelativePath,
 				sha256: captured.snapshot.identity.sha256,
 			},
@@ -8539,10 +14354,16 @@ export class SessionManager {
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
-		const store = this.#managedTranscriptStore();
-		const relativePath = path.basename(this.#sessionFile);
-		const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
-		store.appendSync(relativePath, bytes);
+		this.#withSessionPersistenceFenceSync(() => {
+			const sessionFile = this.#sessionFile!;
+			const store = this.#managedTranscriptStore(sessionFile);
+			const relativePath = path.basename(sessionFile);
+			const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
+			// R2.3: the post-operation receipt descriptor (retained or Darwin
+			// replacement) feeds the commit snapshot directly — no pathname stat.
+			const receipt = store.appendSync(relativePath, bytes);
+			this.#publishSessionCommitMarkerSync(receipt.descriptor);
+		});
 	}
 
 	async #persistPatch(record: SessionPatchRecord): Promise<void> {
@@ -8550,33 +14371,49 @@ export class SessionManager {
 	}
 
 	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
-		if (records.length === 0 || !this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile))
-			return;
+		if (records.length === 0) return;
+		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
 		await this.#queuePersistTask(async () => {
-			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			if (this.#needsFullRewriteOnNextPersist || !this.#flushed || (header?.version ?? 1) < CURRENT_SESSION_VERSION)
-				return this.#rewriteFileContents();
-			const persistedRecords = records.map(record =>
-				record.type === "entry_patch"
-					? (prepareEntryForPersistenceSync(
-							materializeResidentEntryForPersistenceSync(
-								record as unknown as FileEntry,
-								this.#residentBlobStores(),
-								new Map(),
-							),
-							this.#blobStore,
-						) as unknown as SessionPatchRecord)
-					: record,
-			);
-			if (this.destination.kind === "managed") {
-				this.#appendManagedRecordsSync(persistedRecords);
-				return;
+			for (let attempt = 0; attempt <= 2; attempt++) {
+				const token = this.#capturePersistenceInputToken();
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (
+					this.#needsFullRewriteOnNextPersist ||
+					!this.#flushed ||
+					(header?.version ?? 1) < CURRENT_SESSION_VERSION
+				)
+					return this.#rewriteFileContents();
+				const persistedRecords = records.map(record =>
+					record.type === "entry_patch"
+						? (prepareEntryForPersistenceSync(
+								materializeResidentEntryForPersistenceSync(
+									record as unknown as FileEntry,
+									this.#residentBlobStores(),
+									new Map(),
+								),
+								this.#blobStore,
+							) as unknown as SessionPatchRecord)
+						: record,
+				);
+				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
+				const written = this.#withSessionPersistenceFenceSync(() => {
+					if (!this.#persistenceInputTokenMatches(token)) return false;
+					if (this.destination.kind === "managed") {
+						this.#appendManagedRecordsSync(persistedRecords);
+						return true;
+					}
+					const writer = this.#ensurePersistWriter();
+					if (!writer) {
+						this.#rewriteFile().catch(() => {});
+						return true;
+					}
+					for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
+					return true;
+				});
+				if (written) return;
 			}
-			const writer = this.#ensurePersistWriter();
-			if (!writer) return this.#rewriteFileContents();
-			for (const persistedRecord of persistedRecords) {
-				await writer.write(persistedRecord);
-			}
+			throw new Error("session_persistence_input_stale");
 		});
 	}
 	_persist(entry: SessionEntry): void {
@@ -8618,32 +14455,34 @@ export class SessionManager {
 		// the synchronous blob-store path so blob bytes are durable before the JSONL
 		// line referencing them is written.
 		try {
-			if (this.destination.kind === "managed") {
+			this.#withSessionPersistenceFenceSync(() => {
+				if (this.destination.kind === "managed") {
+					const materializedEntry = materializeResidentEntryForPersistenceSync(
+						entry,
+						this.#residentBlobStores(),
+						new Map(),
+					);
+					const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
+					this.#appendManagedRecordsSync([persistedEntry]);
+					return;
+				}
+				const writer = this.#ensurePersistWriter();
+				if (!writer) {
+					// `#ensurePersistWriter` returns undefined here only when the cached
+					// writer is mid-close (the `!persist`/`!sessionFile` cases are
+					// rejected above). Route through `#rewriteFile` so the entry — which
+					// is already in `#fileEntries` — persists once the close drains.
+					this.#rewriteFile().catch(() => {});
+					return;
+				}
 				const materializedEntry = materializeResidentEntryForPersistenceSync(
 					entry,
 					this.#residentBlobStores(),
 					new Map(),
 				);
 				const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
-				this.#appendManagedRecordsSync([persistedEntry]);
-				return;
-			}
-			const writer = this.#ensurePersistWriter();
-			if (!writer) {
-				// `#ensurePersistWriter` returns undefined here only when the cached
-				// writer is mid-close (the `!persist`/`!sessionFile` cases are
-				// rejected above). Route through `#rewriteFile` so the entry — which
-				// is already in `#fileEntries` — persists once the close drains.
-				this.#rewriteFile().catch(() => {});
-				return;
-			}
-			const materializedEntry = materializeResidentEntryForPersistenceSync(
-				entry,
-				this.#residentBlobStores(),
-				new Map(),
-			);
-			const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
-			writer.writeSync(persistedEntry);
+				writer.writeSync(persistedEntry);
+			});
 		} catch (err) {
 			this.#recordPersistError(err);
 			throw this.#persistError ?? toError(err);
@@ -8651,9 +14490,46 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
+		this.#withSessionPersistenceFenceSync(() => this.#appendEntryWithinPersistenceFence(entry));
+	}
+
+	#appendEntryWithinPersistenceFence(entry: SessionEntry): void {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#sidecarBranchActivationDirty) this.#deactivateColdForBranchMutation();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = this.#prepareEntryForCurrentResidentStore(normalizedEntry) as SessionEntry;
+		let sidecarAppendCharge = 0;
+		let sidecarTailCharge = 0;
+		const activeRuntime = this.#sidecarRuntime;
+		let transcriptDurableForSidecar = this.destination.kind === "managed";
+		let transcriptDescriptor: SessionStorageStat | undefined;
+		if (activeRuntime && this.#coldSidecarActive()) {
+			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
+			const appendedAccountedBytes = residentHotEntryBytes(appendedBytes);
+			const tailBytes = tailRecordResidentBytes({
+				seq: 0,
+				kind: tailRecordKindForEntry(residentEntry),
+				ordinal: 0,
+				id: residentEntry.id,
+				parentId: residentEntry.parentId,
+				type: residentEntry.type,
+				byteOffset: 0,
+				byteLength: appendedBytes,
+				recordDigest: "0".repeat(64),
+			});
+			if (activeRuntime.hotSuffixBytes + appendedBytes > this.#sidecarHotSuffixBudgetBytes) {
+				activeRuntime.hotOverflowTransitions++;
+				this.#deactivateColdForBranchMutation();
+			} else if (!activeRuntime.accountant.tryCharge(appendedAccountedBytes)) {
+				this.#deactivateColdForBranchMutation();
+			} else if (!activeRuntime.tailCache.tryAllocate(tailBytes)) {
+				activeRuntime.accountant.release(appendedAccountedBytes);
+				this.#deactivateColdForBranchMutation();
+			} else {
+				sidecarAppendCharge = appendedAccountedBytes;
+				sidecarTailCharge = tailBytes;
+			}
+		}
 		const previousLeafId = this.#leafId;
 		const priorPersistenceError = this.#persistError;
 		this.#fileEntries.push(residentEntry);
@@ -8673,20 +14549,96 @@ export class SessionManager {
 			this.#bumpEntryRevision();
 			this.#leafRevision++;
 			if (entry.type === "label") this.#labelRevision++;
+			if (sidecarAppendCharge > 0) activeRuntime?.accountant.release(sidecarAppendCharge);
+			if (sidecarTailCharge > 0) activeRuntime?.tailCache.release(sidecarTailCharge);
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,
 				this.#persistError ?? toError(error),
 			);
 		}
-		// Same validated, overflow-guarded aggregation as the resume path (#buildIndex): a
-		// malformed task-result or assistant usage shape reaching the append path must not
-		// crash or poison getUsageStatistics() either.
+		if (
+			this.destination.kind !== "managed" &&
+			(sidecarAppendCharge > 0 || (residentEntry.type === "compaction" && this.#sessionMemoryMode === "enabled"))
+		) {
+			const writer = this.#persistWriter;
+			if (writer?.isOpen()) {
+				try {
+					writer.fsyncSync();
+					transcriptDurableForSidecar = true;
+					transcriptDescriptor = writer.statSync();
+				} catch {
+					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+				}
+			} else if (this.#coldSidecarActive()) {
+				this.#deactivateColdForBranchMutation();
+			}
+		}
+
+		// Aggregate usage before the sidecar append publishes its commit marker so an
+		// exact reopen observes the same totals as the live manager.
 		if (this.#accumulateEntryUsage(entry)) {
 			logger.warn("Skipped malformed or overflowing usage on appended entry", {
 				sessionFile: this.#sessionFile,
 				entryId: entry.id,
 			});
+		}
+		if (residentEntry.type === "label" && activeRuntime?.enabled) {
+			if (residentEntry.label) {
+				if (!activeRuntime.labelsPins.setLabel(residentEntry.targetId, residentEntry.label))
+					this.#deactivateColdForBranchMutation();
+			} else {
+				activeRuntime.labelsPins.deleteLabel(residentEntry.targetId);
+			}
+		}
+		if (transcriptDurableForSidecar && sidecarAppendCharge > 0 && activeRuntime && this.#coldSidecarActive()) {
+			const materialized = materializeResidentEntryForPersistenceSync(
+				residentEntry,
+				this.#residentBlobStores(),
+				new Map(),
+			);
+			const persisted = prepareEntryForPersistenceSync(materialized, this.#blobStore);
+			const persistedLine = Buffer.from(`${JSON.stringify(persisted)}\n`, "utf8");
+			const persistedAccountedBytes = residentHotEntryBytes(persistedLine.byteLength);
+			const delta = persistedAccountedBytes - sidecarAppendCharge;
+			if (
+				delta > 0 &&
+				(activeRuntime.hotSuffixBytes + persistedLine.byteLength > this.#sidecarHotSuffixBudgetBytes ||
+					!activeRuntime.accountant.tryCharge(delta))
+			) {
+				this.#deactivateColdForBranchMutation();
+			} else {
+				if (delta < 0) activeRuntime.accountant.release(-delta);
+				const ordinal = this.#nextColdOrdinal();
+				if (!this.#applySidecarReducerDelta(residentEntry, ordinal)) {
+					this.#ensureFullHotView();
+					activeRuntime.coldMutationPromotions++;
+				} else if (this.#appendColdSidecarRecord(residentEntry, persistedLine, transcriptDescriptor, ordinal)) {
+					activeRuntime.hotSuffixBytes += persistedLine.byteLength;
+				}
+			}
+		}
+		if (
+			entry.type === "compaction" &&
+			transcriptDurableForSidecar &&
+			this.#sessionMemoryMode === "enabled" &&
+			this.#sessionFile &&
+			this.storage.existsSync(this.#sessionFile)
+		) {
+			if (this.#coldSidecarActive() && this.#sidecarRuntime) {
+				if (!this.#advanceColdTailBoundary(entry.firstKeptEntryId)) {
+					this.#deactivateColdForBranchMutation();
+				} else {
+					this.#sidecarRuntime.retirementFirstKeptEntryId = entry.firstKeptEntryId;
+					this.#retireColdEntries();
+					this.#publishCommitMarkerFromCurrentTranscriptSync();
+					this.#sidecarRuntime.terminalTransition = this.#classifySidecarReopen();
+				}
+			} else {
+				this.#ensureFullHotView();
+				this.#buildDisposableSidecars(this.#fileEntries);
+				this.#retireColdEntries();
+			}
 		}
 	}
 
@@ -8694,7 +14646,7 @@ export class SessionManager {
 	appendConfiguredModelChain(chain: ConfiguredModelChain): string {
 		const entry: ConfiguredModelChainEntry = {
 			type: "configured_model_chain",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			role: chain.role,
@@ -8725,7 +14677,7 @@ export class SessionManager {
 	): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -8741,7 +14693,7 @@ export class SessionManager {
 	appendThinkingLevelChange(thinkingLevel?: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel: thinkingLevel ?? null,
@@ -8753,7 +14705,7 @@ export class SessionManager {
 	appendServiceTierChange(serviceTier: ServiceTier | null): string {
 		const entry: ServiceTierChangeEntry = {
 			type: "service_tier_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			serviceTier,
@@ -8766,7 +14718,7 @@ export class SessionManager {
 	appendModeChange(mode: string, data?: Record<string, unknown>): string {
 		const entry: ModeChangeEntry = {
 			type: "mode_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			mode,
@@ -8788,7 +14740,7 @@ export class SessionManager {
 	): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			model,
@@ -8811,7 +14763,7 @@ export class SessionManager {
 	}): string {
 		const entry: SessionInitEntry = {
 			type: "session_init",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			...init,
@@ -8832,7 +14784,7 @@ export class SessionManager {
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			summary,
@@ -8853,7 +14805,7 @@ export class SessionManager {
 			type: "custom",
 			customType,
 			data,
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -8872,7 +14824,7 @@ export class SessionManager {
 			type: "custom",
 			customType: "context_clear",
 			data,
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: null,
 			timestamp: new Date().toISOString(),
 		};
@@ -8889,6 +14841,7 @@ export class SessionManager {
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
 		this.#assertRecoveryHydrationWritable();
+		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "message") continue;
@@ -8909,6 +14862,7 @@ export class SessionManager {
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
 		this.#assertRecoveryHydrationWritable();
+		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "custom_message") continue;
@@ -8997,7 +14951,7 @@ export class SessionManager {
 		attribution: MessageAttribution = "agent",
 		observationId?: string,
 	): string {
-		const entryId = generateId(this.#byId);
+		const entryId = this.#generateEntryId();
 		const stableObservationId =
 			observationId ?? (customType.startsWith("irc:") ? `session:${this.#sessionId}:entry:${entryId}` : undefined);
 		const persistedDetails =
@@ -9030,7 +14984,7 @@ export class SessionManager {
 	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
@@ -9044,7 +14998,7 @@ export class SessionManager {
 	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
 		const entry: DiscoveredBuiltinToolSelectionEntry = {
 			type: "discovered_builtin_tool_selection",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
@@ -9062,7 +15016,7 @@ export class SessionManager {
 	appendTtsrInjection(ruleNames: string[], records?: TtsrInjectionRecord[], ttsrMessageCount?: number): string {
 		const entry: TtsrInjectionEntry = {
 			type: "ttsr_injection",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			injectedRules: ruleNames,
@@ -9100,7 +15054,7 @@ export class SessionManager {
 
 	getLeafEntry(): SessionEntry | undefined {
 		if (!this.#leafId) return undefined;
-		const entry = this.#byId.get(this.#leafId);
+		const entry = this.#resolveEntry(this.#leafId);
 		return entry
 			? cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()))
 			: undefined;
@@ -9125,8 +15079,20 @@ export class SessionManager {
 	/**
 	 * Get the most recent model role from the current session path.
 	 * Returns undefined if no model change has been recorded.
+	 *
+	 * R1: keyed ONLY on the nearest `model_change` on the leaf→root path — never on
+	 * `hasExplicitDefaultModel`, which gates only legacy assistant inference into
+	 * `models.default` inside `buildSessionContext`. Six parity cases (D1): reviewer-
+	 * only → "reviewer"; temporary-only → "temporary"; interleaved → nearest;
+	 * no model_change → undefined; legacy-only inference → undefined; explicit
+	 * default then legacy inference → "default".
 	 */
 	getLastModelChangeRole(): string | undefined {
+		// R1: when a cold sidecar region is active, consult the reducer's nearest
+		// model-change delta (bounded, latest-wins) instead of a full parent walk.
+		if (this.#coldSidecarActive() && this.#sidecarRuntime) {
+			return getReducerLastModelChangeRole(this.#sidecarRuntime.reducer);
+		}
 		const visited = new Set<string>();
 		let current = this.getLeafEntry();
 		while (current) {
@@ -9135,13 +15101,14 @@ export class SessionManager {
 			if (current.type === "model_change") {
 				return current.role ?? "default";
 			}
-			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		return undefined;
 	}
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		const firstKept = this.#byId.get(firstKeptEntryId);
 		const compaction = this.#byId.get(compactionEntryId);
 		if (!firstKept) throw new Error(`Entry ${firstKeptEntryId} not found`);
@@ -9277,6 +15244,22 @@ export class SessionManager {
 		};
 	}
 
+	setSidecarHotSuffixBudgetForTests(bytes: number): void {
+		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("invalid_sidecar_hot_suffix_budget");
+		this.#sidecarHotSuffixBudgetBytes = bytes;
+	}
+	parentChildrenCacheKeysForTests(): string[] {
+		return [...(this.#sidecarRuntime?.parentChildrenCache.keys() ?? [])];
+	}
+	parentArtifactEnabledForTests(): boolean {
+		return this.#sidecarRuntime?.parentArtifact !== undefined;
+	}
+	setParentArtifactBudgetForTests(bytes: number): void {
+		const artifact = this.#sidecarRuntime?.parentArtifact;
+		if (!artifact) throw new Error("parent_artifact_unavailable");
+		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("invalid_parent_artifact_budget");
+		artifact.budgetBytes = bytes;
+	}
 	hotRetainedMessageCharsForTests(): number {
 		let total = 0;
 		for (const entry of this.#fileEntries) {
@@ -9287,12 +15270,12 @@ export class SessionManager {
 	}
 
 	getCanonicalEntryForTests(id: string): SessionEntry | undefined {
-		const entry = this.#byId.get(id);
+		const entry = this.#resolveEntry(id);
 		return entry ? cloneSessionEntry(entry) : undefined;
 	}
 
 	getEntryForFidelity(id: string): SessionEntry | undefined {
-		const entry = this.#byId.get(id);
+		const entry = this.#resolveEntry(id);
 		return entry
 			? cloneSessionEntry(
 					rehydrateColdSpillEntry(
@@ -9308,7 +15291,7 @@ export class SessionManager {
 		const cache = new Map<string, string>();
 		const path: SessionEntry[] = [];
 		const visited = new Set<string>();
-		let current = (fromId ?? this.#leafId) ? this.#byId.get(fromId ?? this.#leafId ?? "") : undefined;
+		let current = (fromId ?? this.#leafId) ? this.#resolveEntry(fromId ?? this.#leafId ?? "") : undefined;
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
@@ -9321,7 +15304,7 @@ export class SessionManager {
 					),
 				),
 			);
-			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		path.reverse();
 		return path;
@@ -9330,12 +15313,12 @@ export class SessionManager {
 	#getCanonicalBranchClones(fromId?: string): SessionEntry[] {
 		const path: SessionEntry[] = [];
 		const visited = new Set<string>();
-		let current = (fromId ?? this.#leafId) ? this.#byId.get(fromId ?? this.#leafId ?? "") : undefined;
+		let current = (fromId ?? this.#leafId) ? this.#resolveEntry(fromId ?? this.#leafId ?? "") : undefined;
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
 			path.push(cloneSessionEntry(current));
-			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		path.reverse();
 		return path;
@@ -9350,7 +15333,47 @@ export class SessionManager {
 		return this.#getCanonicalBranchClones(fromId);
 	}
 
+	visitEntriesForExport(visitor: (entry: SessionEntry) => void): void {
+		if (this.#coldSidecarActive() && this.#sessionFile) {
+			const size = this.storage.statSync(this.#sessionFile).size;
+			const failure = scanTranscriptLinesBounded(this.storage, this.#sessionFile, size, (_offset, lineBytes) => {
+				try {
+					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
+					if (record.type === "session") return;
+					if (record.type === "header_patch" || record.type === "entry_patch") return false;
+					if (typeof record.id !== "string") return false;
+					visitor(
+						cloneSessionEntry(
+							rehydrateColdSpillEntry(
+								materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+								this.#coldSpillReadStore(),
+								this.#residentBlobStoresForColdRehydrate(),
+							),
+						),
+					);
+				} catch {
+					return false;
+				}
+			});
+			if (failure) throw new Error(`export_transcript_scan_failed:${failure}`);
+			return;
+		}
+		const cache = new Map<string, string>();
+		for (const entry of this.#fileEntries) {
+			if (entry.type === "session") continue;
+			visitor(
+				cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
+						this.#coldSpillReadStore(),
+						this.#residentBlobStoresForColdRehydrate(),
+					),
+				),
+			);
+		}
+	}
 	getEntriesForExport(): SessionEntry[] {
+		this.#ensureFullHotView();
 		const cache = new Map<string, string>();
 		return this.#fileEntries
 			.filter((entry): entry is SessionEntry => entry.type !== "session")
@@ -9368,17 +15391,164 @@ export class SessionManager {
 	getEntry(id: string): SessionEntry | undefined {
 		this.#publicMaterializerCallCount++;
 		this.#getEntryMaterializerCallCount++;
-		const entry = this.#byId.get(id);
+		const entry = this.#resolveEntry(id);
 		return entry
 			? cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()))
 			: undefined;
+	}
+
+	#readColdChildren(parentId: string): SessionEntry[] | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		let indexStat: SessionStorageStat;
+		try {
+			indexStat = this.storage.statSync(runtime.indexPath);
+		} catch {
+			return undefined;
+		}
+		const size = indexStat.size;
+		const cached = runtime.parentChildrenCache.get(parentId);
+		if (
+			cached &&
+			runtime.validatedIndexDescriptor &&
+			sameDescriptor(cached.descriptor, indexStat) &&
+			sameDescriptor(runtime.validatedIndexDescriptor, indexStat) &&
+			(cached.bucketDescriptor === undefined ||
+				this.#parentBucketDescriptorMatches(cached.bucketDescriptor, cached.bucketIndex))
+		) {
+			const cache = new Map<string, string>();
+			const children: SessionEntry[] = [];
+			for (const id of cached.ids) {
+				const entry = this.#resolveEntry(id);
+				if (!entry || entry.parentId !== parentId) return undefined;
+				children.push(
+					cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+				);
+			}
+			return children;
+		}
+		if (cached) {
+			runtime.parentChildrenCache.delete(parentId);
+			runtime.blockCache.release(cached.bytes);
+		}
+		// Persistent artifact fast path: one bounded bucket read, never a complete
+		// `.spill.idx` digest+scan. The artifact is disposable derived proof bound
+		// to the exact index digest; any miss falls through to the authoritative
+		// cold scan below.
+		if (
+			runtime.parentArtifact &&
+			runtime.parentArtifact.indexDigest === runtime.indexDigest &&
+			runtime.validatedIndexDescriptor &&
+			sameDescriptor(runtime.validatedIndexDescriptor, indexStat)
+		) {
+			const artifactChildren = this.#readParentChildrenFromArtifact(parentId, indexStat);
+			if (artifactChildren) return artifactChildren;
+		}
+		if (!this.#coldIndexDigestValid()) return undefined;
+		const childIds: string[] = [];
+		let malformed = false;
+		const neighboringParents = new BoundedParentChildrenIndex();
+		let collectNeighboringParents = false;
+		const neighboringIndexes = new Map<string, { index: ColdEntryIndex; bytes: number }>();
+		let neighboringParentsComplete = true;
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+			try {
+				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as {
+					id?: unknown;
+					parentId?: unknown;
+					ordinal?: unknown;
+					seq?: unknown;
+					byteOffset?: unknown;
+					byteLength?: unknown;
+					recordDigest?: unknown;
+					entryType?: unknown;
+				};
+				if (typeof value.id !== "string" || (value.parentId !== null && typeof value.parentId !== "string")) {
+					malformed = true;
+					return false;
+				}
+				if (value.parentId === parentId) {
+					collectNeighboringParents = true;
+					if (childIds.length >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
+					childIds.push(value.id);
+				} else if (collectNeighboringParents && value.parentId !== null) {
+					if (!neighboringParents.add(value.parentId, value.id)) {
+						neighboringParentsComplete = false;
+						collectNeighboringParents = false;
+					}
+					if (
+						typeof value.ordinal === "number" &&
+						typeof value.seq === "number" &&
+						typeof value.byteOffset === "number" &&
+						typeof value.byteLength === "number" &&
+						typeof value.recordDigest === "string"
+					) {
+						neighboringIndexes.set(value.id, {
+							index: {
+								ordinal: value.ordinal,
+								seq: value.seq,
+								byteOffset: value.byteOffset,
+								byteLength: value.byteLength,
+								recordDigest: value.recordDigest,
+								parentId: value.parentId,
+								...(typeof value.entryType === "string" ? { entryType: value.entryType } : {}),
+							},
+							bytes: lineBytes.byteLength * 2 + 48,
+						});
+					}
+				}
+			} catch {
+				malformed = true;
+				return false;
+			}
+		});
+		if (failure || malformed) return undefined;
+		const cache = new Map<string, string>();
+		const children: SessionEntry[] = [];
+		for (const id of childIds) {
+			const entry = this.#resolveEntry(id);
+			if (!entry || entry.parentId !== parentId) return undefined;
+			children.push(
+				cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+			);
+		}
+		const cacheBytes =
+			residentStringBytes(parentId) + 48 + childIds.reduce((total, id) => total + residentStringBytes(id) + 8, 0);
+		if (runtime.blockCache.tryAllocate(cacheBytes)) {
+			runtime.parentChildrenCache.set(parentId, { ids: [...childIds], bytes: cacheBytes, descriptor: indexStat });
+		}
+		if (neighboringParentsComplete)
+			for (const neighbor of neighboringParents.entries()) {
+				if (runtime.parentChildrenCache.has(neighbor.parentId)) continue;
+				const neighborBytes =
+					residentStringBytes(neighbor.parentId) +
+					48 +
+					neighbor.children.reduce((total, id) => total + residentStringBytes(id) + 8, 0);
+				for (const childId of neighbor.children) {
+					const childIndex = neighboringIndexes.get(childId);
+					if (childIndex && !runtime.coldEntries.has(childId) && runtime.blockCache.tryAllocate(childIndex.bytes))
+						runtime.coldEntries.set(childId, childIndex.index);
+				}
+				if (!runtime.blockCache.tryAllocate(neighborBytes)) break;
+				runtime.parentChildrenCache.set(neighbor.parentId, {
+					ids: neighbor.children,
+					bytes: neighborBytes,
+					descriptor: indexStat,
+				});
+			}
+		return children;
 	}
 
 	/**
 	 * Get all direct children of an entry.
 	 */
 	getChildren(parentId: string): SessionEntry[] {
+		if (this.#coldSidecarActive()) {
+			const coldChildren = this.#readColdChildren(parentId);
+			if (coldChildren) return coldChildren;
+		}
 		const cache = new Map<string, string>();
+		this.#ensureFullHotView();
 		const children: SessionEntry[] = [];
 		for (const entry of this.#byId.values()) {
 			if (entry.parentId === parentId) {
@@ -9394,7 +15564,17 @@ export class SessionManager {
 	 * Get the label for an entry, if any.
 	 */
 	getLabel(id: string): string | undefined {
-		return this.#labelsById.get(id);
+		return this.#resolveLabelForRead(id);
+	}
+
+	/** Resolve a label from the resident map or the cold labels/pins store (live counter). */
+	#resolveLabelForRead(id: string): string | undefined {
+		const hot = this.#labelsById.get(id);
+		if (hot !== undefined) return hot;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return undefined;
+		runtime.labelDiskFallbackCount++;
+		return runtime.labelsPins.getLabel(id);
 	}
 
 	/**
@@ -9403,12 +15583,12 @@ export class SessionManager {
 	 * Pass undefined or empty string to clear the label.
 	 */
 	appendLabelChange(targetId: string, label: string | undefined): string {
-		if (!this.#byId.has(targetId)) {
+		if (!this.#resolveEntry(targetId)) {
 			throw new Error(`Entry ${targetId} not found`);
 		}
 		const entry: LabelEntry = {
 			type: "label",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -9435,12 +15615,12 @@ export class SessionManager {
 		const path: SessionEntry[] = [];
 		const visited = new Set<string>();
 		const startId = fromId ?? this.#leafId;
-		let current = startId ? this.#byId.get(startId) : undefined;
+		let current = startId ? this.#resolveEntry(startId) : undefined;
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
 			path.push(cloneSessionEntry(materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache)));
-			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		path.reverse();
 		return path;
@@ -9454,7 +15634,20 @@ export class SessionManager {
 	 * Return a defensive context snapshot for public consumers.
 	 */
 	buildSessionContext(): SessionContext {
-		return cloneSessionContext(this.#getSessionContextForRead());
+		const context = this.#getSessionContextForRead();
+		if (!this.#sessionContextCacheOversized) return cloneSessionContext(context);
+		// Large contexts are built from detached entry clones below. Transfer the
+		// one-shot snapshot to the caller instead of retaining and deep-cloning a
+		// second full graph; invalidate the cache so caller mutation cannot affect
+		// a later read.
+		this.#sessionContextCache = undefined;
+		this.#sessionContextCacheOversized = false;
+		this.#sessionContextEntryRevision = -1;
+		this.#sessionContextLeafRevision = -1;
+		this.#sessionContextReplayMetadataRevision = -1;
+		return process.env.NODE_ENV === "test" || process.env.NODE_ENV === "development"
+			? cloneSessionContext(context)
+			: (context as SessionContext);
 	}
 
 	/**
@@ -9473,13 +15666,27 @@ export class SessionManager {
 			return cached;
 		}
 		this.#pathOnlyContextBuildCount++;
-		const builtContext = buildSessionContext(
-			this.#getActivePathEntriesForProviderContext(),
-			this.#leafId,
-			undefined,
-			this.#sessionId,
-		);
-		if (jsonLikeValueExceedsCacheLimit(builtContext, materializedCacheMaxBytes())) {
+		let resolvedProviderState: SessionEntry[] = [];
+		if (this.#coldSidecarActive() && this.#sidecarRuntime) {
+			const resolved = this.#resolvedProviderStateEntries();
+			if (!resolved) {
+				this.#ensureFullHotView();
+				return this.#getSessionContextForRead();
+			}
+			resolvedProviderState = resolved;
+		}
+		const providerEntries = this.#getActivePathEntriesForProviderContext().map(cloneSessionEntry);
+		const providerStateEntries = resolvedProviderState.map(cloneSessionEntry);
+		let syntheticParentId: string | null = null;
+		for (const entry of providerStateEntries) {
+			entry.parentId = syntheticParentId;
+			syntheticParentId = entry.id;
+		}
+		if (providerEntries[0] && syntheticParentId) providerEntries[0].parentId = syntheticParentId;
+		const detachedEntries = [...providerStateEntries, ...providerEntries];
+		const builtContext = buildSessionContext(detachedEntries, this.#leafId, undefined, this.#sessionId);
+		this.#sessionContextCacheOversized = jsonLikeValueExceedsCacheLimit(builtContext, materializedCacheMaxBytes());
+		if (this.#sessionContextCacheOversized) {
 			this.#holdMaterializedCachesWeakly();
 		}
 		const context = freezeInternalReadSnapshot(builtContext);
@@ -9491,20 +15698,28 @@ export class SessionManager {
 		return context;
 	}
 
-	#getActivePathEntriesForProviderContext(fromId?: string | null): SessionEntry[] {
+	#getActivePathEntriesForProviderContext(fromId?: string | null, forceColdSidecar = false): SessionEntry[] {
 		if (fromId === null || (fromId === undefined && this.#leafId === null)) return [];
 		const ids: string[] = [];
 		const visited = new Set<string>();
-		let current = this.#byId.get(fromId ?? this.#leafId ?? "");
+		let current = this.#resolveEntry(fromId ?? this.#leafId ?? "");
+		let activeCompaction: CompactionEntry | undefined;
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
 			ids.push(current.id);
-			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
+			if (!activeCompaction && current.type === "compaction") activeCompaction = current;
+			if (
+				(forceColdSidecar || this.#coldSidecarActive()) &&
+				activeCompaction &&
+				current.id === activeCompaction.firstKeptEntryId
+			)
+				break;
+			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		ids.reverse();
 		const pathEntries = ids
-			.map(id => this.#byId.get(id))
+			.map(id => this.#resolveEntry(id))
 			.filter((entry): entry is SessionEntry => entry !== undefined);
 		let compaction: CompactionEntry | undefined;
 		for (const entry of pathEntries) if (entry.type === "compaction") compaction = entry;
@@ -9583,6 +15798,7 @@ export class SessionManager {
 	 * Internal materialized entry cache. Public getters clone this snapshot before returning it.
 	 */
 	#getMaterializedEntriesInternal(): SessionEntry[] {
+		this.#ensureFullHotView();
 		const cached = dereferenceMaterializedCache(this.#materializedEntriesCache);
 		if (this.#materializedEntriesRevision === this.#entryRevision && cached) return cached;
 		this.#materializedEntriesCachePopulateCount++;
@@ -9623,8 +15839,7 @@ export class SessionManager {
 
 		// Create nodes with resolved labels
 		for (const entry of entries) {
-			const label = this.#labelsById.get(entry.id);
-			nodeMap.set(entry.id, { entry, children: [], label });
+			nodeMap.set(entry.id, { entry, children: [], label: this.#resolveLabelForRead(entry.id) });
 		}
 
 		const addRoot = (node: SessionTreeNode): void => {
@@ -9704,9 +15919,12 @@ export class SessionManager {
 	 */
 	branch(branchFromId: string): void {
 		this.#assertRecoveryHydrationWritable();
-		if (!this.#byId.has(branchFromId)) {
-			throw new Error(`Entry ${branchFromId} not found`);
+		if (this.#activateColdBranch(branchFromId)) {
+			this.#leafRevision++;
+			return;
 		}
+		this.#deactivateColdForBranchMutation();
+		if (!this.#resolveEntry(branchFromId)) throw new Error(`Entry ${branchFromId} not found`);
 		this.#leafId = branchFromId;
 		this.#leafRevision++;
 	}
@@ -9718,6 +15936,7 @@ export class SessionManager {
 	 */
 	resetLeaf(): void {
 		this.#assertRecoveryHydrationWritable();
+		this.#deactivateColdForBranchMutation();
 		this.#leafId = null;
 		this.#leafRevision++;
 	}
@@ -9729,13 +15948,14 @@ export class SessionManager {
 	 */
 	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromExtension?: boolean): string {
 		this.#assertRecoveryHydrationWritable();
+		this.#deactivateColdForBranchMutation();
 		if (branchFromId !== null && !this.#byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.#leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
 			fromId: branchFromId ?? "root",
@@ -9754,6 +15974,7 @@ export class SessionManager {
 	 */
 	createBranchedSession(leafId: string): string | undefined {
 		this.#assertRecoveryHydrationWritable();
+		this.#ensureFullHotView();
 		const previousSessionFile = this.#sessionFile;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) {
@@ -10005,15 +16226,15 @@ export class SessionManager {
 		};
 
 		assertManagedDestinationBound();
-		const inspected = inspectResumeSessionFile(filePath, storage);
-		if ("kind" in inspected) {
-			if (inspected.reason === "missing") return filePath;
-			throw new Error(`Could not inspect managed session: ${inspected.reason}`);
+		const inspectedResult = inspectTranscriptBounded(filePath, storage);
+		if (!inspectedResult.ok) {
+			if (inspectedResult.error.reason === "missing") return filePath;
+			throw new Error(`Could not inspect managed session: ${inspectedResult.error.reason}`);
 		}
+		const inspected = inspectedResult.inspection;
 		if (expectedIdentity && !sameResumeIdentity(expectedIdentity, inspected.identity))
 			throw new Error("Managed session changed before migration authority was adopted.");
-		const header = inspected.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (!header?.cwd) return filePath;
+		if (!inspected.cwd) return filePath;
 		const sessionsRoot = destination.securityContext.sessionsRoot;
 		const resolvedPath = path.resolve(filePath);
 		const relativeToManagedRoot = path.relative(sessionsRoot, resolvedPath);
@@ -10024,7 +16245,7 @@ export class SessionManager {
 		if (!isManagedPath) return filePath;
 		assertManagedDestinationBound();
 		const resolved = resolveManagedScope({
-			cwd: header.cwd,
+			cwd: inspected.cwd,
 			agentDir: destination.securityContext.agentDir,
 			sessionsRoot,
 		});
@@ -10037,10 +16258,10 @@ export class SessionManager {
 
 		const candidate = listing.owned.find(item => path.resolve(item.path) === resolvedPath);
 		if (!candidate) throw new Error("Session is inside managed storage but is not an authorized managed candidate.");
-		const revalidated = inspectResumeSessionFile(filePath, storage);
+		const revalidated = inspectTranscriptBounded(filePath, storage);
 		if (
-			"kind" in revalidated ||
-			!sameResumeIdentity(inspected.identity, revalidated.identity) ||
+			!revalidated.ok ||
+			!sameResumeIdentity(inspected.identity, revalidated.inspection.identity) ||
 			candidate.identity.dev !== inspected.identity.dev ||
 			candidate.identity.ino !== inspected.identity.ino ||
 			candidate.identity.size !== inspected.identity.size ||
@@ -10085,6 +16306,314 @@ export class SessionManager {
 		return opened.path;
 	}
 
+	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof this.storage.readRangeSync !== "function" ||
+			typeof this.storage.openStagedWriter !== "function"
+		)
+			return false;
+		let sourceHeader: SessionHeader | undefined;
+		let previousId: string | null = null;
+		let ordinal = 0;
+		let sawCompaction = false;
+		let preflightRejected = false;
+		const headerPatch: HeaderPatchRecord["patch"] = {};
+		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
+		let overlayBytes = 0;
+		let requiresRecordTransforms = false;
+		const preflightHash = crypto.createHash("sha256");
+		const preflightResult: { stat?: SessionStorageStat } = {};
+		const sourceSize = expectedIdentity?.size ?? this.storage.statSync(sourcePath).size;
+		const preflightFailure = scanTranscriptLinesBounded(
+			this.storage,
+			sourcePath,
+			sourceSize,
+			(_offset, lineBytes) => {
+				preflightHash.update(lineBytes);
+				try {
+					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
+					if (ordinal++ === 0) {
+						if (
+							record.type !== "session" ||
+							record.version !== CURRENT_SESSION_VERSION ||
+							(expectedIdentity !== undefined && record.id !== expectedIdentity.sessionId)
+						)
+							preflightRejected = true;
+						else sourceHeader = record;
+						return !preflightRejected;
+					}
+					if (record.type === "header_patch" || record.type === "entry_patch") {
+						requiresRecordTransforms = true;
+						overlayBytes += lineBytes.byteLength;
+						if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+							preflightRejected = true;
+							return false;
+						}
+						if (record.type === "header_patch" && isHeaderPatchRecord(record))
+							Object.assign(headerPatch, record.patch);
+						else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
+							if (!verifyForkBlobRefsBounded(record.patch)) {
+								preflightRejected = true;
+								return false;
+							}
+							entryPatches.set(record.entryId, record.patch);
+						} else {
+							preflightRejected = true;
+							return false;
+						}
+						return;
+					}
+					if (
+						record.type === "session" ||
+						typeof record.id !== "string" ||
+						record.id === previousId ||
+						record.parentId !== previousId ||
+						!verifyForkBlobRefsBounded(record)
+					) {
+						preflightRejected = true;
+						return false;
+					}
+					previousId = record.id;
+					if (record.type === "message" && record.message.role === "assistant") requiresRecordTransforms = true;
+					if (record.type === "compaction") sawCompaction = true;
+				} catch {
+					preflightRejected = true;
+					return false;
+				}
+			},
+			preflightResult,
+			false,
+			true,
+		);
+		if (preflightFailure || preflightRejected || !sourceHeader || !sawCompaction) return false;
+		const preflightDigest = preflightHash.digest("hex");
+		if (expectedIdentity && preflightDigest !== expectedIdentity.sha256)
+			throw new Error("fork_source_identity_changed");
+		const identity =
+			expectedIdentity ??
+			(preflightResult.stat
+				? {
+						canonicalPath: path.resolve(sourcePath),
+						sessionId: sourceHeader.id,
+						dev: preflightResult.stat.dev,
+						ino: preflightResult.stat.ino,
+						nlink: preflightResult.stat.nlink,
+						size: preflightResult.stat.size,
+						mtimeMs: preflightResult.stat.mtimeMs,
+						mtimeNs: preflightResult.stat.mtimeNs,
+						ctimeNs: preflightResult.stat.ctimeNs,
+						sha256: preflightDigest,
+					}
+				: undefined);
+		if (!identity) return false;
+		applyHeaderPatch(sourceHeader, headerPatch);
+		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
+		fresh.header.title = sourceHeader.title;
+		fresh.header.titleSource = sourceHeader.titleSource;
+		if (!fresh.sessionFile) return false;
+		const staged = this.storage.openStagedWriter(fresh.sessionFile);
+		let published = false;
+		try {
+			let ordinal = 0;
+			const copyHash = crypto.createHash("sha256");
+			const copyResult: { stat?: SessionStorageStat } = {};
+			const copyFailure = scanTranscriptLinesBounded(
+				this.storage,
+				sourcePath,
+				identity.size,
+				(_offset, lineBytes) => {
+					copyHash.update(lineBytes);
+					if (ordinal++ === 0) {
+						staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
+						return;
+					}
+					if (!requiresRecordTransforms) {
+						staged.writeLine(lineBytes.subarray(0, lineBytes.byteLength - 1));
+						return;
+					}
+					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as SessionEntry | SessionPatchRecord;
+					if (record.type === "header_patch" || record.type === "entry_patch") return;
+					if (record.type === "message") {
+						const patch = entryPatches.get(record.id);
+						if (patch?.message) record.message = patch.message;
+						if (record.message.role === "assistant")
+							record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+					}
+					staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
+				},
+				copyResult,
+				false,
+				true,
+			);
+			if (copyFailure) throw new Error(`fork_bounded_copy_${copyFailure}`);
+			if (copyHash.digest("hex") !== identity.sha256) throw new Error("fork_source_identity_changed");
+			if (
+				copyResult.stat &&
+				(copyResult.stat.dev !== identity.dev ||
+					copyResult.stat.ino !== identity.ino ||
+					(identity.nlink !== undefined && copyResult.stat.nlink !== identity.nlink) ||
+					copyResult.stat.size !== identity.size ||
+					copyResult.stat.mtimeNs !== identity.mtimeNs ||
+					(identity.ctimeNs !== undefined && copyResult.stat.ctimeNs !== identity.ctimeNs))
+			)
+				throw new Error("fork_source_identity_changed");
+			staged.fsync();
+			staged.closeSync();
+			staged.publishNoReplace();
+			published = true;
+			if (copyResult.stat) {
+				const current = this.storage.statSync(sourcePath);
+				if (!sameDescriptor(copyResult.stat, current)) throw new Error("fork_source_identity_changed");
+			} else if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid") {
+				throw new Error("fork_source_identity_changed");
+			}
+			await this.copyArtifactsForFork(sourcePath, fresh.sessionFile);
+			await this.#initSessionFile(fresh.sessionFile);
+			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			return true;
+		} catch (error) {
+			try {
+				staged.closeSync();
+			} catch {
+				// Preserve the fork failure.
+			}
+			if (published) await this.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+			throw error;
+		}
+	}
+
+	async #tryForkFromCapturedBounded(
+		snapshot: CapturedSessionTranscriptSnapshot,
+	): Promise<StrictSessionForkResult | undefined> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof snapshot.storage.openStagedWriter !== "function" ||
+			(snapshot.storage instanceof FileSessionStorage && !snapshot.storage.existsSync(this.destination.directory))
+		)
+			return undefined;
+		let sourceHeader: SessionHeader | undefined;
+		let previousId: string | null = null;
+		let ordinal = 0;
+		let sawCompaction = false;
+		let rejected = false;
+		const headerPatch: HeaderPatchRecord["patch"] = {};
+		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
+		let overlayBytes = 0;
+		let requiresRecordTransforms = false;
+		try {
+			snapshot.forEachLine(line => {
+				if (rejected || line.byteLength === 0) return;
+				const record = JSON.parse(decodeBoundedJsonLine(line)) as FileEntry | SessionPatchRecord;
+				if (ordinal++ === 0) {
+					if (
+						record.type !== "session" ||
+						record.version !== CURRENT_SESSION_VERSION ||
+						record.id !== snapshot.identity.sessionId
+					)
+						rejected = true;
+					else sourceHeader = record;
+					return;
+				}
+				if (record.type === "header_patch" || record.type === "entry_patch") {
+					requiresRecordTransforms = true;
+					overlayBytes += line.byteLength;
+					if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+						rejected = true;
+						return;
+					}
+					if (record.type === "header_patch" && isHeaderPatchRecord(record))
+						Object.assign(headerPatch, record.patch);
+					else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
+						if (!verifyForkBlobRefsBounded(record.patch)) {
+							rejected = true;
+							return;
+						}
+						entryPatches.set(record.entryId, record.patch);
+					} else rejected = true;
+					return;
+				}
+				if (
+					record.type === "session" ||
+					typeof record.id !== "string" ||
+					record.id === previousId ||
+					record.parentId !== previousId ||
+					!verifyForkBlobRefsBounded(record)
+				) {
+					rejected = true;
+					return;
+				}
+				previousId = record.id;
+				if (record.type === "message" && record.message.role === "assistant") requiresRecordTransforms = true;
+				if (record.type === "compaction") sawCompaction = true;
+			});
+		} catch {
+			return undefined;
+		}
+		if (rejected || !sourceHeader || !sawCompaction) return undefined;
+		applyHeaderPatch(sourceHeader, headerPatch);
+		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
+		fresh.header.title = sourceHeader.title;
+		fresh.header.titleSource = sourceHeader.titleSource;
+		if (!fresh.sessionFile) return undefined;
+		const staged = snapshot.storage.openStagedWriter(fresh.sessionFile);
+		let published = false;
+		try {
+			let writeOrdinal = 0;
+			snapshot.forEachLine(line => {
+				if (line.byteLength === 0) return;
+				if (writeOrdinal++ === 0) {
+					staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
+					return;
+				}
+				if (!requiresRecordTransforms) {
+					staged.writeLine(line);
+					return;
+				}
+				const record = JSON.parse(decodeBoundedJsonLine(line)) as SessionEntry | SessionPatchRecord;
+				if (record.type === "header_patch" || record.type === "entry_patch") return;
+				if (record.type === "message") {
+					const patch = entryPatches.get(record.id);
+					if (patch?.message) record.message = patch.message;
+					if (record.message.role === "assistant")
+						record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+				}
+				staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
+			});
+			staged.fsync();
+			staged.closeSync();
+			staged.publishNoReplace();
+			published = true;
+			const copyDescriptor = snapshot.getLastReadStat();
+			if (snapshot.storage instanceof FileSessionStorage && copyDescriptor) {
+				const current = snapshot.storage.statSync(snapshot.sourcePath);
+				if (!sameDescriptor(copyDescriptor, current)) {
+					await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+					return { kind: "error", reason: "identity-mismatch" };
+				}
+			} else {
+				const afterWrite = snapshot.revalidate();
+				if (afterWrite.kind !== "valid") {
+					await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+					return afterWrite;
+				}
+			}
+			await this.#initSessionFile(fresh.sessionFile);
+			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			return { kind: "forked", manager: this };
+		} catch (error) {
+			try {
+				staged.closeSync();
+			} catch {
+				// Preserve the captured-fork failure.
+			}
+			if (published) await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+			throw error;
+		}
+	}
+
 	/**
 	 * Fork a session into the current project directory.
 	 * Copies history from another session file while creating a new session file in the current sessionDir.
@@ -10095,6 +16624,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const managedSourcePath =
@@ -10103,7 +16633,23 @@ export class SessionManager {
 				: sourcePath;
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
-		const forkEntries = structuredClone(await loadEntriesFromFile(managedSourcePath, storage)) as FileEntry[];
+		manager.#sessionMemoryMode = sessionMemoryMode;
+		if (
+			sessionMemoryMode === "enabled" &&
+			destination.kind !== "managed" &&
+			storage instanceof FileSessionStorage &&
+			(await manager.#tryForkFromBoundedSource(managedSourcePath))
+		)
+			return manager;
+		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
+			const inspected = inspectTranscriptBounded(managedSourcePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+			if (
+				inspected.ok &&
+				(await manager.#tryForkFromBoundedSource(managedSourcePath, inspected.inspection.identity))
+			)
+				return manager;
+		}
+		const forkEntries = await loadEntriesFromFile(managedSourcePath, storage);
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -10141,6 +16687,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		const destination =
 			destinationInput === undefined
@@ -10152,26 +16699,32 @@ export class SessionManager {
 		// owner-only and reparse guards accept.
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (destination.kind === "explicit" || !(storage instanceof FileSessionStorage)) {
-			// Fail closed on oversized transcripts before the full read in the explicit path too (#3851).
-			// A missing file falls through to loadEntriesFromFile, which returns [] and creates
-			// a fresh session — matching the pre-existing behavior.
-			try {
-				const preStat = storage.statSync(filePath);
-				if (preStat.size > RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(preStat.size);
-			} catch (error) {
-				if (error instanceof SessionTranscriptOversizedError) throw error;
-				if (!isEnoent(error)) throw error;
+			const inspected = inspectTranscriptBounded(
+				filePath,
+				storage,
+				sessionMemoryMode === "enabled" ? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES : RESUME_TRANSCRIPT_MAX_BYTES,
+			);
+			if (!inspected.ok) {
+				if (inspected.error.reason === "missing") {
+					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+					manager.#sessionMemoryMode = sessionMemoryMode;
+					await manager.#initSessionFile(filePath);
+					return manager;
+				}
+				if (inspected.error.reason === "oversized")
+					throw new SessionTranscriptOversizedError(inspected.error.size ?? 0);
+				throw new Error(`Could not open session: ${inspected.error.reason}`);
 			}
-			const entries = await loadEntriesFromFile(filePath, storage);
-			const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 			const manager = new SessionManager(
-				header?.cwd ?? getProjectDir(),
+				inspected.inspection.cwd ?? getProjectDir(),
 				destination.directory,
 				true,
 				storage,
 				destination,
 			);
+			manager.#sessionMemoryMode = sessionMemoryMode;
 			await manager.#initSessionFile(filePath);
+			manager.buildSessionContext();
 			return manager;
 		}
 
@@ -10179,13 +16732,21 @@ export class SessionManager {
 		if ("kind" in inspected) {
 			if (inspected.reason === "missing") {
 				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+				manager.#sessionMemoryMode = sessionMemoryMode;
 				await manager.#initSessionFile(filePath);
 				return manager;
 			}
 			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
+			if (inspected.reason === "context_too_large") throw new SessionContextTooLargeError(inspected.size ?? 0);
 			throw new Error(`Could not open session: ${inspected.reason}`);
 		}
-		const opened = await SessionManager.openExistingStrict(inspected.identity, destination, storage, migrationPolicy);
+		const opened = await SessionManager.openExistingStrict(
+			inspected.identity,
+			destination,
+			storage,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 		if (opened.kind === "error") {
 			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
 			if (opened.reason === "artifact_capacity_exceeded")
@@ -10193,6 +16754,7 @@ export class SessionManager {
 					opened.message ?? "Session artifacts exceed the migration capacity.",
 				);
 			if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
+			if (opened.reason === "context_too_large") throw new SessionContextTooLargeError(opened.size ?? 0);
 			if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
 			throw new Error(`Could not open session: ${opened.reason}`);
 		}
@@ -10205,6 +16767,7 @@ export class SessionManager {
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
@@ -10224,6 +16787,7 @@ export class SessionManager {
 		);
 		if (header && cwdChanged) header.cwd = sessionCwd;
 		const manager = new SessionManager(sessionCwd, destination.directory, true, storage, destination);
+		manager.#sessionMemoryMode = sessionMemoryMode;
 		if (entries.length > 0) {
 			const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
 			await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
@@ -10246,6 +16810,7 @@ export class SessionManager {
 			manager.#ensuredOnDisk = true;
 		}
 		store.assertBound();
+		manager.buildSessionContext();
 		return manager;
 	}
 	/**
@@ -10344,16 +16909,11 @@ export class SessionManager {
 		filePath: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): StrictSessionCaptureResult {
-		const inspected = inspectResumeSessionFile(filePath, storage);
-		if ("kind" in inspected) return inspected;
+		const inspected = inspectTranscriptBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+		if (!inspected.ok) return inspected.error;
 		return {
 			kind: "captured",
-			snapshot: {
-				sourcePath: path.resolve(filePath),
-				identity: inspected.identity,
-				content: Uint8Array.from(inspected.content),
-				storage,
-			},
+			snapshot: createTranscriptSnapshotHandle(inspected.inspection, path.resolve(filePath), storage),
 		};
 	}
 
@@ -10367,33 +16927,56 @@ export class SessionManager {
 		cwd: string,
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<StrictSessionForkResult> {
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
-		if (crypto.createHash("sha256").update(snapshot.content).digest("hex") !== snapshot.identity.sha256) {
-			return { kind: "error", reason: "identity-mismatch" };
+		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
+			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
+			boundedManager.#sessionMemoryMode = sessionMemoryMode;
+			const bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot);
+			if (bounded) return bounded;
+			await boundedManager.close();
 		}
 
+		// Bounded parse: iterate the captured transcript line-by-line (no
+		// whole-file string/Buffer) while re-validating the running content hash
+		// against the captured identity.
 		let forkEntries: FileEntry[] = [];
 		try {
-			const content = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.content);
-			for (const line of content.split(/\r?\n/)) {
-				if (line.length > 0) JSON.parse(line);
+			const directEntries: FileEntry[] = [];
+			let patchRecords: Array<FileEntry | SessionPatchRecord> | undefined;
+			snapshot.forEachLine(line => {
+				const text = new TextDecoder("utf-8", { fatal: true }).decode(line);
+				if (text.length === 0) return;
+				const record = JSON.parse(text) as FileEntry | SessionPatchRecord;
+				if (record.type === "header_patch" || record.type === "entry_patch") {
+					patchRecords ??= [...directEntries];
+					patchRecords.push(record);
+				} else if (patchRecords) {
+					patchRecords.push(record);
+				} else {
+					directEntries.push(record);
+				}
+			});
+			if (patchRecords) {
+				forkEntries = buildFileEntriesFromRecords(patchRecords);
+				patchRecords.length = 0;
+				directEntries.length = 0;
+			} else {
+				forkEntries = directEntries;
 			}
-			forkEntries = parseSessionEntries(content);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
 			if (sourceHeader?.type !== "session" || sourceHeader.id !== snapshot.identity.sessionId)
 				return { kind: "error", reason: "identity-mismatch" };
 			migrateToCurrentVersion(forkEntries);
 			if (!hasStrictSessionSchema(forkEntries)) return { kind: "error", reason: "malformed" };
-		} catch {
+		} catch (error) {
+			if (toError(error).message === "identity-mismatch") return { kind: "error", reason: "identity-mismatch" };
 			return { kind: "error", reason: "malformed" };
 		}
 
-		const revalidated = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
-		if ("kind" in revalidated) return revalidated;
-		if (!sameResumeIdentity(snapshot.identity, revalidated.identity)) {
-			return { kind: "error", reason: "identity-mismatch" };
-		}
+		const revalidated = snapshot.revalidate();
+		if (revalidated.kind !== "valid") return revalidated;
 
 		const dir = destination.directory;
 		const privateStagingDir =
@@ -10412,18 +16995,19 @@ export class SessionManager {
 
 		try {
 			manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination);
+			manager.#sessionMemoryMode = sessionMemoryMode;
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
-			const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			const historyEntries = forkEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
 			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
 			fresh.header.title = sourceHeader?.title;
 			fresh.header.titleSource = sourceHeader?.titleSource;
+			forkEntries[0] = fresh.header;
 			const transition = manager.#prepareResidentTextStoreTransition(
 				{
 					target: { sessionId: fresh.sessionId, sessionFile: fresh.sessionFile ?? "" },
 					primary: {
 						mode: "materialize",
-						sourceEntries: [fresh.header, ...historyEntries],
+						sourceEntries: forkEntries,
 						sourceStores: { textStore: null, imageStore: manager.#residentImageBlobStore },
 					},
 				},
@@ -10433,16 +17017,23 @@ export class SessionManager {
 			manager.#commitResidentTextStoreTransition(transition);
 			manager.#retireEphemeralArtifacts();
 			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
-			const beforeWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
-			if ("kind" in beforeWrite) {
+			const beforeWrite = snapshot.revalidate();
+			if (beforeWrite.kind !== "valid") {
 				authorityFailure = beforeWrite;
 				throw new Error("Captured fork source authority changed before destination write.");
 			}
-			if (!sameResumeIdentity(snapshot.identity, beforeWrite.identity)) {
-				authorityFailure = { kind: "error", reason: "identity-mismatch" };
-				throw new Error("Captured fork source authority changed before destination write.");
-			}
-			await manager.#rewriteFile();
+			const sessionFile = manager.#sessionFile;
+			if (!sessionFile) throw new Error("fork_transcript_session_file_unavailable");
+			const activeManager = manager;
+			// Publish each already-parsed entry through the staged writer without joining
+			// another whole-file string/Buffer. The parse/resident graph is still the
+			// compatibility path; retired cold history is never omitted.
+			publishForkTranscriptStreaming(snapshot.storage, sessionFile, forkDestination, manager.#fileEntries, entry =>
+				prepareEntryForPersistenceSync(
+					materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
+					activeManager.#blobStore,
+				),
+			);
 			if (privateStagingDir) {
 				const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
 				if (!capturedStaging.ok || !capturedStaging.snapshot)
@@ -10455,13 +17046,9 @@ export class SessionManager {
 				managedForkTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
 				if (!managedForkTranscript) throw new Error("managed_fork_transcript_publish_missing");
 			}
-			const afterWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
-			if ("kind" in afterWrite) {
+			const afterWrite = snapshot.revalidate();
+			if (afterWrite.kind !== "valid") {
 				authorityFailure = afterWrite;
-				throw new Error("Captured fork source authority changed during destination write.");
-			}
-			if (!sameResumeIdentity(snapshot.identity, afterWrite.identity)) {
-				authorityFailure = { kind: "error", reason: "identity-mismatch" };
 				throw new Error("Captured fork source authority changed during destination write.");
 			}
 			if (managedForkStore && managedForkTranscript && manager.#sessionFile) {
@@ -10498,7 +17085,15 @@ export class SessionManager {
 					const outcome = classifyNativePublishOutcome(
 						nativeSessionManager().renameNoReplacePath(privateStagingDir, dir),
 					);
-					if (!outcome.ok) throw new Error(outcome.code ?? "fork_destination_publish_failed");
+					if (!outcome.ok) {
+						if (outcome.code === "quarantine_collision") {
+							authorityFailure = { kind: "error", reason: "identity-mismatch" };
+							throw new Error("fork_destination_authority_changed");
+						}
+						if (outcome.code === "destination_identity_changed")
+							throw new Error("fork_destination_terminal_identity_changed");
+						throw new Error(outcome.code ?? "fork_destination_publish_failed");
+					}
 					privateStagingPublished = true;
 					const terminal = nativeSessionManager().snapshotDirectoryTree(dir);
 					if (
@@ -10523,6 +17118,18 @@ export class SessionManager {
 					finalTransition.dispose();
 					throw error;
 				}
+			}
+			const finalSource = snapshot.revalidate();
+			if (finalSource.kind !== "valid") {
+				authorityFailure = finalSource;
+				throw new Error("Captured fork source authority changed after destination publication.");
+			}
+			if (manager.#sessionMemoryMode !== "off" && manager.#sessionFile) {
+				const runtime = manager.#sidecarRuntime;
+				const transcriptSize = manager.storage.statSync(manager.#sessionFile).size;
+				if (!runtime?.enabled || runtime.tail.transcriptSize !== transcriptSize)
+					manager.#buildDisposableSidecars(manager.#fileEntries);
+				if (manager.#sessionMemoryMode === "enabled") manager.#retireColdEntries();
 			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
@@ -10867,6 +17474,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<StrictSessionOpenResult> {
 		const destination =
 			destinationInput === undefined
@@ -10905,6 +17513,7 @@ export class SessionManager {
 		const header = entries[0] as SessionHeader;
 		const dir = destination.directory;
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
+		manager.#sessionMemoryMode = sessionMemoryMode;
 		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
 		const ownershipInspection = revalidateResumeSessionIdentity(sessionPath, storage, inspected.identity);
 		if (ownershipInspection.kind === "error") {
@@ -10931,6 +17540,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
@@ -10938,6 +17548,7 @@ export class SessionManager {
 			const inspected = await SessionManager.inspectSessionTailReadOnly(selectedPath, storage);
 			if (inspected.kind === "error") {
 				if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
+				if (inspected.reason === "context_too_large") throw new SessionContextTooLargeError(inspected.size ?? 0);
 				return undefined;
 			}
 			const opened = await SessionManager.openExistingStrict(
@@ -10945,6 +17556,7 @@ export class SessionManager {
 				destination,
 				storage,
 				migrationPolicy,
+				sessionMemoryMode,
 			);
 			if (opened.kind === "error") {
 				if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
@@ -10953,6 +17565,7 @@ export class SessionManager {
 						opened.message ?? "Session artifacts exceed the migration capacity.",
 					);
 				if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
+				if (opened.reason === "context_too_large") throw new SessionContextTooLargeError(opened.size ?? 0);
 				if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
 				return undefined;
 			}

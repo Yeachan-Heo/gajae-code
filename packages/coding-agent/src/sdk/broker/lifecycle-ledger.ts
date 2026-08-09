@@ -99,6 +99,11 @@ export interface LifecycleLedgerLimits {
 	maxBytes?: number;
 	maxLineBytes?: number;
 	maxRows?: number;
+	/**
+	 * Cap for the `.corrupt` quarantine sidecar. Reaching it rotates one
+	 * generation aside instead of appending forever.
+	 */
+	maxCorruptBytes?: number;
 }
 function canonicalCleanupSessionId(value: unknown): value is string {
 	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
@@ -108,7 +113,11 @@ const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
 	maxBytes: 64 * 1024 * 1024,
 	maxLineBytes: 8 * 1024 * 1024,
 	maxRows: 10_000,
+	maxCorruptBytes: 8 * 1024 * 1024,
 };
+
+/** Appended when a quarantined row is clipped to the sidecar cap. */
+const LIFECYCLE_QUARANTINE_TRUNCATION_MARKER = "\n[gjc: quarantined row truncated at the corrupt-ledger cap]";
 const MAX_LIFECYCLE_LEDGER_JSON_DEPTH = 64;
 const MAX_LIFECYCLE_LEDGER_JSON_FIELDS = 1024;
 
@@ -251,6 +260,7 @@ export class LifecycleLedger {
 			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
 			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
 			maxRows: limits.maxRows ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxRows,
+			maxCorruptBytes: limits.maxCorruptBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxCorruptBytes,
 		};
 	}
 	async open(): Promise<this> {
@@ -353,12 +363,16 @@ export class LifecycleLedger {
 		return this;
 	}
 	/**
-	 * Reads terminal proof for one request without recovering or changing the ledger.
+	 * Reads the durable terminal record for one request without recovering or changing the ledger.
 	 *
 	 * This intentionally accepts an unrelated unterminated final write: concurrent
 	 * appenders may have started a different row after this request's synced terminal
 	 * row. Complete rows are still decoded and validated strictly, and any incomplete
 	 * tail that identifies this request withholds proof.
+	 *
+	 * `terminal_uncertain` is a durable terminal record too: an operation that concluded
+	 * uncertainly persists that conclusion, and refusing to read it back would report a
+	 * synced row as unpersisted and replace its true reason with a generic one.
 	 */
 	async readTerminal(identity: string, requestHash: string): Promise<LifecycleLedgerEntry | undefined> {
 		const source = await this.#readBoundedSourceReadOnly();
@@ -403,12 +417,20 @@ export class LifecycleLedger {
 			const identityMarker = Buffer.from(`"identity":${JSON.stringify(identity)}`);
 			if (tail.includes(identityMarker)) return undefined;
 		}
-		return latest && terminal(latest.state) ? latest : undefined;
+		return latest && final(latest.state) ? latest : undefined;
 	}
 
+	/**
+	 * A recovery pass appends `terminal_uncertain` for every row it finds mid-flight, so a
+	 * long-running operation can have that marker interleaved before its own terminal row
+	 * lands. The marker records unresolved work, not a proven outcome: the owner that ran
+	 * the effects stays authoritative and may still resolve it. A proven terminal row is
+	 * immutable and admits no successor.
+	 */
 	#isValidHistoryContinuation(previous: LifecycleLedgerEntry | undefined, next: LifecycleLedgerEntry): boolean {
 		if (!previous) return next.state === "accepted";
-		if (previous.requestHash !== next.requestHash || final(previous.state)) return false;
+		if (previous.requestHash !== next.requestHash || terminal(previous.state)) return false;
+		if (previous.state === "terminal_uncertain") return final(next.state);
 		if (previous.state === "accepted") return true;
 		return next.state === "effect_started" || next.state === "awaiting_ready" || final(next.state);
 	}
@@ -533,11 +555,43 @@ export class LifecycleLedger {
 			await h.close();
 		}
 	}
+	/**
+	 * Rotate the quarantine sidecar aside once it would exceed its cap.
+	 *
+	 * Quarantine is diagnostic, not durable state: an unreadable ledger
+	 * re-quarantines its whole contents on every open, so a plain append grows
+	 * the sidecar without bound (a 126 MB `.corrupt` next to a 6 MB live ledger,
+	 * #3963). One retained generation keeps the newest evidence while bounding
+	 * the pair at twice the cap.
+	 */
+	async #rotateCorruptWhenFull(incomingBytes: number): Promise<void> {
+		let size: number;
+		try {
+			const stat = await fs.lstat(this.#corruptFile);
+			// A non-regular quarantine path is never rotated; the append guard rejects it.
+			if (!stat.isFile()) return;
+			size = stat.size;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		if (size + incomingBytes <= this.#limits.maxCorruptBytes) return;
+		await fs.rename(this.#corruptFile, `${this.#corruptFile}.1`);
+	}
+
 	async #quarantine(line: string | Uint8Array): Promise<void> {
+		const payload =
+			typeof line === "string" ? Buffer.from(line) : Buffer.from(line.buffer, line.byteOffset, line.byteLength);
+		// A single quarantined row can be as large as the whole ledger, so the
+		// write itself is capped too; otherwise one oversized row would blow past
+		// the rotation bound it just triggered.
+		const truncated = payload.length > this.#limits.maxCorruptBytes;
+		const retained = truncated ? payload.subarray(0, this.#limits.maxCorruptBytes) : payload;
+		await this.#rotateCorruptWhenFull(retained.length + 1);
 		const h = await this.#openAppendRegular(this.#corruptFile);
 		try {
-			await h.writeFile(line);
-			await h.writeFile("\n");
+			await h.writeFile(retained);
+			await h.writeFile(truncated ? `${LIFECYCLE_QUARANTINE_TRUNCATION_MARKER}\n` : "\n");
 			await h.sync();
 		} finally {
 			await h.close();

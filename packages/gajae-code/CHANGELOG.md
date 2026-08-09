@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.12.19] - 2026-08-08
+
+## [0.12.18] - 2026-08-08
+
+## [0.12.17] - 2026-08-08
+
+## [0.12.16] - 2026-08-08
+
 ### Added
 
 - Added installation through the independently published `nightly` dist-tag (`bun install -g gajae-code@nightly`); stable installs remain on `latest`.

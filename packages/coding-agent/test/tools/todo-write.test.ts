@@ -265,18 +265,51 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		arguments: arguments_,
 	});
 
-	it("rejects an unknown root key with the root-shape correction", () => {
-		expect(() => validateToolArguments(tool, call({ ops: [{ op: "done", task: "x" }], extraRootKey: true }))).toThrow(
-			"todo_write root accepts only an ops array of operation entries",
+	const REJECTED = 'Validation failed for tool "todo_write": raw arguments rejected before coercion';
+
+	it("names the unknown root key alongside the root-shape correction", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x" }], extraRootKey: true })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write root accepts only an ops array of operation entries; rejected key: "extraRootKey"`,
 		);
 	});
 
-	it("rejects an unknown operation-entry key with the entry-shape correction", () => {
+	it("names a note key without emitting an incomplete replacement", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "note", note: "why this plan" }] })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "note" (note is an op, not a key; note operations require both "task" and "text")`,
+		);
+		expect(message).not.toContain('use { op: "note", text: "..." }');
+	});
+
+	it("rejects the incomplete note shape for missing task content", async () => {
+		const result = await tool.execute("call-note", { ops: [{ op: "note", text: "why this plan" }] });
+		const first = result.content?.[0];
+		const text = first?.type === "text" ? first.text : "";
+		expect(text).toContain("Missing task content");
+		expect(text).toContain("Todo update was not applied");
+	});
+
+	it("names an unknown operation-entry key without inventing a replacement for it", () => {
 		const message = captureValidationError(() =>
 			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x", bogusOpKey: "y" }] })),
 		);
-		expect(message).toContain("todo_write operation entries accept only op, list, task, phase, items, and text keys");
-		expect(message).not.toContain("bogusOpKey");
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "bogusOpKey"`,
+		);
+	});
+
+	it("names every unknown key when an operation entry carries several", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x", alpha: 1, beta: 2 }] })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected keys: "alpha", "beta"`,
+		);
 	});
 
 	it("rejects a done entry without a task or phase target", () => {
@@ -291,15 +324,23 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		);
 	});
 
-	it("rejects an unknown init list-entry key with the init-shape correction", () => {
+	it("names the unknown init list-entry key alongside the init-shape correction", () => {
 		const message = captureValidationError(() =>
 			validateToolArguments(
 				tool,
 				call({ ops: [{ op: "init", list: [{ phase: "Execution", items: ["status"], bogusInitKey: 1 }] }] }),
 			),
 		);
-		expect(message).toContain("todo_write init list entries accept only phase and items keys");
-		expect(message).not.toContain("bogusInitKey");
+		expect(message).toBe(
+			`${REJECTED}; todo_write init list entries accept only phase and items keys; rejected key: "bogusInitKey"`,
+		);
+	});
+
+	it("still accepts content as the task alias instead of naming it as rejected", () => {
+		const parsed = validateToolArguments(tool, call({ ops: [{ op: "done", content: "ship it" }] })) as {
+			ops: Array<{ op: string; task?: string }>;
+		};
+		expect(parsed.ops[0]).toEqual({ op: "done", task: "ship it" });
 	});
 
 	it("keeps valid payloads accepted at the validation boundary", () => {

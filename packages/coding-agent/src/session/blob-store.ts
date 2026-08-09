@@ -1523,3 +1523,92 @@ export function resolveResidentImageDataSync(
 	}
 	return buffer.toString("base64");
 }
+
+// =============================================================================
+// Canonical-store mark-and-sweep primitives (`gjc gc --disk`)
+// =============================================================================
+//
+// The resident-cache sweep above bounds *cache* directories. These primitives
+// expose the canonical `~/.gjc/agent/blobs` store to an out-of-process retention
+// pass so it can mark live hashes from surviving transcripts and sweep the rest.
+// They own no policy: the caller decides what "unreferenced" means.
+
+/** One canonical blob file (`<blobsDir>/<sha256-hex>`) observed on disk. */
+export interface CanonicalBlobEntry {
+	readonly hash: string;
+	readonly path: string;
+	readonly bytes: number;
+	readonly mtimeMs: number;
+}
+
+const CANONICAL_BLOB_NAME = /^[0-9a-f]{64}$/;
+const BLOB_REFERENCE = /blob:sha256:([0-9a-f]{64})/g;
+
+/** Longest possible `blob:sha256:<hash>` reference, used to bound chunked scans. */
+export const BLOB_REFERENCE_MAX_LENGTH = BLOB_PREFIX.length + 64;
+
+/** Collect every `blob:sha256:<hash>` reference that appears in `text`. */
+export function collectBlobReferences(text: string, into: Set<string>): void {
+	for (const match of text.matchAll(BLOB_REFERENCE)) into.add(match[1]!);
+}
+
+/**
+ * List canonical blob files. Anything that is not a plain, owner-visible regular
+ * file named after its own hash (temp files, symlinks, subdirectories) is
+ * skipped: a sweep must never reason about entries it cannot classify.
+ */
+export async function listCanonicalBlobs(dir: string): Promise<CanonicalBlobEntry[]> {
+	let names: string[];
+	try {
+		names = await fsp.readdir(dir);
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw error;
+	}
+
+	const entries: CanonicalBlobEntry[] = [];
+	for (const name of names) {
+		if (!CANONICAL_BLOB_NAME.test(name)) continue;
+		const blobPath = path.join(dir, name);
+		let stat: fs.Stats;
+		try {
+			stat = await fsp.lstat(blobPath);
+		} catch {
+			continue;
+		}
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) continue;
+		entries.push({ hash: name, path: blobPath, bytes: stat.size, mtimeMs: stat.mtimeMs });
+	}
+	return entries;
+}
+
+/**
+ * Remove one canonical blob, fail-closed on identity drift. The entry captured
+ * at scan time must still describe the file at unlink time (same inode, size and
+ * mtime, still a single-link regular file), otherwise the blob is left in place.
+ *
+ * `failed` distinguishes an actual IO failure (which a caller should surface as
+ * a failed reclaim) from a revalidation refusal (which is an ordinary KEEP).
+ */
+export async function removeCanonicalBlob(
+	entry: CanonicalBlobEntry,
+): Promise<{ removed: true } | { removed: false; reason: string; failed?: true }> {
+	let stat: fs.Stats;
+	try {
+		stat = await fsp.lstat(entry.path);
+	} catch (error) {
+		if (isEnoent(error)) return { removed: false, reason: "blob_disappeared" };
+		return { removed: false, reason: `blob_unverifiable: ${String(error)}`, failed: true };
+	}
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+		return { removed: false, reason: "blob_not_plain_file" };
+	}
+	if (stat.size !== entry.bytes || stat.mtimeMs !== entry.mtimeMs) return { removed: false, reason: "blob_changed" };
+	try {
+		await fsp.unlink(entry.path);
+		return { removed: true };
+	} catch (error) {
+		if (isEnoent(error)) return { removed: false, reason: "blob_disappeared" };
+		return { removed: false, reason: `blob_unlink_failed: ${String(error)}`, failed: true };
+	}
+}

@@ -23,6 +23,16 @@ export interface OutputBlockOptions {
 	width: number;
 	applyBg?: boolean;
 }
+/**
+ * Return the width available to section content after the output block's
+ * visible left and right borders. Keep callers on the same layout contract as
+ * renderOutputBlock so width-aware projections are not wrapped a second time.
+ */
+export function getOutputBlockContentWidth(width: number, theme: Theme): number {
+	const lineWidth = Math.max(0, width);
+	const borderWidth = visibleWidth(`${theme.boxSharp.vertical} `) + visibleWidth(theme.boxSharp.vertical);
+	return Math.max(0, lineWidth - borderWidth);
+}
 
 export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): string[] {
 	const { header, headerMeta, state, sections = [], width, applyBg = true } = options;
@@ -70,7 +80,7 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 
 	const contentPrefix = border(`${v} `);
 	const contentSuffix = border(v);
-	const contentWidth = Math.max(0, lineWidth - visibleWidth(contentPrefix) - visibleWidth(contentSuffix));
+	const contentWidth = getOutputBlockContentWidth(lineWidth, theme);
 	const lines: string[] = [];
 
 	lines.push(

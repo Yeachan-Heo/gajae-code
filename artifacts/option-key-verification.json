@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "kind": "black-box-cli-receipt",
+  "description": "Live and fixture verification of the iTerm2 Option/Alt environment and GJC installation.",
+  "generatedAt": "2026-08-08T22:54:38+09:00",
+  "commands": [
+    "./scripts/verify-option-key.sh",
+    "sh -n scripts/verify-option-key.sh",
+    "python3 -m py_compile scripts/capture-option-key.py",
+    "gjc --smoke-test",
+    "PTY harness: ESC q, ESC i, raw 0x03",
+    "Synthetic plist fixtures: clean, missing tmux, wrong current layout, character-code Option+Q conflict"
+  ],
+  "exitStatus": {
+    "verifyOptionKey": 0,
+    "shellSyntax": 0,
+    "pythonSyntax": 0,
+    "gjcSmokeTest": 0,
+    "ptyCapture": 0,
+    "adversarialFixtures": 0
+  },
+  "observed": {
+    "profiles": {
+      "Default": {
+        "guid": "FC77C302-5179-4EF7-AADC-6B91CA2B61C2",
+        "leftOption": "+Esc",
+        "rightOption": "+Esc",
+        "keyboardMapEntries": 0,
+        "optionQIOverrides": false
+      },
+      "tmux": {
+        "guid": "EDA49C7E-2558-4955-8825-558CDE52D1FD",
+        "leftOption": "+Esc",
+        "rightOption": "+Esc",
+        "keyboardMapEntries": 0,
+        "optionQIOverrides": false
+      }
+    },
+    "inputSource": {
+      "currentKeyboardLayoutInputSourceID": "com.apple.keylayout.ABC",
+      "selectedKeyboardLayout": "ABC"
+    },
+    "bun": "1.3.14",
+    "gjc": "gjc/0.12.16",
+    "smokeTest": "ok",
+    "capture": "ESC q, ESC i, raw 0x03 stop and terminal restoration"
+  },
+  "adversarialFixtures": {
+    "missingTmux": "failed as expected",
+    "wrongCurrentKeyboardLayout": "failed as expected",
+    "characterCodeOptionQConflict": "failed as expected",
+    "cleanFixture": "passed"
+  },
+  "physicalKeyTest": {
+    "status": "manual_required",
+    "procedure": "Run python3 scripts/capture-option-key.py in fresh Default and tmux iTerm2 sessions with ABC active, then press Option+Q and Option+I in each.",
+    "expected": "ESC followed by q or i, without œ or ˆ insertion; the same Alt command executes in GJC.",
+    "notAutomatedBecause": "The agent cannot generate physical Option-key events in the user's iTerm2 sessions."
+  }
+}

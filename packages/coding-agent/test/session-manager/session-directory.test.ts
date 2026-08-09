@@ -58,6 +58,18 @@ function legacyDirectory(sessionsRoot: string, cwd: string): string {
 	);
 }
 
+async function committedReceiptNames(directory: string): Promise<string[]> {
+	const names = await fs.readdir(directory);
+	return names.filter(name => {
+		if (!/^[a-f0-9]{64}\.json$/.test(name)) return false;
+		try {
+			return JSON.parse(syncFs.readFileSync(path.join(directory, name), "utf8")).state === "committed";
+		} catch {
+			return false;
+		}
+	});
+}
+
 function encoded(value: string): string {
 	return value.replace(/[/\\:]/g, "-");
 }
@@ -584,7 +596,7 @@ describe("managed session write protocol", () => {
 		for (const receipt of await fs.readdir(receipts)) await fs.unlink(path.join(receipts, receipt));
 		const interruptedReplay = await openManagedCandidateForWrite(scope, legacyCandidate);
 		expect(interruptedReplay).toMatchObject({ kind: "opened", path: first.path, migrated: true });
-		expect(await fs.readdir(receipts)).toHaveLength(1);
+		expect(await committedReceiptNames(receipts)).toHaveLength(1);
 	});
 	it("publishes a committed managed inode with exactly one link", async () => {
 		const { scope } = await fixture();
@@ -632,9 +644,7 @@ describe("managed session write protocol", () => {
 		expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const committed = (await fs.readdir(receipts))
-			.filter(name => !name.startsWith(".") && name.endsWith(".json"))
-			.find(name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed");
+		const [committed] = await committedReceiptNames(receipts);
 		if (!committed) throw new Error("Missing committed migration receipt");
 		const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
 			artifactManifest?: unknown[];
@@ -855,9 +865,7 @@ describe("managed session write protocol", () => {
 		await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({ kind: "opened" });
 
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const committed = (await fs.readdir(receipts)).find(
-			name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed",
-		);
+		const [committed] = await committedReceiptNames(receipts);
 		if (!committed) throw new Error("Missing committed receipt");
 		const record = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
 			sourceArtifactCleanup?: { retainedPath?: unknown };
@@ -1454,7 +1462,7 @@ describe("managed session write protocol", () => {
 		const opened = await openManagedCandidateForWrite(scope, initial.owned[0]);
 		if (opened.kind !== "opened") throw new Error(opened.message);
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const [receipt] = await fs.readdir(receipts);
+		const receipt = (await fs.readdir(receipts)).find(name => /^[a-f0-9]{64}\.json$/.test(name));
 		if (!receipt) throw new Error("Missing committed receipt");
 		const receiptPath = path.join(receipts, receipt);
 		const externalReceipt = path.join(path.dirname(scope.directoryPath), "external-receipt.json");

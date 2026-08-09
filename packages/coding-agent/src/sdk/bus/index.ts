@@ -80,6 +80,7 @@ import {
 } from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
+import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { SessionIndex } from "../broker/session-index";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
@@ -1170,6 +1171,8 @@ interface SessionRuntime {
 	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
 	hostStopped: boolean;
 	serverStopped: boolean;
+	/** This runtime's own host-liveness publication; only its teardown may retract it. */
+	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
 	/** Managed Telegram root registration released during terminal teardown. */
 	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken: string };
@@ -3749,6 +3752,13 @@ export function createNotificationsExtension(
 				await rt.server.stopAndWait();
 				serverStopped = true;
 				rt.serverStopped = true;
+				// This runtime no longer serves an SDK endpoint, so it withdraws its
+				// own evidence — and only its own. A predecessor's deferred teardown
+				// runs while an identity successor is already serving, and clearing
+				// that live runtime's reader would manufacture "no evidence" for a
+				// host whose clients are still attached.
+				rt.evidencePublication?.retract();
+				rt.evidencePublication = undefined;
 			} catch (e) {
 				ownerReleaseFailures.push(e);
 				logger.warn(`notifications: stop failed: ${String(e)}`);
@@ -5503,6 +5513,14 @@ export function createNotificationsExtension(
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await sdkRuntime.startTransport();
+			// The native server owns the only authoritative view of this host's live
+			// SDK client sockets; publish it so a detached session host can bound its
+			// own lifetime without probing the OS (#4010). The handle is this
+			// runtime's alone, so only this runtime's teardown can retract it.
+			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
+				attachedClients: () => server.clientCount(),
+				workInFlight: () => initializedRuntime.busy || initializedRuntime.pendingPromptCorrelations.length > 0,
+			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
 				endpointDigest: endpointAuthorityDigest(endpoint.url, token),

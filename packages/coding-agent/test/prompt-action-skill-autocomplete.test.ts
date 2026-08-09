@@ -43,24 +43,13 @@ describe("prompt action skill autocomplete", () => {
 		expect(applied.lines[0]).toBe("/skill:deep-interview ");
 	});
 
-	it("normalizes inline direct skill-name typing to the canonical skill command", async () => {
+	it.each([
+		"please use /ra",
+		"/skill:deep-interview first /skill-deep",
+	])("does not offer skill completions after existing prompt text: %s", async line => {
 		const provider = createProvider();
-		const line = "please use /ra";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-		expect(suggestions?.prefix).toBe("/ra");
-		expect(suggestions?.items[0]?.value).toBe("skill:ralplan");
-		const applied = provider.applyCompletion([line], 0, line.length, suggestions!.items[0]!, suggestions!.prefix);
-		expect(applied.lines[0]).toBe("please use /skill:ralplan ");
-	});
 
-	it("normalizes slash-skill-name typing at intermediate positions", async () => {
-		const provider = createProvider();
-		const line = "/skill:deep-interview first /skill-deep";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-		expect(suggestions?.prefix).toBe("/skill-deep");
-		expect(suggestions?.items[0]?.value).toBe("skill:deep-interview");
-		const applied = provider.applyCompletion([line], 0, line.length, suggestions!.items[0]!, suggestions!.prefix);
-		expect(applied.lines[0]).toBe("/skill:deep-interview first /skill:deep-interview ");
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
 	});
 
 	it("does not offer skill completions from a bare top-level slash token", async () => {
@@ -72,23 +61,13 @@ describe("prompt action skill autocomplete", () => {
 		expect(values.some(value => value.startsWith("skill:"))).toBe(false);
 	});
 
-	it("does not offer skill completions from an adjacent bare slash token after prompt text", async () => {
+	it.each([
+		"please use/",
+		"please use /skill",
+	])("keeps skill autocomplete closed for inline slash tokens: %s", async line => {
 		const provider = createProvider();
-		const line = "please use/";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-		const values = suggestions?.items.map(item => item.value) ?? [];
-		expect(suggestions?.prefix).toBe("/");
-		expect(values).toEqual(expect.arrayContaining(["model"]));
-		expect(values.some(value => value.startsWith("skill:"))).toBe(false);
-	});
 
-	it("offers skill completions from an inline /skill token after prompt text", async () => {
-		const provider = createProvider();
-		const line = "please use /skill";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-		expect(suggestions?.prefix).toBe("/skill");
-		expect(suggestions?.items.map(item => item.value)).toContain("skill:team");
-		expect(suggestions?.items.map(item => item.value)).not.toContain("model");
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
 	});
 
 	it("does not rewrite a nested filesystem path as a skill command", async () => {

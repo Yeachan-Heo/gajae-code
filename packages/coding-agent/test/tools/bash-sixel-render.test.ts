@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { RenderResultOptions } from "@gajae-code/agent-core";
+import { KeybindingsManager } from "@gajae-code/coding-agent/config/keybindings";
 import { type IrcSidebarTheme, IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { bashToolRenderer } from "@gajae-code/coding-agent/tools/bash";
-import { ImageProtocol, TERMINAL } from "@gajae-code/tui";
+import { getOutputBlockContentWidth } from "@gajae-code/coding-agent/tui/output-block";
+import { getKeybindings, ImageProtocol, setKeybindings, TERMINAL, visibleWidth } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
 
 type MutableTerminalInfo = {
@@ -23,9 +25,16 @@ const sidebarTheme = {
 
 describe("bashToolRenderer", () => {
 	const originalProtocol = TERMINAL.imageProtocol;
+	let originalKeybindings: ReturnType<typeof getKeybindings>;
+
+	beforeEach(() => {
+		originalKeybindings = getKeybindings();
+		setKeybindings(KeybindingsManager.inMemory());
+	});
 
 	afterEach(() => {
 		terminal.imageProtocol = originalProtocol;
+		setKeybindings(originalKeybindings);
 	});
 
 	it("shows rendered env assignments in the command preview", async () => {
@@ -75,6 +84,120 @@ describe("bashToolRenderer", () => {
 		expect(rendered).toContain("~/projects/demo");
 		expect(rendered).not.toContain(os.homedir());
 		expect(rendered).not.toContain("\t");
+	});
+
+	it("bounds pending commands to five visual rows and expands inline", async () => {
+		const uiTheme = await getThemeByName("red-claw");
+		expect(uiTheme).toBeDefined();
+		const options = {
+			expanded: false,
+			isPartial: true,
+			renderContext: { expanded: false },
+		};
+		const command = Array.from({ length: 12 }, (_, index) => `echo line-${index}`).join("\n");
+		const component = bashToolRenderer.renderCall({ command }, options, uiTheme!);
+
+		const collapsed = component.render(40).map(line => sanitizeText(line));
+		expect(collapsed).toContainEqual(expect.stringContaining("line-0"));
+		expect(collapsed).toContainEqual(expect.stringContaining("line-4"));
+		expect(collapsed).not.toContainEqual(expect.stringContaining("line-5"));
+		expect(collapsed).toContainEqual(expect.stringContaining("7 command rows omitted"));
+		expect(collapsed).toContainEqual(expect.stringContaining("ctrl+o to expand"));
+		expect(collapsed.length).toBeLessThanOrEqual(1 + 5 + 3);
+		for (const line of component.render(40)) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+		}
+
+		options.renderContext.expanded = true;
+		const expanded = component.render(40).map(line => sanitizeText(line));
+		expect(expanded).toContainEqual(expect.stringContaining("line-11"));
+		expect(expanded).not.toContainEqual(expect.stringContaining("command rows omitted"));
+	});
+
+	it("bounds completed commands at the output block content width", async () => {
+		const uiTheme = await getThemeByName("red-claw");
+		expect(uiTheme).toBeDefined();
+		const command = Array.from({ length: 12 }, (_, index) => `echo line-${index}`).join("\n");
+		const component = bashToolRenderer.renderResult(
+			{
+				content: [
+					{
+						type: "text",
+						text: Array.from({ length: 12 }, (_, index) => `output-${index}`).join("\n"),
+					},
+				],
+				details: {},
+				isError: false,
+			},
+			{ expanded: false, isPartial: false },
+			uiTheme!,
+			{ command },
+		);
+
+		const rendered = component.render(20);
+		const sanitized = rendered.map(line => sanitizeText(line));
+		expect(sanitized).toContainEqual(expect.stringContaining("line-0"));
+		expect(sanitized).not.toContainEqual(expect.stringContaining("line-5"));
+		expect(sanitized).toContainEqual(expect.stringContaining("command rows"));
+		expect(sanitized).toContainEqual(expect.stringContaining("omitted"));
+		expect(sanitized).toContainEqual(expect.stringContaining("ctrl+o to expand"));
+		for (const line of rendered) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(20);
+		}
+
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "ctrl+x" }));
+		const remapped = component
+			.render(80)
+			.map(line => sanitizeText(line))
+			.join("\n");
+		expect(remapped).not.toContain("ctrl+o to expand");
+		expect(remapped.match(/ctrl\+x to expand/g)).toHaveLength(2);
+
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "ctrl+shift+alt+x" }));
+		const fallback = component.render(20).map(line => sanitizeText(line));
+		expect(fallback).toContainEqual(expect.stringContaining("expand tools"));
+		expect(fallback).not.toContainEqual(expect.stringContaining("ctrl+shift+alt+x"));
+	});
+
+	it("updates the collapsed hint when the expand binding changes", async () => {
+		const uiTheme = await getThemeByName("red-claw");
+		expect(uiTheme).toBeDefined();
+		const command = Array.from({ length: 8 }, (_, index) => `echo line-${index}`).join("\n");
+		const component = bashToolRenderer.renderCall({ command }, { expanded: false, isPartial: true }, uiTheme!);
+
+		expect(sanitizeText(component.render(40).join("\n"))).toContain("ctrl+o to expand");
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "ctrl+x" }));
+		const remapped = sanitizeText(component.render(40).join("\n"));
+		expect(remapped).toContain("ctrl+x to expand");
+		expect(remapped).not.toContain("ctrl+o to expand");
+
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": [] }));
+		const unbound = sanitizeText(component.render(40).join("\n"));
+		expect(unbound).toContain("expand tools");
+		expect(unbound).not.toContain("ctrl+x to expand");
+	});
+
+	it("keeps the omission sentinel bounded at narrow widths", async () => {
+		const uiTheme = await getThemeByName("red-claw");
+		expect(uiTheme).toBeDefined();
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "ctrl+shift+alt+x" }));
+		const command = Array.from({ length: 12 }, (_, index) => `echo line-${index}`).join("\n");
+		const component = bashToolRenderer.renderCall({ command }, { expanded: false, isPartial: true }, uiTheme!);
+
+		for (const width of [1, 16]) {
+			const commandAndSentinel = component.render(width).slice(1);
+			expect(commandAndSentinel.length).toBeLessThanOrEqual(5 + 3);
+			for (const line of commandAndSentinel) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+		}
+	});
+
+	it("exposes the output block's actual section width", async () => {
+		const uiTheme = await getThemeByName("red-claw");
+		expect(uiTheme).toBeDefined();
+		expect(getOutputBlockContentWidth(0, uiTheme!)).toBe(0);
+		expect(getOutputBlockContentWidth(20, uiTheme!)).toBe(17);
 	});
 
 	it("shows the effective timeout from result details when it differs from call args", async () => {

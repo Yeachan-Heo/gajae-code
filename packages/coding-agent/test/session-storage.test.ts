@@ -502,6 +502,24 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	});
 });
 
+describe("managed descriptor reads", () => {
+	it("returns transcript identity without exposing file bytes", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
+		try {
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			const bytes = Buffer.from("descriptor payload\n");
+			store.publishNoReplaceSync("session.jsonl", bytes);
+			const descriptor = store.descriptorExpected("session.jsonl");
+			expect(descriptor).toMatchObject({ size: bytes.byteLength, isFile: true });
+			expect(descriptor?.dev).toBeTypeOf("bigint");
+			expect(descriptor?.ino).toBeTypeOf("bigint");
+			expect(store.descriptorExpected("missing.jsonl")).toBeNull();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
 	it("atomically replaces an existing file through the Darwin path", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-")));

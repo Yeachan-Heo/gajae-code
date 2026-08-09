@@ -59,6 +59,25 @@ const DEFAULT_GLOB_TIMEOUT_MS = 5000;
 const MIN_GLOB_TIMEOUT_MS = 500;
 const MAX_GLOB_TIMEOUT_MS = 60_000;
 
+function comparePaths(left: string, right: string): number {
+	let leftIndex = 0;
+	let rightIndex = 0;
+	while (leftIndex < left.length && rightIndex < right.length) {
+		const leftCodePoint = left.codePointAt(leftIndex);
+		const rightCodePoint = right.codePointAt(rightIndex);
+		if (leftCodePoint === undefined || rightCodePoint === undefined) break;
+		if (leftCodePoint !== rightCodePoint) return leftCodePoint - rightCodePoint;
+		leftIndex += leftCodePoint > 0xffff ? 2 : 1;
+		rightIndex += rightCodePoint > 0xffff ? 2 : 1;
+	}
+	return left.length - right.length;
+}
+
+function compareMtimePath(left: { path: string; mtime?: number }, right: { path: string; mtime?: number }): number {
+	const mtimeOrder = (right.mtime ?? 0) - (left.mtime ?? 0);
+	return mtimeOrder || comparePaths(left.path, right.path);
+}
+
 /**
  * Reject comma-separated path lists packed into a single array element
  * (`["a.py,b.py"]`). The schema is array-of-string; agents that pass a
@@ -317,29 +336,43 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			}
 
 			let matches: natives.GlobMatch[];
-			const onUpdateMatches: string[] = [];
+			const onUpdateMatches = new Map<string, number>();
+			const rankedUpdateMatches = (): Array<{ path: string; mtime: number }> =>
+				Array.from(onUpdateMatches, ([matchPath, mtime]) => ({ path: matchPath, mtime })).sort(compareMtimePath);
+			const retainUpdateMatch = (matchPath: string, mtime: number) => {
+				onUpdateMatches.set(matchPath, mtime);
+				if (onUpdateMatches.size <= effectiveLimit) return;
+				let worst: { path: string; mtime: number } | undefined;
+				for (const [candidatePath, candidateMtime] of onUpdateMatches) {
+					const candidate = { path: candidatePath, mtime: candidateMtime };
+					if (!worst || compareMtimePath(candidate, worst) > 0) worst = candidate;
+				}
+				if (worst) onUpdateMatches.delete(worst.path);
+			};
 			const updateIntervalMs = 200;
 			let lastUpdate = 0;
+			let terminal = false;
 			const emitUpdate = () => {
 				if (!onUpdate) return;
 				const now = Date.now();
 				if (now - lastUpdate < updateIntervalMs) return;
 				lastUpdate = now;
+				const ranked = rankedUpdateMatches().map(entry => entry.path);
 				const details: FindToolDetails = {
 					scopePath,
-					fileCount: onUpdateMatches.length,
-					files: onUpdateMatches.slice(),
+					fileCount: ranked.length,
+					files: ranked,
 					truncated: false,
 				};
 				onUpdate({
-					content: [{ type: "text", text: onUpdateMatches.join("\n") }],
+					content: [{ type: "text", text: ranked.join("\n") }],
 					details,
 				});
 			};
 			const onMatch = (err: Error | null, match: natives.GlobMatch | null) => {
-				if (err || signal?.aborted || !match?.path) return;
+				if (err || terminal || combinedSignal.aborted || !match?.path) return;
 				const relativePath = formatMatchPath(match.path, match.fileType);
-				onUpdateMatches.push(relativePath);
+				retainUpdateMatch(relativePath, match.mtime ?? 0);
 				emitUpdate();
 			};
 
@@ -355,6 +388,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 							sortByMtime: true,
 							gitignore: useGitignore,
 							signal: combinedSignal,
+							timeoutMs,
 						},
 						onMatch,
 					),
@@ -363,34 +397,29 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			let timedOut = false;
 			try {
 				const result = await doGlob(useGitignore);
-				// Sort by mtime descending (most recent first) in JS instead of native.
-				// This allows native glob to early-terminate at maxResults.
-				result.matches.sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
+				// Native uncached glob retains a bounded newest set; keep the same tie-break after callback delivery.
+				result.matches.sort(compareMtimePath);
 				matches = result.matches;
 			} catch (error) {
-				if (error instanceof Error && error.name === "AbortError") {
-					if (timeoutSignal.aborted && !signal?.aborted) {
-						timedOut = true;
-						matches = [];
-					} else {
-						throw new ToolAbortError();
-					}
+				const nativeTimedOut = error instanceof Error && error.message === "Aborted: Timeout";
+				if (
+					(error instanceof Error && error.name === "AbortError" && timeoutSignal.aborted && !signal?.aborted) ||
+					(nativeTimedOut && !signal?.aborted)
+				) {
+					timedOut = true;
+					matches = [];
+				} else if (error instanceof Error && error.name === "AbortError") {
+					throw new ToolAbortError();
 				} else {
 					throw error;
 				}
+			} finally {
+				terminal = true;
 			}
 
 			if (timedOut) {
-				// Drain the partial matches accumulated during streaming and return them
-				// instead of throwing — empty results after a multi-second wait force the
-				// caller to retry blind, which is the worst possible outcome.
-				const seen = new Set<string>();
-				const partial: string[] = [];
-				for (const entry of onUpdateMatches) {
-					if (seen.has(entry)) continue;
-					seen.add(entry);
-					partial.push(entry);
-				}
+				// Return the bounded, deterministically ranked candidates observed before timeout.
+				const partial = rankedUpdateMatches().map(entry => entry.path);
 				const seconds = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}` : (timeoutMs / 1000).toFixed(1);
 				const notice = `find timed out after ${seconds}s; returning ${partial.length} partial matches — increase timeout or narrow pattern`;
 				return buildResult(partial, { notice, forceTruncated: true });

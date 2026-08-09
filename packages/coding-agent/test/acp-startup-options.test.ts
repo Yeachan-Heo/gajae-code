@@ -500,6 +500,28 @@ test("ACP fails closed for local-only startup flags while translating model and 
 		"--model could not be resolved to a canonical model ID",
 	);
 });
+
+test("ACP rejects unknown flags instead of silently ignoring them", () => {
+	const parsed = parseArgs(["--mpreset", "codex-medium", "--mpresett"]);
+	expect(parsed.unknownFlags).toEqual(new Map([["--mpresett", true]]));
+	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: extension flags");
+});
+
+test("ACP option values cannot consume dash-prefixed unknown flags", () => {
+	for (const args of [
+		["--mpreset", "--mystery"],
+		["--mpreset=--mystery"],
+		["--tools", "--mystery"],
+		["--model", "--mystery"],
+	]) {
+		expect(() => parseArgs(args)).toThrow(/requires a value/);
+	}
+});
+
+test("inline opaque prompt values may start with a dash", () => {
+	expect(parseArgs(["--system-prompt=-literal"]).systemPrompt).toBe("-literal");
+	expect(parseArgs(["--append-system-prompt=-literal"]).appendSystemPrompt).toBe("-literal");
+});
 test("ACP rejects --mcp-config instead of ignoring it", () => {
 	const parsed = parseArgs(["--mcp-config", "/tmp/gjc-mcp.json"]);
 	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: --mcp-config");

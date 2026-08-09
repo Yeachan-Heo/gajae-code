@@ -220,6 +220,31 @@ describe("ConversationStore", () => {
 		expect(bounded.at(-1)).toBe(`event-${MAX_DEDUPE_IDS + 1}`);
 	});
 
+	test("opens staged documents writable before fsync for Windows compatibility", async () => {
+		class WindowsFsyncFs extends MemoryConversationStoreFs {
+			temporaryOpenFlags: string | undefined;
+
+			override async open(file: string, flags: string) {
+				const handle = await super.open(file, flags);
+				if (!file.endsWith(".tmp")) return handle;
+				this.temporaryOpenFlags = flags;
+				return {
+					...handle,
+					sync: async () => {
+						if (!flags.includes("+")) {
+							throw Object.assign(new Error("EPERM: operation not permitted, fsync"), { code: "EPERM" });
+						}
+						await handle.sync();
+					},
+				};
+			}
+		}
+
+		const fs = new WindowsFsyncFs();
+		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs, now: () => 4 });
+		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
+		expect(fs.temporaryOpenFlags).toBe("r+");
+	});
 	test("keeps the prior document intact when fsync or rename fails", async () => {
 		const fs = new MemoryConversationStoreFs();
 		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs, now: () => 4 });

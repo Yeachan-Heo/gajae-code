@@ -44,12 +44,43 @@ export async function* readLines(stream: ReadableStream<Uint8Array>, signal?: Ab
 	}
 }
 
-export async function* readJsonl<T>(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncGenerator<T> {
+export type JsonlLineObserver = (raw: string) => void;
+
+function notifyJsonlLineObserver(observer: JsonlLineObserver | undefined, raw: string): void {
+	if (!observer) return;
+	try {
+		observer(raw);
+	} catch {
+		// Diagnostic observers must never perturb provider stream consumption.
+	}
+}
+
+export async function* readJsonl<T>(
+	stream: ReadableStream<Uint8Array>,
+	signal?: AbortSignal,
+	onLine?: JsonlLineObserver,
+): AsyncGenerator<T> {
 	const buffer = new ConcatSink();
+	const rawLineState = onLine
+		? {
+				buffer: new ConcatSink(),
+				decoder: new TextDecoder(),
+			}
+		: undefined;
 	const source = createAbortableStream(stream, signal);
 	try {
 		for await (const chunk of source) {
+			if (rawLineState) {
+				for (const line of rawLineState.buffer.appendAndFlushLines(chunk)) {
+					notifyJsonlLineObserver(onLine, rawLineState.decoder.decode(line));
+				}
+			}
 			yield* buffer.pullJSONL<T>(chunk, 0, chunk.length);
+		}
+		if (rawLineState && !rawLineState.buffer.isEmpty) {
+			const rawTail = rawLineState.buffer.flush();
+			if (rawTail) notifyJsonlLineObserver(onLine, rawLineState.decoder.decode(rawTail));
+			rawLineState.buffer.clear();
 		}
 		if (!buffer.isEmpty) {
 			const tail = buffer.flush();

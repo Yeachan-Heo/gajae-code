@@ -7,7 +7,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { localBackend } from "@gajae-code/coding-agent/memory-backend/local-backend";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { SessionContextTooLargeError, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
 const createdDirs = new Set<string>();
 
@@ -65,5 +65,36 @@ describe("createAgentSession memory startup", () => {
 		} finally {
 			await session.dispose();
 		}
+	}, 30_000);
+
+	test("propagates typed session-context overflow during SDK startup", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-context-overflow-"));
+		createdDirs.add(cwd);
+		const modelRegistry = new ModelRegistry(authStorage);
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({
+			role: "user",
+			content: "x".repeat(34 * 1024 * 1024),
+			timestamp: Date.now(),
+		});
+
+		await expect(
+			createAgentSession({
+				cwd,
+				agentDir: cwd,
+				authStorage,
+				modelRegistry,
+				sessionManager,
+				settings: Settings.isolated(),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				toolNames: [],
+			}),
+		).rejects.toBeInstanceOf(SessionContextTooLargeError);
 	}, 30_000);
 });

@@ -2079,6 +2079,20 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Bounded-memory cold-session offloading (rollout knobs; budgets are fixed
+	// implementation constants in the sidecar primitives, not user-tunable
+	// fields). "shadow" (default) measures and offloads without changing
+	// observable behavior; canary/default-on are release-channel states, not
+	// user-facing enum values.
+	"sessionMemory.mode": {
+		type: "enum",
+		values: ["off", "shadow", "enabled"] as const,
+		default: "shadow",
+	},
+	// Independent runtime switch for AgentSession's async compact-once overflow
+	// recovery. The synchronous bounded context preflight stays always on.
+	"sessionMemory.contextOverflowRecovery": { type: "boolean", default: true },
+
 	// ────────────────────────────────────────────────────────────────────────
 	// Editing
 	// ────────────────────────────────────────────────────────────────────────
@@ -2809,6 +2823,29 @@ export const SETTINGS_SCHEMA = {
 			label: "Browser Tab GC RSS Limit (MB)",
 			description: "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
 		},
+	},
+	// `gjc gc --disk` retention policy. Report-only unless `--prune` is also passed;
+	// these knobs never run implicitly and never affect the PID-liveness axis.
+	"gc.sessions.maxAgeDays": {
+		type: "number",
+		default: 60,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	// 0 disables the size axis; only the age axis retires transcripts then.
+	"gc.sessions.maxTotalBytes": {
+		type: "number",
+		default: 0,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"gc.natives.keepVersions": {
+		type: "number",
+		default: 2,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
+	},
+	"gc.backups.maxAgeDays": {
+		type: "number",
+		default: 30,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
 	},
 	"resourceGc.sweepIntervalMs": {
 		type: "number",
@@ -4136,6 +4173,11 @@ export interface ShellMinimizerSettings {
 	maxCaptureBytes: number;
 }
 
+export interface SessionMemorySettings {
+	mode: "off" | "shadow" | "enabled";
+	contextOverflowRecovery: boolean;
+}
+
 export interface MemoryGuardSettings {
 	enabled: boolean;
 	checkIntervalMs: number;
@@ -4211,6 +4253,7 @@ export interface GroupTypeMap {
 	thinkingBudgets: ThinkingBudgetsSettings;
 	stt: SttSettings;
 	memoryGuard: MemoryGuardSettings;
+	sessionMemory: SessionMemorySettings;
 	modelRoles: Record<string, ModelSelectorValue>;
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];

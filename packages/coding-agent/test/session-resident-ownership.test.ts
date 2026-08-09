@@ -4,7 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage, UserMessage } from "@gajae-code/ai";
 import { exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
-import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	SessionManager,
+	SessionManagerTestHooks,
+	type SessionMessageEntry,
+} from "@gajae-code/coding-agent/session/session-manager";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -129,6 +133,28 @@ describe("resident cache public ownership and revision invalidation", () => {
 		await sm.close();
 	});
 
+	it("transfers an oversized cache snapshot without retaining a second public graph", async () => {
+		const sm = SessionManager.inMemory();
+		const canonical = `large-owner-${"x".repeat(2 * 1024 * 1024)}`;
+		SessionManagerTestHooks.materializedCacheMaxBytesOverride = 1024 * 1024;
+		try {
+			sm.appendMessage({ role: "user", content: canonical, timestamp: Date.now() });
+
+			const first = sm.buildSessionContext();
+			expect(sm.getObservabilityStatsForTests().materializedCacheDemotedCount).toBeGreaterThan(0);
+			const firstUser = first.messages[0];
+			if (firstUser?.role !== "user") throw new Error("Expected large user message");
+			firstUser.content = "mutated large snapshot";
+
+			const second = sm.buildSessionContext();
+			const secondUser = second.messages[0];
+			if (secondUser?.role !== "user") throw new Error("Expected rebuilt large user message");
+			expect(secondUser.content).toBe(canonical);
+		} finally {
+			SessionManagerTestHooks.materializedCacheMaxBytesOverride = undefined;
+			await sm.close();
+		}
+	});
 	it("invalidates materialized reads after append, prune updates, branch moves, and header title changes", async () => {
 		const { sm } = await createSession();
 		const before = sm.getEntries();

@@ -431,8 +431,8 @@ import type {
 	RecoveryHydrationPromotionFence,
 	SessionContext,
 	SessionEntry,
-	SessionManager,
 	SessionManagerCloseOutcome,
+	SessionMemoryStats,
 } from "./session-manager";
 
 import {
@@ -441,6 +441,8 @@ import {
 	getSessionMessageEntryId,
 	getSessionMessageObservationId,
 	SessionAppendPersistenceError,
+	SessionContextTooLargeError,
+	SessionManager,
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
@@ -744,6 +746,17 @@ type AutoCompactionTerminalStatus =
 	| { kind: "skipped"; continuationScheduled?: boolean }
 	| { kind: "failed" };
 
+/**
+ * R3.2 pre-submit seam: `build` assembles the attempt messages (Phase A once,
+ * Phase B per attempt) and may throw the typed overflow error; `reset` drops the
+ * cached Phase B attempt messages so the next `build` rebuilds them (used after a
+ * forced compaction retry).
+ */
+type PreSubmitBuilder = {
+	build: () => Promise<AgentMessage[]>;
+	reset: () => void;
+};
+
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
 	/** Whether to expand file-based prompt templates (default: true) */
@@ -904,6 +917,7 @@ export interface SessionStats {
 	premiumRequests: number;
 	cost: number;
 	costBreakdown?: Usage["cost"];
+	sessionMemory: SessionMemoryStats;
 }
 
 /** Internal marker for hook messages queued through the agent loop */
@@ -1798,7 +1812,7 @@ function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretOb
 
 export class AgentSession {
 	readonly agent: Agent;
-	readonly sessionManager: SessionManager;
+	sessionManager: SessionManager;
 	readonly settings: Settings;
 	readonly memoryBackend: LazyService<MemoryBackend>;
 	readonly notificationSessionController: NotificationSessionController | undefined;
@@ -2015,7 +2029,7 @@ export class AgentSession {
 
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
-	#pendingBashMessages: BashExecutionMessage[] = [];
+	#pendingBashMessages: Array<{ message: BashExecutionMessage; onPersisted?: () => void }> = [];
 	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
 
 	// Python execution state
@@ -2024,6 +2038,7 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#unregisterSessionMemorySettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -2031,7 +2046,7 @@ export class AgentSession {
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	readonly #ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
-	#pendingPythonMessages: PythonExecutionMessage[] = [];
+	#pendingPythonMessages: Array<{ message: PythonExecutionMessage; onPersisted?: () => void }> = [];
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
 
@@ -2670,6 +2685,12 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
+		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
+			if (settingPath === "sessionMemory.mode") {
+				this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
+			}
+		});
 		this.memoryBackend = config.memoryBackend ?? createMemoryBackendService(this.settings);
 		this.#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(
 			config.workerIntegrationRequest ??
@@ -6256,6 +6277,8 @@ export class AgentSession {
 		// No-op when this session opened no tabs. Failure is logged, not thrown.
 		this.#unregisterResourceGc?.();
 		this.#unregisterResourceGc = undefined;
+		this.#unregisterSessionMemorySettings?.();
+		this.#unregisterSessionMemorySettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
@@ -6320,6 +6343,8 @@ export class AgentSession {
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		this.#unregisterResourceGc?.();
 		this.#unregisterResourceGc = undefined;
+		this.#unregisterSessionMemorySettings?.();
+		this.#unregisterSessionMemorySettings = undefined;
 		this.#unregisterTeamWorkerAsyncJobChange?.();
 		this.#unregisterTeamWorkerAsyncJobChange = undefined;
 		this.#teamWorkerHeartbeat?.dispose();
@@ -8837,160 +8862,198 @@ export class AgentSession {
 				]);
 			}
 
-			// Build messages array (session context, eager todo prelude, then active prompt message)
-			const messages: AgentMessage[] = [];
-			const planReferenceMessage = await this.#buildPlanReferenceMessage?.();
-			if (planReferenceMessage) {
-				messages.push(planReferenceMessage);
-			}
-			const planModeMessage = await this.#buildAutomaticPlanModeMessage();
-			if (planModeMessage) {
-				messages.push(planModeMessage);
-			}
-			const goalModeMessage = this.#buildAutomaticGoalModeMessage();
-			if (goalModeMessage) {
-				messages.push(goalModeMessage);
-			}
-			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
-			messages.push(volatileProjectContextMessage);
-			const untrustedMcpServerInstructionsMessage = this.#buildUntrustedMcpServerInstructionsMessage();
-			if (untrustedMcpServerInstructionsMessage) messages.push(untrustedMcpServerInstructionsMessage);
-
-			if (rosterClaim && this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch)) {
-				messages.push(rosterClaim.message);
-			} else if (rosterClaim) {
-				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
-			}
-			if (options?.prependMessages) {
-				messages.push(...options.prependMessages);
-			}
-
-			messages.push(message);
-
-			// Early bail-out: a generation change or cancellation during setup must
-			// terminate preflight rather than retaining SDK prompt authority.
-			if (this.#isPromptPreflightCancelled(generation, preflightSignal)) {
-				this.#resetInjectedContextSignatures();
-				// A newer abort/prompt cycle superseded this preflight. Callers awaiting
-				// acceptance (onPreflightAccepted) must be told it never ran; direct
-				// callers (e.g. prompt() aborted during a TTSR wait) resolve gracefully.
-				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
-				return;
-			}
-
-			// Inject any pending "nextTurn" messages as context alongside the user message
+			// R3.2: one-time Phase A products are captured inside the closure and
+			// executed once after admission acceptance; Phase B reassembles the
+			// attempt messages after every idle wait / compact retry. Pending
+			// next-turn messages are captured WITHOUT draining — the drain moves to
+			// the run-accepted wrapper (R3.3) so AgentBusy/idle/compact-before-
+			// acceptance never consume them.
 			pendingNextTurnMessageCount = this.#pendingNextTurnMessages.length;
 			hasPendingNextTurnMessages = pendingNextTurnMessageCount > 0;
-			for (const msg of this.#pendingNextTurnMessages.slice(0, pendingNextTurnMessageCount)) {
-				messages.push(msg);
-			}
-
-			// Auto-read @filepath mentions
-			const fileMentions = extractFileMentions(expandedText);
-			if (fileMentions.length > 0) {
-				const cwd = this.sessionManager.getCwd();
-				// Collect resolved paths already shown (read or mentioned) in the recent
-				// window so a repeat @mention emits a compact note instead of the full body.
-				const RECENT_MENTION_WINDOW = 40;
-				const recentlyShownPaths = new Set<string>();
-				for (const entry of this.sessionManager.getBranch().slice(-RECENT_MENTION_WINDOW)) {
-					if (entry.type !== "message") continue;
-					const msg = entry.message;
-					if (msg.role === "fileMention") {
-						for (const file of msg.files) {
-							if (!file.duplicate && !file.pruned) recentlyShownPaths.add(resolveReadPath(file.path, cwd));
-						}
-					} else if (msg.role === "toolResult") {
-						const resolved = (msg.details as { resolvedPath?: unknown } | undefined)?.resolvedPath;
-						if (typeof resolved === "string" && resolved) recentlyShownPaths.add(resolveReadPath(resolved, cwd));
-					}
-				}
-				const fileMentionMessages = await generateFileMentionMessages(fileMentions, cwd, {
-					autoResizeImages: this.settings.get("images.autoResize"),
-					useHashLines: resolveFileDisplayMode(this).hashLines,
-					maxInlineBytes: this.settings.get("tools.fileMentionInlineBytes") * 1024,
-					recentlyShownPaths,
-				});
-				messages.push(...fileMentionMessages);
-			}
-
-			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
-			hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
-			if (hindsightRecall) {
-				// Recall is provider-only context for this request. It must precede the
-				// actual prompt but never become part of durable session history.
-				const promptIndex = messages.lastIndexOf(message);
-				messages.splice(promptIndex, 0, {
-					role: "custom",
-					customType: "hindsight-recall",
-					content: hindsightRecall,
-					display: false,
-					attribution: "agent",
-					timestamp: Date.now(),
-				});
-			}
-
 			const promptAttribution: "user" | "agent" | undefined =
 				"attribution" in message ? message.attribution : undefined;
+			let phaseACompleted = false;
+			let fileMentionMessages: AgentMessage[] = [];
+			let beforeAgentStartResultMessages: BeforeAgentStartInternalMessage[] = [];
+			const contributedMessages: BeforeAgentStartInternalMessage[] = [];
+			let recallMarked = false;
+			let planReferenceMessage: CustomMessage | null = null;
+			// Phase B attempt cache. AgentBusy/idle and forced-compaction retries clear
+			// this cache so live plan/goal/volatile/MCP overlays are rebuilt. One-shot
+			// Phase A products (including the plan reference) remain stable.
+			let attemptMessages: AgentMessage[] | undefined;
 
-			// Emit before_agent_start extension event. Race hook completion with prompt
-			// cancellation so a wedged hook cannot retain SDK prompt authority.
-			if (this.#extensionRunner?.hasHandlers("before_agent_start")) this.#markRetryReplayUnsafe();
-
-			if (this.#extensionRunner) {
-				const result = await this.#awaitPromptPreflight(
-					generation,
-					preflightSignal,
-					this.#extensionRunner.emitBeforeAgentStart(expandedText, options?.images, beforeAgentStartSystemPrompt),
-				);
-				if (result?.messages) {
-					this.#appendBeforeAgentStartCustomMessages(messages, result.messages, promptAttribution, message.role);
-				}
-
-				if (result?.systemPrompt !== undefined) {
-					this.agent.setSystemPrompt(result.systemPrompt);
-				} else {
-					this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
-				}
-			} else {
-				this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
-			}
-
-			// Invoke first-party internal before-agent-start contributors. These run
-			// alongside the extension runner (not via user-loaded hooks) and append
-			// through the same custom-message attribution path. Errors are nonfatal.
-			if (this.#beforeAgentStartContributors.length > 0) {
-				const contributed: BeforeAgentStartInternalMessage[] = [];
-				for (const contributor of this.#beforeAgentStartContributors) {
-					try {
-						const msg = await this.#awaitPromptPreflight(
+			const buildPreSubmit = async (): Promise<AgentMessage[]> => {
+				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+				if (!phaseACompleted) {
+					phaseACompleted = true;
+					// Phase A (one-time side-effectful products; runs once).
+					const fileMentions = extractFileMentions(expandedText);
+					if (fileMentions.length > 0) {
+						const cwd = this.sessionManager.getCwd();
+						// Collect resolved paths already shown (read or mentioned) in the
+						// recent window so a repeat @mention emits a compact note instead
+						// of the full body.
+						const RECENT_MENTION_WINDOW = 40;
+						const recentlyShownPaths = new Set<string>();
+						for (const entry of this.sessionManager.getBranch().slice(-RECENT_MENTION_WINDOW)) {
+							if (entry.type !== "message") continue;
+							const msg = entry.message;
+							if (msg.role === "fileMention") {
+								for (const file of msg.files) {
+									if (!file.duplicate && !file.pruned) recentlyShownPaths.add(resolveReadPath(file.path, cwd));
+								}
+							} else if (msg.role === "toolResult") {
+								const resolved = (msg.details as { resolvedPath?: unknown } | undefined)?.resolvedPath;
+								if (typeof resolved === "string" && resolved)
+									recentlyShownPaths.add(resolveReadPath(resolved, cwd));
+							}
+						}
+						fileMentionMessages = await generateFileMentionMessages(fileMentions, cwd, {
+							autoResizeImages: this.settings.get("images.autoResize"),
+							useHashLines: resolveFileDisplayMode(this).hashLines,
+							maxInlineBytes: this.settings.get("tools.fileMentionInlineBytes") * 1024,
+							recentlyShownPaths,
+						});
+					}
+					const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
+					hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
+					planReferenceMessage = await this.#buildPlanReferenceMessage();
+					// Emit before_agent_start extension event. Race hook completion with
+					// prompt cancellation so a wedged hook cannot retain SDK prompt authority.
+					if (this.#extensionRunner?.hasHandlers("before_agent_start")) this.#markRetryReplayUnsafe();
+					if (this.#extensionRunner) {
+						const result = await this.#awaitPromptPreflight(
 							generation,
 							preflightSignal,
-							contributor({
-								prompt: expandedText,
-								images: options?.images,
-								sessionId: this.sessionId,
-							}),
+							this.#extensionRunner.emitBeforeAgentStart(
+								expandedText,
+								options?.images,
+								beforeAgentStartSystemPrompt,
+							),
 						);
-						if (msg) contributed.push(msg);
-					} catch (err) {
-						if (this.#isPromptPreflightCancelled(generation, preflightSignal))
-							throw promptPreflightCancelledError();
-						logger.debug("before_agent_start contributor failed", { error: String(err) });
+						if (result?.messages) beforeAgentStartResultMessages = [...result.messages];
+						if (result?.systemPrompt !== undefined) {
+							this.agent.setSystemPrompt(result.systemPrompt);
+						} else {
+							this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+						}
+					} else {
+						this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
 					}
+					// Invoke first-party internal before-agent-start contributors. These
+					// run alongside the extension runner (not via user-loaded hooks) and
+					// append through the same custom-message attribution path. Errors are nonfatal.
+					if (this.#beforeAgentStartContributors.length > 0) {
+						for (const contributor of this.#beforeAgentStartContributors) {
+							try {
+								const msg = await this.#awaitPromptPreflight(
+									generation,
+									preflightSignal,
+									contributor({
+										prompt: expandedText,
+										images: options?.images,
+										sessionId: this.sessionId,
+									}),
+								);
+								if (msg) contributedMessages.push(msg);
+							} catch (err) {
+								if (this.#isPromptPreflightCancelled(generation, preflightSignal))
+									throw promptPreflightCancelledError();
+								logger.debug("before_agent_start contributor failed", { error: String(err) });
+							}
+						}
+					}
+					this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 				}
-				this.#appendBeforeAgentStartCustomMessages(messages, contributed, promptAttribution, message.role);
-			}
 
-			// Abort can race asynchronous preflight work. The injection signatures were
-			// consumed while building context, but no prompt was accepted, so reset them.
-			if (this.#isPromptPreflightCancelled(generation, preflightSignal)) {
-				this.#resetInjectedContextSignatures();
-				// Ack-waiting callers are told the preflight never ran; direct callers
-				// (aborted after setup) resolve gracefully as before f24f46ff5.
-				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
-				return;
-			}
+				// Phase B (attempt-dependent; re-runs after every idle wait / compact retry).
+				// R3.2 overflow preflight: materialize the session context synchronously so
+				// an over-budget graph throws SessionContextTooLargeError before any prompt.
+				this.sessionManager.buildSessionContext();
+				if (attemptMessages) {
+					// Idle/AgentBusy retry: reuse the previously assembled attempt
+					// messages; a superseded roster claim releases and the prompt
+					// proceeds without it, matching the pre-seam reuse behavior.
+					if (rosterClaim && !this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch)) {
+						this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
+					}
+					return attemptMessages;
+				}
+				const messages: AgentMessage[] = [];
+				const currentPlanReferenceMessage = planReferenceMessage;
+				if (currentPlanReferenceMessage) {
+					messages.push(currentPlanReferenceMessage);
+				}
+				const planModeMessage = await this.#buildAutomaticPlanModeMessage();
+				if (planModeMessage) {
+					messages.push(planModeMessage);
+				}
+				const goalModeMessage = this.#buildAutomaticGoalModeMessage();
+				if (goalModeMessage) {
+					messages.push(goalModeMessage);
+				}
+				const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
+				messages.push(volatileProjectContextMessage);
+				const untrustedMcpServerInstructionsMessage = this.#buildUntrustedMcpServerInstructionsMessage();
+				if (untrustedMcpServerInstructionsMessage) messages.push(untrustedMcpServerInstructionsMessage);
+
+				// Roster: one Phase A claim, revalidated and reused on every attempt;
+				// a superseded claim releases and the prompt proceeds without it.
+				if (rosterClaim && this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch)) {
+					messages.push(rosterClaim.message);
+				} else if (rosterClaim) {
+					this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
+				}
+				if (options?.prependMessages) {
+					messages.push(...options.prependMessages);
+				}
+
+				const promptIndex = messages.length;
+				messages.push(message);
+
+				// Re-present captured pending next-turn messages (never drained here).
+				for (const msg of this.#pendingNextTurnMessages.slice(0, pendingNextTurnMessageCount)) {
+					messages.push(msg);
+				}
+				messages.push(...fileMentionMessages);
+				if (hindsightRecall) {
+					// Recall is provider-only context for this request. It must precede
+					// the actual prompt but never become part of durable session history.
+					messages.splice(promptIndex, 0, {
+						role: "custom",
+						customType: "hindsight-recall",
+						content: hindsightRecall,
+						display: false,
+						attribution: "agent",
+						timestamp: Date.now(),
+					});
+				}
+				if (beforeAgentStartResultMessages.length > 0) {
+					this.#appendBeforeAgentStartCustomMessages(
+						messages,
+						beforeAgentStartResultMessages,
+						promptAttribution,
+						message.role,
+					);
+				}
+				if (contributedMessages.length > 0) {
+					this.#appendBeforeAgentStartCustomMessages(
+						messages,
+						contributedMessages,
+						promptAttribution,
+						message.role,
+					);
+				}
+				attemptMessages = messages;
+				return messages;
+			};
+			const preSubmit: PreSubmitBuilder = {
+				build: buildPreSubmit,
+				reset: () => {
+					attemptMessages = undefined;
+				},
+			};
 
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
@@ -8999,7 +9062,16 @@ export class AgentSession {
 					this.#acceptRunHandle(handle);
 					options?.onRunAccepted?.(handle);
 					options?.admissionLease?.release();
-					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
+					// R3.3: the accepted-run wrapper is the exact acceptance boundary —
+					// pending next-turn drain and the exactly-once recall mark live here.
+					if (hindsightRecall && !recallMarked) {
+						recallMarked = true;
+						this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
+					}
+					if (pendingNextTurnMessageCount > 0) {
+						this.#pendingNextTurnMessages.splice(0, pendingNextTurnMessageCount);
+					}
+					if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
 				},
 			};
 			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
@@ -9009,11 +9081,10 @@ export class AgentSession {
 				return;
 			}
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
-			if (pendingNextTurnMessageCount > 0) {
-				this.#pendingNextTurnMessages.splice(0, pendingNextTurnMessageCount);
-			}
-			if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
-			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
+			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
+				signal: preflightSignal,
+				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
+			});
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
 				rosterClaim &&
@@ -10712,19 +10783,56 @@ export class AgentSession {
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
 
-			// Prepare the copied successor and complete local:// readiness while all
-			// public manager getters remain bound to the predecessor.
-			const prepared = await this.sessionManager.prepareFork();
-			if (!prepared) {
-				return false;
-			}
-			try {
-				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-				this.sessionManager.commitPreparedNewSession(prepared);
+			const boundedColdForkEligible =
+				this.sessionManager.getSessionMemoryStats().coldRetirementActive &&
+				!this.sessionManager.isManagedDestination() &&
+				previousSessionFile !== undefined;
+			if (boundedColdForkEligible) {
+				const previousManager = this.sessionManager;
+				const forkedManager = await SessionManager.forkFrom(
+					previousSessionFile,
+					previousManager.getCwd(),
+					SessionManager.explicitDestination(previousManager.getSessionDir()),
+					undefined,
+					"copy-retain",
+					this.settings.get("sessionMemory.mode"),
+				);
+				try {
+					await initializeLocalRoot({
+						getArtifactsDir: () => forkedManager.getArtifactsDir(),
+						isManagedDestination: () => false,
+						getManagedLegacyLocalMigrationSource: () => null,
+						getSessionId: () => forkedManager.getSessionId(),
+					});
+					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+				} catch (error) {
+					const forkedFile = forkedManager.getSessionFile();
+					await forkedManager.close();
+					if (forkedFile) await previousManager.discardUncommittedSession(forkedFile);
+					throw error;
+				}
+				this.sessionManager = forkedManager;
+				try {
+					await previousManager.close();
+				} catch (error) {
+					logger.warn("Previous session close failed after bounded fork adoption", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 				await this.#runToolSessionTransitionCleanups();
-			} catch (error) {
-				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
+			} else {
+				// Prepare the copied successor and complete local:// readiness while all
+				// public manager getters remain bound to the predecessor.
+				const prepared = await this.sessionManager.prepareFork();
+				if (!prepared) return false;
+				try {
+					await initializeLocalRoot(this.#localProtocolOptions(prepared));
+					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+					this.sessionManager.commitPreparedNewSession(prepared);
+					await this.#runToolSessionTransitionCleanups();
+				} catch (error) {
+					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
+				}
 			}
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -13363,13 +13471,15 @@ export class AgentSession {
 				}
 			}
 		}
+		const sessionMemory = this.sessionManager.getSessionMemoryStats();
 		return {
 			heapUsedBytes: process.memoryUsage().heapUsed,
 			providerBytes,
 			messageCount: this.state.messages.length,
 			imageBytes,
 			sessionResidentImageBytes: this.sessionManager.getResidentImageBytes(),
-			materializedResidentBytes: this.#streamingEditFileCache.totalBytes,
+			materializedResidentBytes:
+				this.#streamingEditFileCache.totalBytes + sessionMemory.hotRegionBytes + sessionMemory.metaDescriptorBytes,
 			tuiChatChildren: retainedMemory.tuiChatChildren ?? 0,
 			tuiCachedRenderBytes: retainedMemory.tuiCachedRenderBytes ?? 0,
 		};
@@ -13777,11 +13887,6 @@ export class AgentSession {
 			`(Reminder ${this.#todoReminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
 
-		logger.debug("Todo completion: sending reminder", {
-			incomplete: incomplete.length,
-			attempt: this.#todoReminderCount,
-		});
-
 		// Emit event for UI to render notification
 		await this.#emitSessionEvent({
 			type: "todo_reminder",
@@ -13790,7 +13895,27 @@ export class AgentSession {
 			maxAttempts: remindersMax,
 		});
 
-		// Inject reminder and continue the conversation
+		// Consumers that cannot represent a server-initiated turn (ACP v1 clients, SDK
+		// hosts) keep reporting the prompt as running until the terminal `agent_end` is
+		// published. Injecting here would park that terminal behind a continuation hold
+		// (`#scheduleAgentContinue` -> `#reserveDeferredAgentEndForContinuation`), so a
+		// turn that already delivered its final answer would never settle — and there is
+		// no interactive consumer to act on the nudge. Those hosts get the advisory
+		// event above and nothing else.
+		if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+			logger.debug("Todo completion: advisory reminder only", {
+				incomplete: incomplete.length,
+				attempt: this.#todoReminderCount,
+			});
+			return;
+		}
+
+		logger.debug("Todo completion: sending reminder", {
+			incomplete: incomplete.length,
+			attempt: this.#todoReminderCount,
+		});
+
+		// Inject reminder and continue conversation
 		this.agent.appendMessage({
 			role: "developer",
 			content: [{ type: "text", text: reminder }],
@@ -15077,6 +15202,9 @@ export class AgentSession {
 			)
 		);
 	}
+	#isIdleStreamStallErrorMessage(errorMessage: string): boolean {
+		return /stream stalled while waiting for the next event/i.test(errorMessage);
+	}
 
 	#isFirstEventTimeoutErrorMessage(errorMessage: string): boolean {
 		// First-event timeout: the stream watchdog aborted because no event
@@ -15133,8 +15261,8 @@ export class AgentSession {
 	/**
 	 * Ordered retry classification: typed safety stop (surface) -> legacy safety stop
 	 * (surface) -> overflow (compaction) -> terminal (surface) -> usage_limit
-	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry) ->
-	 * unknown (bounded retry).
+	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry,
+	 * except canonical idle-stream stalls bounded downstream) -> unknown (bounded retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
@@ -15692,7 +15820,10 @@ export class AgentSession {
 				return false;
 			}
 		}
-		const legacyUnbounded = !managedFallback && classification === "transient";
+		const legacyUnbounded =
+			!managedFallback &&
+			classification === "transient" &&
+			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
@@ -15958,16 +16089,20 @@ export class AgentSession {
 	}
 
 	async #promptAgentWithIdleRetry(
-		messages: AgentMessage[],
+		preSubmit: PreSubmitBuilder,
 		options?: {
 			toolChoice?: ToolChoice;
 			fallbackManaged?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 		},
 		predecessorAgentEndHold?: symbol,
+		seam?: { signal?: AbortSignal; resourceRunId?: string },
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
 		let continuationHold = predecessorAgentEndHold;
+		// R3.2 helper-local compact-once flag: fresh per prompt; the inline retry
+		// re-runs Phase B via preSubmit after the forced compaction.
+		let overflowRetried = false;
 		for (;;) {
 			try {
 				const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(
@@ -15975,11 +16110,42 @@ export class AgentSession {
 				);
 				continuationHold = undefined;
 				try {
+					const messages = await preSubmit.build();
 					await this.agent.prompt(messages, options);
 					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 					return;
 				} catch (error) {
 					this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+					if (
+						error instanceof SessionContextTooLargeError &&
+						!overflowRetried &&
+						this.settings.get("sessionMemory.contextOverflowRecovery")
+					) {
+						// D7: exactly one forced, no-continuation compaction
+						// (`willRetry:false`, `continueAfterMaintenance:false`), then
+						// exactly one inline retry. Any other terminal status rethrows
+						// the ORIGINAL typed error with measurements.
+						overflowRetried = true;
+						let compacted = false;
+						try {
+							const status = await this.#runAutoCompaction("overflow", false, false, {
+								force: true,
+								continueAfterMaintenance: false,
+								signal: seam?.signal,
+								resourceRunId: seam?.resourceRunId,
+							});
+							compacted = status.kind === "compacted";
+						} catch {
+							compacted = false;
+						}
+						if (compacted) {
+							// Post-compaction Phase B must rebuild overlays (the
+							// injected-context signatures were reset by
+							// #applyCompactionPostAppend), so drop the cached attempt.
+							preSubmit.reset();
+							continue;
+						}
+					}
 					throw error;
 				}
 			} catch (err) {
@@ -15990,6 +16156,7 @@ export class AgentSession {
 					throw new Error("Timed out waiting for prior agent run to finish before prompting.");
 				}
 				await this.agent.waitForIdle();
+				preSubmit.reset();
 			}
 		}
 	}
@@ -16086,11 +16253,13 @@ export class AgentSession {
 	 * @param command The bash command to execute
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
+	 * @param options.onPersisted Called once the execution's message is in session state
+	 *   (immediately when idle, at the post-turn flush while streaming)
 	 */
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean },
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
@@ -16145,7 +16314,11 @@ export class AgentSession {
 	 * Record a bash execution result in session history.
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
-	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+	recordBashResult(
+		command: string,
+		result: BashResult,
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+	): void {
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
@@ -16162,13 +16335,14 @@ export class AgentSession {
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
 			// Queue for later - will be flushed on agent_end
-			this.#pendingBashMessages.push(bashMessage);
+			this.#pendingBashMessages.push({ message: bashMessage, onPersisted: options?.onPersisted });
 		} else {
 			// Add to agent state immediately
 			this.agent.appendMessage(bashMessage);
 
 			// Save to session
 			this.sessionManager.appendMessage(bashMessage);
+			options?.onPersisted?.();
 		}
 	}
 
@@ -16198,12 +16372,13 @@ export class AgentSession {
 	#flushPendingBashMessages(): void {
 		if (this.#pendingBashMessages.length === 0) return;
 
-		for (const bashMessage of this.#pendingBashMessages) {
+		for (const pending of this.#pendingBashMessages) {
 			// Add to agent state
-			this.agent.appendMessage(bashMessage);
+			this.agent.appendMessage(pending.message);
 
 			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
+			this.sessionManager.appendMessage(pending.message);
+			pending.onPersisted?.();
 		}
 
 		this.#pendingBashMessages = [];
@@ -16219,11 +16394,13 @@ export class AgentSession {
 	 * @param code The Python code to execute
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
+	 * @param options.onPersisted Called once the execution's message is in session state
+	 *   (immediately when idle, at the post-turn flush while streaming)
 	 */
 	async executePython(
 		code: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean },
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<PythonResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
@@ -16291,7 +16468,11 @@ export class AgentSession {
 	/**
 	 * Record a Python execution result in session history.
 	 */
-	recordPythonResult(code: string, result: PythonResult, options?: { excludeFromContext?: boolean }): void {
+	recordPythonResult(
+		code: string,
+		result: PythonResult,
+		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
+	): void {
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const pythonMessage: PythonExecutionMessage = {
 			role: "pythonExecution",
@@ -16307,10 +16488,11 @@ export class AgentSession {
 
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
-			this.#pendingPythonMessages.push(pythonMessage);
+			this.#pendingPythonMessages.push({ message: pythonMessage, onPersisted: options?.onPersisted });
 		} else {
 			this.agent.appendMessage(pythonMessage);
 			this.sessionManager.appendMessage(pythonMessage);
+			options?.onPersisted?.();
 		}
 	}
 
@@ -16371,9 +16553,10 @@ export class AgentSession {
 	#flushPendingPythonMessages(): void {
 		if (this.#pendingPythonMessages.length === 0) return;
 
-		for (const pythonMessage of this.#pendingPythonMessages) {
-			this.agent.appendMessage(pythonMessage);
-			this.sessionManager.appendMessage(pythonMessage);
+		for (const pending of this.#pendingPythonMessages) {
+			this.agent.appendMessage(pending.message);
+			this.sessionManager.appendMessage(pending.message);
+			pending.onPersisted?.();
 		}
 
 		this.#pendingPythonMessages = [];
@@ -17816,6 +17999,7 @@ export class AgentSession {
 			cost: totalCost,
 			...(hasCompleteCostBreakdown ? { costBreakdown: totalCostBreakdown } : {}),
 			premiumRequests: totalPremiumRequests,
+			sessionMemory: this.sessionManager.getSessionMemoryStats(),
 		};
 	}
 

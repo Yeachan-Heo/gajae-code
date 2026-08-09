@@ -87,9 +87,14 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * of escaping to the process-level fatal handler, authority-failure throws
  * preserve their underlying cause, and the compensation fence retry is bounded.
  * Generation 56 moves exact unlink and process-incarnation authority behind
- * lazy native bindings for the startup-cost cut (#3846).
+ * lazy native bindings for the startup-cost cut (#3846). Generation 57 clears
+ * disconnect-grace-only fields whenever a topic enters an archive state, so
+ * one stale session cannot make the shared registry unreadable and block every
+ * later session from creating a topic or replaying notifications. Generation
+ * 58 preserves that invariant during durable-fence load promotion and restores
+ * the exact grace deadline when a failed archive publication rolls back.
  */
-export const DAEMON_GENERATION = 56;
+export const DAEMON_GENERATION = 58;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

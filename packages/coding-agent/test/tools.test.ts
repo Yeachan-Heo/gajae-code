@@ -2366,6 +2366,39 @@ function b() {
 			expect(outputLines).toEqual(["z/auth-actions.spec.ts", "a/auth-actions.spec.ts"]);
 		});
 
+		it("should bound progress and break equal-mtime ties by path", async () => {
+			const fixedTime = new Date(Date.now() - 30_000);
+			for (const name of ["z.txt", "a.txt", "m.txt"]) {
+				const filePath = path.join(testDir, name);
+				fs.writeFileSync(filePath, name);
+				fs.utimesSync(filePath, fixedTime, fixedTime);
+			}
+			const updates: string[][] = [];
+			const result = await findTool.execute(
+				"test-call-14f",
+				{
+					paths: [`${testDir}/**/*.txt`],
+					limit: 2,
+				},
+				undefined,
+				update => {
+					if (update.details?.files) updates.push(update.details.files);
+				},
+			);
+			const updatesAtCompletion = updates.length;
+			await Bun.sleep(25);
+
+			const outputLines = getTextOutput(result)
+				.split("\n")
+				.map(line => line.trim())
+				.filter(Boolean);
+			expect(outputLines.slice(0, 2)).toEqual(["a.txt", "m.txt"]);
+			expect(outputLines).not.toContain("z.txt");
+			expect(updates.length).toBeGreaterThan(0);
+			expect(updates.every(files => files.length <= 2)).toBe(true);
+			expect(updates).toHaveLength(updatesAtCompletion);
+		});
+
 		it("should render nested glob results relative to the session cwd", async () => {
 			const nestedDir = path.join(testDir, "apps", "daemon", "src", "telemetry");
 			fs.mkdirSync(nestedDir, { recursive: true });

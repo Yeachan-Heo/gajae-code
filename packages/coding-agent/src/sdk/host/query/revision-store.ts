@@ -312,8 +312,7 @@ export class RevisionStore {
 	readonly #onReadRange?: (start: number, end: number) => void;
 	#closing = false;
 	#closePromise: Promise<void> | undefined;
-	#writesInFlight = 0;
-	#writesDrained: PromiseWithResolvers<void> | undefined;
+	readonly #pendingWrites = new Set<Promise<void>>();
 
 	constructor(
 		readonly sessionId: string,
@@ -324,48 +323,51 @@ export class RevisionStore {
 		this.#onReadRange = options?.onReadRange;
 	}
 
-	async createRevision(resourceKind: string, resourceId: string, payload: unknown): Promise<string> {
-		if (this.#closing) throw new RevisionStoreError("resource_gone", "snapshot store is closing");
-		this.#writesInFlight++;
-		try {
-			if (payload === undefined) throw new RevisionStoreError("resource_gone", "snapshot payload is unavailable");
-			const serialised = await this.#serialise(payload);
-			const key = `${resourceKind}:${resourceId}`;
-			const revisions = this.#resources.get(key) ?? [];
-			const previous = revisions.length === 0 ? undefined : revisions[revisions.length - 1];
-			if (previous?.hash === serialised.hash) {
-				await this.#discardUnreferenced(serialised.chunks, serialised.manifest);
-				return previous.id;
-			}
-			const revision: Revision = {
-				id: String(previous ? Number(previous.id) + 1 : 1),
-				hash: serialised.hash,
-				bytes: serialised.bytes,
-				payload: serialised.payload,
-				manifest: serialised.manifest,
-				chunks: serialised.chunks,
-				chunkLengths: serialised.chunkLengths,
-				index: serialised.index,
-				pins: new Set(),
-				lastAccessed: this.now(),
-				createdAt: this.now(),
-			};
-			revisions.push(revision);
-			this.#resources.set(key, revisions);
-			this.#retainSpill(revision);
-			if (revision.payload) this.#memoryBytes += revision.bytes;
-			await this.#enforceMemory();
-			while (revisions.length > MAX_REVISIONS_PER_RESOURCE) {
-				const candidate = revisions.find(item => item.pins.size === 0);
-				if (!candidate) break;
-				revisions.splice(revisions.indexOf(candidate), 1);
-				this.#drop(candidate);
-			}
-			return revision.id;
-		} finally {
-			this.#writesInFlight--;
-			if (this.#writesInFlight === 0) this.#writesDrained?.resolve();
+	createRevision(resourceKind: string, resourceId: string, payload: unknown): Promise<string> {
+		if (this.#closing) return Promise.reject(new RevisionStoreError("resource_gone", "snapshot store is closing"));
+		const settled = Promise.withResolvers<void>();
+		this.#pendingWrites.add(settled.promise);
+		return this.#createRevision(resourceKind, resourceId, payload).finally(() => {
+			this.#pendingWrites.delete(settled.promise);
+			settled.resolve();
+		});
+	}
+
+	async #createRevision(resourceKind: string, resourceId: string, payload: unknown): Promise<string> {
+		if (payload === undefined) throw new RevisionStoreError("resource_gone", "snapshot payload is unavailable");
+		const serialised = await this.#serialise(payload);
+		const key = `${resourceKind}:${resourceId}`;
+		const revisions = this.#resources.get(key) ?? [];
+		const previous = revisions.length === 0 ? undefined : revisions[revisions.length - 1];
+		if (previous?.hash === serialised.hash) {
+			await this.#discardUnreferenced(serialised.chunks, serialised.manifest);
+			return previous.id;
 		}
+		const revision: Revision = {
+			id: String(previous ? Number(previous.id) + 1 : 1),
+			hash: serialised.hash,
+			bytes: serialised.bytes,
+			payload: serialised.payload,
+			manifest: serialised.manifest,
+			chunks: serialised.chunks,
+			chunkLengths: serialised.chunkLengths,
+			index: serialised.index,
+			pins: new Set(),
+			lastAccessed: this.now(),
+			createdAt: this.now(),
+		};
+		revisions.push(revision);
+		this.#resources.set(key, revisions);
+		this.#retainSpill(revision);
+		if (revision.payload) this.#memoryBytes += revision.bytes;
+		await this.#enforceMemory();
+		while (revisions.length > MAX_REVISIONS_PER_RESOURCE) {
+			const candidate = revisions.find(item => item.pins.size === 0);
+			if (!candidate) break;
+			revisions.splice(revisions.indexOf(candidate), 1);
+			this.#drop(candidate);
+		}
+		return revision.id;
 	}
 
 	async readRevision(resourceKind: string, resourceId: string, id: string): Promise<unknown> {
@@ -466,6 +468,25 @@ export class RevisionStore {
 		const range = item?.fields?.[field];
 		return range ? this.#readStringRange(revision, range, offset, length) : undefined;
 	}
+	async readIndexedFieldRange(
+		resourceKind: string,
+		resourceId: string,
+		id: string,
+		itemId: string,
+		field: string,
+		offset: number,
+		length: number,
+	): Promise<{ body: string; complete: boolean; offset: number } | undefined> {
+		const revision = this.#resources.get(`${resourceKind}:${resourceId}`)?.find(item => item.id === id);
+		if (!revision) return undefined;
+		revision.lastAccessed = this.now();
+		const item = revision.index?.items?.find(candidate => candidate.entryId === itemId);
+		const range = item?.fields?.[field];
+		if (!range) return undefined;
+		return range.isString
+			? this.#readStringRange(revision, range, offset, length)
+			: this.#readJsonRange(revision, range, offset, length);
+	}
 	async describeIndexedItem(
 		resourceKind: string,
 		resourceId: string,
@@ -477,9 +498,7 @@ export class RevisionStore {
 		if (!item) return undefined;
 		return {
 			itemId: item.entryId,
-			fields: Object.entries(item.fields ?? {})
-				.filter(([, range]) => range.isString)
-				.map(([field]) => field),
+			fields: Object.keys(item.fields ?? {}),
 		};
 	}
 	async readTranscriptBodyRange(
@@ -529,10 +548,7 @@ export class RevisionStore {
 		if (this.#closePromise) return this.#closePromise;
 		this.#closing = true;
 		this.#closePromise = (async () => {
-			if (this.#writesInFlight > 0) {
-				this.#writesDrained ??= Promise.withResolvers<void>();
-				await this.#writesDrained.promise;
-			}
+			await Promise.all(this.#pendingWrites);
 			this.#resources.clear();
 			this.#pinIndex.clear();
 			this.#memoryBytes = 0;
@@ -797,6 +813,28 @@ export class RevisionStore {
 		const stringIndex = await this.#encodeString(value, append, true);
 		if (!stringIndex) throw new SyntaxError("escaped string index is unavailable");
 		return { isString: true, stringIndex };
+	}
+
+	async #readJsonRange(
+		revision: Revision,
+		range: IndexedField,
+		offset: number,
+		length: number,
+	): Promise<{ body: string; complete: boolean; offset: number } | undefined> {
+		if (offset < 0 || length <= 0) return undefined;
+		const bytes = range.end - range.start;
+		const requestedStart = Math.min(offset, bytes);
+		const source = await this.#readBytes(
+			revision,
+			range.start + requestedStart,
+			range.start + Math.min(bytes, requestedStart + length + 7),
+		);
+		const skipped = utf8ContinuationPrefixLength(source);
+		const start = requestedStart + skipped;
+		const body = source.subarray(skipped);
+		const end = utf8BoundaryAtOrBefore(body, Math.min(body.length, length));
+		if (end === 0 && start < bytes) return undefined;
+		return { body: body.subarray(0, end).toString("utf8"), complete: start + end === bytes, offset: start };
 	}
 
 	async #readStringRange(
@@ -1082,16 +1120,38 @@ export class RevisionStore {
 	}
 
 	async #writeAtomic(file: string, data: Buffer): Promise<void> {
-		const temporary = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const temporary = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+			try {
+				await this.#writeAtomicAttempt(temporary, data);
+				await chmod(temporary, 0o600);
+				await rename(temporary, file);
+				return;
+			} catch (error) {
+				await rm(temporary, { force: true }).catch(() => undefined);
+				if ((error as NodeJS.ErrnoException).code !== "EBADF" || attempt === 1) throw error;
+			}
+		}
+	}
+
+	async #writeAtomicAttempt(temporary: string, data: Buffer): Promise<void> {
 		const handle = await open(temporary, "w", 0o600);
+		let failure: { error: unknown } | undefined;
 		try {
 			await handle.writeFile(data);
 			await handle.sync();
-		} finally {
-			await handle.close();
+		} catch (error) {
+			failure = { error };
 		}
-		await chmod(temporary, 0o600);
-		await rename(temporary, file);
+		try {
+			await handle.close();
+		} catch (error) {
+			// Bun can report EBADF when concurrent descriptor teardown has already
+			// closed a fully written and fsynced handle. Preserve every primary write
+			// failure and keep all other close errors fatal.
+			if ((error as NodeJS.ErrnoException).code !== "EBADF" && failure === undefined) failure = { error };
+		}
+		if (failure !== undefined) throw failure.error;
 	}
 
 	#retainSpill(revision: Revision): void {

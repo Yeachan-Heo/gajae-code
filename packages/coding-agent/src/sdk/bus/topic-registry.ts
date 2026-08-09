@@ -578,7 +578,10 @@ export class TopicRegistry {
 					: {}),
 				...(isValidBindingString(raw.archiveHostId) ? { archiveHostId: raw.archiveHostId } : {}),
 				...(isValidBindingGeneration(raw.archiveLeaseEpoch) ? { archiveLeaseEpoch: raw.archiveLeaseEpoch } : {}),
-				...(typeof raw.disconnectGraceExpiresAt === "number" && Number.isFinite(raw.disconnectGraceExpiresAt)
+				...(raw.authorityState === "disconnect_grace" &&
+				!fenceSupersedesRecord &&
+				typeof raw.disconnectGraceExpiresAt === "number" &&
+				Number.isFinite(raw.disconnectGraceExpiresAt)
 					? { disconnectGraceExpiresAt: raw.disconnectGraceExpiresAt }
 					: {}),
 				...(bindingMalformed ? { bindingMalformed: true as const } : {}),
@@ -1179,6 +1182,9 @@ export class TopicRegistry {
 		} else {
 			record.authorityEpoch = snapshot.authorityEpoch;
 			record.authorityState = snapshot.authorityState;
+			if (snapshot.authorityState === "disconnect_grace" && snapshot.record?.disconnectGraceExpiresAt !== undefined)
+				record.disconnectGraceExpiresAt = snapshot.record.disconnectGraceExpiresAt;
+			else delete record.disconnectGraceExpiresAt;
 			this.rebuildInboundRoutes();
 		}
 		if (snapshot.fenceEpoch === undefined) this.epochs.delete(snapshot.sessionId);
@@ -1202,11 +1208,14 @@ export class TopicRegistry {
 				authorityEpoch: deleteEpoch,
 				authorityState: "archive_pending",
 			});
+			const restored = this.topics.get(snapshot.sessionId);
+			if (restored) delete restored.disconnectGraceExpiresAt;
 		} else if (record.topicId !== snapshot.topicId) {
 			return false;
 		} else {
 			record.authorityEpoch = deleteEpoch;
 			record.authorityState = "archive_pending";
+			delete record.disconnectGraceExpiresAt;
 			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
 		}
 		this.epochs.set(snapshot.sessionId, deleteEpoch);
@@ -1230,6 +1239,7 @@ export class TopicRegistry {
 			if (record) {
 				record.authorityEpoch = Number.MAX_SAFE_INTEGER;
 				record.authorityState = "archive_exhausted";
+				delete record.disconnectGraceExpiresAt;
 				if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 			}
 			return undefined;
@@ -1239,6 +1249,7 @@ export class TopicRegistry {
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
 		record.authorityState = "archive_pending";
+		delete record.disconnectGraceExpiresAt;
 		if (hostId) record.archiveHostId = hostId;
 		record.archiveLeaseEpoch = epoch;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
@@ -1368,6 +1379,7 @@ export class TopicRegistry {
 		)
 			return false;
 		record.authorityState = "inactive";
+		delete record.disconnectGraceExpiresAt;
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		this.archiveJobs.delete(sessionId);
 		return true;
@@ -1383,6 +1395,7 @@ export class TopicRegistry {
 					record.authorityEpoch = epoch;
 					record.archiveLeaseEpoch = epoch;
 					record.authorityState = "archive_pending";
+					delete record.disconnectGraceExpiresAt;
 				}
 			}
 			return (record.authorityState === "archive_pending" || record.authorityState === "archive_exhausted") &&
@@ -1420,6 +1433,7 @@ export class TopicRegistry {
 			...(exhausted ? { safeDiagnostic: "archive retry remains discoverable after retry budget" } : {}),
 		};
 		record.authorityState = "archive_pending";
+		delete record.disconnectGraceExpiresAt;
 		this.archiveJobs.set(sessionId, job);
 		return job;
 	}

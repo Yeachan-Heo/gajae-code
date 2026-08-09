@@ -13,7 +13,7 @@ function nativeLifecycle(): typeof import("@gajae-code/natives") {
 	return nativeLifecycleBindings;
 }
 
-import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, logger, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
 	isModelProfileError,
@@ -51,7 +51,11 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
-import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
+import {
+	normalizeSdkStartupFailure,
+	type SdkStartupFailure,
+	type SdkStartupRollbackResult,
+} from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
@@ -136,6 +140,8 @@ type LifecycleCommand = SdkInternalSpawnCommand | { file: string; args: string[]
 type LifecycleCommandResolver = () => LifecycleCommand;
 const lifecycleCommandResolversForTest = new WeakMap<Broker, LifecycleCommandResolver>();
 const lifecycleCleanupHooksForTest = new WeakMap<Broker, () => void>();
+const startupAdmittedInputs = new WeakSet<Input>();
+const startupLaunchInputs = new WeakMap<Input, SessionLaunch>();
 
 /** Test-only hook for simulating a crash immediately after one exact lifecycle detach. */
 export function setLifecycleCleanupHookForTest(broker: Broker, hook: (() => void) | undefined): void {
@@ -976,6 +982,7 @@ function isSdkStartupFailure(value: unknown): value is SdkStartupFailure {
 			failure.reason !== "ineligible" &&
 			failure.reason !== "factory_absent" &&
 			failure.reason !== "runner_absent" &&
+			failure.reason !== "admission_timeout" &&
 			failure.reason !== "pending" &&
 			failure.reason !== "failed") ||
 		typeof failure.message !== "string" ||
@@ -3109,15 +3116,51 @@ async function executeLifecycleResponse(
 			}
 		}
 		const timing = lifecycleTiming(broker);
+		const admissionGranted = startupAdmittedInputs.has(input);
+		if (!admissionGranted) {
+			const suppliedDeadlineFields = [
+				input.receivedAt,
+				input.requestedReadinessTimeoutMs,
+				input.semanticReadyDeadlineAt,
+				input.terminationStartDeadlineAt,
+				input.lifecycleCleanupDeadlineAt,
+			];
+			let queueWaitMs: number;
+			if (suppliedDeadlineFields.some(value => value !== undefined)) {
+				const supplied = lifecycleDeadlines(input, timing.now());
+				if ("ok" in supplied) return supplied;
+				queueWaitMs = supplied.requestedReadinessTimeoutMs;
+			} else {
+				const timeout = readinessTimeout(input);
+				if (typeof timeout !== "number") return timeout;
+				queueWaitMs = timeout;
+			}
+			const launch = await launchInput(broker, operation, input);
+			if ("ok" in launch) return launch;
+			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
+				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, queueWaitMs) };
+				startupAdmittedInputs.add(admittedInput);
+				startupLaunchInputs.set(admittedInput, launch);
+				try {
+					return await executeLifecycleResponse(broker, operation, admittedInput, identity, cleanup);
+				} finally {
+					startupLaunchInputs.delete(admittedInput);
+					startupAdmittedInputs.delete(admittedInput);
+				}
+			});
+			if (admitted.status === "completed") return admitted.value;
+			const failure = normalizeSdkStartupFailure("startup", admitted.reason);
+			return fail("startup_admission_timeout", failure.message);
+		}
 
-		const deadlines = lifecycleDeadlines(input, timing.now());
+		const deadlines = lifecycleDeadlines(input, input.receivedAt as number);
 
 		if ("ok" in deadlines) return deadlines;
 		const lifecycleDeadline = deadlines.lifecycleCleanupDeadlineAt;
 		const readinessDeadline = deadlines.semanticReadyDeadlineAt;
 		const terminationStartDeadline = deadlines.terminationStartDeadlineAt;
 
-		const launch = await launchInput(broker, operation, input);
+		const launch = startupLaunchInputs.get(input) ?? (await launchInput(broker, operation, input));
 		if ("ok" in launch) return launch;
 		if (!hasProcessIncarnationAuthority())
 			return fail(
@@ -4381,4 +4424,175 @@ export async function executeLifecycle(
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
 	};
+}
+
+/**
+ * The live client/socket subscription count of the SDK session endpoint this
+ * process serves, or `undefined` while this process serves no endpoint.
+ *
+ * Only the SDK session runtime owns the real socket table, so it publishes a
+ * reader here instead of every consumer re-deriving attachment from the OS.
+ * Consumers must treat `undefined` as "no evidence" and never as "detached".
+ */
+export type SessionHostAttachmentReader = () => number;
+
+/** What one serving runtime reports about itself while its transport is up. */
+export interface SessionHostRuntimeEvidence {
+	/** This runtime's own live SDK client/socket subscription count. */
+	attachedClients: SessionHostAttachmentReader;
+	/** Whether this runtime currently has agent work in flight. */
+	workInFlight: () => boolean;
+}
+
+/** One runtime's live publication, retractable only by its owner. */
+export interface SessionHostRuntimePublication {
+	/**
+	 * Withdraws the evidence this handle published. Idempotent, and never able
+	 * to touch a sibling runtime's evidence.
+	 */
+	retract(): void;
+}
+
+/**
+ * Every runtime in this process that currently serves an SDK endpoint.
+ *
+ * A process can serve more than one at a time: an identity-rotating control op
+ * starts the successor before the predecessor's deferred stop runs. A single
+ * global slot let that predecessor's teardown retract the live successor's
+ * reader and manufacture "no evidence" for a host with clients attached, so
+ * publications are held per runtime and retracted only through their own handle.
+ */
+const sessionHostRuntimes = new Set<SessionHostRuntimeEvidence>();
+
+/**
+ * Publishes this runtime's own liveness evidence for the lifetime of its
+ * transport. Retraction goes through the returned handle, so a runtime can only
+ * ever withdraw evidence it owns.
+ */
+export function publishSessionHostRuntimeEvidence(evidence: SessionHostRuntimeEvidence): SessionHostRuntimePublication {
+	const published: SessionHostRuntimeEvidence = { ...evidence };
+	sessionHostRuntimes.add(published);
+	return {
+		retract(): void {
+			sessionHostRuntimes.delete(published);
+		},
+	};
+}
+
+/**
+ * This process's currently attached SDK client count, summed across every
+ * serving runtime, or `undefined` when no runtime publishes a readable count
+ * (before startup, after teardown, or when every reader itself fails). Never
+ * guesses: absence of a reader is absence of evidence.
+ */
+export function sessionHostAttachedClients(): number | undefined {
+	let total: number | undefined;
+	for (const { attachedClients } of sessionHostRuntimes) {
+		let count: number;
+		try {
+			count = attachedClients();
+		} catch {
+			continue;
+		}
+		if (!Number.isSafeInteger(count) || count < 0) continue;
+		total = (total ?? 0) + count;
+	}
+	return total;
+}
+
+/**
+ * Whether any runtime in this process has agent work in flight right now.
+ *
+ * Positive evidence only: a runtime that publishes nothing, or whose reader
+ * fails, reports no work, so this can never keep an abandoned host alive.
+ */
+export function sessionHostWorkInFlight(): boolean {
+	for (const { workInFlight } of sessionHostRuntimes) {
+		try {
+			if (workInFlight()) return true;
+		} catch {}
+	}
+	return false;
+}
+
+/**
+ * How often a live broker re-checks its own session registrations against OS
+ * process liveness.
+ *
+ * This sweep can never disturb healthy work: a registration is only dropped
+ * when `process.kill(pid, 0)` proves the exact published pid is gone, and a
+ * working host answers that probe for its entire life no matter how long a turn
+ * runs. One minute keeps `gjc_sessions`/`session.get_endpoint` from advertising
+ * a corpse for longer than a single poll while costing one index refresh per
+ * minute on an otherwise idle broker.
+ */
+export const BROKER_DEAD_REGISTRATION_SWEEP_MS = 60_000;
+
+/** One reaped registration, as recorded by {@link reapDeadSessionRegistrations}. */
+export interface ReapedSessionRegistration {
+	sessionId: string;
+	pid: number;
+	endpointGeneration: number;
+}
+
+/**
+ * Drops every indexed session registration whose host process is provably gone.
+ *
+ * Liveness is the session index's own `alive(pid)` probe (`listSessions().live`),
+ * which reports live for both a running pid and an EPERM pid, so an alien or
+ * unreadable process is never mistaken for a dead one. Registrations already
+ * marked `terminalUncertain` are left alone: their disposition belongs to the
+ * terminal-uncertainty reconciliation path, and silently dropping them would
+ * turn a fail-closed `session.close`/`session.delete` refusal into `not_found`.
+ */
+export async function reapDeadSessionRegistrations(
+	broker: Pick<Broker, "index">,
+): Promise<ReapedSessionRegistration[]> {
+	await broker.index.refresh();
+	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
+	const reaped: ReapedSessionRegistration[] = [];
+	for (const session of dead) {
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId: session.sessionId,
+			locator: session.locator,
+			endpointGeneration: session.endpointGeneration,
+			pid: session.pid,
+			...(session.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: session.endpointMtimeMs }),
+			...(session.lifecycleRequestId ? { lifecycleRequestId: session.lifecycleRequestId } : {}),
+		});
+		const record = {
+			sessionId: session.sessionId,
+			pid: session.pid,
+			endpointGeneration: session.endpointGeneration,
+		};
+		reaped.push(record);
+		logger.warn("sdk broker reaped a session registration whose host process is gone", record);
+	}
+	return reaped;
+}
+
+/**
+ * Runs {@link reapDeadSessionRegistrations} on {@link BROKER_DEAD_REGISTRATION_SWEEP_MS}.
+ * The timer is unref'd, so it never keeps an otherwise idle broker process alive.
+ * Returns a disposer.
+ */
+export function startBrokerDeadRegistrationSweep(
+	broker: Pick<Broker, "index">,
+	intervalMs = BROKER_DEAD_REGISTRATION_SWEEP_MS,
+): () => void {
+	let running = false;
+	const timer = setInterval(() => {
+		if (running) return;
+		running = true;
+		void reapDeadSessionRegistrations(broker)
+			.catch(error => {
+				logger.warn("sdk broker dead-registration sweep failed", { error: String(error) });
+			})
+			.finally(() => {
+				running = false;
+			});
+	}, intervalMs);
+	timer.unref();
+	return () => clearInterval(timer);
 }

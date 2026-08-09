@@ -16,6 +16,12 @@ export default class Acp extends Command {
 	async run(): Promise<void> {
 		const { args, terminalAuth } = prepareAcpTerminalAuthArgs(this.argv);
 		const parsed = parseArgs(args);
+		if (parsed.unknownFlags.size > 0) {
+			throw new Error(`Unknown ACP option: ${[...parsed.unknownFlags.keys()].join(", ")}`);
+		}
+		if (terminalAuth && parsed.mode !== undefined) {
+			throw new Error("--acp-terminal-auth only supports --mode acp");
+		}
 		if (!terminalAuth) {
 			parsed.mode = "acp";
 		}

@@ -88,6 +88,34 @@ describe("readJsonl", () => {
 		const output = await collectAsync(readJsonl(readable));
 		expect(output).toEqual([{ z: 9 }]);
 	});
+
+	it("reports byte-derived raw lines without reserializing parsed values", async () => {
+		const readable = bytesStreamFromChunks([
+			encoder.encode(' { "a": 1 }\r\n{"b":"escaped'),
+			encoder.encode('\\\\nvalue"}'),
+		]);
+		const observed: string[] = [];
+
+		const output = await collectAsync(readJsonl(readable, undefined, raw => observed.push(raw)));
+
+		expect(output).toEqual([{ a: 1 }, { b: "escaped\\nvalue" }]);
+		expect(observed).toEqual([' { "a": 1 }\r', '{"b":"escaped\\\\nvalue"}']);
+	});
+
+	it("isolates raw-line observer failures from JSONL consumption", async () => {
+		const readable = bytesStreamFromChunks([encoder.encode('{"a":1}\n{"b":2}\n')]);
+		let observed = 0;
+
+		const output = await collectAsync(
+			readJsonl(readable, undefined, () => {
+				observed++;
+				throw new Error("diagnostic observer failed");
+			}),
+		);
+
+		expect(output).toEqual([{ a: 1 }, { b: 2 }]);
+		expect(observed).toBe(2);
+	});
 });
 
 describe("createSanitizerStream", () => {

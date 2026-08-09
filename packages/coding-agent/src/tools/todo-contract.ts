@@ -8,7 +8,7 @@
  * tool ever loaded, with no correction hint to recover from.
  */
 import { INTENT_FIELD } from "@gajae-code/agent-core";
-import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
+import type { RawArgumentRejectionDetail, RawArgumentValidationResult } from "@gajae-code/ai/types";
 
 /**
  * Models reliably reach for `complete`/`completed` because the status an op
@@ -34,8 +34,27 @@ const TODO_INIT_ENTRY_KEYS = new Set(["phase", "items"]);
 /** `content` is accepted only as a synonym the schema rewrites to `task`. */
 const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
 
-function hasUnknownKeys(value: object, allowed: Set<string>): boolean {
-	return Object.keys(value).some(key => !allowed.has(key));
+/**
+ * Exact key corrections. `note` is the one repeatable confusion: it is an `op`
+ * value, and the body of a note op goes in `text`, so a caller who wrote
+ * `note: "..."` on an entry can be told exactly which fields a note op takes.
+ * The correction names both required fields rather than a literal rewrite,
+ * because a rewrite that omits `task` is rejected again on the retry. Only add
+ * an entry here when the replacement is unambiguous — never from fuzzy or
+ * edit-distance matching, because a wrong suggestion costs more turns than no
+ * suggestion.
+ */
+const TODO_KEY_CORRECTIONS = new Map<string, string>([
+	["note", 'note is an op, not a key; note operations require both "task" and "text"'],
+]);
+
+function unknownKeys(value: object, allowed: Set<string>): string[] {
+	return Object.keys(value).filter(key => !allowed.has(key));
+}
+
+function keyRejectionDetail(keys: readonly string[]): RawArgumentRejectionDetail {
+	const hints = keys.map(key => TODO_KEY_CORRECTIONS.get(key)).filter((hint): hint is string => hint !== undefined);
+	return hints.length > 0 ? { rejectedKeys: keys, hint: hints.join("; ") } : { rejectedKeys: keys };
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -48,14 +67,21 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * instead of a bare "raw arguments rejected" message.
  */
 export function validateRawTodoArguments(arguments_: Record<string, unknown>): RawArgumentValidationResult {
-	if (hasUnknownKeys(arguments_, TODO_WRITE_KEYS)) return { outcome: "reject", code: "todo-write-unknown-root-key" };
+	const unknownRootKeys = unknownKeys(arguments_, TODO_WRITE_KEYS);
+	if (unknownRootKeys.length > 0)
+		return { outcome: "reject", code: "todo-write-unknown-root-key", detail: keyRejectionDetail(unknownRootKeys) };
 	if (!Array.isArray(arguments_.ops)) return { outcome: "passthrough" };
 	for (const entry of arguments_.ops) {
 		if (!isPlainRecord(entry)) continue;
 		// `content` is normalized to `task` by the schema preprocessor, so it must
 		// not be rejected here as an unknown key first.
-		if (hasUnknownKeys(entry, TODO_OP_KEYS_WITH_ALIASES))
-			return { outcome: "reject", code: "todo-write-unknown-op-entry-key" };
+		const unknownEntryKeys = unknownKeys(entry, TODO_OP_KEYS_WITH_ALIASES);
+		if (unknownEntryKeys.length > 0)
+			return {
+				outcome: "reject",
+				code: "todo-write-unknown-op-entry-key",
+				detail: keyRejectionDetail(unknownEntryKeys),
+			};
 		const op = typeof entry.op === "string" && isDoneAlias(entry.op) ? "done" : entry.op;
 		const target = entry.task ?? entry.content;
 		if ((op === "done" || op === "drop") && !target && !entry.phase) {
@@ -64,8 +90,14 @@ export function validateRawTodoArguments(arguments_: Record<string, unknown>): R
 		const list = entry.list;
 		if (!Array.isArray(list)) continue;
 		for (const item of list) {
-			if (isPlainRecord(item) && hasUnknownKeys(item, TODO_INIT_ENTRY_KEYS))
-				return { outcome: "reject", code: "todo-write-unknown-init-entry-key" };
+			if (!isPlainRecord(item)) continue;
+			const unknownItemKeys = unknownKeys(item, TODO_INIT_ENTRY_KEYS);
+			if (unknownItemKeys.length > 0)
+				return {
+					outcome: "reject",
+					code: "todo-write-unknown-init-entry-key",
+					detail: keyRejectionDetail(unknownItemKeys),
+				};
 		}
 	}
 	return { outcome: "passthrough" };

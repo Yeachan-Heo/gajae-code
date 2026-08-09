@@ -1,8 +1,11 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { streamAnthropic } from "@gajae-code/ai/providers/anthropic";
-import type { AssistantMessage, Context, Model, Tool, UserMessage } from "@gajae-code/ai/types";
-import { clearToolChoiceIncapabilityRegistryForTests } from "@gajae-code/ai/utils/tool-choice-capability";
+import type { AssistantMessage, Context, Model, ProviderSessionState, Tool, UserMessage } from "@gajae-code/ai/types";
+import {
+	clearToolChoiceIncapabilityRegistryForTests,
+	getToolChoiceCapabilityOverride,
+} from "@gajae-code/ai/utils/tool-choice-capability";
 
 const model: Model<"anthropic-messages"> = {
 	api: "anthropic-messages",
@@ -153,6 +156,11 @@ function makeSignedAssistant(suffix: string, text: string): AssistantMessage {
 }
 
 describe("Anthropic thinking replay repair retry", () => {
+	// The runtime tool-choice capability registry is module-global, so a forced
+	// tool_choice 400 raised by any test in this file leaks into every later test
+	// (and into repeated file runs). Isolate every test, not just the fallback block.
+	beforeEach(() => clearToolChoiceIncapabilityRegistryForTests());
+
 	it("retries once without latest assistant thinking blocks after the Anthropic 400 invariant error", async () => {
 		const user: UserMessage = {
 			role: "user",
@@ -309,6 +317,44 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(thirdBody).not.toContain("sig_late");
 	});
 
+	it("does not carry an exhausted masked repair into the next turn", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("early", "early answer"),
+				{ ...user, content: "second", timestamp: Date.now() + 1 },
+				makeSignedAssistant("late", "late answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 2 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt <= 3 ? createMaskedProxyRejection() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const failedTurn = await streamAnthropic(model, context, { client, providerSessionState }).result();
+
+		expect(failedTurn.stopReason).toBe("error");
+		expect(requestBodies).toHaveLength(3);
+
+		const recoveredTurn = await streamAnthropic(model, context, { client, providerSessionState }).result();
+
+		expect(recoveredTurn.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(4);
+		expect(JSON.stringify(requestBodies[3])).toContain("sig_early");
+		expect(JSON.stringify(requestBodies[3])).toContain("sig_late");
+	});
+
 	// The masked body says nothing, so the guard must be the request: with no
 	// replayed thinking blocks the failure is somebody else's and retrying would
 	// only hide it behind a second identical request.
@@ -354,9 +400,10 @@ describe("Anthropic thinking replay repair retry", () => {
 	});
 
 	// Real captured session failure (2026-07-29): the mutation 400 says "latest
-	// assistant message" but cites `messages.1.content.1` — a HISTORICAL turn — so the
-	// latest-only repair is rejected identically and the turn used to die.
-	it("escalates to a full-history repair when the mutation 400 survives the latest-only repair", async () => {
+	// assistant message" but cites `messages.1.content.1` — a HISTORICAL turn. The
+	// provider demands those blocks be replayed verbatim, so a latest-only edit is
+	// just another mutation; the only recovery is to stop replaying native thinking.
+	it("drops thinking from EVERY assistant turn on the first mutation 400", async () => {
 		const user: UserMessage = {
 			role: "user",
 			content: "first",
@@ -376,26 +423,26 @@ describe("Anthropic thinking replay repair retry", () => {
 		const create = ((body: unknown) => {
 			requestBodies.push(body);
 			attempt += 1;
-			return (attempt <= 2 ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
+			return (attempt === 1 ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
 
 		const result = await streamAnthropic(model, context, { client }).result();
 
 		expect(result.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(3);
-		// Attempt 2: latest-only repair keeps the historical signature.
+		expect(requestBodies).toHaveLength(2);
+		const firstBody = JSON.stringify(requestBodies[0]);
+		expect(firstBody).toContain("sig_early");
+		expect(firstBody).toContain("sig_late");
+		// The single repair drops every replayed signature rather than re-editing the
+		// turn the provider just refused.
 		const secondBody = JSON.stringify(requestBodies[1]);
-		expect(secondBody).toContain("sig_early");
+		expect(secondBody).not.toContain("sig_early");
 		expect(secondBody).not.toContain("sig_late");
-		// Attempt 3: escalated full-history repair drops every replayed signature.
-		const thirdBody = JSON.stringify(requestBodies[2]);
-		expect(thirdBody).not.toContain("sig_early");
-		expect(thirdBody).not.toContain("sig_late");
-		expect(thirdBody).toContain("early answer");
+		expect(secondBody).toContain("early answer");
 	});
 
-	it("stops after exactly three requests when the mutation 400 persists through both repair scopes", async () => {
+	it("stops after exactly two requests when the mutation 400 persists", async () => {
 		const user: UserMessage = {
 			role: "user",
 			content: "first",
@@ -415,7 +462,7 @@ describe("Anthropic thinking replay repair retry", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorStatus).toBe(400);
-		expect(requestBodies).toHaveLength(3);
+		expect(requestBodies).toHaveLength(2);
 	});
 
 	it("retries once with thinking dropped from EVERY assistant turn after the invalid-signature 400", async () => {
@@ -517,6 +564,10 @@ describe("Anthropic thinking replay repair retry", () => {
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
 
+		// Guards the isolation above: a leaked runtime incapability would silently
+		// strip `tool_choice` from the request and make the assertions below lie.
+		expect(getToolChoiceCapabilityOverride(model)).toBeUndefined();
+
 		const result = await streamAnthropic(model, context, {
 			client,
 			thinkingEnabled: true,
@@ -608,8 +659,6 @@ describe("Anthropic thinking replay repair retry", () => {
 	});
 
 	describe("cumulative degradation across fallbacks", () => {
-		beforeEach(() => clearToolChoiceIncapabilityRegistryForTests());
-
 		const tool: Tool = {
 			name: "read",
 			description: "Read",

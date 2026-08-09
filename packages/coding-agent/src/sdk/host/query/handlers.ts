@@ -405,7 +405,7 @@ export class QueryHandlers {
 		const range =
 			itemId === undefined
 				? await this.revisions.readStringRange(kind, id, revision, field, offset, TARGET_PAGE_BYTES)
-				: await this.revisions.readIndexedStringRange(kind, id, revision, itemId, field, offset, TARGET_PAGE_BYTES);
+				: await this.revisions.readIndexedFieldRange(kind, id, revision, itemId, field, offset, TARGET_PAGE_BYTES);
 		if (!range) return this.#error(request, "resource_gone");
 		return this.#chunkRange(request, kind, id, revision, range, selector, {
 			field,
