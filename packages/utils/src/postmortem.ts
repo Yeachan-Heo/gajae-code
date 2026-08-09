@@ -191,90 +191,101 @@ function installProcessStdoutWriteClassifier(): void {
 }
 
 const UNREADABLE_FIELD = "[unreadable]";
+const UNREADABLE_THROWABLE = "[unreadable throwable]";
+const ERROR_FIELDS = ["name", "message", "stack"] as const;
+type ErrorField = (typeof ERROR_FIELDS)[number];
 
-/**
- * Reads one field of a throwable, exactly once. `undefined` means the throwable
- * does not carry a string there; `null` means it carries the field but refused
- * to answer.
- */
-function readErrorField(reason: object, key: "name" | "message" | "stack"): string | null | undefined {
+type FieldRead =
+	| { readonly kind: "missing" }
+	| { readonly kind: "unreadable" }
+	| { readonly kind: "value"; readonly value: unknown };
+
+interface CapturedPayload {
+	readonly serialized: string;
+	readonly hasContext: boolean;
+}
+
+/** Reads one top-level field exactly once and keeps both its value and refusal state. */
+function readField(reason: object, key: string): FieldRead {
 	try {
 		const value = (reason as Record<string, unknown>)[key];
-		return typeof value === "string" ? value : undefined;
+		return value === undefined ? { kind: "missing" } : { kind: "value", value };
 	} catch {
-		return null;
+		return { kind: "unreadable" };
 	}
 }
 
-/**
- * Reads a throwable's error-shaped fields, exactly once each.
- *
- * Observing a property twice is a hazard, not a detail: a stateful or hostile
- * accessor that satisfies a shape check and then throws on the re-read would
- * escape out of `recordFatalCrash()` and cost the whole crash record. So the
- * values that pass the check are the values that get used.
- *
- * The fields are read one at a time, because a sibling accessor that throws must
- * not take a readable field down with it: a `message` that refuses to answer is
- * no reason to lose a readable `name` or the trace. `stack` is the one field the
- * record can do without, and letting it cost the readable fields is how a fatal
- * becomes `Error: [object Object]`.
- */
-function readErrorLike(reason: unknown): { name: string; message: string; stack?: string } | undefined {
-	if (typeof reason !== "object" || reason === null) return undefined;
-	const name = readErrorField(reason, "name");
-	const message = readErrorField(reason, "message");
-	const stack = readErrorField(reason, "stack");
-
-	// Read every field before deciding whether this is error-shaped. A missing
-	// name or message cannot discard a readable trace, and one refusing accessor
-	// cannot prevent either sibling from being attempted.
-	const carriesErrorField =
-		(name !== undefined && message !== undefined) || name === null || message === null || stack !== undefined;
-	if (!carriesErrorField) {
-		try {
-			if (Object.prototype.toString.call(reason) !== "[object Error]") return undefined;
-		} catch {
-			// A `Symbol.toStringTag` that throws answers nothing about error shape,
-			// so fall through to serialization rather than losing the payload.
-			return undefined;
-		}
-	}
-
-	const shaped = {
-		name: name === null ? UNREADABLE_FIELD : (name ?? "Error"),
-		message: message === null ? UNREADABLE_FIELD : (message ?? "(no message)"),
-	};
-	if (typeof stack === "string") return { ...shaped, stack };
-	if (stack === null) {
-		return { ...shaped, stack: `${shaped.name}: ${shaped.message}\n${UNREADABLE_FIELD}` };
-	}
-	return shaped;
+function capturedValue(field: FieldRead): unknown {
+	if (field.kind === "value") return field.value;
+	if (field.kind === "unreadable") return UNREADABLE_FIELD;
+	return undefined;
 }
 
 /**
- * Render a non-`Error` throwable so the crash record keeps its payload.
- *
- * `String(value)` collapses every plain object to `[object Object]`, which is
- * exactly how SDK lifecycle startup failures (`{ phase, reason, message }` are
- * thrown as records, not `Error`s) used to reach the log with no diagnostic
- * left. Serialize own properties instead, and stay defensive: a throwing
- * `toString`/`toJSON` or a cycle must never mask the original fatal.
+ * Serializes one already-captured value without letting a hostile sibling cost
+ * the rest of the record. Returning `undefined` matches JSON's treatment of
+ * unsupported object-property values.
  */
-function describeThrowable(reason: unknown): string {
-	if (typeof reason === "object" && reason !== null) {
-		try {
-			const serialized = JSON.stringify(reason);
-			if (typeof serialized === "string") return serialized;
-		} catch {
-			// Cyclic or non-serializable payload; fall through to String().
-		}
+function serializeCapturedValue(value: unknown): string | undefined {
+	if (value === undefined || typeof value === "function" || typeof value === "symbol") return undefined;
+	try {
+		const serialized = JSON.stringify(value);
+		if (typeof serialized === "string") return serialized;
+	} catch {
+		// Fall through to a string representation of this field only.
 	}
 	try {
-		return String(reason);
+		return JSON.stringify(String(value));
 	} catch {
-		return "[unserializable throwable]";
+		return JSON.stringify(UNREADABLE_FIELD);
 	}
+}
+
+/**
+ * Captures enumerable own fields without re-reading `name`, `message`, or
+ * `stack`. Those three values came from the same reads used by the diagnostic,
+ * so a stateful accessor cannot pass one branch and fail in another.
+ */
+function capturePayload(reason: object, fields: Readonly<Record<ErrorField, FieldRead>>): CapturedPayload | undefined {
+	let keys: string[];
+	try {
+		keys = Object.keys(reason);
+	} catch {
+		return undefined;
+	}
+
+	const entries: [string, unknown][] = [];
+	const seen = new Set(keys);
+	let hasContext = false;
+
+	for (const key of keys) {
+		if (!ERROR_FIELDS.includes(key as ErrorField)) hasContext = true;
+		const value = ERROR_FIELDS.includes(key as ErrorField)
+			? capturedValue(fields[key as ErrorField])
+			: capturedValue(readField(reason, key));
+		entries.push([key, value]);
+	}
+
+	// Error fields are often non-enumerable. When another own field makes the
+	// complete payload the useful output, append every special field that yielded
+	// information so none of the successful reads disappears.
+	for (const key of ERROR_FIELDS) {
+		if (seen.has(key)) continue;
+		const value = capturedValue(fields[key]);
+		if (value !== undefined) entries.push([key, value]);
+	}
+
+	const properties: string[] = [];
+	for (const [key, value] of entries) {
+		const serialized = serializeCapturedValue(value);
+		if (serialized !== undefined) properties.push(`${JSON.stringify(key)}:${serialized}`);
+	}
+	return { serialized: `{${properties.join(",")}}`, hasContext };
+}
+
+function fieldText(field: FieldRead, fallback: string): string {
+	if (field.kind === "unreadable") return UNREADABLE_FIELD;
+	return field.kind === "value" && typeof field.value === "string" ? field.value || fallback : fallback;
 }
 
 /** A throwable reduced to plain strings; the only shape the rest of this module reads. */
@@ -284,37 +295,58 @@ interface FatalDiagnostic {
 	stack: string;
 }
 
-const UNREADABLE_THROWABLE = "[unreadable throwable]";
-
 /**
  * The single read of an unknown throwable, and the only one this module has.
  *
- * There are unbounded ways to construct a bad throwable — hostile `Proxy`,
- * cross-realm object, primitive, a same-realm `Error` whose lazily computed
- * `message` throws — and exactly one place that has to turn one into text. So
- * the guard lives here instead of at each consumer: the crash log, stderr and
- * the structured log all receive plain strings they can read unconditionally.
- *
- * Total by contract: it always returns a diagnostic and never throws. Each
- * field is attempted independently: answers survive and only refusals are
- * reported as unreadable.
+ * There is no error-shape gate. Objects are captured first. A complete payload
+ * is rendered whenever context or a non-string special field would otherwise be
+ * lost; the compact error form is only used when those three strings are the
+ * whole useful output.
  */
 function describeFatal(reason: unknown): FatalDiagnostic {
 	try {
-		const shaped = readErrorLike(reason);
-		if (shaped) {
-			return {
-				name: shaped.name || "Error",
-				message: shaped.message || "(no message)",
-				stack: shaped.stack ?? "",
-			};
+		if (typeof reason !== "object" || reason === null) {
+			let message: string;
+			try {
+				message = String(reason);
+			} catch {
+				message = UNREADABLE_THROWABLE;
+			}
+			return { name: "Error", message: message || "(no message)", stack: "" };
 		}
-		return { name: "Error", message: describeThrowable(reason) || "(no message)", stack: "" };
+
+		const fields: Record<ErrorField, FieldRead> = {
+			name: readField(reason, "name"),
+			message: readField(reason, "message"),
+			stack: readField(reason, "stack"),
+		};
+		const payload = capturePayload(reason, fields);
+		const hasNonStringSpecial = ERROR_FIELDS.some(key => {
+			const field = fields[key];
+			return field.kind === "value" && typeof field.value !== "string";
+		});
+		const hasErrorText = ERROR_FIELDS.some(key => {
+			const field = fields[key];
+			return field.kind === "unreadable" || (field.kind === "value" && typeof field.value === "string");
+		});
+
+		if (payload && (payload.hasContext || hasNonStringSpecial || !hasErrorText)) {
+			return { name: "Error", message: payload.serialized || "{}", stack: "" };
+		}
+
+		const name = fieldText(fields.name, "Error");
+		const message = fieldText(fields.message, "(no message)");
+		if (fields.stack.kind === "unreadable") {
+			return { name, message, stack: `${name}: ${message}\n${UNREADABLE_FIELD}` };
+		}
+		if (fields.stack.kind === "value" && typeof fields.stack.value === "string") {
+			const stack = fields.stack.value.includes("\n")
+				? fields.stack.value
+				: `${name}: ${message}\n${fields.stack.value}`;
+			return { name, message, stack };
+		}
+		return { name, message, stack: "" };
 	} catch {
-		// Every read above is individually guarded, and every earlier round of
-		// this module believed exactly that about the read it had just
-		// hardened. This is the last diagnostic the process leaves behind; it
-		// does not get to depend on that belief holding.
 		return { name: "Error", message: UNREADABLE_THROWABLE, stack: "" };
 	}
 }

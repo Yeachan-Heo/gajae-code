@@ -39,6 +39,7 @@ interface Throwables {
 	readonly build: () => unknown;
 	/** Fragments the record must keep: everything readable, plus a marker for everything not. */
 	readonly keeps: readonly string[];
+	readonly after?: (contents: string) => void;
 }
 
 const throwables: readonly Throwables[] = [
@@ -119,6 +120,53 @@ const throwables: readonly Throwables[] = [
 		keeps: ['{"phase":"startup","reason":"broker-spawn","message":"record fatal"}'],
 	},
 	{
+		what: "plain record carrying a readable stack and crash context",
+		build: () => ({
+			phase: "startup",
+			reason: "broker-spawn",
+			exitCode: 7,
+			stack: "at spawnBroker (broker.ts:1:1)",
+		}),
+		keeps: ['{"phase":"startup","reason":"broker-spawn","exitCode":7,"stack":"at spawnBroker (broker.ts:1:1)"}'],
+	},
+	{
+		what: "named error record carrying HTTP response context",
+		build: () => ({
+			name: "HttpError",
+			message: "502 Bad Gateway",
+			status: 502,
+			url: "https://api/x",
+			body: "upstream",
+		}),
+		keeps: ['{"name":"HttpError","message":"502 Bad Gateway","status":502,"url":"https://api/x","body":"upstream"}'],
+	},
+	((): Throwables => {
+		const reads: string[] = [];
+		return {
+			what: "record whose error fields must not be re-read during payload serialization",
+			build: () => {
+				reads.length = 0;
+				return {
+					get name(): number {
+						reads.push("name");
+						return 17;
+					},
+					get message(): null {
+						reads.push("message");
+						return null;
+					},
+					get stack(): boolean {
+						reads.push("stack");
+						return false;
+					},
+					payload: "readable context survives",
+				};
+			},
+			keeps: ['{"name":17,"message":null,"stack":false,"payload":"readable context survives"}'],
+			after: () => expect(reads).toEqual(["name", "message", "stack"]),
+		};
+	})(),
+	{
 		what: "thrown string primitive",
 		build: () => "plain string boom",
 		keeps: ["Error: plain string boom"],
@@ -145,7 +193,7 @@ function diagnosticOf(contents: string): string {
 }
 
 describe("crash recording of throwables that refuse to be read", () => {
-	for (const { what, build, keeps } of throwables) {
+	for (const { what, build, keeps, after } of throwables) {
 		it(`records a fatal from a ${what}`, () => {
 			const target = crashLogTarget();
 
@@ -155,37 +203,10 @@ describe("crash recording of throwables that refuse to be read", () => {
 
 			const contents = fs.readFileSync(target, "utf8");
 			for (const fragment of keeps) expect(contents).toContain(fragment);
+			after?.(contents);
 			// Whatever it was, the record says something: never an empty diagnostic.
 			expect(diagnosticOf(contents)).not.toBe("");
 			expect(diagnosticOf(contents)).not.toBe("(no message)");
 		});
 	}
-
-	it("reads each field of a throwable exactly once, even when a sibling refuses", () => {
-		const reads: string[] = [];
-		const reason = {
-			get name(): string {
-				reads.push("name");
-				return "CountedFailure";
-			},
-			get message(): string {
-				reads.push("message");
-				throw new Error("message getter always throws");
-			},
-			get stack(): string {
-				reads.push("stack");
-				return "CountedFailureStack";
-			},
-		};
-
-		const target = crashLogTarget();
-		expect(recordFatalCrash(LABEL, reason, { path: target, now: RECORDED_AT })).toBe(target);
-
-		const contents = fs.readFileSync(target, "utf8");
-		expect(contents).toContain("CountedFailure: [unreadable]");
-		expect(contents).toContain("CountedFailureStack");
-		// A second observation is the hazard a stateful accessor uses to throw
-		// after passing a shape check, so there is no second observation.
-		expect(reads).toEqual(["name", "message", "stack"]);
-	});
 });
