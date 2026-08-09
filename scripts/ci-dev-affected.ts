@@ -3,6 +3,8 @@
 import { $ } from "bun";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import { selectCanaryTests } from "./ci-risk-canary-manifest";
+
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
@@ -928,7 +930,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 	}
 	if (needCiSelftest) {
-		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts"]);
+		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 	}
 	if (needYamlParse) {
@@ -936,6 +938,12 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 	}
 	if (needPermissionCheck) {
 		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
+	}
+
+	// Risk canaries supplement direct affected-path coverage. Their test-file task
+	// identities flow through the canonical plan and fail-closed evidence aggregate.
+	for (const canary of selectCanaryTests(relevant)) {
+		addTestFileTask(tasks, canary);
 	}
 
 	ensureNativeBuild(tasks);

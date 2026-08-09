@@ -121,13 +121,10 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(windowsContract.run).toContain("runDaemonInternal rewrites persisted owner pid");
 	});
 
-	test("validates the same requested commit in the guard, planner, and shards (no arbitrary dispatch head)", async () => {
+	test("keeps affected validation pinned while reserving an explicit virtual-integration dispatch head", async () => {
 		const d = await workflow();
-		// The arbitrary dispatch HEAD inputs are removed: a manual run can only pin the
-		// diff base, never a head that diverges from what the planner/shards test.
 		const dispatchInputs = Object.keys(d.on.workflow_dispatch.inputs);
-		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository"]);
-		expect(dispatchInputs).not.toContain("head_sha");
+		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository", "head_sha", "base_sha_override"]);
 		expect(dispatchInputs).not.toContain("head_ref");
 		expect(dispatchInputs).not.toContain("head_repository");
 
