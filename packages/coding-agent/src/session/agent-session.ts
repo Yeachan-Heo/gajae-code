@@ -15077,6 +15077,9 @@ export class AgentSession {
 			)
 		);
 	}
+	#isIdleStreamStallErrorMessage(errorMessage: string): boolean {
+		return /stream stalled while waiting for the next event/i.test(errorMessage);
+	}
 
 	#isFirstEventTimeoutErrorMessage(errorMessage: string): boolean {
 		// First-event timeout: the stream watchdog aborted because no event
@@ -15692,7 +15695,10 @@ export class AgentSession {
 				return false;
 			}
 		}
-		const legacyUnbounded = !managedFallback && classification === "transient";
+		const legacyUnbounded =
+			!managedFallback &&
+			classification === "transient" &&
+			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback

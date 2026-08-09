@@ -1672,6 +1672,33 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
+	it("bounds repeated provider stream idle stalls by retry.maxRetries", async () => {
+		const requestedModels: string[] = [];
+		session = buildSession({
+			responses: [
+				{ throw: "Anthropic stream stalled while waiting for the next event" },
+				{ throw: "Anthropic stream stalled while waiting for the next event" },
+				{ throw: "Anthropic stream stalled while waiting for the next event" },
+				{ content: ["must not be reached"] },
+			],
+			settingsOverrides: { "retry.maxRetries": 2 },
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("repeated idle stall");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
+		expect(requestedModels).toHaveLength(3);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 2 })]);
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Anthropic stream stalled while waiting for the next event",
+		});
+	});
 	it("fails closed on structured watchdog facts and actual streamed partial output under bare defaults", async () => {
 		for (const partialOutput of [false, true]) {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
