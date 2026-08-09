@@ -35,7 +35,7 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
-import { type IndexedSession, SessionIndex } from "./session-index";
+import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -190,6 +190,28 @@ function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
+type SessionListCursor = {
+	sessions: IndexedSession[];
+	indexSeq: number;
+	warnings: string[];
+	limit: number;
+	offset: number;
+	expiresAt: number;
+};
+
+const SESSION_LIST_DEFAULT_LIMIT = 100;
+const SESSION_LIST_MAX_LIMIT = 100;
+const SESSION_LIST_CURSOR_TTL_MS = 15 * 60 * 1_000;
+const SESSION_LIST_MAX_CURSORS = 32;
+
+function sessionListLimit(input: Record<string, unknown>): number | BrokerResponse {
+	const limit = input.limit;
+	if (limit === undefined) return SESSION_LIST_DEFAULT_LIMIT;
+	if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > SESSION_LIST_MAX_LIMIT)
+		return error("invalid_input", `limit must be a safe integer from 1 to ${SESSION_LIST_MAX_LIMIT}`);
+	return limit;
+}
+
 function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
@@ -234,6 +256,10 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 		const resolved = input.resolveSessionId;
 		if (resolved !== undefined && (typeof resolved !== "string" || !isCanonicalSessionId(resolved)))
 			return error("invalid_input", "resolveSessionId must be a canonical safe identifier");
+		if (input.cursor !== undefined && (typeof input.cursor !== "string" || input.cursor.length === 0))
+			return error("invalid_input", "cursor must be a non-empty opaque string");
+		const limit = sessionListLimit(input);
+		if (isBrokerResponse(limit)) return limit;
 		return { input: normalized };
 	}
 	if (
@@ -704,6 +730,7 @@ export class Broker {
 	discovery: BrokerDiscovery | null = null;
 	#lock: string;
 	#owner = randomBytes(12).toString("hex");
+	#sessionListCursors = new Map<string, SessionListCursor>();
 	#chains = new Map<string, Promise<void>>();
 	#admitted = new Set<Promise<void>>();
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
@@ -1175,6 +1202,61 @@ export class Broker {
 			throw e;
 		}
 	}
+	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string | BrokerResponse {
+		const now = Date.now();
+		for (const [token, stored] of this.#sessionListCursors) {
+			if (stored.expiresAt <= now) this.#sessionListCursors.delete(token);
+		}
+		const replacing = replacingToken !== undefined && this.#sessionListCursors.has(replacingToken);
+		if (!replacing && this.#sessionListCursors.size >= SESSION_LIST_MAX_CURSORS)
+			return error("invalid_input", "session.list cursor capacity is exhausted");
+		const token = randomBytes(24).toString("base64url");
+		if (replacingToken !== undefined) this.#sessionListCursors.delete(replacingToken);
+		this.#sessionListCursors.set(token, cursor);
+		return token;
+	}
+
+	#sessionListPage(input: Record<string, unknown>, result: SessionList): BrokerResponse {
+		const requestedLimit = input.limit === undefined ? undefined : sessionListLimit(input);
+		if (isBrokerResponse(requestedLimit)) return requestedLimit;
+		const cursor = input.cursor;
+		const stored = typeof cursor === "string" ? this.#sessionListCursors.get(cursor) : undefined;
+		if (cursor !== undefined && (!stored || stored.expiresAt <= Date.now())) {
+			if (typeof cursor === "string") this.#sessionListCursors.delete(cursor);
+			return error("invalid_input", "cursor is expired or invalid");
+		}
+		if (stored && requestedLimit !== undefined && stored.limit !== requestedLimit)
+			return error("invalid_input", "limit must match the cursor page shape");
+		const limit = stored?.limit ?? requestedLimit ?? SESSION_LIST_DEFAULT_LIMIT;
+		const snapshot = stored ?? {
+			sessions: result.sessions,
+			indexSeq: result.indexSeq,
+			warnings: result.warnings,
+			limit,
+			offset: 0,
+			expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS,
+		};
+		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit);
+		const offset = snapshot.offset + sessions.length;
+		const continuationCursor =
+			offset >= snapshot.sessions.length
+				? undefined
+				: this.#storeSessionListCursor(
+						{ ...snapshot, offset, expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS },
+						typeof cursor === "string" ? cursor : undefined,
+					);
+		if (isBrokerResponse(continuationCursor)) return continuationCursor;
+		return {
+			ok: true,
+			result: {
+				indexSeq: snapshot.indexSeq,
+				sessions,
+				warnings: snapshot.warnings,
+				...(continuationCursor ? { continuationCursor } : {}),
+			},
+			indexSeq: snapshot.indexSeq,
+		};
+	}
 	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
 		if (this.#stopping || (this.#publication !== null && this.#publicationState !== "healthy-owned"))
 			return Promise.resolve(error("unavailable", "broker publication is unavailable"));
@@ -1197,7 +1279,9 @@ export class Broker {
 		input = normalization.input;
 		if (operation === "session.list") {
 			await this.index.refresh();
-			const result = this.index.listSessions();
+			const page = this.#sessionListPage(input, this.index.listSessions());
+			if (!page.ok) return page;
+			const pageResult = page.result as Record<string, unknown>;
 			const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
 			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
 			if (resolveSessionId && cwd) {
@@ -1210,18 +1294,17 @@ export class Broker {
 						: [];
 				const match = matches.length === 1 ? matches[0] : undefined;
 				return {
-					ok: true,
+					...page,
 					result: {
-						...result,
+						...pageResult,
 						savedSession:
 							match && match.sessionId === resolveSessionId
 								? { id: match.sessionId, path: match.path }
 								: undefined,
 					},
-					indexSeq: result.indexSeq,
 				};
 			}
-			return { ok: true, result, indexSeq: result.indexSeq };
+			return page;
 		}
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");

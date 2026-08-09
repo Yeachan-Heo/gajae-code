@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { listSessionHostEntries } from "./restart-sdk-broker";
 import {
 	type BrokerDiscoveryLike,
 	restartSdkBroker,
@@ -287,4 +288,28 @@ test("rejects a replacement that retains the previous process identity", async (
 			}),
 		),
 	).rejects.toThrow("returned the previous process identity");
+});
+
+test("drains paginated session hosts", async () => {
+	const inputs: Array<Record<string, unknown>> = [];
+	const sessions = await listSessionHostEntries(async input => {
+		inputs.push(input);
+		return inputs.length === 1
+			? { ok: true, result: { sessions: [{ sessionId: "one" }], continuationCursor: "page-2" } }
+			: { ok: true, result: { sessions: [{ sessionId: "two" }] } };
+	});
+	expect(inputs).toEqual([{}, { cursor: "page-2" }]);
+	expect(sessions).toEqual([{ sessionId: "one" }, { sessionId: "two" }]);
+});
+
+test("rejects a failed continuation page", async () => {
+	let calls = 0;
+	await expect(
+		listSessionHostEntries(async () => {
+			calls += 1;
+			return calls === 1
+				? { ok: true, result: { sessions: [{ sessionId: "one" }], continuationCursor: "page-2" } }
+				: { ok: false, error: { code: "unavailable", message: "broker unavailable" } };
+		}),
+	).rejects.toMatchObject({ code: "unavailable", message: "broker unavailable" });
 });

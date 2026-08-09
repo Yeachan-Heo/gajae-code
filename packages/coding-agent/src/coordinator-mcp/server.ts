@@ -325,6 +325,7 @@ const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_COORDINATOR_SESSION_LIST_PAGES = 10_000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3213,6 +3214,34 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return asRecord(response?.result) ?? response ?? {};
 	}
 
+	async function paginatedBrokerSessionList(
+		cwd: string,
+		input: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		const aggregate: Record<string, unknown> = {};
+		const sessions: unknown[] = [];
+		let cursor: string | undefined;
+		for (let pageCount = 0; pageCount < MAX_COORDINATOR_SESSION_LIST_PAGES; pageCount++) {
+			const page = brokerResult(
+				await brokerSession(cwd, "session.list", {
+					...input,
+					...(cursor === undefined ? {} : { cursor }),
+				}),
+			);
+			for (const [key, value] of Object.entries(page)) {
+				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
+			}
+			if (Array.isArray(page.sessions)) sessions.push(...page.sessions);
+			const nextCursor =
+				typeof page.continuationCursor === "string" && page.continuationCursor.length > 0
+					? page.continuationCursor
+					: undefined;
+			if (!nextCursor) return { ...aggregate, sessions };
+			cursor = nextCursor;
+		}
+		throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+	}
+
 	async function canonicalBrokerWorkspace(cwd: string): Promise<string> {
 		try {
 			return await (services.canonicalizePath ?? (value => fs.realpath(value)))(cwd);
@@ -3259,7 +3288,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	};
 
 	async function exactBrokerSessionAuthority(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
-		const listing = brokerResult(await brokerSession(workspace, "session.list", { cwd: workspace }));
+		const listing = await paginatedBrokerSessionList(workspace, { cwd: workspace });
+
 		const matches: Array<{ session: Record<string, unknown>; workspace: string }> = [];
 		for (const session of jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : [])) {
 			if (brokerSessionId(session) !== sessionId) continue;
@@ -3410,7 +3440,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const roots = cwd ? [cwd] : config.allowedRoots;
 		const listings = await Promise.all(
 			roots.map(async root => {
-				const listing = brokerResult(await brokerSession(root, "session.list", { cwd: root }));
+				const listing = await paginatedBrokerSessionList(root, { cwd: root });
 				return scopedBrokerSessions(Array.isArray(listing.sessions) ? listing.sessions : [], root, platform);
 			}),
 		);

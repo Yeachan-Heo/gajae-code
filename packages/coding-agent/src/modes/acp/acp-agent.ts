@@ -70,6 +70,7 @@ const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
+const MAX_ACP_SESSION_LIST_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 /**
@@ -185,6 +186,42 @@ function parsePromptWatchdogClock(value: unknown): PromptWatchdogClock | undefin
 
 function object(value: unknown): JsonObject | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
+}
+
+async function collectAcpSessionList(
+	request: (input: JsonObject) => Promise<unknown>,
+	input: JsonObject = {},
+): Promise<JsonObject> {
+	const aggregate: JsonObject = {};
+	const sessions: unknown[] = [];
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_ACP_SESSION_LIST_PAGES; pageCount++) {
+		const response = object(await request({ ...input, ...(cursor === undefined ? {} : { cursor }) }));
+		const listing = object(response?.result) ?? response;
+		if (response?.ok === false) {
+			const failure = object(response.error);
+			throw new AcpSdkAdapterError(
+				typeof failure?.code === "string" ? failure.code : "broker_error",
+				typeof failure?.message === "string" ? failure.message : "session.list failed",
+			);
+		}
+		if (listing) {
+			for (const [key, value] of Object.entries(listing)) {
+				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
+			}
+			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
+			const nextCursor =
+				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
+					? listing.continuationCursor
+					: undefined;
+			if (nextCursor) {
+				cursor = nextCursor;
+				continue;
+			}
+		}
+		return { ...aggregate, sessions };
+	}
+	throw new AcpSdkAdapterError("protocol_error", "session.list exceeded the page budget.");
 }
 
 function aggregateAcpFailure(code: string, message: string, failures: unknown[]): AcpSdkAdapterError {
@@ -1179,9 +1216,10 @@ export class AcpAgent implements Agent {
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
-		const result = object(await (await this.#brokerAdapter()).global("session.list"));
-		const listing = object(result?.result) ?? result;
-		const listed = Array.isArray(listing?.sessions) ? listing.sessions : [];
+		const adapter = await this.#brokerAdapter();
+		const listing = await collectAcpSessionList(input => adapter.global("session.list", input));
+		const listed = Array.isArray(listing.sessions) ? listing.sessions : [];
+
 		if (params.cwd) {
 			const discovered = new Set<string>();
 			for (const session of listed) {
@@ -1655,8 +1693,9 @@ export class AcpAgent implements Agent {
 	}
 
 	async #scopedBrokerSession(id: string, cwd: string): Promise<BrokerSession | undefined> {
-		const response = object(await (await this.#brokerAdapter()).global("session.list", { cwd }));
-		const result = object(response?.result) ?? response;
+		const adapter = await this.#brokerAdapter();
+		const result = await collectAcpSessionList(input => adapter.global("session.list", input), { cwd });
+
 		const matches: BrokerSession[] = [];
 		for (const item of Array.isArray(result?.sessions) ? result.sessions : []) {
 			const session = object(item) as BrokerSession | undefined;
@@ -1926,10 +1965,11 @@ export class AcpAgent implements Agent {
 	}
 
 	async #resolveSavedSession(id: string, cwd: string): Promise<string> {
-		const response = object(
-			await (await this.#brokerAdapter()).global("session.list", { resolveSessionId: id, cwd }),
-		);
-		const result = object(response?.result) ?? response;
+		const adapter = await this.#brokerAdapter();
+		const result = await collectAcpSessionList(input => adapter.global("session.list", input), {
+			resolveSessionId: id,
+			cwd,
+		});
 		const saved = object(result?.savedSession);
 		if (saved?.id !== id || typeof saved.path !== "string")
 			throw new AcpSdkAdapterError("not_found", `Saved ACP session does not exist: ${id}`);

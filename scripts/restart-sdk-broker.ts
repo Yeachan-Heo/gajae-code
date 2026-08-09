@@ -4,14 +4,51 @@ import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
 import { brokerProcessIncarnation, readBrokerDiscovery } from "../packages/coding-agent/src/sdk/broker/discovery";
 import { ensureBroker } from "../packages/coding-agent/src/sdk/broker/ensure";
-import { SdkClient } from "../packages/coding-agent/src/sdk/client";
+import { SdkClient, SdkClientError } from "../packages/coding-agent/src/sdk/client";
 import {
 	restartSdkBroker,
 	type RestartSdkBrokerDeps,
 	type RestartSdkBrokerOptions,
 } from "./restart-sdk-broker-core";
 
-type SessionListEntry = { sessionId?: unknown; pid?: unknown; live?: unknown };
+export type SessionListEntry = { sessionId?: unknown; pid?: unknown; live?: unknown };
+
+const MAX_SESSION_LIST_PAGES = 10_000;
+
+type SessionListRequest = (input: Record<string, unknown>) => Promise<unknown>;
+
+function record(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+export async function listSessionHostEntries(request: SessionListRequest): Promise<SessionListEntry[]> {
+	const entries: SessionListEntry[] = [];
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+		const response = record(await request(cursor === undefined ? {} : { cursor }));
+		if (response?.ok === false) {
+			const failure = record(response.error);
+			throw new SdkClientError(
+				typeof failure?.code === "string" ? failure.code : "broker_error",
+				typeof failure?.message === "string" ? failure.message : "session.list failed",
+			);
+		}
+		const page = record(response?.result) ?? response;
+		if (Array.isArray(page?.sessions)) {
+			for (const entry of page.sessions) {
+				const parsed = record(entry);
+				if (parsed) entries.push(parsed as SessionListEntry);
+			}
+		}
+		const nextCursor =
+			typeof page?.continuationCursor === "string" && page.continuationCursor.length > 0
+				? page.continuationCursor
+				: undefined;
+		if (!nextCursor) return entries;
+		cursor = nextCursor;
+	}
+	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+}
 
 async function withClient<T>(
 	discovery: { url: string; token: string },
@@ -40,10 +77,8 @@ const defaultDeps: RestartSdkBrokerDeps = {
 	readDiscovery: async (agentDir, heartbeatTtlMs) => await readBrokerDiscovery(agentDir, heartbeatTtlMs),
 	listSessionHosts: async discovery =>
 		await withClient(discovery, async client => {
-			const response = (await client.global("session.list", {})) as {
-				result?: { sessions?: SessionListEntry[] };
-			};
-			return (response.result?.sessions ?? [])
+			const entries = await listSessionHostEntries(input => client.global("session.list", input));
+			return entries
 				.filter(
 					(entry): entry is { sessionId: string; pid: number; live: true } =>
 						entry.live === true && typeof entry.sessionId === "string" && typeof entry.pid === "number",
