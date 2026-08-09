@@ -276,16 +276,22 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		);
 	});
 
-	it("names a note key on an operation entry and points at the text field", () => {
-		// `note` is a valid op whose body field is `text`, so an entry carrying
-		// `note` is the one confusion worth correcting outright: without the key
-		// named, the caller cannot tell what to drop and retries the same payload.
+	it("names a note key without emitting an incomplete replacement", () => {
 		const message = captureValidationError(() =>
 			validateToolArguments(tool, call({ ops: [{ op: "note", note: "why this plan" }] })),
 		);
 		expect(message).toBe(
-			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "note" (note is an op, not a key: use { op: "note", text: "..." })`,
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "note" (note is an op, not a key; note operations require both "task" and "text")`,
 		);
+		expect(message).not.toContain('use { op: "note", text: "..." }');
+	});
+
+	it("rejects the incomplete note shape for missing task content", async () => {
+		const result = await tool.execute("call-note", { ops: [{ op: "note", text: "why this plan" }] });
+		const first = result.content?.[0];
+		const text = first?.type === "text" ? first.text : "";
+		expect(text).toContain("Missing task content");
+		expect(text).toContain("Todo update was not applied");
 	});
 
 	it("names an unknown operation-entry key without inventing a replacement for it", () => {

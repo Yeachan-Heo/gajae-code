@@ -72,9 +72,13 @@ async function collectToolResults(
 // PR #4036 red team: the dispatcher used to split `mcp__<server>__<x>_<rest>` by
 // regex and treat `<rest>` as the tool name. For a two-segment MCP name the
 // second segment belongs to the *tool*, so unrelated tools became the single
-// unambiguous candidate and were executed. Identity is now read off the registry:
-// a tool must be reachable under both a bridge-qualified name and the base that
-// name qualifies, and only the instance segment may differ.
+// unambiguous candidate and were executed. Reading the split off the registry
+// instead does not rescue it: `mcp__<server>__<x>_<base>` denotes a stale bridge
+// instance in front of `base` and that server's own `<x>_<base>` with equal
+// force, and the registry only ever proves the name the tool is live under, never
+// the one the model sent. An unresolvable call name is therefore echoed back
+// untouched — no dispatch, and no guessed alias in the error, because reaching a
+// tool the model never named costs more than the dead end it replaces.
 describe("agentLoop: a stale tool call name dispatches only on a provable identity match", () => {
 	it("does not run the local search for a two-segment web-search MCP call", async () => {
 		let searchRuns = 0;
@@ -87,63 +91,55 @@ describe("agentLoop: a stale tool call name dispatches only on a provable identi
 		expect(results).toHaveLength(1);
 		expect(results[0].isError).toBe(true);
 		expect(results[0].text).toContain("Tool mcp__brave__web_search not found");
+		expect(results[0].text).not.toContain("It is active as");
 	});
 
-	it("does not run the local search for a two-segment semantic-search MCP call", async () => {
+	// The registry proves what `search` is callable as *now*. It cannot prove what
+	// the model meant by a name that differs from it: `mcp__brave__web_search` is
+	// a stale instance in front of `search` and brave's own `web_search` with the
+	// instance dropped, in the same breath. Guessing here executes a tool.
+	it("does not dispatch a bridged tool when only the instance segment differs", async () => {
 		let searchRuns = 0;
 		const results = await collectToolResults(
-			[makeTool("search", { onExecute: () => searchRuns++ }), makeTool("read"), makeTool("bash")],
-			"mcp__jbcontext__code_search",
+			[makeTool("search", { customWireName: "mcp__brave__current_search", onExecute: () => searchRuns++ })],
+			"mcp__brave__web_search",
 		);
 
 		expect(searchRuns).toBe(0);
 		expect(results).toHaveLength(1);
 		expect(results[0].isError).toBe(true);
-		expect(results[0].text).toContain("Tool mcp__jbcontext__code_search not found");
+		expect(results[0].text).toContain("Tool mcp__brave__web_search not found");
 	});
 
-	// Both names parse to the base `issue` on server `github` under the old
-	// split, so the cross-server guard never fired: only a schema mismatch stood
-	// between the model and a write it never asked for.
-	it("does not dispatch close_issue to create_issue on the same server", async () => {
-		let created = 0;
+	// A base name that contains the separator does not make the split provable
+	// either: `stale_internal_edit` is as good a tool name as a stale instance
+	// segment in front of `internal_edit`.
+	it("does not dispatch onto a base name that contains underscores", async () => {
+		let runs = 0;
 		const results = await collectToolResults(
-			[makeTool("mcp__github__create_issue", { onExecute: () => created++ })],
-			"mcp__github__close_issue",
+			[makeTool("internal_edit", { customWireName: "mcp__srv__abc_internal_edit", onExecute: () => runs++ })],
+			"mcp__srv__stale_internal_edit",
 		);
 
-		expect(created).toBe(0);
+		expect(runs).toBe(0);
 		expect(results).toHaveLength(1);
 		expect(results[0].isError).toBe(true);
-		expect(results[0].text).toContain("Tool mcp__github__close_issue not found");
+		expect(results[0].text).toContain("Tool mcp__srv__stale_internal_edit not found");
 	});
 
-	// One tool reachable under two names is one candidate. Counting the names
-	// instead of the tools made a legitimate rename look ambiguous and refused it.
-	it("counts a tool reachable under two names as one candidate", async () => {
+	// A tool reachable under two names is still only one proven name per session,
+	// and `xyz_search` reads as a tool name just as well as a rotated instance id.
+	it("does not dispatch a tool reachable under both a bridge form and its base", async () => {
 		let runs = 0;
 		const results = await collectToolResults(
 			[makeTool("mcp__srv__abc_search", { customWireName: "search", onExecute: () => runs++ })],
 			"mcp__srv__xyz_search",
 		);
 
-		expect(runs).toBe(1);
+		expect(runs).toBe(0);
 		expect(results).toHaveLength(1);
-		expect(results[0].isError).toBe(false);
-		expect(results[0].text).toBe("executed:mcp__srv__abc_search");
-	});
-
-	it("dispatches when only the bridge instance segment went stale", async () => {
-		let runs = 0;
-		const results = await collectToolResults(
-			[makeTool("mcp__srv__NEW_tool", { customWireName: "tool", onExecute: () => runs++ })],
-			"mcp__srv__OLD_tool",
-		);
-
-		expect(runs).toBe(1);
-		expect(results).toHaveLength(1);
-		expect(results[0].isError).toBe(false);
-		expect(results[0].text).toBe("executed:mcp__srv__NEW_tool");
+		expect(results[0].isError).toBe(true);
+		expect(results[0].text).toContain("Tool mcp__srv__xyz_search not found");
 	});
 
 	// Two distinct tools both reachable as `search` on `srv`: picking one would
@@ -164,14 +160,6 @@ describe("agentLoop: a stale tool call name dispatches only on a provable identi
 		expect(results[0].text).toContain("Tool mcp__srv__zzz_search not found");
 	});
 
-	it("keeps the base not-found message when no active tool matches", async () => {
-		const results = await collectToolResults([makeTool("read"), makeTool("bash")], "mcp__srv__abc_write");
-
-		expect(results).toHaveLength(1);
-		expect(results[0].isError).toBe(true);
-		expect(results[0].text).toBe("Tool mcp__srv__abc_write not found");
-	});
-
 	it("does not cross servers even when the base name is proven", async () => {
 		let runs = 0;
 		const results = await collectToolResults(
@@ -183,6 +171,63 @@ describe("agentLoop: a stale tool call name dispatches only on a provable identi
 		expect(results).toHaveLength(1);
 		expect(results[0].isError).toBe(true);
 		expect(results[0].text).toContain("Tool mcp__beta__xyz_search not found");
+	});
+
+	it("does not run the local search for a two-segment semantic-search MCP call", async () => {
+		let searchRuns = 0;
+		const results = await collectToolResults(
+			[makeTool("search", { onExecute: () => searchRuns++ }), makeTool("read"), makeTool("bash")],
+			"mcp__jbcontext__code_search",
+		);
+
+		expect(searchRuns).toBe(0);
+		expect(results).toHaveLength(1);
+		expect(results[0].isError).toBe(true);
+		expect(results[0].text).toContain("Tool mcp__jbcontext__code_search not found");
+	});
+
+	// Both names parse to the base `issue` on server `github`, so any split-based
+	// identity check reads them as the same tool. Suggesting `create_issue` for a
+	// `close_issue` call points the model at a write it never asked for.
+	it("neither dispatches nor suggests create_issue for a close_issue call", async () => {
+		let created = 0;
+		const results = await collectToolResults(
+			[makeTool("mcp__github__create_issue", { onExecute: () => created++ })],
+			"mcp__github__close_issue",
+		);
+
+		expect(created).toBe(0);
+		expect(results).toHaveLength(1);
+		expect(results[0].isError).toBe(true);
+		expect(results[0].text).toContain("Tool mcp__github__close_issue not found");
+		expect(results[0].text).not.toContain("It is active as `mcp__github__create_issue`");
+	});
+
+	// Issue #3917, captured sessions 019fd580/019fd583/019fd595: the model called
+	// `mcp__<server>__<instance>_search` while `search` was active. The registry
+	// holds a bare `search` and nothing that ties the foreign namespace to it, so
+	// the recovery the model gets is tool discovery, not a guessed rename.
+	it("answers a foreign bridge namespace with discovery rather than a rename", async () => {
+		let searchRuns = 0;
+		const results = await collectToolResults(
+			[makeTool("search", { onExecute: () => searchRuns++ }), makeTool("search_tool_bm25")],
+			"mcp__jzi2uzmxd57z__mr6er53iidr3_search",
+		);
+
+		expect(searchRuns).toBe(0);
+		expect(results).toHaveLength(1);
+		expect(results[0].isError).toBe(true);
+		expect(results[0].text).toContain("Tool mcp__jzi2uzmxd57z__mr6er53iidr3_search not found");
+		expect(results[0].text).not.toContain("It is active as");
+		expect(results[0].text).toContain("search_tool_bm25");
+	});
+
+	it("keeps the base not-found message when no active tool matches", async () => {
+		const results = await collectToolResults([makeTool("read"), makeTool("bash")], "mcp__srv__abc_write");
+
+		expect(results).toHaveLength(1);
+		expect(results[0].isError).toBe(true);
+		expect(results[0].text).toBe("Tool mcp__srv__abc_write not found");
 	});
 
 	// What the model receives matters as much as what runs: a mis-dispatch turned

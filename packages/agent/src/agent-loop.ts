@@ -30,7 +30,7 @@ import {
 	neutralizeReservedControlTokens,
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
-import { logger, sanitizeText } from "@gajae-code/utils";
+import { sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
@@ -2507,49 +2507,9 @@ function toolCallNames(tool: { name: string; customWireName?: string }): string[
 
 /**
  * Wire name of the tool-discovery tool. Sessions that hide discoverable
- * built-ins expose it under this name, or under a bridge alias of it.
+ * built-ins expose it under exactly that name.
  */
 const TOOL_DISCOVERY_NAME = "search_tool_bm25";
-
-/**
- * Split an MCP bridge namespace off a call name so it can be compared against
- * the tool it actually denotes. Bridges expose tools as `mcp__<server>_<tool>`,
- * and proxied bridges add a per-session instance segment
- * (`mcp__<server>__<instance>_<tool>`). A name the model replayed from earlier
- * context therefore differs from the live registry only in that segment.
- */
-function parseToolCallName(name: string): { server?: string; base: string } {
-	const namespace = /^mcp__([^_]+)(?:__[^_]+)?_/.exec(name);
-	if (!namespace) return { base: name };
-	return { server: namespace[1], base: name.slice(namespace[0].length) };
-}
-
-/**
- * Call names of active tools that denote the same tool as an unresolved call
- * name. Two servers can expose the same tool name, so a namespaced call is only
- * matched against its own server or against an unnamespaced tool.
- */
-function findToolCallNameAliases(
-	callName: string,
-	tools: ReadonlyArray<{ name: string; customWireName?: string }> | undefined,
-	limit = 3,
-): string[] {
-	const target = parseToolCallName(callName);
-	if (target.base.length === 0) return [];
-	const aliases: string[] = [];
-	for (const tool of tools ?? []) {
-		for (const candidate of toolCallNames(tool)) {
-			if (candidate === callName) continue;
-			const parsed = parseToolCallName(candidate);
-			if (parsed.base !== target.base) continue;
-			if (parsed.server !== undefined && target.server !== undefined && parsed.server !== target.server) continue;
-			if (aliases.includes(candidate)) continue;
-			aliases.push(candidate);
-			if (aliases.length === limit) return aliases;
-		}
-	}
-	return aliases;
-}
 
 /**
  * Active tool a call name dispatches to. Tools emitted via OpenAI's custom-tool
@@ -2568,82 +2528,14 @@ function findActiveTool<T extends { name: string; customWireName?: string }>(
 }
 
 /**
- * Server segment of `qualified` when it is the bridge-qualified form of `base`:
- * `mcp__<server>_<base>`, or `mcp__<server>__<instance>_<base>` once a proxied
- * bridge stamped its per-session instance segment. Both strings come from the
- * registry, so the split is read off a base name the tool is really reachable
- * under instead of being guessed: guessing turns `mcp__brave__web_search` into
- * a call for a local `search`, and `mcp__github__close_issue` into `create_issue`.
+ * Whether tool discovery is callable in this session. A namespaced lookalike
+ * proves nothing: `mcp__srv__x_search_tool_bm25` reads equally well as a bridged
+ * discovery tool and as that server's own `x_search_tool_bm25`, and the registry
+ * cannot tell the two apart. Naming the wrong one sends the model at a tool it
+ * never asked for, so only the literal call name counts.
  */
-function bridgeServerFor(qualified: string, base: string): string | undefined {
-	const suffix = `_${base}`;
-	if (!qualified.startsWith("mcp__") || !qualified.endsWith(suffix)) return undefined;
-	const head = qualified.slice("mcp__".length, qualified.length - suffix.length);
-	const boundary = head.indexOf("__");
-	if (boundary === -1) return head.length > 0 ? head : undefined;
-	const server = head.slice(0, boundary);
-	const instance = head.slice(boundary + 2);
-	// The instance is exactly one segment; anything else belongs to a tool name.
-	if (server.length === 0 || instance.length === 0 || instance.includes("_")) return undefined;
-	return server;
-}
-
-/**
- * Whether `callName` differs from a name this tool is reachable under only in
- * the bridge instance segment. Identity has to be provable from the registry:
- * the tool must expose both a bridge-qualified name and the base that name
- * qualifies, which is what fixes where the tool name starts.
- */
-function callNameDenotesTool(callName: string, tool: { name: string; customWireName?: string }): boolean {
-	const names = toolCallNames(tool);
-	for (const qualified of names) {
-		for (const base of names) {
-			if (base === qualified) continue;
-			const server = bridgeServerFor(qualified, base);
-			if (server !== undefined && bridgeServerFor(callName, base) === server) return true;
-		}
-	}
-	return false;
-}
-
-/**
- * The single active tool an unresolvable call name provably denotes, when there
- * is exactly one. Such a name is not a hallucination: proxied bridges rotate the
- * per-session instance segment, so a name replayed from earlier context differs
- * from the live registry only there. One tool is a rename and is safe to
- * dispatch; zero or several stay a not-found error, because routing the model at
- * another server's tool is worse than a dead end. Candidates are the tools
- * themselves, so one tool reachable under two names is one candidate.
- */
-function resolveSoleToolCallNameAlias<T extends { name: string; customWireName?: string }>(
-	callName: string,
-	tools: ReadonlyArray<T> | undefined,
-): { tool: T; callName: string } | undefined {
-	let resolved: T | undefined;
-	for (const tool of tools ?? []) {
-		if (!callNameDenotesTool(callName, tool)) continue;
-		if (resolved !== undefined && resolved !== tool) return undefined;
-		resolved = tool;
-	}
-	return resolved === undefined ? undefined : { tool: resolved, callName: resolved.name };
-}
-
-/**
- * Resolve how tool discovery is actually callable in this session. Assuming the
- * bare `search_tool_bm25` literal both drops the hint when the discovery tool is
- * bridged and, worse, would name a second non-callable tool if emitted anyway.
- */
-function findToolDiscoveryCallName(
-	tools: ReadonlyArray<{ name: string; customWireName?: string }> | undefined,
-): string | undefined {
-	let bridged: string | undefined;
-	for (const tool of tools ?? []) {
-		for (const candidate of toolCallNames(tool)) {
-			if (candidate === TOOL_DISCOVERY_NAME) return candidate;
-			if (bridged === undefined && parseToolCallName(candidate).base === TOOL_DISCOVERY_NAME) bridged = candidate;
-		}
-	}
-	return bridged;
+function isToolDiscoveryCallable(tools: ReadonlyArray<{ name: string; customWireName?: string }> | undefined): boolean {
+	return (tools ?? []).some(tool => toolCallNames(tool).includes(TOOL_DISCOVERY_NAME));
 }
 
 /**
@@ -2675,24 +2567,6 @@ async function executeToolCalls(
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 	const toolCalls = assistantMessage.content.filter((c): c is ToolCallContent => c.type === "toolCall");
-	// A call name the registry does not expose can still denote exactly one
-	// active tool — bridges rotate their per-session instance segment, so names
-	// the model replayed from earlier context go stale in that segment alone.
-	// Rename the call to the tool it unambiguously means, before anything else
-	// reads the name, so argument validation, hooks, permissions and telemetry
-	// all run against the resolved tool as if it had been called correctly.
-	// Ambiguous and unmatched names fall through to the not-found error below.
-	for (const toolCall of toolCalls) {
-		if (findActiveTool(tools, toolCall.name) !== undefined) continue;
-		const resolved = resolveSoleToolCallNameAlias(toolCall.name, tools);
-		if (resolved === undefined) continue;
-		logger.info("Tool call renamed to its single active alias", {
-			toolCallId: toolCall.id,
-			requestedName: toolCall.name,
-			resolvedName: resolved.callName,
-		});
-		toolCall.name = resolved.callName;
-	}
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
@@ -2858,21 +2732,19 @@ async function executeToolCalls(
 					// the tool and retry instead of giving up on the capability. The
 					// base wording stays byte-for-byte stable for downstream consumers;
 					// the period and hint are appended only when discovery is callable.
+					// The call name is echoed verbatim and no other tool is named or
+					// dispatched to: `mcp__<server>__<x>_<base>` reads equally well as a
+					// stale bridge instance segment in front of `base` and as that
+					// server's own two-segment `<x>_<base>`, and the registry only ever
+					// proves the live name, never the one the model sent. Running or
+					// naming that guess hits a tool the model never asked for, which is
+					// worse than the dead end it would replace.
 					const base = `Tool ${toolCall.name} not found`;
-					const hints: string[] = [];
-					const aliases = findToolCallNameAliases(toolCall.name, tools);
-					if (aliases.length > 0) {
-						hints.push(
-							`It is active as ${aliases.map(name => `\`${name}\``).join(" or ")} — call that name instead.`,
-						);
-					}
-					const discoveryCallName = findToolDiscoveryCallName(tools);
-					if (discoveryCallName !== undefined) {
-						hints.push(
-							`If you are unsure whether this tool exists or how to use it, call \`${discoveryCallName}\` to discover and activate the matching tool, then retry.`,
-						);
-					}
-					throw new Error(hints.length > 0 ? `${base}. ${hints.join(" ")}` : base);
+					throw new Error(
+						isToolDiscoveryCallable(tools)
+							? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
+							: base,
+					);
 				}
 
 				let effectiveArgs: Record<string, unknown>;

@@ -37,12 +37,15 @@ const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
 /**
  * Exact key corrections. `note` is the one repeatable confusion: it is an `op`
  * value, and the body of a note op goes in `text`, so a caller who wrote
- * `note: "..."` on an entry has exactly one correct rewrite. Only add an entry
- * here when the replacement is unambiguous — never from fuzzy or edit-distance
- * matching, because a wrong suggestion costs more turns than no suggestion.
+ * `note: "..."` on an entry can be told exactly which fields a note op takes.
+ * The correction names both required fields rather than a literal rewrite,
+ * because a rewrite that omits `task` is rejected again on the retry. Only add
+ * an entry here when the replacement is unambiguous — never from fuzzy or
+ * edit-distance matching, because a wrong suggestion costs more turns than no
+ * suggestion.
  */
 const TODO_KEY_CORRECTIONS = new Map<string, string>([
-	["note", 'note is an op, not a key: use { op: "note", text: "..." }'],
+	["note", 'note is an op, not a key; note operations require both "task" and "text"'],
 ]);
 
 function unknownKeys(value: object, allowed: Set<string>): string[] {

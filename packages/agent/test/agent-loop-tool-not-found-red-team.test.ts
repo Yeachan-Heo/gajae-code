@@ -16,7 +16,13 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
-function makeTool(name: string, options: { customWireName?: string; onExecute?: () => void } = {}): TestTool {
+function makeTool(
+	name: string,
+	options: {
+		customWireName?: string;
+		onExecute?: () => void;
+	} = {},
+): TestTool {
 	return {
 		name,
 		label: name,
@@ -137,14 +143,16 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 
 	// Issue #3917, captured sessions 019fd580/019fd583/019fd595: the model called
 	// `mcp__<server>__<instance>_search` while `search` was active, five times
-	// across three sessions, and each bare not-found burned a whole turn.
-	// The registry exposes the tool under both its bare name and the bridge form
-	// the live session mints, so only the instance segment is stale: the call is a
-	// rename, not a dead end, and is dispatched. Without that pair the split would
-	// be a guess — `mcp__brave__web_search` looks exactly the same.
-	it("dispatches a call carrying a stale MCP bridge namespace to the one tool it denotes", async () => {
+	// across three sessions, and each bare not-found burned a whole turn. A
+	// registry that exposes the tool under both its bare name and a bridge form
+	// still does not make the sent name readable: it splits into a rotated
+	// instance plus `search` and into that server's own `wbg7pcrl46bd_search`
+	// with equal force. The turn is recovered by the discovery hint, never by
+	// executing a tool the model did not name.
+	it("does not dispatch a call carrying a stale MCP bridge namespace", async () => {
 		let searchRuns = 0;
 		let readRuns = 0;
+		const toolName = "mcp__jzi2uzmxd57z__wbg7pcrl46bd_search";
 		const toolResults = await collectToolResults(
 			[
 				makeTool("search", {
@@ -153,20 +161,20 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 				}),
 				makeTool("read", { onExecute: () => readRuns++ }),
 			],
-			"mcp__jzi2uzmxd57z__wbg7pcrl46bd_search",
+			toolName,
 		);
 
-		expect(searchRuns).toBe(1);
+		expect(searchRuns).toBe(0);
 		expect(readRuns).toBe(0);
 		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0].isError).toBe(false);
-		expect(toolResults[0].text).toBe("executed");
+		expectBaseNotFound(toolResults[0], toolName);
 	});
 
-	// Bridges mint a fresh instance segment per session, so a name replayed from
-	// earlier context differs from the live registry only in that segment.
-	it("dispatches when only the bridge instance segment went stale", async () => {
+	// Bridges mint a fresh instance segment per session, but a rotated segment and
+	// the head of a two-segment tool name are the same string to the registry.
+	it("does not dispatch when only the bridge instance segment differs", async () => {
 		let runs = 0;
+		const toolName = "mcp__jzi2uzmxd57z__jgspauo3hmi5_subagent";
 		const toolResults = await collectToolResults(
 			[
 				makeTool("mcp__jzi2uzmxd57z__gbbgnmhc3qkt_subagent", {
@@ -174,33 +182,33 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 					onExecute: () => runs++,
 				}),
 			],
-			"mcp__jzi2uzmxd57z__jgspauo3hmi5_subagent",
+			toolName,
 		);
 
-		expect(runs).toBe(1);
+		expect(runs).toBe(0);
 		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0].isError).toBe(false);
-		expect(toolResults[0].text).toBe("executed");
+		expectBaseNotFound(toolResults[0], toolName);
 	});
 
-	// The bridge-qualified form the registry knows may be the customWireName; the
-	// dispatcher resolves through it exactly as it does through `name`.
-	it("dispatches an alias reachable only through customWireName", async () => {
+	// The bridge-qualified form the registry knows may be the customWireName. It
+	// proves the live name either way, and never the one the model sent.
+	it("does not dispatch a lookalike reachable only through customWireName", async () => {
 		let runs = 0;
+		const toolName = "mcp__srv__stale_edit";
 		const toolResults = await collectToolResults(
 			[makeTool("edit", { customWireName: "mcp__srv__abc_edit", onExecute: () => runs++ })],
-			"mcp__srv__stale_edit",
+			toolName,
 		);
 
-		expect(runs).toBe(1);
+		expect(runs).toBe(0);
 		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0].isError).toBe(false);
-		expect(toolResults[0].text).toBe("executed");
+		expectBaseNotFound(toolResults[0], toolName);
 	});
 
-	// Two candidates stay a not-found error naming both: picking one would route
-	// the model at a tool it did not ask for.
-	it("keeps the not-found error and lists both names when two tools match", async () => {
+	// Two tools whose names differ only in the segment the call also differs in.
+	// Naming either one asserts an identity the registry cannot prove, so the
+	// error carries the requested name and nothing else.
+	it("keeps the not-found error and names no alias when two tools match the shape", async () => {
 		let runs = 0;
 		const toolName = "mcp__srv__stale_search";
 		const toolResults = await collectToolResults(
@@ -214,7 +222,7 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 		expect(runs).toBe(0);
 		expect(toolResults).toHaveLength(1);
 		expectBaseNotFound(toolResults[0], toolName);
-		expect(toolResults[0].text).toContain("It is active as `mcp__srv__abc_search` or `mcp__srv__xyz_search`");
+		expect(toolResults[0].text).not.toContain("It is active as");
 	});
 
 	it("does not invent an alias when no active tool shares the base name", async () => {
@@ -237,19 +245,33 @@ describe("agentLoop: tool-not-found discovery hint red team", () => {
 		expect(toolResults[0].text).not.toContain("It is active as");
 	});
 
-	// Emitting the bare `search_tool_bm25` literal here would name a second
-	// non-callable tool, so the hint has to carry the bridged call name.
-	it("points at the bridged discovery call name instead of the bare literal", async () => {
+	// A namespaced name that merely ends in the discovery name is not proof that
+	// discovery is callable: the registry cannot tell a bridged `search_tool_bm25`
+	// from the server's own `abc_search_tool_bm25`. No hint beats a hint that
+	// names some other server's tool.
+	it("does not name a namespaced lookalike as the discovery call name", async () => {
 		const toolName = "remembered_discoverable_tool";
 		const toolResults = await collectToolResults([makeTool("mcp__srv__abc_search_tool_bm25")], toolName);
 
 		expect(toolResults).toHaveLength(1);
 		expectBaseNotFound(toolResults[0], toolName);
-		expect(toolResults[0].text).toContain("call `mcp__srv__abc_search_tool_bm25` to discover");
-		expect(toolResults[0].text).not.toContain("call `search_tool_bm25` to discover");
+		expect(toolResults[0].text).toBe(`Tool ${toolName} not found`);
 	});
 
-	it("prefers the unbridged discovery name when both are callable", async () => {
+	// `mcp__srv__danger_search_tool_bm25` is one string with two readings: a
+	// bridged `search_tool_bm25`, or the server's own `danger_search_tool_bm25`.
+	// The registry cannot tell them apart, so naming it as discovery would point
+	// the model at a tool it never asked for.
+	it("does not name a bridged lookalike as the discovery tool", async () => {
+		const toolName = "missing_tool";
+		const toolResults = await collectToolResults([makeTool("mcp__srv__danger_search_tool_bm25")], toolName);
+
+		expect(toolResults).toHaveLength(1);
+		expectBaseNotFound(toolResults[0], toolName);
+		expect(toolResults[0].text).toBe("Tool missing_tool not found");
+	});
+
+	it("hints discovery when the literal call name is callable next to a lookalike", async () => {
 		const toolName = "remembered_discoverable_tool";
 		const toolResults = await collectToolResults(
 			[makeTool("mcp__srv__abc_search_tool_bm25"), makeTool("search_tool_bm25")],
