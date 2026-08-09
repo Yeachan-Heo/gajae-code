@@ -414,13 +414,17 @@ export class ChatDaemonRuntime {
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
 	/**
-	 * The sequence an attachment failed to publish, with how many rounds have tried it.
+	 * The frame an attachment failed to publish, with how many rounds have tried it.
 	 *
 	 * Keyed by session rather than by attachment because the retire-and-rebuild a refused
 	 * publication triggers replaces the attachment: the count has to outlive it, or a
-	 * surface that is down for good would rebuild from the same sequence forever.
+	 * surface that is down for good would rebuild from the same sequence forever. It does
+	 * not outlive the stream, though: a sequence names a frame only within one endpoint
+	 * generation, so a rolled endpoint reopens a sequence space whose first frame nothing
+	 * has ever been offered. Charging it for what an earlier generation's frame cost would
+	 * concede it after a single refusal.
 	 */
-	readonly #undelivered = new Map<string, { seq: number; attempts: number }>();
+	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
 	readonly #reviving = new Set<string>();
 	#reconcileTail: Promise<void> = Promise.resolve();
 
@@ -912,7 +916,7 @@ export class ChatDaemonRuntime {
 	 */
 	#failDelivery(attached: AttachedSession, seq: number, error: unknown): void {
 		const previous = this.#undelivered.get(attached.sessionId);
-		const attempts = previous?.seq === seq ? previous.attempts + 1 : 1;
+		const attempts = previous?.generation === attached.generation && previous.seq === seq ? previous.attempts + 1 : 1;
 		const reason = error instanceof Error ? error.message : String(error);
 		if (attempts >= DELIVERY_ATTEMPT_LIMIT) {
 			this.#undelivered.delete(attached.sessionId);
@@ -922,7 +926,7 @@ export class ChatDaemonRuntime {
 			);
 			return;
 		}
-		this.#undelivered.set(attached.sessionId, { seq, attempts });
+		this.#undelivered.set(attached.sessionId, { generation: attached.generation, seq, attempts });
 		this.#failBarrier(attached, `publication failed at seq ${seq} (${reason})`);
 	}
 

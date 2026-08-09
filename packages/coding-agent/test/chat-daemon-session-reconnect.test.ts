@@ -1196,3 +1196,54 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 		});
 	});
 }, 20_000);
+
+test("a rolled endpoint's first frame gets its own delivery budget, not the previous generation's", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile, supersede }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			// Two rounds spent on this generation's seq 1 — one short of conceding it.
+			provider.failPosts = 2;
+			host.emit("old one");
+			await awaitRefusals(provider, 1);
+			await Bun.sleep(50);
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitRefusals(provider, 2);
+			await Bun.sleep(50);
+
+			// The endpoint rolls, so the replacement attachment opens a fresh sequence space
+			// whose seq 1 is a different frame. The rounds the old stream spent buy it
+			// nothing: charging them here would concede a frame refused exactly once.
+			await supersede();
+			host.roll();
+			provider.failPosts = 1;
+			reconcile();
+			host.accept(await awaitSocket(3));
+			await awaitReplayRequests(host, 3);
+			host.emit("new one");
+			await awaitRefusals(provider, 3);
+			await Bun.sleep(50);
+			expect(warnings.filter(line => line.includes("conceded seq"))).toEqual([]);
+			expect(warnings).toContain(
+				`chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`,
+			);
+
+			// Refused once, so it still sits above the cursor and the rebuild re-serves it.
+			reconcile();
+			host.accept(await awaitSocket(4));
+			await awaitPosts(provider, 1);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\nnew one"]);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+			]);
+		});
+	});
+}, 20_000);
