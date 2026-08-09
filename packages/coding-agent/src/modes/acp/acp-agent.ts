@@ -2499,10 +2499,12 @@ export class AcpAgent implements Agent {
 	 * Publication runs straight off the connection instead of through
 	 * {@link AcpAgent.#publishSessionUpdate}: that helper fails the session and deletes its
 	 * record on the first rejected frame, which turns every later close into a silent no-op
-	 * and would strand every call queued behind the first refusal.
+	 * and would strand every call queued behind the first refusal. The direct path still
+	 * checks session ownership before every frame so a concurrent `session/close` stops it.
 	 */
 	async #closeReplayToolCall(
 		id: string,
+		expectedAdapter: AcpSdkAdapter,
 		cwd: string,
 		toolCallId: string,
 		tool: { name: string; args: unknown },
@@ -2519,8 +2521,11 @@ export class AcpAgent implements Agent {
 				} as never,
 				id,
 				{ cwd, getToolArgs: () => tool.args },
-			))
+			)) {
+				const record = this.#sessions.get(id);
+				if (!record || record.adapter !== expectedAdapter) return undefined;
 				await this.#connection.sessionUpdate(notification);
+			}
 			return undefined;
 		} catch (error) {
 			return this.#frameProcessingFailure(error);
@@ -2537,13 +2542,14 @@ export class AcpAgent implements Agent {
 	 */
 	async #closeOpenReplayToolCalls(
 		id: string,
+		adapter: AcpSdkAdapter,
 		cwd: string,
 		replayTools: Map<string, { name: string; args: unknown }>,
 		reason: string,
 	): Promise<UnclosedReplayToolCalls> {
 		const unclosed: UnclosedReplayToolCalls = { unclosedToolCallIds: [], failures: [] };
 		for (const [toolCallId, tool] of [...replayTools]) {
-			const failure = await this.#closeReplayToolCall(id, cwd, toolCallId, tool, reason);
+			const failure = await this.#closeReplayToolCall(id, adapter, cwd, toolCallId, tool, reason);
 			if (failure === undefined) {
 				replayTools.delete(toolCallId);
 				continue;
@@ -2570,11 +2576,10 @@ export class AcpAgent implements Agent {
 		// client's view of these calls with it: nothing is left to observe a `pending` one,
 		// and a frame carrying a closed session id is one the client asked to stop receiving.
 		// The obligation ends where the session ends; the next `session/load` replays the same
-		// transcript rows from scratch. Read once here rather than at each exit, because
-		// `#closeReplayToolCall` bypasses `#publishSessionUpdate` on purpose — so its own
-		// failures cannot silence the calls behind it — and therefore cannot notice the
-		// session is gone. `#sessionState` reports that missing session to the caller more
-		// accurately than any replay failure about it would.
+		// transcript rows from scratch. The boundary check avoids entering cleanup for an
+		// already-closed session, while `#closeReplayToolCall` repeats the ownership check before
+		// each direct publication so a close during cleanup stops the remaining frames without
+		// restoring the failure side effects that used to silence calls behind a refused close.
 		if (this.#sessions.get(id)?.adapter !== adapter) return;
 		// The one boundary that closes replayed tool calls, covering every way the replay body
 		// can end: normal return, early exit, or a `transcript.list` page that throws. Whatever
@@ -2582,6 +2587,7 @@ export class AcpAgent implements Agent {
 		// spinning at `pending` for the life of the session.
 		const unclosed = await this.#closeOpenReplayToolCalls(
 			id,
+			adapter,
 			record.cwd,
 			replayTools,
 			replayFailure === undefined ? TRANSCRIPT_TOOL_CALL_UNRESOLVED : TRANSCRIPT_REPLAY_INTERRUPTED,
@@ -2648,6 +2654,7 @@ export class AcpAgent implements Agent {
 					if (unresolvedId !== undefined && unresolved) {
 						const failure = await this.#closeReplayToolCall(
 							id,
+							adapter,
 							record.cwd,
 							unresolvedId,
 							unresolved,
@@ -2756,6 +2763,7 @@ export class AcpAgent implements Agent {
 						// refused close is retried and named by the boundary instead of dropped here.
 						const failure = await this.#closeReplayToolCall(
 							id,
+							adapter,
 							record.cwd,
 							message.toolCallId,
 							replayTool,
