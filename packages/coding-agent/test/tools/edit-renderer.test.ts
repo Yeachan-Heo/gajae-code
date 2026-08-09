@@ -114,11 +114,9 @@ describe("editToolRenderer", () => {
 			"b",
 		]);
 		expect(
-			getEditRequestTargetInventory(
-				{ path: "fallback.ts", input: "§actual.ts\n»BOF\n+x" },
-				"hashline",
-				{ isPartial: true },
-			).paths,
+			getEditRequestTargetInventory({ path: "fallback.ts", input: "§actual.ts\n»BOF\n+x" }, "hashline", {
+				isPartial: true,
+			}).paths,
 		).toEqual(["actual.ts"]);
 		expect(
 			getEditRequestTargetInventory(
