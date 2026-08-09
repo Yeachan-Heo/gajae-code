@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ExtensionAPI } from "../../extensibility/extensions";
 import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
@@ -256,6 +257,237 @@ describe("SessionSdkSessionRuntime", () => {
 			await handlers.get("session_shutdown")?.({}, firstContext);
 			expect(transports[1]?.stops).toBe(1);
 		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+});
+interface PreflightHooks {
+	onPreflightAccepted?: () => void;
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+}
+
+interface ResponseFrame {
+	id?: string;
+	ok?: boolean;
+	result?: { status?: string; commandId?: string; turnId?: string; error?: { code: string; message: string } };
+}
+
+interface InvocationHarness {
+	control(operation: string, input: Record<string, unknown>): Promise<ResponseFrame>;
+	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
+	emit(event: string): Promise<void>;
+	stop(): Promise<void>;
+}
+
+/**
+ * Drives the SDK host through its wire surface: control/query frames in,
+ * response frames out. Nothing reaches into the reconciliation maps.
+ */
+async function invocationHarness(
+	sessionId: string,
+	cwd: string,
+	hooks: {
+		sendUserMessage?: (content: unknown, options?: PreflightHooks & { deliverAs?: string }) => Promise<void>;
+		invokeSkill?: (name: string, args?: string, options?: PreflightHooks) => Promise<unknown>;
+		abort?: () => void;
+	},
+): Promise<InvocationHarness> {
+	const waiters = new Map<string, (frame: ResponseFrame) => void>();
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>();
+	let deliver: ((connectionId: string, frame: SdkFrame) => void) | undefined;
+	let nextId = 0;
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		sendUserMessage: hooks.sendUserMessage ?? (async () => {}),
+	} as unknown as ExtensionAPI;
+	createSdkSessionRuntimeExtension(api, {
+		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
+			sessionId: id,
+			stateRoot,
+			token,
+			onFrame(handler) {
+				deliver = handler;
+				return () => {
+					if (deliver === handler) deliver = undefined;
+				};
+			},
+			sendFrame(_connectionId, frame) {
+				const response = frame as ResponseFrame;
+				if (typeof response.id === "string") waiters.get(response.id)?.(response);
+			},
+			broadcastFrame: () => {},
+			start: async () => ({ url: "ws://127.0.0.1:1" }),
+			stop: async () => {},
+		}),
+	});
+	const ctx = {
+		cwd,
+		workflowGate: undefined,
+		sdkBindings: () => (hooks.invokeSkill ? ["invokeSkill"] : []),
+		isIdle: () => true,
+		abort: hooks.abort ?? (() => {}),
+		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
+		sessionManager: { getSessionId: () => sessionId, getSessionName: () => undefined },
+	};
+	await handlers.get("session_start")?.({}, ctx);
+	const request = (frame: Record<string, unknown>): Promise<ResponseFrame> => {
+		const id = `frame-${(nextId += 1)}`;
+		const { promise, resolve } = Promise.withResolvers<ResponseFrame>();
+		waiters.set(id, resolve);
+		deliver?.("client", { ...frame, id } as SdkFrame);
+		return promise;
+	};
+	return {
+		control: (operation, input) => request({ type: "control_request", operation, input }),
+		query: (name, input) => request({ type: "query_request", query: name, input }),
+		emit: async event => {
+			await handlers.get(event)?.({}, ctx);
+		},
+		stop: async () => {
+			await handlers.get("session_shutdown")?.({}, ctx);
+		},
+	};
+}
+
+/** Polls a status query until the invocation reports a terminal reconciliation state. */
+async function settledStatus(
+	harness: InvocationHarness,
+	name: string,
+	input: Record<string, unknown>,
+): Promise<NonNullable<ResponseFrame["result"]>> {
+	for (let attempt = 0; attempt < 200; attempt += 1) {
+		const frame = await harness.query(name, input);
+		const result = frame.result;
+		if (result && (result.status === "failed" || result.status === "terminal_ok")) return result;
+		await Bun.sleep(1);
+	}
+	throw new Error(`${name} never reported a terminal reconciliation status`);
+}
+
+describe("post-acceptance invocation terminalization", () => {
+	test("a prompt killed by a provider stream interrupt reports a terminal failed status", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-"));
+		try {
+			const harness = await invocationHarness("terminalize-prompt", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					throw Object.assign(
+						new Error("upstream request failed: stream interrupted before terminal response event"),
+						{ code: "upstream_stream_interrupted" },
+					);
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const { commandId, turnId } = accepted.result ?? {};
+			// Provider text is redacted on the wire by contract (sanitizePromptFailure);
+			// the failure reason survives as the safe-token code.
+			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
+				status: "failed",
+				error: { code: "upstream_stream_interrupted", message: "Prompt submission failed." },
+			});
+			await harness.stop();
+		} finally {
+			// Let the reconciliation store finish its atomic write before the state root disappears.
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("an aborted prompt reports a terminal failed status instead of hanging", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-abort-"));
+		try {
+			const inflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("terminalize-abort", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await inflight.promise;
+				},
+				abort: () => inflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" })),
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			const { commandId, turnId } = accepted.result ?? {};
+			expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true });
+			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
+				status: "failed",
+				error: { code: "aborted" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed skill invocation still reports a terminal failed status", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-skill-"));
+		try {
+			const harness = await invocationHarness("terminalize-skill", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					throw Object.assign(new Error("skill provider stream interrupted"), { code: "upstream_error" });
+				},
+			});
+			const accepted = await harness.control("skill.invoke", { name: "ralplan" });
+			expect(accepted.ok).toBe(true);
+			const { commandId, turnId } = accepted.result ?? {};
+			expect(await settledStatus(harness, "skill.invoke_status", { commandId, turnId })).toMatchObject({
+				status: "failed",
+				error: { code: "upstream_error" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a pre-acceptance failure rejects the submission without creating a record", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-preflight-"));
+		try {
+			const harness = await invocationHarness("terminalize-preflight", cwd, {
+				sendUserMessage: async () => {
+					throw Object.assign(new Error("session is busy"), { code: "busy" });
+				},
+			});
+			const rejected = await harness.control("turn.prompt", { text: "hello", clientRef: "preflight-ref" });
+			expect(rejected.ok).toBe(false);
+			const status = await harness.query("turn.prompt_status", { clientRef: "preflight-ref" });
+			expect(status.result).toEqual({ status: "unknown" });
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a later provider error never overwrites an already terminal prompt", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-once-"));
+		try {
+			const inflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("terminalize-once", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await inflight.promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			const { commandId, turnId } = accepted.result ?? {};
+			await harness.emit("agent_start");
+			await harness.emit("agent_end");
+			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
+				status: "terminal_ok",
+			});
+			inflight.reject(Object.assign(new Error("late provider failure"), { code: "upstream_error" }));
+			await Bun.sleep(20);
+			const settled = await harness.query("turn.prompt_status", { commandId, turnId });
+			expect(settled.result?.status).toBe("terminal_ok");
+			expect(settled.result?.error).toBeUndefined();
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});

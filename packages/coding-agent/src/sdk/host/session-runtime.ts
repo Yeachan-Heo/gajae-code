@@ -994,8 +994,11 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
-						if (kind === "skill")
-							void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
+						// The submission promise rejects after preflight acceptance only when the
+						// work itself is over (provider stream interrupt, abort, queue failure).
+						// Every kind must terminalize here or the record stays non-terminal
+						// forever; `noteTransition` ignores an already-terminal record.
+						void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 						return;
 					}
 					settled = true;
