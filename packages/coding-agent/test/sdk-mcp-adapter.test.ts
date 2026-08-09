@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
+import { Broker } from "../src/sdk/broker/broker";
 import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createSdkMcpServer } from "../src/sdk/mcp";
@@ -120,6 +121,30 @@ test("MCP lifecycle responses never expose broker endpoint credentials", async (
 	});
 	expect(result).toEqual({ ok: true, result: { sessionId: "created-session" } });
 	expect(JSON.stringify(result)).not.toContain("secret");
+});
+
+test("MCP invalid readiness budgets reach broker validation before client deadlines", async () => {
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-mcp-invalid-readiness-"));
+	dirs.push(repo);
+	const agentDir = path.join(repo, "agent");
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		const result = await createSdkMcpServer({ repo, agentDir }).callTool("gjc_session_global", {
+			operation: "session.create",
+			input: { cwd: repo, readinessTimeoutMs: -1_000 },
+			idempotencyKey: "invalid-readiness",
+		});
+		expect(result).toEqual({
+			ok: false,
+			error: {
+				code: "invalid_input",
+				message: "readinessTimeoutMs must be an integer between 4000 and 60000.",
+			},
+		});
+	} finally {
+		await broker.stop();
+	}
 });
 
 test("MCP global schema exposes and requires caller lifecycle idempotency keys", async () => {

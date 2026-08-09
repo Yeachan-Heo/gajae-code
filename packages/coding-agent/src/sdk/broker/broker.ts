@@ -565,6 +565,7 @@ export type StartupAdmissionResult<T> =
 
 interface StartupAdmissionWaiter {
 	state: "waiting" | "admitted" | "timed_out" | "refused";
+	admissionEpoch?: number;
 	ready: PromiseWithResolvers<void>;
 }
 
@@ -578,6 +579,7 @@ export function sdkHostStartupConcurrency(availableParallelism = os.availablePar
 export class StartupAdmissionQueue {
 	#inFlight = 0;
 	#closed = false;
+	#epoch = 0;
 	#waiters: StartupAdmissionWaiter[] = [];
 
 	constructor(readonly limit: number) {
@@ -612,23 +614,27 @@ export class StartupAdmissionQueue {
 		]);
 		if (outcome === "timed_out") return { status: "admission_timeout", reason: "admission_timeout" };
 		if (outcome === "refused") return { status: "admission_refused", reason: "admission_refused" };
-		return this.#runGranted(timing, task);
+		return this.#runGranted(waiter.admissionEpoch!, timing, task);
 	}
 
 	async #runAdmitted<T>(
 		timing: StartupAdmissionTiming,
 		task: (admittedAt: number) => Promise<T>,
 	): Promise<StartupAdmissionResult<T>> {
+		const admissionEpoch = this.#epoch;
 		this.#inFlight += 1;
-		return this.#runGranted(timing, task);
+		return this.#runGranted(admissionEpoch, timing, task);
 	}
 
 	async #runGranted<T>(
+		admissionEpoch: number,
 		timing: StartupAdmissionTiming,
 		task: (admittedAt: number) => Promise<T>,
 	): Promise<StartupAdmissionResult<T>> {
-		const admittedAt = timing.now();
 		try {
+			const admittedAt = timing.now();
+			if (this.#closed || admissionEpoch !== this.#epoch)
+				return { status: "admission_refused", reason: "admission_refused" };
 			return { status: "completed", admittedAt, value: await task(admittedAt) };
 		} finally {
 			this.#inFlight -= 1;
@@ -637,11 +643,13 @@ export class StartupAdmissionQueue {
 	}
 
 	#grantNext(): void {
+		if (this.#closed) return;
 		while (this.#inFlight < this.limit) {
 			const waiter = this.#waiters.shift();
 			if (!waiter) return;
 			if (waiter.state !== "waiting") continue;
 			waiter.state = "admitted";
+			waiter.admissionEpoch = this.#epoch;
 			this.#inFlight += 1;
 			waiter.ready.resolve();
 		}
@@ -650,16 +658,24 @@ export class StartupAdmissionQueue {
 	/**
 	 * Refuse every queued startup and every later one. A broker that can no longer
 	 * prove it owns the published root must not spawn children through slots that
-	 * free up after it stops, and a waiter must never be silently granted or left
-	 * pending, so each one is woken with an explicit non-success outcome.
+	 * free up while it is fenced. The epoch also invalidates a waiter that was
+	 * granted but has not crossed the task execution boundary yet.
 	 */
 	close(): void {
+		if (this.#closed) return;
 		this.#closed = true;
+		this.#epoch += 1;
 		for (const waiter of this.#waiters.splice(0)) {
 			if (waiter.state !== "waiting") continue;
 			waiter.state = "refused";
 			waiter.ready.resolve();
 		}
+	}
+
+	/** Accept later startups after fresh publication ownership has been proven. */
+	reopen(): void {
+		this.#closed = false;
+		this.#grantNext();
 	}
 }
 type BrokerPublicationState =
@@ -959,6 +975,7 @@ export class Broker {
 	#fence(kind: "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous"): void {
 		if (this.#publicationState === "stopping") return;
 		this.#publicationState = kind;
+		this.#startupAdmissions.close();
 		if (kind === "suspect-unpublished") {
 			this.#lossAt ??= process.hrtime.bigint();
 			this.#ambiguousAt = null;
@@ -991,14 +1008,14 @@ export class Broker {
 			return;
 		}
 		if (observation === "owned") {
-			if (this.#publicationState === "heartbeat-ambiguous") {
-				if (writeHeartbeat) await this.#writeHeartbeat();
+			if (writeHeartbeat) {
+				await this.#writeHeartbeat();
 				return;
 			}
 			this.#publicationState = "healthy-owned";
+			this.#startupAdmissions.reopen();
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
-			if (writeHeartbeat) await this.#writeHeartbeat();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
@@ -1017,6 +1034,7 @@ export class Broker {
 			return;
 		}
 		this.#publicationState = "healthy-owned";
+		this.#startupAdmissions.reopen();
 		this.#lossAt = null;
 		this.#ambiguousAt = null;
 		this.discovery = { ...this.discovery, heartbeatAt };

@@ -1,5 +1,18 @@
 /** Readiness budget the broker grants a lifecycle request that does not size one itself. */
 export const DEFAULT_READINESS_TIMEOUT_MS = 10_000;
+export const MIN_READINESS_TIMEOUT_MS = 4_000;
+export const MAX_READINESS_TIMEOUT_MS = 60_000;
+
+export function isValidReadinessTimeoutMs(value: unknown): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		value >= MIN_READINESS_TIMEOUT_MS &&
+		value <= MAX_READINESS_TIMEOUT_MS
+	);
+}
+
+export const READINESS_TIMEOUT_INVALID_MESSAGE = `readinessTimeoutMs must be an integer between ${MIN_READINESS_TIMEOUT_MS} and ${MAX_READINESS_TIMEOUT_MS}.`;
 
 /**
  * Slack a caller adds over the broker-side budget so that a startup which runs to the
@@ -50,7 +63,8 @@ export function lifecycleStartupBudgetMs(requestedReadinessTimeoutMs: number): n
  */
 export function lifecycleRequestTimeoutMs(operation: string, input: Record<string, unknown>): number | undefined {
 	const requested = input.readinessTimeoutMs;
-	const supplied = typeof requested === "number" && Number.isSafeInteger(requested) ? requested : undefined;
+	if (requested !== undefined && !isValidReadinessTimeoutMs(requested)) return undefined;
+	const supplied = requested as number | undefined;
 	if (isStartupLifecycleOperation(operation))
 		return lifecycleStartupBudgetMs(supplied ?? DEFAULT_READINESS_TIMEOUT_MS) + CALLER_DEADLINE_SLACK_MS;
 	return supplied === undefined ? undefined : supplied + CALLER_DEADLINE_SLACK_MS;
