@@ -31,7 +31,7 @@ import { replaceTabs, truncateToWidth } from "../tools/render-utils";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { computeEditDiff, type DiffError, type DiffResult } from "./diff";
 import { type ApplyPatchEntry, expandApplyPatchToEntries, expandApplyPatchToPreviewEntries } from "./modes/apply-patch";
-import { computePatchDiff, type PatchEditEntry } from "./modes/patch";
+import { computePatchDiff, type Operation, type PatchEditEntry } from "./modes/patch";
 import type { ReplaceEditEntry } from "./modes/replace";
 
 export interface PerFileDiffPreview {
@@ -76,6 +76,10 @@ export interface EditStreamingStrategy<Args = unknown> {
 }
 export interface EditRequestTargetInventory {
 	paths: string[];
+	/** Operation of the first target (Create/Delete) when derivable from the
+	 * request payload (apply_patch/hashline free-form envelopes carry op on the
+	 * parsed entry, not on the top-level args). */
+	firstOp?: Operation;
 	parseError?: string;
 }
 const MISSING_APPLY_PATCH_END_ERROR = `The last line of the patch must be '${END_PATCH_MARKER}'`;
@@ -156,12 +160,16 @@ export function getEditRequestTargetInventory(
 	if (editMode === "apply_patch") {
 		const input = typeof values.input === "string" ? values.input : "";
 		try {
-			return { paths: orderedDistinctPaths(expandApplyPatchToEntries({ input }).map(entry => entry.path)) };
+			const entries = expandApplyPatchToEntries({ input });
+			return { paths: orderedDistinctPaths(entries.map(entry => entry.path)), firstOp: entries[0]?.op };
 		} catch (err) {
 			const parseError = err instanceof Error ? err.message : String(err);
-			const paths = orderedDistinctPaths(expandApplyPatchToPreviewEntries({ input }).map(entry => entry.path));
-			if (options.isPartial && parseError === MISSING_APPLY_PATCH_END_ERROR) return { paths };
-			return { paths, parseError };
+			const previewEntries = expandApplyPatchToPreviewEntries({ input });
+			const paths = orderedDistinctPaths(previewEntries.map(entry => entry.path));
+			if (options.isPartial && parseError === MISSING_APPLY_PATCH_END_ERROR) {
+				return { paths, firstOp: previewEntries[0]?.op };
+			}
+			return { paths, firstOp: previewEntries[0]?.op, parseError };
 		}
 	}
 

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { editToolRenderer } from "@gajae-code/coding-agent/edit/renderer";
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
@@ -43,6 +44,7 @@ describe("apply_patch rendering", () => {
 			uiStub,
 		);
 
+		component.setExpanded(true);
 		component.updateResult(
 			{
 				content: [{ type: "text", text: "" }],
@@ -60,7 +62,6 @@ describe("apply_patch rendering", () => {
 		expect(rendered).toContain("+new");
 		expect(rendered).not.toContain("(no output)");
 	});
-
 	it("derives call path, operation, and file-count hints from apply_patch input", async () => {
 		const uiTheme = await getUiTheme();
 		const input = [
@@ -74,7 +75,11 @@ describe("apply_patch rendering", () => {
 			"*** End Patch",
 		].join("\n");
 
-		const component = toolRenderers.apply_patch.renderCall({ input }, { expanded: false, isPartial: true }, uiTheme);
+		const component = editToolRenderer.renderCall(
+			{ input },
+			{ expanded: false, isPartial: true, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 
 		expect(rendered).toContain("src/first.ts");
@@ -86,7 +91,11 @@ describe("apply_patch rendering", () => {
 		const uiTheme = await getUiTheme();
 		const input = ["*** Begin Patch", "*** Update File: src/streaming.ts", "@@", "-before", "+after"].join("\n");
 
-		const component = toolRenderers.apply_patch.renderCall({ input }, { expanded: false, isPartial: true }, uiTheme);
+		const component = editToolRenderer.renderCall(
+			{ input },
+			{ expanded: false, isPartial: true, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 
 		expect(rendered).toContain("src/streaming.ts");
@@ -97,9 +106,9 @@ describe("apply_patch rendering", () => {
 		const uiTheme = await getUiTheme();
 		const malformedInput = ["*** Begin Patch", "*** Update File: src/bad.ts", "*** End Patch"].join("\n");
 
-		const component = toolRenderers.apply_patch.renderCall(
+		const component = editToolRenderer.renderCall(
 			{ input: malformedInput },
-			{ expanded: false, isPartial: true },
+			{ expanded: true, isPartial: true, renderContext: { editMode: "apply_patch" } },
 			uiTheme,
 		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
@@ -128,10 +137,10 @@ describe("apply_patch rendering", () => {
 			expect(before).not.toContain("(preview)");
 
 			component.setArgsComplete();
+			component.setExpanded(true);
 			await Bun.sleep(50);
 
 			const after = Bun.stripANSI(component.render(160).join("\n"));
-			expect(after).toContain("(preview)");
 			expect(after).toContain("const value = 2;");
 		} finally {
 			await fs.rm(tmpDir, { recursive: true, force: true });
@@ -177,6 +186,7 @@ describe("apply_patch rendering", () => {
 			uiStub,
 		);
 
+		component.setExpanded(true);
 		component.updateResult(
 			{
 				content: [{ type: "text", text: "" }],

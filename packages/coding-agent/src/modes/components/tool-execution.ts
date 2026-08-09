@@ -500,7 +500,21 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	#captureLogicalVisibleProjection(): string {
-		return this.render(10_000).join("\n");
+		const rendered = this.render(10_000).join("\n");
+		// The sticky-viewport source tracks semantic transcript output, not just
+		// the literal pixels. A result-first collapsed edit card intentionally
+		// hides in-flight diff previews, so preview resolution changes the
+		// rendered text by nothing — yet it is still semantic progress the
+		// viewport must re-anchor on (the preview becomes visible the moment the
+		// user expands, and downstream snapshot/replay keys off this revision).
+		// Fold a compact fingerprint of resolved-preview state into the logical
+		// projection so it advances independently of the sparse collapsed render.
+		const preview = this.#editDiffPreview;
+		if (!preview || preview.length === 0) return rendered;
+		const fingerprint = preview
+			.map(file => `${file.path}:${file.diff ? "1" : "0"}:${file.firstChangedLine ?? ""}:${file.error ? "1" : "0"}`)
+			.join("|");
+		return `${rendered}\u0000preview:${fingerprint}`;
 	}
 
 	#markVisibleMutationIfChanged(notify = false): void {

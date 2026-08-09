@@ -126,6 +126,21 @@ describe("editToolRenderer", () => {
 			).paths,
 		).toEqual(["a", "b"]);
 	});
+	it("derives the live-card operation from free-form apply_patch envelopes", async () => {
+		const uiTheme = await getUiTheme();
+		const create = editToolRenderer.renderCall(
+			{ input: "*** Begin Patch\n*** Add File: a.ts\n+body\n*** End Patch" },
+			{ expanded: false, isPartial: false, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+		const del = editToolRenderer.renderCall(
+			{ input: "*** Begin Patch\n*** Delete File: a.ts\n*** End Patch" },
+			{ expanded: false, isPartial: false, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+		expect(Bun.stripANSI(create.render(160).join("\n"))).toContain("Create");
+		expect(Bun.stripANSI(del.render(160).join("\n"))).toContain("Delete");
+	});
 
 	it("uses hashline input headers for streaming call path without apply_patch errors", async () => {
 		const uiTheme = await getUiTheme();
