@@ -106,6 +106,28 @@ describe("session HTML export fidelity", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+	it.skipIf(process.platform === "win32")("rejects hard-link output without modifying the transcript", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-hardlink-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+			await session.ensureOnDisk();
+			await session.flush();
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session");
+			const outputPath = path.join(tempDir, "transcript-hardlink.html");
+			fs.linkSync(sessionFile, outputPath);
+			const before = fs.readFileSync(sessionFile);
+			await expect(exportSessionToHtml(session, undefined, { outputPath })).rejects.toThrow(
+				"must not overwrite the source transcript",
+			);
+			expect(fs.readFileSync(sessionFile)).toEqual(before);
+			await session.close();
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	it("streams an enabled cold session without hydrating retired history", async () => {
 		const tempDir = path.join(os.tmpdir(), `gjc-html-export-cold-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
