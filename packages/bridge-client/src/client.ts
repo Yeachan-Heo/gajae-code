@@ -48,20 +48,27 @@ export type SdkFrameHandler = (frame: SdkFrame) => void;
 export type SdkReconnectHandler = () => void;
 export type SdkReconnectFailedHandler = (error: SdkClientError) => void;
 
-export type SdkAtomicSubmission =
+/** One ordered operation submitted after durable client-side create orchestration. */
+export type SdkDurableSubmission =
 	| { kind: "prompt"; text: string; images?: unknown; clientRef: string }
 	| { kind: "skill"; name: string; args?: unknown; clientRef: string };
 
-export interface SdkAtomicCreateConnectSubmitInput {
+/**
+ * Durable client-side orchestration input. The create key and submission reference
+ * are durable in their respective authorities; restart recovery reconciles them.
+ * This is not a single-authority transactional atomicity guarantee across failure.
+ */
+export interface SdkDurableCreateConnectSubmitInput {
 	create: Record<string, unknown>;
 	createIdempotencyKey: string;
-	submission: SdkAtomicSubmission;
+	submission: SdkDurableSubmission;
 	timeoutMs?: number;
 	replaySinceGeneration?: number;
 	replaySinceSeq?: number;
 }
 
-export interface SdkAtomicLookupIdentity {
+/** Safe, canonical recovery identity without endpoint or create credentials. */
+export interface SdkDurableLookupIdentity {
 	version: 1;
 	operation: "session.create";
 	createIdempotencyKey: string;
@@ -69,20 +76,21 @@ export interface SdkAtomicLookupIdentity {
 	sessionId?: string;
 	endpointGeneration?: number;
 	endpointIncarnation?: string;
-	submission: { kind: SdkAtomicSubmission["kind"]; clientRef: string };
+	submission: { kind: SdkDurableSubmission["kind"]; clientRef: string };
 	commandId?: string;
 	turnId?: string;
 }
 
-export type SdkAtomicResult =
-	| { kind: "accepted"; sessionId: string; identity: SdkAtomicLookupIdentity; receipt: Record<string, unknown> }
-	| { kind: "reconciled"; identity: SdkAtomicLookupIdentity; status: Record<string, unknown> }
+/** Durable client-side orchestration outcome, including reconciliation-required uncertainty. */
+export type SdkDurableResult =
+	| { kind: "accepted"; sessionId: string; identity: SdkDurableLookupIdentity; receipt: Record<string, unknown> }
+	| { kind: "reconciled"; identity: SdkDurableLookupIdentity; status: Record<string, unknown> }
 	| {
 			kind: "create_uncertain" | "attachment_uncertain" | "subscription_uncertain" | "submission_uncertain";
-			identity: SdkAtomicLookupIdentity;
+			identity: SdkDurableLookupIdentity;
 			prohibitResubmission: true;
 	  }
-	| { kind: "failed"; error: { code: SdkErrorCode; message: string }; identity?: SdkAtomicLookupIdentity };
+	| { kind: "failed"; error: { code: SdkErrorCode; message: string }; identity?: SdkDurableLookupIdentity };
 
 type Frame = SdkFrame;
 type Cycle = {
@@ -171,9 +179,55 @@ function validNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
 }
 
-function atomicIdentity(input: SdkAtomicCreateConnectSubmitInput): SdkAtomicLookupIdentity {
-	if (!input.create || typeof input.create !== "object" || Array.isArray(input.create))
-		throw new SdkClientError("invalid_input", "Atomic create input must be an object.");
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function canonicalRecoveryCreate(create: Record<string, unknown>): Record<string, unknown> {
+	const recoveryFields = new Set([
+		"cwd",
+		"path",
+		"target",
+		"stateRoot",
+		"modelPreset",
+		"mcpServers",
+		"worktree",
+		"readiness",
+		"readinessTimeoutMs",
+		"coordinatorStateDir",
+		"coordinatorSessionId",
+		"coordinatorSessionBranch",
+	]);
+	const canonicalize = (value: unknown, seen: Set<object>): unknown => {
+		if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+		if (typeof value === "number") {
+			if (!Number.isFinite(value)) throw new SdkClientError("invalid_input", "Create input must be JSON-safe.");
+			return value;
+		}
+		if (Array.isArray(value)) {
+			if (seen.has(value)) throw new SdkClientError("invalid_input", "Create input must not be cyclic.");
+			seen.add(value);
+			const result = value.map(item => canonicalize(item, seen));
+			seen.delete(value);
+			return result;
+		}
+		if (!isRecord(value)) throw new SdkClientError("invalid_input", "Create input must be JSON-safe.");
+		if (seen.has(value)) throw new SdkClientError("invalid_input", "Create input must not be cyclic.");
+		seen.add(value);
+		const result: Record<string, unknown> = {};
+		for (const key of Object.keys(value).sort()) result[key] = canonicalize(value[key], seen);
+		seen.delete(value);
+		return result;
+	};
+	const result: Record<string, unknown> = {};
+	for (const key of Object.keys(create).sort()) {
+		if (recoveryFields.has(key)) result[key] = canonicalize(create[key], new Set());
+	}
+	return result;
+}
+
+function durableIdentity(input: SdkDurableCreateConnectSubmitInput): SdkDurableLookupIdentity {
+	if (!isRecord(input.create)) throw new SdkClientError("invalid_input", "Create input must be an object.");
 	if (!validClientRef(input.createIdempotencyKey))
 		throw new SdkClientError("invalid_input", "createIdempotencyKey must be a trimmed non-empty string.");
 	const submission = input.submission;
@@ -184,25 +238,25 @@ function atomicIdentity(input: SdkAtomicCreateConnectSubmitInput): SdkAtomicLook
 		(submission.kind === "skill" && !validNonEmptyString(submission.name)) ||
 		(submission.kind !== "prompt" && submission.kind !== "skill")
 	)
-		throw new SdkClientError("invalid_input", "Atomic submission is invalid.");
+		throw new SdkClientError("invalid_input", "Submission is invalid.");
 	return {
 		version: 1,
 		operation: "session.create",
 		createIdempotencyKey: input.createIdempotencyKey,
-		create: structuredClone(input.create),
+		create: canonicalRecoveryCreate(input.create),
 		submission: { kind: submission.kind, clientRef: submission.clientRef },
 	};
 }
 
-function validAtomicIdentity(identity: SdkAtomicLookupIdentity): boolean {
+function validDurableIdentity(identity: unknown): identity is SdkDurableLookupIdentity {
+	if (!isRecord(identity) || !isRecord(identity.submission)) return false;
 	return (
 		identity.version === 1 &&
 		identity.operation === "session.create" &&
-		validNonEmptyString(identity.createIdempotencyKey) &&
+		validClientRef(identity.createIdempotencyKey) &&
 		validClientRef(identity.submission.clientRef) &&
-		!!identity.create &&
-		typeof identity.create === "object" &&
-		!Array.isArray(identity.create)
+		(identity.submission.kind === "prompt" || identity.submission.kind === "skill") &&
+		isRecord(identity.create)
 	);
 }
 
@@ -212,16 +266,18 @@ function isKnownLifecycleFailure(error: SdkClientError): boolean {
 	);
 }
 
-function atomicFailure(error: unknown, identity?: SdkAtomicLookupIdentity): SdkAtomicResult {
+function durableFailure(error: unknown, identity?: SdkDurableLookupIdentity): SdkDurableResult {
 	const typed =
-		error instanceof SdkClientError ? error : new SdkClientError("invalid_input", "Atomic input is invalid.");
+		error instanceof SdkClientError
+			? error
+			: new SdkClientError("invalid_input", "Durable orchestration input is invalid.");
 	return { kind: "failed", error: { code: typed.code, message: typed.message }, ...(identity ? { identity } : {}) };
 }
 
 function uncertain(
-	kind: Extract<SdkAtomicResult, { prohibitResubmission: true }>["kind"],
-	identity: SdkAtomicLookupIdentity,
-): SdkAtomicResult {
+	kind: Extract<SdkDurableResult, { prohibitResubmission: true }>["kind"],
+	identity: SdkDurableLookupIdentity,
+): SdkDurableResult {
 	return { kind, identity, prohibitResubmission: true };
 }
 
@@ -242,7 +298,6 @@ function replayReady(
 		replay.lastSeq < sinceSeq
 	)
 		return false;
-	const sequences = new Set<number>();
 	for (const event of [...(replay.events as Frame[]), ...liveEvents]) {
 		if (
 			event.type !== "event" ||
@@ -253,12 +308,10 @@ function replayReady(
 			event.seq <= sinceSeq
 		)
 			return false;
-		sequences.add(event.seq);
 	}
-	const highestSeq = Math.max(replay.lastSeq, ...sequences);
-	for (let sequence = sinceSeq + 1; sequence <= highestSeq; sequence++) {
-		if (!sequences.has(sequence)) return false;
-	}
+	// `lastSeq` is the host's global cursor. Capability-gated events are absent
+	// from this connection's replay, so only an explicit host gap can invalidate
+	// the same-incarnation replay barrier.
 	return true;
 }
 
@@ -407,12 +460,13 @@ export class SdkClient {
 		await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
 	}
 
-	async createConnectSubscribeSubmit(input: SdkAtomicCreateConnectSubmitInput): Promise<SdkAtomicResult> {
-		let identity: SdkAtomicLookupIdentity;
+	/** Durable client-side orchestration; failures recover by reconciliation, not transaction rollback. */
+	async createConnectSubscribeSubmit(input: SdkDurableCreateConnectSubmitInput): Promise<SdkDurableResult> {
+		let identity: SdkDurableLookupIdentity;
 		try {
-			identity = atomicIdentity(input);
+			identity = durableIdentity(input);
 		} catch (error) {
-			return atomicFailure(error);
+			return durableFailure(error);
 		}
 		let created: Record<string, unknown>;
 		try {
@@ -424,7 +478,7 @@ export class SdkClient {
 			);
 		} catch (error) {
 			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
-				? atomicFailure(error, identity)
+				? durableFailure(error, identity)
 				: uncertain("create_uncertain", identity);
 		}
 		const sessionId = stringField(created, "sessionId");
@@ -454,7 +508,7 @@ export class SdkClient {
 			);
 		} catch (error) {
 			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
-				? atomicFailure(error, identity)
+				? durableFailure(error, identity)
 				: uncertain("attachment_uncertain", identity);
 		}
 		const url = stringField(endpoint, "url");
@@ -516,7 +570,7 @@ export class SdkClient {
 			return { kind: "accepted", sessionId, identity, receipt: response };
 		} catch (error) {
 			if (submissionStarted) return uncertain("submission_uncertain", identity);
-			if (error instanceof SdkClientError && isKnownLifecycleFailure(error)) return atomicFailure(error, identity);
+			if (error instanceof SdkClientError && isKnownLifecycleFailure(error)) return durableFailure(error, identity);
 			return uncertain(isConnectionFailure(error) ? "attachment_uncertain" : "subscription_uncertain", identity);
 		} finally {
 			detach();
@@ -524,12 +578,13 @@ export class SdkClient {
 		}
 	}
 
+	/** Reconcile a prior durable client-side orchestration outcome without resubmitting ordered work. */
 	async reconcileCreateConnectSubmit(
-		identity: SdkAtomicLookupIdentity,
+		identity: SdkDurableLookupIdentity,
 		options: SdkRequestOptions = {},
-	): Promise<SdkAtomicResult> {
-		if (!validAtomicIdentity(identity))
-			return atomicFailure(new SdkClientError("invalid_input", "Invalid atomic lookup identity."));
+	): Promise<SdkDurableResult> {
+		if (!validDurableIdentity(identity))
+			return durableFailure(new SdkClientError("invalid_input", "Invalid durable lookup identity."));
 		let recovered = identity;
 		if (!recovered.sessionId) {
 			try {
@@ -553,7 +608,7 @@ export class SdkClient {
 				};
 			} catch (error) {
 				return error instanceof SdkClientError && isKnownLifecycleFailure(error)
-					? atomicFailure(error, recovered)
+					? durableFailure(error, recovered)
 					: uncertain("create_uncertain", recovered);
 			}
 		}

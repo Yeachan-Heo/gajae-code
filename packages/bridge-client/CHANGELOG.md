@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- Renamed the create-connect-submit API contract to durable client-side orchestration. The create key and submission reference remain durable in their existing authorities, and recovery reconciles their composite outcome after restart; the SDK does not promise a single-authority transactional atomic outcome across process failure. Recovery identities now retain only canonical create fields needed for reconciliation and exclude credentials and secrets.
 
 ## [0.12.21] - 2026-08-09
 
