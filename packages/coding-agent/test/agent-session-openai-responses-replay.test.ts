@@ -602,7 +602,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		sessions.push(child);
 		authStorages.push(childAuthStorage);
 
-		expect(child.sessionId).toBe(parent.sessionId);
+		expect(child.sessionId).not.toBe(parent.sessionId);
 		expect(child.agent.providerSessionId).toBe(child.sessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);

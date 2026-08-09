@@ -43,6 +43,8 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+// Ensure mandatory subagent result extraction is available even when a session is mocked.
+import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import type { ReportFindingDetails } from "../tools/review";
