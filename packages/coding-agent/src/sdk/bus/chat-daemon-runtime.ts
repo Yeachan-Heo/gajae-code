@@ -1191,6 +1191,11 @@ export class ChatDaemonRuntime {
 		await this.#slack?.close(sessionId);
 	}
 
+	// Each surface takes the identity on the call that actually publishes, so a retry
+	// reconciles the attempt it retries instead of adding a second message. Discord's
+	// resume only unarchives the thread — the publication, and the nonce reconciled
+	// against it, belong to the notify below. Slack's resume rolls the root over and
+	// posts the body itself, so it carries the identity directly.
 	private async resume(sessionId: string, generation: number, content: string, publicationId?: string): Promise<void> {
 		if (this.#discord) {
 			await this.#discord.resume(sessionId, generation);
