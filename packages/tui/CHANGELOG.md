@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added atomic same-line deletion APIs for text immediately before or around the `Editor` cursor.
+- Added atomic same-line deletion APIs and an `Editor` undo callback for keeping application state synchronized with editor history.
 
 ## [0.12.19] - 2026-08-08
 
