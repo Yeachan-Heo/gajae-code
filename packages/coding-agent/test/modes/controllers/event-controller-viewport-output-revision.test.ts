@@ -92,6 +92,7 @@ describe("EventController viewport output revision", () => {
 			args: { input: applyPatch },
 		} as never);
 		const component = ctx.pendingTools.get("preview-1") as ToolExecutionComponent;
+		component.setExpanded(true);
 		await waitFor(() => requests.length === 1);
 		recordVisibleTranscriptMutation.mockClear();
 		requests[0]!.resolve(preview);

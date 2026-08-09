@@ -412,7 +412,6 @@ function resolveCompletedEditIdentity(
 	args: EditRenderArgs | undefined,
 	editMode: EditMode | undefined,
 	isPartial: boolean,
-
 ): { path: string; op: Operation | undefined; move: string | undefined; firstChangedLine: number | undefined } {
 	const firstEdit = args?.edits?.[0];
 	const inventory = getEditRequestTargetInventory(args, editMode, { isPartial });

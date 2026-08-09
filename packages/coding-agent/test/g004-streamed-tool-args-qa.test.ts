@@ -270,6 +270,7 @@ describe("G004 streamed tool args QA", () => {
 			{ name: "edit", label: "Edit", mode: "hashline" } as any,
 			ui,
 		);
+		component.setExpanded(true);
 		const settleRenderedPreview = async (expected: string): Promise<void> => {
 			for (let attempt = 0; attempt < 20; attempt++) {
 				await Promise.resolve();

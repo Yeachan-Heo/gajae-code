@@ -31,7 +31,7 @@ import { replaceTabs, truncateToWidth } from "../tools/render-utils";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { computeEditDiff, type DiffError, type DiffResult } from "./diff";
 import { type ApplyPatchEntry, expandApplyPatchToEntries, expandApplyPatchToPreviewEntries } from "./modes/apply-patch";
-import { computePatchDiff, type Operation, type PatchEditEntry } from "./modes/patch";
+import { computePatchDiff, type PatchEditEntry } from "./modes/patch";
 import type { ReplaceEditEntry } from "./modes/replace";
 
 export interface PerFileDiffPreview {
@@ -76,10 +76,6 @@ export interface EditStreamingStrategy<Args = unknown> {
 }
 export interface EditRequestTargetInventory {
 	paths: string[];
-	/** Operation of the first target (Create/Delete) when derivable from the
-	 * request payload (apply_patch/hashline free-form envelopes carry op on the
-	 * parsed entry, not on the top-level args). */
-	firstOp?: Operation;
 	parseError?: string;
 	/** First envelope entry operation, for free-form modes that carry no structured `edits`. */
 	op?: PatchEditEntry["op"];
@@ -176,7 +172,9 @@ export function getEditRequestTargetInventory(
 		return { paths: orderedDistinctPaths([topLevelPath]) };
 	}
 
-	if (editMode === "apply_patch") {
+	// Legacy call sites render the shared edit card without threading `renderContext.editMode`;
+	// a free-form `input` string is only ever an apply_patch envelope there.
+	if (editMode === "apply_patch" || (editMode === undefined && typeof values.input === "string")) {
 		const input = typeof values.input === "string" ? values.input : "";
 		try {
 			return applyPatchEntryInventory(expandApplyPatchToEntries({ input }));
