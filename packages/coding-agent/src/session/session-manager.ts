@@ -7823,6 +7823,18 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
+		if (!this.storage.existsSync(resolvedSessionFile)) {
+			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
+			this.#applyFreshSessionMetadata(fresh);
+			this.#commitResidentTextStoreTransition(prepared);
+			this.#retireEphemeralArtifacts();
+			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			await this.#rewriteFile();
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+			return;
+		}
 		const eagerStat = this.storage.statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
 		const entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
@@ -9275,7 +9287,7 @@ export class SessionManager {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
-			} else if (this.persist && this.#sessionFile && hasAssistant) {
+			} else if (this.persist && this.#sessionFile && (hasAssistant || !hadSessionFile)) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
 			} else {
