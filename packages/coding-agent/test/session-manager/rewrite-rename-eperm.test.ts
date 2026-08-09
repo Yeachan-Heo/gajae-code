@@ -23,21 +23,21 @@ class RenameTrackingStorage extends MemorySessionStorage {
 class AsyncRenameEpermStorage extends MemorySessionStorage {
 	mode: "recover" | "rollback-failure" | undefined;
 
-	override rename(source: string, target: string): Promise<void> {
+	// The rewrite publishes inside a non-yielding fence, so replacement goes
+	// through `renameSync`. Intercepting the async `rename` here would never fire.
+	override renameSync(source: string, target: string): void {
 		if (this.mode && source.includes(".tmp") && target.endsWith(".jsonl")) {
 			if (this.mode === "recover") {
 				this.mode = undefined;
-				return Promise.reject(new FsCodeError("EPERM", "initial replacement rejected"));
+				throw new FsCodeError("EPERM", "initial replacement rejected");
 			}
-			if (!this.existsSync(target)) {
-				return Promise.reject(new Error("replacement retry rejected"));
-			}
-			return Promise.reject(new FsCodeError("EPERM", "initial replacement rejected"));
+			if (!this.existsSync(target)) throw new Error("replacement retry rejected");
+			throw new FsCodeError("EPERM", "initial replacement rejected");
 		}
 		if (this.mode === "rollback-failure" && source.endsWith(".bak") && target.endsWith(".jsonl")) {
-			return Promise.reject(new Error("rollback rejected"));
+			throw new Error("rollback rejected");
 		}
-		return super.rename(source, target);
+		return super.renameSync(source, target);
 	}
 }
 
