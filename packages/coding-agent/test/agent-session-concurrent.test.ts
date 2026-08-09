@@ -2,7 +2,7 @@
  * Tests for AgentSession concurrent prompt guard.
  */
 
-import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -26,8 +26,6 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
-
-setDefaultTimeout(30_000);
 
 // Mock stream that mimics AssistantMessageEventStream
 
