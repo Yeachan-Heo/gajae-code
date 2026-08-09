@@ -188,6 +188,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 			),
 		)
 	).some(Boolean);
+	if (!(await Bun.file(inputPath).exists())) throw new Error(`File not found: ${inputPath}`);
 	try {
 		sm = await SessionManager.open(
 			inputPath,
