@@ -18,6 +18,11 @@ export interface PythonRuntimeOptions {
 	seedPackages?: readonly string[];
 }
 
+export interface PythonRuntimeLifecycleOptions {
+	signal?: AbortSignal;
+	deadlineMs?: number;
+}
+
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
 	"HOME",
@@ -195,11 +200,18 @@ export function resolveVenvPath(cwd: string): string | undefined {
 	return undefined;
 }
 
+function createRuntimeCancellationError(timedOut: boolean): Error {
+	const error = new Error(timedOut ? "Python runtime startup timed out" : "Python runtime startup aborted");
+	error.name = timedOut ? "TimeoutError" : "AbortError";
+	return error;
+}
+
 async function runRuntimeCommand(
 	cmd: string[],
 	cwd: string,
 	env: Record<string, string | undefined>,
 	description: string,
+	lifecycle?: PythonRuntimeLifecycleOptions,
 ): Promise<void> {
 	const spawnEnv: Record<string, string> = {};
 	for (const [key, value] of Object.entries(env)) {
@@ -212,14 +224,50 @@ async function runRuntimeCommand(
 		stderr: "pipe",
 		windowsHide: true,
 	});
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
+	const output = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	const cleanups: Array<() => void> = [];
+	const finish = (callback: () => void): void => {
+		while (cleanups.length > 0) cleanups.pop()?.();
+		callback();
+	};
+	const cancel = (timedOut: boolean): void => {
+		try {
+			proc.kill("SIGTERM");
+		} catch {
+			// The process may have exited between the cancellation check and signal.
+		}
+		finish(() => reject(createRuntimeCancellationError(timedOut)));
+	};
+	if (lifecycle?.signal?.aborted) {
+		cancel(false);
+	} else if (lifecycle?.signal) {
+		const onAbort = (): void => cancel(false);
+		lifecycle.signal.addEventListener("abort", onAbort, { once: true });
+		cleanups.push(() => lifecycle.signal?.removeEventListener("abort", onAbort));
+	}
+	const remainingMs = lifecycle?.deadlineMs === undefined ? undefined : lifecycle.deadlineMs - Date.now();
+	if (remainingMs !== undefined) {
+		if (remainingMs <= 0) {
+			cancel(true);
+		} else {
+			const timer = setTimeout(() => cancel(true), remainingMs);
+			timer.unref();
+			cleanups.push(() => clearTimeout(timer));
+		}
+	}
+	proc.exited.then(code => finish(() => resolve(code)));
+	let exitCode: number;
+	try {
+		exitCode = await promise;
+	} catch (error) {
+		void output.catch(() => undefined);
+		throw error;
+	}
+	const [stdout, stderr] = await output;
 	if (exitCode !== 0) {
-		const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-		throw new Error(`${description} failed with exit code ${exitCode}${output ? `: ${output}` : ""}`);
+		const text = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+		throw new Error(`${description} failed with exit code ${exitCode}${text ? `: ${text}` : ""}`);
 	}
 }
 
@@ -227,6 +275,7 @@ async function ensureWorkspaceManagedVenv(
 	cwd: string,
 	baseEnv: Record<string, string | undefined>,
 	seedPackages: readonly string[],
+	lifecycle?: PythonRuntimeLifecycleOptions,
 ): Promise<void> {
 	const managed = resolveWorkspaceManagedPythonCandidate(cwd);
 	if (!fs.existsSync(managed.pythonPath)) {
@@ -238,6 +287,7 @@ async function ensureWorkspaceManagedVenv(
 			cwd,
 			baseEnv,
 			"Managed Python venv creation",
+			lifecycle,
 		);
 	}
 	if (seedPackages.length === 0) return;
@@ -257,12 +307,14 @@ async function ensureWorkspaceManagedVenv(
 		cwd,
 		runtimeEnv,
 		"Managed Python pip bootstrap",
+		lifecycle,
 	);
 	await runRuntimeCommand(
 		[managed.pythonPath, "-m", "pip", "install", ...seedPackages],
 		cwd,
 		runtimeEnv,
 		"Managed Python package seed",
+		lifecycle,
 	);
 	await fs.promises.writeFile(
 		markerPath,
@@ -315,6 +367,7 @@ export async function ensurePythonRuntime(
 	cwd: string,
 	baseEnv: Record<string, string | undefined>,
 	options: PythonRuntimeOptions = {},
+	lifecycle?: PythonRuntimeLifecycleOptions,
 ): Promise<PythonRuntime> {
 	if (options.managedWorkspaceVenv) {
 		const env = { ...baseEnv };
@@ -325,7 +378,7 @@ export async function ensurePythonRuntime(
 				return runtimeFromVenv(candidate.venvPath, candidate.pythonPath, candidate.binDir, env);
 			}
 		}
-		await ensureWorkspaceManagedVenv(cwd, baseEnv, options.seedPackages ?? RLM_MANAGED_PYTHON_PACKAGES);
+		await ensureWorkspaceManagedVenv(cwd, baseEnv, options.seedPackages ?? RLM_MANAGED_PYTHON_PACKAGES, lifecycle);
 	}
 	return resolvePythonRuntime(cwd, baseEnv, options);
 }

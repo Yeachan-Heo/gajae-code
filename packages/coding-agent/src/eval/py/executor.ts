@@ -127,6 +127,14 @@ function ensurePythonResourceCleanup(): void {
 	registerResourceOwner("python-kernel-sessions", disposeAllKernelSessions);
 }
 const sessions = new Map<string, PythonSession | InitializingPythonSession>();
+const retiringKernels = new Set<PythonKernel>();
+
+async function shutdownOrRetainKernel(kernel: PythonKernel): Promise<void> {
+	const result = await kernel.shutdown().catch(() => undefined);
+	if (result?.confirmed) return;
+	retiringKernels.add(kernel);
+	logger.warn("Python kernel shutdown not confirmed", { kernelId: kernel.id });
+}
 
 function isInitializingSession(
 	session: PythonSession | InitializingPythonSession,
@@ -326,12 +334,12 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 		promise: Promise.resolve().then(async () => {
 			const kernel = await startKernel(cwd, options);
 			if (initializing.cancelled) {
-				await kernel.shutdown().catch(() => undefined);
+				await shutdownOrRetainKernel(kernel);
 				throw initializing.cancelled;
 			}
 			const current = sessions.get(sessionId);
 			if (current !== initializing) {
-				await kernel.shutdown().catch(() => undefined);
+				await shutdownOrRetainKernel(kernel);
 				const winner = current
 					? isInitializingSession(current)
 						? await waitForPromiseWithCancellation(current.promise, options)
@@ -469,6 +477,8 @@ async function runQueued<T>(
 
 export async function disposeAllKernelSessions(): Promise<void> {
 	const all = [...sessions.entries()];
+	const retiring = [...retiringKernels];
+	retiringKernels.clear();
 	for (const [id, session] of all) {
 		if (sessions.get(id) === session) sessions.delete(id);
 	}
@@ -489,6 +499,16 @@ export async function disposeAllKernelSessions(): Promise<void> {
 		const reason = result.status === "rejected" ? result.reason : "not confirmed";
 		logger.warn("Python kernel shutdown not confirmed", { sessionId: id, reason });
 		if (!sessions.has(id)) sessions.set(id, session);
+	}
+	const retiringResults = await Promise.allSettled(retiring.map(kernel => kernel.shutdown()));
+	for (let i = 0; i < retiring.length; i += 1) {
+		const result = retiringResults[i];
+		if (result.status === "fulfilled" && result.value.confirmed) continue;
+		retiringKernels.add(retiring[i]);
+		logger.warn("Python kernel shutdown not confirmed", {
+			kernelId: retiring[i].id,
+			reason: result.status === "rejected" ? result.reason : "not confirmed",
+		});
 	}
 }
 

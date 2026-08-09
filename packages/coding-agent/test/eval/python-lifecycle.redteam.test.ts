@@ -378,6 +378,7 @@ describe("python eval lifecycle red-team", () => {
 			const startup = Promise.withResolvers<void>();
 			const startupCalled = Promise.withResolvers<void>();
 			const kernel = new FakeKernel();
+			kernel.shutdownResult = { confirmed: false };
 			let startupFinished = false;
 			let executionSettled = false;
 			PythonKernel.start = async () => {
@@ -414,6 +415,11 @@ describe("python eval lifecycle red-team", () => {
 			}
 			expect(startupFinished).toBe(true);
 			expect(kernel.shutdownCalls).toBe(1);
+			await disposeAllKernelSessions();
+			expect(kernel.shutdownCalls).toBe(2);
+			kernel.shutdownResult = { confirmed: true };
+			await disposeAllKernelSessions();
+			expect(kernel.shutdownCalls).toBe(3);
 		},
 		LIFECYCLE_TEST_TIMEOUT_MS,
 	);

@@ -194,7 +194,10 @@ export class PythonKernel {
 		const settings = await Settings.init();
 		const { env: shellEnv } = settings.getShellConfig();
 		const baseEnv = filterEnv(shellEnv);
-		const runtime = await ensurePythonRuntime(options.cwd, baseEnv, options.runtimeOptions);
+		const runtime = await ensurePythonRuntime(options.cwd, baseEnv, options.runtimeOptions, {
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		});
 		const spawnEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
 			if (typeof value === "string") spawnEnv[key] = value;
