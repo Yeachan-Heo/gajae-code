@@ -173,6 +173,7 @@ type PromptTerminalExtra = {
 	finalText?: string;
 	error?: { code: string; message: string };
 	diagnostic?: PromptTerminalDiagnostic;
+	diagnosticAlreadyLogged?: boolean;
 };
 
 function formatPromptTerminalFailureReason(reason: unknown): string {
@@ -4466,7 +4467,11 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation) || !runtime) return;
-			if (winner.kind === "failed" && extra?.diagnostic?.intentionalCancellation !== true) {
+			if (
+				winner.kind === "failed" &&
+				extra?.diagnostic?.intentionalCancellation !== true &&
+				extra?.diagnosticAlreadyLogged !== true
+			) {
 				const diagnostic = extra?.diagnostic;
 				logger.error("sdk_prompt_terminal_failed", {
 					sessionId: id,
@@ -4505,18 +4510,29 @@ export function createNotificationsExtension(
 				error: formatPromptFailureForLocalLog(error),
 			});
 			const sanitized = sanitizePromptFailure(error);
+			const outcome: SdkPromptTerminalOutcome = {
+				kind: "failed",
+				code: "prompt_failed",
+				message: sanitized.message,
+				provenance: "agent_failed",
+			};
+			// This rejection bypasses `agent_end`, so record its local-only reason at
+			// the accepted submission failure boundary before terminalization begins.
+			logger.error("sdk_prompt_terminal_failed", {
+				sessionId: id,
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+				code: outcome.code,
+				provenance: outcome.provenance,
+				reason: formatPromptTerminalFailureReason(error),
+			});
 			void terminalizePrompt(
 				correlation,
-				{
-					kind: "failed",
-					code: "prompt_failed",
-					message: sanitized.message,
-					provenance: "agent_failed",
-				},
+				outcome,
 				{},
-				// The raw reason is local-only diagnostic input. The normalized outcome
-				// and wire error retain the fixed safe token required by SDK/ACP.
-				{ error: sanitized, diagnostic: { reason: error } },
+				// The normalized outcome and wire error retain the fixed safe token.
+				// Mark the diagnostic as recorded so terminalization does not duplicate it.
+				{ error: sanitized, diagnostic: { reason: error }, diagnosticAlreadyLogged: true },
 			);
 		};
 		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {

@@ -209,9 +209,12 @@ test("SDK host logs a bounded reason from an accepted sendUserMessage rejection"
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
 
-	const diagnostics: Record<string, unknown>[] = [];
+	let sdkPromptTerminalFailedCount = 0;
+	let diagnostic: Record<string, unknown> | undefined;
 	const errorSpy = spyOn(logger, "error").mockImplementation((...args: unknown[]) => {
-		if (args[0] === "sdk_prompt_terminal_failed") diagnostics.push(args[1] as Record<string, unknown>);
+		if (args[0] !== "sdk_prompt_terminal_failed") return;
+		sdkPromptTerminalFailedCount++;
+		diagnostic = args[1] as Record<string, unknown>;
 	});
 
 	try {
@@ -240,14 +243,14 @@ test("SDK host logs a bounded reason from an accepted sendUserMessage rejection"
 			outcome: { kind: "failed", code: "prompt_failed", message: "Prompt submission failed." },
 		});
 		expect(JSON.stringify(failure)).not.toContain("Accepted sendUserMessage rejected");
-		expect(diagnostics).toHaveLength(1);
-		expect(diagnostics[0]).toMatchObject({
+		expect(sdkPromptTerminalFailedCount).toBe(1);
+		expect(diagnostic).toMatchObject({
 			sessionId,
 			commandId: acknowledgement.result?.commandId,
 			turnId: acknowledgement.result?.turnId,
 			reason: reason.slice(0, 512),
 		});
-		expect(diagnostics[0]?.reason).toHaveLength(512);
+		expect(diagnostic?.reason).toHaveLength(512);
 	} finally {
 		errorSpy.mockRestore();
 	}
