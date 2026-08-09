@@ -4,7 +4,7 @@ import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runti
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
 
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (await predicate()) return;

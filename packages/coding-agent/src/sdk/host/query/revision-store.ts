@@ -468,6 +468,25 @@ export class RevisionStore {
 		const range = item?.fields?.[field];
 		return range ? this.#readStringRange(revision, range, offset, length) : undefined;
 	}
+	async readIndexedFieldRange(
+		resourceKind: string,
+		resourceId: string,
+		id: string,
+		itemId: string,
+		field: string,
+		offset: number,
+		length: number,
+	): Promise<{ body: string; complete: boolean; offset: number } | undefined> {
+		const revision = this.#resources.get(`${resourceKind}:${resourceId}`)?.find(item => item.id === id);
+		if (!revision) return undefined;
+		revision.lastAccessed = this.now();
+		const item = revision.index?.items?.find(candidate => candidate.entryId === itemId);
+		const range = item?.fields?.[field];
+		if (!range) return undefined;
+		return range.isString
+			? this.#readStringRange(revision, range, offset, length)
+			: this.#readJsonRange(revision, range, offset, length);
+	}
 	async describeIndexedItem(
 		resourceKind: string,
 		resourceId: string,
@@ -479,9 +498,7 @@ export class RevisionStore {
 		if (!item) return undefined;
 		return {
 			itemId: item.entryId,
-			fields: Object.entries(item.fields ?? {})
-				.filter(([, range]) => range.isString)
-				.map(([field]) => field),
+			fields: Object.keys(item.fields ?? {}),
 		};
 	}
 	async readTranscriptBodyRange(
@@ -799,6 +816,28 @@ export class RevisionStore {
 		const stringIndex = await this.#encodeString(value, append, true);
 		if (!stringIndex) throw new SyntaxError("escaped string index is unavailable");
 		return { isString: true, stringIndex };
+	}
+
+	async #readJsonRange(
+		revision: Revision,
+		range: IndexedField,
+		offset: number,
+		length: number,
+	): Promise<{ body: string; complete: boolean; offset: number } | undefined> {
+		if (offset < 0 || length <= 0) return undefined;
+		const bytes = range.end - range.start;
+		const requestedStart = Math.min(offset, bytes);
+		const source = await this.#readBytes(
+			revision,
+			range.start + requestedStart,
+			range.start + Math.min(bytes, requestedStart + length + 7),
+		);
+		const skipped = utf8ContinuationPrefixLength(source);
+		const start = requestedStart + skipped;
+		const body = source.subarray(skipped);
+		const end = utf8BoundaryAtOrBefore(body, Math.min(body.length, length));
+		if (end === 0 && start < bytes) return undefined;
+		return { body: body.subarray(0, end).toString("utf8"), complete: start + end === bytes, offset: start };
 	}
 
 	async #readStringRange(

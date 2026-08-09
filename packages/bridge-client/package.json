@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/bridge-client",
-	"version": "0.12.16",
+	"version": "0.12.19",
 	"description": "Transport-only v3 SDK WebSocket client",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",

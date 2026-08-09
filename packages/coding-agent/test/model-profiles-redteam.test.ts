@@ -68,8 +68,6 @@ describe("model profile red-team schema and catalog cases", () => {
 		["empty provider", "/model"],
 		["empty model", "provider/"],
 		["trailing colon", "provider/model:"],
-		["bogus effort", "provider/model:ultra"],
-		["double effort", "provider/model:high:low"],
 	])("selector rejects %s", (_label, selector) => {
 		const result = ModelsConfigSchema.safeParse(profileConfig(selector));
 
@@ -80,6 +78,10 @@ describe("model profile red-team schema and catalog cases", () => {
 				"Expected modelId or provider/modelId with optional :effort suffix",
 			);
 		}
+	});
+
+	test.each(["provider/model:ultra", "provider/model:high:low"])("selector accepts colon route %s", selector => {
+		expect(ModelsConfigSchema.safeParse(profileConfig(selector)).success).toBe(true);
 	});
 
 	test("profile definitions strictly reject extra fields", () => {

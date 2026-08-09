@@ -499,6 +499,40 @@ describe("SDK query pagination", () => {
 		});
 		expect(crossQuery.error).toMatchObject({ code: "invalid_input", message: "cursor does not match query" });
 	});
+	it("streams typed indexed fields through resource body continuations", async () => {
+		const content = [{ type: "toolCall", id: "tool-1", name: "read", arguments: { file_path: "large.ts" } }];
+		const query = handlers([
+			{
+				id: "oversized",
+				role: "assistant",
+				body: "x".repeat(300_000),
+				content,
+				isError: true,
+			},
+		]);
+		const list = await query.handlers.dispatch({ query: "Q01", connectionId: "c" });
+		const descriptor = list.page?.items[0] as {
+			continuations: Array<{ field: string; itemId: string; revision: string }>;
+		};
+		expect(descriptor.continuations.map(item => item.field)).toEqual(["id", "role", "body", "content", "isError"]);
+
+		const contentContinuation = descriptor.continuations.find(item => item.field === "content");
+		const errorContinuation = descriptor.continuations.find(item => item.field === "isError");
+		expect(contentContinuation).toBeDefined();
+		expect(errorContinuation).toBeDefined();
+		const contentResponse = await query.handlers.dispatch({
+			query: "Q23",
+			input: contentContinuation,
+			connectionId: "c",
+		});
+		const errorResponse = await query.handlers.dispatch({
+			query: "Q23",
+			input: errorContinuation,
+			connectionId: "c",
+		});
+		expect(JSON.parse(String((contentResponse.page?.items[0] as { body?: unknown })?.body))).toEqual(content);
+		expect(JSON.parse(String((errorResponse.page?.items[0] as { body?: unknown })?.body))).toBe(true);
+	});
 });
 it("retrieves a large Q13 indexed item field by stable ID across revisions", async () => {
 	const config = [{ id: "large-config", value: "é".repeat(700_000) }];

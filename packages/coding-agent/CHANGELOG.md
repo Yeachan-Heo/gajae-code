@@ -2,10 +2,20 @@
 
 ## [Unreleased]
 
+## [0.12.19] - 2026-08-08
+
+### Fixed
+
+- Telegram topic-registry archive transitions remain parser-valid across durable-fence load promotion and failed archive-publication rollback. The initial generation-57 fix cleared `disconnectGraceExpiresAt` on direct archive transitions, but loading a `disconnect_grace` record superseded by a newer durable fence could still promote it to `archive_pending` while retaining the grace-only field, and rollback could restore `disconnect_grace` without restoring its required deadline. Both paths now preserve the state/field invariant with parser-roundtrip coverage. This entry also corrects the hotfix attribution omitted from the published 0.12.18 release notes. `DAEMON_GENERATION` bumped to 58.
+
+## [0.12.18] - 2026-08-08
+
 ### Fixed
 
 - SDK snapshot spill writes now retry once with a fresh temporary file when Bun reports `EBADF` during write or `fsync` under heavily contended descriptor teardown, and no longer fail when `close()` reports `EBADF` after a successful write and sync. The atomic writer removes the abandoned attempt before retrying, preserves primary I/O failures, accepts only the proven already-closed close case, and keeps every non-`EBADF` error or repeated descriptor failure fatal.
 - ACP now imports the synthetic model-profile provider namespace from a dependency-free SDK constant module, keeping the machine entrypoint out of model-registry, session-host, MCP-manager, and extension-runner closures enforced by `check:runtime`.
+
+## [0.12.17] - 2026-08-08
 
 ## [0.12.16] - 2026-08-08
 

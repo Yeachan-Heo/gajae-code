@@ -94,7 +94,7 @@ export const ModelBindingsSchema = z.object({
 });
 
 export const ProfileRoleSchema = z.enum(GJC_MODEL_ASSIGNMENT_TARGET_IDS);
-export const ProfileModelSelectorPattern = "^(?:[^,/]+/[^,]+|[^/,]+)$";
+export const ProfileModelSelectorPattern = "^(?:[^,/]+/[^,]*[^,:]|[^/,]*[^/,:])$";
 
 export const ProfileModelSelectorSchema = z
 	.string()

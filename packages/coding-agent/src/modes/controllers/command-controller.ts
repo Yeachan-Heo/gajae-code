@@ -39,7 +39,7 @@ import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
-import { prepareTranscriptRebuild } from "../utils/ui-helpers";
+import { addChatChild, prepareTranscriptRebuild, syncPendingExecutionComponents } from "../utils/ui-helpers";
 
 type HindsightModule = typeof import("../../hindsight");
 let hindsightModulePromise: Promise<HindsightModule> | undefined;
@@ -1147,7 +1147,8 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		const component = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		this.ctx.bashComponent = component;
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.bashComponent);
@@ -1165,7 +1166,9 @@ export class CommandController {
 						this.ctx.bashComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext },
+				// A transcript rebuild racing this call must drop the parked block once the
+				// session owns its message, otherwise the rebuilt row is rendered twice.
+				{ excludeFromContext, onPersisted: () => component.markResultPersisted() },
 			);
 
 			if (this.ctx.bashComponent) {
@@ -1182,8 +1185,18 @@ export class CommandController {
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
 		const bashComponent = this.ctx.bashComponent;
-		if (isDeferred && bashComponent && this.ctx.pendingBashComponents.includes(bashComponent)) {
-			this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+		if (isDeferred && bashComponent) {
+			// Parentage is the container's answer, never this bookkeeping's: `/clear`,
+			// `/context-clear`, extension redraws and the selector all call
+			// `pendingMessagesContainer.clear()`, which disposes and evicts the parked
+			// component while leaving it listed in `pendingBashComponents`. Ask the
+			// container whether it still holds a live child before moving anything;
+			// a disposed block is terminal and must never reach a fresh transcript.
+			if (this.ctx.pendingMessagesContainer.hasLiveChild(bashComponent)) {
+				this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+				addChatChild(this.ctx, bashComponent);
+			}
+			syncPendingExecutionComponents(this.ctx);
 		}
 
 		this.ctx.bashComponent = undefined;
@@ -1192,7 +1205,8 @@ export class CommandController {
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.pythonComponent = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		const component = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		this.ctx.pythonComponent = component;
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.pythonComponent);
@@ -1210,7 +1224,9 @@ export class CommandController {
 						this.ctx.pythonComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext },
+				// A transcript rebuild racing this call must drop the parked block once the
+				// session owns its message, otherwise the rebuilt row is rendered twice.
+				{ excludeFromContext, onPersisted: () => component.markResultPersisted() },
 			);
 
 			if (this.ctx.pythonComponent) {

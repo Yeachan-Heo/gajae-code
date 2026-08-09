@@ -3016,8 +3016,8 @@ describe("telegram daemon", () => {
 		// generation 55 hardens the shared topic authority outage path (#3974).
 		// generation 56 moves exact unlink and process-incarnation authority behind
 		// lazy native bindings (#3846); generation 57 preserves parser-valid archive
-		// transitions after disconnect grace.
-		expect(DAEMON_GENERATION).toBe(57);
+		// transitions; generation 58 covers fence-load promotion and rollback.
+		expect(DAEMON_GENERATION).toBe(58);
 	});
 	test.each([
 		"1",

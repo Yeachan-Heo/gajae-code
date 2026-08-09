@@ -586,6 +586,8 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession, deq
 		editor,
 		ui: { requestRender },
 		pendingMessagesContainer,
+		pendingBashComponents: [],
+		pendingPythonComponents: [],
 		session,
 		compactionQueuedMessages: [],
 		keybindings: {

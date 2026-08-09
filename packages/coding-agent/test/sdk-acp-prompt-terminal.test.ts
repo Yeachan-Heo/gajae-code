@@ -41,6 +41,15 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	throw new Error(`Timed out waiting for ${label}`);
 }
 
+/** ACP `session_info_update` frames that release the client's running phase. */
+function idlePhaseUpdates(updates: SessionNotification[]): number {
+	return updates.filter(
+		update =>
+			update.update.sessionUpdate === "session_info_update" &&
+			(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
+	).length;
+}
+
 async function createFixture(
 	options: {
 		terminalBeforeAcknowledgement?: boolean;
@@ -264,6 +273,9 @@ for (const reason of ["end_turn", "max_tokens", "max_turn_requests", "refusal", 
 			await bounded(fixture.promptDelivered, "prompt delivery");
 			fixture.sendStopped(reason);
 			expect(await bounded(pending, `${reason} prompt completion`)).toEqual({ stopReason: reason });
+			// The prompt settles on its terminal frame, so the advisory end-of-turn queries
+			// and the phase publication land after it rather than gating it.
+			await waitFor(() => idlePhaseUpdates(fixture.updates) > idleUpdatesBefore, "end-of-turn idle update");
 			expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore + 1);
 			expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(
 				metadataQueriesBefore + 1,
@@ -322,6 +334,7 @@ test("ACP prompt settles exactly once when terminal arrives before acknowledgeme
 		});
 		expect(await bounded(pending, "pre-acknowledgement completion")).toEqual({ stopReason: "end_turn" });
 		expect(settleCount).toBe(1);
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleUpdatesBefore, "end-of-turn idle update");
 		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore + 1);
 		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore + 1);
 		expect(
@@ -541,6 +554,9 @@ test("ACP suppresses partial and duplicate terminals after settlement", async ()
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "terminal completion")).toEqual({ stopReason: "end_turn" });
+		// Settlement precedes the advisory end-of-turn work, so the suppression baseline is
+		// taken once that work has flushed.
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > 1, "end-of-turn idle update");
 		const updatesAfterSettlement = fixture.updates.length;
 		const queriesAfterSettlement = fixture.queryCalls.length;
 		fixture.sendTerminal({

@@ -578,7 +578,10 @@ export class TopicRegistry {
 					: {}),
 				...(isValidBindingString(raw.archiveHostId) ? { archiveHostId: raw.archiveHostId } : {}),
 				...(isValidBindingGeneration(raw.archiveLeaseEpoch) ? { archiveLeaseEpoch: raw.archiveLeaseEpoch } : {}),
-				...(typeof raw.disconnectGraceExpiresAt === "number" && Number.isFinite(raw.disconnectGraceExpiresAt)
+				...(raw.authorityState === "disconnect_grace" &&
+				!fenceSupersedesRecord &&
+				typeof raw.disconnectGraceExpiresAt === "number" &&
+				Number.isFinite(raw.disconnectGraceExpiresAt)
 					? { disconnectGraceExpiresAt: raw.disconnectGraceExpiresAt }
 					: {}),
 				...(bindingMalformed ? { bindingMalformed: true as const } : {}),
@@ -1179,6 +1182,9 @@ export class TopicRegistry {
 		} else {
 			record.authorityEpoch = snapshot.authorityEpoch;
 			record.authorityState = snapshot.authorityState;
+			if (snapshot.authorityState === "disconnect_grace" && snapshot.record?.disconnectGraceExpiresAt !== undefined)
+				record.disconnectGraceExpiresAt = snapshot.record.disconnectGraceExpiresAt;
+			else delete record.disconnectGraceExpiresAt;
 			this.rebuildInboundRoutes();
 		}
 		if (snapshot.fenceEpoch === undefined) this.epochs.delete(snapshot.sessionId);

@@ -281,6 +281,31 @@ export function addChatChild(ctx: InteractiveModeContext, component: Component):
 	trimChatChildren(ctx);
 }
 
+/**
+ * Parked `!`/`$` execution components are listed in `pendingBashComponents` /
+ * `pendingPythonComponents`, but `pendingMessagesContainer` is the only
+ * authority on parentage: `/clear`, `/context-clear`, extension redraws and the
+ * selector all call `pendingMessagesContainer.clear()`, which disposes and
+ * evicts parked components without touching those arrays. Drop every entry the
+ * container no longer holds so nothing downstream can move a dead component.
+ */
+export function syncPendingExecutionComponents(ctx: InteractiveModeContext): void {
+	const container = ctx.pendingMessagesContainer;
+	ctx.pendingBashComponents = ctx.pendingBashComponents.filter(component => container.hasLiveChild(component));
+	ctx.pendingPythonComponents = ctx.pendingPythonComponents.filter(component => container.hasLiveChild(component));
+}
+
+/**
+ * Whether the session already owns this execution's message, i.e. the rebuilt
+ * transcript renders the block from session state. Set by the controller when
+ * `executeBash()` / `executePython()` reports the result as persisted.
+ */
+function hasPersistedExecutionResult(component: Component): boolean {
+	if (component instanceof BashExecutionComponent) return component.hasPersistedResult();
+	if (component instanceof EvalExecutionComponent) return component.hasPersistedResult();
+	return false;
+}
+
 export function trimChatChildren(ctx: InteractiveModeContext): void {
 	const children = ctx.chatContainer.children;
 
@@ -899,10 +924,24 @@ export class UiHelpers {
 		// This path is used to rebuild the visible chat transcript (e.g. after custom/debug UI).
 		// Clear existing rendered chat first to avoid duplicating the full session in the container.
 		const preservedChatChildren = options.preserveExistingChat ? this.ctx.chatContainer.children : undefined;
+		// A still-running deferred `!`/`$` block is the only rendering of output whose
+		// message has not been published to the session yet, so the rebuild must keep it
+		// parked instead of disposing it. Finished blocks are dropped here: the rebuilt
+		// transcript renders them from the session. A block whose result was persisted
+		// while its controller was still suspended is finished for this purpose — keeping
+		// it would render the same execution twice.
+		const runningExecutionComponents = this.#detachPendingMessages(
+			component =>
+				(component === this.ctx.bashComponent || component === this.ctx.pythonComponent) &&
+				!hasPersistedExecutionResult(component),
+		);
+		this.ctx.pendingBashComponents = this.ctx.pendingBashComponents.filter(component =>
+			runningExecutionComponents.includes(component),
+		);
+		this.ctx.pendingPythonComponents = this.ctx.pendingPythonComponents.filter(component =>
+			runningExecutionComponents.includes(component),
+		);
 		this.ctx.chatContainer.clear();
-		this.ctx.pendingMessagesContainer.clear();
-		this.ctx.pendingBashComponents = [];
-		this.ctx.pendingPythonComponents = [];
 
 		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.
 		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
@@ -922,6 +961,9 @@ export class UiHelpers {
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.ctx.showStatus(`Session compacted ${times}`);
+		}
+		for (const component of runningExecutionComponents) {
+			this.ctx.pendingMessagesContainer.addChild(component);
 		}
 		if (preservedChatChildren && preservedChatChildren.length > 0) {
 			for (const child of preservedChatChildren) {
@@ -978,8 +1020,35 @@ export class UiHelpers {
 		this.ctx.ui.requestRender();
 	}
 
+	/**
+	 * Empty the pending container, disposing the queued-message chips but handing back
+	 * the parked `!`/`$` execution components matched by `retain`, in render order.
+	 *
+	 * `Container.clear()` disposes every child, which would tear down a running
+	 * execution block mid-flight; retained components are reused instances that the
+	 * caller re-attaches (pending area or chat transcript).
+	 */
+	#detachPendingMessages(retain: (component: Component) => boolean): Component[] {
+		syncPendingExecutionComponents(this.ctx);
+		const parked = new Set<Component>([...this.ctx.pendingBashComponents, ...this.ctx.pendingPythonComponents]);
+		const retained: Component[] = [];
+		for (const child of this.ctx.pendingMessagesContainer.children) {
+			if (parked.has(child) && retain(child)) {
+				retained.push(child);
+			} else {
+				child.dispose?.();
+			}
+		}
+		this.ctx.pendingMessagesContainer.detachAll();
+		return retained;
+	}
+
 	updatePendingMessagesDisplay(): void {
-		this.ctx.pendingMessagesContainer.clear();
+		// Rebuild only the queued-message chips: parked execution components stay attached
+		// so a mid-turn queue/dequeue event cannot dispose a streaming `!`/`$` block.
+		for (const component of this.#detachPendingMessages(() => true)) {
+			this.ctx.pendingMessagesContainer.addChild(component);
+		}
 		const queuedMessages = this.ctx.session.getQueuedMessages() as QueuedMessages;
 
 		const steeringMessages: Array<{ message: string; label: string }> = [];
@@ -1237,20 +1306,21 @@ export class UiHelpers {
 		}
 	}
 
-	/** Move pending bash components from pending area to chat */
+	/** Move pending bash/python components from the pending area to chat */
 	flushPendingBashComponents(): void {
 		// Move (detach, not dispose) the live execution components from the pending
 		// area into the chat transcript — they are reused instances, so a disposing
-		// removeChild() would tear them down before re-adding.
-		for (const component of this.ctx.pendingBashComponents) {
+		// removeChild() would tear them down before re-adding. Walk the container so
+		// the transcript keeps the order the pending area rendered, and so a
+		// component the container no longer holds can never be re-parented.
+		syncPendingExecutionComponents(this.ctx);
+		const parked = new Set<Component>([...this.ctx.pendingBashComponents, ...this.ctx.pendingPythonComponents]);
+		for (const component of [...this.ctx.pendingMessagesContainer.children]) {
+			if (!parked.has(component)) continue;
 			this.ctx.pendingMessagesContainer.detachChild(component);
 			addChatChild(this.ctx, component);
 		}
 		this.ctx.pendingBashComponents = [];
-		for (const component of this.ctx.pendingPythonComponents) {
-			this.ctx.pendingMessagesContainer.detachChild(component);
-			addChatChild(this.ctx, component);
-		}
 		this.ctx.pendingPythonComponents = [];
 	}
 
