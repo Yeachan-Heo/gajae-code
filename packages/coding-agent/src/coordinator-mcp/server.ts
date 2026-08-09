@@ -16,6 +16,7 @@ import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context"
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
+import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
@@ -3183,7 +3184,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		let requestError: SdkClientError | undefined;
 		let result: unknown;
 		try {
-			result = await client.global(operation, input, { ...(idempotencyKey ? { idempotencyKey } : {}) });
+			const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+			result = await client.global(operation, input, {
+				...(idempotencyKey ? { idempotencyKey } : {}),
+				...(timeoutMs === undefined ? {} : { timeoutMs }),
+			});
 		} catch (error) {
 			requestError = toCoordinatorBrokerError("request", error);
 		}

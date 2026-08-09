@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { type IndexedSession, SessionIndex } from "../broker/session-index";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import { SESSION_PREPARED_EVENT } from "../host/host";
@@ -46,7 +47,7 @@ export interface ChatDaemonSdkClient {
 	onReconnect?(handler: () => void): () => void;
 	/** Re-dials a retired socket; a no-op on a live one. */
 	connect?(): Promise<void>;
-	request(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
+	request(frame: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>>;
 	close(): Promise<void>;
 	send(frame: Record<string, unknown>): void;
 }
@@ -1272,7 +1273,11 @@ export class ChatDaemonRuntime {
 			throw new ChatDeliveryError("pre_send");
 		}
 		try {
-			return await client.request({ type: "broker_request", operation, input, idempotencyKey });
+			const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+			return await client.request(
+				{ type: "broker_request", operation, input, idempotencyKey },
+				timeoutMs === undefined ? undefined : { timeoutMs },
+			);
 		} finally {
 			await client.close();
 		}

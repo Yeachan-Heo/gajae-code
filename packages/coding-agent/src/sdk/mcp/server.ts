@@ -1,6 +1,7 @@
 import path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError } from "../client/client";
 import {
 	listSdkSessionEndpoints,
@@ -253,7 +254,11 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 				const broker = await readSdkBrokerDiscovery(agentDir);
 				if (!broker) return { ok: false, error: { code: "not_found", message: "SDK broker not found" } };
 				client = await connect(broker.url, broker.token);
-				const response = await client.global(operation, input, { idempotencyKey });
+				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+				const response = await client.global(operation, input, {
+					idempotencyKey,
+					...(timeoutMs === undefined ? {} : { timeoutMs }),
+				});
 				return isLifecycleOperation(operation) ? redactLifecycleCredentials(response) : response;
 			} catch (error) {
 				return resultError(error);

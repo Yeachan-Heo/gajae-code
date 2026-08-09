@@ -854,6 +854,9 @@ export class Broker {
 			this.#resolveCompletion = completion.resolve;
 			this.#rejectCompletion = completion.reject;
 			this.#completionTask = null;
+			// A drained queue refuses every later startup by design, so a restarted broker
+			// needs a new one or it would admit nothing for the rest of the process.
+			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 		}
 		this.#stopping = false;
 		this.#publicationState = "healthy-owned";
@@ -1059,8 +1062,27 @@ export class Broker {
 		void this.#completionTask.then(this.#resolveCompletion, this.#rejectCompletion);
 		return this.#completionTask;
 	}
+	/**
+	 * Fresh, uncached proof that this broker still publishes the discovery root.
+	 * The cached state is not proof: the watchdog observes on a cadence, so a
+	 * replacement can already be on disk without having been seen yet.
+	 */
+	#provenOwnedRoot(): boolean {
+		if (!this.#publication || this.#publicationState !== "healthy-owned") return false;
+		try {
+			return (publicationObservationOverridesForTest.get(this) ?? this.#publication.observe()) === "owned";
+		} catch {
+			return false;
+		}
+	}
+	/**
+	 * A stop may take the owning path only while it can prove it still owns the root.
+	 * Claiming ownership it cannot prove keeps the admission queue open, so a startup
+	 * queued behind this broker is granted a slot that frees after completion and
+	 * spawns a child the broker has no authority over.
+	 */
 	async stop(): Promise<void> {
-		await this.#complete("owned-root");
+		await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root");
 	}
 	async #endpoint(input: Record<string, unknown>): Promise<BrokerResponse> {
 		const sessionId = input.sessionId;
