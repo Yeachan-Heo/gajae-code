@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { MAX_PINNED_REVISIONS, type RevisionStore, RevisionStoreError, SNAPSHOT_TTL_MS } from "./revision-store.js";
 
 export const CURSOR_TTL_MS = SNAPSHOT_TTL_MS;
@@ -10,8 +10,14 @@ export interface CursorEnvelope {
 	protocolMajor: 3;
 	sessionId: string;
 	resource: string;
+	/** Unique per-grant identity so identical envelopes never alias into one pin. */
+	nonce?: string;
 	revision: string;
 	highWatermark?: unknown;
+	/** TTL metadata minted by `CursorRegistry.grant`: wall-clock ms when granted. */
+	issuedAt?: number;
+	/** TTL metadata minted by `CursorRegistry.grant`: wall-clock ms when the cursor expires. */
+	expiresAt?: number;
 	position: unknown;
 	direction: string;
 	pageShape: unknown;
@@ -139,6 +145,12 @@ export class CursorRegistry {
 				MAX_CURSORS_PER_CONNECTION
 		)
 			throw new CursorError("snapshot_capacity_exceeded", false);
+		// Mint the authoritative TTL inside the registry so the signed envelope
+		// and the active-entry expiry can never diverge; callers read
+		// `issuedAt`/`expiresAt` back from the envelope they passed in.
+		const issuedAt = this.now();
+		envelope.issuedAt = issuedAt;
+		envelope.expiresAt = issuedAt + CURSOR_TTL_MS;
 		const cursor = signCursor(envelope, this.sessionToken);
 		try {
 			await this.revisions.pin(cursor, resourceKind, resourceId, envelope.revision);
@@ -146,15 +158,47 @@ export class CursorRegistry {
 			if (error instanceof RevisionStoreError) throw new CursorError(error.code, false);
 			throw error;
 		}
-		this.#active.set(cursor, { connectionId, resourceId, expiresAt: this.now() + CURSOR_TTL_MS });
+		this.#active.set(cursor, { connectionId, resourceId, expiresAt: envelope.expiresAt });
 		return cursor;
+	}
+
+	async exchange(
+		cursor: string,
+		connectionId: string,
+		expected: CursorQueryContext,
+		resourceKind: string,
+		resourceId: string,
+	): Promise<{ cursor: string; envelope: CursorEnvelope }> {
+		const envelope = verifyCursor(cursor, this.sessionToken);
+		if (!envelope) throw new CursorError("invalid_cursor", false);
+		if (envelope.expiresAt === undefined || envelope.expiresAt <= this.now()) throw new CursorError("cursor_expired");
+		if (
+			envelope.sessionId !== expected.sessionId ||
+			(expected.resource !== undefined && envelope.resource !== expected.resource) ||
+			envelope.direction !== expected.direction ||
+			canonicalJson(envelope.pageShape) !== canonicalJson(expected.pageShape)
+		)
+			throw new CursorError("invalid_input", false, "cursor does not match query");
+		const exchanged: CursorEnvelope = {
+			...envelope,
+			nonce: randomUUID(),
+			issuedAt: undefined,
+			expiresAt: undefined,
+		};
+		const exchangedCursor = await this.grant(connectionId, exchanged, resourceKind, resourceId);
+		return { cursor: exchangedCursor, envelope: exchanged };
 	}
 
 	consume(cursor: string, connectionId: string, expected: CursorQueryContext): CursorEnvelope {
 		const envelope = verifyCursor(cursor, this.sessionToken);
 		if (!envelope) throw new CursorError("invalid_cursor", false);
 		const active = this.#active.get(cursor);
-		if (!active || active.connectionId !== connectionId || active.expiresAt <= this.now()) {
+		const expired =
+			!active ||
+			active.connectionId !== connectionId ||
+			active.expiresAt <= this.now() ||
+			(envelope.expiresAt !== undefined && envelope.expiresAt <= this.now());
+		if (expired) {
 			this.release(cursor);
 			throw new CursorError("cursor_expired");
 		}

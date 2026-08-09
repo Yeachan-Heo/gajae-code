@@ -104,6 +104,16 @@ function isLifecycleOperation(operation: string): boolean {
 	);
 }
 
+function redactLifecycleCredentials(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(redactLifecycleCredentials);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>)
+			.filter(([key]) => key !== "endpoint" && key !== "token")
+			.map(([key, nested]) => [key, redactLifecycleCredentials(nested)]),
+	);
+}
+
 /**
  * Pure ACP-to-SDK adapter. It deliberately owns neither an AgentSession nor an
  * ACP bridge: all session work is performed through authenticated v3 frames.
@@ -229,10 +239,11 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		return await this.#client.global(operation, input, {
+		const response = await this.#client.global(operation, input, {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		});
+		return isLifecycleOperation(operation) ? redactLifecycleCredentials(response) : response;
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {

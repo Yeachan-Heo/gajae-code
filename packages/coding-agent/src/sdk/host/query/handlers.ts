@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import type { ActiveProviderDescriptor } from "../../providers.js";
 import { ActiveProviderResolutionError } from "../../providers.js";
@@ -56,6 +57,12 @@ export interface SessionSurface {
 	}): unknown | Promise<unknown>;
 	/** Q27 effective model-profile catalog from the live session registry. */
 	getModelProfiles?(): unknown[] | Promise<unknown[]>;
+	/**
+	 * Q30 atomic checkpoint capture: the live transcript entries and the
+	 * event-ring watermark read in ONE synchronous call, so the snapshot
+	 * revision and the subscribe position can never straddle an append.
+	 */
+	getCheckpointSnapshot?(): { entries: unknown[]; watermark: SdkCheckpointRecord };
 	/** Query rows backed by the session's installed binding map. */
 	installedQueries?: ReadonlySet<string>;
 }
@@ -81,7 +88,33 @@ export interface QueryResponse {
 	result?: unknown;
 	error?: { code: string; message: string; restartQuery?: boolean; details?: unknown };
 }
+/**
+ * Host-published durable transcript checkpoint (C9). `revision` is the
+ * transcript high-watermark (entry count/offset) at checkpoint time and bounds
+ * replay to exactly `[checkpointRevision, live)`; `generation`/`seq` anchor the
+ * event-ring subscribe position carried by replay cursors.
+ */
+export interface SdkCheckpointRecord {
+	revision: number;
+	generation: number;
+	seq: number;
+}
 
+function isNonNegativeSafeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isCheckpointRecord(value: unknown): value is SdkCheckpointRecord {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	return (
+		keys.length === 3 &&
+		isNonNegativeSafeInteger(record.revision) &&
+		isNonNegativeSafeInteger(record.generation) &&
+		isNonNegativeSafeInteger(record.seq)
+	);
+}
 const sources: Record<string, { resource: string; method: keyof SessionSurface; mvcc: boolean }> = {
 	Q01: { resource: "transcript", method: "getTranscriptEntries", mvcc: true },
 	Q03: { resource: "context", method: "getContextSnapshot", mvcc: false },
@@ -138,6 +171,7 @@ const names = [
 	"models.profiles.list",
 	"skill.invoke_status",
 	"providers.list/active",
+	"session.checkpoint",
 ];
 
 export class QueryHandlers {
@@ -164,11 +198,32 @@ export class QueryHandlers {
 					false,
 					`${request.query} is not installed for this session.`,
 				);
+			// D1 strict raw checkpoint/cursor validation (approved authority contract):
+			// `checkpointToken` is a signed checkpoint cursor accepted ONLY on Q01
+			// (transcript.list), is mutually exclusive with a top-level cursor, and
+			// empty cursors are rejected instead of silently dropped.
+			if (request.cursor !== undefined && request.cursor === "")
+				return this.#error(request, "invalid_input", false, "cursor must be a non-empty string");
+			const checkpointToken = request.input?.checkpointToken;
+			if (checkpointToken !== undefined) {
+				if (typeof checkpointToken !== "string" || checkpointToken.trim() === "")
+					return this.#error(request, "invalid_input", false, "checkpointToken must be a non-empty string");
+				if (query !== "Q01" && query !== "Q30")
+					return this.#error(
+						request,
+						"invalid_input",
+						false,
+						"checkpointToken is only supported on transcript.list and session.checkpoint",
+					);
+				if (request.cursor !== undefined)
+					return this.#error(request, "invalid_input", false, "checkpointToken and cursor are mutually exclusive");
+			}
 			if (query === "Q02") return await this.#transcriptBody(request);
 			if (query === "Q23") return await this.#resourceBody(request);
 			if (query === "Q26") return await this.#promptStatus(request);
 			if (query === "Q28") return await this.#skillInvokeStatus(request);
 			if (query === "Q24") return await this.#artifact(request);
+			if (query === "Q30") return await this.#checkpoint(request);
 			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
 				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
 			if (query === "Q27" && typeof this.surface.getModelProfiles !== "function")
@@ -203,8 +258,16 @@ export class QueryHandlers {
 		let position = 0;
 		let byteOffset = 0;
 		let snapshot: unknown;
-		if (request.cursor) {
-			const cursor = this.cursors.consume(request.cursor, request.connectionId, {
+		// The cursor may arrive either as the top-level continuation cursor or,
+		// on Q01 only (validated in `dispatch`), as the `checkpointToken` resume
+		// seed. Both are signed checkpoint cursors consumed through the same
+		// CursorRegistry authority; neither mints a fresh snapshot.
+		const rawCursorToken = request.cursor ?? (queryId === "Q01" ? request.input?.checkpointToken : undefined);
+		if (rawCursorToken !== undefined && typeof rawCursorToken !== "string")
+			return this.#error(request, "invalid_request", false, "checkpointToken must be a non-empty string.");
+		const cursorToken = rawCursorToken;
+		if (cursorToken !== undefined) {
+			const cursor = this.cursors.consume(cursorToken, request.connectionId, {
 				sessionId: this.sessionId,
 				resource: source.resource,
 				direction: "forward",
@@ -343,6 +406,96 @@ export class QueryHandlers {
 			selector,
 			source.resource === "transcript" ? { highWatermark: lastId(snapshot) } : {},
 		);
+	}
+	async #checkpoint(request: QueryRequest): Promise<QueryResponse> {
+		if (request.cursor)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"session.checkpoint does not accept a cursor; issue a fresh checkpoint on reconnect.",
+			);
+		const input = request.input ?? {};
+		const inputKeys = Object.keys(input);
+		if (inputKeys.some(key => key !== "checkpointToken"))
+			return this.#error(request, "invalid_request", false, "session.checkpoint accepts only checkpointToken.");
+		if (input.checkpointToken !== undefined) {
+			if (typeof input.checkpointToken !== "string" || input.checkpointToken.length === 0)
+				return this.#error(request, "invalid_request", false, "checkpointToken must be a non-empty string.");
+			try {
+				const exchanged = await this.cursors.exchange(
+					input.checkpointToken,
+					request.connectionId,
+					{
+						sessionId: this.sessionId,
+						resource: "transcript",
+						direction: "forward",
+						pageShape: { targetBytes: TARGET_PAGE_BYTES },
+					},
+					"transcript",
+					"default",
+				);
+				return {
+					id: request.id,
+					ok: true,
+					result: {
+						checkpointToken: exchanged.cursor,
+						checkpoint: exchanged.envelope.highWatermark,
+						revisionId: exchanged.envelope.revision,
+						issuedAt: exchanged.envelope.issuedAt,
+						expiresAt: exchanged.envelope.expiresAt,
+					},
+				};
+			} catch (error) {
+				if (error instanceof CursorError)
+					return this.#error(request, error.code, error.restartQuery, error.message);
+				throw error;
+			}
+		}
+		// Expired pins must be removed before payload-hash deduplication; otherwise
+		// createRevision can return an expired revision that grant() immediately sweeps.
+		this.cursors.sweep();
+		// Atomic synchronous capture (C9): entries and event-ring watermark come
+		// from the same host-owned call, so the pinned snapshot revision and the
+		// subscribe position can never straddle a concurrent append.
+		const captured =
+			typeof this.surface.getCheckpointSnapshot === "function" ? this.surface.getCheckpointSnapshot() : undefined;
+		const entries = captured !== undefined ? captured.entries : await this.surface.getTranscriptEntries();
+		const head: SdkCheckpointRecord =
+			captured !== undefined
+				? captured.watermark
+				: { revision: Array.isArray(entries) ? entries.length : 0, generation: 0, seq: 0 };
+		// Mint the snapshot from the exact entries captured with the watermark;
+		// entries appended after this point are excluded from replay by
+		// construction (append-during-checkpoint), and the returned token is the
+		// per-grant signed cursor pinned to this revision — never an unlocked
+		// fresh replay authority.
+		const snapshot = await this.revisions.createRevision("transcript", "default", entries);
+		const nonce = randomUUID();
+		const envelope: CursorEnvelope = {
+			cursorVersion: 1,
+			protocolMajor: 3,
+			sessionId: this.sessionId,
+			resource: "transcript",
+			revision: snapshot,
+			highWatermark: head,
+			nonce,
+			position: { offset: 0, selector: { queryId: "Q01" } },
+			direction: "forward",
+			pageShape: { targetBytes: TARGET_PAGE_BYTES },
+		};
+		const cursor = await this.cursors.grant(request.connectionId, envelope, "transcript", "default");
+		return {
+			id: request.id,
+			ok: true,
+			result: {
+				checkpointToken: cursor,
+				checkpoint: head,
+				revisionId: snapshot,
+				issuedAt: envelope.issuedAt,
+				expiresAt: envelope.expiresAt,
+			},
+		};
 	}
 
 	async #transcriptBody(request: QueryRequest): Promise<QueryResponse> {

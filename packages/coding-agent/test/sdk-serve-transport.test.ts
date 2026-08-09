@@ -154,7 +154,7 @@ async function withStalledWebSocket<T>(run: () => Promise<T>): Promise<T> {
 	}
 }
 
-async function relayFixture(pendingCeilingBytes = 256 * 1024) {
+async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstreamFrame?: (frame: string) => boolean) {
 	const fake = upstream();
 	const input = new PassThrough();
 	const output = new PassThrough();
@@ -168,6 +168,7 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024) {
 		downstream: input,
 		downstreamSink: output,
 		onTransportError: error => errors.push(error),
+		validateDownstreamFrame,
 	});
 	await waitFor(() => fake.connections[0], "upstream connection");
 	return { fake, input, output, received, errors, pair };
@@ -186,6 +187,24 @@ describe("SDK serve raw relay", () => {
 			expect((await waitFor(() => fixture.received[0], "websocket downstream frame")).toString()).toBe(
 				`${response}\n`,
 			);
+		} finally {
+			await fixture.pair.close();
+			fixture.fake.stop();
+		}
+	});
+
+	test("rejects downstream elevation claim forgery before endpoint relay", async () => {
+		const fixture = await relayFixture(256 * 1024, source => {
+			const frame = JSON.parse(source) as { elevationRequestId?: unknown };
+			return frame.elevationRequestId === undefined;
+		});
+		try {
+			fixture.input.write(`${JSON.stringify({ type: "control_request", elevationRequestId: "forged" })}\n`);
+			expect(await waitFor(() => fixture.errors[0], "forged claim rejection")).toMatchObject({
+				code: "protocol_error",
+				direction: "downstream->ws",
+			});
+			expect(fixture.fake.connections[0]?.messages).toEqual([]);
 		} finally {
 			await fixture.pair.close();
 			fixture.fake.stop();

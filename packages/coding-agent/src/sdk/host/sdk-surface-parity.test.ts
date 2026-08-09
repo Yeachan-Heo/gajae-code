@@ -116,6 +116,7 @@ describe("SDK surface parity", () => {
 		expect(createSdkCapabilities(nativePolicy, false)).toEqual(createSdkCapabilities(loopbackPolicy, false));
 		expect(nativePolicy.installedQueries).toContain("turn.prompt_status");
 		expect(nativePolicy.installedQueries).toContain("skill.invoke_status");
+		expect(nativePolicy.installedQueries).toContain("session.checkpoint");
 	});
 
 	test("workflow controls are advertised exactly when a durable gate bridge exists", () => {

@@ -34,6 +34,9 @@ import { SdkClient } from "@gajae-code/bridge-client";
 ```
 
 `@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
+For terminal-side session operation, see [the SDK session CLI guide](./sdk-session-cli.md):
+`gjc sdk session list|inspect|send|status|tail` plus the explicit raw
+`control|query|global` hatch, all broker-bound and credential-free.
 
 ## Migration from the removed RPC mode
 

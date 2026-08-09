@@ -15,6 +15,9 @@ const BROKER_OPERATIONS = new Set([
 	"session.close",
 	"session.delete",
 	"broker.shutdown",
+	"elevation.issue",
+	"elevation.status",
+	"session.control",
 ]);
 type RequestInput = Record<string, unknown>;
 type BrokerRequest = {
@@ -23,6 +26,7 @@ type BrokerRequest = {
 	operation?: string;
 	input?: RequestInput;
 	idempotencyKey?: string;
+	elevationRequestId?: string;
 };
 function digest(value: string): Buffer {
 	return createHash("sha256").update(value).digest();
@@ -134,6 +138,10 @@ export class BrokerTransport {
 			sendError(socket, frame.id, "invalid_input", "idempotencyKey must be a string");
 			return;
 		}
+		if (frame.elevationRequestId !== undefined && typeof frame.elevationRequestId !== "string") {
+			sendError(socket, frame.id, "invalid_input", "elevationRequestId must be a string");
+			return;
+		}
 		if (frame.operation === "broker.shutdown") {
 			const action = brokerShutdownSendAction(
 				send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } }),
@@ -145,7 +153,12 @@ export class BrokerTransport {
 			return;
 		}
 		try {
-			const result = await this.#broker.handleRequest(frame.operation, frame.input, frame.idempotencyKey);
+			const result = await this.#broker.handleRequest(
+				frame.operation,
+				frame.input,
+				frame.idempotencyKey,
+				frame.elevationRequestId,
+			);
 			send(socket, { type: "broker_response", id: frame.id, ...result });
 		} catch {
 			sendError(socket, frame.id, "unavailable", "broker request failed");
