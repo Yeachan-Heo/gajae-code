@@ -14262,7 +14262,13 @@ export class SessionManager {
 	async saveDraft(text: string): Promise<void> {
 		if (this.destination.kind === "managed") {
 			if (text.length === 0) {
-				await this.#getManagedDraftStore()?.remove("draft.txt");
+				const store = this.#getManagedDraftStore();
+				if (!store) return;
+				await store.remove("draft.txt");
+				if (this.#readOnlyResume && this.#sessionFile) {
+					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+					this.#readOnlyResume = false;
+				}
 				return;
 			}
 			// Force the session header onto disk so resume can find the file we are
@@ -14286,6 +14292,10 @@ export class SessionManager {
 				await this.storage.unlink(draftPath);
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
+			}
+			if (this.#readOnlyResume && this.#sessionFile) {
+				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
 			}
 			return;
 		}
