@@ -15713,10 +15713,9 @@ export class SessionManager {
 						if (record.type === "session") return;
 						if (record.type === "header_patch" || record.type === "entry_patch") return false;
 						if (typeof record.id !== "string") return false;
-						const entry = sanitizeLoadedSessionEntryReplayMetadata(
-							materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
-						);
-						residentizePersistedBlobRefs(entry);
+						const coldEntry = sanitizeLoadedSessionEntryReplayMetadata(record);
+						residentizePersistedBlobRefs(coldEntry);
+						const entry = materializeResidentEntryForReadSync(coldEntry, this.#residentBlobStores(), new Map());
 						visitor(
 							cloneSessionEntry(
 								rehydrateColdSpillEntry(
@@ -15724,13 +15723,6 @@ export class SessionManager {
 									this.#coldSpillReadStore(),
 									this.#residentBlobStoresForColdRehydrate(),
 								),
-							),
-						);
-					} catch {
-						return false;
-					}
-				},
-			);
 							),
 						);
 					} catch {
