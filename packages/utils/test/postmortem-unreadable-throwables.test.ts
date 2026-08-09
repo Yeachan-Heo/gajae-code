@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
-import { recordFatalCrash } from "../src/postmortem";
+import { CRASH_RECORD_MAX_BYTES, recordFatalCrash } from "../src/postmortem";
 import { NonZeroExitError } from "../src/ptree";
 
 /**
@@ -13,8 +13,9 @@ import { NonZeroExitError } from "../src/ptree";
  * cross-realm object, a plain record, a primitive — and hardening them one at a
  * time is what left a sibling path unguarded on every previous attempt.
  *
- * So this table is written against the consumer: whatever the throwable is, the
- * record exists and carries every field that could be read.
+ * So this table is written against the consumer: every throwable produces a
+ * useful record, while arbitrary request data is excluded and retained context
+ * is redacted and bounded.
  */
 const LABEL = "Uncaught Exception";
 const RECORDED_AT = new Date("2026-01-01T00:00:00.000Z");
@@ -47,8 +48,10 @@ interface Throwables {
 	/** Case name, also the assertion failure label. */
 	readonly what: string;
 	readonly build: () => unknown;
-	/** Fragments the record must keep: everything readable, plus a marker for everything not. */
+	/** Fragments the record must keep. */
 	readonly keeps: readonly string[];
+	/** Fragments excluded by the diagnostic-context policy. */
+	readonly omits?: readonly string[];
 	readonly after?: (contents: string) => void;
 }
 
@@ -144,9 +147,7 @@ const throwables: readonly Throwables[] = [
 	{
 		what: "plain record thrown instead of an Error",
 		build: () => ({ phase: "startup", reason: "broker-spawn", message: "record fatal" }),
-		// No `name`, so this is payload rather than an error shape: the whole
-		// record is kept instead of collapsing to `[object Object]`.
-		keeps: ['{"message":"record fatal","phase":"startup","reason":"broker-spawn"}'],
+		keeps: ["Error: record fatal", '{"phase":"startup","reason":"broker-spawn"}'],
 	},
 	{
 		what: "plain record carrying a readable stack and crash context",
@@ -156,7 +157,7 @@ const throwables: readonly Throwables[] = [
 			exitCode: 7,
 			stack: "at spawnBroker (broker.ts:1:1)",
 		}),
-		keeps: ['{"stack":"at spawnBroker (broker.ts:1:1)","phase":"startup","reason":"broker-spawn","exitCode":7}'],
+		keeps: ["spawnBroker (broker.ts:1:1)", '{"phase":"startup","reason":"broker-spawn","exitCode":7}'],
 	},
 	{
 		what: "named error record carrying HTTP response context",
@@ -167,7 +168,8 @@ const throwables: readonly Throwables[] = [
 			url: "https://api/x",
 			body: "upstream",
 		}),
-		keeps: ['{"name":"HttpError","message":"502 Bad Gateway","status":502,"url":"https://api/x","body":"upstream"}'],
+		keeps: ["HttpError: 502 Bad Gateway", '{"status":502,"url":"https://api/x"}'],
+		omits: ['"body"', "upstream"],
 	},
 	((): Throwables => {
 		const reads: string[] = [];
@@ -188,37 +190,80 @@ const throwables: readonly Throwables[] = [
 						reads.push("stack");
 						return false;
 					},
-					payload: "readable context survives",
+					phase: "readable context survives",
 				};
 			},
-			keeps: ['{"name":17,"message":null,"stack":false,"payload":"readable context survives"}'],
+			keeps: ["17: null", '{"phase":"readable context survives"}'],
 			after: () => expect(reads).toEqual(["name", "message", "stack"]),
 		};
 	})(),
 	{
-		what: "Error with an oversized own field",
-		build: () => Object.assign(new Error("upstream refused the connection"), { body: "X".repeat(70_000) }),
-		keeps: [
-			"upstream refused the connection",
-			"postmortem-unreadable-throwables.test.ts",
-			"[crash record truncated]",
-		],
-		after: contents => {
-			const body = contents.indexOf('"body"');
-			expect(contents.indexOf('"name"')).toBeLessThan(body);
-			expect(contents.indexOf('"message"')).toBeLessThan(body);
-			expect(contents.indexOf('"stack"')).toBeLessThan(body);
+		what: "NonZeroExitError whose 20KB stderr must not evict exitCode",
+		build: () => new NonZeroExitError(7, "E".repeat(20 * 1024)),
+		keeps: ['"exitCode":7', '"stderr":"', "[field truncated]"],
+		after: contents => expect(Buffer.byteLength(contents, "utf8")).toBeLessThanOrEqual(CRASH_RECORD_MAX_BYTES),
+	},
+	{
+		what: "credential-shaped request fields on an Error",
+		build: () =>
+			Object.assign(new Error("upstream refused the connection"), {
+				config: { headers: { authorization: "Bearer sk-abcdefghijklmnopqrstuvwxyz012345" } },
+				body: "Y".repeat(200_000),
+			}),
+		keeps: ["upstream refused the connection", "postmortem-unreadable-throwables.test.ts"],
+		omits: ["Bearer sk-", '"config"', '"body"', "Y".repeat(1024)],
+		after: contents => expect(Buffer.byteLength(contents, "utf8")).toBeLessThanOrEqual(CRASH_RECORD_MAX_BYTES),
+	},
+	{
+		what: "credential inside a retained diagnostic field",
+		build: () =>
+			Object.assign(new Error("child failed"), {
+				exitCode: 7,
+				stderr: "Authorization=Bearer sk-abcdefghijklmnopqrstuvwxyz012345",
+			}),
+		keeps: ['"exitCode":7', '"stderr":"Authorization=«redacted»"'],
+		omits: ["Bearer sk-", "abcdefghijklmnopqrstuvwxyz012345"],
+	},
+	{
+		what: "named record with an explicitly empty stack",
+		build: () => ({ name: "E", message: "m", stack: "", other: 1 }),
+		keeps: ["E: m"],
+		omits: ['"stack"', '"other"'],
+		after: contents => expect(contents.match(/E: m/g)).toHaveLength(1),
+	},
+	{
+		what: "own context field that references the throwable",
+		build: () => {
+			const reads: string[] = [];
+			const throwable: Record<string, unknown> = {
+				get name() {
+					if (reads.push("name") > 1) throw new Error("name read twice");
+					return "E";
+				},
+				get message() {
+					if (reads.push("message") > 2) throw new Error("message read twice");
+					return "m";
+				},
+			};
+			throwable.reason = throwable;
+			return throwable;
 		},
+		keeps: ["E: m", '"reason":"[object Object]"'],
+	},
+	{
+		what: "own diagnostic field whose value is undefined",
+		build: () => ({ message: "undefined context survives", phase: undefined }),
+		keeps: ["Error: undefined context survives", '"phase":"[undefined]"'],
 	},
 	{
 		what: "record whose symbol message must not disappear",
 		build: () => ({ message: Symbol("lost") }),
-		keeps: ['{"message":"Symbol(lost)"}'],
+		keeps: ["Error: Symbol(lost)"],
 	},
 	{
 		what: "record whose function message must not disappear",
 		build: () => ({ message: () => "x" }),
-		keeps: ['{"message":"() => \\"x\\""}'],
+		keeps: ['Error: () => "x"'],
 	},
 	{
 		what: "thrown string primitive",
@@ -247,7 +292,7 @@ function diagnosticOf(contents: string): string {
 }
 
 describe("crash recording of throwables that refuse to be read", () => {
-	for (const { what, build, keeps, after } of throwables) {
+	for (const { what, build, keeps, omits, after } of throwables) {
 		it(`records a fatal from a ${what}`, () => {
 			const target = crashLogTarget();
 
@@ -257,6 +302,7 @@ describe("crash recording of throwables that refuse to be read", () => {
 
 			const contents = fs.readFileSync(target, "utf8");
 			for (const fragment of keeps) expect(contents).toContain(fragment);
+			for (const fragment of omits ?? []) expect(contents).not.toContain(fragment);
 			after?.(contents);
 			// Whatever it was, the record says something: never an empty diagnostic.
 			expect(diagnosticOf(contents)).not.toBe("");
