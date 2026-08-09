@@ -37,6 +37,7 @@
 - New `modelProfile.proxyProvider` and `modelProfile.proxyMode` settings route built-in model-preset selectors through an authenticated OpenAI-compatible proxy (e.g. `xai/grok-4.3` → `litellm/xai/grok-4.3`). `fallback` preserves directly authenticated providers by default; `always` forces every proxy-routable built-in selector through the configured gateway. Routing fails closed for unconfigured or unauthenticated proxies and missing or ambiguous proxy models (#4123).
 - SDK-only session hosts now publish their session ID and register their endpoint lifecycle with the broker, matching its identity and staleness fences. This restores broker/coordinator resolution for durable workflow-gate controls (`workflow.gates.list` and `workflow.gate_answer`) without relying on tmux pane input; broker unavailability leaves non-lifecycle local hosts usable and retries publication later.
 
+- Python eval now settles managed-runtime provisioning before cancellation, retires cancelled initialization without sharing it with successors, and retains late kernels whose shutdown is unconfirmed for postmortem retry.
 ## [0.12.21] - 2026-08-09
 
 ### Fixed

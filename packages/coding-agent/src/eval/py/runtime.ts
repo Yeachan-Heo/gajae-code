@@ -23,6 +23,8 @@ export interface PythonRuntimeLifecycleOptions {
 	deadlineMs?: number;
 }
 
+const RUNTIME_CANCEL_GRACE_MS = 1_000;
+
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
 	"HOME",
@@ -231,13 +233,24 @@ async function runRuntimeCommand(
 		while (cleanups.length > 0) cleanups.pop()?.();
 		callback();
 	};
+	let cancellation: { timedOut: boolean } | undefined;
 	const cancel = (timedOut: boolean): void => {
+		if (cancellation) return;
+		cancellation = { timedOut };
 		try {
 			proc.kill("SIGTERM");
 		} catch {
 			// The process may have exited between the cancellation check and signal.
 		}
-		finish(() => reject(createRuntimeCancellationError(timedOut)));
+		const escalation = setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// The process may have exited during the graceful cancellation window.
+			}
+		}, RUNTIME_CANCEL_GRACE_MS);
+		escalation.unref();
+		cleanups.push(() => clearTimeout(escalation));
 	};
 	if (lifecycle?.signal?.aborted) {
 		cancel(false);
@@ -256,7 +269,14 @@ async function runRuntimeCommand(
 			cleanups.push(() => clearTimeout(timer));
 		}
 	}
-	proc.exited.then(code => finish(() => resolve(code)));
+	proc.exited.then(code => {
+		const cancelled = cancellation;
+		if (cancelled) {
+			finish(() => reject(createRuntimeCancellationError(cancelled.timedOut)));
+			return;
+		}
+		finish(() => resolve(code));
+	});
 	let exitCode: number;
 	try {
 		exitCode = await promise;

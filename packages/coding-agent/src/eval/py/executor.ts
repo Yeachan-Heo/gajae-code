@@ -361,6 +361,7 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 		}),
 	};
 	sessions.set(sessionId, initializing);
+	ensurePythonResourceCleanup();
 	let cancellationTimer: NodeJS.Timeout | undefined;
 	const retireCancelledInitialization = (timedOut: boolean): void => {
 		if (initializing.cancelled) return;
