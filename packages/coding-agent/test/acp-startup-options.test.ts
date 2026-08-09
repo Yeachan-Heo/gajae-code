@@ -538,22 +538,29 @@ test("ACP accepts --no-extensions and still names every unsupported discovery fl
 	expect(accepted.noExtensions).toBe(true);
 	expect(() => resolveAcpStartupOptions(accepted, {})).not.toThrow();
 
-	for (const [args, flag] of [
+	for (const [args, expectedFlag] of [
 		[["--no-skills"], "--no-skills"],
 		[["--skills", "git-*,docker"], "--skills"],
+		[["--skills", ",,"], "--skills"],
+		[["--skills", "git-*", "--skills", ",,"], "--skills"],
 	] as const) {
 		const parsed = parseArgs([...args]);
 		expect(parsed.unknownFlags.size).toBe(0);
-		expect(() => resolveAcpStartupOptions(parsed, {})).toThrow(`Unsupported under SDK-backed ACP: ${flag}`);
+		expect(() => resolveAcpStartupOptions(parsed, {})).toThrow(`Unsupported under SDK-backed ACP: ${expectedFlag}`);
 	}
 });
 
 test("ACP rejects registered extension-loading flags by name", () => {
-	expect(() => resolveAcpStartupOptions(parseArgs(["--extension", "/tmp/a.ts"]), {})).toThrow(
-		"Unsupported under SDK-backed ACP: --extension",
-	);
+	for (const args of [
+		["--extension", "/tmp/a.ts"],
+		["-e", "/tmp/a.ts"],
+	] as const) {
+		expect(() => resolveAcpStartupOptions(parseArgs([...args]), {})).toThrow(
+			"Unsupported under SDK-backed ACP: --extension",
+		);
+	}
 	expect(() => resolveAcpStartupOptions(parseArgs(["--hook", "/tmp/a.ts"]), {})).toThrow(
-		"Unsupported under SDK-backed ACP: --hook",
+		"Unsupported under SDK-backed ACP: --hook. Use ACP session configuration",
 	);
 });
 
