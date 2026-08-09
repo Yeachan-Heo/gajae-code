@@ -971,6 +971,251 @@ describe("gjc gc --disk (backups retention)", () => {
 		}
 	});
 
+	test("does not half-delete a backup that goes unreadable inside recursive removal", async () => {
+		const fixture = await makeTestRoot();
+		const backup = path.join(fixture.backupsDir, "gjc-update-old");
+		const locked = path.join(backup, "locked");
+		const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: boolean }) => Promise<Stats>;
+		const realRm = fsp.rm;
+		let raceInjected = false;
+		const lstatSpy = spyOn(fsp, "lstat");
+		lstatSpy.mockImplementation((async (target: PathLike, options?: { bigint?: boolean }) => {
+			if (!raceInjected && options?.bigint === true && path.resolve(String(target)) === path.dirname(backup)) {
+				raceInjected = true;
+				await fsp.chmod(locked, 0o000);
+			}
+			return await realLstat(target, options);
+		}) as unknown as typeof fsp.lstat);
+		const rmSpy = spyOn(fsp, "rm");
+		rmSpy.mockImplementation((async (target: PathLike, options?: Parameters<typeof fsp.rm>[1]) => {
+			if (!raceInjected && path.resolve(String(target)) === backup) {
+				raceInjected = true;
+				await fsp.chmod(locked, 0o000);
+			}
+			return await realRm(target, options);
+		}) as typeof fsp.rm);
+		try {
+			await fsp.mkdir(locked, { recursive: true });
+			for (let index = 0; index < 200; index++) {
+				await Bun.write(path.join(backup, `payload-${index}.bin`), "x".repeat(64));
+			}
+			await Bun.write(path.join(locked, "inner.bin"), "z".repeat(2048));
+			await backdate(backup, 40);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy(),
+				prune: true,
+			});
+			lstatSpy.mockRestore();
+			rmSpy.mockRestore();
+			expect(raceInjected).toBe(true);
+
+			expect(reasonById(disk, "backups").get("gjc-update-old")).toBe(
+				"keep:withheld_evidence_incomplete: tree_unreadable",
+			);
+			expect(disk.surfaces.backups.records.find(record => record.id === "gjc-update-old")?.withheld).toBe(true);
+			expect(disk.surfaces.backups.reclaimed).toBe(0);
+			expect(disk.surfaces.backups.failed).toBe(0);
+			expect(await Bun.file(path.join(backup, "payload-0.bin")).exists()).toBe(true);
+			expect((await fsp.readdir(backup)).length).toBe(201);
+		} finally {
+			lstatSpy.mockRestore();
+			rmSpy.mockRestore();
+			await fsp.chmod(locked, 0o700).catch(() => {});
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("withholds a capped walk whose unvisited subtree is unreadable", async () => {
+		const dry = await makeTestRoot();
+		const wet = await makeTestRoot();
+		const syntheticSymlinks = Array.from({ length: 200_000 }, (_unused, index) => {
+			return {
+				name: `vanished-${index}`,
+				isBlockDevice: () => false,
+				isCharacterDevice: () => false,
+				isDirectory: () => false,
+				isFIFO: () => false,
+				isFile: () => false,
+				isSocket: () => false,
+				isSymbolicLink: () => true,
+			} as unknown as Dirent;
+		});
+		const realReaddir = fsp.readdir as unknown as (
+			dir: PathLike,
+			options?: { withFileTypes?: true },
+		) => Promise<Array<string | Dirent>>;
+		const roots = new Set<string>();
+		const spy = spyOn(fsp, "readdir");
+		spy.mockImplementation((async (dir: PathLike, options?: { withFileTypes?: true }) => {
+			if (options?.withFileTypes && roots.has(path.resolve(String(dir)))) {
+				const entries = await realReaddir(dir, options);
+				const locked = entries.find(entry => typeof entry !== "string" && entry.name === "locked");
+				if (!locked) throw new Error("Expected locked fixture directory");
+				return [...syntheticSymlinks, locked];
+			}
+			return await realReaddir(dir, options);
+		}) as unknown as typeof fsp.readdir);
+		try {
+			for (const fixture of [dry, wet]) {
+				const backup = path.join(fixture.backupsDir, "gjc-update-old");
+				roots.add(backup);
+				await fsp.mkdir(path.join(backup, "locked"), { recursive: true });
+				await Bun.write(path.join(backup, "payload-0.bin"), "x".repeat(64));
+				await Bun.write(path.join(backup, "locked", "inner.bin"), "z".repeat(2048));
+				await fsp.chmod(path.join(backup, "locked"), 0o000);
+				await backdate(backup, 40);
+			}
+
+			const dryDisk = await collectGcDiskReport({
+				agentDir: dry.agentDir,
+				env: dry.env,
+				policy: policy(),
+				prune: false,
+			});
+			const wetDisk = await collectGcDiskReport({
+				agentDir: wet.agentDir,
+				env: wet.env,
+				policy: policy(),
+				prune: true,
+			});
+			spy.mockRestore();
+
+			expect(reasonById(dryDisk, "backups").get("gjc-update-old")).toBe(
+				"keep:withheld_evidence_incomplete: tree_unreadable",
+			);
+			expect(reasonById(wetDisk, "backups").get("gjc-update-old")).toBe(
+				"keep:withheld_evidence_incomplete: tree_unreadable",
+			);
+			expect(wetDisk.surfaces.backups.reclaimed).toBe(dryDisk.surfaces.backups.reclaimable);
+			expect(wetDisk.surfaces.backups.failed).toBe(0);
+			expect(await Bun.file(path.join(wet.backupsDir, "gjc-update-old", "payload-0.bin")).exists()).toBe(true);
+			expect((await fsp.readdir(path.join(wet.backupsDir, "gjc-update-old"))).sort()).toEqual([
+				"locked",
+				"payload-0.bin",
+			]);
+		} finally {
+			spy.mockRestore();
+			for (const fixture of [dry, wet]) {
+				await fsp.chmod(path.join(fixture.backupsDir, "gjc-update-old", "locked"), 0o700).catch(() => {});
+				await fsp.rm(fixture.root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("reclaims a capped walk whose unvisited subtree is readable", async () => {
+		const dry = await makeTestRoot();
+		const wet = await makeTestRoot();
+		// The same cap that hides an unreadable subtree also hides a readable one.
+		// Running out of sizing budget is not evidence of anything: it must leave
+		// `bytes` a floor without ever withholding a tree that can be removed.
+		const syntheticSymlinks = Array.from({ length: 200_000 }, (_unused, index) => {
+			return {
+				name: `skipped-${index}`,
+				isBlockDevice: () => false,
+				isCharacterDevice: () => false,
+				isDirectory: () => false,
+				isFIFO: () => false,
+				isFile: () => false,
+				isSocket: () => false,
+				isSymbolicLink: () => true,
+			} as unknown as Dirent;
+		});
+		const realReaddir = fsp.readdir as unknown as (
+			dir: PathLike,
+			options?: { withFileTypes?: true },
+		) => Promise<Array<string | Dirent>>;
+		const roots = new Set<string>();
+		const spy = spyOn(fsp, "readdir");
+		spy.mockImplementation((async (dir: PathLike, options?: { withFileTypes?: true }) => {
+			if (options?.withFileTypes && roots.has(path.resolve(String(dir)))) {
+				const entries = await realReaddir(dir, options);
+				const deep = entries.find(entry => typeof entry !== "string" && entry.name === "deep");
+				if (!deep) throw new Error("Expected the deep fixture directory");
+				return [...syntheticSymlinks, deep];
+			}
+			return await realReaddir(dir, options);
+		}) as unknown as typeof fsp.readdir);
+		try {
+			for (const fixture of [dry, wet]) {
+				const backup = path.join(fixture.backupsDir, "gjc-update-old");
+				roots.add(backup);
+				await fsp.mkdir(path.join(backup, "deep"), { recursive: true });
+				await Bun.write(path.join(backup, "payload-0.bin"), "x".repeat(64));
+				await Bun.write(path.join(backup, "deep", "inner.bin"), "z".repeat(2048));
+				await backdate(backup, 40);
+			}
+
+			const dryDisk = await collectGcDiskReport({
+				agentDir: dry.agentDir,
+				env: dry.env,
+				policy: policy(),
+				prune: false,
+			});
+			const wetDisk = await collectGcDiskReport({
+				agentDir: wet.agentDir,
+				env: wet.env,
+				policy: policy(),
+				prune: true,
+			});
+			spy.mockRestore();
+
+			expect(reasonById(dryDisk, "backups").get("gjc-update-old")).toBe("would_reclaim:older_than_max_age(14d)");
+			expect(reasonById(wetDisk, "backups").get("gjc-update-old")).toBe("reclaimed:older_than_max_age(14d)");
+			expect(dryDisk.surfaces.backups.records.find(record => record.id === "gjc-update-old")?.partial).toBe(true);
+			expect(wetDisk.surfaces.backups.reclaimed).toBe(dryDisk.surfaces.backups.reclaimable);
+			expect(wetDisk.surfaces.backups.failed).toBe(0);
+			expect(await fsp.readdir(wet.backupsDir)).toEqual([]);
+		} finally {
+			spy.mockRestore();
+			for (const fixture of [dry, wet]) {
+				await fsp.rm(fixture.root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("reports a symlinked backup that vanishes under the detach as gone, not failed", async () => {
+		const fixture = await makeTestRoot();
+		const backup = path.join(fixture.backupsDir, "gjc-update-old");
+		const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: boolean }) => Promise<Stats>;
+		let vanished = false;
+		// A tree holding a symlink is detached before it is removed, and the detach
+		// re-reads the root's identity. A concurrent cleanup that wins that race
+		// must be reported as gone, not crash the whole disk pass.
+		const spy = spyOn(fsp, "lstat");
+		spy.mockImplementation((async (target: PathLike, options?: { bigint?: boolean }) => {
+			if (!vanished && options?.bigint === true && path.resolve(String(target)) === backup) {
+				vanished = true;
+				await fsp.rm(backup, { recursive: true, force: true });
+			}
+			return await realLstat(target, options);
+		}) as unknown as typeof fsp.lstat);
+		try {
+			await fsp.mkdir(backup, { recursive: true });
+			await Bun.write(path.join(backup, "payload.bin"), "x".repeat(64));
+			await fsp.symlink(path.join(backup, "payload.bin"), path.join(backup, "alias"));
+			await backdate(backup, 40);
+
+			const disk = await collectGcDiskReport({
+				agentDir: fixture.agentDir,
+				env: fixture.env,
+				policy: policy(),
+				prune: true,
+			});
+			spy.mockRestore();
+
+			expect(vanished).toBe(true);
+			expect(reasonById(disk, "backups").get("gjc-update-old")).toBe("keep:entry_disappeared");
+			expect(disk.surfaces.backups.records.find(record => record.id === "gjc-update-old")?.withheld).toBeUndefined();
+			expect(disk.surfaces.backups.failed).toBe(0);
+			expect(disk.surfaces.backups.reclaimed).toBe(0);
+		} finally {
+			spy.mockRestore();
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
 	test("reclaims a backup whose enumerated files vanished under the walk", async () => {
 		const fixture = await makeTestRoot();
 		const backup = path.join(fixture.backupsDir, "gjc-update-old");

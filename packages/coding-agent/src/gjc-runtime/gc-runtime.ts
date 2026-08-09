@@ -13,10 +13,11 @@
  * - Dry-run by default: nothing is deleted unless `--prune`/`--force`.
  */
 
-import type { Dirent, Stats } from "node:fs";
+import type { BigIntStats, Dirent, Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exactRemoveDirectoryTree, exactUnlink, snapshotDirectoryTree } from "@gajae-code/natives";
 import { getAgentDir, getBlobsDir, getSessionsDir, isEnoent, VERSION } from "@gajae-code/utils";
 import { getDefault } from "../config/settings-schema";
 import { listHarnessRootRegistriesForGc } from "../harness-control-plane/storage";
@@ -765,6 +766,11 @@ function summarizeGcDiskSurface(report: GcDiskSurfaceReport): void {
  * An entry that vanished mid-walk (`ENOENT`) is the opposite fact: it is gone,
  * not withheld. A vanished entry cannot block a recursive remove, so it only
  * makes `bytes` a floor and never withholds the tree.
+ *
+ * The walk is bounded in sizing work, not in reach: past
+ * {@link GC_DISK_MAX_WALK_ENTRIES} it stops stat'ing files but keeps opening
+ * directories, so a huge but perfectly readable tree stays reclaimable instead
+ * of being reported as unreadable.
  */
 async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial: boolean; unreadable: boolean }> {
 	let bytes = 0;
@@ -785,7 +791,6 @@ async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial
 			continue;
 		}
 		for (const entry of entries) {
-			if (visited >= GC_DISK_MAX_WALK_ENTRIES) return { bytes, partial: true, unreadable };
 			visited++;
 			const child = path.join(dir, entry.name);
 			if (entry.isSymbolicLink()) {
@@ -797,6 +802,13 @@ async function measureGcDiskTree(root: string): Promise<{ bytes: number; partial
 				continue;
 			}
 			if (!entry.isFile()) continue;
+			// The entry cap bounds the per-file `lstat` work, not the enumeration:
+			// past it `bytes` is a floor, but every directory is still opened so
+			// `unreadable` stays a complete answer for the whole tree.
+			if (visited > GC_DISK_MAX_WALK_ENTRIES) {
+				partial = true;
+				continue;
+			}
 			try {
 				bytes += (await fsp.lstat(child)).size;
 			} catch (error) {
@@ -1424,11 +1436,10 @@ async function runGcDiskNatives(input: {
  * Remove one directory/file entry, fail-closed on identity drift. Anything that
  * changed inode or mtime between classification and removal is left alone.
  *
- * Readability is re-proven here instead of being trusted from measurement time:
- * a nested directory can become unreadable after the size walk without touching
- * the root's inode or mtime, and a recursive remove that cannot finish past it
- * would destroy the readable half. The fact has to hold at the moment it
- * matters, so a removal that cannot complete never starts.
+ * Directories use the native exact-tree remover. Its fresh descriptor-relative
+ * snapshot is revalidated by the removal itself before an atomic detach, closing
+ * the gap where a plain recursive `rm` could destroy readable siblings before
+ * discovering that another subtree had become unreadable.
  */
 async function removeGcDiskEntry(
 	target: string,
@@ -1446,16 +1457,93 @@ async function removeGcDiskEntry(
 		return { removed: false, reason: "entry_identity_changed" };
 	}
 	if (current.mtimeMs !== expected.mtimeMs) return { removed: false, reason: "entry_changed" };
-	if (current.isDirectory() && (await measureGcDiskTree(target)).unreadable) {
-		return { removed: false, reason: "withheld_evidence_incomplete: tree_unreadable", withheld: true };
+
+	if (!current.isDirectory()) {
+		try {
+			await fsp.rm(target, { force: false });
+			return { removed: true };
+		} catch (error) {
+			if (isEnoent(error)) return { removed: false, reason: "entry_disappeared" };
+			return { removed: false, reason: `entry_remove_failed: ${gcDiskErrorText(error)}`, failed: true };
+		}
 	}
+
+	const snapshot = snapshotDirectoryTree(target);
+	if (!snapshot.ok || !snapshot.snapshot) {
+		if (snapshot.code === "not_found") return { removed: false, reason: "entry_disappeared" };
+		if (snapshot.code !== "reparse_point") {
+			return { removed: false, reason: "withheld_evidence_incomplete: tree_unreadable", withheld: true };
+		}
+
+		let identity: BigIntStats;
+		let linkParent: BigIntStats;
+		try {
+			identity = await fsp.lstat(target, { bigint: true });
+			linkParent = await fsp.lstat(path.dirname(target), { bigint: true });
+		} catch (error) {
+			if (isEnoent(error)) return { removed: false, reason: "entry_disappeared" };
+			return { removed: false, reason: `entry_unverifiable: ${gcDiskErrorText(error)}`, failed: true };
+		}
+		const detached = exactUnlink(target, {
+			dev: identity.dev,
+			ino: identity.ino,
+			nlink: identity.nlink,
+			size: identity.size,
+			mtimeNs: identity.mtimeNs,
+			parentDev: linkParent.dev,
+			parentIno: linkParent.ino,
+			directory: true,
+			detachOnly: true,
+			quarantineName: `${path.basename(target)}.removing`,
+		});
+		if ((!detached.ok && detached.code !== "cleanup_pending") || !detached.detachedPath) {
+			return { removed: false, reason: `entry_remove_failed: ${detached.code ?? "unknown"}`, failed: true };
+		}
+		try {
+			await fsp.rm(detached.detachedPath, { recursive: true, force: false });
+			if (detached.retainedPlaceholderPath) await fsp.rmdir(detached.retainedPlaceholderPath);
+			return { removed: true };
+		} catch (error) {
+			if (isEnoent(error)) return { removed: true };
+			return { removed: false, reason: `entry_remove_failed: ${gcDiskErrorText(error)}`, failed: true };
+		}
+	}
+
+	let parent: BigIntStats;
 	try {
-		await fsp.rm(target, { recursive: true, force: false });
-		return { removed: true };
+		parent = await fsp.lstat(path.dirname(target), { bigint: true });
 	} catch (error) {
 		if (isEnoent(error)) return { removed: false, reason: "entry_disappeared" };
-		return { removed: false, reason: `entry_remove_failed: ${gcDiskErrorText(error)}`, failed: true };
+		return { removed: false, reason: `entry_unverifiable: ${gcDiskErrorText(error)}`, failed: true };
 	}
+
+	const removal = exactRemoveDirectoryTree(target, snapshot.snapshot, {
+		dev: parent.dev,
+		ino: parent.ino,
+	});
+	if (removal.ok) return { removed: true };
+	if (removal.code === "cleanup_pending" && removal.payloadDurable === true && removal.detachedPath) {
+		try {
+			await fsp.rm(removal.detachedPath, { recursive: true, force: false });
+			return { removed: true };
+		} catch (error) {
+			if (isEnoent(error)) return { removed: true };
+			return { removed: false, reason: `entry_remove_failed: ${gcDiskErrorText(error)}`, failed: true };
+		}
+	}
+	if (removal.code === "not_found") return { removed: false, reason: "entry_disappeared" };
+	if (removal.code === "identity_mismatch" || removal.code === "parent_mismatch") {
+		return { removed: false, reason: "entry_changed" };
+	}
+	const retainedAtOriginal = !removal.detachedPath || path.resolve(removal.detachedPath) === path.resolve(target);
+	if ((removal.code === "permission_denied" || removal.code === "io_error") && retainedAtOriginal) {
+		return { removed: false, reason: "withheld_evidence_incomplete: tree_unreadable", withheld: true };
+	}
+	return {
+		removed: false,
+		reason: `entry_remove_failed: ${removal.code ?? "unknown"}`,
+		failed: true,
+	};
 }
 
 async function runGcDiskBackups(input: {
