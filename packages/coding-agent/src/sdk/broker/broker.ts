@@ -1014,14 +1014,16 @@ export class Broker {
 			return;
 		}
 		if (observation === "owned") {
-			if (writeHeartbeat) {
-				await this.#writeHeartbeat();
-				return;
-			}
+			// Recover the cached publication state synchronously with the observation
+			// so request admission does not lag behind the awaited heartbeat IO.
+			// The heartbeat write that follows re-checks fresh publication authority
+			// and fences (downgrading this optimistic recovery) if ownership changed
+			// between the observation and the write.
 			this.#publicationState = "healthy-owned";
 			this.#startupAdmissions.reopen();
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
+			if (writeHeartbeat) await this.#writeHeartbeat();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
@@ -1040,10 +1042,6 @@ export class Broker {
 			return;
 		}
 		const recovery = this.runSynchronousEffectWithFreshPublicationAuthority(() => {
-			this.#publicationState = "healthy-owned";
-			this.#startupAdmissions.reopen();
-			this.#lossAt = null;
-			this.#ambiguousAt = null;
 			this.discovery = { ...this.discovery!, heartbeatAt };
 		});
 		if (!recovery.authorized) return;
