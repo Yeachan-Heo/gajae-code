@@ -15605,14 +15605,27 @@ export class AgentSession {
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
-			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
-				settings: this.settings,
-				matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
-				modelRegistry: this.#modelRegistry,
-				sessionId: this.sessionId,
-				...(this.#persistedModelProfileAliasIntent("default") ?? {}),
-				credentialSessionId: this.credentialSessionId,
-			});
+			const profileAliasIntent = this.#persistedModelProfileAliasIntent("default");
+			const resolved = profileAliasIntent
+				? await resolveModelChainWithAuth(
+						[selector],
+						this.#modelRegistry,
+						this.settings,
+						this.credentialSessionId,
+						{
+							managedFallback: true,
+							...profileAliasIntent,
+							canonicalSessionId: this.agent.providerSessionId ?? this.sessionId,
+							credentialSessionId: this.credentialSessionId,
+						},
+					)
+				: resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+						settings: this.settings,
+						matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
+						modelRegistry: this.#modelRegistry,
+						sessionId: this.agent.providerSessionId ?? this.sessionId,
+						credentialSessionId: this.credentialSessionId,
+					});
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
 				continue;
