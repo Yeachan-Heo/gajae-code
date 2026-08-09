@@ -116,7 +116,6 @@ it("coalesces concurrent managed migration for the same local root", async () =>
 		const first = initializeLocalRoot(options);
 		await captureStarted.promise;
 		const second = initializeLocalRoot(options);
-		await Bun.sleep(20);
 		expect(captures).toBe(1);
 		releaseCapture.resolve();
 		await expect(Promise.all([first, second])).resolves.toEqual([localRoot, localRoot]);

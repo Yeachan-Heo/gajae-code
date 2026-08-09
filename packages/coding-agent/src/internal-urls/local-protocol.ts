@@ -369,7 +369,7 @@ async function migrateManagedLegacyLocal(
 ): Promise<void> {
 	const captured = await source.capture();
 	if (!captured) {
-		await writeAbsentMigrationMarker(marker);
+		await fs.writeFile(marker, "absent\n", { mode: 0o600, flag: "wx" });
 		return;
 	}
 	let copiedBytes = 0;
@@ -446,17 +446,6 @@ async function readMigrationMarker(marker: string): Promise<LegacyMigrationState
 	}
 }
 
-async function writeAbsentMigrationMarker(marker: string): Promise<void> {
-	try {
-		await fs.writeFile(marker, "absent\n", { mode: 0o600, flag: "wx" });
-	} catch (error) {
-		if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
-		if ((await readMigrationMarker(marker)) !== "complete") {
-			throw new Error("Legacy local:// migration marker race");
-		}
-	}
-}
-
 async function migrateLegacyLocal(
 	options: LocalProtocolOptions,
 	localRoot: string,
@@ -471,7 +460,7 @@ async function migrateLegacyLocal(
 	}
 	const artifactsDir = options.getArtifactsDir?.();
 	if (!artifactsDir) {
-		await writeAbsentMigrationMarker(marker);
+		await fs.writeFile(marker, "absent\n", { mode: 0o600, flag: "wx" });
 		return;
 	}
 	let legacySource: CanonicalLegacyRoot;
@@ -481,7 +470,7 @@ async function migrateLegacyLocal(
 		manifest = await captureLegacyManifest(legacySource.root, legacySource.identity);
 	} catch (error) {
 		if (isEnoent(error)) {
-			await writeAbsentMigrationMarker(marker);
+			await fs.writeFile(marker, "absent\n", { mode: 0o600, flag: "wx" });
 			return;
 		}
 		throw error;
