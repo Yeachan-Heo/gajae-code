@@ -8519,6 +8519,8 @@ export class SessionManager {
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
+		this.#readOnlyResume = false;
+		this.#resumedDraftConsumed = false;
 
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
@@ -15005,6 +15007,10 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
+		if (this.#readOnlyResume) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 	}
 
 	/**
