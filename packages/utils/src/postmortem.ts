@@ -190,6 +190,66 @@ function installProcessStdoutWriteClassifier(): void {
 	process.stdout.write = markedWrite as typeof process.stdout.write;
 }
 
+const UNREADABLE_FIELD = "[unreadable]";
+
+/**
+ * Reads one field of a throwable, exactly once. `undefined` means the throwable
+ * does not carry a string there; `null` means it carries the field but refused
+ * to answer.
+ */
+function readErrorField(reason: object, key: "name" | "message" | "stack"): string | null | undefined {
+	try {
+		const value = (reason as Record<string, unknown>)[key];
+		return typeof value === "string" ? value : undefined;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Reads a throwable's error-shaped fields, exactly once each.
+ *
+ * Observing a property twice is a hazard, not a detail: a stateful or hostile
+ * accessor that satisfies a shape check and then throws on the re-read would
+ * escape out of `recordFatalCrash()` and cost the whole crash record. So the
+ * values that pass the check are the values that get used.
+ *
+ * The fields are read one at a time, because a sibling accessor that throws must
+ * not take a readable field down with it: a `message` that refuses to answer is
+ * no reason to lose a readable `name` or the trace. `stack` is the one field the
+ * record can do without, and letting it cost the readable fields is how a fatal
+ * becomes `Error: [object Object]`.
+ */
+function readErrorLike(reason: unknown): { name: string; message: string; stack?: string } | undefined {
+	if (typeof reason !== "object" || reason === null) return undefined;
+	const name = readErrorField(reason, "name");
+	const message = readErrorField(reason, "message");
+	// A field whose accessor throws is still a field the throwable carries; it
+	// just cannot hand over the value. Both must be carried for error shape: a
+	// refusal is evidence of the field, an absence is not. A throwable that
+	// refuses every field stays error-shaped and is recorded as unreadable —
+	// serializing it instead renders an `Error` as `{}`, which is silence.
+	if (name === undefined || message === undefined) return undefined;
+	const shaped = { name: name ?? UNREADABLE_FIELD, message: message ?? UNREADABLE_FIELD };
+
+	const stack = readErrorField(reason, "stack");
+	if (typeof stack === "string") return { ...shaped, stack };
+	// An accessor that refuses to answer is still evidence of error shape,
+	// exactly like a real `Error` is: the throwable carries the field, it just
+	// cannot hand over the value. So whatever was readable stays the diagnostic
+	// instead of being dropped for a serialization.
+	if (stack === null || name === null || message === null) return shaped;
+	try {
+		if (Object.prototype.toString.call(reason) === "[object Error]") return shaped;
+	} catch {
+		// A `Symbol.toStringTag` that throws answers nothing about error shape,
+		// and must never escape: this read is the last thing standing between a
+		// hostile throwable and a suppressed crash record. Fall through to the
+		// serialization, which still keeps the payload.
+	}
+	return undefined;
+}
+
 /**
  * Render a non-`Error` throwable so the crash record keeps its payload.
  *
@@ -199,19 +259,6 @@ function installProcessStdoutWriteClassifier(): void {
  * left. Serialize own properties instead, and stay defensive: a throwing
  * `toString`/`toJSON` or a cycle must never mask the original fatal.
  */
-function isErrorLike(reason: unknown): reason is { name: string; message: string; stack?: string } {
-	if (typeof reason !== "object" || reason === null) return false;
-	try {
-		const error = reason as { name?: unknown; message?: unknown; stack?: unknown };
-		return (
-			typeof error.name === "string" &&
-			typeof error.message === "string" &&
-			(typeof error.stack === "string" || Object.prototype.toString.call(reason) === "[object Error]")
-		);
-	} catch {
-		return false;
-	}
-}
 function describeThrowable(reason: unknown): string {
 	if (typeof reason === "object" && reason !== null) {
 		try {
@@ -228,13 +275,52 @@ function describeThrowable(reason: unknown): string {
 	}
 }
 
-function errorForDiagnostic(reason: unknown): Error {
-	if (reason instanceof Error) return reason;
-	if (!isErrorLike(reason)) return new Error(describeThrowable(reason));
+/** A throwable reduced to plain strings; the only shape the rest of this module reads. */
+interface FatalDiagnostic {
+	name: string;
+	message: string;
+	stack: string;
+}
 
-	const error = new Error(reason.message);
-	error.name = reason.name;
-	if (typeof reason.stack === "string") error.stack = reason.stack;
+const UNREADABLE_THROWABLE = "[unreadable throwable]";
+
+/**
+ * The single read of an unknown throwable, and the only one this module has.
+ *
+ * There are unbounded ways to construct a bad throwable — hostile `Proxy`,
+ * cross-realm object, primitive, a same-realm `Error` whose lazily computed
+ * `message` throws — and exactly one place that has to turn one into text. So
+ * the guard lives here instead of at each consumer: the crash log, stderr and
+ * the structured log all receive plain strings they can read unconditionally.
+ *
+ * Total by contract: it always returns a diagnostic and never throws. Whatever
+ * answered is kept; whatever refused is reported as unreadable.
+ */
+function describeFatal(reason: unknown): FatalDiagnostic {
+	try {
+		const shaped = readErrorLike(reason);
+		if (shaped) {
+			return {
+				name: shaped.name || "Error",
+				message: shaped.message || "(no message)",
+				stack: shaped.stack ?? "",
+			};
+		}
+		return { name: "Error", message: describeThrowable(reason) || "(no message)", stack: "" };
+	} catch {
+		// Every read above is individually guarded, and every earlier round of
+		// this module believed exactly that about the read it had just
+		// hardened. This is the last diagnostic the process leaves behind; it
+		// does not get to depend on that belief holding.
+		return { name: "Error", message: UNREADABLE_THROWABLE, stack: "" };
+	}
+}
+
+/** Rebuild an `Error` for structured logging out of strings that are already safe to read. */
+function fatalErrorForLog(fatal: FatalDiagnostic): Error {
+	const error = new Error(fatal.message);
+	error.name = fatal.name;
+	if (fatal.stack) error.stack = fatal.stack;
 	return error;
 }
 
@@ -243,13 +329,10 @@ function errorForDiagnostic(reason: unknown): Error {
 // Worker thread: exit only (workers use self.addEventListener for exceptions)
 let inspectorOpened = false;
 
-function formatFatalError(label: string, err: Error): string {
-	const name = err.name || "Error";
-	const message = err.message || "(no message)";
-	const stack = err.stack || "";
-	const stackLines = stack.split("\n").slice(1);
+function formatFatalError(label: string, fatal: FatalDiagnostic): string {
+	const stackLines = fatal.stack.split("\n").slice(1);
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
-	return `\n[${label}] ${name}: ${message}${formattedStack}\n`;
+	return `\n[${label}] ${fatal.name}: ${fatal.message}${formattedStack}\n`;
 }
 /** Cap for the durable crash log; it is reset past this so a crash loop cannot fill the disk. */
 export const CRASH_LOG_MAX_BYTES = 512 * 1024;
@@ -328,14 +411,21 @@ export function recordFatalCrash(
 	reason: unknown,
 	options: { path?: string; now?: Date } = {},
 ): string | undefined {
+	return writeCrashRecord(label, describeFatal(reason), options);
+}
+
+function writeCrashRecord(
+	label: string,
+	fatal: FatalDiagnostic,
+	options: { path?: string; now?: Date } = {},
+): string | undefined {
 	try {
-		const err = errorForDiagnostic(reason);
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
 		const report = boundCrashRecord(
 			`${now.toISOString()} pid=${process.pid} [${label}] ` +
-				`${err.name || "Error"}: ${redactCrashSecrets(err.message || "(no message)")}\n` +
-				`${redactCrashSecrets(err.stack ?? "")}\n\n`,
+				`${fatal.name}: ${redactCrashSecrets(fatal.message)}\n` +
+				`${redactCrashSecrets(fatal.stack)}\n\n`,
 		);
 		fs.mkdirSync(path.dirname(target), { recursive: true });
 		let existingSize = 0;
@@ -380,14 +470,15 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	// contract, including when it arrives while quiet cleanup is still pending.
 	ordinaryFatalStarted = true;
 	process.exitCode = 1;
-	const err = errorForDiagnostic(reason);
+	const fatal = describeFatal(reason);
 	// Persist first: the rotation-immune record must land before any
 	// best-effort stderr output, so a slow or failing stderr cannot cost the
 	// crash record. Cleanup (which may itself hang or fail) runs afterwards.
-	const crashLogPath = recordFatalCrash(label, err);
-	safeStderrWrite(formatFatalError(label, err));
+	const crashLogPath = writeCrashRecord(label, fatal);
+	safeStderrWrite(formatFatalError(label, fatal));
 	if (crashLogPath) safeStderrWrite(`[${label}] crash recorded at ${crashLogPath}\n`);
 	if (!quietShutdownStarted) {
+		const err = fatalErrorForLog(fatal);
 		logger.error(label === "Uncaught Exception" ? "Uncaught exception" : "Unhandled rejection", {
 			err,
 			stack: err.stack,
