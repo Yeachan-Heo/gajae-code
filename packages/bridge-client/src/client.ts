@@ -96,6 +96,7 @@ export type SdkDurableResult =
 	| {
 			kind: "create_uncertain" | "attachment_uncertain" | "subscription_uncertain" | "submission_uncertain";
 			identity: SdkDurableLookupIdentity;
+			nextLegalLookupAction: "reconcileCreateConnectSubmit";
 			prohibitResubmission: true;
 	  }
 	| { kind: "failed"; error: { code: SdkErrorCode; message: string }; identity?: SdkDurableLookupIdentity };
@@ -206,21 +207,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+const durableCreateFields = new Set([
+	"cwd",
+	"path",
+	"target",
+	"stateRoot",
+	"modelPreset",
+	"mcpServers",
+	"readiness",
+	"readinessTimeoutMs",
+	"coordinatorStateDir",
+	"coordinatorSessionId",
+	"coordinatorSessionBranch",
+]);
+const durableTargetFields = new Set(["path", "stateRoot", "worktree"]);
+
 function canonicalRecoveryCreate(create: Record<string, unknown>): Record<string, unknown> {
-	const recoveryFields = new Set([
-		"cwd",
-		"path",
-		"target",
-		"stateRoot",
-		"modelPreset",
-		"mcpServers",
-		"worktree",
-		"readiness",
-		"readinessTimeoutMs",
-		"coordinatorStateDir",
-		"coordinatorSessionId",
-		"coordinatorSessionBranch",
-	]);
 	const canonicalize = (value: unknown, seen: Set<object>): unknown => {
 		if (value === null || typeof value === "string" || typeof value === "boolean") return value;
 		if (typeof value === "number") {
@@ -242,26 +244,48 @@ function canonicalRecoveryCreate(create: Record<string, unknown>): Record<string
 		seen.delete(value);
 		return result;
 	};
-	const result: Record<string, unknown> = {};
-	for (const key of Object.keys(create).sort()) {
-		if (recoveryFields.has(key)) result[key] = canonicalize(create[key], new Set());
+	for (const key of Object.keys(create)) {
+		if (!durableCreateFields.has(key))
+			throw new SdkClientError("invalid_input", `Unsupported session.create field: ${key}.`);
 	}
-	return result;
+	if (create.target !== undefined) {
+		if (!isRecord(create.target)) throw new SdkClientError("invalid_input", "Create target must be an object.");
+		for (const key of Object.keys(create.target)) {
+			if (!durableTargetFields.has(key))
+				throw new SdkClientError("invalid_input", `Unsupported session.create target field: ${key}.`);
+		}
+	}
+	return canonicalize(create, new Set()) as Record<string, unknown>;
+}
+
+function validTimeout(value: unknown): boolean {
+	return value === undefined || (typeof value === "number" && Number.isFinite(value) && value > 0);
+}
+
+function validReplayCursor(value: unknown): boolean {
+	return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
 }
 
 function durableIdentity(input: SdkDurableCreateConnectSubmitInput): SdkDurableLookupIdentity {
 	if (!isRecord(input.create)) throw new SdkClientError("invalid_input", "Create input must be an object.");
 	if (!validClientRef(input.createIdempotencyKey))
 		throw new SdkClientError("invalid_input", "createIdempotencyKey must be a trimmed non-empty string.");
+	if (!validTimeout(input.timeoutMs))
+		throw new SdkClientError("invalid_input", "timeoutMs must be a positive finite number.");
+	if (!validReplayCursor(input.replaySinceGeneration) || !validReplayCursor(input.replaySinceSeq))
+		throw new SdkClientError("invalid_input", "Replay cursors must be non-negative safe integers.");
 	const submission = input.submission;
 	if (!submission || !validClientRef(submission.clientRef))
 		throw new SdkClientError("invalid_input", "clientRef must be a trimmed 1..128 character string.");
-	if (
-		(submission.kind === "prompt" && !validNonEmptyString(submission.text)) ||
-		(submission.kind === "skill" && !validNonEmptyString(submission.name)) ||
-		(submission.kind !== "prompt" && submission.kind !== "skill")
-	)
+	if (submission.kind === "prompt") {
+		if (!validNonEmptyString(submission.text) || "name" in submission || "args" in submission)
+			throw new SdkClientError("invalid_input", "Prompt submission is invalid.");
+	} else if (submission.kind === "skill") {
+		if (!validNonEmptyString(submission.name) || "text" in submission || "images" in submission)
+			throw new SdkClientError("invalid_input", "Skill submission is invalid.");
+	} else {
 		throw new SdkClientError("invalid_input", "Submission is invalid.");
+	}
 	return {
 		version: 1,
 		operation: "session.create",
@@ -301,7 +325,7 @@ function uncertain(
 	kind: Extract<SdkDurableResult, { prohibitResubmission: true }>["kind"],
 	identity: SdkDurableLookupIdentity,
 ): SdkDurableResult {
-	return { kind, identity, prohibitResubmission: true };
+	return { kind, identity, nextLegalLookupAction: "reconcileCreateConnectSubmit", prohibitResubmission: true };
 }
 
 function replayReady(
@@ -497,8 +521,8 @@ export class SdkClient {
 		let created: Record<string, unknown>;
 		try {
 			created = responseResult(
-				await this.global("session.create", input.create, {
-					idempotencyKey: input.createIdempotencyKey,
+				await this.global("session.create", identity.create, {
+					idempotencyKey: identity.createIdempotencyKey,
 					timeoutMs: input.timeoutMs,
 				}),
 			);
@@ -532,10 +556,8 @@ export class SdkClient {
 					{ timeoutMs: input.timeoutMs },
 				),
 			);
-		} catch (error) {
-			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
-				? durableFailure(error, identity)
-				: uncertain("attachment_uncertain", identity);
+		} catch {
+			return uncertain("attachment_uncertain", identity);
 		}
 		const url = stringField(endpoint, "url");
 		const token = stringField(endpoint, "token");
@@ -596,7 +618,6 @@ export class SdkClient {
 			return { kind: "accepted", sessionId, identity, receipt: response };
 		} catch (error) {
 			if (submissionStarted) return uncertain("submission_uncertain", identity);
-			if (error instanceof SdkClientError && isKnownLifecycleFailure(error)) return durableFailure(error, identity);
 			return uncertain(isConnectionFailure(error) ? "attachment_uncertain" : "subscription_uncertain", identity);
 		} finally {
 			detach();
@@ -664,7 +685,11 @@ export class SdkClient {
 					? {}
 					: { endpointIncarnation: endpointIncarnation(endpoint) }),
 			};
-			const client = new SdkClient(url, token, { timeoutMs: options.timeoutMs, reconnectAttempts: 0 });
+			const client = new SdkClient(url, token, {
+				timeoutMs: options.timeoutMs,
+				deadline: this.#deadline,
+				reconnectAttempts: 0,
+			});
 			try {
 				const incarnation = await client.#connect();
 				const replayGeneration = recovered.endpointGeneration ?? 1;

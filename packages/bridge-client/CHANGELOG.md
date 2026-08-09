@@ -5,6 +5,10 @@
 
 - Renamed the create-connect-submit API contract to durable client-side orchestration. The create key and submission reference remain durable in their existing authorities, and recovery reconciles their composite outcome after restart; the SDK does not promise a single-authority transactional atomic outcome across process failure. Recovery identities now retain only canonical create fields needed for reconciliation and exclude credentials and secrets.
 
+### Added
+
+- Added `SdkClient.createConnectSubscribeSubmit()` and `reconcileCreateConnectSubmit()`. The TypeScript SDK retains caller-provided create and submission identities, fences the one ordered write to a replay-validated socket incarnation, and reports explicit recovery uncertainty without retrying ordered work.
+
 ## [0.12.21] - 2026-08-09
 
 ## [0.12.20] - 2026-08-09
