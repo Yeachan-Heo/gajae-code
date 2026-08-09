@@ -100,102 +100,98 @@ describe("task fork-context provider identity", () => {
 	});
 
 	it("gives nested managed children distinct provider identities without rewriting logical headers", async () => {
-		await withLifecycleIdentity("managed-parent-session", async () => {
-			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-cache-key-${Snowflake.next()}-`));
-			tempDirs.push(tempDir);
-			const { session: parent, authStorage: parentAuth } = await createSession(tempDir);
-			sessions.push(parent);
-			authStorages.push(parentAuth);
-			parent.agent.appendMessage({ role: "user", content: "parent context", timestamp: Date.now() });
-			const seedA = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
-			const seedB = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
-			expect(seedA.metadata.includedMessages).toBeGreaterThan(0);
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-cache-key-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const { session: parent, authStorage: parentAuth } = await createSession(tempDir);
+		sessions.push(parent);
+		authStorages.push(parentAuth);
+		parent.agent.appendMessage({ role: "user", content: "parent context", timestamp: Date.now() });
+		const seedA = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
+		const seedB = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
+		expect(seedA.metadata.includedMessages).toBeGreaterThan(0);
 
-			const artifactsDir = path.join(tempDir, "artifacts");
-			const artifacts = new ArtifactManager(
-				new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
-			);
-			const childAProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-child-a"]);
-			const childBProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "1-child-b"]);
-			const childAPersistence = createManagedTaskPersistence(artifacts, "0-child-a");
-			const childBPersistence = createManagedTaskPersistence(artifacts, "1-child-b");
-			const [{ session: childA, authStorage: authA }, { session: childB, authStorage: authB }] = await Promise.all([
-				createSession(tempDir, {
-					forkContextSeed: seedA,
-					providerSessionId: childAProviderSessionId,
-					sessionManager: await childAPersistence.openSession(tempDir),
-				}),
-				createSession(tempDir, {
-					forkContextSeed: seedB,
-					providerSessionId: childBProviderSessionId,
-					sessionManager: await childBPersistence.openSession(tempDir),
-				}),
-			]);
-			sessions.push(childA, childB);
-			authStorages.push(authA, authB);
+		const artifactsDir = path.join(tempDir, "artifacts");
+		const artifacts = new ArtifactManager(
+			new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
+		);
+		const childAProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-child-a"]);
+		const childBProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "1-child-b"]);
+		const childAPersistence = createManagedTaskPersistence(artifacts, "0-child-a");
+		const childBPersistence = createManagedTaskPersistence(artifacts, "1-child-b");
+		const [{ session: childA, authStorage: authA }, { session: childB, authStorage: authB }] = await Promise.all([
+			createSession(tempDir, {
+				forkContextSeed: seedA,
+				providerSessionId: childAProviderSessionId,
+				sessionManager: await withLifecycleIdentity(parent.sessionId, () => childAPersistence.openSession(tempDir)),
+			}),
+			createSession(tempDir, {
+				forkContextSeed: seedB,
+				providerSessionId: childBProviderSessionId,
+				sessionManager: await withLifecycleIdentity(parent.sessionId, () => childBPersistence.openSession(tempDir)),
+			}),
+		]);
+		sessions.push(childA, childB);
+		authStorages.push(authA, authB);
 
-			expect(childA.messages.slice(0, seedA.agentMessages.length)).toEqual(seedA.agentMessages);
-			expect(childA.sessionManager.getSessionFile()).toBe(path.join(artifactsDir, "0-child-a.jsonl"));
-			expect(childB.sessionManager.getSessionFile()).toBe(path.join(artifactsDir, "1-child-b.jsonl"));
-			// Nested managed persistence intentionally preserves the lifecycle-owned logical
-			// header while provider continuity must be child-owned and collision-free.
-			expect(childA.sessionManager.getSessionId()).toBe(parent.sessionManager.getSessionId());
-			expect(childB.sessionManager.getSessionId()).toBe(parent.sessionManager.getSessionId());
-			expect(childA.agent.providerSessionId).not.toBe(parent.sessionId);
-			expect(childB.agent.providerSessionId).not.toBe(parent.sessionId);
-			expect(childA.agent.providerSessionId).not.toBe(childB.agent.providerSessionId);
-		});
+		expect(childA.messages.slice(0, seedA.agentMessages.length)).toEqual(seedA.agentMessages);
+		expect(childA.sessionManager.getSessionFile()).toBe(path.join(artifactsDir, "0-child-a.jsonl"));
+		expect(childB.sessionManager.getSessionFile()).toBe(path.join(artifactsDir, "1-child-b.jsonl"));
+		// Nested managed persistence intentionally preserves the lifecycle-owned logical
+		// header while provider continuity must be child-owned and collision-free.
+		expect(childA.sessionManager.getSessionId()).toBe(parent.sessionManager.getSessionId());
+		expect(childB.sessionManager.getSessionId()).toBe(parent.sessionManager.getSessionId());
+		expect(childA.agent.providerSessionId).not.toBe(parent.sessionId);
+		expect(childB.agent.providerSessionId).not.toBe(parent.sessionId);
+		expect(childA.agent.providerSessionId).not.toBe(childB.agent.providerSessionId);
 	}, 15_000);
 
 	it("keeps a nested managed child provider identity across detached resume", async () => {
-		await withLifecycleIdentity("managed-resume-parent", async () => {
-			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-detached-resume-${Snowflake.next()}-`));
-			tempDirs.push(tempDir);
-			const { session: parent, authStorage: parentAuth } = await createSession(tempDir);
-			sessions.push(parent);
-			authStorages.push(parentAuth);
-			parent.agent.appendMessage({ role: "user", content: "parent context", timestamp: Date.now() });
-			const seed = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
-			const artifactsDir = path.join(tempDir, "artifacts");
-			const artifacts = new ArtifactManager(
-				new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
-			);
-			const persistence = createManagedTaskPersistence(artifacts, "0-resumable-child");
-			const childProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-resumable-child"]);
-			const { session: child, authStorage: childAuth } = await createSession(tempDir, {
-				forkContextSeed: seed,
-				providerSessionId: childProviderSessionId,
-				sessionManager: await persistence.openSession(tempDir),
-			});
-			sessions.push(child);
-			authStorages.push(childAuth);
-			expect(child.agent.providerSessionId).toBe(childProviderSessionId);
-			const persistedTurn: Message = {
-				role: "user",
-				content: [{ type: "text", text: "persisted child turn" }],
-				attribution: "user",
-				timestamp: Date.now(),
-			};
-			child.agent.appendMessage(persistedTurn);
-			child.sessionManager.appendMessage(persistedTurn);
-			await child.sessionManager.flush();
-			await child.dispose();
-
-			const { session: resumed, authStorage: resumedAuth } = await createSession(tempDir, {
-				forkContextSeed: seed,
-				providerSessionId: childProviderSessionId,
-				sessionManager: await persistence.openSession(tempDir),
-			});
-			sessions.push(resumed);
-			authStorages.push(resumedAuth);
-
-			expect(resumed.sessionManager.getSessionId()).toBe(parent.sessionManager.getSessionId());
-			expect(resumed.agent.providerSessionId).toBe(childProviderSessionId);
-			expect(resumed.agent.providerSessionId).not.toBe(parent.sessionId);
-			const restoredContent = resumed.messages.map(message => JSON.stringify(message));
-			expect(restoredContent.some(content => content.includes("persisted child turn"))).toBe(true);
-			expect(restoredContent.some(content => content.includes("parent context"))).toBe(false);
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-detached-resume-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const { session: parent, authStorage: parentAuth } = await createSession(tempDir);
+		sessions.push(parent);
+		authStorages.push(parentAuth);
+		parent.agent.appendMessage({ role: "user", content: "parent context", timestamp: Date.now() });
+		const seed = await parent.buildForkContextSeed({ maxMessages: 50, maxTokens: 10_000 });
+		const artifactsDir = path.join(tempDir, "artifacts");
+		const artifacts = new ArtifactManager(
+			new ManagedSessionDescendantStore(managedDirectoryRoot(tempDir), artifactsDir),
+		);
+		const persistence = createManagedTaskPersistence(artifacts, "0-resumable-child");
+		const childProviderSessionId = JSON.stringify(["subagent-canonical", parent.sessionId, "0-resumable-child"]);
+		const { session: child, authStorage: childAuth } = await createSession(tempDir, {
+			forkContextSeed: seed,
+			providerSessionId: childProviderSessionId,
+			sessionManager: await withLifecycleIdentity(parent.sessionId, () => persistence.openSession(tempDir)),
 		});
+		sessions.push(child);
+		authStorages.push(childAuth);
+		expect(child.agent.providerSessionId).toBe(childProviderSessionId);
+		const persistedTurn: Message = {
+			role: "user",
+			content: [{ type: "text", text: "persisted child turn" }],
+			attribution: "user",
+			timestamp: Date.now(),
+		};
+		child.agent.appendMessage(persistedTurn);
+		child.sessionManager.appendMessage(persistedTurn);
+		await child.sessionManager.flush();
+		await child.dispose();
+
+		const { session: resumed, authStorage: resumedAuth } = await createSession(tempDir, {
+			forkContextSeed: seed,
+			providerSessionId: childProviderSessionId,
+			sessionManager: await withLifecycleIdentity(parent.sessionId, () => persistence.openSession(tempDir)),
+		});
+		sessions.push(resumed);
+		authStorages.push(resumedAuth);
+
+		expect(resumed.sessionManager.getSessionId()).toBe(parent.sessionManager.getSessionId());
+		expect(resumed.agent.providerSessionId).toBe(childProviderSessionId);
+		expect(resumed.agent.providerSessionId).not.toBe(parent.sessionId);
+		const restoredContent = resumed.messages.map(message => JSON.stringify(message));
+		expect(restoredContent.some(content => content.includes("persisted child turn"))).toBe(true);
+		expect(restoredContent.some(content => content.includes("parent context"))).toBe(false);
 	}, 15_000);
 
 	it("honors an explicit providerSessionId over the fork seed and logical id", async () => {

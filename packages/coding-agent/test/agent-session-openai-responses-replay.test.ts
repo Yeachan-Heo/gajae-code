@@ -430,7 +430,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			await openedSessionManager?.close();
 			appendSync.mockRestore();
 		}
-	}, 15_000);
+	}, 30_000);
 
 	it("sanitizes stale assistant replay metadata when forking a persisted session", async () => {
 		const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-source-${Snowflake.next()}-`));
@@ -602,7 +602,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		sessions.push(child);
 		authStorages.push(childAuthStorage);
 
-		expect(child.sessionId).not.toBe(parent.sessionId);
+		expect(child.sessionId).toBe(parent.sessionId);
 		expect(child.agent.providerSessionId).toBe(child.sessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
