@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient, SdkClientError, type SdkFrame } from "../client";
+import { HEARTBEAT_TTL_MS } from "../bus/daemon-paths";
+import { SdkClient, SdkClientError, type SdkClientOptions, type SdkFrame, type SdkSentRecord } from "../client";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -224,16 +225,24 @@ export class AcpSdkAdapter {
 		if (isLifecycleOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
 		// The broker may hold a startup in its admission queue before the readiness
-		// clock even starts, so the caller deadline covers the queue wait too; sizing
-		// it on readiness alone times out requests the broker is still running. A
-		// request that named no readiness budget is queued for the default one, so it
-		// needs the same extension rather than the client's generic request deadline.
+		// clock starts, so the caller deadline covers the queue wait too.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const response = await this.#client.global(operation, input, {
-			idempotencyKey,
-			...(timeoutMs === undefined ? {} : { timeoutMs }),
-		});
-		return response;
+		try {
+			return await this.#client.global(operation, input, {
+				idempotencyKey,
+				...(timeoutMs === undefined ? {} : { timeoutMs }),
+			});
+		} catch (error) {
+			if (
+				isLifecycleOperation(operation) &&
+				error instanceof SdkClientError &&
+				error.code === "uncertain_after_send" &&
+				error.details &&
+				typeof error.details === "object"
+			)
+				return await this.#client.lookupLifecycle(error.details as SdkSentRecord);
+			throw error;
+		}
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {

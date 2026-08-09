@@ -15,6 +15,13 @@ describe("SDK lifecycle ledger", () => {
 		expect((await resumed.begin("i", "a")).kind).toBe("replay");
 		expect((await resumed.begin("i", "b")).kind).toBe("idempotency_conflict");
 	});
+	it("recognizes pre-index legacy rows as ambiguous without making them migration authority", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("legacy-target-a", "request-a");
+		expect(ledger.hasLegacyIdentity()).toBe(true);
+		expect(ledger.findByOperationKey("session.create\0caller-key")).toBeUndefined();
+	});
 	it("does not re-execute a durably accepted row after restart", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-accepted-"));
 		const ledger = await new LifecycleLedger(dir).open();

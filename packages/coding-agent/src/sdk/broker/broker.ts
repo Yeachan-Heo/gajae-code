@@ -1419,11 +1419,11 @@ export class Broker {
 		elevationRequestId?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		const fingerprint = JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		const approvedInput = input;
 		input = normalization.input;
-		const fingerprint = canonicalJson({ operation, input });
 		if (operation === "session.list") {
 			if (input.cursor === undefined) {
 				await this.index.refresh();
@@ -1547,7 +1547,7 @@ export class Broker {
 		if (!this.ledger.get(identity)) {
 			if (await this.ledger.migrateIdentity(legacyIdentity, identity)) {
 				// Exact target-derived legacy identity migrated without granting new authority.
-			} else if (this.ledger.findByOperationKey(operationKey))
+			} else if (this.ledger.findByOperationKey(operationKey) || this.ledger.hasLegacyIdentity())
 				return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
 		}
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;

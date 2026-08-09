@@ -3,8 +3,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::lifecycle::{LifecycleState, UncertainStatus};
-
 /// Current broker protocol major version.
 pub const PROTOCOL_MAJOR: u32 = 3;
 
@@ -48,20 +46,6 @@ pub enum BrokerOperation {
 	SessionDelete,
 }
 
-/// Accepted submission acknowledgement returned by the broker.
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcceptedResponse {
-	pub id:            String,
-	pub accepted:      bool,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub submission_id: Option<String>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub state:         Option<LifecycleState>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub uncertain:     Option<UncertainStatus>,
-}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerResponse {

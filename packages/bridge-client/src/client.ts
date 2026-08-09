@@ -134,7 +134,7 @@ function canonicalJson(value: unknown): string {
 }
 
 function lifecycleFingerprint(operation: string, input: unknown): string {
-	return canonicalJson({ operation, input });
+	return JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
 }
 
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */

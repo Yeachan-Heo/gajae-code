@@ -668,6 +668,14 @@ export class LifecycleLedger {
 	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
 		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
 	}
+	/**
+	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
+	 * identities cannot establish that a different target is safe, so callers
+	 * must reject rather than create a second admission.
+	 */
+	hasLegacyIdentity(): boolean {
+		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
+	}
 	async migrateIdentity(from: string, to: string): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
 			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);

@@ -2,8 +2,13 @@ import path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient, SdkClientError } from "../client/client";
-import { readSdkBrokerDiscovery, SdkDiscoveryError } from "../client/discovery";
+import { SdkClient, SdkClientError, type SdkSentRecord } from "../client/client";
+import {
+	listSdkSessionEndpoints,
+	readSdkBrokerDiscovery,
+	readSdkSessionEndpoint,
+	SdkDiscoveryError,
+} from "../client/discovery";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
 
@@ -327,11 +332,24 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 				const broker = await readSdkBrokerDiscovery(agentDir);
 				if (!broker) return { ok: false, error: { code: "not_found", message: "SDK broker not found" } };
 				client = await connect(broker.url, broker.token);
-				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-				const response = await client.global(operation, input, {
-					idempotencyKey,
-					...(timeoutMs === undefined ? {} : { timeoutMs }),
-				});
+				let response: unknown;
+				try {
+					const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+					response = await client.global(operation, input, {
+						idempotencyKey,
+						...(timeoutMs === undefined ? {} : { timeoutMs }),
+					});
+				} catch (error) {
+					if (
+						isLifecycleOperation(operation) &&
+						error instanceof SdkClientError &&
+						error.code === "uncertain_after_send" &&
+						error.details &&
+						typeof error.details === "object"
+					)
+						response = await client.lookupLifecycle(error.details as SdkSentRecord);
+					else throw error;
+				}
 				return isLifecycleOperation(operation) ? redactLifecycleCredentials(response) : response;
 			} catch (error) {
 				return resultError(error);

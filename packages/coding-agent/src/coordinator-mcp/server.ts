@@ -18,7 +18,7 @@ import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
-import { SdkClient, SdkClientError } from "../sdk/client/client";
+import { SdkClient, SdkClientError, type SdkSentRecord } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import {
 	type ActivatedPreparedSession,
@@ -109,6 +109,16 @@ interface JsonRpcResponse {
 	id: string | number | null;
 	result?: JsonRpcResult;
 	error?: { code: number; message: string; data?: unknown };
+}
+
+function isLifecycleOperation(operation: string): boolean {
+	return (
+		operation === "session.create" ||
+		operation === "session.fork" ||
+		operation === "session.resume" ||
+		operation === "session.close" ||
+		operation === "session.delete"
+	);
 }
 
 function sinkErrorCode(error: unknown): string | undefined {
@@ -3191,7 +3201,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				...(timeoutMs === undefined ? {} : { timeoutMs }),
 			});
 		} catch (error) {
-			requestError = toCoordinatorBrokerError("request", error);
+			const mapped = toCoordinatorBrokerError("request", error);
+			if (
+				isLifecycleOperation(operation) &&
+				mapped.code === "uncertain_after_send" &&
+				mapped.details &&
+				typeof mapped.details === "object"
+			)
+				result = await client.lookupLifecycle(mapped.details as SdkSentRecord);
+			else requestError = mapped;
 		}
 		try {
 			await client.close();
