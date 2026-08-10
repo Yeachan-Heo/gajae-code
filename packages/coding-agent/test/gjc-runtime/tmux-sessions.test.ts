@@ -1310,6 +1310,106 @@ describe("GJC tmux session management", () => {
 		);
 		await fs.rm(stateDir, { recursive: true, force: true });
 	});
+	it("does not extend durable verdict polling beyond the original intent expiry", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-expiry-"));
+		const sessionId = "session";
+		const generation = "generation";
+		const marker = path.join(stateDir, "marker");
+		await fs.mkdir(path.join(stateDir, sessionId, "owner-lifecycle"), { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, sessionId, "owner-lifecycle", "generation.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				generation,
+				published_at: new Date().toISOString(),
+			}),
+		);
+		spyOn(Bun, "spawnSync").mockImplementation(((command: string[]) => {
+			if (command.includes("if-shell")) return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+			if (command.includes("display-message")) return spawnResult(0, "$0\n");
+			if (command.includes("list-sessions"))
+				return spawnResult(
+					0,
+					`managed\t1\t0\t1770000000\t1\troot\t1\t321\t\t\t\t${sessionId}\t${marker}\t${generation}\t\n`,
+				);
+			if (command.includes("list-panes")) return spawnResult(0, "321\n");
+			if (command.includes("show-options")) {
+				const option = command.at(-1);
+				return spawnResult(
+					0,
+					option === "@gjc-profile"
+						? "1\n"
+						: option === "@gjc-session-id"
+							? `${sessionId}\n`
+							: option === "@gjc-owner-generation"
+								? `${generation}\n`
+								: option === "@gjc-owner-server-key"
+									? "managed\n"
+									: `${marker}\n`,
+				);
+			}
+			return spawnResult(0, "");
+		}) as unknown as typeof Bun.spawnSync);
+		injectSafeMutationProof();
+		const initialNow = Date.now();
+		let nowMs = initialNow;
+		let sleepCalls = 0;
+		let cleaned = false;
+		const failedOwnerExitVerdict = Promise.withResolvers<never>();
+		void failedOwnerExitVerdict.promise.catch(() => {});
+		await expect(
+			forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker, {
+				resolveOwner: async () => ({
+					sessionId,
+					stateDir,
+					socketKey: "managed",
+					generation,
+					pid: 321,
+					startTime: "10",
+				}),
+				readProcessStartTime: async () => "10",
+				now: () => new Date(nowMs),
+				waitForOwnerExitVerdict: () => failedOwnerExitVerdict.promise,
+				signalTerm: () => {
+					nowMs = initialNow + 14_999;
+					failedOwnerExitVerdict.reject(new Error("owner observer consumed the intent budget"));
+				},
+				sleep: async () => {
+					sleepCalls++;
+					nowMs += 51;
+					if (sleepCalls !== 2) return;
+					const intent = JSON.parse(
+						await fs.readFile(
+							path.join(stateDir, sessionId, "owner-lifecycle", `intent-${generation}.json`),
+							"utf8",
+						),
+					);
+					await observeOwnerTerminal({
+						schema_version: 1,
+						op: "observe_terminal",
+						session_id: sessionId,
+						owner_generation: generation,
+						state_dir: stateDir,
+						socket_key: "managed",
+						observer: "sidecar",
+						observed_at: new Date().toISOString(),
+						signal: "SIGTERM",
+						exit_code: null,
+						exit_kind: "exit",
+						reason: "late test verdict",
+						operator_dispatch_id: intent.dispatch_id,
+					});
+				},
+				cleanupSession: () => {
+					cleaned = true;
+				},
+			}),
+		).rejects.toThrow("owner_term_verdict_timeout");
+		expect(sleepCalls).toBe(1);
+		expect(cleaned).toBe(false);
+		await fs.rm(stateDir, { recursive: true, force: true });
+	});
 
 	it("terminates a real owner process through the default signal and start-time proofs", async () => {
 		// Exercises the *default* owner dependencies rather than the injected test

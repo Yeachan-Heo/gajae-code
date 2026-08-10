@@ -1168,6 +1168,8 @@ interface SessionRuntime {
 	cursors: CursorRegistry;
 	/** Current endpoint session identity; never re-key an existing host across a switch. */
 	id: string;
+	/** Discovery scope is fixed before publication; a live default endpoint is never rotated in place. */
+	endpointScope: "default" | "chat";
 	idleSeq: number;
 	/** Interactive asks awaiting a remote answer, by action id. */
 	pendingInteractive: Map<string, PendingInteractiveAsk>;
@@ -4945,6 +4947,7 @@ export function createNotificationsExtension(
 			revisions,
 			cursors,
 			id,
+			endpointScope: isolateChatEndpoint ? "chat" : "default",
 			idleSeq: 0,
 			pendingInteractive,
 			brokerRegistrationActive: false,
@@ -5581,12 +5584,9 @@ export function createNotificationsExtension(
 						logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
 					}
 					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
-						await cleanupAbandonedStartup();
-						if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
-						forceIsolatedChatSessions.add(id);
-						const result = await startSession(ctx);
-						finishStartup(result);
-						return result;
+						logger.warn(
+							"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
+						);
 					}
 					if (registrationToken !== undefined) {
 						runtime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
@@ -5892,8 +5892,11 @@ export function createNotificationsExtension(
 		isolateTelegram: async binding => {
 			const runtime = runtimes.get(binding.sessionId);
 			if (runtime) {
-				const stopped = await stopSession(binding.sessionId, "session", runtime);
-				if (!stopped || runtimes.has(binding.sessionId) || cleanupRetries.has(binding.sessionId)) return "failed";
+				if (runtime.endpointScope === "default") {
+					runtime.notificationOwnerState = "blocked";
+					return "failed";
+				}
+				return "started";
 			}
 			forceIsolatedChatSessions.add(binding.sessionId);
 			const result = await startSession(binding.context);

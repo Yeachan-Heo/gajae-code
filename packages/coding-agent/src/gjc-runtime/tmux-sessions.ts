@@ -1369,8 +1369,8 @@ async function waitForExpectedVerdict(
 	identity: ExactOwnerIdentity,
 	sleep: (ms: number) => Promise<void>,
 	now: () => Date,
+	deadline: number,
 ): Promise<OwnerVerdict | null> {
-	const deadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;
 	const paths = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation);
 	const verdictFile = paths.verdictFile;
 	const verdictAliasFile = paths.verdictAliasFile;
@@ -1461,6 +1461,7 @@ export async function forceCloseGjcTmuxSession(
 	const now = deps.now ?? (() => new Date());
 	const sleep = deps.sleep ?? (ms => Bun.sleep(ms));
 	const dispatchId = crypto.randomUUID();
+	const verdictDeadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;
 	let operatorVerdict: Promise<OwnerVerdict> | null = deps.waitForOwnerExitVerdict?.() ?? null;
 	await closeExactTmuxOwner(
 		{
@@ -1472,7 +1473,7 @@ export async function forceCloseGjcTmuxSession(
 			startTime: identity.startTime,
 			dispatchId,
 			createdAt: now().toISOString(),
-			expiresAt: new Date(now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS).toISOString(),
+			expiresAt: new Date(verdictDeadline).toISOString(),
 		},
 		{
 			readStartTime: deps.readProcessStartTime ?? readProcessStartTime,
@@ -1508,14 +1509,14 @@ export async function forceCloseGjcTmuxSession(
 			},
 
 			waitForVerdict: async () => {
-				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now);
+				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
 				try {
 					return await operatorVerdict;
 				} catch {
 					// The sidecar and raw monitor intentionally race to publish the first valid
 					// verdict. If the exact supervisor-exit path loses that race or times out
 					// under load, recover only from the same fully validated durable evidence.
-					return await waitForExpectedVerdict(identity, sleep, now);
+					return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
 				}
 			},
 			cleanupSession: async () => {

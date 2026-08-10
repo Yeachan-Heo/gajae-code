@@ -615,7 +615,7 @@ test("Telegram cleanup is never retained without a registration token", async ()
 	}
 }, 60_000);
 
-test("Telegram ownership races publish safe siblings only in broker-authorized chat scope", async () => {
+ test("late Telegram ownership races preserve the published canonical core endpoint", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, "agent");
@@ -654,16 +654,16 @@ test("Telegram ownership races publish safe siblings only in broker-authorized c
 	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 	await expect(capability.promise).resolves.toEqual({ status: "started" });
 	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
-	const chatEndpoint = path.join(chatStateRoot, "sdk", `${sessionId}.json`);
-	expect(fs.existsSync(defaultEndpoint)).toBe(false);
-	expect(fs.existsSync(chatEndpoint)).toBe(true);
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const chatEndpoint = path.join(stateRoot, "chat", "sdk", `${sessionId}.json`);
+	expect(fs.existsSync(defaultEndpoint)).toBe(true);
+	expect(fs.existsSync(chatEndpoint)).toBe(false);
 	const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
 	expect(sessions).toContainEqual(
 		expect.objectContaining({
 			sessionId,
-			locator: { repo: path.resolve(cwd), stateRoot: chatStateRoot },
-			endpointMtimeMs: fs.statSync(chatEndpoint).mtimeMs,
+			locator: { repo: path.resolve(cwd), stateRoot },
+			endpointMtimeMs: fs.statSync(defaultEndpoint).mtimeMs,
 		}),
 	);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
