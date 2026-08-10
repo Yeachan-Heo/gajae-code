@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import sys
 from typing import Any, NoReturn
 import warnings
 
@@ -99,7 +100,8 @@ def require_approval(session_id: str, operation: str, operation_input: dict[str,
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     challenge = f"APPROVE {session_id} {operation} {digest} {secrets.token_hex(8)}"
-    answer = input(f"Approval required: {challenge}\nType the exact challenge: ")
+    print(f"Approval required: {challenge}\nType the exact challenge: ", file=sys.stderr, end="", flush=True)
+    answer = sys.stdin.readline()
     if answer.strip() != challenge:
         raise ValueError("human_approval_required")
 
@@ -145,5 +147,5 @@ async def main() -> None:
 try:
     asyncio.run(main())
 except Exception:
-    print("GJC SDK request failed safely.", file=__import__("sys").stderr)
+    print("GJC SDK request failed safely.", file=sys.stderr)
     raise SystemExit(1)

@@ -4,11 +4,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ServerWebSocket } from "bun";
 import {
+	BUNDLE_FORMAT_VERSION,
+	BUNDLE_MANIFEST_NAME,
+	bundleContentFiles,
 	checkSdkSkillFiles,
 	findUnexpectedSdkSkillFiles,
 	renderSdkSkillFiles,
+	validateBundleManifest,
+	validateInstalledBundle,
+	validatePromptAllowlistConsistency,
 } from "./generate-gjc-sdk-skills";
 
+const repoRoot = path.join(import.meta.dir, "..");
 const roots: string[] = [];
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 
@@ -81,7 +88,7 @@ async function runTypeScriptTemplate(
 	approval: "none" | "deny" | "accept" | { reply: string } = "none",
 	onChallenge?: () => void,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const child = Bun.spawn(["bun", path.join(import.meta.dir, "..", "sdk-skills", "gjc-sdk-author", "templates", "direct-sdk.ts"), ...args], {
+	const child = Bun.spawn(["bun", path.join(repoRoot, "sdk-skills", "gjc-sdk-author", "templates", "direct-sdk.ts"), ...args], {
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -121,10 +128,11 @@ async function runTypeScriptTemplate(
 }
 
 describe("generated external GJC SDK skills", () => {
-	it("renders the exact namespaced five-file contract", () => {
+	it("renders the exact namespaced six-file versioned contract", () => {
 		const files = renderSdkSkillFiles();
 		expect([...files.keys()].sort()).toEqual(
 			[
+				BUNDLE_MANIFEST_NAME,
 				"gjc-sdk-discover/SKILL.md",
 				"gjc-sdk-operate/SKILL.md",
 				"gjc-sdk-author/SKILL.md",
@@ -132,6 +140,126 @@ describe("generated external GJC SDK skills", () => {
 				"gjc-sdk-author/templates/direct-sdk.py",
 			].sort(),
 		);
+		const manifest = JSON.parse(files.get(BUNDLE_MANIFEST_NAME) ?? "{}") as {
+			bundle?: unknown;
+			formatVersion?: unknown;
+			files?: unknown;
+		};
+		expect(manifest.bundle).toBe("gjc-sdk-skills");
+		expect(manifest.formatVersion).toBe(BUNDLE_FORMAT_VERSION);
+		expect(manifest.files).toEqual(bundleContentFiles(files));
+		expect(files.get("gjc-sdk-discover/SKILL.md")).toContain("name: gjc-sdk-discover");
+		expect(files.get("gjc-sdk-operate/SKILL.md")).toContain("name: gjc-sdk-operate");
+		expect(files.get("gjc-sdk-author/SKILL.md")).toContain("name: gjc-sdk-author");
+	});
+
+	it("renders deterministically and keeps the prompt allowlist in sync", () => {
+		const first = renderSdkSkillFiles();
+		const second = renderSdkSkillFiles();
+		expect([...first.entries()]).toEqual([...second.entries()]);
+		expect(validatePromptAllowlistConsistency()).toBeNull();
+	});
+
+	it("keeps the four default workflow skills closed and adds no extra skills", () => {
+		const files = renderSdkSkillFiles();
+		const skills = [...files.keys()].filter(key => key.endsWith("/SKILL.md")).sort();
+		expect(skills).toEqual(["gjc-sdk-author/SKILL.md", "gjc-sdk-discover/SKILL.md", "gjc-sdk-operate/SKILL.md"]);
+		for (const key of files.keys()) {
+			expect(key.startsWith("packages/coding-agent/")).toBe(false);
+			expect(key.startsWith(".gjc/")).toBe(false);
+			const topLevel = key.split("/")[0];
+			if (topLevel !== BUNDLE_MANIFEST_NAME) {
+				expect(["gjc-sdk-author", "gjc-sdk-discover", "gjc-sdk-operate"]).toContain(topLevel);
+			}
+		}
+		const defaultsRoot = path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills");
+		const defaultSkills = fs
+			.readdirSync(defaultsRoot)
+			.filter(entry => fs.statSync(path.join(defaultsRoot, entry)).isDirectory())
+			.sort();
+		expect(defaultSkills).toEqual(["deep-interview", "ralplan", "team", "ultragoal"]);
+
+		const extra = materialize();
+		fs.mkdirSync(path.join(extra.root, "gjc-sdk-bash"));
+		fs.writeFileSync(path.join(extra.root, "gjc-sdk-bash", "SKILL.md"), "---\nname: gjc-sdk-bash\n---\n");
+		expect(findUnexpectedSdkSkillFiles(extra.files, extra.root)).toEqual([path.join("gjc-sdk-bash", "SKILL.md")]);
+		expect(checkSdkSkillFiles(extra.files, extra.root, false)).toBe(1);
+	});
+
+	it("fails closed on missing, malformed, and unsupported manifest versions", () => {
+		const files = renderSdkSkillFiles();
+		const contentFiles = bundleContentFiles(files);
+		const manifest = files.get(BUNDLE_MANIFEST_NAME) ?? "";
+
+		expect(validateBundleManifest(manifest, contentFiles)).toBeNull();
+		expect(validateBundleManifest(null, contentFiles)).toContain("no format version");
+		expect(validateBundleManifest("not json", contentFiles)).toContain("unparseable JSON");
+		expect(
+			validateBundleManifest(JSON.stringify({ bundle: "gjc-sdk-skills", formatVersion: 999, files: contentFiles }), contentFiles),
+		).toContain("unsupported");
+		expect(
+			validateBundleManifest(JSON.stringify({ bundle: "gjc-sdk-skills", formatVersion: BUNDLE_FORMAT_VERSION, files: ["gjc-sdk-bash/SKILL.md"] }), contentFiles),
+		).toContain("file list does not match");
+		expect(
+			validateBundleManifest(JSON.stringify({ bundle: "other-bundle", formatVersion: BUNDLE_FORMAT_VERSION, files: contentFiles }), contentFiles),
+		).toContain("bundle name mismatch");
+
+		const missingManifest = materialize();
+		fs.rmSync(path.join(missingManifest.root, BUNDLE_MANIFEST_NAME));
+		expect(checkSdkSkillFiles(missingManifest.files, missingManifest.root, false)).toBe(1);
+	});
+
+	it("upgrades installed v1 bundles and fails closed on legacy or future layouts", () => {
+		const files = renderSdkSkillFiles();
+		const contentFiles = bundleContentFiles(files);
+
+		const installed = materialize();
+		expect(validateInstalledBundle(installed.root)).toBeNull();
+		expect(checkSdkSkillFiles(installed.files, installed.root, false)).toBe(0);
+
+		// A legacy unversioned install (the original five-file layout) must be
+		// rejected with a migration hint instead of being read ambiguously.
+		const legacy = materialize();
+		fs.rmSync(path.join(legacy.root, BUNDLE_MANIFEST_NAME));
+		expect(validateInstalledBundle(legacy.root)).toContain("regenerate with `bun run generate-sdk-skills`");
+		expect(checkSdkSkillFiles(legacy.files, legacy.root, false)).toBe(1);
+
+		// A future incompatible layout must fail closed on the version field.
+		const future = materialize();
+		fs.writeFileSync(
+			path.join(future.root, BUNDLE_MANIFEST_NAME),
+			JSON.stringify({ bundle: "gjc-sdk-skills", formatVersion: 2, files: contentFiles }, null, 2) + "\n",
+		);
+		expect(validateInstalledBundle(future.root)).toContain("unsupported");
+		expect(checkSdkSkillFiles(future.files, future.root, false)).toBe(1);
+
+		// Regeneration upgrades an installed bundle in place to the versioned format.
+		const upgrade = materialize();
+		fs.rmSync(path.join(upgrade.root, BUNDLE_MANIFEST_NAME));
+		for (const [rel, content] of files) {
+			fs.writeFileSync(path.join(upgrade.root, rel), content);
+		}
+		expect(validateInstalledBundle(upgrade.root)).toBeNull();
+	});
+
+	it("matches the committed bundle byte-for-byte", () => {
+		const files = renderSdkSkillFiles();
+		expect(checkSdkSkillFiles(files)).toBe(0);
+	});
+
+	it("passes the generator drift check as a subprocess", async () => {
+		const child = Bun.spawn(["bun", path.join(repoRoot, "scripts", "generate-gjc-sdk-skills.ts"), "--check"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		expect(exitCode).toBe(0);
+		expect(stdout).toContain("SDK skill bundle is in sync");
+		expect(stderr).toBe("");
 	});
 
 	it("rejects missing, drifted, and unexpected generated files", () => {
@@ -177,6 +305,10 @@ describe("generated external GJC SDK skills", () => {
 		}
 		expect(typescript).toContain("ALLOWED_CONTROLS.has");
 		expect(python).toContain("operation not in ALLOWED_CONTROLS");
+		// the Python approval challenge must stay off stdout so a successful
+		// control's stdout parses directly as JSON
+		expect(python).toContain("file=sys.stderr");
+		expect(python).toContain("sys.stdin.readline()");
 	});
 
 	it("executes the TypeScript inspection recipe without exposing credentials", async () => {

@@ -4,9 +4,8 @@
 
 ### Added
 - Browser `act` and `run` responses can now surface an opt-in (`open(..., { diagnostics: true })`), bounded mailbox of page exceptions and `console.error` metadata. Entries carry only kind, timestamp, origin-only URL, line/column, and an allowlisted built-in error class; path segments, query strings, messages, arguments, values, and stacks are never retained. Serialization is byte-bounded with an explicit truncation marker.
+- A generated, host-neutral `sdk-skills/` bundle now provides namespaced external-agent skills for direct GJC SDK session discovery, approved trusted-local operations, and TypeScript/Python script authoring, with deterministic drift checks and credential-safe fail-closed templates. The bundle carries a versioned `manifest.json` (format version 1) so installed bundles fail closed on missing or unsupported layouts, and the skill prompts are authored as static Markdown sources under `scripts/gjc-sdk-skills/prompts/` that the generator copies and validates.
 
-### Added
-- A generated, host-neutral `sdk-skills/` bundle now provides namespaced external-agent skills for direct GJC SDK session discovery, approved trusted-local operations, and TypeScript/Python script authoring, with deterministic drift checks and credential-safe fail-closed templates.
 ### Fixed
 - Option+Q verification now supports normal macOS Terminal.app profiles and fails with an actionable Settings > Profiles > Keyboard > Use Option as Meta key diagnostic when the profile cannot forward Option as Meta/Esc.
 - Queued-message selection now accepts the actual macOS Terminal.app Option+Up/Down byte sequence from either physical Option key, enabling multi-message restore, delete, and reorder flows.

@@ -1,7 +1,14 @@
 #!/usr/bin/env bun
 
 import * as path from "node:path";
-import { findUnexpectedSdkSkillFiles, renderSdkSkillFiles } from "./generate-gjc-sdk-skills";
+import {
+	BUNDLE_FORMAT_VERSION,
+	BUNDLE_MANIFEST_NAME,
+	findUnexpectedSdkSkillFiles,
+	renderSdkSkillFiles,
+	validateInstalledBundle,
+	validatePromptAllowlistConsistency,
+} from "./generate-gjc-sdk-skills";
 
 interface GateResult {
 	name: string;
@@ -20,12 +27,23 @@ const operatePath = path.join("gjc-sdk-operate", "SKILL.md");
 const authorPath = path.join("gjc-sdk-author", "SKILL.md");
 const typeScriptPath = path.join("gjc-sdk-author", "templates", "direct-sdk.ts");
 const pythonPath = path.join("gjc-sdk-author", "templates", "direct-sdk.py");
-const expectedPaths = [discoverPath, operatePath, authorPath, typeScriptPath, pythonPath].sort();
+const expectedPaths = [discoverPath, operatePath, authorPath, typeScriptPath, pythonPath, BUNDLE_MANIFEST_NAME].sort();
 const actualPaths = [...files.keys()].sort();
 const unexpectedFiles = findUnexpectedSdkSkillFiles(files);
+const manifestProblem = validateInstalledBundle();
 
-gate("exact five-file bundle", JSON.stringify(actualPaths) === JSON.stringify(expectedPaths), actualPaths.join(", "));
+gate("exact six-file versioned bundle", JSON.stringify(actualPaths) === JSON.stringify(expectedPaths), actualPaths.join(", "));
 gate("no unexpected generated files", unexpectedFiles.length === 0, unexpectedFiles.join(", ") || "none");
+gate(
+	"versioned bundle manifest present and supported",
+	manifestProblem === null,
+	manifestProblem ?? `formatVersion ${BUNDLE_FORMAT_VERSION}`,
+);
+gate(
+	"static prompt sources stay in sync with the generated allowlists",
+	validatePromptAllowlistConsistency() === null,
+	"scripts/gjc-sdk-skills/prompts/operate.md",
+);
 
 const discover = files.get(discoverPath) ?? "";
 const operate = files.get(operatePath) ?? "";
@@ -105,6 +123,11 @@ gate(
 		typeScript.includes("human_approval_required") &&
 		python.includes("human_approval_required"),
 	"single-process operation/session/input/nonce approval",
+);
+gate(
+	"python approval challenge stays off stdout",
+	python.includes("file=sys.stderr") && python.includes("sys.stdin.readline()"),
+	"challenge on stderr, answer from stdin",
 );
 gate(
 	"templates close clients",

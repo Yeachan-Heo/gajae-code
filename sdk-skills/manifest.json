@@ -1,0 +1,11 @@
+{
+  "bundle": "gjc-sdk-skills",
+  "formatVersion": 1,
+  "files": [
+    "gjc-sdk-author/SKILL.md",
+    "gjc-sdk-author/templates/direct-sdk.py",
+    "gjc-sdk-author/templates/direct-sdk.ts",
+    "gjc-sdk-discover/SKILL.md",
+    "gjc-sdk-operate/SKILL.md"
+  ]
+}

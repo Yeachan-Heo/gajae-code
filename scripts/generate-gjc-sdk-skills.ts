@@ -4,10 +4,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import authorPrompt from "./gjc-sdk-skills/prompts/author.md" with { type: "text" };
+import discoverPrompt from "./gjc-sdk-skills/prompts/discover.md" with { type: "text" };
+import operatePrompt from "./gjc-sdk-skills/prompts/operate.md" with { type: "text" };
+
 const repoRoot = path.join(import.meta.dir, "..");
 const bundleDir = path.join(repoRoot, "sdk-skills");
 
-const ALLOWED_CONTROLS = [
+export const BUNDLE_NAME = "gjc-sdk-skills";
+export const BUNDLE_MANIFEST_NAME = "manifest.json";
+export const BUNDLE_FORMAT_VERSION = 1;
+export const SUPPORTED_BUNDLE_FORMAT_VERSIONS = [BUNDLE_FORMAT_VERSION] as const;
+
+export const ALLOWED_CONTROLS = [
 	"turn.prompt",
 	"turn.steer",
 	"turn.follow_up",
@@ -18,136 +27,100 @@ const ALLOWED_CONTROLS = [
 	"session.rename",
 ] as const;
 
-const ALLOWED_GLOBALS = ["session.create", "session.fork", "session.resume", "session.close"] as const;
+export const ALLOWED_GLOBALS = ["session.create", "session.fork", "session.resume", "session.close"] as const;
 
-function discoverSkill(): string {
-	return `---
-name: gjc-sdk-discover
-description: Discover and inspect trusted local GJC sessions through direct SDK v3 endpoints.
----
+// The three skill prompts are authored as static Markdown sources under
+// scripts/gjc-sdk-skills/prompts/ and are imported verbatim. They are the
+// canonical prompt-authoring source per AGENTS.md; the generator only copies
+// and validates them, it never builds prompt prose inline.
 
-# GJC SDK session discovery
-
-Use this skill when an external agent needs to find or inspect local GJC sessions without terminal scraping, MCP, or coordinator delegation.
-
-## Required behavior
-
-1. Resolve the repository root explicitly.
-2. Read the local SDK discovery records under \`<repo>/.gjc/state/sdk/\` through the maintained SDK discovery API.
-3. Select an exact session ID. Session omission is allowed only when exactly one live endpoint exists.
-4. Fail closed for missing, malformed, stale, dead, unknown, symlinked, or ambiguous discovery.
-5. Never print, persist, return, or place the endpoint token in logs, errors, source, config, environment examples, or shell history.
-6. Close every SDK client in a \`finally\` block.
-
-## Core inspection recipe
-
-Compose this pull-based view in order:
-
-1. \`session.metadata\`
-2. \`context.get\`
-3. \`goal.list/get\`
-4. \`todo.list\`
-5. \`workflow.gates.list\`
-6. \`session.stats\`
-
-Fetch transcript pages and diffs only when the user's task requires them:
-
-- \`transcript.list\` and \`transcript.body\`
-- \`diff.list_files\`, \`diff.list_hunks\`, and \`diff.read_hunk\`
-
-The reads are not an atomic snapshot. For every reported field, identify its source query and classify it as \`confirmed\`, \`inferred\`, \`stale\`, \`unavailable\`, or \`unknown\`. Preserve partial results when independent queries succeed; never invent a missing value.
-
-## Direct client references
-
-- TypeScript: \`@gajae-code/coding-agent/sdk\`
-- Python: \`gjc_sdk\`
-- Canonical templates: \`gjc-sdk-author/templates/direct-sdk.ts\` and \`direct-sdk.py\`
-`;
+export function bundleContentFiles(files: ReadonlyMap<string, string>): string[] {
+	return [...files.keys()].filter(key => key !== BUNDLE_MANIFEST_NAME).sort();
 }
 
-function operateSkill(): string {
-	return `---
-name: gjc-sdk-operate
-description: Operate trusted local GJC sessions through a reviewed direct-SDK allowlist with single-use human approval.
----
-
-# GJC SDK approved operations
-
-This skill is for trusted local scripts. It is a procedural safety policy, not a security boundary: a modified process that can read the endpoint token can call more of the SDK than this skill permits.
-
-## Before every operation
-
-1. Rediscover the exact target session and fail closed if it is missing, stale, dead, unknown, symlinked, or ambiguous.
-2. Never print, persist, return, or embed endpoint credentials.
-3. Validate the operation against the allowlist below. Do not expose arbitrary operation passthrough.
-4. For every lifecycle operation, show the exact operation and session target to the human through the external host.
-5. Obtain one explicit approval immediately before the call. Approval is single-use and becomes invalid if the operation, input, or target changes.
-   The templates emit a nonce-bearing, input-bound \`APPROVE <session> <operation> <digest> <nonce>\` challenge and read the exact response once from the active process's standard input. Present it verbatim through the external host only after the human accepts that exact action.
-6. On denial, cancellation, failed rediscovery, or changed target, send no SDK request.
-7. Close the SDK client on success and failure.
-8. Render only bounded, redacted error codes or generic failures; never forward raw SDK error text that may contain credentials.
-
-## Allowed per-session controls
-
-${ALLOWED_CONTROLS.map(operation => `- \`${operation}\``).join("\n")}
-
-For \`workflow.gate_answer\`, use the durable workflow gate ID and pass \`expectedSessionId\`. Never use transient \`action_needed.id\` as durable authority.
-
-## Allowed lifecycle operations
-
-${ALLOWED_GLOBALS.map(operation => `- \`${operation}\``).join("\n")}
-
-Use the existing daemon-owned SDK lifecycle surface or the pure-SDK \`gjc daemon session global\` command family as documented. Do not pretend lifecycle operations share the per-session endpoint or one idempotency model.
-
-## Explicitly excluded
-
-- \`session.delete\`
-- managed bash operations
-- configuration mutation
-- authentication mutation
-- permission-mode mutation
-- tool activation mutation
-- extension mutation
-- session cwd mutation
-- endpoint credential display
-- arbitrary SDK operation names
-
-The templates demonstrate one inspection flow and one allowlisted per-session control flow. Keep broader lifecycle orchestration in reviewed scripts that follow the same approval and credential rules.
-`;
+function manifestFile(files: ReadonlyMap<string, string>): string {
+	return `${JSON.stringify(
+		{
+			bundle: BUNDLE_NAME,
+			formatVersion: BUNDLE_FORMAT_VERSION,
+			files: bundleContentFiles(files),
+		},
+		null,
+		2,
+	)}\n`;
 }
 
-function authorSkill(): string {
-	return `---
-name: gjc-sdk-author
-description: Author trusted local TypeScript and Python scripts that use direct GJC SDK v3 endpoints safely.
----
+/**
+ * Fail-closed validation of a bundle manifest. Returns a human-readable problem
+ * (which always contains the `sdk-skills/manifest.json` reference) or null when
+ * the manifest declares a supported format version and the exact file closure.
+ * Consumers must treat any non-null result as "do not read this bundle".
+ */
+export function validateBundleManifest(manifestContent: string | null, expectedFiles: readonly string[]): string | null {
+	if (manifestContent === null) {
+		return `missing: sdk-skills/${BUNDLE_MANIFEST_NAME} (bundle has no format version; regenerate with \`bun run generate-sdk-skills\`)`;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(manifestContent);
+	} catch (error) {
+		return `invalid: sdk-skills/${BUNDLE_MANIFEST_NAME} (unparseable JSON: ${error instanceof Error ? error.message : String(error)})`;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return `invalid: sdk-skills/${BUNDLE_MANIFEST_NAME} (manifest is not an object)`;
+	}
+	const record = parsed as Record<string, unknown>;
+	if (record.bundle !== BUNDLE_NAME) return `invalid: sdk-skills/${BUNDLE_MANIFEST_NAME} (bundle name mismatch)`;
+	if (!Number.isInteger(record.formatVersion)) {
+		return `invalid: sdk-skills/${BUNDLE_MANIFEST_NAME} (missing or invalid formatVersion)`;
+	}
+	const version = record.formatVersion as number;
+	if (!(SUPPORTED_BUNDLE_FORMAT_VERSIONS as readonly number[]).includes(version)) {
+		return `unsupported: sdk-skills bundle format version ${version} (supported: ${SUPPORTED_BUNDLE_FORMAT_VERSIONS.join(", ")}); regenerate with \`bun run generate-sdk-skills\``;
+	}
+	if (!Array.isArray(record.files) || !record.files.every(item => typeof item === "string")) {
+		return `invalid: sdk-skills/${BUNDLE_MANIFEST_NAME} (files must be an array of relative paths)`;
+	}
+	const declared = [...(record.files as string[])].sort();
+	const expected = [...expectedFiles].sort();
+	if (JSON.stringify(declared) !== JSON.stringify(expected)) {
+		return `invalid: sdk-skills/${BUNDLE_MANIFEST_NAME} (manifest file list does not match the rendered bundle)`;
+	}
+	return null;
+}
 
-# Author direct GJC SDK scripts
+export function readBundleManifest(root = bundleDir): string | null {
+	const target = path.join(root, BUNDLE_MANIFEST_NAME);
+	try {
+		const stat = fs.lstatSync(target);
+		if (stat.isSymbolicLink() || !stat.isFile()) return null;
+		return fs.readFileSync(target, "utf8");
+	} catch {
+		return null;
+	}
+}
 
-Start from the owned templates in this skill directory:
+export function validateInstalledBundle(root = bundleDir): string | null {
+	const files = renderSdkSkillFiles();
+	return validateBundleManifest(readBundleManifest(root), bundleContentFiles(files));
+}
 
-- \`templates/direct-sdk.ts\`
-- \`templates/direct-sdk.py\`
-
-## Authoring contract
-
-- Use the maintained TypeScript or Python SDK client; do not reimplement the WebSocket protocol.
-- Accept repository and session ID as non-secret inputs.
-- Resolve endpoint credentials at runtime from the selected local session.
-- Fail closed when discovery is missing, stale, dead, unknown, symlinked, or ambiguous.
-- Never accept a token as the default CLI interface.
-- Never print, serialize, persist, cache, or embed endpoint tokens.
-- Keep query and control operation names on fixed allowlists.
-- Require an immediately preceding, single-use human approval before mutation.
-- Use the template's nonce-bearing operation/session/input-bound standard-input challenge; never replace it with a free boolean or reusable approval.
-- Send no SDK request after denial or cancellation.
-- Bind durable workflow controls to the expected session ID.
-- Redact secret-shaped keys from all rendered results.
-- Close clients in \`finally\` blocks.
-- State that these are trusted local procedural controls, not capability isolation.
-
-Generated user scripts belong in the user's workspace. Only the two canonical templates are owned by this clean-generated bundle.
-`;
+/**
+ * Keeps the static prompts/operate.md allowlist blocks in sync with the
+ * ALLOWED_CONTROLS / ALLOWED_GLOBALS constants the templates embed. The prompt
+ * is the authored document; this validator is the drift gate that proves the
+ * generated bundle and the templates still describe the same allowlist.
+ */
+export function validatePromptAllowlistConsistency(): string | null {
+	const controlsBlock = `## Allowed per-session controls\n\n${ALLOWED_CONTROLS.map(operation => `- \`${operation}\``).join("\n")}\n`;
+	const globalsBlock = `## Allowed lifecycle operations\n\n${ALLOWED_GLOBALS.map(operation => `- \`${operation}\``).join("\n")}\n`;
+	if (!operatePrompt.includes(controlsBlock)) {
+		return "prompt drift: static scripts/gjc-sdk-skills/prompts/operate.md per-session controls do not match ALLOWED_CONTROLS";
+	}
+	if (!operatePrompt.includes(globalsBlock)) {
+		return "prompt drift: static scripts/gjc-sdk-skills/prompts/operate.md lifecycle operations do not match ALLOWED_GLOBALS";
+	}
+	return null;
 }
 
 function typeScriptTemplate(): string {
@@ -350,6 +323,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import sys
 from typing import Any, NoReturn
 import warnings
 
@@ -437,7 +411,8 @@ def require_approval(session_id: str, operation: str, operation_input: dict[str,
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     challenge = f"APPROVE {session_id} {operation} {digest} {secrets.token_hex(8)}"
-    answer = input(f"Approval required: {challenge}\\nType the exact challenge: ")
+    print(f"Approval required: {challenge}\\nType the exact challenge: ", file=sys.stderr, end="", flush=True)
+    answer = sys.stdin.readline()
     if answer.strip() != challenge:
         raise ValueError("human_approval_required")
 
@@ -483,19 +458,21 @@ async def main() -> None:
 try:
     asyncio.run(main())
 except Exception:
-    print("GJC SDK request failed safely.", file=__import__("sys").stderr)
+    print("GJC SDK request failed safely.", file=sys.stderr)
     raise SystemExit(1)
 `;
 }
 
 export function renderSdkSkillFiles(): Map<string, string> {
-	return new Map([
-		[path.join("gjc-sdk-discover", "SKILL.md"), discoverSkill()],
-		[path.join("gjc-sdk-operate", "SKILL.md"), operateSkill()],
-		[path.join("gjc-sdk-author", "SKILL.md"), authorSkill()],
+	const files = new Map<string, string>([
+		[path.join("gjc-sdk-discover", "SKILL.md"), discoverPrompt],
+		[path.join("gjc-sdk-operate", "SKILL.md"), operatePrompt],
+		[path.join("gjc-sdk-author", "SKILL.md"), authorPrompt],
 		[path.join("gjc-sdk-author", "templates", "direct-sdk.ts"), typeScriptTemplate()],
 		[path.join("gjc-sdk-author", "templates", "direct-sdk.py"), pythonTemplate()],
 	]);
+	files.set(BUNDLE_MANIFEST_NAME, manifestFile(files));
+	return files;
 }
 
 function listFiles(dir: string, rel = ""): string[] {
@@ -517,23 +494,32 @@ export function findUnexpectedSdkSkillFiles(files: ReadonlyMap<string, string>, 
 
 export function checkSdkSkillFiles(files: ReadonlyMap<string, string>, root = bundleDir, report = true): number {
 	const problems: string[] = [];
-	for (const [rel, content] of files) {
-		const target = path.join(root, rel);
-		let actual: string | null = null;
-		try {
-			const stat = fs.lstatSync(target);
-			if (stat.isSymbolicLink() || !stat.isFile()) {
-				problems.push(`invalid: sdk-skills/${rel}`);
-				continue;
+	// Fail closed on the versioned contract first: an unsupported or missing
+	// format version means the layout is unknown, so content-level drift checks
+	// must not run against it.
+	const manifestProblem = validateBundleManifest(readBundleManifest(root), bundleContentFiles(files));
+	if (manifestProblem !== null) problems.push(manifestProblem);
+	const allowlistProblem = validatePromptAllowlistConsistency();
+	if (allowlistProblem !== null) problems.push(allowlistProblem);
+	if (problems.length === 0) {
+		for (const [rel, content] of files) {
+			const target = path.join(root, rel);
+			let actual: string | null = null;
+			try {
+				const stat = fs.lstatSync(target);
+				if (stat.isSymbolicLink() || !stat.isFile()) {
+					problems.push(`invalid: sdk-skills/${rel}`);
+					continue;
+				}
+				actual = fs.readFileSync(target, "utf8");
+			} catch {
+				actual = null;
 			}
-			actual = fs.readFileSync(target, "utf8");
-		} catch {
-			actual = null;
+			if (actual === null) problems.push(`missing: sdk-skills/${rel}`);
+			else if (actual !== content) problems.push(`drift: sdk-skills/${rel}`);
 		}
-		if (actual === null) problems.push(`missing: sdk-skills/${rel}`);
-		else if (actual !== content) problems.push(`drift: sdk-skills/${rel}`);
+		for (const rel of findUnexpectedSdkSkillFiles(files, root)) problems.push(`unexpected: sdk-skills/${rel}`);
 	}
-	for (const rel of findUnexpectedSdkSkillFiles(files, root)) problems.push(`unexpected: sdk-skills/${rel}`);
 	if (problems.length > 0) {
 		if (report) {
 			for (const problem of problems) process.stderr.write(`${problem}\n`);
