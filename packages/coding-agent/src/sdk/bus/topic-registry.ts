@@ -213,7 +213,7 @@ export function emptyTopicRegistryState(): TopicRegistryState {
  */
 export function parseTopicRegistryState(value: unknown): TopicRegistryState | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const state = value as TopicRegistryState;
+	let state = value as TopicRegistryState;
 	if (state.version !== undefined && state.version !== 2) throw new Error("unsupported future Telegram topic state");
 	if (!state.topics || typeof state.topics !== "object" || Array.isArray(state.topics)) return undefined;
 	if (state.version === undefined) {
@@ -239,6 +239,15 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 
 	const isObject = (candidate: unknown): candidate is Record<string, unknown> =>
 		!!candidate && typeof candidate === "object" && !Array.isArray(candidate);
+	state = {
+		...state,
+		topics: Object.fromEntries(
+			Object.entries(state.topics).map(([sessionId, record]) => [
+				sessionId,
+				isObject(record) ? { ...record } : record,
+			]),
+		),
+	};
 	const validTimestamp = (candidate: unknown): candidate is number =>
 		typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0;
 	const validEpoch = (candidate: unknown): candidate is number =>

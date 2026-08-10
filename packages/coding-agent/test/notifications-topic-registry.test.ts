@@ -725,7 +725,7 @@ test("rejects future topic registry versions and quarantines retained legacy rec
 });
 
 test("repairs an archive record carrying a stale disconnect-grace marker", () => {
-	const state = parseTopicRegistryState({
+	const snapshot = {
 		version: 2,
 		registryGeneration: 7,
 		topics: {
@@ -747,10 +747,13 @@ test("repairs an archive record carrying a stale disconnect-grace marker", () =>
 				disconnectGraceExpiresAt: 3,
 			},
 		},
-	});
+	};
+	const original = structuredClone(snapshot);
+	const state = parseTopicRegistryState(snapshot);
 
 	expect(state?.topics.session?.authorityState).toBe("archive_pending");
 	expect(state?.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(snapshot).toEqual(original);
 });
 test("fences a concurrent host and permits same-topic resume only before grace expiry", async () => {
 	const registry = new TopicRegistry();
