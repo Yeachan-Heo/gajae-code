@@ -1,0 +1,295 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { ServerWebSocket } from "bun";
+import {
+	checkSdkSkillFiles,
+	findUnexpectedSdkSkillFiles,
+	renderSdkSkillFiles,
+} from "./generate-gjc-sdk-skills";
+
+const roots: string[] = [];
+const servers: Array<ReturnType<typeof Bun.serve>> = [];
+
+afterEach(() => {
+	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+	for (const server of servers.splice(0)) server.stop(true);
+});
+
+function materialize(): { files: Map<string, string>; root: string } {
+	const files = renderSdkSkillFiles();
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skills-test-"));
+	roots.push(root);
+	for (const [rel, content] of files) {
+		const target = path.join(root, rel);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, content);
+	}
+	return { files, root };
+}
+
+function endpointRepo(url: string, token: string): string {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-template-test-"));
+	roots.push(root);
+	const directory = path.join(root, ".gjc", "state", "sdk");
+	fs.mkdirSync(directory, { recursive: true });
+	fs.writeFileSync(
+		path.join(directory, "session-1.json"),
+		JSON.stringify({ version: 1, sessionId: "session-1", url, token, pid: process.pid, stale: false }),
+	);
+	return root;
+}
+
+function startSdkServer(frames: Array<Record<string, unknown>>): { url: string; token: string } {
+	const token = "template-test-secret";
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			if (new URL(request.url).searchParams.get("token") !== token) return new Response("Unauthorized", { status: 401 });
+			if (!server.upgrade(request, { data: undefined })) return new Response("Upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket: ServerWebSocket<undefined>) {
+				socket.send(JSON.stringify({ type: "hello", connectionId: "template-test" }));
+			},
+			message(socket: ServerWebSocket<undefined>, raw: string | Buffer) {
+				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				frames.push(frame);
+				if (frame.type === "query_request") {
+					const failed = frame.query === "session.stats";
+					socket.send(
+						JSON.stringify(
+							failed
+								? { type: "query_response", id: frame.id, ok: false, error: { code: "unavailable", message: `failed-${token}` } }
+								: { type: "query_response", id: frame.id, ok: true, result: { query: frame.query, data: `prefix-${token}-suffix` } },
+						),
+					);
+				}
+				if (frame.type === "control_request")
+					socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: { accepted: true } }));
+			},
+		},
+	});
+	servers.push(server);
+	return { url: `ws://127.0.0.1:${server.port}`, token };
+}
+
+async function runTypeScriptTemplate(
+	args: string[],
+	approval: "none" | "deny" | "accept" | { reply: string } = "none",
+	onChallenge?: () => void,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const child = Bun.spawn(["bun", path.join(import.meta.dir, "..", "sdk-skills", "gjc-sdk-author", "templates", "direct-sdk.ts"), ...args], {
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (approval !== "accept") {
+		if (approval === "deny") child.stdin.write("DENY\n");
+		if (typeof approval === "object") child.stdin.write(`${approval.reply}\n`);
+		child.stdin.end();
+	}
+	const stderrPromise = (async () => {
+		const reader = child.stderr.getReader();
+		const decoder = new TextDecoder();
+		let stderr = "";
+		let answered = false;
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			stderr += decoder.decode(value, { stream: true });
+			if (approval === "accept" && !answered) {
+				const challenge = stderr.match(/Approval required: (APPROVE [^\n]+)/)?.[1];
+				if (challenge) {
+					onChallenge?.();
+					child.stdin.write(`${challenge}\n`);
+					child.stdin.end();
+					answered = true;
+				}
+			}
+		}
+		return stderr + decoder.decode();
+	})();
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		stderrPromise,
+	]);
+	return { exitCode, stdout, stderr };
+}
+
+describe("generated external GJC SDK skills", () => {
+	it("renders the exact namespaced five-file contract", () => {
+		const files = renderSdkSkillFiles();
+		expect([...files.keys()].sort()).toEqual(
+			[
+				"gjc-sdk-discover/SKILL.md",
+				"gjc-sdk-operate/SKILL.md",
+				"gjc-sdk-author/SKILL.md",
+				"gjc-sdk-author/templates/direct-sdk.ts",
+				"gjc-sdk-author/templates/direct-sdk.py",
+			].sort(),
+		);
+	});
+
+	it("rejects missing, drifted, and unexpected generated files", () => {
+		const missing = materialize();
+		fs.rmSync(path.join(missing.root, "gjc-sdk-discover", "SKILL.md"));
+		expect(checkSdkSkillFiles(missing.files, missing.root, false)).toBe(1);
+
+		const drifted = materialize();
+		fs.appendFileSync(path.join(drifted.root, "gjc-sdk-operate", "SKILL.md"), "drift\n");
+		expect(checkSdkSkillFiles(drifted.files, drifted.root, false)).toBe(1);
+
+		const symlinked = materialize();
+		const target = path.join(symlinked.root, "gjc-sdk-operate", "SKILL.md");
+		const contents = fs.readFileSync(target, "utf8");
+		fs.rmSync(target);
+		const backing = path.join(symlinked.root, "same-bytes.md");
+		fs.writeFileSync(backing, contents);
+		fs.symlinkSync(backing, target);
+		expect(checkSdkSkillFiles(symlinked.files, symlinked.root, false)).toBe(1);
+
+		const unexpected = materialize();
+		const stale = path.join(unexpected.root, "gjc-sdk-author", "stale.md");
+		fs.writeFileSync(stale, "stale\n");
+		expect(findUnexpectedSdkSkillFiles(unexpected.files, unexpected.root)).toEqual([
+			path.join("gjc-sdk-author", "stale.md"),
+		]);
+		expect(checkSdkSkillFiles(unexpected.files, unexpected.root, false)).toBe(1);
+	});
+
+	it("keeps direct-client templates fail-closed and credential-safe", () => {
+		const files = renderSdkSkillFiles();
+		const typescript = files.get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
+		const python = files.get("gjc-sdk-author/templates/direct-sdk.py") ?? "";
+		for (const source of [typescript, python]) {
+			expect(source).toContain("human_approval_required");
+			expect(source).toContain("[REDACTED]");
+			expect(source).toContain("APPROVE");
+			expect(source).toContain("Type the exact challenge");
+			expect(source).not.toContain("--approval");
+			expect(source).not.toContain('"--token"');
+			expect(source).not.toContain("mcp-serve");
+			expect(source).not.toContain("coordinator-mcp");
+		}
+		expect(typescript).toContain("ALLOWED_CONTROLS.has");
+		expect(python).toContain("operation not in ALLOWED_CONTROLS");
+	});
+
+	it("executes the TypeScript inspection recipe without exposing credentials", async () => {
+		const frames: Array<Record<string, unknown>> = [];
+		const sdk = startSdkServer(frames);
+		const repo = endpointRepo(sdk.url, sdk.token);
+		const result = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
+		expect(result.exitCode).toBe(0);
+		expect(frames.map(frame => frame.query)).toEqual([
+			"session.metadata",
+			"context.get",
+			"goal.list/get",
+			"todo.list",
+			"workflow.gates.list",
+			"session.stats",
+		]);
+		expect(result.stdout).toContain('"status": "confirmed"');
+		expect(result.stdout).not.toContain(sdk.token);
+		expect(result.stdout).toContain('"status": "unavailable"');
+		expect(result.stdout).toContain("[REDACTED]");
+	});
+
+	it("sends no control until approval matches the exact operation, session, and input", async () => {
+		const frames: Array<Record<string, unknown>> = [];
+		const sdk = startSdkServer(frames);
+		const repo = endpointRepo(sdk.url, sdk.token);
+		const args = [
+			"--repo",
+			repo,
+			"--session-id",
+			"session-1",
+			"--mode",
+			"control",
+			"--operation",
+			"turn.prompt",
+			"--input",
+			'{"prompt":"hello"}',
+		];
+		const denied = await runTypeScriptTemplate(args, "deny");
+		expect(denied.exitCode).toBe(1);
+		expect(frames).toEqual([]);
+		expect(denied.stderr).not.toContain(sdk.token);
+
+		const approved = await runTypeScriptTemplate(args, "accept");
+		expect(approved.exitCode).toBe(0);
+		expect(frames).toHaveLength(1);
+		expect(frames[0]).toMatchObject({ type: "control_request", operation: "turn.prompt", input: { prompt: "hello" } });
+		expect(approved.stdout).not.toContain(sdk.token);
+		const acceptedChallenge = approved.stderr.match(/Approval required: (APPROVE [^\n]+)/)?.[1];
+		expect(acceptedChallenge).toBeDefined();
+		const replayed = await runTypeScriptTemplate(args, { reply: acceptedChallenge! });
+		expect(replayed.exitCode).toBe(1);
+		expect(frames).toHaveLength(1);
+	});
+
+	it("rejects unsupported arguments before discovery", async () => {
+		const result = await runTypeScriptTemplate(["--repo", "/missing", "--token", "must-not-print"]);
+		expect(result.exitCode).toBe(1);
+		expect(result.stdout + result.stderr).not.toContain("must-not-print");
+	});
+
+	it("fails closed for ambiguous and non-regular discovery records", async () => {
+		const frames: Array<Record<string, unknown>> = [];
+		const sdk = startSdkServer(frames);
+		const repo = endpointRepo(sdk.url, sdk.token);
+		const directory = path.join(repo, ".gjc", "state", "sdk");
+		fs.writeFileSync(
+			path.join(directory, "session-2.json"),
+			JSON.stringify({ version: 1, sessionId: "session-2", url: sdk.url, token: sdk.token, pid: process.pid, stale: false }),
+		);
+		const ambiguous = await runTypeScriptTemplate(["--repo", repo, "--mode", "inspect"]);
+		expect(ambiguous.exitCode).toBe(1);
+		expect(frames).toEqual([]);
+
+		fs.mkdirSync(path.join(directory, "bad.json"));
+		const invalid = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
+		expect(invalid.exitCode).toBe(1);
+		expect(frames).toEqual([]);
+
+		fs.rmSync(path.join(directory, "bad.json"), { recursive: true });
+		const first = path.join(directory, "session-1.json");
+		const firstRecord = JSON.parse(fs.readFileSync(first, "utf8")) as Record<string, unknown>;
+		fs.writeFileSync(first, JSON.stringify({ ...firstRecord, sessionId: "different-session" }));
+		const mismatched = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
+		expect(mismatched.exitCode).toBe(1);
+		expect(frames).toEqual([]);
+	});
+
+	it("sends no control when discovery changes during approval", async () => {
+		const frames: Array<Record<string, unknown>> = [];
+		const sdk = startSdkServer(frames);
+		const repo = endpointRepo(sdk.url, sdk.token);
+		const endpointPath = path.join(repo, ".gjc", "state", "sdk", "session-1.json");
+		const result = await runTypeScriptTemplate(
+			[
+				"--repo",
+				repo,
+				"--session-id",
+				"session-1",
+				"--mode",
+				"control",
+				"--operation",
+				"turn.prompt",
+				"--input",
+				'{"prompt":"hello"}',
+			],
+			"accept",
+			() => {
+				const record = JSON.parse(fs.readFileSync(endpointPath, "utf8")) as Record<string, unknown>;
+				fs.writeFileSync(endpointPath, JSON.stringify({ ...record, token: "replacement-token" }));
+			},
+		);
+		expect(result.exitCode).toBe(1);
+		expect(frames).toEqual([]);
+	});
+});

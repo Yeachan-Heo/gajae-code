@@ -74,6 +74,22 @@ Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
 `SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
 The client supplies `reply.token` for replies.
 
+## External-agent SDK skills
+
+The generated `sdk-skills/` bundle provides host-neutral guidance for external agents that operate local GJC sessions directly through SDK v3. It is intentionally separate from GJC's four internal workflow skills, the coordinator MCP plugin, and the SDK MCP adapter.
+
+The bundle owns exactly five files:
+
+- `gjc-sdk-discover/SKILL.md`
+- `gjc-sdk-operate/SKILL.md`
+- `gjc-sdk-author/SKILL.md`
+- `gjc-sdk-author/templates/direct-sdk.ts`
+- `gjc-sdk-author/templates/direct-sdk.py`
+
+Regenerate with `bun run generate-sdk-skills`; CI checks byte-for-byte content and rejects unexpected files with `bun run check:sdk-skills`.
+
+The skills use a trusted-local procedural model. They require exact live-session selection, never log or persist endpoint credentials, compose a provenance-labeled inspection view from existing queries, and require single-use human approval before allowlisted lifecycle operations. They do not claim capability isolation: a modified local script that can read an endpoint token has the authority of that token.
+
 Phase 2 still does **not** provide unattended negotiation, a cross-process
 reattach/registry, or a renderer-grade full event stream. No event-plane parity
 is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
