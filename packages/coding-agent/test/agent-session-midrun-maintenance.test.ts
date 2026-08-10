@@ -533,7 +533,7 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		} finally {
 			SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = undefined;
 		}
-	}, 45_000);
+	}, 15_000);
 
 	it("keeps canonical output when exact publication is incomplete", async () => {
 		session = await buildSession({ persisted: true, settings: { "compaction.keepRecentTokens": 10 } });
@@ -557,19 +557,24 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 
 	it("keeps canonical output when exact publication fails after planning", async () => {
 		session = await buildSession({ persisted: true, settings: { "compaction.keepRecentTokens": 10 } });
-		const output = "publication-failure-output-".repeat(35_000);
+		const output = "publication-failure-output-".repeat(15_000);
 		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
 		const artifactManager = session.sessionManager.getArtifactManager();
 		expect(artifactManager).not.toBeNull();
 		if (!artifactManager) return;
 		const originalPublishExactText = artifactManager.publishExactText.bind(artifactManager);
-		artifactManager.publishExactText = async () => ({
-			outcome: "failed",
-			diagnostic: "injected publication failure",
-		});
+		let publicationAttempts = 0;
+		artifactManager.publishExactText = async () => {
+			publicationAttempts++;
+			return {
+				outcome: "failed",
+				diagnostic: "injected publication failure",
+			};
+		};
 		try {
 			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 			expect(outcome).toBe("failed");
+			expect(publicationAttempts).toBe(1);
 		} finally {
 			artifactManager.publishExactText = originalPublishExactText;
 		}
@@ -585,7 +590,7 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
 		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
 		expect(await artifactManager.listFiles()).toEqual([]);
-	}, 90_000);
+	}, 30_000);
 
 	it("commits persisted tool-output eviction through production maintenance and releases append-only retainers", async () => {
 		session = await buildSession({

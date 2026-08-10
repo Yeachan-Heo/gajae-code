@@ -12398,6 +12398,16 @@ export class AgentSession {
 		if (!artifactManager && plan.digests.length > 0) {
 			return undefined;
 		}
+		const removePublishedArtifacts = async (): Promise<void> => {
+			for (const handle of published.values()) {
+				const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
+				if (removed === false) {
+					logger.warn("Failed to remove unpublished tool-output eviction artifact", {
+						artifactId: handle.artifactId,
+					});
+				}
+			}
+		};
 
 		// Publish exact text one candidate at a time. The plan carries only digests and
 		// replacement proposals; original output bytes exist only in this iteration.
@@ -12420,21 +12430,13 @@ export class AgentSession {
 						outcome: outcome.outcome,
 						diagnostic: "diagnostic" in outcome ? outcome.diagnostic : undefined,
 					});
-					if (outcome.outcome === "failed") break;
+					if (outcome.outcome === "failed") {
+						await removePublishedArtifacts();
+						return undefined;
+					}
 				}
 			}
 		}
-
-		const removePublishedArtifacts = async (): Promise<void> => {
-			for (const handle of published.values()) {
-				const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
-				if (removed === false) {
-					logger.warn("Failed to remove unpublished tool-output eviction artifact", {
-						artifactId: handle.artifactId,
-					});
-				}
-			}
-		};
 
 		// Evaluate non-tool pruning on a disposable copy so the gate runs before any
 		// live entry is mutated. This avoids retaining originals for rollback.
