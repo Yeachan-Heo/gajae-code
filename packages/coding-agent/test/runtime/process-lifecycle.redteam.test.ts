@@ -97,6 +97,99 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 			"live count baseline after already-exited dispose",
 		);
 	});
+	test.skipIf(process.platform !== "linux")(
+		"dispose terminates without burning the grace window when only zombie members remain",
+		async () => {
+			const before = liveOwnedProcessCount();
+			const base = `/tmp/gjc-process-lifecycle-zombie-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			const pidsFile = `${base}.pids`;
+			const helperFile = `${base}.helper`;
+			const scriptFile = `${base}.py`;
+			await Bun.write(
+				scriptFile,
+				`import os, sys, time
+root_pgid = os.getpid()
+out, hpid_out = sys.argv[1], sys.argv[2]
+h = os.fork()
+if h == 0:
+    # Detach from the owned root's stdio pipes so the helper holding a write
+    # end cannot keep the transport's stdout/stderr streams open past the
+    # root's death (which would wedge awaitExit on the stderr drain).
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    # Helper leaves the owned group (new pgrp, same session) so it never counts
+    # as an owned member, then forks the grandchild into the owned group and
+    # never reaps it: the grandchild stays a zombie with the helper as parent.
+    os.setpgid(0, 0)
+    with open(hpid_out, "w") as f:
+        f.write(str(os.getpid()))
+    c = os.fork()
+    if c == 0:
+        os.setpgid(0, root_pgid)
+        with open(out, "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(100)
+        os._exit(0)
+    time.sleep(100)
+time.sleep(100)
+`,
+			);
+			const owner = spawnOwnedProcess(["python3", scriptFile, pidsFile, helperFile], {
+				name: "redteam-zombie-only-group",
+				gracefulMs: 1_000,
+			});
+			const pgid = owner.pid as number;
+			try {
+				await waitForAsync(() => fileContains(pidsFile, ""), 3_000, "grandchild joined the owned group");
+				await waitForAsync(() => fileContains(helperFile, ""), 3_000, "helper pid");
+				const grandchildPid = Number((await Bun.file(pidsFile).text()).trim());
+				const helperPid = Number((await Bun.file(helperFile).text()).trim());
+				expect(grandchildPid).toBeGreaterThan(0);
+				expect(helperPid).toBeGreaterThan(0);
+				expect(processAlive(grandchildPid)).toBe(true);
+
+				// Kill the grandchild: it becomes a zombie in the owned group whose
+				// parent (the helper) never reaps it, so the zombie persists.
+				process.kill(grandchildPid, "SIGKILL");
+				await Bun.sleep(50);
+				// Root exits on its own; the only owned member left is the zombie.
+				process.kill(pgid, "SIGKILL");
+
+				// dispose() must terminate once no *running* member remains. With the
+				// zombie-blind liveness probe the whole SIGTERM+SIGKILL escalation is
+				// burned waiting for an external reaper (>= gracefulMs).
+				const start = Date.now();
+				await owner.dispose();
+				const elapsed = Date.now() - start;
+				expect(elapsed).toBeLessThan(800);
+
+				const exit = await owner.awaitExit({ timeoutMs: 2_000 });
+				expect(exit.exited).toBe(true);
+				await waitFor(
+					() => liveOwnedProcessCount() === before,
+					2_000,
+					"live count baseline after zombie-only dispose",
+				);
+			} finally {
+				await owner.dispose().catch(() => {});
+				try {
+					const helperPid = Number((await Bun.file(helperFile).text()).trim());
+					if (helperPid > 0) {
+						try {
+							process.kill(helperPid, "SIGKILL");
+						} catch {
+							/* already gone */
+						}
+					}
+				} catch {
+					/* helper file never appeared */
+				}
+				await Bun.$`rm -f ${pidsFile} ${helperFile} ${scriptFile}`.quiet();
+			}
+		},
+	);
 
 	test("double and concurrent dispose share one settled result and issue one terminating signal", async () => {
 		const before = liveOwnedProcessCount();

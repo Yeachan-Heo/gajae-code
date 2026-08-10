@@ -1,12 +1,12 @@
-import { afterEach, describe, expect, setDefaultTimeout, test, vi } from "bun:test";
-import * as path from "node:path";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { logger } from "@gajae-code/utils";
 import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
 
-setDefaultTimeout(90_000);
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 30_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (await predicate()) return;
@@ -15,7 +15,34 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 	throw new Error("waitFor timed out");
 }
 
+function processState(pid: number): string {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "?";
+		return `state=${state}`;
+	} catch {
+		return "gone";
+	}
+}
+
+/**
+ * Whether a pid is alive. A zombie (state Z) is NOT alive: it executes no code
+ * and only its reaping remains, which is the parent reaper's job. Counting
+ * zombies as alive makes the teardown assertions hostage to an external reaper
+ * (PID 1 under shard load), which is exactly what previously timed this test
+ * out. Non-Linux falls back to signal-0 probing.
+ */
 function isAlive(pid: number): boolean {
+	if (process.platform === "linux") {
+		try {
+			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "";
+			if (state === "Z" || state === "X") return false;
+		} catch {
+			// No such process (or it raced out of the table).
+			return false;
+		}
+	}
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -24,14 +51,34 @@ function isAlive(pid: number): boolean {
 	}
 }
 
-async function waitForPid(pidFile: string): Promise<number> {
-	await waitFor(async () => {
-		const text = await Bun.file(pidFile)
-			.text()
-			.catch(() => "");
-		return Number(text) > 0;
-	});
-	return Number(await Bun.file(pidFile).text());
+/**
+ * Wait for the fixture's grandchild pid file. The fixture writes its root pid
+ * first and the spawned grandchild pid second, so a timeout here is a fixture
+ * readiness failure (root never became ready), not a product teardown failure
+ * — the error surfaces the root's live state for diagnosis instead of hanging.
+ */
+async function waitForPid(childPidFile: string, rootPidFile: string): Promise<number> {
+	try {
+		// The readiness window is bounded well under the test budget so a dead
+		// fixture surfaces the diagnostic below instead of a bare timeout.
+		await waitFor(async () => {
+			const text = await Bun.file(childPidFile)
+				.text()
+				.catch(() => "");
+			return Number(text) > 0;
+		}, 4_000);
+		return Number(await Bun.file(childPidFile).text());
+	} catch (error) {
+		const rootPid = Number(
+			(await Bun.file(rootPidFile)
+				.text()
+				.catch(() => "")) || 0,
+		);
+		const rootInfo = rootPid > 0 ? `${rootPid} ${processState(rootPid)}` : "no root pid file written";
+		throw new Error(
+			`fixture readiness failed: grandchild pid file never appeared; root=${rootInfo} (${error instanceof Error ? error.message : String(error)})`,
+		);
+	}
 }
 
 const servers: Bun.Server<unknown>[] = [];
@@ -41,7 +88,7 @@ async function runIsolatedStdioLifecycleTest(): Promise<void> {
 	const child = Bun.spawn(
 		[process.execPath, "test", import.meta.path, "--test-name-pattern", "close and reconnect dispose"],
 		{
-			cwd: path.join(import.meta.dir, "..", ".."),
+			cwd: join(import.meta.dir, "..", ".."),
 			env: { ...process.env, [STDIO_LIFECYCLE_ISOLATION]: "1" },
 			stdout: "pipe",
 			stderr: "pipe",
@@ -71,20 +118,31 @@ describe("MCP stdio transport lifecycle", () => {
 			return;
 		}
 		const before = liveOwnedProcessCount();
-		const pidFile = `/tmp/gjc-mcp-stdio-${Date.now()}-${Math.random().toString(36).slice(2)}.pid`;
-		const command = [process.execPath, path.join(import.meta.dir, "fixtures", "stdio-process-tree.ts"), pidFile];
+		const base = `/tmp/gjc-mcp-stdio-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const rootPidFile = `${base}.root.pid`;
+		const childPidFile = `${base}.child.pid`;
+		// The fixture root runs on the already-resident Bun runtime and reports
+		// its own pid first and the spawned grandchild pid second, so readiness
+		// is observable and distinguishable from the transport's close/reconnect
+		// ownership contract below.
+		const command = [
+			process.execPath,
+			join(import.meta.dir, "fixtures", "stdio-process-tree.ts"),
+			childPidFile,
+			rootPidFile,
+		];
 		const transport = new StdioTransport({ command: command[0], args: command.slice(1), timeout: 500 });
 		await transport.connect();
-		const oldChildPid = await waitForPid(pidFile);
+		const oldChildPid = await waitForPid(childPidFile, rootPidFile);
 		expect(isAlive(oldChildPid)).toBe(true);
 
 		await transport.close();
 		await waitFor(() => !isAlive(oldChildPid));
 		expect(liveOwnedProcessCount()).toBeLessThanOrEqual(before);
 
-		await Bun.write(pidFile, "");
+		await Bun.write(childPidFile, "");
 		await transport.connect();
-		const newChildPid = await waitForPid(pidFile);
+		const newChildPid = await waitForPid(childPidFile, rootPidFile);
 		expect(newChildPid).not.toBe(oldChildPid);
 		expect(isAlive(oldChildPid)).toBe(false);
 		await transport.close();
