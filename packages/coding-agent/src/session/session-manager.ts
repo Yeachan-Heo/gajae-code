@@ -15601,6 +15601,16 @@ export class SessionManager {
 		};
 	}
 
+	/**
+	 * Directory backing the resident *text* blob store, or undefined when the
+	 * store is in-memory. The resident-cache root also holds the managed sidecar
+	 * cache instance, so callers must not infer the text store from directory
+	 * counts.
+	 */
+	residentTextCacheDirForTests(): string | undefined {
+		return this.#residentTextBlobStore instanceof EphemeralBlobStore ? this.#residentTextBlobStore.dir : undefined;
+	}
+
 	setSidecarHotSuffixBudgetForTests(bytes: number): void {
 		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("invalid_sidecar_hot_suffix_budget");
 		this.#sidecarHotSuffixBudgetBytes = bytes;

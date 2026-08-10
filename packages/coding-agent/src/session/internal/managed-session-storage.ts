@@ -1501,6 +1501,25 @@ export class ManagedSessionDescendantStore {
 			throw new Error("managed_nested_path_unsupported");
 	}
 
+	/**
+	 * Without retained root authority a nested read resolves through intermediate
+	 * directories that `O_NOFOLLOW` does not cover, so each component between the
+	 * bound base directory and the target is verified as a real same-device
+	 * directory before the capture opens the leaf.
+	 */
+	#assertPathBackedDirectoryChain(resolved: string): void {
+		if (this.#authority) return;
+		const relative = path.relative(this.#baseDir, resolved);
+		const components = relative.split(path.sep);
+		let current = this.#baseDir;
+		for (const component of components.slice(0, -1)) {
+			current = path.join(current, component);
+			const stat = fs.lstatSync(current, { bigint: true });
+			if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== this.#subtreeRoot.dev)
+				throw new Error("Managed descendant path escapes retained store");
+		}
+	}
+
 	#relative(resolved: string): string {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
 	}
@@ -1789,12 +1808,13 @@ export class ManagedSessionDescendantStore {
 	}
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
-		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
-		const relative = this.#relative(this.#resolve(relativePath));
+		const resolved = this.#resolve(relativePath);
+		const relative = this.#relative(resolved);
 		if (!this.#authority) {
 			try {
-				const captured = captureManagedFileNoFollow(this.#resolve(relativePath));
+				this.#assertPathBackedDirectoryChain(resolved);
+				const captured = captureManagedFileNoFollow(resolved);
 				this.#assertBound();
 				return captured;
 			} catch (error) {

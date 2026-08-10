@@ -334,6 +334,7 @@
 
 ### Fixed
 
+- Managed session forks no longer fail with `managed_nested_path_unsupported` on platforms without retained root authority. Nested reads verify each intermediate directory component as a real same-device directory instead of being rejected outright, restoring artifact copying during `fork()` and `moveTo()`.
 - Terminal input now normalizes Option/Meta navigation and psmux modified-Enter encodings through the native key parser, keeping legacy, Kitty CSI-u, and modifyOtherKeys behavior consistent.
 - Ultragoal CLI replay no longer executes model-authored test source or trusts `replaySafe: true` as arbitrary command authority. Runtime replay is limited to the pinned Bun runtime for `--version` and literal `-e "console.log(...)"`; shells, interpreter code strings, path-qualified executables, tests, install/publish/network/git mutation commands, and arbitrary argv are rejected. Replay cwd/artifact files are realpath-confined, ambiguous rows fail closed, stdout and stderr are checked, and POSIX timeout cleanup signals the process group. Structured test-report fallback remains deliberately unsupported pending a separate trusted-provenance design (#3533).
 - Ultragoal CLI replay evidence now reads the replay file referenced by an `executorQa.artifactRefs` entry whose `kind` is `cli-replay`. Inline, nested, and file-backed replay forms are disambiguated explicitly; mixed or malformed rows fail closed (#3533).
