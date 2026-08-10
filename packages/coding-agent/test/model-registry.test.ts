@@ -315,6 +315,31 @@ describe("ModelRegistry", () => {
 			expect(sol?.contextWindow).toBe(373_000);
 			expect(terra?.contextWindow).toBe(372_000);
 		});
+		test("openai-codex contextWindow override does not exempt same-id models on other Codex-transport providers", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+					},
+				},
+				"codex-extension": {
+					baseUrl: "https://codex-extension.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-codex-responses",
+					models: [{ id: "gpt-5.6-sol", contextWindow: 1_000_000 }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const openaiCodexSol = codexModels.find(model => model.id === "gpt-5.6-sol");
+			const extensionSol = getModelsForProvider(registry, "codex-extension").find(
+				model => model.id === "gpt-5.6-sol",
+			);
+
+			expect(openaiCodexSol?.contextWindow).toBe(373_000);
+			expect(extensionSol?.contextWindow).toBe(372_000);
+		});
 		test("keeps models config baseUrl ahead of provider base URL env vars", () => {
 			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-env.example.com/v1");
 			try {

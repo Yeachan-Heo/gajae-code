@@ -65,6 +65,9 @@ export function isCodexProductTransport(model: Pick<Model<Api>, "api" | "provide
 export function isCodexGpt56Tier(model: Pick<Model<Api>, "id">): boolean {
 	return CODEX_GPT_5_6_MODEL_IDS.has(model.id.toLowerCase());
 }
+export function codexContextOverrideKey(provider: string, modelId: string): string {
+	return `${provider.toLowerCase()}:${modelId.toLowerCase()}`;
+}
 
 export function resolveCodexGpt56DiscoveryContext(
 	model: Pick<Model<Api>, "api" | "id" | "provider">,
@@ -86,12 +89,16 @@ export function resolveCodexGpt56DiscoveryContext(
  * Applies the final Codex GPT-5.6 context ceiling, honoring explicit user
  * overrides.
  *
- * `userContextWindowOverrides` maps lowercased model ids to the user's explicit
- * `contextWindow` value (already merged into `model.contextWindow` by the model
- * registry). A tier model present with a positive finite value keeps its value
- * even above `enforced` — the user's explicit, diagnosed choice. Every other tier
+ * `userContextWindowOverrides` maps provider-qualified composite keys
+ * (`provider:modelId`, both lowercased, built by
+ * {@link codexContextOverrideKey}) to the user's explicit `contextWindow` value
+ * (already merged into `model.contextWindow` by the model registry). A tier
+ * model present with a positive finite value keeps its value even above
+ * `enforced` — the user's explicit, diagnosed choice. Every other tier
  * model is forced to `enforced`, so a stale larger live/cached observation
  * (e.g. a pre-rollback 373K cache) cannot resurface without an override.
+ * Because the key is provider-qualified, an override only exempts the exact
+ * provider+model pair it was configured for.
  */
 export function applyFinalCodexGpt56ContextCap<TApi extends Api>(
 	models: readonly Model<TApi>[],
@@ -102,7 +109,7 @@ export function applyFinalCodexGpt56ContextCap<TApi extends Api>(
 		if (!isCodexGpt56Tier(model as Model<Api>) || !isCodexProductTransport(model as Model<Api>)) {
 			return model;
 		}
-		const userOverride = userContextWindowOverrides.get(model.id.toLowerCase());
+		const userOverride = userContextWindowOverrides.get(codexContextOverrideKey(model.provider, model.id));
 		if (userOverride !== undefined && isPositiveFiniteNumber(userOverride)) {
 			return model;
 		}

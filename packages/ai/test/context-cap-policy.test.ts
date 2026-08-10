@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	applyFinalCodexGpt56ContextCap,
 	CODEX_GPT_5_6_CONTEXT_CAP,
+	codexContextOverrideKey,
 	resolveCodexGpt56DiscoveryContext,
 } from "../src/context-cap-policy";
 import type { Api, Model } from "../src/types";
@@ -83,13 +84,13 @@ describe("Codex GPT-5.6 context cap policy", () => {
 	});
 
 	it("honors an explicit user override above the ceiling and caps sibling tiers", () => {
-		const overrides = new Map([["gpt-5.6-sol", 373_000]]);
+		const overrides = new Map([[codexContextOverrideKey("openai-codex", "gpt-5.6-sol"), 373_000]]);
 		const capped = applyFinalCodexGpt56ContextCap([model(), model({ id: "gpt-5.6-terra" })], undefined, overrides);
 		expect(capped.map(entry => entry.contextWindow)).toEqual([373_000, 372_000]);
 	});
 
 	it("leaves non-tier and first-party OpenAI transports untouched by the override path", () => {
-		const overrides = new Map([["gpt-5.6-sol", 373_000]]);
+		const overrides = new Map([[codexContextOverrideKey("openai-codex", "gpt-5.6-sol"), 373_000]]);
 		const capped = applyFinalCodexGpt56ContextCap(
 			[model({ id: "gpt-5.5" }), model({ id: "gpt-5.6-sol", api: "openai-responses", provider: "openai" })],
 			undefined,
@@ -103,10 +104,51 @@ describe("Codex GPT-5.6 context cap policy", () => {
 			[model(), model({ id: "gpt-5.6-terra" })],
 			undefined,
 			new Map([
-				["gpt-5.6-sol", -5],
-				["gpt-5.6-terra", Number.NaN],
+				[codexContextOverrideKey("openai-codex", "gpt-5.6-sol"), -5],
+				[codexContextOverrideKey("openai-codex", "gpt-5.6-terra"), Number.NaN],
 			]),
 		);
 		expect(capped.map(entry => entry.contextWindow)).toEqual([372_000, 372_000]);
+	});
+
+	it("does not exempt a same-ID model when the override belongs to another provider", () => {
+		// The override is configured for openai-codex/gpt-5.6-sol, but this model
+		// is an unrelated extension-provider model with the same id. Its 1M window
+		// must be capped to the enforced window, not honored.
+		const capped = applyFinalCodexGpt56ContextCap(
+			[model({ id: "gpt-5.6-sol", provider: "extension", api: "openai-codex-responses", contextWindow: 1_000_000 })],
+			undefined,
+			new Map([[codexContextOverrideKey("openai-codex", "gpt-5.6-sol"), 373_000]]),
+		);
+		expect(capped.map(entry => entry.contextWindow)).toEqual([372_000]);
+	});
+
+	it("honors a same-ID override configured for the extension provider", () => {
+		// The override is configured for extension/gpt-5.6-sol, matching this
+		// model's own provider, so it is honored even above the enforced window.
+		const capped = applyFinalCodexGpt56ContextCap(
+			[model({ id: "gpt-5.6-sol", provider: "extension", api: "openai-codex-responses", contextWindow: 1_000_000 })],
+			undefined,
+			new Map([[codexContextOverrideKey("extension", "gpt-5.6-sol"), 1_000_000]]),
+		);
+		expect(capped.map(entry => entry.contextWindow)).toEqual([1_000_000]);
+	});
+
+	it("honors a right-provider override above the enforced window", () => {
+		// openai-codex/gpt-5.6-sol with an override for the same provider+model
+		// keeps its explicit value even above the enforced window.
+		const capped = applyFinalCodexGpt56ContextCap(
+			[
+				model({
+					id: "gpt-5.6-sol",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					contextWindow: 373_000,
+				}),
+			],
+			undefined,
+			new Map([[codexContextOverrideKey("openai-codex", "gpt-5.6-sol"), 373_000]]),
+		);
+		expect(capped.map(entry => entry.contextWindow)).toEqual([373_000]);
 	});
 });

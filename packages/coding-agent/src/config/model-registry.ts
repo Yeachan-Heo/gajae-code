@@ -8,6 +8,7 @@ import {
 	type CacheRetention,
 	CODEX_GPT_5_6_CONTEXT_CAP,
 	type Context,
+	codexContextOverrideKey,
 	createModelManager,
 	enrichModelThinking,
 	getBundledModels,
@@ -3143,8 +3144,9 @@ export class ModelRegistry {
 		});
 	}
 	/**
-	 * Collects explicit user `contextWindow` overrides keyed by lowercased model
-	 * id, and surfaces diagnostics when one applies to a Codex GPT-5.6 tier
+	 * Collects explicit user `contextWindow` overrides keyed by provider + model
+	 * id (`codexContextOverrideKey`), and surfaces diagnostics when one applies
+	 * to a Codex GPT-5.6 tier
 	 * model. The map is computed once per config load and feeds the final
 	 * context cap so an explicit override is never silently re-clamped.
 	 */
@@ -3167,7 +3169,7 @@ export class ModelRegistry {
 					}
 					continue;
 				}
-				result.set(normalizedId, value);
+				result.set(codexContextOverrideKey(provider, modelId), value);
 				if (!isCodexGpt56Tier({ id: normalizedId })) {
 					continue;
 				}
@@ -3175,8 +3177,7 @@ export class ModelRegistry {
 					model: modelId,
 					provider,
 					override: override.contextWindow,
-					ceiling: CODEX_GPT_5_6_CONTEXT_CAP.ceiling,
-					fallback: CODEX_GPT_5_6_CONTEXT_CAP.fallback,
+					enforced: CODEX_GPT_5_6_CONTEXT_CAP.enforced,
 				});
 			}
 		}
