@@ -507,15 +507,18 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 	});
 
 	it("fails closed when tool-output artifact persistence is unavailable", async () => {
+		let artifactInstallAttempts = 0;
 		SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = async () => {
+			artifactInstallAttempts++;
 			throw new Error("injected ephemeral artifact install failure");
 		};
 		try {
 			session = await buildSession({ settings: { "compaction.keepRecentTokens": 10 } });
-			const output = "unavailable-output-".repeat(35_000);
+			const output = "unavailable-output-".repeat(15_000);
 			const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
 			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 			expect(outcome).toBe("failed");
+			expect(artifactInstallAttempts).toBe(1);
 			const entry = session.sessionManager
 				.getBranch()
 				.find(

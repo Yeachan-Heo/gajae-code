@@ -12383,11 +12383,15 @@ export class AgentSession {
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
+		const artifactManager = await this.sessionManager.ensureArtifactManager();
+		// Over-threshold callers have already proven tool-output savings before entering
+		// this path. If exact persistence is unavailable, fail closed before hashing and
+		// planning large outputs so maintenance cannot drift into timeout-driven abort.
+		if (overThreshold && !artifactManager) return undefined;
 		const plan = planToolOutputPrune(branchEntries, {
 			...DEFAULT_PRUNE_CONFIG,
 			minimumSavings: overThreshold ? 0 : DEFAULT_PRUNE_CONFIG.minimumSavings,
 		});
-		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		const published = new Map<string, ToolOutputPruneEvictionHandle>();
 		// Fail closed when tool-output eviction is planned but no artifact store can be
 		// established: do not report a successful prune that skipped durable eviction.
