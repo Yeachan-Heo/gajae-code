@@ -602,6 +602,13 @@ export interface DaemonHealth {
 	stopped: boolean;
 	heartbeatAt: number | undefined;
 	heartbeatAgeMs: number | undefined;
+
+	/**
+	 * Session endpoints the live owner reported an OPEN socket to in its latest
+	 * matching heartbeat sidecar. `undefined` means the owner never published the
+	 * field (older daemon, no stable owner tag, no matching sidecar): unknown, not zero.
+	 */
+	attachedEndpoints: number | undefined;
 	generation: number | undefined;
 	currentGeneration: number;
 	generationRelation: DaemonGenerationRelation;
@@ -822,7 +829,13 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 		});
 	} catch {
 		daemonStateUnreadable = true;
-		snapshot = { ownerTag: null, effectiveHeartbeatAt: undefined, legacyEmbedded: false, state: undefined };
+		snapshot = {
+			ownerTag: null,
+			effectiveHeartbeatAt: undefined,
+			legacyEmbedded: false,
+			attachedEndpoints: undefined,
+			state: undefined,
+		};
 	}
 	const state = snapshot.state ? parseDaemonState(JSON.stringify(snapshot.state)) : undefined;
 	const heartbeatAt = finiteNonNegativeNumber(snapshot.effectiveHeartbeatAt);
@@ -840,6 +853,7 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 		stopped: state?.stoppedAt !== undefined,
 		heartbeatAt,
 		heartbeatAgeMs: heartbeatAt === undefined ? undefined : displayHeartbeatAgeMs(now, heartbeatAt),
+		attachedEndpoints: snapshot.attachedEndpoints,
 		generation: state?.generation,
 		currentGeneration: DAEMON_GENERATION,
 		generationRelation: daemonGenerationRelation(state),
@@ -929,6 +943,25 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 				level: "warn",
 				detail:
 					"No local notification endpoint for this working directory. In this GJC terminal run /notify on; if it does not report notifications enabled, start a new local GJC session. Do not re-pair Telegram.",
+			});
+		}
+		// Endpoint files are registrations, not deliveries: a live owner that
+		// reports zero OPEN sockets cannot deliver to any of them. An owner that
+		// never published a count is unknown, and unknown is never treated as zero.
+		if (
+			telegramConfigured &&
+			daemon.present &&
+			daemon.alive &&
+			daemon.heartbeatFresh &&
+			daemon.identityMatches &&
+			!daemon.stopped &&
+			endpoints.total > 0 &&
+			daemon.attachedEndpoints === 0
+		) {
+			checks.push({
+				name: "endpoint_attachment",
+				level: "warn",
+				detail: `${endpoints.total} endpoint file(s) registered but daemon pid ${daemon.pid} reports 0 attached session(s); the daemon cannot deliver to any registered endpoint`,
 			});
 		}
 	}

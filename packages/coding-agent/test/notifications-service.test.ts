@@ -344,6 +344,92 @@ describe("notification-service health", () => {
 		});
 		expect(report.checks.indexOf(hint!)).toBe(report.checks.findIndex(check => check.name === "endpoints") + 1);
 	});
+
+	const heartbeatPath = daemonPaths(settings.getAgentDir()).heartbeat;
+	// Matches the owner tag daemonStateJson() writes, so the sidecar is accepted as this owner's own.
+	const ownerSidecarTag = { pid: 1000, incarnation: "linux:100", ownerId: "owner-a", acquisitionId: "owner-a" };
+	const attachStateRoot = "/tmp/gjc-attachment";
+	const attachEndpoint = JSON.stringify({
+		sessionId: "session-a",
+		url: "ws://127.0.0.1:3000",
+		token: "endpoint-token",
+		pid: 1000,
+	});
+
+	test("warns when endpoint files are registered but a live daemon reports zero attachments", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490, attachedEndpoints: 0 }),
+			[path.join(attachStateRoot, "sdk", "session-a.json")]: attachEndpoint,
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: attachStateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.attachedEndpoints).toBe(0);
+		expect(report.endpoints.total).toBe(1);
+		expect(report.checks.find(check => check.name === "endpoint_attachment")).toEqual({
+			name: "endpoint_attachment",
+			level: "warn",
+			detail:
+				"1 endpoint file(s) registered but daemon pid 1000 reports 0 attached session(s); the daemon cannot deliver to any registered endpoint",
+		});
+		expect(report.overall).toBe("warn");
+	});
+
+	test("stays clean when the live daemon reports at least one attached endpoint", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490, attachedEndpoints: 1 }),
+			[path.join(attachStateRoot, "sdk", "session-a.json")]: attachEndpoint,
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: attachStateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.attachedEndpoints).toBe(1);
+		expect(report.checks.some(check => check.name === "endpoint_attachment")).toBe(false);
+		expect(report.overall).toBe("ok");
+	});
+
+	test("treats a sidecar without an attachment count as unknown rather than zero", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490 }),
+			[path.join(attachStateRoot, "sdk", "session-a.json")]: attachEndpoint,
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: attachStateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.attachedEndpoints).toBeUndefined();
+		expect(report.checks.some(check => check.name === "endpoint_attachment")).toBe(false);
+		expect(report.overall).toBe("ok");
+	});
+
+	test("keeps the no-endpoint-file hint and skips the attachment warn when nothing is registered", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490, attachedEndpoints: 0 }),
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.endpoints.total).toBe(0);
+		expect(report.checks.find(check => check.name === "local_endpoint")).toEqual({
+			name: "local_endpoint",
+			level: "warn",
+			detail:
+				"No local notification endpoint for this working directory. In this GJC terminal run /notify on; if it does not report notifications enabled, start a new local GJC session. Do not re-pair Telegram.",
+		});
+		expect(report.checks.some(check => check.name === "endpoint_attachment")).toBe(false);
+		expect(report.overall).toBe("warn");
+	});
 	test("ignores shared lifecycle, ready, and broker records when discovering endpoints", async () => {
 		const stateRoot = "/tmp/gjc-shared-sdk-state";
 		const { fs } = mockFs({
