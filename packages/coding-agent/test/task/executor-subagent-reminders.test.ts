@@ -10,7 +10,7 @@ import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } from "../../src/session/agent-session";
 import type { AuthStorage } from "../../src/session/auth-storage";
-import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
+import { type ManagedTaskPersistence, runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
 
 import {
 	type AgentDefinition,
@@ -747,6 +747,41 @@ describe("runSubprocess yield reminders", () => {
 		);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.credentialSessionId).toBe("credential-pool");
 		expect(authSessionIds).toEqual(["credential-pool"]);
+	});
+	it("keeps the canonical child scope as provider identity for managed fork children", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-managed-fork",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const managedPersistence = {
+			openSession: async () => ({}),
+			publishOutput: async () => {},
+		} as unknown as ManagedTaskPersistence;
+
+		await runSubprocess({
+			...baseOptions,
+			id: "4-ManagedFork",
+			subagentId: "4-ManagedFork",
+			parentSessionId: "parent-session",
+			forkContextSeed: createForkContextSeed(),
+			managedPersistence,
+		});
+
+		// Every subagent gets the canonical child scope (c2ddfb7c1), fork seeds included.
+		// This pins that a fork seed never suppresses the composite for managed
+		// descendants, whose shared lifecycle logical id would otherwise collide.
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.providerSessionId).toBe(
+			JSON.stringify(["subagent-canonical", "parent-session", "4-ManagedFork"]),
+		);
 	});
 
 	it("renders shared task context in subagent system prompt before now", async () => {
