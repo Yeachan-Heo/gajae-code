@@ -22,6 +22,16 @@ function isAlive(pid: number): boolean {
 	}
 }
 
+async function waitForPid(pidFile: string): Promise<number> {
+	await waitFor(async () => {
+		const text = await Bun.file(pidFile)
+			.text()
+			.catch(() => "");
+		return Number(text) > 0;
+	});
+	return Number(await Bun.file(pidFile).text());
+}
+
 const servers: Bun.Server<unknown>[] = [];
 
 afterEach(async () => {
@@ -39,12 +49,11 @@ describe("MCP stdio transport lifecycle", () => {
 		const command = [
 			"node",
 			"-e",
-			`const fs=require('fs'); const cp=require('child_process'); const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:false,stdio:'ignore'}); fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid)); setInterval(()=>{},1000);`,
+			`const fs=require('fs'); const cp=require('child_process'); const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:false,stdio:'ignore'}); const pidFile=${JSON.stringify(pidFile)}; fs.writeFileSync(pidFile+'.tmp', String(child.pid)); fs.renameSync(pidFile+'.tmp', pidFile); setInterval(()=>{},1000);`,
 		];
 		const transport = new StdioTransport({ command: command[0], args: command.slice(1), timeout: 500 });
 		await transport.connect();
-		await waitFor(() => Bun.file(pidFile).exists());
-		const oldChildPid = Number(await Bun.file(pidFile).text());
+		const oldChildPid = await waitForPid(pidFile);
 		expect(isAlive(oldChildPid)).toBe(true);
 
 		await transport.close();
@@ -53,13 +62,7 @@ describe("MCP stdio transport lifecycle", () => {
 
 		await Bun.write(pidFile, "");
 		await transport.connect();
-		await waitFor(async () => {
-			const text = await Bun.file(pidFile)
-				.text()
-				.catch(() => "");
-			return Number(text) > 0;
-		});
-		const newChildPid = Number(await Bun.file(pidFile).text());
+		const newChildPid = await waitForPid(pidFile);
 		expect(newChildPid).not.toBe(oldChildPid);
 		expect(isAlive(oldChildPid)).toBe(false);
 		await transport.close();
