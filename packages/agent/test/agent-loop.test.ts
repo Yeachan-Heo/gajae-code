@@ -1781,7 +1781,14 @@ describe("agentLoop - empty response overflow detection", () => {
 			tools: [],
 		};
 		const mock = createMockModel({
-			responses: [{ content: [], stopReason: "stop", usage: { input: 0, output: 0 } }],
+			responses: [
+				{
+					content: [],
+					stopReason: "stop",
+					usage: { input: 0, output: 0 },
+					transportFailure: { kind: "transport", providerCode: "empty_response" },
+				},
+			],
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 

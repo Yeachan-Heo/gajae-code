@@ -112,6 +112,7 @@ function zeroTokenEmptyStopStream(model: Model): AssistantMessageEventStream {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "stop",
+			transportFailure: { kind: "transport", providerCode: "empty_response" },
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
