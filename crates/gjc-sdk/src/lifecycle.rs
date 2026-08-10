@@ -27,18 +27,6 @@ pub enum LifecycleState {
 	TerminalUncertain,
 }
 
-/// Status indicating that side effects may have occurred but confirmation is
-/// unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UncertainStatus {
-	pub reason:      String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub observed_at: Option<u64>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub detail:      Option<String>,
-}
-
 /// Where a `session_create` should run. Tagged by `kind` on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

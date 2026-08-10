@@ -751,10 +751,9 @@ export class LifecycleLedger {
 		if (terminal(prior.state) || (prior.state === "effect_started" && this.#isCleanupPending(prior)))
 			return { kind: "replay", entry: prior };
 		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };
-		// Accepted may be the last durable evidence before a crash. It has no effect
-		// marker, but admitting it again would re-run an operation whose process state
-		// cannot be proven after restart.
-		if (prior.state === "accepted") return { kind: "in_progress", entry: prior };
+		// Accepted proves admission only. The effect_started marker is the boundary
+		// after which retrying the operation is unsafe.
+		if (prior.state === "accepted") return { kind: "new", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
 	async transition(

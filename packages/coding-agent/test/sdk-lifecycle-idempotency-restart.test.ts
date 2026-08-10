@@ -22,18 +22,27 @@ describe("SDK lifecycle ledger", () => {
 		expect(ledger.hasLegacyIdentity()).toBe(true);
 		expect(ledger.findByOperationKey("session.create\0caller-key")).toBeUndefined();
 	});
-	it("does not re-execute a durably accepted row after restart", async () => {
+	it("re-admits a durably accepted row after restart before any effect starts", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-accepted-"));
 		const ledger = await new LifecycleLedger(dir).open();
 		await ledger.begin("i", "a");
 
 		const resumed = await new LifecycleLedger(dir).open();
-		expect((await resumed.begin("i", "a")).kind).toBe("in_progress");
+		expect((await resumed.begin("i", "a")).kind).toBe("new");
 		expect((await resumed.begin("i", "b")).kind).toBe("idempotency_conflict");
 		await resumed.transition("i", "terminal_ok", { response: { sessionId: "s" } });
 		expect((await new LifecycleLedger(dir).open()).get("i")?.state).toBe("terminal_ok");
 	});
-	it("seals a valid accepted row missing its final newline without re-executing", async () => {
+	it("keeps effect_started as the retry lockout boundary", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-effect-started-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("i", "a");
+		await ledger.transition("i", "effect_started");
+
+		const resumed = await new LifecycleLedger(dir).open();
+		expect((await resumed.begin("i", "a")).kind).toBe("terminal_uncertain");
+	});
+	it("seals a valid accepted row missing its final newline and re-admits it", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-unsealed-"));
 		const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
 		const ledger = await new LifecycleLedger(dir).open();
@@ -42,7 +51,7 @@ describe("SDK lifecycle ledger", () => {
 		await fs.writeFile(ledgerPath, source.slice(0, -1));
 
 		const resumed = await new LifecycleLedger(dir).open();
-		expect((await resumed.begin("i", "a")).kind).toBe("in_progress");
+		expect((await resumed.begin("i", "a")).kind).toBe("new");
 		await resumed.transition("i", "terminal_ok", { response: { sessionId: "s" } });
 		const lines = (await fs.readFile(ledgerPath, "utf8")).trimEnd().split("\n");
 		expect(lines.map(line => JSON.parse(line))).toHaveLength(2);
