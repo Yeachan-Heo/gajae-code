@@ -101,12 +101,17 @@ export interface ResourceGcDeps {
 	) => Promise<void>;
 }
 
+/** Request collection without synchronously stopping the main event loop. */
+export function requestMemoryPressureGc(): void {
+	Bun.gc(false);
+}
+
 const defaultDeps: ResourceGcDeps = {
 	now: () => Date.now(),
 	monotonicNow: () => performance.now(),
 	rssBytes: () => process.memoryUsage().rss,
 	memorySnapshot: () => sampleMemoryPressure(),
-	runGc: () => Bun.gc(true),
+	runGc: requestMemoryPressureGc,
 	logWarn: (msg, meta) => logger.warn(msg, meta),
 	listTabs: () => listTabsForGc(),
 	releaseTab: (name, policy) => releaseTabIfGcEligible(name, policy),
