@@ -80,6 +80,30 @@ test("preserves an agent failure code in host prompt reconciliation", async () =
 	});
 });
 
+test("a late agent failure never overwrites the reason an already terminal record carries", async () => {
+	const reconciliation = createInvocationReconciliation();
+	const correlation = { commandId: "first-reason-command", turnId: "first-reason-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "first-reason-ref");
+	await reconciliation.noteTransition("prompt", correlation, {
+		type: "agent_failed",
+		error: Object.assign(new Error("stream interrupted"), { code: "upstream_stream_interrupted" }),
+	});
+	const claimed = reconciliation.lookup("prompt", { clientRef: "first-reason-ref" });
+	expect(claimed).toMatchObject({
+		status: "failed",
+		error: { code: "upstream_stream_interrupted", message: "Prompt submission failed." },
+		terminalAt: expect.any(Number),
+	});
+	// First reason wins: a second, different late failure neither replaces the recorded
+	// reason nor re-stamps the terminal. The sleep makes a re-stamped terminalAt observable.
+	await Bun.sleep(2);
+	await reconciliation.noteTransition("prompt", correlation, {
+		type: "agent_failed",
+		error: Object.assign(new Error("transport reset"), { code: "transport_reset" }),
+	});
+	expect(reconciliation.lookup("prompt", { clientRef: "first-reason-ref" })).toEqual(claimed);
+});
+
 test("redacts a persisted host failure during hydration", async () => {
 	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-reconciliation-"));
 	const sessionId = "hydrated-failure";
@@ -463,7 +487,7 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
-	test("a later provider error never overwrites an already terminal prompt", async () => {
+	test("a later provider error enriches but never re-opens an already terminal prompt", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-once-"));
 		try {
 			const inflight = Promise.withResolvers<void>();
@@ -477,14 +501,23 @@ describe("post-acceptance invocation terminalization", () => {
 			const { commandId, turnId } = accepted.result ?? {};
 			await harness.emit("agent_start");
 			await harness.emit("agent_end");
-			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
-				status: "terminal_ok",
-			});
+			const claimed = await settledStatus(harness, "turn.prompt_status", { commandId, turnId });
+			expect(claimed).toMatchObject({ status: "terminal_ok" });
 			inflight.reject(Object.assign(new Error("late provider failure"), { code: "upstream_error" }));
 			await Bun.sleep(20);
+			// A lifecycle frame arriving after the terminal must not resurrect the record either.
+			await harness.emit("agent_start");
 			const settled = await harness.query("turn.prompt_status", { commandId, turnId });
-			expect(settled.result?.status).toBe("terminal_ok");
-			expect(settled.result?.error).toBeUndefined();
+			// A late reason may attach to a settled record that has none (#4105), so `error` is the
+			// only field allowed to appear; status, terminalAt, and identity stay exactly as claimed.
+			const { error: _claimedReason, ...claimedTerminal } = claimed;
+			const { error: _lateReason, ...settledTerminal } = settled.result ?? {};
+			expect(settledTerminal).toEqual(claimedTerminal);
+			// Recorded or not, the reason is the sanitized late failure: never fabricated, never raw.
+			// Once #4105 lands the reason is always recorded, and this allow-list collapses to one shape.
+			expect([undefined, { code: "upstream_error", message: "Prompt submission failed." }]).toContainEqual(
+				settled.result?.error,
+			);
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
