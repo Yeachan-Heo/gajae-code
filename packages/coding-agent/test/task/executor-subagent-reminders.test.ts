@@ -696,7 +696,7 @@ describe("runSubprocess yield reminders", () => {
 		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("uses one stable child-owned identity for auth resolution and createAgentSession", async () => {
+	it("keeps child-owned provider identity separate from the parent credential scope", async () => {
 		const session = createMockSession(({ emit }) => {
 			emit({
 				type: "tool_execution_end",
@@ -717,6 +717,7 @@ describe("runSubprocess yield reminders", () => {
 			id: "3-Child",
 			subagentId: "3-Child",
 			parentSessionId: "parent-session",
+			parentCredentialSessionId: "credential-pool",
 			modelRegistry: {
 				refresh: async () => {},
 				getAvailable: () => [
@@ -744,7 +745,8 @@ describe("runSubprocess yield reminders", () => {
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.providerSessionId).toBe(
 			JSON.stringify(["subagent-canonical", "parent-session", "3-Child"]),
 		);
-		expect(authSessionIds).toEqual([JSON.stringify(["subagent-canonical", "parent-session", "3-Child"])]);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.credentialSessionId).toBe("credential-pool");
+		expect(authSessionIds).toEqual(["credential-pool"]);
 	});
 
 	it("renders shared task context in subagent system prompt before now", async () => {
