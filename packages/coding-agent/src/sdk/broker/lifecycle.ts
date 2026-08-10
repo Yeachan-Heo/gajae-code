@@ -4445,7 +4445,7 @@ export async function executeLifecycle(
 									}
 								: {
 										code: "spawn_failed",
-										message: "No ready SDK endpoint remains available.",
+										message: startupFailure.message,
 										endpoint: "unavailable" as const,
 									},
 							...(durableEffects ? { durableEffects } : {}),

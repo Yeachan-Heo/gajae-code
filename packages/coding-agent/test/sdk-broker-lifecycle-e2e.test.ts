@@ -2336,6 +2336,46 @@ test("broker propagates an owned lifecycle startup failure without semantic read
 	}
 });
 
+test("broker preserves a code-less lifecycle startup failure message", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-startup-message-"));
+	const agentDir = path.join(root, "agent");
+	const fixture = path.join(root, "startup-failure.ts");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.writeFile(
+			fixture,
+			`import { writeSessionLifecycleFailure } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"))};
+const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+await writeSessionLifecycleFailure(
+	request.stateRoot,
+	request.sessionId,
+	request.effectMarker,
+	{ phase: "startup", reason: "failed", message: "owned synthetic startup failure" },
+	{ endpointGeneration: null, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true },
+);
+await Bun.sleep(60_000);
+`,
+		);
+		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
+		await broker.start();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 4_000 },
+			"code-less-startup-failure",
+		);
+		expect(response).toMatchObject({
+			ok: false,
+			error: { code: "spawn_failed", message: "owned synthetic startup failure" },
+		});
+	} finally {
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("broker replays immutable lifecycle cleanup after a crash immediately after an exact detach", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-crash-"));
 	const agentDir = path.join(root, "agent");
@@ -2455,7 +2495,10 @@ await fs.rm(endpoint);
 				{ cwd: normalRoot, sessionId: normalSessionId, sessionPath: normalSessionPath },
 				"normal-after-verification",
 			);
-			expect(normalResponse).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+			expect(normalResponse).toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed", message: "owned synthetic startup failure" },
+			});
 			const normalTerminal = (await fs.readFile(path.join(normalAgentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
 				.split("\n")
 				.filter(Boolean)
@@ -3309,7 +3352,7 @@ test("production post-registration startup failure proves cleanup and exact repl
 			ok: false,
 			error: {
 				code: "spawn_failed",
-				message: "No ready SDK endpoint remains available.",
+				message: "Lifecycle test failure after SDK host registration.",
 				endpoint: "unavailable",
 			},
 			startupFailure: {
