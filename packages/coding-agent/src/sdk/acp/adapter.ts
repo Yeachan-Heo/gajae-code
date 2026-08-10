@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { HEARTBEAT_TTL_MS } from "../bus/daemon-paths";
-import { SdkClient, SdkClientError, type SdkClientOptions, type SdkFrame, type SdkSentRecord } from "../client";
+import { SdkClient, SdkClientError, type SdkFrame, type SdkSentRecord } from "../client";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";

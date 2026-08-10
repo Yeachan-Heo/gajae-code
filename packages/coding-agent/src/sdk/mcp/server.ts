@@ -3,12 +3,7 @@ import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError, type SdkSentRecord } from "../client/client";
-import {
-	listSdkSessionEndpoints,
-	readSdkBrokerDiscovery,
-	readSdkSessionEndpoint,
-	SdkDiscoveryError,
-} from "../client/discovery";
+import { readSdkBrokerDiscovery, SdkDiscoveryError } from "../client/discovery";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
 
