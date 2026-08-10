@@ -116,7 +116,7 @@ mkdir -p "$TARBALL_APP_DIR"
 		require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 	"
 
-	bun add "$utils_tgz" "$natives_linux_x64_tgz" "$natives_tgz" "$ai_tgz" "$agent_tgz" "$bridge_client_tgz" "$tui_tgz" "$stats_tgz" "$coding_agent_tgz" "$wrapper_tgz"
+	bun add "$utils_tgz" "$natives_linux_x64_tgz" "$natives_tgz" "$ai_tgz" "$agent_tgz" "$tui_tgz" "$stats_tgz" "$coding_agent_tgz" "$wrapper_tgz"
 	smoke_cli ./node_modules/.bin/gjc
 )
 
