@@ -1929,6 +1929,8 @@ describe("notifications config", () => {
 			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 			let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
 			let providerReady = false;
+			let providerAttempts = 0;
+			const notifications: string[] = [];
 			const rollback = new SdkStartupRollbackTracker();
 			const capability = new SdkStartupCapability(rollback);
 			const api = {
@@ -1949,12 +1951,13 @@ describe("notifications config", () => {
 					getSessionId: () => "provider-readiness-retry",
 					getSessionName: () => "provider readiness retry",
 				},
-				ui: { notify: () => {} },
+				ui: { notify: (message: string) => notifications.push(message) },
 			} as unknown as ExtensionCommandContext;
 			const endpoint = path.join(cwd, ".gjc", "state", "sdk", "provider-readiness-retry.json");
 			createNotificationsExtension(api, {
 				settings,
 				ensureProviderDaemon: async () => {
+					providerAttempts++;
 					if (!providerReady) throw new Error("provider readiness denied");
 				},
 			});
@@ -1971,9 +1974,13 @@ describe("notifications config", () => {
 					hostStopped: false,
 					brokerRegistrationReleased: false,
 				});
+				expect(providerAttempts).toBeGreaterThanOrEqual(2);
+				const attemptsAfterStartup = providerAttempts;
 
 				providerReady = true;
 				await notify.handler("on", context);
+				expect(providerAttempts).toBeGreaterThan(attemptsAfterStartup);
+				expect(notifications).toContain("Notifications enabled for this session.");
 				expect(fs.existsSync(endpoint)).toBe(true);
 			} finally {
 				await sessionShutdown({}, context);

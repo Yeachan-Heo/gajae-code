@@ -1179,6 +1179,8 @@ interface SessionRuntime {
 	disposeGateListener: () => void;
 	/** Whether notification-only delivery and answer resources are active. */
 	notificationsActive: boolean;
+	/** Provider ownership state is independent from the already-published core SDK runtime. */
+	notificationOwnerState: "ready" | "retry" | "blocked";
 	/** Rejects new SDK frames while a leased terminal response drains. */
 	inboundFenced: boolean;
 	/** Set as soon as terminal teardown is requested, before startup settles. */
@@ -4953,6 +4955,7 @@ export function createNotificationsExtension(
 			disposeFileSink: () => {},
 			disposeGateListener: () => {},
 			notificationsActive: false,
+			notificationOwnerState: "ready",
 			enableNotifications: () => {},
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
@@ -5562,12 +5565,18 @@ export function createNotificationsExtension(
 			// daemon ownership. A blocked adapter must not make an interactive session
 			// undiscoverable or uncontrollable.
 			const endpoint = await sdkRuntime.startTransport();
+			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
+				initializedRuntime.notificationOwnerState = "retry";
 				try {
 					let registrationToken: string | undefined;
 					const ownership = await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
 						registrationToken = token;
 					});
+					initializedRuntime.notificationOwnerState =
+						ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
+							? "ready"
+							: "blocked";
 					if (ownership === "blocked_identity") {
 						logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
 					}
@@ -5583,6 +5592,7 @@ export function createNotificationsExtension(
 						runtime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
 					}
 				} catch (error) {
+					initializedRuntime.notificationOwnerState = "retry";
 					logger.warn(
 						`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
 					);
@@ -5847,7 +5857,10 @@ export function createNotificationsExtension(
 	}
 
 	const sessionRuntime: NotificationSessionRuntime<ExtensionContext> = {
-		isRunning: binding => runtimes.get(binding.sessionId)?.notificationsActive === true,
+		isRunning: binding => {
+			const runtime = runtimes.get(binding.sessionId);
+			return runtime?.notificationsActive === true && runtime.notificationOwnerState === "ready";
+		},
 		start: async binding => {
 			if (sessionStartPromises.has(binding.sessionId)) {
 				const result = await startSession(binding.context);
@@ -5860,6 +5873,16 @@ export function createNotificationsExtension(
 			}
 			const runtime = runtimes.get(binding.sessionId);
 			if (runtime) {
+				if (runtime.notificationOwnerState === "retry") {
+					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
+					if (!settingsAvailable || !settings) return "failed";
+					try {
+						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
+						runtime.notificationOwnerState = ownership === "ready" ? "ready" : "blocked";
+					} catch {
+						return "failed";
+					}
+				}
 				return "started";
 			}
 			const result = await startSession(binding.context);
@@ -5914,6 +5937,7 @@ export function createNotificationsExtension(
 			// Activation is only valid after the controller commits a stable policy;
 			// never expose deferred presentations while provisional policy is held.
 			if (runtime.policySuspended) return;
+			if (runtime.notificationOwnerState !== "ready") return;
 			runtime.enableNotifications();
 			runtime.gatePresentations?.setPublicationSuspended(false);
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
@@ -5940,6 +5964,8 @@ export function createNotificationsExtension(
 						registrationToken,
 					});
 				}
+				if (runtime?.notificationOwnerState === "blocked")
+					runtime.notificationOwnerState = result === "ready" ? "ready" : "blocked";
 				return result;
 			} catch {
 				return "failed";
