@@ -4968,10 +4968,10 @@ export class AgentSession {
 							predecessorAccepted = true;
 							this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 						};
-						const startsQueuedSuccessor =
-							this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
+						const hasQueuedMessages = this.agent.hasQueuedMessages();
+						const startsQueuedSuccessor = hasQueuedMessages;
 						const continueQueued =
-							this.agent.state.messages.at(-1)?.role === "assistant"
+							this.agent.state.messages.at(-1)?.role === "assistant" || !hasQueuedMessages
 								? this.agent.continue.bind(this.agent)
 								: this.agent.continueQueuedMessages.bind(this.agent);
 						try {

@@ -6,6 +6,7 @@
 - Follow-up queue auto-continuation now waits for compaction and foreground bash/eval work to settle, preventing queued prompts from starting a model turn concurrently with those operations.
 - Follow-up queue submissions now defer slash/skill text during foreground bash/eval work instead of invoking a competing custom-message turn.
 - Follow-up queues now resume through a dedicated queued-message continuation after Python/Bash execution tails, avoiding an extra stale-turn replay.
+- Post-maintenance continuation now resumes the current non-assistant tail when no queued messages exist, while consuming queued steering/follow-ups only when present; overflow recovery no longer fails with `No queued messages to continue`, and accepted queued successors reset fallback accounting exactly once.
 - Streamed edit preview coalescing now keys on the complete partial-JSON payload rather than its length, so same-size in-place argument replacements recompute and render while repeated payloads remain cached.
 - CLI parsing now fails closed by default, while launch and ACP explicitly defer only their owned startup options; this preserves ACP-specific diagnostics, SDK startup forwarding, real ACP subprocess framing, and RLM typo rejection without exposing retired flags in root help or completion.
 
