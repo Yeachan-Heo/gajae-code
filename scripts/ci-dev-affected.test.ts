@@ -1475,6 +1475,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
+		expect(describeTasks(tasks).find(task => task.key === "release-publish-contract")?.native).toBe(true);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});
 
@@ -1484,6 +1485,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 
 		expect(keys).toContain("root-check");
 		expect(keys).toContain("root-test:release");
+		expect(describeTasks(tasks).find(task => task.key === "root-test:release")?.native).toBe(true);
 		expect(keys).not.toContain("root-test");
 		expect(tasks.filter(task => task.key.startsWith("test:@gajae-code/coding-agent:shard-")).map(task => task.key)).toEqual([
 			"test:@gajae-code/coding-agent:shard-1-of-8",

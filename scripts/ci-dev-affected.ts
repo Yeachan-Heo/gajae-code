@@ -347,6 +347,8 @@ function taskNeedsNative(key: string): boolean {
 	return (
 		key === "python-test" ||
 		key === "root-test" ||
+		key === "root-test:release" ||
+		key === "release-publish-contract" ||
 		key === "root-check" ||
 		key === "check:@gajae-code/coding-agent" ||
 		key === "cli-smoke" ||
