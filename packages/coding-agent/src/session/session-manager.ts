@@ -10767,12 +10767,23 @@ export class SessionManager {
 	#releaseManagedSidecarCache(): void {
 		this.#managedSidecarAuthorityStore?.close();
 		this.#managedSidecarSecurityContext?.retainedAuthority?.close();
+		const store = this.#managedSidecarCacheStore;
 		this.#managedSidecarAuthorityStore = undefined;
 		this.#managedSidecarSecurityContext = undefined;
-		this.#managedSidecarCacheStore?.dispose();
 		this.#managedSidecarCacheStore = undefined;
 		this.#managedSidecarCacheSessionFile = undefined;
 		this.#managedRangeExpectedDescriptor = undefined;
+		// Release state before disposal so a rejected cache directory can never
+		// strand a half-released sidecar, and never escape teardown (close()) as
+		// an unhandled rejection.
+		if (!store) return;
+		try {
+			store.dispose();
+		} catch (error) {
+			logger.warn("Failed to dispose the managed sidecar resident cache", {
+				error: toError(error).message,
+			});
+		}
 	}
 
 	#isManagedSidecarPath(candidate: string): boolean {

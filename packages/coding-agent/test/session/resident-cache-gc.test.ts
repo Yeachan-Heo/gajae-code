@@ -3,9 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	disposeVerifiedResidentCacheInstanceDir,
 	EphemeralBlobStore,
 	openVerifiedResidentCacheInstanceDir,
 	openVerifiedSidecarCacheInstanceDir,
+	ResidentCacheTrustError,
 	sweepResidentCacheRoot,
 } from "@gajae-code/coding-agent/session/blob-store";
 
@@ -252,5 +254,31 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 
 		scan.mockRestore();
 		await expect(sweepResidentCacheRoot(cacheRoot)).resolves.toBeUndefined();
+	});
+	it("treats an already-removed instance directory as disposed", () => {
+		const cacheRoot = path.join(makeTempDir(), "resident-cache");
+		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
+		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		store.putSync(Buffer.from("resident payload", "utf8"));
+		fs.rmSync(instanceDir, { recursive: true, force: true });
+
+		store.dispose();
+		disposeVerifiedResidentCacheInstanceDir(instanceDir);
+
+		expect(fs.existsSync(instanceDir)).toBe(false);
+	});
+
+	it("refuses to dispose a present instance directory that lost owner-only mode", () => {
+		const cacheRoot = path.join(makeTempDir(), "resident-cache");
+		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
+		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		fs.chmodSync(instanceDir, 0o755);
+		try {
+			expect(() => store.dispose()).toThrow(ResidentCacheTrustError);
+			expect(fs.existsSync(instanceDir)).toBe(true);
+		} finally {
+			fs.chmodSync(instanceDir, 0o700);
+			store.dispose();
+		}
 	});
 });

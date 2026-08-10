@@ -390,6 +390,16 @@ function removeResidentCacheTreeNoFollow(pathname: string): void {
 export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string): void {
 	const instanceKey = path.resolve(instanceDir);
 	const uid = residentCacheOwnerUid(instanceDir);
+	// An instance directory that no longer exists carries nothing left to
+	// distrust: disposal is already satisfied. Only a present-but-unreadable
+	// entry is a trust failure.
+	try {
+		fs.lstatSync(instanceDir);
+	} catch (error) {
+		if (errorCode(error) !== "ENOENT") throw residentCacheTrustError("directory_unverifiable", instanceDir, error);
+		ownedResidentCacheInstanceDirs.delete(instanceKey);
+		return;
+	}
 	const quarantineDir = path.join(
 		path.dirname(instanceDir),
 		`${path.basename(instanceDir)}.dispose.${crypto.randomUUID()}`,
