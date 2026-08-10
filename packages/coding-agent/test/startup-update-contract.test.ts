@@ -49,9 +49,12 @@ function rootArgs(overrides: Partial<Args> = {}): Args {
 	};
 }
 
+const FAKE_SESSION_ID = "startup-update-contract-session";
+
 function fakeSessionResult(): CreateAgentSessionResult {
 	let activeModel = testModel;
 	const session = {
+		sessionId: FAKE_SESSION_ID,
 		get model() {
 			return activeModel;
 		},
@@ -802,6 +805,10 @@ describe("startup update contract", () => {
 			expect(printModeStarted).toBe(false);
 			expect(settings.get("modelProfile.default")).toBe("codex-medium");
 			expect(stderr.join("")).toContain('Model profile "codex-medium" requires credentials for: openai-codex');
+			expect(getApiKeySpy.mock.calls.map(call => [call[0], call[1]])).toContainEqual([
+				"openai-codex",
+				FAKE_SESSION_ID,
+			]);
 		} finally {
 			stderrSpy.mockRestore();
 			getApiKeySpy.mockRestore();
