@@ -21,8 +21,10 @@ function createRuntime() {
 				selector: string,
 				options?: { candidates?: Array<{ provider: string; id: string }> },
 			) => (selector === "claude-sonnet" ? options?.candidates?.[0] : undefined),
+			getAvailable: () => [availableModel],
 		},
 		getAvailableModels: () => [availableModel],
+		setConfiguredModelChain: () => {},
 		async setModel(model: { provider: string; id: string }, _role: "default", _options?: unknown) {
 			this.model = model;
 		},
@@ -124,12 +126,12 @@ describe("/model batch assignments", () => {
 
 		expect(setActiveSpy).toHaveBeenCalledTimes(1);
 		expect(setActiveSpy).toHaveBeenCalledWith(undefined);
-		expect(settings.getModelRole("default")).toBe("claude-sonnet:low");
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:low");
 		expect(settings.get("task.agentModelOverrides")).toEqual({
-			executor: "claude-sonnet:low",
-			architect: "claude-sonnet:low",
-			planner: "claude-sonnet:low",
-			critic: "claude-sonnet:low",
+			executor: "anthropic/claude-3-5-sonnet:low",
+			architect: "anthropic/claude-3-5-sonnet:low",
+			planner: "anthropic/claude-3-5-sonnet:low",
+			critic: "anthropic/claude-3-5-sonnet:low",
 		});
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(output).toEqual([
