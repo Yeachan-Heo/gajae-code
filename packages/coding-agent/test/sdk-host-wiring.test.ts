@@ -615,7 +615,7 @@ test("Telegram cleanup is never retained without a registration token", async ()
 	}
 }, 60_000);
 
- test("late Telegram ownership races preserve the published canonical core endpoint", async () => {
+test("late Telegram ownership races preserve the published canonical core endpoint", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, "agent");

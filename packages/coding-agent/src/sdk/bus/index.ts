@@ -5571,8 +5571,8 @@ export function createNotificationsExtension(
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				initializedRuntime.notificationOwnerState = "retry";
+				let registrationToken: string | undefined;
 				try {
-					let registrationToken: string | undefined;
 					const ownership = await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
 						registrationToken = token;
 					});
@@ -5588,14 +5588,14 @@ export function createNotificationsExtension(
 							"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
 						);
 					}
-					if (registrationToken !== undefined) {
-						runtime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
-					}
 				} catch (error) {
 					initializedRuntime.notificationOwnerState = "retry";
 					logger.warn(
 						`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
 					);
+				} finally {
+					if (registrationToken !== undefined)
+						initializedRuntime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
 				}
 			}
 
@@ -5876,8 +5876,17 @@ export function createNotificationsExtension(
 				if (runtime.notificationOwnerState === "retry") {
 					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
 					if (!settingsAvailable || !settings) return "failed";
+					let registrationToken: string | undefined;
 					try {
-						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
+						const ownership = await ensureConfiguredDaemonOwners(
+							settings,
+							cfg,
+							binding.cwd,
+							binding.sessionId,
+							token => {
+								registrationToken = token;
+							},
+						);
 						runtime.notificationOwnerState =
 							ownership === "ready" ||
 							(ownership === "blocked_identity_with_sibling" && runtime.endpointScope === "chat")
@@ -5885,6 +5894,9 @@ export function createNotificationsExtension(
 								: "blocked";
 					} catch {
 						return "failed";
+					} finally {
+						if (registrationToken !== undefined)
+							runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
 					}
 				}
 				return "started";
