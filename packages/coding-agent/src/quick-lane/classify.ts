@@ -39,7 +39,10 @@ const FILE_EXT =
 	"(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|rb|md|markdown|json|jsonl|yml|yaml|toml|xml|sql|sh|bash|css|scss|html|vue|svelte|java|kt|scala|c|cpp|h|hpp|csv|txt|env|tf)";
 
 /** Regex matching one concrete file-path anchor (also used to count distinct paths). */
-const FILE_PATH_PATTERN = new RegExp(`(?:[A-Za-z0-9_@.+~\\-]+/)*[A-Za-z0-9_.@+\\-]+\\.${FILE_EXT}(?![A-Za-z0-9])`, "i");
+const FILE_PATH_PATTERN = new RegExp(
+	`(?:(?:[A-Za-z0-9_@.+~\\-]+/)*[A-Za-z0-9_.@+\\-]+|(?:[A-Za-z0-9_@.+~\\-]+/)*\\.[A-Za-z0-9_-]+|(?:[A-Za-z0-9_@.+~\\-]+/)*)\\.${FILE_EXT}(?![A-Za-z0-9])`,
+	"i",
+);
 
 /** Global variant of FILE_PATH_PATTERN for counting distinct file-path anchors. */
 const FILE_PATH_PATTERN_GLOBAL = new RegExp(FILE_PATH_PATTERN.source, "gi");
@@ -58,7 +61,7 @@ const QUICK_SIGNALS: ReadonlyArray<{ id: string; label: string; pattern: RegExp 
 		// issue/PR numbers: exclude 3-digit rgb short forms, any token containing
 		// a hex letter (a-f), and 6/8-digit color forms. Pure 4+ digit numbers
 		// like #4146 remain issue/PR references.
-		pattern: /#(?!\d{3}\b|[0-9a-fA-F]*[a-fA-F][0-9a-fA-F]*\b|[0-9a-fA-F]{6,8}\b)\d+/,
+		pattern: /#(?!\d{3}\b|[0-9a-fA-F]*[a-fA-F][0-9a-fA-F]*\b)\d+/,
 	},
 	{
 		id: "named-symbol",
@@ -229,9 +232,7 @@ export function classifyQuickLane(input: string): QuickLaneDecision {
 			exclusions.push(`${group.label} (matched keyword group "${group.id}")`);
 		}
 	}
-	const distinctFilePaths = new Set(
-		Array.from(text.matchAll(FILE_PATH_PATTERN_GLOBAL), match => match[0].toLowerCase()),
-	);
+	const distinctFilePaths = new Set(Array.from(text.matchAll(FILE_PATH_PATTERN_GLOBAL), match => match[0]));
 	if (distinctFilePaths.size >= 2) {
 		exclusions.push("multi-file / cross-contract breadth (matched 2 or more distinct file paths)");
 	}

@@ -258,3 +258,68 @@ describe("quick-lane classifier (issue #3984)", () => {
 		});
 	});
 });
+
+describe("post-merge codex review regressions", () => {
+	it("treats long decimal issue references as issue numbers, not hex colors", () => {
+		for (const request of ["implement #123456", "implement #12345678", "implement #1234567"]) {
+			const decision = classifyQuickLane(request);
+			expect(decision.lane).toBe("quick");
+			expect(decision.reasons).toContain("issue/PR number");
+		}
+	});
+
+	it("still excludes real hex-color tokens from the issue-number signal", () => {
+		// Regression guard for the long-decimal fix: shortening the issue-number
+		// pattern must not reopen the color false positives the original review
+		// found ("use color #123 while redesigning the app" was quick on the
+		// pre-repair head because #123 read as an issue number).
+		for (const request of [
+			"use color #123",
+			"paint the button #1a2b3c",
+			"use accent #abc12345",
+			"set background #f00",
+		]) {
+			const decision = classifyQuickLane(request);
+			expect(decision.lane).toBe("deep");
+			expect(decision.reasons).toEqual([]);
+		}
+	});
+
+	it("recognizes extension-only dotfiles as concrete file anchors", () => {
+		for (const request of ["fix .env", "update .env.example"]) {
+			const decision = classifyQuickLane(request);
+			expect(decision.lane).toBe("quick");
+			expect(decision.reasons).toContain("explicit file path");
+		}
+	});
+
+	it("counts case-distinct file paths separately for the multi-file exclusion", () => {
+		// Platform contract: on case-sensitive filesystems `src/Foo.ts` and
+		// `src/foo.ts` are two distinct files, so they must trigger the
+		// authoritative multi-file deep exclusion instead of collapsing into one
+		// path match. The classifier is pure/deterministic and has no
+		// filesystem access; it preserves path casing exactly as written, which
+		// is the safe fail-closed behavior on both case-sensitive and
+		// case-insensitive hosts (case-insensitive hosts may over-exclude, never
+		// under-exclude).
+		const decision = classifyQuickLane("update src/Foo.ts and src/foo.ts");
+		expect(decision.lane).toBe("deep");
+		expect(decision.exclusions.some(e => e.includes("multi-file"))).toBe(true);
+
+		const sameCase = classifyQuickLane("update src/foo.ts and src/bar.ts");
+		expect(sameCase.lane).toBe("deep");
+		expect(sameCase.exclusions.some(e => e.includes("multi-file"))).toBe(true);
+
+		const singlePath = classifyQuickLane("update src/Foo.ts");
+		expect(singlePath.lane).toBe("quick");
+		expect(singlePath.reasons).toContain("explicit file path");
+	});
+
+	it("keeps the quick-lane entry lazy-loading through the registry after the top-level-import repair", async () => {
+		const entry = commands.find(c => c.name === "quick-lane");
+		expect(entry).toBeDefined();
+		const cmd = (await entry?.load()) as { description?: string } | undefined;
+		expect(cmd).toBeDefined();
+		expect(cmd?.description ?? "").toMatch(/quick lane/i);
+	});
+});

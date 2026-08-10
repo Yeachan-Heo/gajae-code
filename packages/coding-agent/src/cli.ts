@@ -9,6 +9,7 @@ import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-co
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
+import QuickLane from "./commands/quick-lane";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -66,7 +67,7 @@ export const commands: CommandEntry[] = [
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
 	{ name: "completion", load: () => import("./commands/completion").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
-	{ name: "quick-lane", load: () => import("./commands/quick-lane").then(m => m.default) },
+	{ name: "quick-lane", load: async () => QuickLane },
 ];
 
 async function showHelp(config: CliConfig): Promise<void> {
