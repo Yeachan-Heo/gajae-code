@@ -25,6 +25,7 @@ import {
 import { dispatchGjcNativeSkillHook } from "../src/hooks/native-skill-hook";
 import {
 	detectSkillKeywords,
+	ensureWorkflowSkillActivationSeed,
 	ensureWorkflowSkillActivationState,
 	readVisibleSkillActiveState,
 } from "../src/hooks/skill-state";
@@ -1892,6 +1893,43 @@ disabledExtensions:
 		// Already active → no reseed; lineage entry untouched.
 		const entry = result?.active_skills?.find(e => e.skill === "ralplan");
 		expect(entry?.handoff_from).toBe("deep-interview");
+	});
+
+	it("activation rollback preserves state that changed ownership after seeding", async () => {
+		const root = await cwd();
+		const sessionId = "session-seed-owned";
+		const activation = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+		});
+		expect(activation.seeded).toBe(true);
+		const statePath = modeStatePath(root, sessionId, "deep-interview");
+		const seeded = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		const seededRevision = seeded.state_revision;
+		if (typeof seededRevision !== "number") throw new Error("Expected seeded state revision");
+		await writeGuardedWorkflowEnvelopeAtomic(
+			statePath,
+			{ ...seeded, current_phase: "requirements", updated_at: "2099-01-01T00:00:00.000Z" },
+			{
+				cwd: root,
+				policy: "source",
+				expectedRevision: seededRevision,
+				receipt: {
+					cwd: root,
+					skill: "deep-interview",
+					owner: "gjc-runtime",
+					command: "state-ownership-change",
+					sessionId,
+				},
+			},
+		);
+
+		expect(await activation.rollback()).toBe(false);
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		expect(persisted.current_phase).toBe("requirements");
+		const visible = await readVisibleSkillActiveState(root, sessionId);
+		expect(visible?.active_skills?.some(entry => entry.skill === "deep-interview")).toBe(true);
 	});
 
 	it("ensureWorkflowSkillActivationState ignores non-workflow skills", async () => {

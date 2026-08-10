@@ -960,12 +960,18 @@ export async function deleteIfOwned(
 	const options = typeof predicateOrOptions === "function" ? undefined : predicateOrOptions;
 	const predicate = typeof predicateOrOptions === "function" ? predicateOrOptions : predicateOrOptions?.predicate;
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const current = await readJsonIfPresent(filePath);
-	if (current === undefined) return { path: filePath, deleted: false };
-	if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
-	const deleted = await atomicRemove(filePath);
-	if (deleted) await maybeAudit(filePath, options);
-	return { path: filePath, deleted };
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const current = await readJsonIfPresent(filePath);
+			if (current === undefined) return { path: filePath, deleted: false };
+			if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
+			const deleted = await atomicRemove(filePath);
+			if (deleted) await maybeAudit(filePath, options);
+			return { path: filePath, deleted };
+		},
+		options?.lock,
+	);
 }
 
 export async function removeFileAudited(targetPath: string, options?: StateWriterOptions): Promise<DeleteResult> {

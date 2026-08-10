@@ -7,6 +7,7 @@ import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gj
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
 import {
+	deleteIfOwned,
 	readExistingStateForMutation,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -485,6 +486,12 @@ export interface EnsureWorkflowSkillActivationInput {
 	stateDir?: string;
 }
 
+export interface WorkflowSkillActivationSeed {
+	state: SkillActiveState | null;
+	seeded: boolean;
+	rollback(): Promise<boolean>;
+}
+
 /**
  * Idempotently seed `.gjc/state` for a workflow skill that was invoked directly
  * (e.g. via `/skill:<name>`) rather than through keyword detection. This ensures
@@ -496,11 +503,12 @@ export interface EnsureWorkflowSkillActivationInput {
  * `handoff_from`/`handoff_at` lineage), nothing is written so lineage is
  * preserved. Non-workflow skills are ignored.
  */
-export async function ensureWorkflowSkillActivationState(
+export async function ensureWorkflowSkillActivationSeed(
 	input: EnsureWorkflowSkillActivationInput,
-): Promise<SkillActiveState | null> {
+): Promise<WorkflowSkillActivationSeed> {
 	const skill = input.skill.trim();
-	if (!isGjcWorkflowSkill(skill)) return null;
+	const noRollback = async () => false;
+	if (!isGjcWorkflowSkill(skill)) return { state: null, seeded: false, rollback: noRollback };
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
 	const alreadyActive = listActiveSkills(existing).some(
@@ -508,8 +516,8 @@ export async function ensureWorkflowSkillActivationState(
 			entry.skill === skill &&
 			(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
 	);
-	if (alreadyActive) return existing;
-	return await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
+	if (alreadyActive) return { state: existing, seeded: false, rollback: noRollback };
+	const state = await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
 		cwd: input.cwd,
 		sessionId: resolvedSessionId,
 		threadId: input.threadId,
@@ -517,6 +525,58 @@ export async function ensureWorkflowSkillActivationState(
 		nowIso: input.nowIso,
 		stateDir: input.stateDir,
 	});
+	if (!state?.initialized_state_path) return { state, seeded: false, rollback: noRollback };
+	const initializedStatePath = state.initialized_state_path;
+	const persistedModeState = await readValidatedJsonFile<ModeState>(
+		initializedStatePath,
+		"mode-state",
+		ModeStateSchema,
+	);
+	const sourceRevision =
+		typeof persistedModeState?.state_revision === "number" && Number.isFinite(persistedModeState.state_revision)
+			? persistedModeState.state_revision
+			: undefined;
+	const seededUpdatedAt = persistedModeState?.updated_at;
+	if (sourceRevision === undefined || typeof seededUpdatedAt !== "string")
+		return { state, seeded: false, rollback: noRollback };
+
+	return {
+		state,
+		seeded: true,
+		rollback: async () => {
+			const removed = await deleteIfOwned(initializedStatePath, {
+				cwd: input.cwd,
+				predicate: current => {
+					if (!current || typeof current !== "object" || Array.isArray(current)) return false;
+					const record = current as Record<string, unknown>;
+					return (
+						record.state_revision === sourceRevision &&
+						record.updated_at === seededUpdatedAt &&
+						record.skill === skill &&
+						record.session_id === resolvedSessionId &&
+						record.active === true
+					);
+				},
+			});
+			if (!removed.deleted) return false;
+			await syncSkillActiveState({
+				cwd: input.cwd,
+				skill,
+				active: false,
+				sessionId: resolvedSessionId,
+				threadId: input.threadId,
+				turnId: input.turnId,
+				sourceRevision,
+			});
+			return true;
+		},
+	};
+}
+
+export async function ensureWorkflowSkillActivationState(
+	input: EnsureWorkflowSkillActivationInput,
+): Promise<SkillActiveState | null> {
+	return (await ensureWorkflowSkillActivationSeed(input)).state;
 }
 
 function isTerminalModeState(state: ModeState | null): boolean {

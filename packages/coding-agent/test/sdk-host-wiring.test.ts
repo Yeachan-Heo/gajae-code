@@ -2404,6 +2404,124 @@ test("SDK host cancels canonical skill invocation before agent start and fences 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
+test("SDK host waits for accepted handleless skill settlement before publishing cancellation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-accepted-handleless-cancel-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-accepted-handleless-cancel-${Date.now()}`;
+	const acceptedWithoutHandle = Promise.withResolvers<void>();
+	const abortObserved = Promise.withResolvers<void>();
+	const releaseSettlement = Promise.withResolvers<void>();
+	let executionStarted = false;
+	const sessionContext = context(cwd, sessionId);
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		acceptedWithoutHandle.resolve();
+		options?.preflightSignal?.addEventListener("abort", () => abortObserved.resolve(), { once: true });
+		await releaseSettlement.promise;
+		if (options?.preflightSignal?.aborted)
+			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
+		executionStarted = true;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "accepted-handleless-skill",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "cancel after acceptance" },
+		}),
+	);
+	await acceptedWithoutHandle.promise;
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "accepted-handleless-skill"),
+		"accepted handleless skill response",
+	);
+	const acceptedFrame = frames.find(
+		frame => frame.type === "control_response" && frame.id === "accepted-handleless-skill",
+	) as { result?: { commandId?: string; turnId?: string } } | undefined;
+	const acceptedCommandId = acceptedFrame?.result?.commandId;
+	const acceptedTurnId = acceptedFrame?.result?.turnId;
+	expect(acceptedFrame).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-accepted-handleless-skill",
+			operation: "turn.abort",
+			input: {},
+		}),
+	);
+	await abortObserved.promise;
+	await Bun.sleep(20);
+	expect(
+		frames.some(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
+	).toBe(false);
+	expect(
+		frames.some(
+			frame =>
+				(frame.type === "agent_end" || frame.type === "agent_failed") &&
+				frame.commandId === acceptedFrame?.result?.commandId &&
+				frame.turnId === acceptedFrame?.result?.turnId,
+		),
+	).toBe(false);
+
+	releaseSettlement.resolve();
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
+		"accepted handleless cancellation response",
+	);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "agent_end" && frame.commandId === acceptedCommandId && frame.turnId === acceptedTurnId,
+			),
+		"accepted handleless cancellation terminal",
+	);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
+	).toMatchObject({
+		ok: true,
+		result: { aborted: true, disposition: "cancelled" },
+	});
+	expect(
+		frames.find(
+			frame =>
+				frame.type === "agent_end" && frame.commandId === acceptedCommandId && frame.turnId === acceptedTurnId,
+		),
+	).toMatchObject({
+		outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+	});
+	expect(executionStarted).toBe(false);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
 test("SDK host rolls back canonical skill ownership when durable acceptance fails", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-acceptance-failed-"));
 	dirs.push(cwd);

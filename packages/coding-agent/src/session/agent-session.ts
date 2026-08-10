@@ -302,7 +302,12 @@ import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heart
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
-import { buildSkillStopOutput, ensureWorkflowSkillActivationState } from "../hooks/skill-state";
+import {
+	buildSkillStopOutput,
+	ensureWorkflowSkillActivationSeed,
+	ensureWorkflowSkillActivationState,
+	type WorkflowSkillActivationSeed,
+} from "../hooks/skill-state";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackendId } from "../memory-backend/resolve";
@@ -8720,57 +8725,61 @@ export class AgentSession {
 
 		const admissionGeneration = this.#promptGeneration;
 		const admissionSignal = this.#promptPreflightAbortController.signal;
-		await this.#withSessionAdmission("prompt", async admission => {
-			this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
-			if (workflowIntentDiff) {
-				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
-			}
+		await this.#withSessionAdmission(
+			"prompt",
+			async admission => {
+				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
+				if (workflowIntentDiff) {
+					this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+				}
 
-			// Skip eager todo prelude when the user has already queued a directive
-			const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
-			const eagerTodoPrelude =
-				!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
+				// Skip eager todo prelude when the user has already queued a directive
+				const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
+				const eagerTodoPrelude =
+					!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
 
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-			if (options?.images) {
-				userContent.push(...options.images);
-			}
+				const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
+				if (options?.images) {
+					userContent.push(...options.images);
+				}
 
-			const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
-			const message = options?.synthetic
-				? {
-						role: "developer" as const,
-						content: userContent,
-						attribution: promptAttribution,
-						timestamp: Date.now(),
-					}
-				: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
-			if (deepInterviewUserIntentEpoch !== undefined)
-				this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
-			await this.refreshGjcSubskillTools();
+				const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+				const message = options?.synthetic
+					? {
+							role: "developer" as const,
+							content: userContent,
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						}
+					: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+				if (deepInterviewUserIntentEpoch !== undefined)
+					this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
+				await this.refreshGjcSubskillTools();
 
-			if (eagerTodoPrelude?.toolChoice) {
-				this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
-					label: "eager-todo",
-				});
-			}
+				if (eagerTodoPrelude?.toolChoice) {
+					this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
+						label: "eager-todo",
+					});
+				}
 
-			try {
-				await this.#promptWithMessage(message, expandedText, {
-					...options,
-					prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
-					admissionLease: admission,
-					resetRetryReplaySafety: true,
-				});
-			} finally {
-				// Clean up residual eager-todo directive if the prompt never consumed it
-				// (e.g., compaction aborted, validation failed).
-				this.#toolChoiceQueue.removeByLabel("eager-todo");
-			}
-			if (!options?.synthetic) {
-				await this.#enforcePlanModeToolDecision();
-			}
-		});
+				try {
+					await this.#promptWithMessage(message, expandedText, {
+						...options,
+						prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
+						admissionLease: admission,
+						resetRetryReplaySafety: true,
+					});
+				} finally {
+					// Clean up residual eager-todo directive if the prompt never consumed it
+					// (e.g., compaction aborted, validation failed).
+					this.#toolChoiceQueue.removeByLabel("eager-todo");
+				}
+				if (!options?.synthetic) {
+					await this.#enforcePlanModeToolDecision();
+				}
+			},
+			options?.preflightSignal,
+		);
 	}
 
 	async #syncSkillPromptActiveState(
@@ -8800,7 +8809,11 @@ export class AgentSession {
 		// active, so the mutation guard and Stop hook engage immediately instead
 		// of relying on the skill prompt to run its own state-init steps.
 		if (active) {
-			await ensureWorkflowSkillActivationState({ cwd: this.sessionManager.getCwd(), skill, sessionId });
+			await ensureWorkflowSkillActivationState({
+				cwd: this.sessionManager.getCwd(),
+				skill,
+				sessionId,
+			});
 			const subskillDetails = details as {
 				subskillActivation?: LoadedSubskillActivation;
 				subskillActivationSet?: LoadedSubskillActivation[];
@@ -8841,6 +8854,25 @@ export class AgentSession {
 			// Skill HUD state is observational; a filesystem write failure must not
 			// interrupt the prompt turn it is visualizing. The native Stop hook still
 			// performs authoritative workflow blocking from persisted state.
+		}
+	}
+
+	async #seedSkillPromptActiveStateSafely(
+		message: Pick<CustomMessage<unknown>, "customType" | "details">,
+	): Promise<WorkflowSkillActivationSeed | undefined> {
+		if (message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return undefined;
+		const details = message.details;
+		if (!details || typeof details !== "object") return undefined;
+		const name = (details as { name?: unknown }).name;
+		if (typeof name !== "string" || !name.trim()) return undefined;
+		try {
+			return await ensureWorkflowSkillActivationSeed({
+				cwd: this.sessionManager.getCwd(),
+				skill: name.trim(),
+				sessionId: this.sessionManager.getSessionId(),
+			});
+		} catch {
+			return undefined;
 		}
 	}
 
@@ -8904,14 +8936,28 @@ export class AgentSession {
 				if (deepInterviewUserIntentEpoch !== undefined)
 					this.#deepInterviewGenuineUserMessageEpochs.set(customMessage, deepInterviewUserIntentEpoch);
 
-				try {
+				let activationSeed: WorkflowSkillActivationSeed | undefined;
+				const commitAcceptance = async () => {
+					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					else options?.onPreflightAccepted?.();
+					activationSeed = await this.#seedSkillPromptActiveStateSafely(customMessage);
 					await this.#syncSkillPromptActiveStateSafely(customMessage, true);
-					if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+					if (options?.preflightSignal?.aborted) {
+						await activationSeed?.rollback();
+						throw promptPreflightCancelledError();
+					}
+				};
+				try {
 					await this.#promptWithMessage(customMessage, textContent, {
 						...options,
+						onPreflightAccepted: undefined,
+						onPreflightAcceptCommit: commitAcceptance,
 						admissionLease: admission,
 						resetRetryReplaySafety: true,
 					});
+				} catch (error) {
+					if (isPromptPreflightCancelledError(error)) await activationSeed?.rollback();
+					throw error;
 				} finally {
 					await this.#syncSkillPromptActiveStateSafely(customMessage, false);
 				}
