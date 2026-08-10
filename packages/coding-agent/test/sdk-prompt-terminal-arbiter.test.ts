@@ -219,8 +219,8 @@ describe("SDK prompt terminal arbiter", () => {
 	});
 	test("surfaces a late agent_failed reason on a terminal_ok record through the production lookup and persists it", async () => {
 		const { reconciliation, store } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
-		await reconciliation.finalizePromptOutcome(correlation);
+		await reconciliation.claimPendingOutcome("prompt", correlation, stopped("end_turn"));
+		await reconciliation.finalizeOutcome("prompt", correlation);
 
 		const settled = reconciliation.lookup("prompt", correlation);
 		expect(settled).toMatchObject({ status: "terminal_ok" });
@@ -246,8 +246,8 @@ describe("SDK prompt terminal arbiter", () => {
 
 	test("keeps the first late reason when later agent_failed frames disagree", async () => {
 		const { reconciliation } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
-		await reconciliation.finalizePromptOutcome(correlation);
+		await reconciliation.claimPendingOutcome("prompt", correlation, stopped("end_turn"));
+		await reconciliation.finalizeOutcome("prompt", correlation);
 		await reconciliation.noteTransition("prompt", correlation, {
 			type: "agent_failed",
 			error: Object.assign(new Error("first"), { code: "transport_reset" }),
@@ -264,8 +264,8 @@ describe("SDK prompt terminal arbiter", () => {
 
 	test("does not enrich a terminal record with a late agent_start or agent_end", async () => {
 		const { reconciliation } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
-		await reconciliation.finalizePromptOutcome(correlation);
+		await reconciliation.claimPendingOutcome("prompt", correlation, stopped("end_turn"));
+		await reconciliation.finalizeOutcome("prompt", correlation);
 		const before = reconciliation.lookup("prompt", correlation);
 		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
 		await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
