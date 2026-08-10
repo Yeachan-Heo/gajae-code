@@ -93,6 +93,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * later session from creating a topic or replaying notifications. Generation
  * 58 preserves that invariant during durable-fence load promotion and restores
  * the exact grace deadline when a failed archive publication rolls back.
+ * Generation 59 publishes the owner's attached OPEN-socket count in the
+ * heartbeat sidecar so `gjc notify health` can report a live daemon that is
+ * attached to no registered endpoint (#4128).
  */
 export const DAEMON_GENERATION = 59;
 

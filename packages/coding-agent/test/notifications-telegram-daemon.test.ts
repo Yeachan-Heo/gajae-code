@@ -3017,7 +3017,8 @@ describe("telegram daemon", () => {
 		// generation 56 moves exact unlink and process-incarnation authority behind
 		// lazy native bindings (#3846); generation 57 preserves parser-valid archive
 		// transitions; generation 58 covers fence-load promotion and rollback.
-		expect(DAEMON_GENERATION).toBe(58);
+		// Generation 59 publishes the attached OPEN-socket count in the heartbeat sidecar (#4128).
+		expect(DAEMON_GENERATION).toBe(59);
 	});
 	test.each([
 		"1",
