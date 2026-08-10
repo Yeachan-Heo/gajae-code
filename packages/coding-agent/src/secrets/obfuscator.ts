@@ -21,17 +21,12 @@ export interface SecretEntry {
 
 const REPLACEMENT_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/** Generate a deterministic same-length replacement string from a secret value. */
-function generateDeterministicReplacement(secret: string): string {
-	// Simple hash: use Bun.hash for speed, seed from the secret bytes
-	const hash = BigInt(Bun.hash(secret));
+/** Generate a deterministic same-length replacement string from keyed secret bytes. */
+function generateDeterministicReplacement(secret: string, key: Uint8Array): string {
+	const digest = deriveSecretDigest(secret, key);
 	const chars: string[] = [];
-	let h = hash;
 	for (let i = 0; i < secret.length; i++) {
-		// Mix the hash for each character position
-		h = h ^ (BigInt(i + 1) * 0x9e3779b97f4a7c15n);
-		const idx = Number((h < 0n ? -h : h) % BigInt(REPLACEMENT_CHARS.length));
-		chars.push(REPLACEMENT_CHARS[idx]);
+		chars.push(REPLACEMENT_CHARS[digest[i % digest.length]! % REPLACEMENT_CHARS.length]!);
 	}
 	return chars.join("");
 }
@@ -43,14 +38,13 @@ function generateDeterministicReplacement(secret: string): string {
 const PLACEHOLDER_DOMAIN = "gjc.secret-obfuscation.placeholder.v1\0";
 const PLACEHOLDER_RE = /#GJC1_[A-Za-z0-9_-]{22}#/g;
 
+function deriveSecretDigest(secret: string, key: Uint8Array): Uint8Array {
+	return createHmac("sha256", key).update(PLACEHOLDER_DOMAIN).update(secret, "utf8").digest();
+}
+
 /** Build a versioned, authenticated placeholder whose identity depends only on the key and secret. */
 function buildPlaceholder(secret: string, key: Uint8Array): string {
-	const tag = createHmac("sha256", key)
-		.update(PLACEHOLDER_DOMAIN)
-		.update(secret, "utf8")
-		.digest()
-		.subarray(0, 16)
-		.toString("base64url");
+	const tag = Buffer.from(deriveSecretDigest(secret, key)).subarray(0, 16).toString("base64url");
 	return `#GJC1_${tag}#`;
 }
 
@@ -115,7 +109,8 @@ export class SecretObfuscator {
 					index++;
 				} else {
 					// replace mode
-					const replacement = entry.replacement ?? generateDeterministicReplacement(entry.content);
+					const replacement =
+						entry.replacement ?? generateDeterministicReplacement(entry.content, this.#placeholderKey);
 					this.#replaceMappings.set(entry.content, replacement);
 				}
 			} else {
@@ -168,7 +163,8 @@ export class SecretObfuscator {
 
 			for (const matchValue of matches) {
 				if (entry.mode === "replace") {
-					const replacement = entry.replacement ?? generateDeterministicReplacement(matchValue);
+					const replacement =
+						entry.replacement ?? generateDeterministicReplacement(matchValue, this.#placeholderKey);
 					result = replaceAll(result, matchValue, replacement);
 				} else {
 					// obfuscate mode — get or create stable index

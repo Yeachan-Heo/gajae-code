@@ -407,6 +407,44 @@ describe("SecretObfuscator sorted mapping cache", () => {
 	});
 });
 
+describe("SecretObfuscator keyed replacements", () => {
+	const otherKey = Uint8Array.from({ length: 32 }, (_, index) => 255 - index);
+
+	it("keeps plain replacements stable, keyed, same-length, and alphanumeric", () => {
+		const value = "synthetic-credential-value-longer-than-one-digest-block";
+		const entries = [{ type: "plain" as const, content: value, mode: "replace" as const }];
+		const replacement = new SecretObfuscator(entries, TEST_KEY).obfuscate(value);
+
+		expect(new SecretObfuscator(entries, TEST_KEY).obfuscate(value)).toBe(replacement);
+		expect(new SecretObfuscator(entries, otherKey).obfuscate(value)).not.toBe(replacement);
+		expect(replacement).toHaveLength(value.length);
+		expect(replacement).toMatch(/^[A-Za-z0-9]+$/);
+	});
+
+	it("keeps regex-derived replacements stable, keyed, same-length, and alphanumeric", () => {
+		const value = "synthetic-regex-value";
+		const entries = [{ type: "regex" as const, content: "synthetic-[a-z-]+", mode: "replace" as const }];
+		const replacement = new SecretObfuscator(entries, TEST_KEY).obfuscate(value);
+
+		expect(new SecretObfuscator(entries, TEST_KEY).obfuscate(value)).toBe(replacement);
+		expect(new SecretObfuscator(entries, otherKey).obfuscate(value)).not.toBe(replacement);
+		expect(replacement).toHaveLength(value.length);
+		expect(replacement).toMatch(/^[A-Za-z0-9]+$/);
+	});
+
+	it("preserves explicit plain and regex replacements", () => {
+		const entries = [
+			{ type: "plain", content: "synthetic-plain-value", mode: "replace", replacement: "PLAIN_REPLACEMENT" },
+			{ type: "regex", content: "synthetic-regex-[a-z]+", mode: "replace", replacement: "REGEX_REPLACEMENT" },
+		] as const;
+		const obfuscator = new SecretObfuscator([...entries], TEST_KEY);
+
+		expect(obfuscator.obfuscate("synthetic-plain-value synthetic-regex-value")).toBe(
+			"PLAIN_REPLACEMENT REGEX_REPLACEMENT",
+		);
+	});
+});
+
 describe("SecretObfuscator authenticated placeholders", () => {
 	const otherKey = Uint8Array.from({ length: 32 }, (_, index) => 255 - index);
 
