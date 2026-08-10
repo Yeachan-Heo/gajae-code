@@ -220,6 +220,34 @@ describe("read receipt by default", () => {
 		const small = await read(file, receiptSettings({ "read.summarize.enabled": true }));
 		expect(textOf(small)).not.toContain("Summary truncated at");
 	});
+	it("stubs summarizeCode as a real async SummaryResult with the full schema", async () => {
+		const file = path.join(testDir, "summary-schema-regression.ts");
+		fs.writeFileSync(file, "export const x = 1;\n");
+		summarySegments = [
+			{ kind: "code", startLine: 1, endLine: 1, text: "export const x = 1;" },
+			{ kind: "elided", startLine: 2, endLine: 40 },
+		];
+
+		// The stub branch must honor the native async contract exactly: it
+		// resolves a full SummaryResult (parsed/elided/totalLines/segments).
+		// A bare object return, a dropped totalLines, or a cast that hides
+		// the sync/async drift fails the type check or these assertions.
+		const pending = native.summarizeCode({ path: file, code: "export const x = 1;\n" });
+		expect(pending).toBeInstanceOf(Promise);
+		const summary = await pending;
+		expect(summary).toEqual({
+			parsed: true,
+			elided: true,
+			totalLines: 40,
+			segments: summarySegments,
+		});
+
+		// The stubbed schema also flows through the tool end to end.
+		const result = await read(file, receiptSettings({ "read.summarize.enabled": true }));
+		expect(result.details?.summary?.elidedSpans).toBe(1);
+		expect(result.details?.summary?.elidedLines).toBe(39);
+		expect(textOf(result)).toContain("elided");
+	});
 
 	it("bounds directories by bytes and lines without spilling while preserving small listings", async () => {
 		const large = path.join(testDir, "large-dir");
