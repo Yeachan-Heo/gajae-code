@@ -15,12 +15,19 @@ export default class QuickLane extends Command {
 		"Classify a task into the quick lane (bounded, direct execution) or the deep path (planning/interview)";
 
 	static args = {
-		text: Args.string({ description: "Task classification input", required: true, multiple: true }),
+		action: Args.string({ description: "Action", required: true, options: ["classify"] }),
+		text: Args.string({ description: "Task text", required: true, multiple: true }),
 	};
 
 	static flags = {
 		json: Flags.boolean({ description: "Output the decision as JSON" }),
 	};
+
+	static examples = [
+		`$ gjc quick-lane classify "add validation to processKeywordDetector"`,
+		`$ gjc quick-lane classify --json "fix src/hooks/bridge.ts"`,
+		`$ gjc quick-lane classify "team make it better"`,
+	];
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(QuickLane);

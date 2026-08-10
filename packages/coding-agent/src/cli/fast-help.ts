@@ -30,6 +30,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} web-search           - Search the web from the CLI (alias: q)
   ${APP_NAME} codex-native-hook    - Run Codex native hook integration
   ${APP_NAME} gc                   - Run garbage-collection/cleanup helpers
+  ${APP_NAME} quick-lane         - Classify a task into quick lane or deep path
   ${APP_NAME} <command> --help     - Show command-specific help
 
 Environment Variables:

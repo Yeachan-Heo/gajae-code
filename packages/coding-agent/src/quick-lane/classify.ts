@@ -38,17 +38,27 @@ function standalone(word: string): RegExp {
 const FILE_EXT =
 	"(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|rb|md|markdown|json|jsonl|yml|yaml|toml|xml|sql|sh|bash|css|scss|html|vue|svelte|java|kt|scala|c|cpp|h|hpp|csv|txt|env|tf)";
 
+/** Regex matching one concrete file-path anchor (also used to count distinct paths). */
+const FILE_PATH_PATTERN = new RegExp(`(?:[A-Za-z0-9_@.+~\\-]+/)*[A-Za-z0-9_.@+\\-]+\\.${FILE_EXT}(?![A-Za-z0-9])`, "i");
+
+/** Global variant of FILE_PATH_PATTERN for counting distinct file-path anchors. */
+const FILE_PATH_PATTERN_GLOBAL = new RegExp(FILE_PATH_PATTERN.source, "gi");
+
 /** Concrete anchors that establish quick-lane eligibility. */
 const QUICK_SIGNALS: ReadonlyArray<{ id: string; label: string; pattern: RegExp }> = [
 	{
 		id: "file-path",
 		label: "explicit file path",
-		pattern: new RegExp(`(?:[A-Za-z0-9_@.+~\\-]+/)*[A-Za-z0-9_.@+\\-]+\\.${FILE_EXT}(?![A-Za-z0-9])`, "i"),
+		pattern: FILE_PATH_PATTERN,
 	},
 	{
 		id: "issue-number",
 		label: "issue/PR number",
-		pattern: /#\d+/,
+		// Hex-color-shaped tokens (#rgb/#rgba/#rrggbb/#rrggbbaa) must not read as
+		// issue/PR numbers: exclude 3-digit rgb short forms, any token containing
+		// a hex letter (a-f), and 6/8-digit color forms. Pure 4+ digit numbers
+		// like #4146 remain issue/PR references.
+		pattern: /#(?!\d{3}\b|[0-9a-fA-F]*[a-fA-F][0-9a-fA-F]*\b|[0-9a-fA-F]{6,8}\b)\d+/,
 	},
 	{
 		id: "named-symbol",
@@ -56,13 +66,28 @@ const QUICK_SIGNALS: ReadonlyArray<{ id: string; label: string; pattern: RegExp 
 		// lowerCamelCase and snake_case identifiers are unambiguous code anchors
 		// and rarely appear in ordinary prose. PascalCase is deliberately
 		// excluded to avoid false positives on proper nouns ("Google").
-		pattern: /\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b|\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/,
+		pattern:
+			/\b[a-z]{2,}[a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b|\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b|\b[A-Z][A-Z]+\b|\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b/,
+	},
+	{
+		id: "named-symbol-pascal",
+		label: "named symbol (PascalCase)",
+		// Two or more capitalized segments ("UserService" = User+Service) are
+		// unambiguous code anchors; single-segment proper nouns ("Google") and
+		// lowercase-leading names ("iPhone") must not match.
+		pattern: /\b[A-Z][a-z]+(?:[A-Z][a-z]*)+\b/,
 	},
 	{
 		id: "explicit-test",
 		label: "explicit test/validation request",
 		pattern:
 			/\b(?:bun test|unit test|integration test|regression(?: test)?|e2e(?: test)?|add (?:a )?(?:test|validation)|write (?:a )?(?:test|test case)|tests? for)\b/i,
+	},
+	{
+		id: "test-runner",
+		label: "test runner",
+		pattern:
+			/\b(?:run (?:pytest|vitest|jest|mocha|rspec|go test|cargo test|bun test|npm test|pnpm test|yarn test|deno test))\b/i,
 	},
 	{
 		id: "numbered-steps",
@@ -88,7 +113,9 @@ const QUICK_SIGNALS: ReadonlyArray<{ id: string; label: string; pattern: RegExp 
 	{
 		id: "explicit-override",
 		label: "explicit quick-lane override (force: / !)",
-		pattern: /(?:^|\s)(?:force:|!)\s*/,
+		// The gate prose says "prefix `force:` or `!`" — only a prefix at the
+		// very start of the trimmed request counts, never mid-text.
+		pattern: /^(?:force:|!)\s*/,
 	},
 ];
 
@@ -112,6 +139,9 @@ const RISK_KEYWORDS = [
 	"legal",
 	"credential",
 	"secret",
+	"password",
+	"passphrase",
+	"passwd",
 	"privilege",
 	"firewall",
 	"encryption",
@@ -145,16 +175,25 @@ const AMBIGUITY_KEYWORDS = [
 /** Wide-breadth exclusions indicating multi-file / cross-contract scope. */
 const BREADTH_KEYWORDS = [
 	"all files",
+	"all modules",
+	"across modules",
+	"across every",
 	"everywhere",
 	"across the board",
 	"multiple modules",
 	"many files",
+	"entire",
 	"whole codebase",
 	"entire app",
 	"whole app",
 	"cross-cutting",
 	"cross-contract",
 	"the whole",
+	"redesign",
+	"redesigning",
+	"rewrite",
+	"rewriting",
+	"from scratch",
 ];
 
 const EXCLUSION_KEYWORDS: ReadonlyArray<{ id: string; label: string; words: readonly string[] }> = [
@@ -172,8 +211,9 @@ function matchesAny(text: string, words: readonly string[]): boolean {
  * the deep path (existing planning/interview orchestration).
  *
  * Order of operations (fail-closed):
- * 1. Exclusions are authoritative — any risk/ambiguity/breadth signal forces
- *    `deep`, even when concrete anchors are present.
+ * 1. Exclusions are authoritative — any risk/ambiguity/breadth signal (including
+ *    two or more distinct file-path anchors) forces `deep`, even when concrete
+ *    anchors are present.
  * 2. Otherwise, any concrete anchor yields `quick`.
  * 3. Otherwise, `deep` (boundness could not be confirmed).
  */
@@ -188,6 +228,12 @@ export function classifyQuickLane(input: string): QuickLaneDecision {
 		if (matchesAny(text, group.words)) {
 			exclusions.push(`${group.label} (matched keyword group "${group.id}")`);
 		}
+	}
+	const distinctFilePaths = new Set(
+		Array.from(text.matchAll(FILE_PATH_PATTERN_GLOBAL), match => match[0].toLowerCase()),
+	);
+	if (distinctFilePaths.size >= 2) {
+		exclusions.push("multi-file / cross-contract breadth (matched 2 or more distinct file paths)");
 	}
 	if (exclusions.length > 0) {
 		return { lane: "deep", reasons: [], exclusions };
