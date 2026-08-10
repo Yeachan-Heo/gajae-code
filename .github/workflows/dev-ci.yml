@@ -883,15 +883,18 @@ jobs:
   # Stable pre-merge status: this runs for every PR after the protected affected
   # aggregate, then only materializes a virtual merge when the canonical planner
   # selected risk canaries. A dispatch remains available for exact-head bootstrap
-  # evidence. Every candidate shares this non-cancelling job-level group so PR
-  # and dispatch validation cannot race different base/head merge candidates.
+  # evidence. The job-level group is scoped per merge candidate (per PR/head ref)
+  # so an unrelated PR can never evict this run while it waits behind a single
+  # global queue slot; a fresh push to the same head still cancels its stale run.
+  # Dispatch validation keeps its own non-cancelling lane so manual re-validations
+  # cannot race a different base/head merge candidate.
   virtual-integration:
     name: Virtual integration validation
     needs: [affected-plan, affected]
     if: ${{ always() && ((github.event_name == 'pull_request' && needs.affected.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.head_sha != '')) }}
     concurrency:
-      group: dev-ci-virtual-integration
-      cancel-in-progress: false
+      group: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' && 'dev-ci-virtual-integration' || format('dev-ci-virtual-integration-{0}', github.ref) }}
+      cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
