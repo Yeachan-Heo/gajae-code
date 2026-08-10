@@ -258,7 +258,6 @@ async function fixture(): Promise<AdapterFixture> {
 		brokerEndpoint,
 		observed,
 		stop: async () => {
-			await brokerOwnerForTest(agentDir)?.stop();
 			await productionHost.stop();
 			await broker.stop();
 			fs.rmSync(repo, { recursive: true, force: true });
