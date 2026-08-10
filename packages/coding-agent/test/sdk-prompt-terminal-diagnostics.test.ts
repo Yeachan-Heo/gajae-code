@@ -5,9 +5,11 @@ import * as path from "node:path";
 import { Agent, type AgentEvent } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { logger } from "@gajae-code/utils";
+import { Settings } from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
+import { attachLifecycleStartupCapability, SdkStartupCapability } from "../src/sdk/startup-capability";
 
 /**
  * A provider failure reaches this extension as an `agent_end` carrying an error
@@ -66,10 +68,21 @@ function context(cwd: string, sessionId: string): Record<string, unknown> {
 	};
 }
 
-function start(
+function isolatedSettings(cwd: string): Settings {
+	const base = Settings.isolated({ "notifications.enabled": false });
+	return new Proxy(base, {
+		get(target, property) {
+			if (property === "getAgentDir") return () => path.join(cwd, ".gjc", "agent");
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+async function start(
 	ctx: Record<string, unknown>,
 	deliverUserMessage: ExtensionActions["sendUserMessage"] = () => undefined,
-): Map<string, (event: unknown, context: unknown) => unknown> {
+): Promise<Map<string, (event: unknown, context: unknown) => unknown>> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
 		on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
@@ -91,12 +104,15 @@ function start(
 			return deliver();
 		},
 	} as unknown as ExtensionAPI;
-	createNotificationsExtension(api, undefined);
-	void handlers.get("session_start")?.({ type: "session_start" }, ctx);
+	const capability = new SdkStartupCapability();
+	attachLifecycleStartupCapability(api, capability);
+	createNotificationsExtension(api, { settings: isolatedSettings(String(ctx.cwd)) });
+	await handlers.get("session_start")?.({ type: "session_start" }, ctx);
+	expect(await capability.promise).toEqual({ status: "started" });
 	return handlers;
 }
 
-test("SDK host logs a bounded reason from a reachable provider failure", async () => {
+test.serial("SDK host logs a bounded reason from a reachable provider failure", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-diagnostics-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-terminal-diagnostics-${Date.now()}`;
@@ -110,7 +126,7 @@ test("SDK host logs a bounded reason from a reachable provider failure", async (
 		streamMaxRetries: 0,
 	});
 	let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
-	handlers = start(sessionContext, async () => {
+	handlers = await start(sessionContext, async () => {
 		await agent.prompt("reproduce the reviewer findings");
 	});
 	const unsubscribe = agent.subscribe(event => {
@@ -187,13 +203,13 @@ test("SDK host logs a bounded reason from a reachable provider failure", async (
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
-test("SDK host logs a bounded reason from an accepted sendUserMessage rejection", async () => {
+test.serial("SDK host logs a bounded reason from an accepted sendUserMessage rejection", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-accepted-rejection-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-terminal-accepted-rejection-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
 	const reason = `Accepted sendUserMessage rejected after commit: ${"y".repeat(600)}`;
-	const handlers = start(sessionContext, async () => {
+	const handlers = await start(sessionContext, async () => {
 		throw new Error(reason);
 	});
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
@@ -257,12 +273,12 @@ test("SDK host logs a bounded reason from an accepted sendUserMessage rejection"
 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
-test("SDK host does not log a client cancellation as a prompt terminal failure", async () => {
+test.serial("SDK host does not log a client cancellation as a prompt terminal failure", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-cancel-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-terminal-cancel-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext);
+	const handlers = await start(sessionContext);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
