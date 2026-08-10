@@ -5878,7 +5878,11 @@ export function createNotificationsExtension(
 					if (!settingsAvailable || !settings) return "failed";
 					try {
 						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
-						runtime.notificationOwnerState = ownership === "ready" ? "ready" : "blocked";
+						runtime.notificationOwnerState =
+							ownership === "ready" ||
+							(ownership === "blocked_identity_with_sibling" && runtime.endpointScope === "chat")
+								? "ready"
+								: "blocked";
 					} catch {
 						return "failed";
 					}

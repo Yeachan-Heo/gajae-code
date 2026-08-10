@@ -2013,6 +2013,25 @@ describe("notifications config", () => {
 				"notifications.discord.guildId": "discord-guild",
 				"notifications.discord.parentChannelId": "discord-parent",
 			});
+			const incarnation = processIncarnation(process.pid);
+			if (!incarnation) throw new Error("Current process incarnation is unavailable for the ownership test.");
+			const paths = daemonPaths(agentDir);
+			fs.mkdirSync(paths.dir, { recursive: true });
+			fs.writeFileSync(
+				paths.state,
+				JSON.stringify({
+					pid: process.pid,
+					incarnation,
+					ownerId: "foreign-retry-owner",
+					tokenFingerprint: tokenFingerprint("9876543210:foreign-retry-token-value"),
+					chatId: "foreign-retry-chat",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+					roots: [path.join(cwd, ".gjc", "state")],
+					version: DAEMON_VERSION,
+					generation: DAEMON_GENERATION,
+				}),
+			);
 			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 			let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
 			let providerReady = false;
@@ -2040,10 +2059,10 @@ describe("notifications config", () => {
 				},
 				ui: { notify: (message: string) => notifications.push(message) },
 			} as unknown as ExtensionCommandContext;
-			const endpoint = path.join(cwd, ".gjc", "state", "sdk", "provider-readiness-retry.json");
+			const endpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", "provider-readiness-retry.json");
 			createNotificationsExtension(api, {
 				settings,
-				ensureTelegramDaemon: async () => "attached",
+				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async () => {
 					providerAttempts++;
 					if (!providerReady) throw new Error("provider readiness denied");
@@ -2064,10 +2083,14 @@ describe("notifications config", () => {
 				});
 				expect(providerAttempts).toBeGreaterThanOrEqual(2);
 				const attemptsAfterStartup = providerAttempts;
+				const endpointBeforeRetry = fs.readFileSync(endpoint, "utf8");
+				const endpointMtimeBeforeRetry = fs.statSync(endpoint).mtimeMs;
 
 				providerReady = true;
 				await notify.handler("on", context);
 				expect(providerAttempts).toBeGreaterThan(attemptsAfterStartup);
+				expect(fs.readFileSync(endpoint, "utf8")).toBe(endpointBeforeRetry);
+				expect(fs.statSync(endpoint).mtimeMs).toBe(endpointMtimeBeforeRetry);
 				expect(notifications).toContain("Notifications enabled for this session.");
 				expect(fs.existsSync(endpoint)).toBe(true);
 			} finally {

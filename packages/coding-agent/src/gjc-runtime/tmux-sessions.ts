@@ -1365,6 +1365,22 @@ async function requireUnchangedOwnerForCompatibilityCleanup(
 	}
 }
 
+async function waitForOwnerVerdictUntil(
+	verdict: Promise<OwnerVerdict>,
+	now: () => Date,
+	deadline: number,
+): Promise<OwnerVerdict> {
+	const remainingMs = deadline - now().getTime();
+	if (remainingMs <= 0) throw new Error("owner_term_verdict_timeout");
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(() => timeout.reject(new Error("owner_term_verdict_timeout")), remainingMs);
+	try {
+		return await Promise.race([verdict, timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 async function waitForExpectedVerdict(
 	identity: ExactOwnerIdentity,
 	sleep: (ms: number) => Promise<void>,
@@ -1511,7 +1527,7 @@ export async function forceCloseGjcTmuxSession(
 			waitForVerdict: async () => {
 				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
 				try {
-					return await operatorVerdict;
+					return await waitForOwnerVerdictUntil(operatorVerdict, now, verdictDeadline);
 				} catch {
 					// The sidecar and raw monitor intentionally race to publish the first valid
 					// verdict. If the exact supervisor-exit path loses that race or times out

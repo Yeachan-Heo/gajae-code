@@ -1356,8 +1356,7 @@ describe("GJC tmux session management", () => {
 		let nowMs = initialNow;
 		let sleepCalls = 0;
 		let cleaned = false;
-		const failedOwnerExitVerdict = Promise.withResolvers<never>();
-		void failedOwnerExitVerdict.promise.catch(() => {});
+		const hangingOwnerExitVerdict = Promise.withResolvers<never>();
 		await expect(
 			forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker, {
 				resolveOwner: async () => ({
@@ -1370,43 +1369,19 @@ describe("GJC tmux session management", () => {
 				}),
 				readProcessStartTime: async () => "10",
 				now: () => new Date(nowMs),
-				waitForOwnerExitVerdict: () => failedOwnerExitVerdict.promise,
+				waitForOwnerExitVerdict: () => hangingOwnerExitVerdict.promise,
 				signalTerm: () => {
-					nowMs = initialNow + 14_999;
-					failedOwnerExitVerdict.reject(new Error("owner observer consumed the intent budget"));
+					nowMs = initialNow + 15_001;
 				},
 				sleep: async () => {
 					sleepCalls++;
-					nowMs += 51;
-					if (sleepCalls !== 2) return;
-					const intent = JSON.parse(
-						await fs.readFile(
-							path.join(stateDir, sessionId, "owner-lifecycle", `intent-${generation}.json`),
-							"utf8",
-						),
-					);
-					await observeOwnerTerminal({
-						schema_version: 1,
-						op: "observe_terminal",
-						session_id: sessionId,
-						owner_generation: generation,
-						state_dir: stateDir,
-						socket_key: "managed",
-						observer: "sidecar",
-						observed_at: new Date().toISOString(),
-						signal: "SIGTERM",
-						exit_code: null,
-						exit_kind: "exit",
-						reason: "late test verdict",
-						operator_dispatch_id: intent.dispatch_id,
-					});
 				},
 				cleanupSession: () => {
 					cleaned = true;
 				},
 			}),
 		).rejects.toThrow("owner_term_verdict_timeout");
-		expect(sleepCalls).toBe(1);
+		expect(sleepCalls).toBe(0);
 		expect(cleaned).toBe(false);
 		await fs.rm(stateDir, { recursive: true, force: true });
 	});
