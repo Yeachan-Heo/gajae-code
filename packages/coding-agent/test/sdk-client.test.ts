@@ -1,5 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { SdkClient, SdkClientError } from "../src/sdk/client";
+import { listSdkSessionEndpoints, readSdkSessionEndpoint } from "../src/sdk/client/discovery";
 
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 afterEach(() => {
@@ -36,6 +40,37 @@ function start(
 	servers.push(server);
 	return { url: `ws://127.0.0.1:${server.port}`, token, stop: () => server.stop(true) };
 }
+
+test("discovery binds explicit identity while accepting usable legacy filename identities", async () => {
+	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-discovery-identity-"));
+	const state = path.join(repo, ".gjc", "state", "sdk");
+	await fs.mkdir(state, { recursive: true });
+	try {
+		await fs.writeFile(path.join(state, "stale.json"), JSON.stringify({ url: "ws://stale", stale: true, token: "" }));
+		await fs.writeFile(path.join(state, "bad.json"), JSON.stringify({ url: "ws://bad", token: "" }));
+		await fs.writeFile(
+			path.join(state, "wrong-session.json"),
+			JSON.stringify({ sessionId: "different-session", url: "ws://wrong", token: "token" }),
+		);
+		await fs.writeFile(path.join(state, ".json"), JSON.stringify({ url: "ws://empty", token: "token" }));
+		await fs.writeFile(
+			path.join(state, "opaque session 你好.json"),
+			JSON.stringify({ url: "ws://opaque", token: "token" }),
+		);
+		const records = await listSdkSessionEndpoints(repo);
+		expect(records.endpoints).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ sessionId: "stale", stale: true, token: "" }),
+				expect.objectContaining({ sessionId: "opaque session 你好", url: "ws://opaque", token: "token" }),
+			]),
+		);
+		expect(records.warnings).toHaveLength(3);
+		expect(await readSdkSessionEndpoint(repo, "")).toBeNull();
+		expect(await readSdkSessionEndpoint(repo, "../escape")).toBeNull();
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true });
+	}
+});
 
 async function expectResult(promise: Promise<unknown>, expected: object): Promise<void> {
 	expect(await promise).toMatchObject(expected);
