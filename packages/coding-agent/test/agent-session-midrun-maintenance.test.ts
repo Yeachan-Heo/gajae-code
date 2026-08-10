@@ -168,13 +168,26 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		s: AgentSession,
 		output: string,
 		finalUsageTotal: number,
+		additionalOldOutput?: string,
 	): Promise<string> {
 		const toolCallId = "evict-call";
 		await seed(s, [
 			{ role: "user", content: "first request", timestamp: Date.now() },
 			{
 				role: "assistant",
-				content: [{ type: "toolCall", id: toolCallId, name: "bash", arguments: { command: "cat" } }],
+				content: [
+					{ type: "toolCall", id: toolCallId, name: "bash", arguments: { command: "cat" } },
+					...(additionalOldOutput === undefined
+						? []
+						: [
+								{
+									type: "toolCall" as const,
+									id: "evict-call-secondary",
+									name: "bash",
+									arguments: { command: "cat secondary" },
+								},
+							]),
+				],
 				api: s.model!.api,
 				provider: s.model!.provider,
 				model: s.model!.id,
@@ -196,6 +209,18 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 				isError: false,
 				timestamp: Date.now(),
 			},
+			...(additionalOldOutput === undefined
+				? []
+				: [
+						{
+							role: "toolResult" as const,
+							toolCallId: "evict-call-secondary",
+							toolName: "bash",
+							content: [{ type: "text" as const, text: additionalOldOutput }],
+							isError: false,
+							timestamp: Date.now(),
+						},
+					]),
 			{
 				role: "toolResult",
 				toolCallId: "recent-call",
@@ -558,14 +583,16 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 	it("keeps canonical output when exact publication fails after planning", async () => {
 		session = await buildSession({ persisted: true, settings: { "compaction.keepRecentTokens": 10 } });
 		const output = "publication-failure-output-".repeat(15_000);
-		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
+		const secondaryOutput = "secondary-publication-failure-output-".repeat(500);
+		const toolCallId = await seedPrunableToolConversation(session, output, 1_000, secondaryOutput);
 		const artifactManager = session.sessionManager.getArtifactManager();
 		expect(artifactManager).not.toBeNull();
 		if (!artifactManager) return;
 		const originalPublishExactText = artifactManager.publishExactText.bind(artifactManager);
 		let publicationAttempts = 0;
-		artifactManager.publishExactText = async () => {
+		artifactManager.publishExactText = async (...args) => {
 			publicationAttempts++;
+			if (publicationAttempts === 1) return await originalPublishExactText(...args);
 			return {
 				outcome: "failed",
 				diagnostic: "injected publication failure",
@@ -574,7 +601,7 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		try {
 			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 			expect(outcome).toBe("failed");
-			expect(publicationAttempts).toBe(1);
+			expect(publicationAttempts).toBe(2);
 		} finally {
 			artifactManager.publishExactText = originalPublishExactText;
 		}
@@ -589,7 +616,20 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		expect(entry?.type).toBe("message");
 		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
 		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
-		expect(await artifactManager.listFiles()).toEqual([]);
+		const secondaryEntry = session.sessionManager
+			.getBranch()
+			.find(
+				(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+					candidate.type === "message" &&
+					candidate.message.role === "toolResult" &&
+					candidate.message.toolCallId === "evict-call-secondary",
+			);
+		expect(secondaryEntry?.type).toBe("message");
+		if (secondaryEntry?.type === "message" && secondaryEntry.message.role === "toolResult")
+			expect(secondaryEntry.message.content).toEqual([{ type: "text", text: secondaryOutput }]);
+		const artifactFiles = await artifactManager.listFiles();
+		expect(artifactFiles.filter(file => file.endsWith(".evicted.log"))).toEqual([]);
+		expect(artifactFiles).toEqual([".artifact-id-0"]);
 	}, 30_000);
 
 	it("commits persisted tool-output eviction through production maintenance and releases append-only retainers", async () => {

@@ -752,6 +752,13 @@ type AutoCompactionTerminalStatus =
 	| { kind: "skipped"; continuationScheduled?: boolean }
 	| { kind: "failed" };
 
+type ToolOutputPruneResult = {
+	prunedCount: number;
+	tokensSaved: number;
+	committed: boolean;
+	failure?: "artifact_persistence";
+};
+
 /**
  * R3.2 pre-submit seam: `build` assembles the attempt messages (Phase A once,
  * Phase B per attempt) and may throw the typed overflow error; `reset` drops the
@@ -12381,13 +12388,14 @@ export class AgentSession {
 		signal?: AbortSignal,
 		overThreshold = false,
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
-	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
+	): Promise<ToolOutputPruneResult | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		// Over-threshold callers have already proven tool-output savings before entering
 		// this path. If exact persistence is unavailable, fail closed before hashing and
 		// planning large outputs so maintenance cannot drift into timeout-driven abort.
-		if (overThreshold && !artifactManager) return undefined;
+		if (overThreshold && !artifactManager)
+			return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
 		const plan = planToolOutputPrune(branchEntries, {
 			...DEFAULT_PRUNE_CONFIG,
 			minimumSavings: overThreshold ? 0 : DEFAULT_PRUNE_CONFIG.minimumSavings,
@@ -12396,7 +12404,7 @@ export class AgentSession {
 		// Fail closed when tool-output eviction is planned but no artifact store can be
 		// established: do not report a successful prune that skipped durable eviction.
 		if (!artifactManager && plan.digests.length > 0) {
-			return undefined;
+			return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
 		}
 		const removePublishedArtifacts = async (): Promise<void> => {
 			for (const handle of published.values()) {
@@ -12432,7 +12440,7 @@ export class AgentSession {
 					});
 					if (outcome.outcome === "failed") {
 						await removePublishedArtifacts();
-						return undefined;
+						return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
 					}
 				}
 			}
@@ -13519,7 +13527,7 @@ export class AgentSession {
 				relaxedMinimum: 0,
 				artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			});
-			let pruneResult: { prunedCount: number; tokensSaved: number; committed: boolean } | undefined;
+			let pruneResult: ToolOutputPruneResult | undefined;
 			if (
 				pruneEstimate.tokensSaved > 0 &&
 				!shouldCompact(
@@ -13531,6 +13539,7 @@ export class AgentSession {
 			) {
 				pruneResult = await this.#pruneToolOutputs(maintenanceSignal, true);
 				if (isAborted()) return result("aborted");
+				if (pruneResult?.failure === "artifact_persistence") return result("failed");
 				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
 			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
