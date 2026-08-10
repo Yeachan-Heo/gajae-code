@@ -1831,6 +1831,49 @@ describe("notifications config", () => {
 			}
 		}, 30_000);
 
+		test("keeps canonical SDK discovery when Telegram ownership is blocked", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-ownership-blocked-"));
+			const agentDir = path.join(cwd, ".gjc", "agent");
+			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+			const settings = isolatedNotificationSettings(agentDir, {
+				"notifications.enabled": true,
+				"notifications.telegram.enabled": true,
+				"notifications.telegram.botToken": "1234567890:blocked-telegram-token-value",
+				"notifications.telegram.chatId": "blocked-chat",
+			});
+			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+			const api = {
+				on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+					handlers.set(event, handler);
+				},
+				registerCommand() {},
+			} as unknown as ExtensionAPI;
+			const sessionId = "telegram-ownership-blocked";
+			const context = {
+				cwd,
+				sessionManager: {
+					getSessionId: () => sessionId,
+					getSessionName: () => "blocked Telegram owner",
+				},
+				ui: { notify: () => {} },
+			} as unknown as ExtensionContext;
+			createNotificationsExtension(api, {
+				settings,
+				ensureTelegramDaemon: async () => "blocked",
+			});
+			const sessionStart = handlers.get("session_start");
+			const sessionShutdown = handlers.get("session_shutdown");
+			if (!sessionStart || !sessionShutdown) throw new Error("notifications extension handlers were not registered");
+			const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+			try {
+				await sessionStart({}, context);
+				expect(JSON.parse(fs.readFileSync(endpoint, "utf8"))).toMatchObject({ sessionId });
+			} finally {
+				await sessionShutdown({}, context);
+				expect(fs.existsSync(endpoint)).toBe(false);
+				await cleanupFixtureRoot(cleanup);
+			}
+		}, 30_000);
 		test("keeps the core SDK endpoint when notification provider readiness fails", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-failure-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");

@@ -38,8 +38,15 @@ export type SdkSessionEndpointScope = "default" | "chat";
 function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "default"): string {
 	return scope === "chat" ? path.join(repo, ".gjc", "state", "chat", "sdk") : path.join(repo, ".gjc", "state", "sdk");
 }
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function isUsableSessionId(sessionId: string): boolean {
+	return SESSION_ID_PATTERN.test(sessionId);
+}
 
 function parseEndpoint(sessionId: string, file: string, value: unknown): SdkSessionEndpoint {
+	if (!isUsableSessionId(sessionId))
+		throw new SdkDiscoveryError(file, "SDK endpoint discovery filename does not contain a usable session id.");
 	if (!value || typeof value !== "object")
 		throw new SdkDiscoveryError(file, "SDK endpoint discovery record must be an object.");
 	const endpoint = value as {
@@ -117,7 +124,7 @@ export async function readSdkSessionEndpoint(
 	sessionId: string,
 	scope: SdkSessionEndpointScope = "default",
 ): Promise<SdkSessionEndpoint | null> {
-	if (!sessionId || sessionId.includes(path.sep) || sessionId.includes("/")) return null;
+	if (!isUsableSessionId(sessionId)) return null;
 	const file = path.join(endpointDirectory(repo, scope), `${sessionId}.json`);
 	try {
 		return parseEndpoint(sessionId, file, JSON.parse(await fs.readFile(file, "utf8")));
