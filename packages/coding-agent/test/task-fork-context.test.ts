@@ -440,7 +440,10 @@ describe("fork context policy surface", () => {
 
 		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 8000, signal: undefined });
 		expect(getOptions()?.forkContextSeed).toBe(seed);
-		expect(getOptions()?.providerSessionId).toBeUndefined();
+		const parentSessionId = parent.getSessionId?.();
+		const forkScope = getOptions()?.providerSessionId;
+		expect(forkScope).toBeDefined();
+		expect(forkScope).not.toBe(parentSessionId);
 		expect(getOptions()?.credentialSessionId).toBe("credential-pool");
 		expect(getOptions()?.providerSessionState).toBeUndefined();
 		expect(getOptions()?.toolNames).toEqual(["read"]);
@@ -449,6 +452,23 @@ describe("fork context policy surface", () => {
 			typeof systemPromptOption === "function" ? systemPromptOption(["base", "tail"]) : systemPromptOption;
 		expect(renderedPrompt?.join("\n")).toContain("executor system prompt");
 		expect(renderedPrompt?.join("\n")).toContain("forked snapshot of the parent conversation");
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "ForkSeedSibling",
+					description: "seed",
+					assignment: "Use inherited context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+
+		const siblingScope = getOptions()?.providerSessionId;
+		expect(siblingScope).toBeDefined();
+		expect(siblingScope).not.toBe(parentSessionId);
+		expect(siblingScope).not.toBe(forkScope);
 	});
 
 	test("suppresses fork-context prompt notice for zero-message seeds", async () => {
