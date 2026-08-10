@@ -5831,7 +5831,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			let suppressExtensionError = false;
+			let suppressExtensionError = result.failure?.message === "Lifecycle SDK startup was cancelled.";
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);

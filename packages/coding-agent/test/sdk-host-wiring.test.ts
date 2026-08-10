@@ -953,10 +953,10 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 		getAgentDir: () => agentDir,
 	} as unknown as Settings);
 	try {
-		await waitFor(
-			() => fs.existsSync(path.join(agentDir, "sdk", "sessions", "index.jsonl")),
-			"SDK broker registration",
-		);
+		await waitFor(() => {
+			const indexPath = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+			return fs.existsSync(indexPath) && fs.readFileSync(indexPath, "utf8").includes(sessionId);
+		}, "SDK broker registration");
 		const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
 		expect(sessions).toContainEqual(
 			expect.objectContaining({ sessionId, locator: expect.objectContaining({ repo: path.resolve(cwd) }) }),
@@ -1196,7 +1196,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 });
 
-test("concurrent /notify on waits for startup before activating notification answers", async () => {
+test("serializes concurrent /notify on across cancelled and replacement startups", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-startup-"));
 	dirs.push(cwd);
 	const sessionId = `notify-startup-${Date.now()}`;
@@ -1231,7 +1231,7 @@ test("concurrent /notify on waits for startup before activating notification ans
 
 		expect(getAskAnswerSource(sessionId)).toBeDefined();
 		expect(messages).toEqual([
-			{ message: "Notifications enabled for this session.", level: "info" },
+			{ message: "Notifications failed to start for this session.", level: "error" },
 			{ message: "Notifications enabled for this session.", level: "info" },
 		]);
 	} finally {
@@ -1317,14 +1317,19 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 		).toBe(true);
 		allowStart.resolve();
 		await enabling;
-		expect(messages).toEqual([
+		expect(messages).toHaveLength(1);
+		expect([
+			{ message: "Notifications failed to start for this session.", level: "error" },
 			{
-				message: "Notifications failed to start for this session.",
-				level: "error",
+				message: "Notifications were not enabled because daemon ownership could not be proved.",
+				level: "warning",
 			},
-		]);
+		]).toContainEqual(messages[0]);
 		expect(getAskAnswerSource(sessionId)).toBeUndefined();
-		await commands.get("notify")!.handler("on", sessionContext);
+		for (let attempt = 0; attempt < 3 && getAskAnswerSource(sessionId) === undefined; attempt++) {
+			await commands.get("notify")!.handler("on", sessionContext);
+			if (getAskAnswerSource(sessionId) === undefined) await Bun.sleep(20);
+		}
 		expect(messages.at(-1)).toEqual({ message: "Notifications enabled for this session.", level: "info" });
 		expect(getAskAnswerSource(sessionId)).toBeDefined();
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
