@@ -2329,7 +2329,13 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 
-		const selectedThinkingLevel = itemThinkingLevel ?? this.#getCurrentRoleThinkingLevel(role);
+		const currentThinkingLevel = this.#getCurrentRoleThinkingLevel(role);
+		const selectedThinkingLevel =
+			itemThinkingLevel ??
+			(currentThinkingLevel === ThinkingLevel.Inherit ||
+			getSelectableThinkingLevels(item.model).includes(currentThinkingLevel)
+				? currentThinkingLevel
+				: ThinkingLevel.Inherit);
 		const selectorValue = roles
 			? formatModelSelectorValue(item.selector, selectedThinkingLevel)
 			: role === "default"

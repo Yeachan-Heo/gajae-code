@@ -37,9 +37,16 @@ function createSelector(
 	model: Model,
 	settings: Settings,
 	onSelect: (selection: TestModelSelectorSelection) => void,
+	knownModels: readonly Model[] = [model],
+	scopedModels: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }> = [
+		{ model, thinkingLevel: ThinkingLevel.Off },
+	],
 ): ModelSelectorComponent {
 	const modelRegistry = {
-		getAll: () => [model],
+		getAll: () => knownModels,
+		refresh: async () => {},
+		getAvailable: () => knownModels,
+		getError: () => undefined,
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
@@ -51,7 +58,7 @@ function createSelector(
 		model,
 		settings,
 		modelRegistry,
-		[{ model, thinkingLevel: ThinkingLevel.Off }],
+		scopedModels,
 		selection => onSelect(selection as TestModelSelectorSelection),
 		() => {},
 		{},
@@ -212,5 +219,38 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		const actionRendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(actionRendered).toContain("Action for:");
 		expect(actionRendered).toContain("Set for all targets");
+	});
+	test("drops an unsupported inherited thinking level when selecting a plain model", async () => {
+		installTestTheme();
+		const previousModel = createAnthropicReasoningModel("claude-fable-5");
+		const targetModel = {
+			...previousModel,
+			id: "claude-plain",
+			name: "claude-plain",
+			reasoning: false,
+			thinking: undefined,
+		} as Model;
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": { executor: `${previousModel.provider}/${previousModel.id}:xhigh` },
+		});
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			targetModel,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			[targetModel, previousModel],
+			[{ model: targetModel }],
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selectActionRow(selector, 1);
+		await Bun.sleep(0);
+
+		const selectedAssignment = selected;
+		if (!selectedAssignment) throw new Error("Expected executor assignment selection");
+		expect(selectedAssignment.selector).toBe("anthropic/claude-plain");
 	});
 });
