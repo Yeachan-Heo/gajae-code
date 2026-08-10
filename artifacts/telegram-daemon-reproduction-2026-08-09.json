@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
   "branch": "fix/telegram-daemon-authority-crash",
-  "base": "upstream/dev@6608c2014",
-  "testedHead": "861cf6218",
+  "base": "upstream/dev@b4c4f6044",
+  "testedHead": "e028997f4",
   "environment": {
     "os": "darwin-arm64",
     "runtime": "Bun 1.3.14",
@@ -27,10 +27,10 @@
     "sameSessionTransport": "kept attached while predecessor archival converges",
     "crossSessionAuthority": "remains fenced",
     "nonForumArchive": "definitive 400 response settles the impossible close",
-    "daemonGeneration": 59
+    "daemonGeneration": 60
   },
   "dogfood": {
-    "base": "upstream/dev@4a16e99e7",
+    "base": "upstream/dev@b4c4f6044",
     "observationWindowSeconds": 180,
     "finalDaemonStatus": "running",
     "finalHealth": "OK: heartbeat fresh",
@@ -40,7 +40,7 @@
     "result": "PASS"
   },
   "verification": {
-    "focusedRegression": "PASS: 616 tests, 0 failures, 2362 assertions",
+    "focusedRegression": "PASS: 616 tests, 0 failures, 2364 assertions",
     "packageCheck": "PASS: Biome and TypeScript",
     "binaryBuild": "PASS",
     "generationGuard": "PASS",
