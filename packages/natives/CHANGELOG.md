@@ -5,6 +5,7 @@
 ### Fixed
 
 - Code summarization now runs on the native blocking-work pool and returns a promise, keeping the JavaScript render and input loop responsive while tree-sitter parses source.
+- The macOS computer batch controller is now warning-free under the workspace's strict Clippy configuration, with infallible result construction represented directly instead of wrapped in redundant `Result` values.
 
 ## [0.12.21] - 2026-08-09
 

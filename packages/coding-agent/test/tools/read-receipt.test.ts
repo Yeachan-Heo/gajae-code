@@ -93,12 +93,12 @@ describe("read receipt by default", () => {
 		const summarizeCode = native.summarizeCode;
 		summarizeCodeSpy = vi.spyOn(native, "summarizeCode").mockImplementation((...args) =>
 			summarySegments !== null
-				? {
+				? Promise.resolve({
 						parsed: true,
 						elided: true,
 						totalLines: Math.max(0, ...summarySegments.map(segment => segment.endLine)),
 						segments: summarySegments,
-					}
+					})
 				: summarizeCode(...args),
 		);
 	});
