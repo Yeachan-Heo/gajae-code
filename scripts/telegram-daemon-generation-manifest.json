@@ -577,7 +577,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunning": "0dbc6e3450ee72827d720cf492b69c4659e2f366d4d2ff4c008cc19f793a5a19",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunningDetailed": "845f8f868eb2b22c1f9964cd88f536634d7ff76eee543ee4feb7518d538b66f6",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:fetchWithRetry": "0bd340153367adbfe58dc51df9fc39f3c163104aa2040ca76cdbb9142eb68ac2",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:handleSessionMessage": "6af84169591978a377948c2324c5028fd04720548d33f1190d50a05f6fac8e53",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:handleSessionMessage": "de4bcc85f1cfc38de0a2f03bccc8ffc91da766df512b9ab54ead0f74254f0e84",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:handleTelegramUpdate": "8f1dc6c87dcbb3000c1de03195d2e8eb000f69a36f44f09edbfcbbdf9203f1dd",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:hasSafeDaemonStateShape": "4c015214f5dd344299328312451d3a6a093c91373e50d449c108c1b5f01e5fcb",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:historicalStateSerializer": "52fb9019a96fd386dca753b594b02e16bc888fe18970bfefcba5268823ae6547",

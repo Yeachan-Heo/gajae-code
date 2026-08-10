@@ -1223,7 +1223,6 @@ export class TopicRegistry {
 				...snapshot.record,
 				authorityEpoch: deleteEpoch,
 				authorityState: "archive_pending",
-				disconnectGraceExpiresAt: undefined,
 			});
 			const restored = this.topics.get(snapshot.sessionId);
 			if (restored) delete restored.disconnectGraceExpiresAt;

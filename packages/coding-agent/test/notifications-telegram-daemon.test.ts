@@ -19294,6 +19294,105 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		expect(routed).toHaveLength(2);
 		expect(routed.every(call => call.body.message_thread_id !== 77)).toBe(true);
 	});
+	test("archive settlement redials a rejected fenced transport and restores delivery on a new topic", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const daemonSettings = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: daemonSettings, cwd, sessionId: "S" });
+		const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(endpointDir, "S.json"),
+			JSON.stringify({ url: "ws://successor", token: "successor-token" }),
+		);
+		const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		fs.mkdirSync(path.dirname(topicsPath), { recursive: true });
+		fs.writeFileSync(
+			topicsPath,
+			JSON.stringify({
+				version: 2,
+				topics: {
+					S: {
+						topicId: "77",
+						topicOrigin: "daemon_created",
+						sessionUuid: "predecessor",
+						identitySent: true,
+						createdAt: 1,
+						chatId: "42",
+						endpointKey: endpointAuthorityDigest("ws://predecessor", "predecessor-token"),
+						endpointDigest: endpointAuthorityDigest("ws://predecessor", "predecessor-token"),
+						endpointGeneration: 1,
+						authorityState: "archive_pending",
+						authorityEpoch: 2,
+					},
+				},
+				fences: { S: 2 },
+			}),
+		);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: daemonSettings,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		await daemon.loadTopics();
+		daemon.connectSession("S", "ws://successor", "successor-token");
+		const fenced = daemon.sessions.get("S")!;
+		fenced.ws.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(fenced, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "queued behind the replay barrier",
+		});
+		await daemon.handleSessionMessage(fenced, {
+			type: "event_replay_result",
+			ok: true,
+			id: fenced.replayId,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ payload: { type: "identity_header", sessionId: "S", repo: "gajae-code", branch: "dev" } }],
+		});
+		expect(daemon.sessions.get("S")).toBe(fenced);
+		expect(fenced.recoveryLease?.state).toBe("rejected");
+		expect(fenced.replayQueue).toEqual([]);
+
+		await daemon.scanRoots();
+		const successor = daemon.sessions.get("S")!;
+		expect(successor).not.toBe(fenced);
+		successor.ws.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(successor, {
+			type: "event_replay_result",
+			ok: true,
+			id: successor.replayId,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ payload: { type: "identity_header", sessionId: "S", repo: "gajae-code", branch: "dev" } }],
+		});
+		await daemon.handleSessionMessage(successor, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "successor delivery",
+		});
+
+		expect(bot.calls.some(call => call.method === "closeForumTopic" && call.body.message_thread_id === 77)).toBe(
+			true,
+		);
+		expect(bot.calls.some(call => call.method === "createForumTopic")).toBe(true);
+		expect(
+			bot.calls.some(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.message_thread_id !== 77 &&
+					String(call.body.text).includes("successor delivery"),
+			),
+		).toBe(true);
+	});
 	test.each([
 		["accepted remote archive", async () => ({ ok: true, result: true }), "inactive", "42", "42", [77], false],
 		[
@@ -19308,6 +19407,15 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		[
 			"non-forum chat cannot retain a closable topic",
 			async () => ({ ok: false, error_code: 400, description: "Bad Request: the chat is not a supergroup forum" }),
+			"inactive",
+			"42",
+			"42",
+			[77],
+			false,
+		],
+		[
+			"non-forum chat alias cannot retain a closable topic",
+			async () => ({ ok: false, error_code: 400, description: "Bad Request: the chat is not a forum" }),
 			"inactive",
 			"42",
 			"42",
