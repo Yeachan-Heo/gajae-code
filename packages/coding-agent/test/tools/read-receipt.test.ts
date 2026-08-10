@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,36 +7,13 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
+import { ReadTool } from "@gajae-code/coding-agent/tools/read";
+import * as markit from "@gajae-code/coding-agent/utils/markit";
+import * as native from "@gajae-code/natives";
 import { Snowflake } from "@gajae-code/utils";
 
 let markitContent = "";
 let summarySegments: Array<{ kind: string; startLine: number; endLine: number; text?: string }> | null = null;
-
-// Bun `mock.module` is process-global and is NOT reverted by `mock.restore()`, so these
-// mocks delegate to the real implementations unless this file's own fixtures are set.
-// That keeps sibling test files (find/glob, sqlite, summary) on the real modules.
-const realMarkit = await import("@gajae-code/coding-agent/utils/markit");
-const realNatives = await import("@gajae-code/natives");
-mock.module("@gajae-code/coding-agent/utils/markit", () => ({
-	...realMarkit,
-	convertFileWithMarkit: async (...args: unknown[]) =>
-		markitContent
-			? { ok: true, content: markitContent }
-			: (realMarkit.convertFileWithMarkit as (...a: unknown[]) => unknown)(...args),
-	convertBufferWithMarkit: async (...args: unknown[]) =>
-		markitContent
-			? { ok: true, content: markitContent }
-			: (realMarkit.convertBufferWithMarkit as (...a: unknown[]) => unknown)(...args),
-}));
-mock.module("@gajae-code/natives", () => ({
-	...realNatives,
-	summarizeCode: (...args: unknown[]) =>
-		summarySegments !== null
-			? { parsed: true, elided: true, segments: summarySegments }
-			: (realNatives.summarizeCode as (...a: unknown[]) => unknown)(...args),
-}));
-const { ReadTool } = await import("@gajae-code/coding-agent/tools/read");
-
 let artifactCounter = 0;
 
 function createSession(cwd: string, settings: Settings = Settings.isolated()): ToolSession {
@@ -91,15 +68,47 @@ function receiptSettings(extra: Record<string, unknown> = {}): Settings {
 
 describe("read receipt by default", () => {
 	let testDir: string;
+	let convertFileSpy: { mockRestore(): void } | undefined;
+	let convertBufferSpy: { mockRestore(): void } | undefined;
+	let summarizeCodeSpy: { mockRestore(): void } | undefined;
 
 	beforeEach(() => {
 		testDir = path.join(os.tmpdir(), `read-receipt-${Snowflake.next()}`);
 		fs.mkdirSync(testDir, { recursive: true });
 		markitContent = "";
 		summarySegments = null;
+
+		const convertFileWithMarkit = markit.convertFileWithMarkit;
+		convertFileSpy = vi
+			.spyOn(markit, "convertFileWithMarkit")
+			.mockImplementation((...args) =>
+				markitContent ? Promise.resolve({ ok: true, content: markitContent }) : convertFileWithMarkit(...args),
+			);
+		const convertBufferWithMarkit = markit.convertBufferWithMarkit;
+		convertBufferSpy = vi
+			.spyOn(markit, "convertBufferWithMarkit")
+			.mockImplementation((...args) =>
+				markitContent ? Promise.resolve({ ok: true, content: markitContent }) : convertBufferWithMarkit(...args),
+			);
+		const summarizeCode = native.summarizeCode;
+		summarizeCodeSpy = vi.spyOn(native, "summarizeCode").mockImplementation((...args) =>
+			summarySegments !== null
+				? {
+						parsed: true,
+						elided: true,
+						totalLines: Math.max(0, ...summarySegments.map(segment => segment.endLine)),
+						segments: summarySegments,
+					}
+				: summarizeCode(...args),
+		);
 	});
 
-	afterEach(() => fs.rmSync(testDir, { recursive: true, force: true }));
+	afterEach(() => {
+		summarizeCodeSpy?.mockRestore();
+		convertBufferSpy?.mockRestore();
+		convertFileSpy?.mockRestore();
+		fs.rmSync(testDir, { recursive: true, force: true });
+	});
 
 	async function read(filePath: string, settings = receiptSettings(), params: Record<string, unknown> = {}) {
 		const tool = wrapToolWithMetaNotice(new ReadTool(createSession(testDir, settings)));

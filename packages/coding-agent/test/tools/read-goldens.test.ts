@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, it, mock, vi } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,38 +10,12 @@ import { computeLineHash } from "@gajae-code/coding-agent/hashline/hash";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
+import { ReadTool } from "@gajae-code/coding-agent/tools/read";
+import * as markit from "@gajae-code/coding-agent/utils/markit";
 import * as scrapers from "@gajae-code/coding-agent/web/scrapers/types";
 
-// Bun `mock.module` is process-global and sibling receipt tests replace the
-// natives module. Re-register only the native exports used by ReadTool from a
-// direct loader import, so this harness's structural-summary fixture always uses
-// the actual native implementation rather than another test's wrapper.
-const nativeIndexUrl = import.meta.resolve("@gajae-code/natives");
-const nativeLoaderUrl = new URL("./loader-state.js?read-goldens-real-loader", nativeIndexUrl).href;
-const realNatives = (await import(nativeLoaderUrl)).loadNative();
-function installRealNativesMock(): void {
-	mock.module("@gajae-code/natives", () => realNatives);
-}
-
-installRealNativesMock();
-
-// Keep the same delegation shape as the read receipt tests. The harness owns only
-// the deterministic markit fixture; all other calls use the real implementations.
 const markitContents = new Map<string, string>();
-const realMarkit = await import("@gajae-code/coding-agent/utils/markit");
-
-mock.module("@gajae-code/coding-agent/utils/markit", () => ({
-	...realMarkit,
-	convertFileWithMarkit: async (filePath: string, signal?: AbortSignal) => {
-		const content = markitContents.get(filePath);
-		return content === undefined ? realMarkit.convertFileWithMarkit(filePath, signal) : { ok: true, content };
-	},
-}));
-// Load a fresh ReadTool graph after installing the real natives mock; Bun caches
-// the ordinary module URL even when a sibling test imported it under another mock.
-const readModuleUrl = new URL("../../src/tools/read.ts", import.meta.url);
-readModuleUrl.search = "read-goldens";
-const { ReadTool } = await import(readModuleUrl.href);
+const convertFileWithMarkit = markit.convertFileWithMarkit;
 
 const MANIFEST_PATH = path.join(import.meta.dir, "../fixtures/read-goldens/manifest.json");
 const GOLDEN_ROOT = path.dirname(MANIFEST_PATH);
@@ -140,6 +114,7 @@ const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8")) as Entry[];
 let fixture: FixtureState;
 let contextManager: SessionManager;
 let urlPageSpy: ReturnType<typeof vi.spyOn> | undefined;
+let markitConvertSpy: { mockRestore(): void } | undefined;
 let artifactCounter = 0;
 
 function variantFor(hashLines: boolean): Variant {
@@ -566,7 +541,10 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 
 describe("read truncation golden harness", () => {
 	beforeAll(async () => {
-		installRealNativesMock();
+		markitConvertSpy = vi.spyOn(markit, "convertFileWithMarkit").mockImplementation(async (filePath, signal) => {
+			const content = markitContents.get(filePath);
+			return content === undefined ? convertFileWithMarkit(filePath, signal) : { ok: true, content };
+		});
 		fixture = await createFixtures(fs.mkdtempSync(path.join(os.tmpdir(), "read-goldens-")));
 
 		contextManager = SessionManager.inMemory(fixture.root);
@@ -592,6 +570,7 @@ describe("read truncation golden harness", () => {
 
 	afterAll(async () => {
 		urlPageSpy?.mockRestore();
+		markitConvertSpy?.mockRestore();
 		await contextManager?.close();
 		fs.rmSync(fixture.root, { recursive: true, force: true });
 	});
