@@ -676,12 +676,16 @@ export class LifecycleLedger {
 	hasLegacyIdentity(): boolean {
 		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
 	}
-	async migrateIdentity(from: string, to: string): Promise<LifecycleLedgerEntry | undefined> {
+	async migrateIdentity(
+		from: string,
+		to: string,
+		metadata: { operationKey: string; fingerprint: string },
+	): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
 			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
 			const entry = this.#byIdentity.get(from);
 			if (!entry) return undefined;
-			return await this.#append({ ...entry, identity: to, ts: Date.now() });
+			return await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
 		});
 	}
 	get warnings(): readonly string[] {
@@ -739,14 +743,18 @@ export class LifecycleLedger {
 			};
 		if (
 			prior.requestHash !== requestHash ||
-			(metadata.operationKey !== undefined && prior.operationKey !== metadata.operationKey)
+			(prior.operationKey !== undefined &&
+				metadata.operationKey !== undefined &&
+				prior.operationKey !== metadata.operationKey)
 		)
 			return { kind: "idempotency_conflict" };
 		if (terminal(prior.state) || (prior.state === "effect_started" && this.#isCleanupPending(prior)))
 			return { kind: "replay", entry: prior };
 		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };
-		// Accepted is durable admission only; no effect fence exists, so a restart may retry it.
-		if (prior.state === "accepted") return { kind: "new", entry: prior };
+		// Accepted may be the last durable evidence before a crash. It has no effect
+		// marker, but admitting it again would re-run an operation whose process state
+		// cannot be proven after restart.
+		if (prior.state === "accepted") return { kind: "in_progress", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
 	async transition(

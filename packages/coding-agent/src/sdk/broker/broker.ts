@@ -1545,7 +1545,7 @@ export class Broker {
 			target,
 		);
 		if (!this.ledger.get(identity)) {
-			if (await this.ledger.migrateIdentity(legacyIdentity, identity)) {
+			if (await this.ledger.migrateIdentity(legacyIdentity, identity, { operationKey, fingerprint })) {
 				// Exact target-derived legacy identity migrated without granting new authority.
 			} else if (this.ledger.findByOperationKey(operationKey) || this.ledger.hasLegacyIdentity())
 				return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
