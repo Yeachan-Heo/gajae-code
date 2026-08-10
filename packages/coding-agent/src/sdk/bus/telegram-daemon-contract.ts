@@ -94,7 +94,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * 58 preserves that invariant during durable-fence load promotion and restores
  * the exact grace deadline when a failed archive publication rolls back.
  */
-export const DAEMON_GENERATION = 58;
+export const DAEMON_GENERATION = 59;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
