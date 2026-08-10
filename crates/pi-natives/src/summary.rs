@@ -3,6 +3,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use crate::task;
+
 #[napi(object)]
 pub struct SummaryOptions {
 	/// Source code to summarize.
@@ -67,14 +69,16 @@ impl From<pi_ast::summary::SummaryResult> for SummaryResult {
 }
 
 #[napi]
-pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
-	pi_ast::summary::summarize_code(pi_ast::summary::SummaryOptions {
-		code:              options.code,
-		lang:              options.lang,
-		path:              options.path,
-		min_body_lines:    options.min_body_lines,
-		min_comment_lines: options.min_comment_lines,
+pub fn summarize_code(options: SummaryOptions) -> task::Promise<SummaryResult> {
+	task::blocking("summarize_code", (), move |_| {
+		pi_ast::summary::summarize_code(pi_ast::summary::SummaryOptions {
+			code:              options.code,
+			lang:              options.lang,
+			path:              options.path,
+			min_body_lines:    options.min_body_lines,
+			min_comment_lines: options.min_comment_lines,
+		})
+		.map(Into::into)
+		.map_err(|error| Error::from_reason(error.to_string()))
 	})
-	.map(Into::into)
-	.map_err(|error| Error::from_reason(error.to_string()))
 }

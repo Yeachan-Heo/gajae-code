@@ -10,6 +10,7 @@
 - Post-maintenance continuation now resumes the current non-assistant tail when no queued messages exist, while consuming queued steering/follow-ups only when present; overflow recovery no longer fails with `No queued messages to continue`, and accepted queued successors reset fallback accounting exactly once.
 - Streamed edit preview coalescing now keys on the complete partial-JSON payload rather than its length, so same-size in-place argument replacements recompute and render while repeated payloads remain cached.
 - CLI parsing now fails closed by default, while launch and ACP explicitly defer only their owned startup options; this preserves ACP-specific diagnostics, SDK startup forwarding, real ACP subprocess framing, and RLM typo rejection without exposing retired flags in root help or completion.
+- Read-tool code summarization and ZIP extraction now run asynchronously instead of blocking the TUI event loop during structural parsing or decompression.
 
 ## [0.12.21] - 2026-08-09
 

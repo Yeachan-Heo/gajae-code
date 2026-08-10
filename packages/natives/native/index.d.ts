@@ -2291,7 +2291,7 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
  */
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
 
-export declare function summarizeCode(options: SummaryOptions): SummaryResult
+export declare function summarizeCode(options: SummaryOptions): Promise<SummaryResult>
 
 export interface SummaryOptions {
   /** Source code to summarize. */

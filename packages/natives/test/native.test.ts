@@ -137,8 +137,8 @@ describe("pi-natives", () => {
 	});
 
 	describe("summarize", () => {
-		it("summarizes TypeScript function bodies", () => {
-			const result = summarizeCode({
+		it("summarizes TypeScript function bodies", async () => {
+			const result = await summarizeCode({
 				path: "fixture.ts",
 				code: "export function greet(name: string): string {\n\tconst clean = name.trim();\n\tconst label = clean || 'world';\n\treturn label.toUpperCase();\n}\n",
 			});
@@ -152,12 +152,12 @@ describe("pi-natives", () => {
 			expect(result.segments[2].text).toBe("}");
 		});
 
-		it("summarizes Rust and Python bodies while preserving boundary lines", () => {
-			const rust = summarizeCode({
+		it("summarizes Rust and Python bodies while preserving boundary lines", async () => {
+			const rust = await summarizeCode({
 				path: "fixture.rs",
 				code: 'impl Greeter {\n\tfn greet(&self) -> String {\n\t\tlet name = "world";\n\t\tlet label = name.to_uppercase();\n\t\tformat!("hello {label}")\n\t}\n}\n',
 			});
-			const python = summarizeCode({
+			const python = await summarizeCode({
 				path: "fixture.py",
 				code: "class Greeter:\n    def greet(self, name: str) -> str:\n        clean = name.strip()\n        label = clean or 'world'\n        return f'hello {label}'\n",
 			});
@@ -169,8 +169,8 @@ describe("pi-natives", () => {
 			expect(python.segments.at(-1)?.text).toContain("return");
 		});
 
-		it("summarizes multiline literals and block comments", () => {
-			const result = summarizeCode({
+		it("summarizes multiline literals and block comments", async () => {
+			const result = await summarizeCode({
 				path: "fixture.ts",
 				code: "/*\n * line 1\n * line 2\n * line 3\n * line 4\n */\nexport const config = {\n\ta: 1,\n\tb: 2,\n\tc: 3,\n};\n",
 			});
@@ -183,9 +183,9 @@ describe("pi-natives", () => {
 			);
 		});
 
-		it("falls back for unsupported or empty input", () => {
-			const unsupported = summarizeCode({ path: "fixture.txt", code: "plain text\nwith lines\n" });
-			const empty = summarizeCode({ path: "fixture.ts", code: "" });
+		it("falls back for unsupported or empty input", async () => {
+			const unsupported = await summarizeCode({ path: "fixture.txt", code: "plain text\nwith lines\n" });
+			const empty = await summarizeCode({ path: "fixture.ts", code: "" });
 
 			expect(unsupported.parsed).toBe(false);
 			expect(unsupported.segments).toHaveLength(1);
@@ -194,10 +194,25 @@ describe("pi-natives", () => {
 			expect(empty.segments).toHaveLength(0);
 		});
 
-		it("respects minBodyLines", () => {
+		it("respects minBodyLines", async () => {
 			const code = "function small() {\n\treturn 1;\n}\n";
-			expect(summarizeCode({ path: "fixture.ts", code }).elided).toBe(false);
-			expect(summarizeCode({ path: "fixture.ts", code, minBodyLines: 3 }).elided).toBe(true);
+			expect((await summarizeCode({ path: "fixture.ts", code })).elided).toBe(false);
+			expect((await summarizeCode({ path: "fixture.ts", code, minBodyLines: 3 })).elided).toBe(true);
+		});
+
+		it("runs code summarization off the JavaScript event loop", async () => {
+			const code = Array.from(
+				{ length: 20_000 },
+				(_, index) => `export function value${index}() {\n\tconst value = ${index};\n\treturn value;\n}`,
+			).join("\n");
+			const summary = summarizeCode({ path: "fixture.ts", code });
+			const firstSettled = await Promise.race([
+				summary.then(() => "summary" as const),
+				Bun.sleep(0).then(() => "timer" as const),
+			]);
+
+			expect(firstSettled).toBe("timer");
+			expect((await summary).parsed).toBe(true);
 		});
 	});
 	describe("grep", () => {
