@@ -16139,18 +16139,27 @@ export class AgentSession {
 			this.#retryAbortController?.abort();
 			this.#retryAbortController = retryAbortController;
 			this.#retryNowRequested = false;
-			await this.#emitSessionEvent({
-				type: "auto_retry_start",
-				attempt: this.#retryAttempt,
-				maxAttempts: managedFallback
-					? controller.maxAttempts
-					: firstEventTimeout
-						? retrySettings.maxRetries + 1
-						: retrySettings.maxRetries,
-				delayMs,
-				errorMessage,
-				unbounded: managedFallback ? false : legacyUnbounded,
-			});
+			try {
+				await this.#emitSessionEvent({
+					type: "auto_retry_start",
+					attempt: this.#retryAttempt,
+					maxAttempts: managedFallback
+						? controller.maxAttempts
+						: firstEventTimeout
+							? retrySettings.maxRetries + 1
+							: retrySettings.maxRetries,
+					delayMs,
+					errorMessage,
+					unbounded: managedFallback ? false : legacyUnbounded,
+				});
+			} catch (error) {
+				if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
+				retryAbortController.abort();
+				this.#failRetryRecovery(
+					`Retry start delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				throw error;
+			}
 
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
