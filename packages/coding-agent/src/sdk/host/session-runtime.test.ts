@@ -440,6 +440,7 @@ async function invocationHarness(
 		sendUserMessage?: (content: unknown, options?: PreflightHooks & { deliverAs?: string }) => Promise<void>;
 		invokeSkill?: (name: string, args?: string, options?: PreflightHooks) => Promise<unknown>;
 		abort?: () => void;
+		isIdle?: () => boolean;
 	},
 ): Promise<InvocationHarness> {
 	const waiters = new Map<string, (frame: ResponseFrame) => void>();
@@ -477,7 +478,7 @@ async function invocationHarness(
 		cwd,
 		workflowGate: undefined,
 		sdkBindings: () => (hooks.invokeSkill ? ["invokeSkill"] : []),
-		isIdle: () => true,
+		isIdle: hooks.isIdle ?? (() => true),
 		abort: hooks.abort ?? (() => {}),
 		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
 		sessionManager: { getSessionId: () => sessionId, getSessionName: () => undefined },
@@ -589,6 +590,102 @@ describe("post-acceptance invocation terminalization", () => {
 				status: "failed",
 				error: { code: "upstream_error" },
 			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("a completed prompt reports a terminal successful status", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-completed-prompt-"));
+		try {
+			const harness = await invocationHarness("terminalize-completed-prompt", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const { commandId, turnId } = accepted.result ?? {};
+			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
+				status: "terminal_ok",
+				terminalAt: expect.any(Number),
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("a queued follow-up prompt is not terminalized before the turn runs", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-followup-"));
+		try {
+			const turnRunning = Promise.withResolvers<void>();
+			const harness = await invocationHarness("terminalize-followup", cwd, {
+				sendUserMessage: async (_content, options) => {
+					if (options?.deliverAs === "followUp") {
+						await options?.onPreflightAcceptCommit?.();
+						// #queueFollowUp resolves immediately; the turn has not run yet.
+						return;
+					}
+					await options?.onPreflightAcceptCommit?.();
+					await turnRunning.promise;
+				},
+			});
+			const accepted = await harness.control("turn.follow_up", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const { commandId, turnId } = accepted.result ?? {};
+			// The follow-up submission must NOT report terminal_ok while the turn is still pending.
+			const status = await harness.query("turn.prompt_status", { commandId, turnId });
+			expect(status.result?.status).toMatch(/accepted|in_flight|unknown/);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("a prompt queued as steer while streaming is not terminalized before the turn runs", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-while-busy-"));
+		try {
+			const harness = await invocationHarness("terminalize-prompt-while-busy", cwd, {
+				sendUserMessage: async (_content, options) => {
+					// Session is streaming: sendUserMessage diverts to #queueSteer and resolves.
+					await options?.onPreflightAcceptCommit?.();
+				},
+				isIdle: () => false,
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const { commandId, turnId } = accepted.result ?? {};
+			// The diverted prompt must NOT report terminal_ok while the turn is still pending.
+			const status = await harness.query("turn.prompt_status", { commandId, turnId });
+			expect(status.result?.status).toMatch(/accepted|in_flight|unknown/);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("a queued prompt stays non-terminal even if isIdle flips during the accept window", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-race-"));
+		let idle = false;
+		try {
+			const harness = await invocationHarness("terminalize-race", cwd, {
+				sendUserMessage: async (_content, options) => {
+					// The session is streaming when the submission starts (divert to steer).
+					// During accept()->persist(), the prior turn unwinds and isIdle flips to true.
+					await options?.onPreflightAcceptCommit?.();
+					idle = true;
+				},
+				isIdle: () => idle,
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const { commandId, turnId } = accepted.result ?? {};
+			// The snapshot taken at dispatch time (idle=false) must hold: the prompt was
+			// queued, so it must not report terminal_ok even though isIdle is now true.
+			const status = await harness.query("turn.prompt_status", { commandId, turnId });
+			expect(status.result?.status).toMatch(/accepted|in_flight|unknown/);
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);

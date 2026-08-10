@@ -1060,6 +1060,7 @@ function createControlSurface(
 		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
 		allowCompletionFallback = false,
+		alwaysQueued = false,
 	): Promise<unknown> => {
 		const retainedClientRef = normalizeClientRef(clientRef);
 		reconciliation.admit(kind, retainedClientRef);
@@ -1069,6 +1070,7 @@ function createControlSurface(
 		let settled = false;
 		const accept = async (): Promise<void> => {
 			if (settled) return;
+
 			try {
 				await reconciliation.noteAccepted(kind, correlation, retainedClientRef);
 				accepted = true;
@@ -1081,6 +1083,11 @@ function createControlSurface(
 				throw error;
 			}
 		};
+		// Snapshot before run(): if the session is streaming when the submission starts,
+		// sendUserMessage will divert to steer-queue and resolve before the turn runs.
+		// Re-reading ctx.isIdle() after run() would race — accept() does async fs I/O that
+		// yields, so isStreaming can flip during the persist window.
+		const queuedAtDispatch = alwaysQueued || !ctx.isIdle();
 		try {
 			const submission = Promise.resolve(
 				run({
@@ -1091,7 +1098,12 @@ function createControlSurface(
 			void submission.then(
 				result => {
 					if (settled) {
-						if (kind === "skill")
+						// A resolved submission after preflight acceptance means the work is over
+						// for every kind. `noteTransition` ignores an already-terminal record, so
+						// terminalizing here is safe — unless the submission resolved at queue time
+						// (followUp, or a prompt diverted to steer while streaming), in which case
+						// the turn's own lifecycle events drive terminalization.
+						if (!queuedAtDispatch)
 							void reconciliation.noteTransition(kind, correlation, {
 								type: "agent_end",
 								...(typeof result === "string"
@@ -1152,7 +1164,14 @@ function createControlSurface(
 			return { commandId: crypto.randomUUID(), accepted: true };
 		},
 		followUp: async text =>
-			submit("prompt", undefined, options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" })),
+			submit(
+				"prompt",
+				undefined,
+				options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" }),
+				undefined,
+				false,
+				true,
+			),
 		abort: () => {
 			ctx.abort();
 			return { aborted: true };
