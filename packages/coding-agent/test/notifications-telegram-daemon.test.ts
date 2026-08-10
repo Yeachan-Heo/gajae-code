@@ -20955,7 +20955,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const after = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
 		expect(after.topics.S).toMatchObject({ replayGeneration: 1, replaySeq: 1 });
 	});
-	test("a sequence-gap replay with a consistent identity resumes the exact endpoint authority", async () => {
+	test("a single-event sequence-gap replay with a consistent identity resumes the exact endpoint authority", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const bot = new FakeBotApi();
@@ -20976,7 +20976,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			id: session.replayId,
 			generation: 1,
 			lastSeq: 10,
-			gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 5, resyncQueries: ["Q01", "Q02"] },
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 1, resyncQueries: ["Q01"] },
 			events: [
 				{
 					payload: {

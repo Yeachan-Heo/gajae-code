@@ -10030,7 +10030,7 @@ export class TelegramNotificationDaemon {
 				msg.gap.kind === "sequence_gap" &&
 				Number.isSafeInteger(msg.gap.fromSeq) &&
 				Number.isSafeInteger(msg.gap.toSeq) &&
-				msg.gap.fromSeq < msg.gap.toSeq &&
+				msg.gap.fromSeq <= msg.gap.toSeq &&
 				Array.isArray(msg.gap.resyncQueries) &&
 				msg.gap.resyncQueries.every((query: unknown) => typeof query === "string") &&
 				identityFrames.length > 0;
@@ -10084,10 +10084,6 @@ export class TelegramNotificationDaemon {
 				) {
 					// The old topic remains fenced, but the authenticated live transport
 					// must stay attached while archive reconciliation retries.
-					if (!this.#ownsLiveOpenEndpoint(session, endpointBinding)) {
-						this.dropSession(session, "recovery_rejected");
-						return;
-					}
 					session.replayQueue = [];
 					session.replayPending = false;
 					return;

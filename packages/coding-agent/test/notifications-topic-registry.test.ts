@@ -755,6 +755,35 @@ test("repairs an archive record carrying a stale disconnect-grace marker", () =>
 	expect(state?.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
 	expect(snapshot).toEqual(original);
 });
+test("normalizes stale disconnect-grace markers in retired history without mutating the snapshot", () => {
+	const snapshot = {
+		version: 2,
+		registryGeneration: 7,
+		topics: {},
+		retiredTopics: {
+			session: [
+				{
+					topicId: "42",
+					topicOrigin: "daemon_created",
+					sessionUuid: "session-uuid",
+					identitySent: true,
+					createdAt: 1,
+					orphanedAt: 2,
+					authorityEpoch: 1,
+					authorityState: "inactive",
+					chatId: "42",
+					disconnectGraceExpiresAt: 3,
+				},
+			],
+		},
+	};
+	const original = structuredClone(snapshot);
+	const state = parseTopicRegistryState(snapshot);
+
+	expect(state?.retiredTopics?.session?.[0]?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(new TopicRegistry(state).serialize().retiredTopics?.session?.[0]?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(snapshot).toEqual(original);
+});
 test("fences a concurrent host and permits same-topic resume only before grace expiry", async () => {
 	const registry = new TopicRegistry();
 	await registry.getOrCreateTopic(
