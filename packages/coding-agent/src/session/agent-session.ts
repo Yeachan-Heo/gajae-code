@@ -12440,7 +12440,12 @@ export class AgentSession {
 					});
 					if (outcome.outcome === "failed") {
 						await removePublishedArtifacts();
-						return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
+						return {
+							prunedCount: published.size,
+							tokensSaved: 0,
+							committed: false,
+							failure: "artifact_persistence",
+						};
 					}
 				}
 			}
