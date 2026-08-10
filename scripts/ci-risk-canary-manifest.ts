@@ -67,7 +67,6 @@ export const RISK_CLASSES: readonly RiskClass[] = [
 		description: "session manager, SDK broker, notification, TUI, and runtime lifecycle coupling.",
 		match: {
 			prefixes: [
-				"packages/coding-agent/src/notifications/",
 				"packages/coding-agent/src/session/",
 				"packages/coding-agent/src/sdk/",
 				"packages/coding-agent/src/tui/",
