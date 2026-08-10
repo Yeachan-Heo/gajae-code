@@ -357,7 +357,8 @@ async function invocationHarness(
 	};
 	await handlers.get("session_start")?.({}, ctx);
 	const request = (frame: Record<string, unknown>): Promise<ResponseFrame> => {
-		const id = `frame-${(nextId += 1)}`;
+		const id = `frame-${nextId}`;
+		nextId += 1;
 		const { promise, resolve } = Promise.withResolvers<ResponseFrame>();
 		waiters.set(id, resolve);
 		deliver?.("client", { ...frame, id } as SdkFrame);
