@@ -28,6 +28,7 @@
  * drain it, so a chatty child whose stdout is never read can still block on a
  * full pipe. That draining is the adopter's responsibility.
  */
+import * as fs from "node:fs";
 import { logger, postmortem, ptree } from "@gajae-code/utils";
 
 const DEFAULT_GRACEFUL_MS = 2_000;
@@ -66,6 +67,42 @@ function groupAlive(pgid: number): boolean {
 	} catch (err) {
 		// EPERM => the group exists but we cannot signal it; treat as alive.
 		return (err as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/**
+ * Whether a POSIX process group still has a *running* member. Zombies are
+ * inert: they execute no code and can only be reaped by their parent, which
+ * the owned process cannot control. Teardown must not wait on an external
+ * reaper, so disposal considers a group terminated once every member is dead
+ * or a zombie. On Linux this inspects `/proc`; elsewhere it conservatively
+ * falls back to {@link groupAlive} (zombies count as alive).
+ */
+function groupHasRunningMembers(pgid: number): boolean {
+	if (!groupAlive(pgid)) return false;
+	if (process.platform !== "linux") return true;
+	try {
+		for (const entry of fs.readdirSync("/proc")) {
+			if (entry.length === 0 || entry.charCodeAt(0) < 0x30 || entry.charCodeAt(0) > 0x39) continue;
+			let stat: string;
+			try {
+				stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
+			} catch {
+				// Process vanished between readdir and stat; skip.
+				continue;
+			}
+			// Format: pid (comm) state ppid pgrp session tty ...; comm may contain
+			// spaces or parens, so parse everything after the last ')'.
+			const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+			const state = fields[0] ?? "";
+			if (Number(fields[2]) === pgid && state !== "Z" && state !== "X") {
+				return true;
+			}
+		}
+		return false;
+	} catch {
+		// /proc unavailable or unreadable: keep the conservative behavior.
+		return true;
 	}
 }
 
@@ -246,14 +283,18 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 			disposePromise = (async () => {
 				try {
 					if (pgid !== undefined) {
-						// Group ownership: reap until the whole group is gone, even if
-						// the root has already exited (it may have backgrounded children).
+						// Group ownership: terminate every *running* member, even if the
+						// root has already exited (it may have backgrounded children).
+						// Liveness is measured by running members, not raw group
+						// existence: SIGTERM'd descendants become zombies that only their
+						// parent (often PID 1) can reap, and teardown must not burn its
+						// grace window waiting on an external reaper.
 						if (!groupAlive(pgid)) return;
 						signalTree("SIGTERM");
-						if (await pollUntil(() => !groupAlive(pgid), gracefulMs)) return;
+						if (await pollUntil(() => !groupHasRunningMembers(pgid), gracefulMs)) return;
 						signalTree("SIGKILL");
-						if (!(await pollUntil(() => !groupAlive(pgid), SIGKILL_REAP_CAP_MS))) {
-							logger.warn("owned process group still alive after SIGKILL", {
+						if (!(await pollUntil(() => !groupHasRunningMembers(pgid), SIGKILL_REAP_CAP_MS))) {
+							logger.warn("owned process group still running after SIGKILL", {
 								name: opts.name,
 								pgid,
 							});
