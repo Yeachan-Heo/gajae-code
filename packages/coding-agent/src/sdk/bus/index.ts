@@ -5549,6 +5549,15 @@ export function createNotificationsExtension(
 				await cleanupAbandonedStartup();
 				return { status: "failed" };
 			}
+			// Record canonical identity before transport startup so lifecycle events emitted
+			// by an early server-start callback cannot overtake it in replay. The direct
+			// socket publication remains below, after the server is listening.
+			const identityHeader = {
+				type: "identity_header",
+				sessionId: id,
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+			};
+			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			// Core SDK authority is published before optional notification adapters acquire
 			// daemon ownership. A blocked adapter must not make an interactive session
 			// undiscoverable or uncontrollable.
@@ -5580,15 +5589,6 @@ export function createNotificationsExtension(
 				}
 			}
 
-			// Notification adapter readiness controls notification activation only. The
-			// endpoint is already authoritative; identity remains replayable for clients
-			// that attach after adapter ownership settles.
-			const identityHeader = {
-				type: "identity_header",
-				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
-			};
-			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			// The native server owns the only authoritative view of this host's live
 			// SDK client sockets; publish it so a detached session host can bound its
 			// own lifetime without probing the OS (#4010). The handle is this
