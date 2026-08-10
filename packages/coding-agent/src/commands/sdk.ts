@@ -141,25 +141,31 @@ export const SESSION_HOST_FIRST_ATTACH_GRACE_MS = 60 * 60_000;
 const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
 
 /**
- * Resolves once this host is provably abandoned: either it has been detached
- * from every client for the full idle grace, or nobody has come for it at all
- * for the full first-attach grace.
+ * Resolves once the host is provably abandoned: either it has been detached
+ * from every client for a full idle grace, or nobody has come for it at all
+ * for a full first-attach grace.
  *
  * `readAttachedClients` reports the host's own live client/socket subscription
- * count; `undefined` means the SDK endpoint publishes no such evidence yet and
- * is deliberately *not* treated as detachment, so a host can never be reaped on
- * missing evidence — only on observed absence of clients.
+ * count; `undefined` means the SDK endpoint publishes no such evidence — before
+ * startup, after teardown, or when every reader itself fails. That ambiguity is
+ * never instant detachment: it cannot reap on the poll that first sees it, it
+ * can only open a window. Which window depends on what was already observed. A
+ * host never seen attached accrues against the first-attach bound. A host that
+ * was seen attached and has since lost its evidence is in the *more* suspicious
+ * state — a runtime that retracted its registration during teardown looks
+ * exactly like this — so it accrues against the detached idle bound, alongside
+ * an observed count of zero. Every reachable state therefore carries a finite
+ * bound.
  *
  * `readWorkInFlight` reports whether the host is running agent work right now.
- * Work is positive proof that a client did come for this host: a prompt can
- * only arrive over the endpoint a client dialed. So for a host that has never
- * been *observed* attached — a client that connected, prompted and dropped
- * between two 30s polls, or a client count that is momentarily unreadable — the
- * first-attach window is measured from the last moment work was in flight
- * rather than from process start. That still bounds a host whose SDK runtime
- * never came up: with no transport it can never receive a prompt, so it never
- * reports work and its window keeps running from start. And any real turn ends,
- * after which the window resumes; live work defers the bound, never removes it.
+ * Work is positive proof a client did come for this host: a prompt can only
+ * arrive over an endpoint a client dialed. Live work therefore restarts both
+ * windows, which is what keeps a mid-prompt host alive whether its count reads
+ * zero or stops being readable at all. That still bounds a host whose SDK
+ * runtime never came up: with no transport it can never receive a prompt, so it
+ * never reports work and its window keeps running from process start. And any
+ * real turn ends, after which the window resumes; live work defers a bound, it
+ * never removes it.
  */
 export async function watchSessionHostClientAttachment(deps: {
 	readAttachedClients: () => number | undefined;
@@ -182,16 +188,18 @@ export async function watchSessionHostClientAttachment(deps: {
 	let unattendedSince = now();
 	for (;;) {
 		const attached = deps.readAttachedClients();
-		if (readWorkInFlight()) unattendedSince = now();
-		if (attached === undefined) {
-			// No endpoint evidence at all is ambiguity, not abandonment; it still
-			// accrues against the first-attach bound so a host whose SDK runtime
-			// never came up cannot outlive that bound either.
-			if (!everAttached && now() - unattendedSince >= firstAttachGraceMs) return;
-		} else if (attached > 0) {
+		if (readWorkInFlight()) {
+			unattendedSince = now();
+			detachedSince = null;
+		}
+		if (attached !== undefined && attached > 0) {
 			everAttached = true;
 			detachedSince = null;
 		} else if (everAttached) {
+			// An observed zero and no readable evidence at all are the same
+			// absence once a client has been seen: a runtime that retracted its
+			// registration stops publishing a count instead of reporting zero.
+			// Both accrue against the idle bound rather than running forever.
 			detachedSince ??= now();
 			if (now() - detachedSince >= idleGraceMs) return;
 		} else if (now() - unattendedSince >= firstAttachGraceMs) {

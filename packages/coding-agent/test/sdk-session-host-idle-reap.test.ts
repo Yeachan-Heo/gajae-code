@@ -100,9 +100,13 @@ test("a freshly spawned session host is held by the longer first-attach grace, n
 	expect(reads).toBe(5);
 });
 
-test("missing endpoint evidence is not detachment for a host that has already served a client", async () => {
+test("a host observed attached and then losing all endpoint evidence is reaped at the idle bound", async () => {
 	const clock = { nowMs: 0 };
 	let reads = 0;
+	// One attached observation, then the runtime retracts its registration and
+	// the count reads `undefined` for the rest of the process' life. Ambiguity
+	// must not reap on the poll that first sees it, but it must still open a
+	// window that closes — otherwise this host outlives every bound.
 	const outcome = await runUntilStable(
 		{
 			readAttachedClients: () => {
@@ -116,8 +120,11 @@ test("missing endpoint evidence is not detachment for a host that has already se
 		200,
 		clock,
 	);
-	expect(outcome).toBe("still-running");
-	expect(clock.nowMs).toBe(2_000);
+	expect(outcome).toBe("reaped");
+	// The first ambiguous poll at 10ms opens the window and a full idle grace
+	// closes it: neither instant detachment nor immortality.
+	expect(clock.nowMs).toBe(30);
+	expect(reads).toBe(4);
 });
 
 test("a host whose SDK endpoint never publishes attachment evidence still exits at the first-attach bound", async () => {
@@ -142,6 +149,29 @@ test("a host with clients attached but never observed attached is not reaped whi
 	const outcome = await runUntilStable(
 		{
 			readAttachedClients: () => undefined,
+			readWorkInFlight: () => true,
+			idleGraceMs: 20,
+			firstAttachGraceMs: 40,
+			pollMs: 10,
+		},
+		200,
+		clock,
+	);
+	expect(outcome).toBe("still-running");
+	expect(clock.nowMs).toBe(2_000);
+});
+
+test("a host whose evidence vanishes mid-prompt is held open by work in flight past the idle bound", async () => {
+	const clock = { nowMs: 0 };
+	let reads = 0;
+	// Attached once, then the count stops being readable while the turn that
+	// client asked for is still running: the bound must defer, not reap.
+	const outcome = await runUntilStable(
+		{
+			readAttachedClients: () => {
+				reads += 1;
+				return reads === 1 ? 1 : undefined;
+			},
 			readWorkInFlight: () => true,
 			idleGraceMs: 20,
 			firstAttachGraceMs: 40,
