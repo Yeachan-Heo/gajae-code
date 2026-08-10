@@ -3292,12 +3292,13 @@ test("production post-registration startup failure proves cleanup and exact repl
 			ok: false,
 			error: {
 				code: "spawn_failed",
-				message: "No ready SDK endpoint remains available.",
+				message: "Lifecycle test failure after SDK host registration.",
 				endpoint: "unavailable",
 			},
 			startupFailure: {
 				phase: "startup",
 				reason: "failed",
+				message: "Lifecycle test failure after SDK host registration.",
 				rollback: {
 					endpointGeneration: expect.any(Number),
 					fenced: true,
