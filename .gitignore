@@ -90,3 +90,6 @@ packages/coding-agent/binaries/
 # Python SDK build output
 python/gjc-sdk/build/
 *.py[cod]
+
+# Issue #4145 Herdr evaluation — private local probe tooling
+/.herdr-local/
