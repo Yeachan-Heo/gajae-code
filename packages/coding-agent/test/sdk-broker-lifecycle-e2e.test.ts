@@ -2754,6 +2754,66 @@ test("broker refuses a stale registered PID when no durable effect marker proves
 	}
 });
 
+test("broker closes a live host whose workspace state root is gone using its registered incarnation", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lost-workspace-"));
+	// The workspace — and with it the spawn-time lifecycle marker and endpoint —
+	// was deleted while the host kept running, which is exactly how an orphan that
+	// still serves its original source outlives every later close attempt.
+	const stateRoot = path.join(agentDir, "deleted-workspace", ".gjc", "state");
+	const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	const pid = child.pid;
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		const incarnation = processIncarnation(pid);
+		expect(incarnation).toBeString();
+
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "wrong-incarnation",
+			locator: { repo: "fixture", stateRoot },
+			endpointGeneration: 1,
+			pid,
+			processIncarnation: `${incarnation}-recycled`,
+		});
+		expect(await broker.handleRequest("session.close", { sessionId: "wrong-incarnation" }, "recycled-close")).toEqual(
+			{
+				ok: false,
+				error: {
+					code: "close_refused",
+					message: "Session endpoint is unavailable and its durable process identity could not be verified.",
+				},
+			},
+		);
+		expect(child.exitCode).toBeNull();
+
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "orphan",
+			locator: { repo: "fixture", stateRoot },
+			endpointGeneration: 1,
+			pid,
+			processIncarnation: incarnation,
+		});
+		const closed = await broker.handleRequest("session.close", { sessionId: "orphan" }, "orphan-close");
+		expect(closed).toMatchObject({ ok: true, result: { sessionId: "orphan" } });
+		expect(await child.exited).toBe(143);
+		// The killed host never withdrew its own registration, so the broker owes the
+		// index that retirement; leaving it open would keep advertising a dead session.
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ sessionId: "wrong-incarnation" })] },
+		});
+	} finally {
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+}, 15_000);
+
 test("broker refuses same-generation close authority from a prior endpoint incarnation", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-close-incarnation-"));
 	const stateRoot = path.join(agentDir, "state");

@@ -26,6 +26,13 @@ export interface SessionIndexEvent {
 	locator: { repo: string; stateRoot: string };
 	endpointGeneration: number;
 	pid: number;
+	/**
+	 * OS start incarnation of `pid`, published by the host that owns that pid. A
+	 * pid is reusable, so teardown needs this binding to prove the pid is still
+	 * the same process; keeping it here, in broker-owned storage, is what lets
+	 * that proof outlive the session's own workspace.
+	 */
+	processIncarnation?: string;
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
@@ -37,6 +44,8 @@ export interface IndexedSession {
 	locator: { repo: string; stateRoot: string };
 	endpointGeneration: number;
 	pid: number;
+	/** OS start incarnation of `pid` as published by its own host at registration. */
+	processIncarnation?: string;
 	endpointMtimeMs?: number;
 	live: boolean;
 	indexSeq: number;
@@ -621,6 +630,7 @@ export class SessionIndex {
 							locator: previous.locator,
 							endpointMtimeMs: previous.endpointMtimeMs,
 							lifecycleRequestId: previous.lifecycleRequestId,
+							processIncarnation: previous.processIncarnation,
 						}
 					: event,
 			);
@@ -632,6 +642,7 @@ export class SessionIndex {
 				locator: event.locator,
 				endpointGeneration: event.endpointGeneration,
 				pid: event.pid,
+				processIncarnation: event.processIncarnation,
 				endpointMtimeMs: event.endpointMtimeMs,
 				lifecycleRequestId: event.lifecycleRequestId,
 				terminalUncertain: event.type === "lifecycle_terminal" || event.terminalUncertain === true,
@@ -685,6 +696,7 @@ export class SessionIndex {
 					locator: event.locator,
 					endpointGeneration: event.endpointGeneration,
 					pid: event.pid,
+					processIncarnation: event.processIncarnation,
 					endpointMtimeMs: event.endpointMtimeMs,
 					lifecycleRequestId: event.lifecycleRequestId,
 					terminalUncertain: false,

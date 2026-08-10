@@ -741,6 +741,10 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		locator: { ...record.locator, repo: scope },
 		endpointGeneration: record.endpointGeneration,
 		pid: record.pid,
+		// Reconciliation only re-scopes the locator, so every identity fact the host
+		// published about its own process has to survive it: dropping the incarnation
+		// here would silently disarm the teardown fence for every lifecycle session.
+		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 		endpointMtimeMs: record.endpointMtimeMs,
 	});
 }
@@ -1947,15 +1951,35 @@ export async function readSessionLifecycleFailureForTest(
 		: undefined;
 }
 
-async function hasDurableProcessIdentity(
-	root: string,
-	id: string,
-	pid: number,
-	expected?: EffectMarker,
-): Promise<boolean> {
-	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
-	if (!marker || marker.pid !== pid || (expected && !sameEffectMarker(marker, expected))) return false;
-	return marker.incarnation === processIncarnation(pid);
+/** Everything a signal target must prove about itself before it can be signalled. */
+type SignalTarget = {
+	locator: { stateRoot: string };
+	pid: number;
+	lifecycleRequestId?: string;
+	processIncarnation?: string;
+};
+
+/**
+ * The spawn-time marker is the strongest evidence — the broker itself wrote it for
+ * exactly this pid — but it lives in the session's own workspace state root. A
+ * workspace deleted while its host keeps running takes that evidence with it, and
+ * the host then survives every later `session.close` as an orphan still serving the
+ * source it started with. The registration its host published into the broker-owned
+ * index carries the same pid-to-incarnation binding, outlives the workspace, and is
+ * therefore consulted when the marker is absent. A marker naming a different process
+ * is contradiction rather than absence and still refuses the signal, and either
+ * source is only accepted while the pid's current OS incarnation still matches it.
+ */
+async function hasDurableProcessIdentity(target: SignalTarget, id: string, expected?: EffectMarker): Promise<boolean> {
+	const marker = await readEffectMarker(lifecycleMarkerPath(target.locator.stateRoot, id));
+	if (marker)
+		return (
+			marker.pid === target.pid &&
+			(!expected || sameEffectMarker(marker, expected)) &&
+			marker.incarnation === processIncarnation(target.pid)
+		);
+	if (expected && (expected.pid !== target.pid || target.lifecycleRequestId !== expected.effectMarker)) return false;
+	return target.processIncarnation !== undefined && target.processIncarnation === processIncarnation(target.pid);
 }
 
 async function hasOwnedReadinessEvidence(
@@ -2229,14 +2253,14 @@ async function terminateSpawnedChild(
 }
 
 async function signalVerifiedSession(
-	record: { locator: { stateRoot: string }; pid: number },
+	record: SignalTarget,
 	id: string,
 	signal: NodeJS.Signals,
 	expected?: EffectMarker,
 ): Promise<boolean> {
-	if (!(await hasDurableProcessIdentity(record.locator.stateRoot, id, record.pid, expected))) return false;
+	if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
 	try {
-		if (!(await hasDurableProcessIdentity(record.locator.stateRoot, id, record.pid, expected))) return false;
+		if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
 		process.kill(record.pid, signal);
 		return true;
 	} catch {
@@ -2276,6 +2300,24 @@ async function waitForClose(
 			hasObservedProcessExit(record.pid)
 		)
 			return true;
+		// A host that dies before it can withdraw its own registration — killed
+		// mid-teardown, or unable to finish one because its workspace is gone —
+		// leaves the index advertising a session whose process is provably absent.
+		// That is exactly the evidence the dead-registration sweep retires records
+		// on, so retire it here too instead of escalating signals at a pid that no
+		// longer exists and then reporting the teardown as unfinished.
+		if (registration && hasObservedProcessExit(record.pid)) {
+			await broker.index.append({
+				type: "host_unregistered",
+				sessionId: id,
+				locator: registration.locator,
+				endpointGeneration: registration.endpointGeneration,
+				pid: registration.pid,
+				...(registration.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registration.endpointMtimeMs }),
+				...(registration.lifecycleRequestId ? { lifecycleRequestId: registration.lifecycleRequestId } : {}),
+			});
+			return true;
+		}
 		await timing.sleep(POLL_MS);
 	}
 	return false;
