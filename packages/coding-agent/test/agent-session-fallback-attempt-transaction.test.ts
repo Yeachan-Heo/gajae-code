@@ -93,6 +93,32 @@ function typedFirstEventTimeoutStream(model: Model): AssistantMessageEventStream
 	});
 	return stream;
 }
+
+function zeroTokenEmptyStopStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "done", reason: "stop", message });
+	});
+	return stream;
+}
 function toolUseStream(model: Model, toolCall: ToolCall): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -292,6 +318,27 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			);
 		expect(lifecycle.slice(-3)).toEqual(["message_end", "turn_end", "agent_end"]);
 		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("discards a zero-token empty stop and accepts the fallback response", async () => {
+		const calls: string[] = [];
+		createSession((model, context, options) => {
+			calls.push(selector(model));
+			return calls.length === 1
+				? zeroTokenEmptyStopStream(model)
+				: createMockModel({ responses: [{ content: ["accepted"] }] }).stream(model, context, options);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("recover from empty response");
+		await session!.waitForIdle();
+
+		expect(calls).toHaveLength(2);
+		expect(assistantLifecycleEvents(events).filter(event => event.type === "message_start")).toHaveLength(1);
+		expect(session!.messages.filter(message => message.role === "assistant")).toEqual([
+			expect.objectContaining({ content: [expect.objectContaining({ type: "text", text: "accepted" })] }),
+		]);
 	});
 
 	it("emits exhausted completion exactly once through the agent finalizer", async () => {

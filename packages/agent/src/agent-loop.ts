@@ -10,6 +10,7 @@ import {
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
+	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
 	isZodSchema,
 	streamSimple,
@@ -173,6 +174,18 @@ function managedRetryableFailure(failure: unknown): boolean {
 	// downstream would block healthy credentials on the way.
 	if (trigger.class === "auth") return trigger.authDisposition !== "forbidden";
 	return trigger.class === "rate_limit" || trigger.class === "quota" || trigger.class === "server";
+}
+
+function isZeroUsageEmptyStop(message: AssistantMessage): boolean {
+	return (
+		message.stopReason === "stop" &&
+		message.content.length === 0 &&
+		message.usage.input === 0 &&
+		message.usage.output === 0 &&
+		message.usage.cacheRead === 0 &&
+		message.usage.cacheWrite === 0 &&
+		message.usage.totalTokens === 0
+	);
 }
 
 /**
@@ -1755,6 +1768,14 @@ async function runLoopBody(
 				}
 			}
 
+			if (isZeroUsageEmptyStop(message)) {
+				message.stopReason = "error";
+				message.errorMessage = "Provider returned an empty response with zero token usage";
+				message.transportFailure = {
+					kind: "transport",
+					providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+				};
+			}
 			const overflow = managedContextOverflow(message, config);
 			if (config.fallbackManaged && overflow) {
 				transaction?.discard();

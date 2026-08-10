@@ -24,6 +24,8 @@ export interface FallbackTrigger {
 
 /** Stable code for streams that time out before producing semantic progress. */
 export const STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE = "stream_first_event_timeout";
+/** Stable code for a nominally successful response with no content or token usage. */
+export const EMPTY_RESPONSE_PROVIDER_CODE = "empty_response";
 
 export type TransportHeaders = Headers | Record<string, string | undefined>;
 
@@ -212,7 +214,8 @@ export function transportFailureFacts(
 		!isAuthCode(normalizedCode) &&
 		!isRateLimitCode(normalizedCode) &&
 		!isContextOverflowCode(normalizedCode) &&
-		normalizedCode !== STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE
+		normalizedCode !== STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE &&
+		normalizedCode !== EMPTY_RESPONSE_PROVIDER_CODE
 	) {
 		return undefined;
 	}
@@ -320,7 +323,7 @@ export function classifyFallbackTrigger(
 	);
 	const code = codes[0] ?? codes[1] ?? codes[2];
 	const triggerClass: FallbackTriggerClass =
-		code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE
+		code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE || code === EMPTY_RESPONSE_PROVIDER_CODE
 			? "server"
 			: isQuotaCode(code)
 				? "quota"
