@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Anthropic thinking-replay repairs caused by a deterministic rejection now stay in force for the rest of the session instead of being released as soon as the repaired retry succeeds. `thinking`/`redacted_thinking` blocks that draw a 400 (`blocks ... cannot be modified`, `Invalid \`signature\` in \`thinking\` block`) stay in the session history, so releasing the repair made the very next turn replay the same blocks and spend another rejected round trip — every turn, indefinitely. Observed against a proxied Claude Code session as a sustained ~50% 400 rate that never converged. The speculative masked-`api_error` probe is still released on the first completed stream, since that one may have been a transient blip (#4011).
+
 ## [0.12.21] - 2026-08-09
 
 ## [0.12.20] - 2026-08-09

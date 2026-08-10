@@ -355,6 +355,49 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(JSON.stringify(requestBodies[3])).toContain("sig_late");
 	});
 
+	// A "cannot be modified" rejection is caused by blocks that stay in this
+	// session's history, so a repair that fixed one turn has to stay in force.
+	// Releasing it once the retry succeeds makes the next turn replay the same
+	// blocks and burn another rejected round trip — on every turn, indefinitely.
+	it("keeps a deterministic thinking repair in force on later turns", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("early", "early answer"),
+				{ ...user, content: "second", timestamp: Date.now() + 1 },
+				makeSignedAssistant("late", "late answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 2 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		// Anthropic rejects exactly the requests that replay native thinking, which
+		// is what makes this failure deterministic rather than a transient blip.
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			const replaysThinking = JSON.stringify(body).includes("sig_");
+			return (replaysThinking ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const firstTurn = await streamAnthropic(model, context, { client, providerSessionState }).result();
+
+		// Rejected replay, then a repaired retry with thinking dropped.
+		expect(firstTurn.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(2);
+
+		const secondTurn = await streamAnthropic(model, context, { client, providerSessionState }).result();
+
+		expect(secondTurn.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(3);
+		expect(JSON.stringify(requestBodies[2])).not.toContain("sig_");
+	});
+
 	// The masked body says nothing, so the guard must be the request: with no
 	// replayed thinking blocks the failure is somebody else's and retrying would
 	// only hide it behind a second identical request.

@@ -1480,6 +1480,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope =
 				providerSessionState?.thinkingReplayRepairScope ?? "none";
 			let thinkingReplayRepairAttempts = providerSessionState?.thinkingReplayRepairAttempts ?? 0;
+			// A scope inherited from an earlier turn can only have come from the
+			// deterministic branch below — the speculative masked-`api_error` probe is
+			// never persisted — so a completed stream must not release it.
+			let thinkingReplayRepairPersistent = thinkingReplayRepairScope !== "none";
 			let generatedCacheBudget: GeneratedCacheBudget = providerSessionState?.generatedCacheBudget ?? 2;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				// Degradation state is cumulative: every fallback rebuild must merge all
@@ -1918,7 +1922,17 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					// branch above fires on an error nobody can classify, so keeping its
 					// guess would silently strip native thinking replay from every later
 					// turn of the session over what may have been one transient blip.
-					if (providerSessionState && (thinkingReplayRepairScope !== "none" || thinkingReplayRepairAttempts > 0)) {
+					//
+					// A deterministic rejection ("cannot be modified" / invalid signature) is
+					// the opposite case: it cites blocks that stay in this session's history,
+					// so releasing the repair here makes the next turn replay the same blocks
+					// and spend another rejected round trip on every turn that follows. That
+					// repair has to outlive the stream it fixed.
+					if (
+						providerSessionState &&
+						!thinkingReplayRepairPersistent &&
+						(thinkingReplayRepairScope !== "none" || thinkingReplayRepairAttempts > 0)
+					) {
 						providerSessionState.thinkingReplayRepairScope = "none";
 						providerSessionState.thinkingReplayRepairAttempts = 0;
 					}
@@ -2007,6 +2021,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
 						thinkingReplayRepairScope = nextScope;
+						// Anything but the masked probe is caused by blocks that remain in
+						// history, so this repair must survive the stream it is about to fix.
+						if (!maskedProxyRejection) thinkingReplayRepairPersistent = true;
 						if (providerSessionState) {
 							providerSessionState.thinkingReplayRepairAttempts = thinkingReplayRepairAttempts;
 							if (!maskedProxyRejection) {
