@@ -127,3 +127,14 @@ gjc --mpreset ultimate --default  # persist as the startup default (config.yml)
 ```
 
 Activation hard-blocks when any provider in `required_providers` lacks credentials, so log in first: `/login anthropic`, `/login openai-codex`, `/login google-antigravity`, `/login xai` (and `opencode-go` via `OPENCODE_API_KEY`).
+
+### Serving cross-vendor profiles through one OpenAI-compatible proxy
+
+When a single gateway (LiteLLM, OpenRouter, or a custom proxy) fronts several vendors, you do not need to configure every `required_providers` entry directly. Add the gateway as a provider — `gjc setup provider --preset litellm --base-url <url>` or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` — and point `modelProfile.proxyProvider` at it in `config.yml`:
+
+```yaml
+modelProfile:
+  proxyProvider: litellm
+```
+
+For **built-in** presets whose direct provider is unauthenticated, activation then rewrites that preset's selectors through the proxy (for example `xai/grok-4.3` → `litellm/xai/grok-4.3`), so a `grok-*` tier activates on your gateway's grok entry rather than hard-blocking. Directly authenticated providers keep their direct endpoints; the proxy is a fallback, never an override. User-defined profiles are never rewritten — set their selectors to `litellm/…` explicitly if you want them proxied. Routing and fail-closed behavior are documented in [Routing built-in presets through a proxy](./models.md#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider).

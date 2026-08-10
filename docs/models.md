@@ -251,6 +251,23 @@ gjc --mpreset codex-medium
 gjc --mpreset opencodego --default
 ```
 
+### Routing built-in presets through a proxy (`modelProfile.proxyProvider`)
+
+Built-in preset selectors pin a direct provider endpoint (`xai/grok-4.3`, `xiaomi/mimo-v2.5-pro`, …). To serve those models through your own OpenAI-compatible gateway (LiteLLM, OpenRouter, or a custom proxy) instead of each vendor's endpoint, set the proxy provider id in `config.yml`:
+
+```yaml
+modelProfile:
+  proxyProvider: litellm
+```
+
+The proxy provider is a normal `providers:` entry. Add it with `gjc setup provider --preset litellm --base-url <url>` or the generic `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (both presets require `--base-url` and use live model discovery). When a built-in preset's direct provider is **not authenticated** but the proxy is, activation rewrites that preset's selectors from `<direct-provider>/<model>` to `<proxy>/<direct-provider>/<model>` (for example `xai/grok-4.3` → `litellm/xai/grok-4.3`), matching the proxy's own catalog entry for the model. The rules:
+
+- Routing applies to **built-in presets only**. User-defined `profiles:` entries always keep their exact selectors — set them explicitly if you want them proxied.
+- A direct provider that **is** authenticated keeps its direct selectors; the proxy is a fallback for missing credentials, never an override.
+- If a routable provider is unauthenticated and the proxy is unset **or** unauthenticated, activation fails closed with a credential error naming the proxy (or the direct provider when no proxy is configured). `auth: none` proxies count as authenticated.
+- Only providers the bundled preset catalog treats as routable are rewritten; providers outside that set (for example a custom `acme-private`) keep the direct credential error.
+- A selector whose model id is missing from the proxy's catalog is left unchanged, so the usual `selector did not resolve` error surfaces instead of a silent misroute.
+
 The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically. Custom providers participate in provider-agnostic alias resolution but require manual preset selection.
 
 External SDK/ACP clients (e.g. the Paseo TUI) can select profiles like ordinary models: the SDK `models.list/current` (Q10) catalog exposes every usable profile as a synthetic `gajae-code/<profile>` entry (e.g. `gajae-code/codex-eco`), and selecting one through `model.set` (or the ACP Model picker) activates the profile for the live session only. Persisting a profile remains an explicit TUI choice, mirroring `gjc --mpreset <name> --default`. See [SDK model profiles](./sdk.md#model-profiles-as-synthetic-models-gajae-codeprofile).
@@ -325,6 +342,7 @@ translation protocol that GJC does not implement, so they are deliberately not b
 ## OpenAI-compatible proxy configuration
 
 OpenAI-compatible proxy providers should use schema-supported provider keys first:
+The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config:
 
 ```yaml
 providers:

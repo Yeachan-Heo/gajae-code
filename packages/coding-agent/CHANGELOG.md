@@ -19,6 +19,9 @@
 - Read-tool code summarization and ZIP extraction now run asynchronously instead of blocking the TUI event loop during structural parsing or decompression.
 - `secrets.yml` entries with `mode: "replace"` and no explicit `replacement` now derive their substitute from a keyed, domain-separated HMAC-SHA256 construction over the process key instead of an unkeyed public `Bun.hash`. Derived replacements are no longer confirmable offline without the key (issue #4166); same-process determinism, same-length output, and alphanumeric character behavior are preserved, and explicit `replacement` values are unchanged. Note: derived replacements differ across processes/key rotations — set an explicit `replacement` when a stable value is required.
 
+### Added
+- `gjc setup provider` now ships parameterized proxy presets: `--preset litellm` and `--preset openai-compatible-proxy` (aliases `litellm-proxy`, `openai-proxy`, `compatible-proxy`, `custom-proxy`) with a required `--base-url`, configurable `--api-key-env`, and live model discovery (#4123).
+- New `modelProfile.proxyProvider` setting routes built-in model-preset selectors through an authenticated OpenAI-compatible proxy (e.g. `xai/grok-4.3` → `litellm/xai/grok-4.3`) when the preset's direct provider is unauthenticated. Routing is limited to built-in presets, fails closed when the proxy is unauthenticated, and never overrides a directly-authenticated provider (#4123).
 ## [0.12.21] - 2026-08-09
 
 ### Fixed

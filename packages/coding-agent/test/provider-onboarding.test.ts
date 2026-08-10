@@ -535,6 +535,96 @@ describe("provider onboarding setup core", () => {
 
 		expect(await Bun.file(modelsPath).exists()).toBe(false);
 	});
+	it("requires --base-url for parameterized proxy presets", async () => {
+		const modelsPath = await tempModelsPath();
+		await expect(
+			addApiCompatibleProvider({
+				preset: "litellm",
+				modelsPath,
+			}),
+		).rejects.toThrow("requires --base-url");
+		await expect(
+			addApiCompatibleProvider({
+				preset: "openai-compatible-proxy",
+				modelsPath,
+			}),
+		).rejects.toThrow("requires --base-url");
+		expect(await Bun.file(modelsPath).exists()).toBe(false);
+	});
+
+	it("adds a LiteLLM proxy preset with a user-supplied base URL and live discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({
+			preset: "litellm",
+			baseUrl: "http://127.0.0.1:4000",
+			apiKeyEnv: "LITELLM_API_KEY",
+			modelsPath,
+		});
+
+		expect(result.providerId).toBe("litellm");
+		expect(result.preset).toBe("litellm");
+		expect(result.baseUrl).toBe("http://127.0.0.1:4000");
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<string, { baseUrl: string; apiKeyEnv: string; discovery?: { type: string } }>;
+		};
+		expect(parsed.providers.litellm?.baseUrl).toBe("http://127.0.0.1:4000");
+		expect(parsed.providers.litellm?.apiKeyEnv).toBe("LITELLM_API_KEY");
+		expect(parsed.providers.litellm?.discovery?.type).toBe("openai-models-list");
+	});
+
+	it("adds a generic OpenAI-compatible proxy preset with a user-supplied base URL", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({
+			preset: "openai-proxy",
+			baseUrl: "https://gateway.example.com/v1",
+			apiKeyEnv: "GATEWAY_KEY",
+			modelsPath,
+		});
+
+		expect(result.providerId).toBe("openai-compatible-proxy");
+		expect(result.preset).toBe("openai-compatible-proxy");
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<string, { baseUrl: string; apiKeyEnv: string }>;
+		};
+		expect(parsed.providers["openai-compatible-proxy"]?.baseUrl).toBe("https://gateway.example.com/v1");
+		expect(parsed.providers["openai-compatible-proxy"]?.apiKeyEnv).toBe("GATEWAY_KEY");
+	});
+
+	it("rejects provider preset attempts to pin models on parameterized proxy presets", async () => {
+		const modelsPath = await tempModelsPath();
+		await expect(
+			addApiCompatibleProvider({
+				preset: "litellm",
+				baseUrl: "http://127.0.0.1:4000",
+				models: ["gpt-example"],
+				modelsPath,
+			}),
+		).rejects.toThrow("discovers models automatically");
+		expect(await Bun.file(modelsPath).exists()).toBe(false);
+	});
+
+	it("allows overriding the API key env on parameterized proxy presets", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({
+			preset: "litellm",
+			baseUrl: "http://127.0.0.1:4000",
+			apiKeyEnv: "MY_PROXY_KEY",
+			modelsPath,
+		});
+
+		expect(result.credentialSource).toBe("env");
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers: Record<string, { apiKeyEnv: string }>;
+		};
+		expect(parsed.providers.litellm?.apiKeyEnv).toBe("MY_PROXY_KEY");
+	});
+
+	it("resolves parameterized proxy preset aliases", () => {
+		expect(findProviderPreset("litellm-proxy")?.id).toBe("litellm");
+		expect(findProviderPreset("openai-proxy")?.id).toBe("openai-compatible-proxy");
+		expect(formatProviderPresetList()).toContain("litellm");
+		expect(formatProviderPresetList()).toContain("openai-compatible-proxy");
+	});
 
 	it("keeps generic OpenAI-compatible custom provider setup available for custom values", async () => {
 		const modelsPath = await tempModelsPath();

@@ -522,6 +522,16 @@ export const SETTINGS_SCHEMA = {
 			options: "runtime",
 		},
 	},
+	"modelProfile.proxyProvider": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			label: "Proxy Provider",
+			description:
+				"Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) that built-in model preset selectors are routed through when the preset's direct provider is not configured. Only selectors for presets whose direct provider is unauthenticated are rewritten to <proxy>/<model>. Leave unset to keep direct provider endpoints.",
+		},
+	},
 	"session.resumeModelBehavior": {
 		type: "enum",
 		values: ["keepSessionModel", "useCurrentDefault", "ask"] as const,

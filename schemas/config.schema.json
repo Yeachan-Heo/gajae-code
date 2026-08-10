@@ -408,6 +408,10 @@
 				"default": {
 					"type": "string",
 					"description": "Model profile applied automatically at startup"
+				},
+				"proxyProvider": {
+					"type": "string",
+					"description": "Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) that built-in model preset selectors are routed through when the preset's direct provider is not configured. Only selectors for presets whose direct provider is unauthenticated are rewritten to <proxy>/<model>. Leave unset to keep direct provider endpoints."
 				}
 			},
 			"additionalProperties": false

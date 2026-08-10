@@ -47,12 +47,18 @@ interface ProviderPreset {
 	compatibility: ProviderCompatibility;
 	api: ProviderSetupApi;
 	providerId: string;
-	baseUrl: string;
+	baseUrl?: string;
 	apiKeyEnv: string;
 	models?: readonly string[];
 	modelApi?: Readonly<Record<string, ProviderSetupApi>>;
 	compat?: ProviderCompatConfig;
 	discovery?: ProviderDiscovery;
+	/**
+	 * Parameterized presets (proxy gateways) do not hardcode a base URL or an
+	 * unoverridable apiKeyEnv: the caller must supply `--base-url` and may
+	 * override `--api-key-env`. `baseUrl` is absent for these presets.
+	 */
+	parameterized?: boolean;
 }
 
 const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
@@ -144,9 +150,14 @@ function resolvePresetInput(input: ProviderSetupInput): {
 			`Provider preset '${preset.id}' is ${preset.compatibility}-compatible; omit --compat or use '${preset.compatibility}'.`,
 		);
 	}
-	if (preset && input.baseUrl !== undefined) {
+	if (preset && input.baseUrl !== undefined && !preset.parameterized) {
 		throw new Error(
 			`Provider preset '${preset.id}' uses a fixed base URL; omit --base-url or use --compat openai for a custom provider.`,
+		);
+	}
+	if (preset?.parameterized && !input.baseUrl) {
+		throw new Error(
+			`Provider preset '${preset.id}' requires --base-url <url> (your proxy endpoint). Use --compat openai for a fully custom provider instead.`,
 		);
 	}
 	if (preset && input.models && input.models.length > 0) {
@@ -156,7 +167,12 @@ function resolvePresetInput(input: ProviderSetupInput): {
 			`Provider preset '${preset.id}' ${catalogMode}; omit --model or use --compat openai for a custom provider.`,
 		);
 	}
-	if (preset && input.apiKeyEnv !== undefined && input.apiKeyEnv.trim() !== preset.apiKeyEnv) {
+	if (
+		preset &&
+		input.apiKeyEnv !== undefined &&
+		!preset.parameterized &&
+		input.apiKeyEnv.trim() !== preset.apiKeyEnv
+	) {
 		throw new Error(
 			`Provider preset '${preset.id}' uses ${preset.apiKeyEnv}; omit --api-key-env or use --compat openai for a custom provider.`,
 		);
