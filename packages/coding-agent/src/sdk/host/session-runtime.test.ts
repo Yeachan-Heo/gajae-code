@@ -104,6 +104,38 @@ test("a late agent failure never overwrites the reason an already terminal recor
 	expect(reconciliation.lookup("prompt", { clientRef: "first-reason-ref" })).toEqual(claimed);
 });
 
+test("a reason attached after a prompt settled is never replaced by a later failure", async () => {
+	const reconciliation = createInvocationReconciliation();
+	const correlation = { commandId: "late-reason-command", turnId: "late-reason-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "late-reason-ref");
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	const claimed = reconciliation.lookup("prompt", { clientRef: "late-reason-ref" }) as Record<string, unknown>;
+	expect(claimed).toEqual({
+		status: "terminal_ok",
+		commandId: "late-reason-command",
+		turnId: "late-reason-turn",
+		clientRef: "late-reason-ref",
+		acceptedAt: expect.any(Number),
+		terminalAt: expect.any(Number),
+	});
+	// A failure delivered after the record settled enriches it with the sanitized reason and
+	// leaves the terminal claim itself (status, terminalAt, identity) untouched.
+	await reconciliation.noteTransition("prompt", correlation, {
+		type: "agent_failed",
+		error: Object.assign(new Error("late provider failure"), { code: "upstream_error" }),
+	});
+	const enriched = reconciliation.lookup("prompt", { clientRef: "late-reason-ref" });
+	expect(enriched).toEqual({ ...claimed, error: { code: "upstream_error", message: "Prompt submission failed." } });
+	// First reason wins on the enrichment path too: a second, different late failure changes
+	// nothing. The sleep makes a re-stamped terminalAt observable.
+	await Bun.sleep(2);
+	await reconciliation.noteTransition("prompt", correlation, {
+		type: "agent_failed",
+		error: Object.assign(new Error("transport reset"), { code: "transport_reset" }),
+	});
+	expect(reconciliation.lookup("prompt", { clientRef: "late-reason-ref" })).toEqual(enriched);
+});
+
 test("redacts a persisted host failure during hydration", async () => {
 	const stateRoot = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-reconciliation-"));
 	const sessionId = "hydrated-failure";
@@ -509,16 +541,13 @@ describe("post-acceptance invocation terminalization", () => {
 			// A lifecycle frame arriving after the terminal must not resurrect the record either.
 			await harness.emit("agent_start");
 			const settled = await harness.query("turn.prompt_status", { commandId, turnId });
-			// A late reason may attach to a settled record that has none (#4105), so `error` is the
-			// only field allowed to appear; status, terminalAt, and identity stay exactly as claimed.
+			// The late reason attaches to the settled record, so `error` is the only field that may
+			// appear; status, terminalAt, and identity stay exactly as claimed.
 			const { error: _claimedReason, ...claimedTerminal } = claimed;
 			const { error: _lateReason, ...settledTerminal } = settled.result ?? {};
 			expect(settledTerminal).toEqual(claimedTerminal);
-			// Recorded or not, the reason is the sanitized late failure: never fabricated, never raw.
-			// Once #4105 lands the reason is always recorded, and this allow-list collapses to one shape.
-			expect([undefined, { code: "upstream_error", message: "Prompt submission failed." }]).toContainEqual(
-				settled.result?.error,
-			);
+			// The recorded reason is the sanitized late failure: never fabricated, never raw.
+			expect(settled.result?.error).toEqual({ code: "upstream_error", message: "Prompt submission failed." });
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
