@@ -149,6 +149,8 @@ export interface ForceCloseOwnerDependencies {
 	now(): Date;
 	sleep(ms: number): Promise<void>;
 	listPanePids(sessionName: string, env: NodeJS.ProcessEnv): number[];
+	/** Test/runtime seam for an exact owner-exit observer; durable validation remains authoritative. */
+	waitForOwnerExitVerdict?(): Promise<OwnerVerdict>;
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 
@@ -1459,7 +1461,7 @@ export async function forceCloseGjcTmuxSession(
 	const now = deps.now ?? (() => new Date());
 	const sleep = deps.sleep ?? (ms => Bun.sleep(ms));
 	const dispatchId = crypto.randomUUID();
-	let operatorVerdict: Promise<OwnerVerdict> | null = null;
+	let operatorVerdict: Promise<OwnerVerdict> | null = deps.waitForOwnerExitVerdict?.() ?? null;
 	await closeExactTmuxOwner(
 		{
 			stateDir: identity.stateDir,

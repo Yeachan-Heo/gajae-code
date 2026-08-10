@@ -38,10 +38,15 @@ export type SdkSessionEndpointScope = "default" | "chat";
 function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "default"): string {
 	return scope === "chat" ? path.join(repo, ".gjc", "state", "chat", "sdk") : path.join(repo, ".gjc", "state", "sdk");
 }
-const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-
 function isUsableSessionId(sessionId: string): boolean {
-	return SESSION_ID_PATTERN.test(sessionId);
+	return (
+		sessionId.length > 0 &&
+		sessionId !== "." &&
+		sessionId !== ".." &&
+		!sessionId.includes("/") &&
+		!sessionId.includes("\\") &&
+		!sessionId.includes("\0")
+	);
 }
 
 function parseEndpoint(sessionId: string, file: string, value: unknown): SdkSessionEndpoint {

@@ -72,8 +72,8 @@ describe("SDK session index", () => {
 	it("serializes six isolated launchers past the legacy five-second contention ceiling", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-six-launches-"));
 		const agentDir = path.join(root, "agent");
-		const worktrees = Array.from({ length: 6 }, (_, index) => path.join(root, `worktree-${index + 1}`));
-		await Promise.all(worktrees.map(worktree => fs.mkdir(worktree, { recursive: true })));
+		const laneDirs = Array.from({ length: 6 }, (_, index) => path.join(root, `lane-${index + 1}`));
+		await Promise.all(laneDirs.map(laneDir => fs.mkdir(laneDir, { recursive: true })));
 		const helper = path.join(root, "append-session.ts");
 		const sessionIndexModule = path.resolve(import.meta.dir, "../src/sdk/broker/session-index.ts");
 		await fs.writeFile(
@@ -88,9 +88,9 @@ describe("SDK session index", () => {
 			await release.promise;
 		});
 		await entered.promise;
-		const children = worktrees.map((worktree, index) =>
+		const children = laneDirs.map((laneDir, index) =>
 			Bun.spawn([process.execPath, helper, agentDir, `lane-${index + 1}`], {
-				cwd: worktree,
+				cwd: laneDir,
 				env: {
 					PATH: process.env.PATH ?? "",
 					HOME: process.env.HOME ?? root,

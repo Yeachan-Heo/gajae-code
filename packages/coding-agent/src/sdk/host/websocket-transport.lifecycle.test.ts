@@ -47,7 +47,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 		await expect(fs.stat(endpointPath)).rejects.toMatchObject({ code: "ENOENT" });
 		await fs.rm(stateRoot, { recursive: true, force: true });
 	});
-	test("six isolated worktrees publish unique probeable discovery records", async () => {
+	test("six isolated roots publish unique probeable discovery records", async () => {
 		const roots = await Promise.all(Array.from({ length: 6 }, () => tempStateRoot()));
 		const transports = await Promise.all(
 			roots.map((stateRoot, index) =>

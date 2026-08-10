@@ -1195,7 +1195,7 @@ describe("GJC tmux session management", () => {
 		).rejects.toThrow("gjc_tmux_owner_changed:managed");
 		expect(cleanupSession).not.toHaveBeenCalled();
 	});
-	it("requires a matching SIGTERM verdict before compatibility cleanup", async () => {
+	it("recovers a matching durable SIGTERM verdict when the owner-exit observer fails", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-"));
 		const sessionId = "session";
 		const generation = "generation";
@@ -1241,6 +1241,8 @@ describe("GJC tmux session management", () => {
 		}) as unknown as typeof Bun.spawnSync);
 		injectSafeMutationProof();
 		let signaled = false;
+		const failedOwnerExitVerdict = Promise.reject(new Error("injected owner-exit observer failure"));
+		void failedOwnerExitVerdict.catch(() => {});
 		await forceCloseGjcTmuxSession(
 			"managed",
 			{ GJC_TMUX_COMMAND: "tmux" },
@@ -1256,6 +1258,7 @@ describe("GJC tmux session management", () => {
 					startTime: "10",
 				}),
 				readProcessStartTime: async () => "10",
+				waitForOwnerExitVerdict: () => failedOwnerExitVerdict,
 				signalTerm: () => {
 					signaled = true;
 				},
