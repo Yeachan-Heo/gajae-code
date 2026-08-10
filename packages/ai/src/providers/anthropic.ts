@@ -2369,6 +2369,36 @@ function hasNativeThinkingBlocks(messages: MessageParam[]): boolean {
 	);
 }
 
+/**
+ * Would the latest assistant turn lose a thinking block on its way to the wire?
+ *
+ * `convertAnthropicMessages` can only replay a `thinking` block natively when it
+ * still carries the bytes Anthropic signed. A block that arrived as a bare
+ * start/stop pair — no `thinking_delta`, no `signature_delta` — has neither, so
+ * it is silently dropped, and Anthropic rejects the turn it produced for coming
+ * back without it. Same for a `redactedThinking` block whose opaque payload is
+ * gone. Only the latest assistant message is inspected because that is the turn
+ * Anthropic validates against its own output.
+ */
+function latestAssistantThinkingIsUnreplayable(messages: Message[], model: Model<"anthropic-messages">): boolean {
+	const index = messages.findLastIndex(message => message.role === "assistant");
+	if (index < 0) return false;
+
+	const assistant = messages[index] as AssistantMessage;
+	// Cross-API history degrades to text rather than replaying native blocks, so
+	// nothing is lost and nothing needs repairing.
+	if (assistant.api !== "anthropic-messages") return false;
+	// Endpoints that never sign thinking replay unsigned blocks verbatim.
+	const requiresSignature = !isNonSigningAnthropicEndpoint(model);
+
+	return assistant.content.some(block => {
+		if (block.type === "redactedThinking") return block.data.trim().length === 0;
+		if (block.type !== "thinking") return false;
+		if (block.thinking.trim().length === 0) return true;
+		return requiresSignature && !block.thinkingSignature?.trim();
+	});
+}
+
 function mapAnthropicToolChoice(
 	toolChoice: NonNullable<ResolveToolChoiceResult["resolvedChoice"]>,
 	isOAuthToken: boolean,
@@ -2721,6 +2751,27 @@ function buildParams(
 	// replay has to degrade in the same rebuild. Runs before the billing/system payload
 	// snapshot so the attribution hash covers the messages actually sent.
 	if (disableThinkingIfToolChoiceForced(params) && hasNativeThinkingBlocks(params.messages)) {
+		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
+			...thinkingRepair,
+			repairAllAssistantThinking: true,
+		});
+	}
+
+	// Anthropic compares the latest assistant message against the turn it actually
+	// produced, and rejects it when a `thinking`/`redacted_thinking` block that was
+	// in that response is missing. A block Anthropic streamed as a start/stop pair
+	// with no `thinking_delta` and no `signature_delta` lands in history empty and
+	// unsigned, and `convertAnthropicMessages` then drops it: the turn goes back
+	// carrying only its `tool_use`, and the request is rejected before a token
+	// streams. The rejection is recoverable — the repair drops native thinking from
+	// the whole replay — but only after a full round trip has been spent, and the
+	// condition is visible locally, so detect it here and degrade in the first
+	// build instead of paying for the 400 to discover it.
+	if (
+		!thinkingRepair?.repairAllAssistantThinking &&
+		latestAssistantThinkingIsUnreplayable(context.messages, model) &&
+		hasNativeThinkingBlocks(params.messages)
+	) {
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,
