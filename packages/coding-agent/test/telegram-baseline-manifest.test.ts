@@ -327,6 +327,7 @@ describe("test manifest runner", () => {
 		const fake = await fakeBun(directory);
 		const result = run(runner, [manifestPath], {
 			GJC_MANIFEST_RECEIPT_LOG: fake.log,
+			GJC_MANIFEST_RECEIPT_CONCURRENCY: "8",
 			PATH: `${fake.binDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
 		});
 
@@ -335,10 +336,19 @@ describe("test manifest runner", () => {
 		expect(output(result)).toContain(
 			"manifest row receipts complete: 576 (telegram=96, discord=96, slack=96, mcp=96, acp=96, daemonCli=96)",
 		);
+		// Receipts run concurrently inside a phase, so their relative order carries
+		// no evidence; what must hold is that every declared receipt ran exactly
+		// once as its own process, and that no parity row started before the
+		// behavioral commands had all reported.
 		const invocations = (await Bun.file(fake.log).text()).trim().split("\n");
 		expect(invocations).toHaveLength(manifest.commands.length + manifest.rows.length);
-		expect(invocations[0]).toBe(`test ${manifest.commands[0]?.argv.slice(2).join(" ")}`);
-		expect(invocations.at(-1)).toBe(`test ${manifest.rows.at(-1)?.argv.slice(2).join(" ")}`);
+		const expected = (argv: string[]) => `test ${argv.slice(2).join(" ")}`;
+		expect(invocations.slice(0, manifest.commands.length).sort()).toEqual(
+			manifest.commands.map(command => expected(command.argv)).sort(),
+		);
+		expect(invocations.slice(manifest.commands.length).sort()).toEqual(
+			manifest.rows.map(row => expected(row.argv)).sort(),
+		);
 	}, 300_000);
 });
 
