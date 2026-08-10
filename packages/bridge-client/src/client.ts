@@ -34,6 +34,8 @@ export interface SdkClientOptions {
 	 * on its last attempts. Defaults to 2s.
 	 */
 	reconnectMaxBackoffMs?: number;
+	/** Application heartbeat cadence for persistent session-host connections. */
+	clientHeartbeatMs?: number;
 }
 
 export interface SdkRequestOptions {
@@ -127,6 +129,7 @@ export class SdkClient {
 	 * deadline, or the socket leaks.
 	 */
 	readonly #closeGraceMs: number;
+	readonly #clientHeartbeatMs?: number;
 	readonly #deadline?: number;
 	#currentSocketRecord: Incarnation | null = null;
 	#opening: Cycle | null = null;
@@ -137,6 +140,7 @@ export class SdkClient {
 	#reconnectHandlers = new Set<SdkReconnectHandler>();
 	#reconnectFailedHandlers = new Set<SdkReconnectFailedHandler>();
 	#closePromise: Promise<void> | undefined;
+	#heartbeat?: NodeJS.Timeout;
 
 	#closed = false;
 	connectionId?: string;
@@ -146,6 +150,7 @@ export class SdkClient {
 		this.#token = token;
 		this.#timeoutMs = options.timeoutMs ?? 10_000;
 		this.#closeGraceMs = Math.max(1, Math.min(this.#timeoutMs, 1_000));
+		this.#clientHeartbeatMs = options.clientHeartbeatMs;
 		this.#deadline =
 			typeof options.deadline === "number" && Number.isFinite(options.deadline) ? options.deadline : undefined;
 
@@ -627,6 +632,22 @@ export class SdkClient {
 		incarnation.rejectHello = undefined;
 		resolveHello?.();
 		if (reconnecting) this.#notifyReconnectHandlers();
+		this.#startHeartbeat(incarnation);
+	}
+	#startHeartbeat(incarnation: Incarnation): void {
+		if (this.#clientHeartbeatMs === undefined) return;
+		if (this.#heartbeat) clearInterval(this.#heartbeat);
+		const heartbeat = () => {
+			if (!this.#isActive(incarnation) || !this.connectionId || incarnation.socket.readyState !== WebSocket.OPEN)
+				return;
+			try {
+				incarnation.socket.send(JSON.stringify({ type: "client_heartbeat", connectionId: this.connectionId }));
+			} catch {
+				// The socket lifecycle owns reconnect and error handling.
+			}
+		};
+		heartbeat();
+		this.#heartbeat = setInterval(heartbeat, this.#clientHeartbeatMs);
 	}
 
 	#settlePending(id: string, pending: Pending, result: unknown): void {
@@ -652,7 +673,11 @@ export class SdkClient {
 		incarnation.resolveHello = undefined;
 		incarnation.rejectHello = undefined;
 		this.#rejectPendingFor(incarnation, error);
-		if (this.#currentSocketRecord === incarnation) this.#currentSocketRecord = null;
+		if (this.#currentSocketRecord === incarnation) {
+			if (this.#heartbeat) clearInterval(this.#heartbeat);
+			this.#heartbeat = undefined;
+			this.#currentSocketRecord = null;
+		}
 		if (incarnation.cycle.candidate === incarnation) incarnation.cycle.candidate = null;
 		this.#teardown(incarnation, closeSocket);
 	}

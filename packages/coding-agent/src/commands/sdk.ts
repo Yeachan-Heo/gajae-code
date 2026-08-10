@@ -603,9 +603,24 @@ export async function runSessionHost(
 		})();
 		return failureRollback;
 	};
+	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
+	const exitAfterSessionDisposal = async (): Promise<void> => {
+		await disposeSession();
+		try {
+			await fs.stat(sessionEndpointPath);
+			process.exitCode = 1;
+			process.stderr.write(`SDK host endpoint remained after graceful shutdown: ${request.sessionId}\n`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				process.exitCode = 1;
+				process.stderr.write(`SDK host endpoint cleanup could not be verified: ${request.sessionId}\n`);
+			}
+		}
+		process.exit(process.exitCode ?? 0);
+	};
 	const stop = () => {
 		if (capability.result?.status === "started") {
-			void disposeSession().finally(() => process.exit(0));
+			void exitAfterSessionDisposal();
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");

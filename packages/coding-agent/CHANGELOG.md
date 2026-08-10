@@ -83,6 +83,7 @@
 - Edit cards now keep live calls concise when collapsed and show per-file results, diff statistics, diagnostics availability, and full details consistently when expanded.
 
 ### Fixed
+- Detached SDK session hosts now maintain authenticated client leases: persistent ACP clients heartbeat every five seconds, leases expire after fifteen seconds, and a host shuts down when no lease remains even while its broker is healthy. Endpoint removal is verified before the lifecycle host reports successful graceful shutdown, so retained endpoint files remain visible as failure rather than a false clean exit.
 
 - SDK snapshot shutdown now reserves a revision write synchronously before any asynchronous serialization work, so an immediate `close()` cannot begin terminal cleanup ahead of an in-progress spill write under heavily contended CI scheduling. The coordinator owner-intent negative matrix also receives the same 30-second contention budget used by other filesystem-backed integration cases; its assertions and four-case coverage are unchanged.
 - Provider-agnostic preset ranking now uses AuthStorage's effective selectable credential type. Unusable stored command keys no longer misclassify OAuth-backed providers, and session-selected OAuth, fail-closed selectors, blocked/expired OAuth retry, and `openai-codex-device` aliases now follow the same precedence and normalization as request dispatch.

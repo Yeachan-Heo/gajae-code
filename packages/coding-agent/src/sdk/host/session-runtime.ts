@@ -1404,6 +1404,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			onRequest: options.onSdkRequest,
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
+			onClientLivenessEmpty: () => ctx.shutdown(),
 			afterControlResponse: async (_connectionId, request, response) => {
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},

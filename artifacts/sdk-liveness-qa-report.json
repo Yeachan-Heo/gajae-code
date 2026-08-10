@@ -1,0 +1,158 @@
+{
+	"kind": "api-package-test-report",
+	"commit": "4b0ecc01b87aae59fd9ba73ee61fad30897ef6d0",
+	"branch": "repair/pr-4034-rebase",
+	"base": "d1d4807a2fa6b6747ef8ea5c03afa381e302e1af",
+	"scope": "SDK session-host authenticated-client liveness (host.ts) + bridge-client clientHeartbeatMs (PR #4034 repair)",
+	"role": "ultragoal completion QA / red-team lane",
+	"commands": [
+		"bun test packages/coding-agent/test/sdk-host.test.ts packages/coding-agent/src/sdk/host/session-runtime.test.ts packages/bridge-client/test/client.test.ts",
+		"bun --cwd=packages/bridge-client run check",
+		"bun test /tmp/sdk-liveness-qa/adversarial.test.ts",
+		"bun test /tmp/sdk-liveness-qa/client-adversarial.test.ts"
+	],
+	"results": {
+		"prQaSurface": {
+			"summary": "40 pass, 0 fail, 141 expect() calls across 3 files",
+			"perFile": {
+				"packages/coding-agent/test/sdk-host.test.ts": "12 pass, 0 fail, 53 expect() calls",
+				"packages/coding-agent/src/sdk/host/session-runtime.test.ts": "13 pass, 0 fail, 35 expect() calls",
+				"packages/bridge-client/test/client.test.ts": "15 pass, 0 fail, 53 expect() calls"
+			}
+		},
+		"bridgeClientCheck": {
+			"biomeCheck": "3 files checked, no fixes applied",
+			"tsc": "tsc -p tsconfig.json --noEmit passed"
+		},
+		"adversarialSurface": {
+			"summary": "15 pass, 0 fail, 62 expect() calls across 2 throwaway files under /tmp (not in repo)",
+			"perFile": {
+				"/tmp/sdk-liveness-qa/adversarial.test.ts": "13 pass, 0 fail, 55 expect() calls",
+				"/tmp/sdk-liveness-qa/client-adversarial.test.ts": "2 pass, 0 fail, 7 expect() calls"
+			}
+		}
+	},
+	"adversarialCases": [
+		{
+			"id": "T1",
+			"scenario": "A live-but-quiet client (non-heartbeat frames only) is never reaped, even with many sweeps.",
+			"expectedBehavior": "Leases are granted ONLY for client_heartbeat frames. Control/query/event_replay/session_activate/unknown frames from chat clients across 12 sweeps (60s fake time) never grant a lease; onClientLivenessEmpty never fires; host stays started.",
+			"verdict": "pass"
+		},
+		{
+			"id": "T2",
+			"scenario": "Disconnect + reconnect heartbeat within TTL keeps the host alive; only after TTL elapses does onClientLivenessEmpty fire exactly once.",
+			"expectedBehavior": "handleDisconnect does NOT delete the lease; a reconnect heartbeat at 5s refreshes it; sweep at 15s keeps the host alive; at 20s the lease expires and empty fires exactly once (later sweeps at 25s/30s/60s do not re-fire).",
+			"verdict": "pass"
+		},
+		{
+			"id": "T2b",
+			"scenario": "TTL boundary precision: lease reaped at exactly now - heartbeatAt >= 15000.",
+			"expectedBehavior": "Sweep at 14999ms keeps the lease; sweep at 15000ms reaps it and fires empty.",
+			"verdict": "pass"
+		},
+		{
+			"id": "T3",
+			"scenario": "Two concurrent heartbeat clients: host notifies empty only after BOTH leases expire (staggered re-heartbeat).",
+			"expectedBehavior": "Client b re-heartbeats at 5s; at 15s only a's lease is stale (empty stays 0); at 20s b's lease is stale too and empty fires once.",
+			"verdict": "pass"
+		},
+		{
+			"id": "T3b",
+			"scenario": "The last client to re-heartbeat determines when empty fires (re-heartbeat overtakes the other client's expiry).",
+			"expectedBehavior": "a re-heartbeats at 19s; b reaped at 20s (empty 0, a alive); a reaped at 34s and only then empty fires.",
+			"verdict": "pass"
+		},
+		{
+			"id": "T4",
+			"scenario": "A client that stops heartbeating mid-session (socket stays open, other frames keep flowing) is reaped after TTL.",
+			"expectedBehavior": "control_request at 10s and event_replay at 14.5s do NOT refresh the lease; sweep at 15s reaps it and fires empty.",
+			"verdict": "pass"
+		},
+		{
+			"id": "T5",
+			"scenario": "Start/stop/restart cycle: second start resets lease state so the once-only notify can fire again on the next cycle.",
+			"expectedBehavior": "Cycle 1: heartbeat -> sweep reaps -> empty fires once; stop clears the timer. Cycle 2: start clears leases and re-arms the once-only flag; heartbeat -> sweep -> empty fires again (count 2); stop clears the re-armed timer.",
+			"verdict": "pass"
+		},
+		{
+			"id": "T6",
+			"scenario": "Startup failure (registration rejection) clears the sweep timer (no leaked interval).",
+			"expectedBehavior": "start() rejects; host.started false; the armed timer handle is cleared exactly once (clearedHandles == armedHandles); a retried start re-arms the timer and succeeds.",
+			"verdict": "pass"
+		},
+		{
+			"id": "T7",
+			"scenario": "Stop rollback: a failing unregister keeps the host started with the timer armed.",
+			"expectedBehavior": "stop() rejects; host.started stays true; clearInterval NOT called (timer armed); the sweep keeps running; a retry with a healthy unregister succeeds, clears the timer, and unregister is attempted exactly twice.",
+			"verdict": "pass"
+		},
+		{
+			"id": "C1",
+			"scenario": "bridge-client clientHeartbeatMs: frame emission, restart on reconnect, stop-after-close.",
+			"expectedBehavior": "Immediate heartbeat on connect plus interval-driven beats (real 25ms interval); after the socket dies and the client reconnects on demand, ONLY the new socket keeps heartbeating (old socket's frame count frozen), and close() halts emission on the live socket.",
+			"verdict": "pass"
+		},
+		{
+			"id": "A10",
+			"scenario": "A fresh heartbeat after empty re-arms liveness; notify fires again once the new lease expires.",
+			"expectedBehavior": "After empty fires at 15s, a heartbeat at 16s grants a new lease (once-only flag reset by #heartbeatClient); at 30s still alive; at 31s the new lease expires and notify fires again (count 2).",
+			"verdict": "pass"
+		},
+		{
+			"id": "A11",
+			"scenario": "A host that never sees a heartbeat never fires empty and keeps its timer armed.",
+			"expectedBehavior": "10 sweeps with an empty lease table: no notify (guarded on #hasClientLease), host stays started, timer stays armed until stop().",
+			"verdict": "pass"
+		},
+		{
+			"id": "A12",
+			"scenario": "A heartbeat whose connectionId does not match the transport grants no lease and yields an error frame.",
+			"expectedBehavior": "requireConnection rejects the spoofed frame; a reverse_response ok:false error frame is sent; no lease exists, so a 60s sweep never fires empty.",
+			"verdict": "pass"
+		},
+		{
+			"id": "A13",
+			"scenario": "A throwing onClientLivenessEmpty propagates through the sweep but fires only once per lease generation.",
+			"expectedBehavior": "The notify call has no try/catch: the throw surfaces from the sweep callback; the once-only flag is set before the call so later sweeps do not re-invoke it; a fresh heartbeat re-arms and the next expiry invokes (and throws) again.",
+			"verdict": "pass"
+		},
+		{
+			"id": "OBS-C",
+			"scenario": "clientHeartbeatMs is not floored: 0 runs the heartbeat interval at timer minimum.",
+			"expectedBehavior": "Observed: with clientHeartbeatMs: 0 the client emitted >20 heartbeat frames in a 150ms window (Bun clamps the delay to ~1ms). No validation/floor exists on the option. Not part of the PR's contract (ACP_SESSION_RECONNECT uses 5000) — API hardening gap only.",
+			"verdict": "observation"
+		}
+	],
+	"surfaceEvidence": [
+		{
+			"invocation": "bun test packages/coding-agent/test/sdk-host.test.ts packages/coding-agent/src/sdk/host/session-runtime.test.ts packages/bridge-client/test/client.test.ts",
+			"verdict": "pass",
+			"detail": "40 pass, 0 fail, 141 expect() calls (sdk-host 12, session-runtime 13, client 15); includes the PR's 2 new sdk-host liveness regressions and the new client heartbeat test."
+		},
+		{
+			"invocation": "bun --cwd=packages/bridge-client run check",
+			"verdict": "pass",
+			"detail": "biome check . (3 files, no fixes) + tsc -p tsconfig.json --noEmit clean."
+		},
+		{
+			"invocation": "bun test /tmp/sdk-liveness-qa/adversarial.test.ts (throwaway, not in repo)",
+			"verdict": "pass",
+			"detail": "13 pass, 0 fail, 55 expect() calls — cases T1-T7, A10-A13 driven through the fake-clock liveness seam in SessionSdkHost."
+		},
+		{
+			"invocation": "bun test /tmp/sdk-liveness-qa/client-adversarial.test.ts (throwaway, not in repo)",
+			"verdict": "pass",
+			"detail": "2 pass, 0 fail, 7 expect() calls — C1 reconnect-restart/stop-after-close with a real 25ms interval, OBS-C 0ms floor observation."
+		}
+	],
+	"observations": [
+		"T7 rollback: while a stop is stuck on a failing unregister, #stopping stays true, so a sweep that empties the lease table cannot fire the notify; the host only tears down once a stop retry succeeds. Matches the PR's stated rollback contract (host stays started, timer armed) but means an orphaned host with persistent unregister failure will not self-shutdown.",
+		"A13: #notifyClientLivenessEmpty has no try/catch — a synchronously throwing onClientLivenessEmpty propagates out of the sweep interval callback (in production: surfaces from a setInterval callback). The once-only flag is set before the call, so it still fires once per lease generation. The runtime wiring passes () => ctx.shutdown(), which returns a promise and is unlikely to throw synchronously.",
+		"OBS-C: SdkClientOptions.clientHeartbeatMs has no floor or validation; 0/negative values run the interval at the timer minimum (~1ms). The wired constant ACP_SESSION_RECONNECT.clientHeartbeatMs is 5000, so the shipped path is unaffected.",
+		"Coverage: no test outside packages/coding-agent/test/sdk-host.test.ts exercises onClientLivenessEmpty; the session-runtime.ts wiring (onClientLivenessEmpty: () => ctx.shutdown()) is type-checked only. Verified by grep across packages/coding-agent.",
+		"bridge-client reconnect is demand-driven: an active-socket death does not auto-create a new open cycle; the client reconnects on the next connect()/request. Heartbeat restart on the new incarnation is correct: the old interval is cleared in #retire and again in #startHeartbeat, and the isActive guard prevents stale-socket sends."
+	],
+	"blockers": [],
+	"artifactPath": "artifacts/sdk-liveness-qa-report.json"
+}

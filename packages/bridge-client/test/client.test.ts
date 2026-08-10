@@ -522,3 +522,26 @@ test("SdkClient clamps reconnect backoff to the configured per-attempt ceiling",
 		await client.close();
 	});
 });
+
+test("SdkClient with clientHeartbeatMs sends client_heartbeat frames and stops after close", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { clientHeartbeatMs: 5_000, reconnectAttempts: 0 });
+		const socket = await connect(client, "hb");
+		const frames = socket.sent.map(raw => JSON.parse(raw) as Record<string, unknown>);
+		expect(frames.some(frame => frame.type === "client_heartbeat" && frame.connectionId === "hb")).toBe(true);
+		await client.close();
+		const afterClose = socket.sent.length;
+		await flush();
+		expect(socket.sent).toHaveLength(afterClose);
+	});
+
+	await withFakeTransport(async () => {
+		// Without clientHeartbeatMs the client never emits heartbeat frames.
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client, "plain");
+		expect(socket.sent.some(raw => (JSON.parse(raw) as Record<string, unknown>).type === "client_heartbeat")).toBe(
+			false,
+		);
+		await client.close();
+	});
+});

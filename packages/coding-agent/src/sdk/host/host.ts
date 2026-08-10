@@ -59,6 +59,10 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	onReverseCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
 	/** Best-effort capabilities mirrored from the native transport for out-of-band consumers. */
 	connectionCapabilities?: (connectionId: string) => ReadonlySet<string> | undefined;
+	/** Called once every authenticated client lease has expired or disconnected. */
+	onClientLivenessEmpty?: () => void;
+	/** Readable clock/timer seam for client liveness tests. */
+	clientLiveness?: { now?: () => number; setInterval?: typeof setInterval; clearInterval?: typeof clearInterval };
 	/** Readiness publication mode; defaults to the stock immediate contract. */
 	readiness?: SessionReadinessMode;
 	/**
@@ -181,6 +185,10 @@ export class SessionSdkHost {
 	#readyGeneration?: number;
 	/** Serializes activation attempts so a concurrent pair cannot both publish. */
 	#activation: Promise<SessionActivationOutcome> = Promise.resolve("not_prepared");
+	#clientLeases = new Map<string, number>();
+	#clientLivenessTimer?: NodeJS.Timeout;
+	#clientLivenessEmpty = false;
+	#hasClientLease = false;
 
 	constructor(options: SessionSdkHostOptions) {
 		this.#options = options;
@@ -210,9 +218,28 @@ export class SessionSdkHost {
 	getProviderDefinitions(capability: string): unknown | undefined {
 		return this.reverse.getInstalledDefinitions(capability);
 	}
-	/** Release reverse leases after the transport reports a WebSocket disconnect. */
+	/** Release all client state after the transport reports a WebSocket disconnect. */
 	handleDisconnect(connectionId: string): void {
 		this.reverse.disconnect(connectionId);
+		// Keep the client lease: a transient WebSocket close must not reap a live
+		// client before the 15s liveness TTL elapses. The sweep timer expires the
+		// stale lease and only then fires onClientLivenessEmpty.
+	}
+	#heartbeatClient(connectionId: string): void {
+		this.#clientLeases.set(connectionId, (this.#options.clientLiveness?.now ?? Date.now)());
+		this.#hasClientLease = true;
+		this.#clientLivenessEmpty = false;
+	}
+	#expireClientLeases(): void {
+		const now = (this.#options.clientLiveness?.now ?? Date.now)();
+		for (const [connectionId, heartbeatAt] of this.#clientLeases)
+			if (now - heartbeatAt >= 15_000) this.#clientLeases.delete(connectionId);
+		this.#notifyClientLivenessEmpty();
+	}
+	#notifyClientLivenessEmpty(): void {
+		if (this.#stopping || !this.#hasClientLease || this.#clientLeases.size !== 0 || this.#clientLivenessEmpty) return;
+		this.#clientLivenessEmpty = true;
+		this.#options.onClientLivenessEmpty?.();
 	}
 	/** Route malformed transport bytes through the host's structured protocol-error seam. */
 	handleMalformedFrame(connectionId: string, message: string): void {
@@ -230,6 +257,11 @@ export class SessionSdkHost {
 
 	async start(): Promise<"started" | "already"> {
 		if (this.#started) return "already";
+		// A stop/start cycle starts with a clean lease table, and the once-only
+		// notify is re-armed so the next cycle can fire it again.
+		this.#clientLeases.clear();
+		this.#hasClientLease = false;
+		this.#clientLivenessEmpty = false;
 		this.events.restart();
 		if (this.#options.readiness !== "deferred") this.#publishReadiness();
 		else
@@ -242,6 +274,8 @@ export class SessionSdkHost {
 			void this.#onFrame(connectionId, frame);
 		});
 		this.#unsubscribe = typeof disposer === "function" ? disposer : undefined;
+		const schedule = this.#options.clientLiveness?.setInterval ?? setInterval;
+		this.#clientLivenessTimer = schedule(() => this.#expireClientLeases(), 5_000);
 		this.#started = true;
 		try {
 			if (this.#registration)
@@ -254,6 +288,9 @@ export class SessionSdkHost {
 		} catch (error) {
 			this.#unsubscribe?.();
 			this.#unsubscribe = undefined;
+			const clear = this.#options.clientLiveness?.clearInterval ?? clearInterval;
+			if (this.#clientLivenessTimer) clear(this.#clientLivenessTimer);
+			this.#clientLivenessTimer = undefined;
 			this.#started = false;
 			throw error;
 		}
@@ -338,6 +375,11 @@ export class SessionSdkHost {
 				stateRoot: this.#options.stateRoot,
 				endpointGeneration: this.events.generation,
 			});
+		// Clear liveness only after teardown succeeded: a rejected unregister
+		// rolls back with the timer still armed while the host stays active.
+		const clear = this.#options.clientLiveness?.clearInterval ?? clearInterval;
+		if (this.#clientLivenessTimer) clear(this.#clientLivenessTimer);
+		this.#clientLivenessTimer = undefined;
 		this.#started = false;
 		this.#stopping = false;
 		return "stopped";
@@ -488,6 +530,11 @@ export class SessionSdkHost {
 						leaseExpiresAt: new Date(lease.expiresAt).toISOString(),
 						registeredNames: registeredNames(frame.definitions),
 					});
+					break;
+				}
+				case "client_heartbeat": {
+					requireConnection(connectionId, frame);
+					this.#heartbeatClient(connectionId);
 					break;
 				}
 				case "provider_heartbeat": {

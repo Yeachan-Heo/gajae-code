@@ -2,7 +2,7 @@ import { HEARTBEAT_TTL_MS } from "./bus/daemon-paths";
 import type { SdkClientOptions } from "./client";
 
 type SessionReconnectOptions = Required<
-	Pick<SdkClientOptions, "reconnectAttempts" | "reconnectBackoffMs" | "reconnectMaxBackoffMs">
+	Pick<SdkClientOptions, "reconnectAttempts" | "reconnectBackoffMs" | "reconnectMaxBackoffMs" | "clientHeartbeatMs">
 >;
 
 const SESSION_RECONNECT_BACKOFF_MS = 250;
@@ -40,4 +40,5 @@ export const ACP_SESSION_RECONNECT: SessionReconnectOptions = {
 	reconnectAttempts: attemptsCovering(SESSION_RECONNECT_BUDGET_MS),
 	reconnectBackoffMs: SESSION_RECONNECT_BACKOFF_MS,
 	reconnectMaxBackoffMs: SESSION_RECONNECT_MAX_BACKOFF_MS,
+	clientHeartbeatMs: 5_000,
 };

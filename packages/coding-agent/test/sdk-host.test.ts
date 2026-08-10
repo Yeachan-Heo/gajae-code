@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { SessionEventStream, SessionSdkHost, shouldHostSdk } from "../src/sdk/host";
+import { SessionEventStream } from "../src/sdk/host/events";
+import { SessionSdkHost, shouldHostSdk } from "../src/sdk/host/host";
 
 describe("session SDK event stream", () => {
 	test("replays retained events and emits a resync gap for lagged subscribers", () => {
@@ -334,6 +335,137 @@ describe("SessionSdkHost", () => {
 		await new Promise(resolve => setTimeout(resolve, 0));
 		expect(sent).toEqual([expect.objectContaining({ type: "control_response", id: "c1", ok: true })]);
 		expect(order).toEqual(["before", "ready", "send"]);
+		await host.stop();
+	});
+	test("expires authenticated client leases only after the last lease becomes stale", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		let now = 0;
+		let tick!: () => void;
+		let empty = 0;
+		const host = new SessionSdkHost({
+			sessionId: "liveness",
+			stateRoot: "/tmp/liveness",
+			token: "token",
+			sendFrame: () => {},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+			onClientLivenessEmpty: () => {
+				empty++;
+			},
+			clientLiveness: {
+				now: () => now,
+				setInterval: (callback: Parameters<typeof setInterval>[0], ..._args: unknown[]) => {
+					tick = () => (callback as () => void)();
+					void _args;
+					return 0 as unknown as NodeJS.Timeout;
+				},
+				clearInterval: () => {},
+			},
+		});
+		await host.start();
+		receive("first", { type: "client_heartbeat", connectionId: "first" });
+		await Bun.sleep(0);
+		now = 5_000;
+		receive("second", { type: "client_heartbeat", connectionId: "second" });
+		await Bun.sleep(0);
+		now = 15_000;
+		tick();
+		expect(empty).toBe(0);
+		now = 20_000;
+		tick();
+		expect(empty).toBe(1);
+		await host.stop();
+	});
+
+	test("never leases clients that only send non-heartbeat frames", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		let now = 0;
+		let tick!: () => void;
+		let empty = 0;
+		const host = new SessionSdkHost({
+			sessionId: "liveness-no-heartbeat",
+			stateRoot: "/tmp/liveness-no-heartbeat",
+			token: "token",
+			sendFrame: () => {},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+			onClientLivenessEmpty: () => {
+				empty++;
+			},
+			clientLiveness: {
+				now: () => now,
+				setInterval: (callback: Parameters<typeof setInterval>[0], ..._args: unknown[]) => {
+					tick = () => (callback as () => void)();
+					void _args;
+					return 0 as unknown as NodeJS.Timeout;
+				},
+				clearInterval: () => {},
+			},
+		});
+		await host.start();
+		// Ordinary non-heartbeat frames must never grant a lease: a chat-daemon
+		// client that goes quiet after its last frame must not reap the host.
+		receive("chat", { type: "control_request", id: "c1", operation: "session.switch", input: {} });
+		await Bun.sleep(0);
+		receive("chat", { type: "event_replay", id: "r1", sinceGeneration: 0, sinceSeq: 0 });
+		await Bun.sleep(0);
+		now = 15_000;
+		tick();
+		now = 30_000;
+		tick();
+		now = 60_000;
+		tick();
+		expect(empty).toBe(0);
+		await host.stop();
+	});
+
+	test("disconnect does not reap a live client before the liveness TTL elapses", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		let now = 0;
+		let tick!: () => void;
+		let empty = 0;
+		const host = new SessionSdkHost({
+			sessionId: "liveness-disconnect",
+			stateRoot: "/tmp/liveness-disconnect",
+			token: "token",
+			sendFrame: () => {},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+			onClientLivenessEmpty: () => {
+				empty++;
+			},
+			clientLiveness: {
+				now: () => now,
+				setInterval: (callback: Parameters<typeof setInterval>[0], ..._args: unknown[]) => {
+					tick = () => (callback as () => void)();
+					void _args;
+					return 0 as unknown as NodeJS.Timeout;
+				},
+				clearInterval: () => {},
+			},
+		});
+		await host.start();
+		receive("client", { type: "client_heartbeat", connectionId: "client" });
+		await Bun.sleep(0);
+		// A transient WebSocket close must not notify empty while the lease is
+		// still within the 15s reconnect grace.
+		host.handleDisconnect("client");
+		expect(empty).toBe(0);
+		now = 10_000;
+		tick();
+		expect(empty).toBe(0);
+		now = 20_000;
+		tick();
+		expect(empty).toBe(1);
+		now = 25_000;
+		tick();
+		expect(empty).toBe(1);
 		await host.stop();
 	});
 });
