@@ -42,9 +42,18 @@ function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "defau
 function parseEndpoint(sessionId: string, file: string, value: unknown): SdkSessionEndpoint {
 	if (!value || typeof value !== "object")
 		throw new SdkDiscoveryError(file, "SDK endpoint discovery record must be an object.");
-	const endpoint = value as { version?: unknown; url?: unknown; token?: unknown; pid?: unknown; stale?: unknown };
+	const endpoint = value as {
+		version?: unknown;
+		sessionId?: unknown;
+		url?: unknown;
+		token?: unknown;
+		pid?: unknown;
+		stale?: unknown;
+	};
 	if (typeof endpoint.version === "number" && endpoint.version > 1)
 		throw new SdkDiscoveryError(file, "Unsupported SDK endpoint discovery state version.");
+	if (endpoint.sessionId !== undefined && endpoint.sessionId !== sessionId)
+		throw new SdkDiscoveryError(file, "SDK endpoint discovery record session id does not match its filename.");
 	if (typeof endpoint.url !== "string" || !endpoint.url)
 		throw new SdkDiscoveryError(file, "SDK endpoint discovery record is invalid.");
 	const stale = typeof endpoint.stale === "boolean" ? endpoint.stale : undefined;

@@ -69,6 +69,82 @@ describe("SDK session index", () => {
 			spy.mockRestore();
 		}
 	});
+	it("serializes six isolated launchers past the legacy five-second contention ceiling", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-six-launches-"));
+		const agentDir = path.join(root, "agent");
+		const worktrees = Array.from({ length: 6 }, (_, index) => path.join(root, `worktree-${index + 1}`));
+		await Promise.all(worktrees.map(worktree => fs.mkdir(worktree, { recursive: true })));
+		const helper = path.join(root, "append-session.ts");
+		const sessionIndexModule = path.resolve(import.meta.dir, "../src/sdk/broker/session-index.ts");
+		await fs.writeFile(
+			helper,
+			`import * as fs from "node:fs/promises";\nimport * as path from "node:path";\nimport { SessionIndex } from ${JSON.stringify(sessionIndexModule)};\nconst [agentDir, sessionId] = process.argv.slice(2);\nif (!agentDir || !sessionId) throw new Error("missing launch arguments");\nawait fs.writeFile(path.join(agentDir, \`ready-\${sessionId}\`), "ready");\nconst index = await new SessionIndex(agentDir).open();\nawait index.append({ type: "host_registered", sessionId, locator: { repo: process.cwd(), stateRoot: process.cwd() }, endpointGeneration: 1, pid: process.pid });\nawait fs.writeFile(path.join(agentDir, \`complete-\${sessionId}\`), "complete");\n`,
+		);
+		const index = await new SessionIndex(agentDir).open();
+		const entered = deferred();
+		const release = deferred();
+		const holder = index.withLocked(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const children = worktrees.map((worktree, index) =>
+			Bun.spawn([process.execPath, helper, agentDir, `lane-${index + 1}`], {
+				cwd: worktree,
+				env: {
+					PATH: process.env.PATH ?? "",
+					HOME: process.env.HOME ?? root,
+					TMPDIR: process.env.TMPDIR ?? "/tmp",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		const readyFiles = Array.from({ length: 6 }, (_, index) => path.join(agentDir, `ready-lane-${index + 1}`));
+		const readyDeadline = Date.now() + 5_000;
+		while (!(await Promise.all(readyFiles.map(file => fs.exists(file)))).every(Boolean)) {
+			if (Date.now() >= readyDeadline) throw new Error("six launchers did not reach session-index contention");
+			await Bun.sleep(20);
+		}
+		await Bun.sleep(5_500);
+		expect(
+			await Promise.all(
+				Array.from({ length: 6 }, (_, index) => fs.exists(path.join(agentDir, `complete-lane-${index + 1}`))),
+			),
+		).toEqual([false, false, false, false, false, false]);
+		release.resolve();
+		await holder;
+		const exits = await Promise.all(children.map(child => child.exited));
+		const diagnostics = await Promise.all(
+			children.map(
+				async child => `${await new Response(child.stdout).text()}${await new Response(child.stderr).text()}`,
+			),
+		);
+		expect(exits, diagnostics.join("\n")).toEqual([0, 0, 0, 0, 0, 0]);
+		const replay = await new SessionIndex(agentDir).open();
+		expect(
+			replay
+				.listSessions()
+				.sessions.map(session => session.sessionId)
+				.sort(),
+		).toEqual(["lane-1", "lane-2", "lane-3", "lane-4", "lane-5", "lane-6"]);
+		await fs.rm(root, { recursive: true, force: true });
+	}, 20_000);
+	it("recovers a dead session-index lock owner without waiting for the stale clock", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-dead-lock-"));
+		const lockDir = path.join(dir, "sdk", "sessions", "index.jsonl.lock");
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(
+			path.join(lockDir, "info"),
+			JSON.stringify({ pid: 2_147_483_647, start_time: "dead-owner", timestamp: Date.now() }),
+		);
+		const startedAt = Date.now();
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("recovered"));
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
+		expect(index.listSessions().sessions.map(session => session.sessionId)).toEqual(["recovered"]);
+		await fs.rm(dir, { recursive: true, force: true });
+	});
 	it("clears a failed open group so a later open can retry", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-open-failure-"));
 		const sessionsDir = path.join(dir, "sdk", "sessions");

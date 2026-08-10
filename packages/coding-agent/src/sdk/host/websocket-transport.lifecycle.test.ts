@@ -39,10 +39,40 @@ describe("SDK WebSocket transport lifecycle", () => {
 		const endpoints = await Promise.all([transport.start(), transport.start(), transport.start()]);
 		expect(new Set(endpoints.map(endpoint => endpoint.url)).size).toBe(1);
 		const endpointPath = path.join(stateRoot, "sdk", "concurrent-start.json");
-		expect(JSON.parse(await fs.readFile(endpointPath, "utf8")).url).toBe(endpoints[0]?.url);
+		expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({
+			sessionId: "concurrent-start",
+			url: endpoints[0]?.url,
+		});
 		await transport.stop();
 		await expect(fs.stat(endpointPath)).rejects.toMatchObject({ code: "ENOENT" });
 		await fs.rm(stateRoot, { recursive: true, force: true });
+	});
+	test("six isolated worktrees publish unique probeable discovery records", async () => {
+		const roots = await Promise.all(Array.from({ length: 6 }, () => tempStateRoot()));
+		const transports = await Promise.all(
+			roots.map((stateRoot, index) =>
+				createSdkWebSocketTransport({
+					sessionId: `isolated-lane-${index + 1}`,
+					stateRoot,
+					token: `token-${index + 1}`,
+				}),
+			),
+		);
+		try {
+			const endpoints = await Promise.all(transports.map(transport => transport.start()));
+			expect(new Set(endpoints.map(endpoint => endpoint.url)).size).toBe(6);
+			await Promise.all(
+				roots.map(async (stateRoot, index) => {
+					const sessionId = `isolated-lane-${index + 1}`;
+					const record = JSON.parse(await fs.readFile(path.join(stateRoot, "sdk", `${sessionId}.json`), "utf8"));
+					expect(record).toMatchObject({ sessionId, url: endpoints[index]?.url, token: `token-${index + 1}` });
+					await probeWebSocketEndpoint(endpoints[index]!.url, `token-${index + 1}`);
+				}),
+			);
+		} finally {
+			await Promise.all(transports.map(transport => transport.stop().catch(() => undefined)));
+			await Promise.all(roots.map(root => fs.rm(root, { recursive: true, force: true })));
+		}
 	});
 
 	test("start waits for a pending stop before publishing a probeable replacement endpoint", async () => {

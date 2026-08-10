@@ -152,7 +152,7 @@ export interface ForceCloseOwnerDependencies {
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 
-const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 5_000;
+const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 15_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
 
 export interface CreateGjcTmuxSessionOptions {
@@ -1505,7 +1505,17 @@ export async function forceCloseGjcTmuxSession(
 				}
 			},
 
-			waitForVerdict: () => operatorVerdict ?? waitForExpectedVerdict(identity, sleep, now),
+			waitForVerdict: async () => {
+				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now);
+				try {
+					return await operatorVerdict;
+				} catch {
+					// The sidecar and raw monitor intentionally race to publish the first valid
+					// verdict. If the exact supervisor-exit path loses that race or times out
+					// under load, recover only from the same fully validated durable evidence.
+					return await waitForExpectedVerdict(identity, sleep, now);
+				}
+			},
 			cleanupSession: async () => {
 				const cleanupRequired = await requireUnchangedOwnerForCompatibilityCleanup(
 					session.name,

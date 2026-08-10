@@ -5549,6 +5549,10 @@ export function createNotificationsExtension(
 				await cleanupAbandonedStartup();
 				return { status: "failed" };
 			}
+			// Core SDK authority is published before optional notification adapters acquire
+			// daemon ownership. A blocked adapter must not make an interactive session
+			// undiscoverable or uncontrollable.
+			const endpoint = await sdkRuntime.startTransport();
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
 					let registrationToken: string | undefined;
@@ -5556,10 +5560,7 @@ export function createNotificationsExtension(
 						registrationToken = token;
 					});
 					if (ownership === "blocked_identity") {
-						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
-						finishStartup(result);
-						await cleanupAbandonedStartup();
-						return result;
+						logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
 					}
 					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
 						await cleanupAbandonedStartup();
@@ -5573,24 +5574,21 @@ export function createNotificationsExtension(
 						runtime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
 					}
 				} catch (error) {
-					const result = failLifecycleStartup("failed", error);
-					finishStartup(result);
-					await cleanupAbandonedStartup();
-					return result;
+					logger.warn(
+						`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
+					);
 				}
 			}
 
-			// Startup contract: configured notification daemon ownership must be ready
-			// before identity or endpoint publication. Native frames are ephemeral, so
-			// publish identity only after readiness; late SDK consumers recover it from
-			// event_replay.
+			// Notification adapter readiness controls notification activation only. The
+			// endpoint is already authoritative; identity remains replayable for clients
+			// that attach after adapter ownership settles.
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
-			const endpoint = await sdkRuntime.startTransport();
 			// The native server owns the only authoritative view of this host's live
 			// SDK client sockets; publish it so a detached session host can bound its
 			// own lifetime without probing the OS (#4010). The handle is this

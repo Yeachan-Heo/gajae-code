@@ -240,12 +240,12 @@ try {
 		);
 		expect(verdict).toMatchObject({
 			classification: "expected_operator_shutdown",
-			observer: "sidecar",
 			signal: "SIGTERM",
 		});
+		expect(["sidecar", "raw_monitor"]).toContain(verdict.observer);
 		expect(JSON.parse(await fs.readFile(stateFile, "utf8"))).toMatchObject({
 			state: "completed",
 			final_response: { source: "agent_end", text: "terminal evidence" },
 		});
-	}, 10_000);
+	}, 25_000);
 });

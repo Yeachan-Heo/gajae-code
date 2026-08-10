@@ -1831,7 +1831,7 @@ describe("notifications config", () => {
 			}
 		}, 30_000);
 
-		test("rejects ordinary session_start after provider readiness fails without publishing an endpoint", async () => {
+		test("keeps the core SDK endpoint when notification provider readiness fails", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-failure-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
@@ -1868,8 +1868,8 @@ describe("notifications config", () => {
 				const unsubscribe = runner.onError(error => errors.push(error.error));
 				await runner.emit({ type: "session_start" });
 				unsubscribe();
-				expect(errors).toContain("notifications: SDK startup failed: provider readiness denied");
-				expect(fs.existsSync(endpoint)).toBe(false);
+				expect(errors).not.toContain("notifications: SDK startup failed: provider readiness denied");
+				expect(fs.existsSync(endpoint)).toBe(true);
 			} finally {
 				await session?.extensionRunner?.emit({ type: "session_shutdown" });
 				session?.dispose();
@@ -1878,7 +1878,7 @@ describe("notifications config", () => {
 			}
 		}, 30000);
 
-		test("removes a readiness-failed runtime with rollback proof so /notify on retries a real startup", async () => {
+		test("retains a readiness-failed notification runtime so /notify on can retry without republishing SDK", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-retry-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
@@ -1921,15 +1921,12 @@ describe("notifications config", () => {
 				throw new Error("notifications extension did not register its command handlers");
 			try {
 				await sessionStart({}, context);
-				expect(await capability.promise).toMatchObject({
-					status: "failed",
-					failure: { message: "provider readiness denied" },
-				});
-				expect(fs.existsSync(endpoint)).toBe(false);
+				expect(await capability.promise).toMatchObject({ status: "started" });
+				expect(fs.existsSync(endpoint)).toBe(true);
 				expect(rollback.result).toMatchObject({
-					runtimeRemoved: true,
-					hostStopped: true,
-					brokerRegistrationReleased: true,
+					runtimeRemoved: false,
+					hostStopped: false,
+					brokerRegistrationReleased: false,
 				});
 
 				providerReady = true;
@@ -1942,7 +1939,7 @@ describe("notifications config", () => {
 			}
 		}, 30000);
 
-		test("waits for provider readiness before publishing the embedded session endpoint", async () => {
+		test("publishes the core SDK endpoint before notification provider readiness", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-success-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
@@ -1961,7 +1958,7 @@ describe("notifications config", () => {
 						model: getBundledModel("openai", "gpt-4o-mini"),
 						disableExtensionDiscovery: true,
 						ensureNotificationProviderDaemon: async () => {
-							expect(fs.existsSync(endpoint)).toBe(false);
+							expect(fs.existsSync(endpoint)).toBe(true);
 						},
 						extensions: [],
 						skills: [],
