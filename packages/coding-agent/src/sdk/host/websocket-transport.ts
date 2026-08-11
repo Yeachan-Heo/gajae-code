@@ -215,18 +215,22 @@ export async function createSdkWebSocketTransport(
 					});
 					await withFileLock(endpointFile, async () => {
 						try {
-							await filesystem.writeFile(
-								tempEndpointFile,
-								endpoint,
-								{ encoding: "utf8", mode: 0o600, flag: "wx" },
-							);
+							await filesystem.writeFile(tempEndpointFile, endpoint, {
+								encoding: "utf8",
+								mode: 0o600,
+								flag: "wx",
+							});
 						} catch (error) {
 							throw asLifecycleError("endpoint_write_failed", "SDK endpoint file publication failed.", error);
 						}
 						try {
 							await filesystem.chmod(tempEndpointFile, 0o600);
 						} catch (error) {
-							throw asLifecycleError("endpoint_chmod_failed", "SDK endpoint file permission update failed.", error);
+							throw asLifecycleError(
+								"endpoint_chmod_failed",
+								"SDK endpoint file permission update failed.",
+								error,
+							);
 						}
 						try {
 							await filesystem.rename(tempEndpointFile, endpointFile);
