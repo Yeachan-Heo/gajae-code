@@ -9,6 +9,7 @@
 
 ### Fixed
 - Option+Q verification now supports normal macOS Terminal.app profiles and fails with an actionable Settings > Profiles > Keyboard > Use Option as Meta key diagnostic when the profile cannot forward Option as Meta/Esc.
+- Enabling Speech-to-Text from `/settings` now checks and configures its local dependencies immediately instead of deferring setup until the first recording. Setup progress is shown in the status line; failures disable STT again rather than leaving an unusable enabled toggle. Setup also reports platform-correct recorder commands, detects Ghostty's `macos-option-as-alt` requirement, and documents the Ctrl+P command-palette fallback, permissions, models, troubleshooting, and remapping.
 - Queued-message selection now accepts the actual macOS Terminal.app Option+Up/Down byte sequence from either physical Option key, enabling multi-message restore, delete, and reorder flows.
 - Keybinding configuration now normalizes `option`/`meta` to Option and `command`/`cmd` to Command, while Terminal.app guidance covers both physical Option keys and explicit Command profile mappings.
 - ACP prompts now settle when a terminal frame arrives before prompt acknowledgement with correlation split between the frame envelope and event payload. Live and deferred frames share strict ownership derivation, correlated nonterminals wait for exact acknowledgement ownership, and watchdog or cancel settlement no longer waits for a missing acknowledgement. Incomplete or foreign terminals emit structured error logs, unrelated session traffic cannot keep a wedged turn alive, and correlationless session events remain publishable without contaminating prompt-owned final-text state. Deferred terminal replay failures are contained by the session frame queue.
@@ -31,6 +32,8 @@
 ### Added
 - `gjc setup provider` now ships parameterized proxy presets: `--preset litellm` and `--preset openai-compatible-proxy` (aliases `litellm-proxy`, `openai-proxy`, `compatible-proxy`, `custom-proxy`) with a required `--base-url`, configurable `--api-key-env`, and live model discovery (#4123).
 - New `modelProfile.proxyProvider` and `modelProfile.proxyMode` settings route built-in model-preset selectors through an authenticated OpenAI-compatible proxy (e.g. `xai/grok-4.3` → `litellm/xai/grok-4.3`). `fallback` preserves directly authenticated providers by default; `always` forces every proxy-routable built-in selector through the configured gateway. Routing fails closed for unconfigured or unauthenticated proxies and missing or ambiguous proxy models (#4123).
+- SDK-only session hosts now publish their session ID and register their endpoint lifecycle with the broker, matching its identity and staleness fences. This restores broker/coordinator resolution for durable workflow-gate controls (`workflow.gates.list` and `workflow.gate_answer`) without relying on tmux pane input; broker unavailability leaves non-lifecycle local hosts usable and retries publication later.
+
 ## [0.12.21] - 2026-08-09
 
 ### Fixed

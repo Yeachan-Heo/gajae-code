@@ -198,7 +198,13 @@ export async function createSdkWebSocketTransport(
 					try {
 						await filesystem.writeFile(
 							endpointFile,
-							JSON.stringify({ version: 1, url, token: input.token, pid: process.pid }),
+							JSON.stringify({
+								version: 1,
+								sessionId: input.sessionId,
+								url,
+								token: input.token,
+								pid: process.pid,
+							}),
 							"utf8",
 						);
 					} catch (error) {

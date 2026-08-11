@@ -117,6 +117,7 @@ import {
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
+import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
@@ -2174,8 +2175,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						});
 					} else if (sdkHostEligible) {
 						registerSdkOnlyNotificationCommand(api);
-						const { createSdkWebSocketTransport } = await import("../sdk/host/websocket-transport");
 						createSdkSessionRuntimeExtension(api, {
+							agentDir,
+							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
 							configOverrides: new Map(),

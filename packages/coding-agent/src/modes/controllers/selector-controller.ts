@@ -52,6 +52,7 @@ import {
 	stopInteractiveActivityIndicator,
 	suspendInteractiveActivityIndicator,
 } from "../../modes/types";
+import { configureSttFromSettings } from "../../runtime/stt-settings-setup";
 import { ChatDaemonController } from "../../sdk/bus/chat-daemon-control";
 import {
 	getCurrentTelegramActivationMarker,
@@ -2124,6 +2125,18 @@ export class SelectorController {
 
 			case "autocompleteMaxVisible":
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
+				break;
+
+			case "stt.enabled":
+				if (value === true) {
+					void configureSttFromSettings({
+						modelName: settings.get("stt.modelName"),
+						setEnabled: enabled => settings.set("stt.enabled", enabled),
+						flush: () => settings.flushOrThrow(),
+						showStatus: message => this.ctx.showStatus(message),
+						showError: message => this.ctx.showError(message),
+					});
+				}
 				break;
 
 			// Settings with UI side effects
