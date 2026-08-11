@@ -73,11 +73,13 @@ Committed on `feat/abort-sdk-terminal` (lore `c04-terminal-*`), base `e92a04e3`:
   `AcpSdkAdapter.cancel(scope)` sends `turn.abort` `{mode:"terminal", scope}` with a fresh
   bounded idempotency key per call; `AcpAgent.cancel` resolves the scope as `"owned"` by
   default (`_meta.gjc.abortScope` on the cancel notification wins, `GJC_ACP_ABORT_SCOPE` is the
-  process fallback), accepts the terminal dispositions (`stopped` / `no_active_turn` /
-  `no_effect` / `no_store` / `uncertain`) in addition to the legacy `{aborted:true}`
-  plain-abort ack (broker-compat only: the C04 host always answers terminal dispositions,
-  and the ack must echo the requested scope when it carries a `selection`), and keeps the
-  bounded cancel settlement grace. An external client that ends a turn (e.g. Paseo's stop)
+  process fallback), acknowledges ONLY a matching-scope `stopped` result or the legacy
+  `{aborted:true}` plain-abort ack (broker-compat only: the C04 host always answers
+  terminal dispositions), and keeps the bounded cancel settlement grace. The other
+  terminal dispositions (`no_active_turn` / `no_effect` / `no_store` / `uncertain`) are
+  returned to the caller as request outcomes but are NOT cancellation acknowledgements:
+  `isAbortAcknowledged()` rejects them (`abort_unacknowledged`) so a client never
+  mistakes a no-effect or uncertain response for a confirmed stop. An external client that ends a turn (e.g. Paseo's stop)
   therefore terminates owned subagents and background tasks, not just the turn; `scope:"turn"`
   remains available per cancel as the leave-running opt-out.
 - `c04-terminal-continuation-gate`: same-turn continuations denied at the final synchronous
