@@ -251,6 +251,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -295,6 +296,10 @@ describe("SessionSdkSessionRuntime", () => {
 
 			transport.feed("client", { ...request, id: "terminal-abort-replay" });
 			await waitForFrame("terminal-abort-replay");
+			// An in-memory dispatch-cache replay short-circuits before the
+			// surface: terminalAbort never runs, so no snapshot is captured and
+			// nothing to discard (the durable-replay discard is covered by the
+			// seeded-row test below).
 			expect(seamCalls).toHaveLength(1);
 			expect(transport.sent).toEqual(
 				expect.arrayContaining([
@@ -398,6 +403,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -490,6 +496,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -583,6 +590,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -672,6 +680,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (_handle, _options) => {
 					// The aborted run's loop exit publishes the correlated
@@ -738,6 +747,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -2941,6 +2951,8 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
+	let captureCalls = 0;
+	let discardCalls = 0;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
@@ -2950,6 +2962,13 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 			getActivePromptHandle: () => "exact-run-handle",
 			getActivePromptOwnerConnectionId: () => "client",
 			cancelPendingPreflightForTerminalAbort: () => {},
+			captureTerminalAbortSteeringSnapshot: () => {
+				captureCalls += 1;
+				return captureCalls;
+			},
+			discardTerminalAbortSteeringSnapshot: () => {
+				discardCalls += 1;
+			},
 			abortPromptAndWaitWithTerminal: async (_handle, _options) => {
 				return { status: "settled", terminalScope: {} };
 			},
@@ -3036,6 +3055,13 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 				replay: expect.objectContaining({ responseState: "pending" }),
 			}),
 		});
+		// The durable replay (dispatch-cache eviction equivalent: the row was
+		// seeded before this runtime admitted anything) captured a snapshot at
+		// admission and then DISCARDED it — the replay path never settles, so
+		// the FIFO holds no stale entry for a later real abort to consume
+		// (review thread P1).
+		expect(captureCalls).toBe(1);
+		expect(discardCalls).toBe(1);
 	} finally {
 		await handlers.get("session_shutdown")?.({}, ctx);
 		await rm(cwd, { recursive: true, force: true });

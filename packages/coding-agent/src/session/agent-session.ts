@@ -2032,12 +2032,16 @@ export class AgentSession {
 	readonly #externalSteerAdmissionSeq = new WeakMap<AgentMessage, number>();
 	/**
 	 * Per-admission terminal-abort steering snapshots, FIFO per aborted turn
-	 * key (lineage:epoch). Each admission pushes its sequence here; the
+	 * key (lineage:epoch). Each admission pushes { sequence, token } here; the
 	 * settlement of THAT admission consumes (shifts) it, so overlapping aborts
 	 * of the same turn never overwrite an earlier admission's snapshot (review
-	 * thread P1).
+	 * thread P1). A replay-only abort discards its own token — the durable
+	 * replay path never settles, so without the discard a later real abort
+	 * would consume the stale entry and treat steering admitted since the
+	 * replay as post-abort (review thread P1).
 	 */
-	readonly #terminalAbortSteeringSnapshots = new Map<string, number[]>();
+	readonly #terminalAbortSteeringSnapshots = new Map<string, Array<{ seq: number; token: number }>>();
+	#terminalAbortAdmissionSeq = 0;
 	#queuedDisplaySequence = 0;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
@@ -11240,12 +11244,31 @@ export class AgentSession {
 	 * overwrite an earlier admission's snapshot and purge an already-accepted
 	 * steer (review thread P1).
 	 */
-	captureTerminalAbortSteeringSnapshot(): void {
-		if (this.#turnLineageIdHash === undefined) return;
+	captureTerminalAbortSteeringSnapshot(): number | undefined {
+		if (this.#turnLineageIdHash === undefined) return undefined;
 		const key = `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
 		const queue = this.#terminalAbortSteeringSnapshots.get(key) ?? [];
-		queue.push(this.#steeringAdmissionSeq);
+		const token = ++this.#terminalAbortAdmissionSeq;
+		queue.push({ seq: this.#steeringAdmissionSeq, token });
 		this.#terminalAbortSteeringSnapshots.set(key, queue);
+		return token;
+	}
+	/**
+	 * Discard a captured snapshot whose admission never settles (a durable
+	 * same-key replay, no-effect, conflict, or marker failure): the entry is
+	 * keyed to the CURRENT turn, which is where its admission captured it.
+	 * Removing by token keeps overlapping admissions' entries independent.
+	 */
+	discardTerminalAbortSteeringSnapshot(token: number): void {
+		if (this.#turnLineageIdHash === undefined) return;
+		const key = `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
+		const queue = this.#terminalAbortSteeringSnapshots.get(key);
+		if (!queue) return;
+		const index = queue.findIndex(entry => entry.token === token);
+		if (index >= 0) {
+			queue.splice(index, 1);
+			if (queue.length === 0) this.#terminalAbortSteeringSnapshots.delete(key);
+		}
 	}
 
 	getTerminalTurnEpoch(): number | undefined {
@@ -11328,7 +11351,7 @@ export class AgentSession {
 				// preserved — owned-completion resumes must still deliver.
 				const turnSnapshotKey = `${lineageIdHash}:${this.#promptGeneration}`;
 				const queuedTurnSnapshots = this.#terminalAbortSteeringSnapshots.get(turnSnapshotKey);
-				abortSteeringSnapshot = queuedTurnSnapshots?.shift() ?? this.#steeringAdmissionSeq;
+				abortSteeringSnapshot = queuedTurnSnapshots?.shift()?.seq ?? this.#steeringAdmissionSeq;
 				if (queuedTurnSnapshots?.length === 0) {
 					this.#terminalAbortSteeringSnapshots.delete(turnSnapshotKey);
 				}

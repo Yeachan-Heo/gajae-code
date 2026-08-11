@@ -209,8 +209,14 @@ export interface SdkOnlyTerminalAbortSeams {
 	cancelPendingPreflightForTerminalAbort: () => void;
 	/** Capture the steering admission snapshot at abort ADMISSION (before any
 	 *  durable transaction), so steers admitted while the abort is in flight
-	 *  classify as post-snapshot (review thread P1). */
-	captureTerminalAbortSteeringSnapshot?: () => void;
+	 *  classify as post-snapshot (review thread P1). Returns the admission
+	 *  token so a replay-only abort can discard its own snapshot. */
+	captureTerminalAbortSteeringSnapshot?: () => number | undefined;
+	/** Discard the snapshot captured by an admission that never settles (a
+	 *  durable same-key replay, no-effect, conflict, or marker failure): its
+	 *  FIFO entry would otherwise be consumed by a later real abort (review
+	 *  thread P1). */
+	discardTerminalAbortSteeringSnapshot?: (token: number) => void;
 	abortPromptAndWaitWithTerminal: (
 		handle: string,
 		options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
@@ -1390,11 +1396,6 @@ function createControlSurface(
 		idempotencyKey?: string,
 	): Promise<unknown> => {
 		const scope = input.scope === "owned" ? "owned" : "turn";
-		// Capture the steering snapshot at ADMISSION (before any durable
-		// transaction): client steering admitted while the abort is in flight
-		// classifies as post-snapshot and is preserved at abortPromptAndWait
-		// (review thread P1).
-		terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
 		// Hash the EXACT response payload this abort will return: the durable row
 		// stores it at finalization so the response-state advance requires
 		// equality instead of trusting a non-pending placeholder (review thread P2).
@@ -1409,92 +1410,111 @@ function createControlSurface(
 				terminal: "terminal_no_effect",
 			};
 		}
-		const keyHash =
-			typeof idempotencyKey === "string"
-				? crypto.createHash("sha256").update(idempotencyKey).digest("hex")
-				: undefined;
-		const inputHash = crypto
-			.createHash("sha256")
-			.update(JSON.stringify({ mode: "terminal", scope }))
-			.digest("hex");
-		const stored = (record: SdkOnlyTerminalScopeRecord | SdkOnlyEvictedTerminalKeyEntry) => ({
-			responseState: record.responseState ?? "pending",
-			responsePayloadHash: record.responsePayloadHash ?? inputHash,
-			terminalPublished: record.terminalPublished === true,
-		});
-		// The exact response a same-key retry delivers appends the replay envelope
-		// (and, for uncertainty, the replay reason). The delivery hash check
-		// requires exact equality, so the durable row must store BOTH the original
-		// response hash (first write) and the replay-shaped hash (retry write) or a
-		// successfully written replay could never advance a pending row to sent
-		// (review thread P2).
-		const replayShapedHash = (
-			record: SdkOnlyTerminalScopeRecord,
-			result: Record<string, unknown>,
-			payloadHash: string,
-		): string =>
-			crypto
+		// Capture the steering snapshot at ADMISSION (before any durable
+		// transaction): client steering admitted while the abort is in flight
+		// classifies as post-snapshot and is preserved at abortPromptAndWait
+		// (review thread P1). The returned token lets a replay-only abort (a
+		// durable same-key replay never settles) discard its own snapshot so a
+		// later real abort never consumes a stale entry (review thread P1).
+		const steeringSnapshotToken = terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
+		let steeringSnapshotConsumed = false;
+		try {
+			const keyHash =
+				typeof idempotencyKey === "string"
+					? crypto.createHash("sha256").update(idempotencyKey).digest("hex")
+					: undefined;
+			const inputHash = crypto
 				.createHash("sha256")
-				.update(
-					JSON.stringify({
-						...result,
-						...(result.turn === "uncertain" && typeof result.reason === "string"
-							? { reason: "replay_uncertain" }
-							: {}),
-						replay: {
-							responseState: record.responseState ?? "pending",
-							responsePayloadHash: payloadHash,
-							terminalPublished: record.terminalPublished === true,
-						},
-					}),
-				)
+				.update(JSON.stringify({ mode: "terminal", scope }))
 				.digest("hex");
-		const replay = (): unknown => {
-			const scopes = store.snapshotTerminalScopes();
-			const existing = keyHash ? scopes.find(record => record.idempotencyKeyHash === keyHash) : undefined;
-			if (existing) {
-				if (existing.idempotencyInputHash !== inputHash)
-					throw Object.assign(new Error("Idempotency key was reused with different input."), {
-						code: "idempotency_conflict",
-					});
-				const persisted = stored(existing);
-				if (existing.turnDisposition === "stopped")
-					return {
-						ok: true,
-						selection: scope,
-						turn: "stopped",
-						...(scope === "owned"
-							? {
-									ownedWork: existing.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
-									automaticDelivery: "none",
-									resumeOnOwnedCompletion: false,
-								}
-							: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
-						replay: persisted,
-					};
-				if (existing.turnDisposition === "no_effect")
-					return {
-						ok: true,
-						selection: scope,
-						turn: "no_active_turn",
-						terminal: "terminal_no_effect",
-						replay: persisted,
-					};
-				if (existing.turnDisposition === "no_effect_marker_failure")
-					// The initial marker write failed before any destructive work;
-					// replay the SAME no_effect result the request returned, never
-					// a no_active_turn fabrication (review thread P2).
-					return {
-						ok: true,
-						selection: scope,
-						turn: "no_effect",
-						terminal: "terminal_no_effect",
-						replay: persisted,
-					};
-				if (existing.turnDisposition === "no_effect_reserved")
-					// A no-effect reservation that may still transition to active: a
-					// duplicate must never claim no_active_turn over a provisional row
-					// (review thread P2).
+			const stored = (record: SdkOnlyTerminalScopeRecord | SdkOnlyEvictedTerminalKeyEntry) => ({
+				responseState: record.responseState ?? "pending",
+				responsePayloadHash: record.responsePayloadHash ?? inputHash,
+				terminalPublished: record.terminalPublished === true,
+			});
+			// The exact response a same-key retry delivers appends the replay envelope
+			// (and, for uncertainty, the replay reason). The delivery hash check
+			// requires exact equality, so the durable row must store BOTH the original
+			// response hash (first write) and the replay-shaped hash (retry write) or a
+			// successfully written replay could never advance a pending row to sent
+			// (review thread P2).
+			const replayShapedHash = (
+				record: SdkOnlyTerminalScopeRecord,
+				result: Record<string, unknown>,
+				payloadHash: string,
+			): string =>
+				crypto
+					.createHash("sha256")
+					.update(
+						JSON.stringify({
+							...result,
+							...(result.turn === "uncertain" && typeof result.reason === "string"
+								? { reason: "replay_uncertain" }
+								: {}),
+							replay: {
+								responseState: record.responseState ?? "pending",
+								responsePayloadHash: payloadHash,
+								terminalPublished: record.terminalPublished === true,
+							},
+						}),
+					)
+					.digest("hex");
+			const replay = (): unknown => {
+				const scopes = store.snapshotTerminalScopes();
+				const existing = keyHash ? scopes.find(record => record.idempotencyKeyHash === keyHash) : undefined;
+				if (existing) {
+					if (existing.idempotencyInputHash !== inputHash)
+						throw Object.assign(new Error("Idempotency key was reused with different input."), {
+							code: "idempotency_conflict",
+						});
+					const persisted = stored(existing);
+					if (existing.turnDisposition === "stopped")
+						return {
+							ok: true,
+							selection: scope,
+							turn: "stopped",
+							...(scope === "owned"
+								? {
+										ownedWork: existing.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
+										automaticDelivery: "none",
+										resumeOnOwnedCompletion: false,
+									}
+								: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
+							replay: persisted,
+						};
+					if (existing.turnDisposition === "no_effect")
+						return {
+							ok: true,
+							selection: scope,
+							turn: "no_active_turn",
+							terminal: "terminal_no_effect",
+							replay: persisted,
+						};
+					if (existing.turnDisposition === "no_effect_marker_failure")
+						// The initial marker write failed before any destructive work;
+						// replay the SAME no_effect result the request returned, never
+						// a no_active_turn fabrication (review thread P2).
+						return {
+							ok: true,
+							selection: scope,
+							turn: "no_effect",
+							terminal: "terminal_no_effect",
+							replay: persisted,
+						};
+					if (existing.turnDisposition === "no_effect_reserved")
+						// A no-effect reservation that may still transition to active: a
+						// duplicate must never claim no_active_turn over a provisional row
+						// (review thread P2).
+						return {
+							ok: true,
+							selection: scope,
+							turn: "uncertain",
+							ownedWork: scope === "turn" ? "left_running" : "uncertain",
+							automaticDelivery: scope === "turn" ? "enabled" : "none",
+							resumeOnOwnedCompletion: scope === "turn",
+							reason: "reservation_in_flight",
+							replay: persisted,
+						};
 					return {
 						ok: true,
 						selection: scope,
@@ -1502,105 +1522,447 @@ function createControlSurface(
 						ownedWork: scope === "turn" ? "left_running" : "uncertain",
 						automaticDelivery: scope === "turn" ? "enabled" : "none",
 						resumeOnOwnedCompletion: scope === "turn",
-						reason: "reservation_in_flight",
+						reason: existing.turnDisposition === "pending" ? "replay_pending" : "replay_uncertain",
 						replay: persisted,
 					};
-				return {
-					ok: true,
-					selection: scope,
-					turn: "uncertain",
-					ownedWork: scope === "turn" ? "left_running" : "uncertain",
-					automaticDelivery: scope === "turn" ? "enabled" : "none",
-					resumeOnOwnedCompletion: scope === "turn",
-					reason: existing.turnDisposition === "pending" ? "replay_pending" : "replay_uncertain",
-					replay: persisted,
-				};
-			}
-			if (keyHash) {
-				const tombstone = store.snapshotTerminalKeys().find(record => record.keyHash === keyHash);
-				if (tombstone) {
-					if (tombstone.inputHash !== inputHash)
-						throw Object.assign(new Error("Idempotency key was reused with different input."), {
-							code: "idempotency_conflict",
-						});
-					return tombstone.turnDisposition === "stopped"
-						? {
-								ok: true,
-								selection: scope,
-								turn: "stopped",
-								...(scope === "owned"
-									? {
-											ownedWork: tombstone.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
-											automaticDelivery: "none",
-											resumeOnOwnedCompletion: false,
-										}
-									: {
-											ownedWork: "left_running",
-											automaticDelivery: "enabled",
-											resumeOnOwnedCompletion: true,
-										}),
-								replay: stored(tombstone),
-							}
-						: tombstone.turnDisposition === "no_effect"
+				}
+				if (keyHash) {
+					const tombstone = store.snapshotTerminalKeys().find(record => record.keyHash === keyHash);
+					if (tombstone) {
+						if (tombstone.inputHash !== inputHash)
+							throw Object.assign(new Error("Idempotency key was reused with different input."), {
+								code: "idempotency_conflict",
+							});
+						return tombstone.turnDisposition === "stopped"
 							? {
 									ok: true,
 									selection: scope,
-									turn: "no_active_turn",
-									terminal: "terminal_no_effect",
+									turn: "stopped",
+									...(scope === "owned"
+										? {
+												ownedWork: tombstone.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
+												automaticDelivery: "none",
+												resumeOnOwnedCompletion: false,
+											}
+										: {
+												ownedWork: "left_running",
+												automaticDelivery: "enabled",
+												resumeOnOwnedCompletion: true,
+											}),
 									replay: stored(tombstone),
 								}
-							: tombstone.turnDisposition === "no_effect_marker_failure"
+							: tombstone.turnDisposition === "no_effect"
 								? {
 										ok: true,
 										selection: scope,
-										turn: "no_effect",
+										turn: "no_active_turn",
 										terminal: "terminal_no_effect",
 										replay: stored(tombstone),
 									}
-								: {
-										ok: true,
-										selection: scope,
-										turn: "uncertain",
-										ownedWork: scope === "turn" ? "left_running" : "uncertain",
-										automaticDelivery: scope === "turn" ? "enabled" : "none",
-										resumeOnOwnedCompletion: scope === "turn",
-										replay: stored(tombstone),
-									};
+								: tombstone.turnDisposition === "no_effect_marker_failure"
+									? {
+											ok: true,
+											selection: scope,
+											turn: "no_effect",
+											terminal: "terminal_no_effect",
+											replay: stored(tombstone),
+										}
+									: {
+											ok: true,
+											selection: scope,
+											turn: "uncertain",
+											ownedWork: scope === "turn" ? "left_running" : "uncertain",
+											automaticDelivery: scope === "turn" ? "enabled" : "none",
+											resumeOnOwnedCompletion: scope === "turn",
+											replay: stored(tombstone),
+										};
+					}
 				}
+				return undefined;
+			};
+			const prior = replay();
+			if (prior !== undefined) return prior;
+			const writeNoEffect = async (markerFailure = false): Promise<"ok" | "conflict"> => {
+				try {
+					await store.transactTerminalState(state => {
+						// Atomic recheck: a concurrent request may have committed a
+						// DIFFERENT input under this key after the earlier snapshot
+						// check; appending a second same-key row would make later
+						// replay's .find() by key hash ambiguous (review thread P2).
+						const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
+						if (conflicting && conflicting.idempotencyInputHash !== inputHash)
+							throw new SdkOnlyIdempotencyConflictError();
+						// A SAME-input live row is durable replay authority (the original
+						// in-flight abort's marker): never replace it with a no-effect
+						// reservation, or the successful abort would replay later as
+						// no_active_turn. Leave the store unchanged and let the caller
+						// re-run the replay snapshot (review thread P2).
+						if (conflicting) {
+							existingReplay = conflicting;
+							return { scopes: state.scopes, keys: state.keys };
+						}
+						// A concurrent admission may ALSO have evicted a same-key row into
+						// the tombstone collection after this request's snapshot; recheck
+						// keys so a different input can never install a fresh marker over
+						// existing durable replay authority (review thread P2). A
+						// same-input tombstone already carries the reservation: leave the
+						// store unchanged and replay it.
+						const tombstone = state.keys.find(record => keyHash && record.keyHash === keyHash);
+						if (tombstone) {
+							if (tombstone.inputHash !== inputHash) throw new SdkOnlyIdempotencyConflictError();
+							existingReplay = tombstone;
+							return { scopes: state.scopes, keys: state.keys };
+						}
+						const preBound: SdkOnlyTerminalScopeRecord[] = [
+							...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
+							{
+								selection: scope,
+								...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
+								// A marker-failure reservation must replay as the SAME
+								// no_effect result it was returned with, so one idempotency
+								// key can never produce no_effect first and no_active_turn
+								// after eviction/restart (review thread P2). The idle-abort
+								// path writes a TRANSITIONAL reserved disposition: the
+								// requester's prompt may become active while the reservation
+								// is awaited, and a duplicate must never claim no_active_turn
+								// over a provisional row — the reserved row is finalized to
+								// plain no_effect only when the recheck confirms no active
+								// turn (review thread P2).
+								turnDisposition: markerFailure
+									? "no_effect_marker_failure"
+									: keyHash
+										? "no_effect_reserved"
+										: "no_effect",
+								ownedWorkDisposition: "not_requested",
+								automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
+								resumeOnOwnedCompletion: scope === "turn",
+								turnContinuationFence: {
+									state: "retained",
+									abortedAttemptEpoch: 0,
+									blockedContinuationIds: [],
+									predecessorTombstones: [],
+									ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
+								},
+								responseState: "pending",
+								// marker_failure rows are FINAL as written (the abort returns the
+								// public no_effect disposition immediately, no later
+								// finalization), so store the public payload hash; idle
+								// reservations are finalized by finalizeNoEffectReservation
+								// (review thread P2). The replay-shaped hash is stored too so a
+								// same-key retry's metadata-bearing replay can still advance the
+								// row on delivery (review thread P2).
+								responsePayloadHash: markerFailure
+									? hashResult({
+											ok: true,
+											selection: scope,
+											turn: "no_effect",
+											terminal: "terminal_no_effect",
+										})
+									: inputHash,
+								replayPayloadHash: markerFailure
+									? hashResult({
+											ok: true,
+											selection: scope,
+											turn: "no_effect",
+											terminal: "terminal_no_effect",
+											replay: {
+												responseState: "pending",
+												responsePayloadHash: hashResult({
+													ok: true,
+													selection: scope,
+													turn: "no_effect",
+													terminal: "terminal_no_effect",
+												}),
+												terminalPublished: false,
+											},
+										})
+									: undefined,
+								acceptedAt: Date.now(),
+							},
+						];
+						const bounded = boundCompletedTerminalScopeRows(preBound, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
+						const evicted = collectEvictedTerminalKeys(preBound, bounded);
+						const combined = [...state.keys, ...evicted];
+						// FIFO-expire the OLDEST tombstones past the cap instead of
+						// throwing after the destructive stop already happened (review
+						// thread P2).
+						return {
+							scopes: bounded,
+							keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+						};
+					});
+					return "ok";
+				} catch (error) {
+					if (error instanceof SdkOnlyIdempotencyConflictError) return "conflict";
+					throw error;
+				}
+			};
+			// Finalize THIS abort's transitional no_effect_reserved reservation to
+			// plain no_effect once the recheck confirms there is no active turn to
+			// stop: a later same-key retry then replays the deterministic
+			// no_active_turn result instead of reservation_in_flight uncertainty
+			// (review thread P2). Only OUR row (exact key+input, still reserved) is
+			// touched — a concurrent transition that already replaced it is left
+			// alone. The EXACT final response payload hash is stored so the
+			// response-state advance can require equality instead of trusting a
+			// non-pending placeholder (review thread P2).
+			const finalizeNoEffectReservation = async (result: {
+				ok: boolean;
+				selection: string;
+				turn: string;
+				terminal: string;
+			}): Promise<void> => {
+				if (!keyHash) return;
+				const payloadHash = hashResult(result);
+				// The same-key retry delivers the metadata-bearing replay envelope;
+				// store its hash too so the retry's written response can advance the
+				// finalized row (review thread P2).
+				const replayPayloadHash = hashResult({
+					...result,
+					replay: { responseState: "pending", responsePayloadHash: payloadHash, terminalPublished: false },
+				});
+				try {
+					await store.transactTerminalState(state => {
+						const scopes: SdkOnlyTerminalScopeRecord[] = state.scopes.map(record =>
+							record.idempotencyKeyHash === keyHash &&
+							record.idempotencyInputHash === inputHash &&
+							record.turnDisposition === "no_effect_reserved"
+								? {
+										...record,
+										turnDisposition: "no_effect",
+										responsePayloadHash: payloadHash,
+										replayPayloadHash,
+									}
+								: record,
+						);
+						// Finalized reservations become evictable completed rows: apply
+						// the SAME bounded retention as writeNoEffect so a burst of idle
+						// aborts cannot grow the document (review thread P2).
+						const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
+						const evicted = collectEvictedTerminalKeys(scopes, bounded);
+						const combined = [...state.keys, ...evicted];
+						// FIFO-expire the OLDEST tombstones past the cap instead of
+						// throwing after the destructive stop already happened (review
+						// thread P2).
+						return {
+							scopes: bounded,
+							keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+						};
+					});
+				} catch {
+					// Best-effort: the row stays reserved (replays as uncertainty)
+					// rather than failing the abort (review thread P2).
+				}
+			};
+			// Finalize pending markers through the SAME bounded retention as the
+			// admission writes: mapping pending rows to completed dispositions
+			// (uncertain/stopped) must evict the oldest completed rows and retain
+			// tombstones, or a burst of concurrent distinct-key aborts of one slow
+			// turn leaves an arbitrarily large reconciliation document (review
+			// thread P2).
+			const transactBoundedTerminalScopes = async (
+				mutate: (scopes: SdkOnlyTerminalScopeRecord[]) => SdkOnlyTerminalScopeRecord[],
+			): Promise<void> => {
+				await store.transactTerminalState(state => {
+					const scopes = mutate(state.scopes);
+					const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
+					const evicted = collectEvictedTerminalKeys(scopes, bounded);
+					const combined = [...state.keys, ...evicted];
+					// FIFO-expire the OLDEST tombstones past the cap instead of
+					// throwing after the destructive stop already happened (review
+					// thread P2).
+					return {
+						scopes: bounded,
+						keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+					};
+				});
+			};
+			let handle = terminalAbortSeams.getActivePromptHandle();
+			let epoch = terminalAbortSeams.getTerminalTurnEpoch();
+			// Set when the no-effect reservation found an existing SAME-input row or
+			// tombstone: the caller re-runs the replay snapshot instead of returning
+			// a no-active result over the original row's replay authority (review
+			// thread P2).
+			let existingReplay: SdkOnlyTerminalScopeRecord | SdkOnlyEvictedTerminalKeyEntry | undefined;
+			// Read the requester's preflight bucket WITHOUT creating one: an
+			// abort-only request that returns via an early replay/marker path (which
+			// never runs the bucket cleanup) must not leave an empty per-connection
+			// entry behind — reconnecting clients would otherwise accumulate buckets
+			// indefinitely (review thread P2).
+			const requesterBucketKey = sdkControlRequesterContext.getStore() ?? "";
+			const requesterPreflights = pendingPreflights.get(requesterBucketKey);
+			// Snapshot the requester's preflight callbacks AT ADMISSION: a successor
+			// turn.prompt pipelined by the same connection while the abort awaits
+			// (e.g. the reconciliation transaction) must never be cancelled as part
+			// of this abort — only the callbacks present when it was admitted are
+			// its to cancel, mirroring the full-bus capture (review thread P1).
+			const admittedRequesterPreflights = new Set(requesterPreflights ?? []);
+			const cancelRequesterPreflights = () => {
+				for (const cancel of [...admittedRequesterPreflights]) cancel();
+				if (admittedRequesterPreflights.size > 0) {
+					// Remove the admitted callbacks from the live set so a preflight
+					// added by a LATER submission is untouched by this abort (and the
+					// bucket cleanup below reflects what actually remains).
+					for (const cancel of admittedRequesterPreflights) requesterPreflights?.delete(cancel);
+					// The seam cancels the SESSION-WIDE preflight controller, so only
+					// invoke it when NO OTHER connection has a pending admission: a
+					// queued requester's abort must reject its own wrapper callback
+					// (above) without cancelling another connection's active
+					// preflight — the aborting requester's admission is already
+					// rejected, so the session-wide abort is never required for it
+					// (review thread P1).
+					const otherConnectionPreflights = [...pendingPreflights.entries()].some(
+						([bucket, callbacks]) => bucket !== requesterBucketKey && callbacks.size > 0,
+					);
+					if (!otherConnectionPreflights) terminalAbortSeams.cancelPendingPreflightForTerminalAbort();
+				}
+				if (requesterPreflights && requesterPreflights.size === 0) {
+					// Abort-only lookups must not retain an empty per-connection bucket:
+					// connections are ephemeral UUIDs and nothing else removes the
+					// bucket when no prompt submission ever registered on it, so a
+					// long-lived runtime handling aborts from reconnecting clients
+					// would accumulate one entry per connection forever (review
+					// thread P2).
+					if (pendingPreflights.get(requesterBucketKey) === requesterPreflights)
+						pendingPreflights.delete(requesterBucketKey);
+				}
+			};
+			if (!handle || epoch === undefined) {
+				if ((await writeNoEffect()) === "conflict") {
+					throw Object.assign(new Error("Idempotency key was reused with different input."), {
+						code: "idempotency_conflict",
+					});
+				}
+				// A SAME-input row or tombstone existed while the reservation
+				// awaited the store: it is durable replay authority, so replay its
+				// stored result (stopped/pending/uncertain/no_effect) instead of
+				// returning no_active_turn over it (review thread P2).
+				if (existingReplay) {
+					const replayed = replay();
+					if (replayed !== undefined) return replayed;
+				}
+				cancelRequesterPreflights();
+				// A prompt for this requester may have become ACTIVE while the
+				// reservation awaited the filesystem transaction: its submit()
+				// cleanup already removed the preflight callback, so cancelling here
+				// saw an empty set and never reached the session cancellation seam —
+				// and the durable no-effect row would prevent a same-key retry from
+				// ever stopping the now-running prompt. Re-read the active prompt and
+				// fall through to ACTIVE terminalization when it won the race
+				// (review thread P1); the active-turn marker write replaces the
+				// no-effect reservation.
+				const recheckedHandle = terminalAbortSeams.getActivePromptHandle();
+				const recheckedEpoch = terminalAbortSeams.getTerminalTurnEpoch();
+				if (!recheckedHandle || recheckedEpoch === undefined) {
+					// No prompt won the race: finalize the reserved row so a later
+					// same-key retry replays this deterministic no_active_turn result
+					// (review thread P2).
+					const noActiveTurnResult = {
+						ok: true,
+						selection: scope,
+						turn: "no_active_turn",
+						terminal: "terminal_no_effect",
+					};
+					await finalizeNoEffectReservation(noActiveTurnResult);
+					return noActiveTurnResult;
+				}
+				handle = recheckedHandle;
+				epoch = recheckedEpoch;
 			}
-			return undefined;
-		};
-		const prior = replay();
-		if (prior !== undefined) return prior;
-		const writeNoEffect = async (markerFailure = false): Promise<"ok" | "conflict"> => {
+			// Requester ownership: the active prompt belongs to the SDK connection
+			// that accepted it. Another connection's terminal abort must not stop it
+			// (review thread P1) — no-op with an idle reservation, mirroring the
+			// per-connection selection of the full bus path. The owner is re-read
+			// through the seam when provided (deterministic tests) and otherwise
+			// from the runtime-tracked accepting connection.
+			const abortingConnectionId = sdkControlRequesterContext.getStore();
+			const currentOwnerConnectionIds = (): ReadonlySet<string> => {
+				const seam = terminalAbortSeams.getActivePromptOwnerConnectionId?.();
+				// The seam reports a single deterministic owner (test harnesses); the
+				// runtime holder may carry every connection whose follow-up was
+				// promoted into the current run (review thread P2).
+				return seam === undefined ? (activePromptOwner.connectionIds ?? new Set<string>()) : new Set([seam]);
+			};
+			// FAIL CLOSED unless the active handle is POSITIVELY associated with the
+			// requester: an undefined owner (agent-initiated monitor/cron turn, or
+			// cleared after a terminal lifecycle boundary) authorizes no client, and
+			// a stale prior owner authorizes only that old client — never a later
+			// turn it did not submit (review thread P1).
+			if (handle && (abortingConnectionId === undefined || !currentOwnerConnectionIds().has(abortingConnectionId))) {
+				if ((await writeNoEffect()) === "conflict") {
+					throw Object.assign(new Error("Idempotency key was reused with different input."), {
+						code: "idempotency_conflict",
+					});
+				}
+				if (existingReplay) {
+					const replayed = replay();
+					if (replayed !== undefined) return replayed;
+				}
+				cancelRequesterPreflights();
+				// A prompt for this requester may have become ACTIVE while the
+				// no-effect reservation awaited the filesystem transaction: the
+				// owner-mismatch decision was taken against the OLD owner, and the
+				// newly active submission already removed its preflight callback, so
+				// cancelling here saw an empty set and never reached the session
+				// cancellation seam — and the durable no-effect row would prevent a
+				// same-key retry from ever stopping the now-running prompt. Re-read
+				// the active prompt, its epoch, and its owner; when the ABORTING
+				// connection now owns the turn, fall through to ACTIVE
+				// terminalization (the active-turn marker write replaces the
+				// no-effect reservation) (review thread P1).
+				const recheckedHandle = terminalAbortSeams.getActivePromptHandle();
+				const recheckedEpoch = terminalAbortSeams.getTerminalTurnEpoch();
+				const recheckedOwners = currentOwnerConnectionIds();
+				if (
+					!recheckedHandle ||
+					recheckedEpoch === undefined ||
+					abortingConnectionId === undefined ||
+					!recheckedOwners.has(abortingConnectionId)
+				) {
+					// The turn is still not the aborting connection's: finalize the
+					// reserved row so a later same-key retry replays no_active_turn
+					// deterministically (review thread P2).
+					const noActiveTurnResult = {
+						ok: true,
+						selection: scope,
+						turn: "no_active_turn",
+						terminal: "terminal_no_effect",
+					};
+					await finalizeNoEffectReservation(noActiveTurnResult);
+					return noActiveTurnResult;
+				}
+				handle = recheckedHandle;
+				epoch = recheckedEpoch;
+			}
+			let pendingReplay: SdkOnlyTerminalScopeRecord | undefined;
+			let tombstoneReplay: SdkOnlyEvictedTerminalKeyEntry | undefined;
 			try {
 				await store.transactTerminalState(state => {
-					// Atomic recheck: a concurrent request may have committed a
-					// DIFFERENT input under this key after the earlier snapshot
-					// check; appending a second same-key row would make later
-					// replay's .find() by key hash ambiguous (review thread P2).
+					// Atomic recheck (same rationale as writeNoEffect): never wipe a
+					// row a concurrent request committed under this key (review thread
+					// P2). A same-input PENDING row is an in-flight duplicate admitted
+					// past the snapshot (dispatch-cache eviction): replay it instead of
+					// replacing the marker, so the duplicate cannot race terminalization
+					// and flip the row to uncertain while the original returns stopped
+					// (or execute the abort twice).
 					const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
-					if (conflicting && conflicting.idempotencyInputHash !== inputHash)
-						throw new SdkOnlyIdempotencyConflictError();
-					// A SAME-input live row is durable replay authority (the original
-					// in-flight abort's marker): never replace it with a no-effect
-					// reservation, or the successful abort would replay later as
-					// no_active_turn. Leave the store unchanged and let the caller
-					// re-run the replay snapshot (review thread P2).
 					if (conflicting) {
-						existingReplay = conflicting;
-						return { scopes: state.scopes, keys: state.keys };
+						if (conflicting.idempotencyInputHash !== inputHash) throw new SdkOnlyIdempotencyConflictError();
+						if (conflicting.turnDisposition === "pending") {
+							pendingReplay = conflicting;
+							return { scopes: state.scopes, keys: state.keys };
+						}
 					}
 					// A concurrent admission may ALSO have evicted a same-key row into
-					// the tombstone collection after this request's snapshot; recheck
+					// the tombstone collection after this request's snapshot. Recheck
 					// keys so a different input can never install a fresh marker over
-					// existing durable replay authority (review thread P2). A
-					// same-input tombstone already carries the reservation: leave the
-					// store unchanged and replay it.
+					// existing durable replay authority; a same-input tombstone already
+					// carries replay authority, so never install a second marker here
+					// (review thread P2).
 					const tombstone = state.keys.find(record => keyHash && record.keyHash === keyHash);
 					if (tombstone) {
 						if (tombstone.inputHash !== inputHash) throw new SdkOnlyIdempotencyConflictError();
-						existingReplay = tombstone;
+						tombstoneReplay = tombstone;
 						return { scopes: state.scopes, keys: state.keys };
 					}
 					const preBound: SdkOnlyTerminalScopeRecord[] = [
@@ -1608,65 +1970,20 @@ function createControlSurface(
 						{
 							selection: scope,
 							...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
-							// A marker-failure reservation must replay as the SAME
-							// no_effect result it was returned with, so one idempotency
-							// key can never produce no_effect first and no_active_turn
-							// after eviction/restart (review thread P2). The idle-abort
-							// path writes a TRANSITIONAL reserved disposition: the
-							// requester's prompt may become active while the reservation
-							// is awaited, and a duplicate must never claim no_active_turn
-							// over a provisional row — the reserved row is finalized to
-							// plain no_effect only when the recheck confirms no active
-							// turn (review thread P2).
-							turnDisposition: markerFailure
-								? "no_effect_marker_failure"
-								: keyHash
-									? "no_effect_reserved"
-									: "no_effect",
+							turnDisposition: "pending",
+							terminalPublished: false,
 							ownedWorkDisposition: "not_requested",
 							automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
 							resumeOnOwnedCompletion: scope === "turn",
 							turnContinuationFence: {
 								state: "retained",
-								abortedAttemptEpoch: 0,
+								abortedAttemptEpoch: epoch,
 								blockedContinuationIds: [],
 								predecessorTombstones: [],
 								ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
 							},
 							responseState: "pending",
-							// marker_failure rows are FINAL as written (the abort returns the
-							// public no_effect disposition immediately, no later
-							// finalization), so store the public payload hash; idle
-							// reservations are finalized by finalizeNoEffectReservation
-							// (review thread P2). The replay-shaped hash is stored too so a
-							// same-key retry's metadata-bearing replay can still advance the
-							// row on delivery (review thread P2).
-							responsePayloadHash: markerFailure
-								? hashResult({
-										ok: true,
-										selection: scope,
-										turn: "no_effect",
-										terminal: "terminal_no_effect",
-									})
-								: inputHash,
-							replayPayloadHash: markerFailure
-								? hashResult({
-										ok: true,
-										selection: scope,
-										turn: "no_effect",
-										terminal: "terminal_no_effect",
-										replay: {
-											responseState: "pending",
-											responsePayloadHash: hashResult({
-												ok: true,
-												selection: scope,
-												turn: "no_effect",
-												terminal: "terminal_no_effect",
-											}),
-											terminalPublished: false,
-										},
-									})
-								: undefined,
+							responsePayloadHash: inputHash,
 							acceptedAt: Date.now(),
 						},
 					];
@@ -1681,480 +1998,141 @@ function createControlSurface(
 						keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
 					};
 				});
-				return "ok";
 			} catch (error) {
-				if (error instanceof SdkOnlyIdempotencyConflictError) return "conflict";
-				throw error;
+				if (error instanceof SdkOnlyIdempotencyConflictError) {
+					throw Object.assign(new Error("Idempotency key was reused with different input."), {
+						code: "idempotency_conflict",
+					});
+				}
+				// Marker persistence failed before any destructive work: reserve a
+				// distinct marker-failure disposition so replay returns the same
+				// no_effect result (review thread P2).
+				if ((await writeNoEffect(true)) === "conflict") {
+					throw Object.assign(new Error("Idempotency key was reused with different input."), {
+						code: "idempotency_conflict",
+					});
+				}
+				if (existingReplay) {
+					const replayed = replay();
+					if (replayed !== undefined) return replayed;
+				}
+				return {
+					ok: true,
+					selection: scope,
+					turn: "no_effect",
+					terminal: "terminal_no_effect",
+				};
 			}
-		};
-		// Finalize THIS abort's transitional no_effect_reserved reservation to
-		// plain no_effect once the recheck confirms there is no active turn to
-		// stop: a later same-key retry then replays the deterministic
-		// no_active_turn result instead of reservation_in_flight uncertainty
-		// (review thread P2). Only OUR row (exact key+input, still reserved) is
-		// touched — a concurrent transition that already replaced it is left
-		// alone. The EXACT final response payload hash is stored so the
-		// response-state advance can require equality instead of trusting a
-		// non-pending placeholder (review thread P2).
-		const finalizeNoEffectReservation = async (result: {
-			ok: boolean;
-			selection: string;
-			turn: string;
-			terminal: string;
-		}): Promise<void> => {
-			if (!keyHash) return;
-			const payloadHash = hashResult(result);
-			// The same-key retry delivers the metadata-bearing replay envelope;
-			// store its hash too so the retry's written response can advance the
-			// finalized row (review thread P2).
-			const replayPayloadHash = hashResult({
-				...result,
-				replay: { responseState: "pending", responsePayloadHash: payloadHash, terminalPublished: false },
-			});
-			try {
-				await store.transactTerminalState(state => {
-					const scopes: SdkOnlyTerminalScopeRecord[] = state.scopes.map(record =>
-						record.idempotencyKeyHash === keyHash &&
-						record.idempotencyInputHash === inputHash &&
-						record.turnDisposition === "no_effect_reserved"
+			if (pendingReplay) {
+				// An in-flight duplicate of this exact key+input was already admitted;
+				// replay its pending row WITHOUT touching the seam, so the duplicate
+				// cannot abort the run a second time or race the terminalization.
+				return {
+					ok: true,
+					selection: scope,
+					turn: "uncertain",
+					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					automaticDelivery: scope === "turn" ? "enabled" : "none",
+					resumeOnOwnedCompletion: scope === "turn",
+					reason: "replay_pending",
+					replay: {
+						responseState: pendingReplay.responseState,
+						responsePayloadHash: pendingReplay.responsePayloadHash,
+						terminalPublished: pendingReplay.terminalPublished === true,
+					},
+				};
+			}
+			if (tombstoneReplay) {
+				// The key gained durable replay authority via an eviction tombstone
+				// while this request was in flight; never install a second marker or
+				// run the abort. Re-run the replay snapshot (the tombstone is now
+				// visible) so the STORED result is returned (review thread P2).
+				const replayed = replay();
+				if (replayed !== undefined) return replayed;
+			}
+			// A new prompt won the race while the marker was being persisted. Never
+			// apply this request to that later handle; replay remains a safe uncertainty.
+			if (
+				terminalAbortSeams.getActivePromptHandle() !== handle ||
+				terminalAbortSeams.getTerminalTurnEpoch() !== epoch
+			) {
+				const result = {
+					ok: true,
+					selection: scope,
+					turn: "uncertain",
+					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					automaticDelivery: scope === "turn" ? "enabled" : "none",
+					resumeOnOwnedCompletion: scope === "turn",
+					reason: "active_turn_changed",
+				};
+				const activeTurnPayloadHash = hashResult(result);
+				await transactBoundedTerminalScopes(scopes =>
+					scopes.map(record =>
+						(keyHash
+							? record.idempotencyKeyHash === keyHash
+							: record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+						record.turnDisposition === "pending"
 							? {
 									...record,
-									turnDisposition: "no_effect",
-									responsePayloadHash: payloadHash,
-									replayPayloadHash,
+									turnDisposition: "uncertain",
+									responsePayloadHash: activeTurnPayloadHash,
+									replayPayloadHash: replayShapedHash(record, result, activeTurnPayloadHash),
+									terminalAt: Date.now(),
 								}
 							: record,
-					);
-					// Finalized reservations become evictable completed rows: apply
-					// the SAME bounded retention as writeNoEffect so a burst of idle
-					// aborts cannot grow the document (review thread P2).
-					const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
-					const evicted = collectEvictedTerminalKeys(scopes, bounded);
-					const combined = [...state.keys, ...evicted];
-					// FIFO-expire the OLDEST tombstones past the cap instead of
-					// throwing after the destructive stop already happened (review
-					// thread P2).
-					return {
-						scopes: bounded,
-						keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-					};
+					),
+				);
+				return result;
+			}
+			cancelRequesterPreflights();
+			// Observe the correlated agent_end publication (AC 19) instead of
+			// assuming it: the aborted run's lifecycle event is published
+			// independently by emitLifecycle, so the durable stopped row must only
+			// claim terminalPublished when the publication was actually observed
+			// (review thread P2). Multiple concurrent aborts of the SAME turn (distinct
+			// idempotency keys, same scope) are all admitted and all await the ONE
+			// agent_end the turn emits, so every waiter is registered — a single slot
+			// would resolve only the latest and leave the earlier abort to record a
+			// false negative (review thread P2).
+			const terminalPublication = Promise.withResolvers<boolean>();
+			const removeTerminalPublicationWaiter = () => {
+				const resolvers = terminalPublicationCapture?.resolvers;
+				if (!resolvers) return;
+				const index = resolvers.indexOf(terminalPublication.resolve);
+				if (index >= 0) resolvers.splice(index, 1);
+			};
+			if (terminalPublicationCapture) {
+				if (!terminalPublicationCapture.resolvers) terminalPublicationCapture.resolvers = [];
+				terminalPublicationCapture.resolvers.push(terminalPublication.resolve);
+			}
+			let proof: { status: string; terminalScope?: unknown };
+			try {
+				proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(handle, {
+					graceMs: 10_000,
+					terminal: { scope, expectedEpoch: epoch },
 				});
 			} catch {
-				// Best-effort: the row stays reserved (replays as uncertainty)
-				// rather than failing the abort (review thread P2).
+				proof = { status: "unfenced" };
 			}
-		};
-		// Finalize pending markers through the SAME bounded retention as the
-		// admission writes: mapping pending rows to completed dispositions
-		// (uncertain/stopped) must evict the oldest completed rows and retain
-		// tombstones, or a burst of concurrent distinct-key aborts of one slow
-		// turn leaves an arbitrarily large reconciliation document (review
-		// thread P2).
-		const transactBoundedTerminalScopes = async (
-			mutate: (scopes: SdkOnlyTerminalScopeRecord[]) => SdkOnlyTerminalScopeRecord[],
-		): Promise<void> => {
-			await store.transactTerminalState(state => {
-				const scopes = mutate(state.scopes);
-				const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
-				const evicted = collectEvictedTerminalKeys(scopes, bounded);
-				const combined = [...state.keys, ...evicted];
-				// FIFO-expire the OLDEST tombstones past the cap instead of
-				// throwing after the destructive stop already happened (review
-				// thread P2).
-				return {
-					scopes: bounded,
-					keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-				};
-			});
-		};
-		let handle = terminalAbortSeams.getActivePromptHandle();
-		let epoch = terminalAbortSeams.getTerminalTurnEpoch();
-		// Set when the no-effect reservation found an existing SAME-input row or
-		// tombstone: the caller re-runs the replay snapshot instead of returning
-		// a no-active result over the original row's replay authority (review
-		// thread P2).
-		let existingReplay: SdkOnlyTerminalScopeRecord | SdkOnlyEvictedTerminalKeyEntry | undefined;
-		// Read the requester's preflight bucket WITHOUT creating one: an
-		// abort-only request that returns via an early replay/marker path (which
-		// never runs the bucket cleanup) must not leave an empty per-connection
-		// entry behind — reconnecting clients would otherwise accumulate buckets
-		// indefinitely (review thread P2).
-		const requesterBucketKey = sdkControlRequesterContext.getStore() ?? "";
-		const requesterPreflights = pendingPreflights.get(requesterBucketKey);
-		// Snapshot the requester's preflight callbacks AT ADMISSION: a successor
-		// turn.prompt pipelined by the same connection while the abort awaits
-		// (e.g. the reconciliation transaction) must never be cancelled as part
-		// of this abort — only the callbacks present when it was admitted are
-		// its to cancel, mirroring the full-bus capture (review thread P1).
-		const admittedRequesterPreflights = new Set(requesterPreflights ?? []);
-		const cancelRequesterPreflights = () => {
-			for (const cancel of [...admittedRequesterPreflights]) cancel();
-			if (admittedRequesterPreflights.size > 0) {
-				// Remove the admitted callbacks from the live set so a preflight
-				// added by a LATER submission is untouched by this abort (and the
-				// bucket cleanup below reflects what actually remains).
-				for (const cancel of admittedRequesterPreflights) requesterPreflights?.delete(cancel);
-				// The seam cancels the SESSION-WIDE preflight controller, so only
-				// invoke it when NO OTHER connection has a pending admission: a
-				// queued requester's abort must reject its own wrapper callback
-				// (above) without cancelling another connection's active
-				// preflight — the aborting requester's admission is already
-				// rejected, so the session-wide abort is never required for it
-				// (review thread P1).
-				const otherConnectionPreflights = [...pendingPreflights.entries()].some(
-					([bucket, callbacks]) => bucket !== requesterBucketKey && callbacks.size > 0,
-				);
-				if (!otherConnectionPreflights) terminalAbortSeams.cancelPendingPreflightForTerminalAbort();
-			}
-			if (requesterPreflights && requesterPreflights.size === 0) {
-				// Abort-only lookups must not retain an empty per-connection bucket:
-				// connections are ephemeral UUIDs and nothing else removes the
-				// bucket when no prompt submission ever registered on it, so a
-				// long-lived runtime handling aborts from reconnecting clients
-				// would accumulate one entry per connection forever (review
-				// thread P2).
-				if (pendingPreflights.get(requesterBucketKey) === requesterPreflights)
-					pendingPreflights.delete(requesterBucketKey);
-			}
-		};
-		if (!handle || epoch === undefined) {
-			if ((await writeNoEffect()) === "conflict") {
-				throw Object.assign(new Error("Idempotency key was reused with different input."), {
-					code: "idempotency_conflict",
-				});
-			}
-			// A SAME-input row or tombstone existed while the reservation
-			// awaited the store: it is durable replay authority, so replay its
-			// stored result (stopped/pending/uncertain/no_effect) instead of
-			// returning no_active_turn over it (review thread P2).
-			if (existingReplay) {
-				const replayed = replay();
-				if (replayed !== undefined) return replayed;
-			}
-			cancelRequesterPreflights();
-			// A prompt for this requester may have become ACTIVE while the
-			// reservation awaited the filesystem transaction: its submit()
-			// cleanup already removed the preflight callback, so cancelling here
-			// saw an empty set and never reached the session cancellation seam —
-			// and the durable no-effect row would prevent a same-key retry from
-			// ever stopping the now-running prompt. Re-read the active prompt and
-			// fall through to ACTIVE terminalization when it won the race
-			// (review thread P1); the active-turn marker write replaces the
-			// no-effect reservation.
-			const recheckedHandle = terminalAbortSeams.getActivePromptHandle();
-			const recheckedEpoch = terminalAbortSeams.getTerminalTurnEpoch();
-			if (!recheckedHandle || recheckedEpoch === undefined) {
-				// No prompt won the race: finalize the reserved row so a later
-				// same-key retry replays this deterministic no_active_turn result
-				// (review thread P2).
-				const noActiveTurnResult = {
-					ok: true,
-					selection: scope,
-					turn: "no_active_turn",
-					terminal: "terminal_no_effect",
-				};
-				await finalizeNoEffectReservation(noActiveTurnResult);
-				return noActiveTurnResult;
-			}
-			handle = recheckedHandle;
-			epoch = recheckedEpoch;
-		}
-		// Requester ownership: the active prompt belongs to the SDK connection
-		// that accepted it. Another connection's terminal abort must not stop it
-		// (review thread P1) — no-op with an idle reservation, mirroring the
-		// per-connection selection of the full bus path. The owner is re-read
-		// through the seam when provided (deterministic tests) and otherwise
-		// from the runtime-tracked accepting connection.
-		const abortingConnectionId = sdkControlRequesterContext.getStore();
-		const currentOwnerConnectionIds = (): ReadonlySet<string> => {
-			const seam = terminalAbortSeams.getActivePromptOwnerConnectionId?.();
-			// The seam reports a single deterministic owner (test harnesses); the
-			// runtime holder may carry every connection whose follow-up was
-			// promoted into the current run (review thread P2).
-			return seam === undefined ? (activePromptOwner.connectionIds ?? new Set<string>()) : new Set([seam]);
-		};
-		// FAIL CLOSED unless the active handle is POSITIVELY associated with the
-		// requester: an undefined owner (agent-initiated monitor/cron turn, or
-		// cleared after a terminal lifecycle boundary) authorizes no client, and
-		// a stale prior owner authorizes only that old client — never a later
-		// turn it did not submit (review thread P1).
-		if (handle && (abortingConnectionId === undefined || !currentOwnerConnectionIds().has(abortingConnectionId))) {
-			if ((await writeNoEffect()) === "conflict") {
-				throw Object.assign(new Error("Idempotency key was reused with different input."), {
-					code: "idempotency_conflict",
-				});
-			}
-			if (existingReplay) {
-				const replayed = replay();
-				if (replayed !== undefined) return replayed;
-			}
-			cancelRequesterPreflights();
-			// A prompt for this requester may have become ACTIVE while the
-			// no-effect reservation awaited the filesystem transaction: the
-			// owner-mismatch decision was taken against the OLD owner, and the
-			// newly active submission already removed its preflight callback, so
-			// cancelling here saw an empty set and never reached the session
-			// cancellation seam — and the durable no-effect row would prevent a
-			// same-key retry from ever stopping the now-running prompt. Re-read
-			// the active prompt, its epoch, and its owner; when the ABORTING
-			// connection now owns the turn, fall through to ACTIVE
-			// terminalization (the active-turn marker write replaces the
-			// no-effect reservation) (review thread P1).
-			const recheckedHandle = terminalAbortSeams.getActivePromptHandle();
-			const recheckedEpoch = terminalAbortSeams.getTerminalTurnEpoch();
-			const recheckedOwners = currentOwnerConnectionIds();
-			if (
-				!recheckedHandle ||
-				recheckedEpoch === undefined ||
-				abortingConnectionId === undefined ||
-				!recheckedOwners.has(abortingConnectionId)
-			) {
-				// The turn is still not the aborting connection's: finalize the
-				// reserved row so a later same-key retry replays no_active_turn
-				// deterministically (review thread P2).
-				const noActiveTurnResult = {
-					ok: true,
-					selection: scope,
-					turn: "no_active_turn",
-					terminal: "terminal_no_effect",
-				};
-				await finalizeNoEffectReservation(noActiveTurnResult);
-				return noActiveTurnResult;
-			}
-			handle = recheckedHandle;
-			epoch = recheckedEpoch;
-		}
-		let pendingReplay: SdkOnlyTerminalScopeRecord | undefined;
-		let tombstoneReplay: SdkOnlyEvictedTerminalKeyEntry | undefined;
-		try {
-			await store.transactTerminalState(state => {
-				// Atomic recheck (same rationale as writeNoEffect): never wipe a
-				// row a concurrent request committed under this key (review thread
-				// P2). A same-input PENDING row is an in-flight duplicate admitted
-				// past the snapshot (dispatch-cache eviction): replay it instead of
-				// replacing the marker, so the duplicate cannot race terminalization
-				// and flip the row to uncertain while the original returns stopped
-				// (or execute the abort twice).
-				const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
-				if (conflicting) {
-					if (conflicting.idempotencyInputHash !== inputHash) throw new SdkOnlyIdempotencyConflictError();
-					if (conflicting.turnDisposition === "pending") {
-						pendingReplay = conflicting;
-						return { scopes: state.scopes, keys: state.keys };
-					}
-				}
-				// A concurrent admission may ALSO have evicted a same-key row into
-				// the tombstone collection after this request's snapshot. Recheck
-				// keys so a different input can never install a fresh marker over
-				// existing durable replay authority; a same-input tombstone already
-				// carries replay authority, so never install a second marker here
-				// (review thread P2).
-				const tombstone = state.keys.find(record => keyHash && record.keyHash === keyHash);
-				if (tombstone) {
-					if (tombstone.inputHash !== inputHash) throw new SdkOnlyIdempotencyConflictError();
-					tombstoneReplay = tombstone;
-					return { scopes: state.scopes, keys: state.keys };
-				}
-				const preBound: SdkOnlyTerminalScopeRecord[] = [
-					...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
-					{
-						selection: scope,
-						...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
-						turnDisposition: "pending",
-						terminalPublished: false,
-						ownedWorkDisposition: "not_requested",
-						automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
-						resumeOnOwnedCompletion: scope === "turn",
-						turnContinuationFence: {
-							state: "retained",
-							abortedAttemptEpoch: epoch,
-							blockedContinuationIds: [],
-							predecessorTombstones: [],
-							ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
-						},
-						responseState: "pending",
-						responsePayloadHash: inputHash,
-						acceptedAt: Date.now(),
-					},
-				];
-				const bounded = boundCompletedTerminalScopeRows(preBound, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
-				const evicted = collectEvictedTerminalKeys(preBound, bounded);
-				const combined = [...state.keys, ...evicted];
-				// FIFO-expire the OLDEST tombstones past the cap instead of
-				// throwing after the destructive stop already happened (review
-				// thread P2).
-				return {
-					scopes: bounded,
-					keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-				};
-			});
-		} catch (error) {
-			if (error instanceof SdkOnlyIdempotencyConflictError) {
-				throw Object.assign(new Error("Idempotency key was reused with different input."), {
-					code: "idempotency_conflict",
-				});
-			}
-			// Marker persistence failed before any destructive work: reserve a
-			// distinct marker-failure disposition so replay returns the same
-			// no_effect result (review thread P2).
-			if ((await writeNoEffect(true)) === "conflict") {
-				throw Object.assign(new Error("Idempotency key was reused with different input."), {
-					code: "idempotency_conflict",
-				});
-			}
-			if (existingReplay) {
-				const replayed = replay();
-				if (replayed !== undefined) return replayed;
-			}
-			return {
-				ok: true,
-				selection: scope,
-				turn: "no_effect",
-				terminal: "terminal_no_effect",
-			};
-		}
-		if (pendingReplay) {
-			// An in-flight duplicate of this exact key+input was already admitted;
-			// replay its pending row WITHOUT touching the seam, so the duplicate
-			// cannot abort the run a second time or race the terminalization.
-			return {
-				ok: true,
-				selection: scope,
-				turn: "uncertain",
-				ownedWork: scope === "turn" ? "left_running" : "uncertain",
-				automaticDelivery: scope === "turn" ? "enabled" : "none",
-				resumeOnOwnedCompletion: scope === "turn",
-				reason: "replay_pending",
-				replay: {
-					responseState: pendingReplay.responseState,
-					responsePayloadHash: pendingReplay.responsePayloadHash,
-					terminalPublished: pendingReplay.terminalPublished === true,
-				},
-			};
-		}
-		if (tombstoneReplay) {
-			// The key gained durable replay authority via an eviction tombstone
-			// while this request was in flight; never install a second marker or
-			// run the abort. Re-run the replay snapshot (the tombstone is now
-			// visible) so the STORED result is returned (review thread P2).
-			const replayed = replay();
-			if (replayed !== undefined) return replayed;
-		}
-		// A new prompt won the race while the marker was being persisted. Never
-		// apply this request to that later handle; replay remains a safe uncertainty.
-		if (
-			terminalAbortSeams.getActivePromptHandle() !== handle ||
-			terminalAbortSeams.getTerminalTurnEpoch() !== epoch
-		) {
-			const result = {
-				ok: true,
-				selection: scope,
-				turn: "uncertain",
-				ownedWork: scope === "turn" ? "left_running" : "uncertain",
-				automaticDelivery: scope === "turn" ? "enabled" : "none",
-				resumeOnOwnedCompletion: scope === "turn",
-				reason: "active_turn_changed",
-			};
-			const activeTurnPayloadHash = hashResult(result);
-			await transactBoundedTerminalScopes(scopes =>
-				scopes.map(record =>
-					(keyHash
-						? record.idempotencyKeyHash === keyHash
-						: record.turnContinuationFence.abortedAttemptEpoch === epoch) && record.turnDisposition === "pending"
-						? {
-								...record,
-								turnDisposition: "uncertain",
-								responsePayloadHash: activeTurnPayloadHash,
-								replayPayloadHash: replayShapedHash(record, result, activeTurnPayloadHash),
-								terminalAt: Date.now(),
-							}
-						: record,
-				),
-			);
-			return result;
-		}
-		cancelRequesterPreflights();
-		// Observe the correlated agent_end publication (AC 19) instead of
-		// assuming it: the aborted run's lifecycle event is published
-		// independently by emitLifecycle, so the durable stopped row must only
-		// claim terminalPublished when the publication was actually observed
-		// (review thread P2). Multiple concurrent aborts of the SAME turn (distinct
-		// idempotency keys, same scope) are all admitted and all await the ONE
-		// agent_end the turn emits, so every waiter is registered — a single slot
-		// would resolve only the latest and leave the earlier abort to record a
-		// false negative (review thread P2).
-		const terminalPublication = Promise.withResolvers<boolean>();
-		const removeTerminalPublicationWaiter = () => {
-			const resolvers = terminalPublicationCapture?.resolvers;
-			if (!resolvers) return;
-			const index = resolvers.indexOf(terminalPublication.resolve);
-			if (index >= 0) resolvers.splice(index, 1);
-		};
-		if (terminalPublicationCapture) {
-			if (!terminalPublicationCapture.resolvers) terminalPublicationCapture.resolvers = [];
-			terminalPublicationCapture.resolvers.push(terminalPublication.resolve);
-		}
-		let proof: { status: string; terminalScope?: unknown };
-		try {
-			proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(handle, {
-				graceMs: 10_000,
-				terminal: { scope, expectedEpoch: epoch },
-			});
-		} catch {
-			proof = { status: "unfenced" };
-		}
-		if (proof.status !== "settled" || proof.terminalScope === undefined) {
-			removeTerminalPublicationWaiter();
-			const result = {
-				ok: true,
-				selection: scope,
-				turn: "uncertain",
-				ownedWork: scope === "turn" ? "left_running" : "uncertain",
-				automaticDelivery: scope === "turn" ? "enabled" : "none",
-				resumeOnOwnedCompletion: scope === "turn",
-				reason: "worker_unsettled",
-			};
-			const workerUnsettledPayloadHash = hashResult(result);
-			await transactBoundedTerminalScopes(scopes =>
-				scopes.map(record =>
-					(keyHash
-						? record.idempotencyKeyHash === keyHash
-						: record.turnContinuationFence.abortedAttemptEpoch === epoch) && record.turnDisposition === "pending"
-						? {
-								...record,
-								turnDisposition: "uncertain",
-								ownedWorkDisposition: "uncertain",
-								responsePayloadHash: workerUnsettledPayloadHash,
-								replayPayloadHash: replayShapedHash(record, result, workerUnsettledPayloadHash),
-								terminalAt: Date.now(),
-							}
-						: record,
-				),
-			);
-			return result;
-		}
-		// scope:"owned" must generation-verify and CANCEL the exact owned work
-		// before reporting it stopped: abortPromptAndWaitWithTerminal only aborts
-		// the foreground run and registers the disabled-delivery scope — a
-		// background Bash/task/detached subagent would otherwise keep running
-		// while the client receives stopped_owned (review thread P1).
-		const ownedStopped = true;
-		if (scope === "owned") {
-			const terminalScope = proof.terminalScope as
-				| { abortedAttemptEpoch?: number; lineageIdHash?: string }
-				| undefined;
-			const failOwnedUncertain = async (): Promise<unknown> => {
+			// A settled proof means the session's abortPromptAndWait ran its
+			// purge, consuming THIS admission's snapshot (a settled run also
+			// covers the quarantined-unfenced case: the purge ran before the
+			// ledger quarantine, so the token is already gone and the discard
+			// below no-ops). Any other outcome leaves the snapshot in the FIFO
+			// and the finally block discards it by token (review thread P1).
+			steeringSnapshotConsumed = proof.status === "settled";
+			if (proof.status !== "settled" || proof.terminalScope === undefined) {
 				removeTerminalPublicationWaiter();
 				const result = {
 					ok: true,
 					selection: scope,
 					turn: "uncertain",
-					ownedWork: "uncertain",
-					automaticDelivery: "none",
-					resumeOnOwnedCompletion: false,
-					reason: "owned_unsettled",
+					ownedWork: scope === "turn" ? "left_running" : "uncertain",
+					automaticDelivery: scope === "turn" ? "enabled" : "none",
+					resumeOnOwnedCompletion: scope === "turn",
+					reason: "worker_unsettled",
 				};
-				const ownedUnsettledPayloadHash = hashResult(result);
+				const workerUnsettledPayloadHash = hashResult(result);
 				await transactBoundedTerminalScopes(scopes =>
 					scopes.map(record =>
 						(keyHash
@@ -2165,89 +2143,140 @@ function createControlSurface(
 									...record,
 									turnDisposition: "uncertain",
 									ownedWorkDisposition: "uncertain",
-									responsePayloadHash: ownedUnsettledPayloadHash,
-									replayPayloadHash: replayShapedHash(record, result, ownedUnsettledPayloadHash),
+									responsePayloadHash: workerUnsettledPayloadHash,
+									replayPayloadHash: replayShapedHash(record, result, workerUnsettledPayloadHash),
 									terminalAt: Date.now(),
 								}
 							: record,
 					),
 				);
 				return result;
-			};
-			if (
-				!terminalScope ||
-				terminalScope.abortedAttemptEpoch === undefined ||
-				!terminalScope.lineageIdHash ||
-				isOwnedAttemptRegistrationIncomplete(terminalScope.lineageIdHash, terminalScope.abortedAttemptEpoch)
-			) {
-				// The attempt's registration set may be KNOWN incomplete (registry
-				// saturation or an evicted in-flight binding): never claim
-				// stopped_owned over an incomplete causal set.
-				return await failOwnedUncertain();
 			}
-			const exactJobs = findOwnedRegistrationsForTurn(
-				terminalScope.lineageIdHash,
-				terminalScope.abortedAttemptEpoch,
-			);
-			if (exactJobs.length > 0) {
-				// Resolve the manager from the ABORTING ENDPOINT captured on the
-				// registrations — never the process-global last-created session,
-				// which could cancel a foreign same-id job and report stopped_owned
-				// while the aborting session's job keeps running (review thread P1).
-				const endpointId = exactJobs[0]?.endpointId;
-				const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
-				if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped") {
-					return await failOwnedUncertain();
-				}
-			}
-		}
-		// The worker settled; await the correlated agent_end publication for a
-		// bounded window and persist the OBSERVED result (review thread P2). A
-		// publication that never lands (lifecycle listener absent, still
-		// pending, or failed) yields observed=false — the durable row never
-		// claims a terminal event reached clients unless it was actually
-		// published.
-		const observed = await Promise.race([
-			terminalPublication.promise,
-			Bun.sleep(SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS).then(() => false as const),
-		]);
-		removeTerminalPublicationWaiter();
-		const terminalPublished = observed === true;
-		const result = {
-			ok: true,
-			selection: scope,
-			turn: "stopped",
-			...(scope === "turn"
-				? { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }
-				: {
-						ownedWork: ownedStopped ? "stopped" : "uncertain",
+			// scope:"owned" must generation-verify and CANCEL the exact owned work
+			// before reporting it stopped: abortPromptAndWaitWithTerminal only aborts
+			// the foreground run and registers the disabled-delivery scope — a
+			// background Bash/task/detached subagent would otherwise keep running
+			// while the client receives stopped_owned (review thread P1).
+			const ownedStopped = true;
+			if (scope === "owned") {
+				const terminalScope = proof.terminalScope as
+					| { abortedAttemptEpoch?: number; lineageIdHash?: string }
+					| undefined;
+				const failOwnedUncertain = async (): Promise<unknown> => {
+					removeTerminalPublicationWaiter();
+					const result = {
+						ok: true,
+						selection: scope,
+						turn: "uncertain",
+						ownedWork: "uncertain",
 						automaticDelivery: "none",
 						resumeOnOwnedCompletion: false,
-					}),
-		};
-		const payloadHash = crypto.createHash("sha256").update(JSON.stringify(result)).digest("hex");
-		await transactBoundedTerminalScopes(scopes =>
-			scopes.map(record =>
-				(keyHash
-					? record.idempotencyKeyHash === keyHash
-					: record.turnContinuationFence.abortedAttemptEpoch === epoch) && record.turnDisposition === "pending"
-					? {
-							...record,
-							turnDisposition: "stopped",
-							terminalPublished,
-							ownedWorkDisposition: scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain",
-							responsePayloadHash: payloadHash,
-							// The replay envelope carries the POST-CAS publication
-							// flag; the replay-shaped hash must be computed from the
-							// updated row or a written replay could never match it
-							// (review thread P2).
-							replayPayloadHash: replayShapedHash({ ...record, terminalPublished }, result, payloadHash),
-							terminalAt: Date.now(),
-						}
-					: record,
-			),
-		);
-		return result;
+						reason: "owned_unsettled",
+					};
+					const ownedUnsettledPayloadHash = hashResult(result);
+					await transactBoundedTerminalScopes(scopes =>
+						scopes.map(record =>
+							(keyHash
+								? record.idempotencyKeyHash === keyHash
+								: record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+							record.turnDisposition === "pending"
+								? {
+										...record,
+										turnDisposition: "uncertain",
+										ownedWorkDisposition: "uncertain",
+										responsePayloadHash: ownedUnsettledPayloadHash,
+										replayPayloadHash: replayShapedHash(record, result, ownedUnsettledPayloadHash),
+										terminalAt: Date.now(),
+									}
+								: record,
+						),
+					);
+					return result;
+				};
+				if (
+					!terminalScope ||
+					terminalScope.abortedAttemptEpoch === undefined ||
+					!terminalScope.lineageIdHash ||
+					isOwnedAttemptRegistrationIncomplete(terminalScope.lineageIdHash, terminalScope.abortedAttemptEpoch)
+				) {
+					// The attempt's registration set may be KNOWN incomplete (registry
+					// saturation or an evicted in-flight binding): never claim
+					// stopped_owned over an incomplete causal set.
+					return await failOwnedUncertain();
+				}
+				const exactJobs = findOwnedRegistrationsForTurn(
+					terminalScope.lineageIdHash,
+					terminalScope.abortedAttemptEpoch,
+				);
+				if (exactJobs.length > 0) {
+					// Resolve the manager from the ABORTING ENDPOINT captured on the
+					// registrations — never the process-global last-created session,
+					// which could cancel a foreign same-id job and report stopped_owned
+					// while the aborting session's job keeps running (review thread P1).
+					const endpointId = exactJobs[0]?.endpointId;
+					const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
+					if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped") {
+						return await failOwnedUncertain();
+					}
+				}
+			}
+			// The worker settled; await the correlated agent_end publication for a
+			// bounded window and persist the OBSERVED result (review thread P2). A
+			// publication that never lands (lifecycle listener absent, still
+			// pending, or failed) yields observed=false — the durable row never
+			// claims a terminal event reached clients unless it was actually
+			// published.
+			const observed = await Promise.race([
+				terminalPublication.promise,
+				Bun.sleep(SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS).then(() => false as const),
+			]);
+			removeTerminalPublicationWaiter();
+			const terminalPublished = observed === true;
+			const result = {
+				ok: true,
+				selection: scope,
+				turn: "stopped",
+				...(scope === "turn"
+					? { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }
+					: {
+							ownedWork: ownedStopped ? "stopped" : "uncertain",
+							automaticDelivery: "none",
+							resumeOnOwnedCompletion: false,
+						}),
+			};
+			const payloadHash = crypto.createHash("sha256").update(JSON.stringify(result)).digest("hex");
+			await transactBoundedTerminalScopes(scopes =>
+				scopes.map(record =>
+					(keyHash
+						? record.idempotencyKeyHash === keyHash
+						: record.turnContinuationFence.abortedAttemptEpoch === epoch) && record.turnDisposition === "pending"
+						? {
+								...record,
+								turnDisposition: "stopped",
+								terminalPublished,
+								ownedWorkDisposition:
+									scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain",
+								responsePayloadHash: payloadHash,
+								// The replay envelope carries the POST-CAS publication
+								// flag; the replay-shaped hash must be computed from the
+								// updated row or a written replay could never match it
+								// (review thread P2).
+								replayPayloadHash: replayShapedHash({ ...record, terminalPublished }, result, payloadHash),
+								terminalAt: Date.now(),
+							}
+						: record,
+				),
+			);
+			return result;
+		} finally {
+			// A replay-only abort (or any pre-settlement failure) never consumed its
+			// snapshot: discard it so a later real abort cannot consume the stale
+			// entry and treat steering admitted since the replay as post-abort
+			// (review thread P1).
+			if (steeringSnapshotToken !== undefined && !steeringSnapshotConsumed) {
+				terminalAbortSeams?.discardTerminalAbortSteeringSnapshot?.(steeringSnapshotToken);
+			}
+		}
 	};
 	return {
 		prompt: async (text, images, clientRef) =>

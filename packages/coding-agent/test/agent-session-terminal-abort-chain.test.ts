@@ -681,6 +681,35 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await waitFor(() => !session.agent.hasQueuedMessages(), "external follow-up consumed");
 		await promptPromise;
 	}, 30_000);
+	it("terminal abort discards snapshots captured by replay-only admissions", async () => {
+		// Review thread P1: a durable same-key replay reaches the admission but
+		// never settles — its captured snapshot must be discarded, or a later
+		// real abort would consume the stale entry and treat steering admitted
+		// since the replay as post-abort.
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		// A replay-only admission captures a snapshot for the (still fenced)
+		// turn and then discards it — the durable replay path never settles.
+		const token = session.captureTerminalAbortSteeringSnapshot();
+		expect(token).toBeDefined();
+		session.discardTerminalAbortSteeringSnapshot(token ?? 0);
+		// A client steer admitted AFTER the discarded snapshot: the next real
+		// abort must classify it as PRE-snapshot (blocked) — the stale entry
+		// would have made it post-snapshot (survive) and leak into the next turn.
+		await session.sendUserMessage("steer after replay", { deliverAs: "steer" });
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		await promptPromise;
+	}, 30_000);
+
 	it("terminal abort preserves authorized owned completions queued as hidden next-turn messages", async () => {
 		// Review thread P1: when ACP defers agent-initiated turns and a
 		// left-running owned job completes after a scope:"turn" abort while the
