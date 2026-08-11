@@ -263,12 +263,22 @@ const BASE_KEYS = new Set<string>([
 	"f12",
 ]);
 
-const KEY_MODIFIERS: readonly KeyModifier[] = ["ctrl", "alt", "shift", "super"];
+const KEY_MODIFIER_ALIASES: Readonly<Partial<Record<string, KeyModifier>>> = {
+	ctrl: "ctrl",
+	alt: "alt",
+	shift: "shift",
+	super: "super",
+	option: "alt",
+	meta: "alt",
+	cmd: "super",
+	command: "super",
+};
 
 /**
  * Parse a case-insensitive key identifier into normalized dispatch parts.
  * The legacy `plus` base-key alias normalizes to `+`; the trailing `+` in
  * values such as `ctrl++` is the literal plus base.
+ * Modifier aliases `option`/`meta` and `command`/`cmd` normalize to `alt` and `super`.
  */
 export function parseKeyId(value: string): ParsedKeyId | undefined {
 	if (hasControlChars(value) || value.length === 0) return undefined;
@@ -289,10 +299,12 @@ export function parseKeyId(value: string): ParsedKeyId | undefined {
 					.slice(0, -1)
 					.split("+")
 					.map(part => part.trim());
-	if (modifierParts.some(part => !KEY_MODIFIERS.includes(part as KeyModifier))) return undefined;
-
-	const modifiers = modifierParts as KeyModifier[];
-	if (new Set(modifiers).size !== modifiers.length) return undefined;
+	const modifiers: KeyModifier[] = [];
+	for (const part of modifierParts) {
+		const modifier = KEY_MODIFIER_ALIASES[part];
+		if (!modifier || modifiers.includes(modifier)) return undefined;
+		modifiers.push(modifier);
+	}
 
 	const canonicalBase = baseKey === "pageup" ? "pageUp" : baseKey === "pagedown" ? "pageDown" : baseKey;
 	return {
@@ -314,10 +326,7 @@ export function isKeyId(value: string): value is KeyId {
  * is literally `"enter"`); the value of `Key` over a bag of magic strings is
  * that each property is typed to the exact `KeyId` literal it produces and the
  * modifier methods return precisely-typed concatenations (e.g. `Key.ctrl("c")`
- * is `"ctrl+c"`, not just `string`). This mirrors the upstream
- * `@mariozechner/pi-tui` `Key` export verbatim so plugins built against any
- * scope alias (`@mariozechner`, `@earendil-works`, `@gajae-code`) keep working
- * once the specifier shim remaps them to this package.
+ * The canonical modifier helpers mirror the upstream `@mariozechner/pi-tui` `Key` export so plugins built against any scope alias (`@mariozechner`, `@earendil-works`, `@gajae-code`) keep working once the specifier shim remaps them to this package. The additional `option`/`command` helpers normalize macOS naming to the portable `alt`/`super` identifiers.
  */
 export const Key = {
 	escape: "escape",
@@ -384,7 +393,10 @@ export const Key = {
 	ctrl: <K extends BaseKey>(key: K) => `ctrl+${key}` as const,
 	shift: <K extends BaseKey>(key: K) => `shift+${key}` as const,
 	alt: <K extends BaseKey>(key: K) => `alt+${key}` as const,
+	option: <K extends BaseKey>(key: K) => `alt+${key}` as const,
 	super: <K extends BaseKey>(key: K) => `super+${key}` as const,
+	cmd: <K extends BaseKey>(key: K) => `super+${key}` as const,
+	command: <K extends BaseKey>(key: K) => `super+${key}` as const,
 	ctrlShift: <K extends BaseKey>(key: K) => `ctrl+shift+${key}` as const,
 	shiftCtrl: <K extends BaseKey>(key: K) => `shift+ctrl+${key}` as const,
 	ctrlAlt: <K extends BaseKey>(key: K) => `ctrl+alt+${key}` as const,

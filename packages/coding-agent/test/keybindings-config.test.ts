@@ -24,7 +24,7 @@ describe("keybindings config", () => {
 		await fs.writeFile(
 			path.join(tempDir, "keybindings.json"),
 			JSON.stringify({
-				"app.clear": "command+p",
+				"app.clear": "control+p",
 				"app.message.dequeue": ["alt+up", "ctrl+\u001b[31m"],
 				"app.commandPalette.open": "CTRL+P",
 			}),
@@ -34,6 +34,20 @@ describe("keybindings config", () => {
 		expect(keybindings.getKeys("app.clear")).toEqual(["ctrl+c"]);
 		expect(keybindings.getKeys("app.message.dequeue")).toEqual(["alt+up", "alt+down"]);
 		expect(keybindings.getKeys("app.commandPalette.open")).toEqual(["ctrl+p"]);
+	});
+	it("normalizes Option and Command aliases in user bindings", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-keybindings-"));
+		await fs.writeFile(
+			path.join(tempDir, "keybindings.json"),
+			JSON.stringify({
+				"app.message.queue": "option+q",
+				"app.commandPalette.open": "command+p",
+			}),
+		);
+
+		const keybindings = KeybindingsManager.create(tempDir);
+		expect(keybindings.getKeys("app.message.queue")).toEqual(["alt+q"]);
+		expect(keybindings.getKeys("app.commandPalette.open")).toEqual(["super+p"]);
 	});
 
 	it("accepts literal plus as a configured base key", async () => {

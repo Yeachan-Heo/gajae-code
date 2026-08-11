@@ -8,6 +8,8 @@
 ### Fixed
 
 - macOS Terminal.app Option+Arrow input is now buffered and decoded as a single Meta-wrapped escape sequence, so Option+Up/Down can open and navigate queued-message selectors.
+- Terminal.app Meta-prefix decoding now covers legacy Option shortcuts for printable symbols, digits, spaces, and Ctrl+Option symbol chords while preserving enhanced Kitty and modifyOtherKeys Super/Command matching.
+- Kitty and modifyOtherKeys function-key sequences now match consistently for F1–F12, including unmodified CSI forms.
 
 ## [0.12.21] - 2026-08-09
 

@@ -226,6 +226,12 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
 			expect(parseKey(emittedSequences[0]!)).toBe("alt+up");
 		});
+		it("keeps Option paging, function, delete, and shifted-arrow sequences atomic", () => {
+			setKittyProtocolActive(false);
+			processInput("\x1b\x1b[5~\x1b\x1bOP\x1b\x1b[3~\x1b\x1b[1;2A");
+			expect(emittedSequences).toEqual(["\x1b\x1b[5~", "\x1b\x1bOP", "\x1b\x1b[3~", "\x1b\x1b[1;2A"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["alt+pageUp", "alt+f1", "alt+delete", "alt+shift+up"]);
+		});
 	});
 	describe.each([
 		{ chunks: ["\x1bi"], expected: ["\x1bi"], parsed: ["alt+i"] },
