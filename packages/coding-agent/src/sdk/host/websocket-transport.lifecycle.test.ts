@@ -72,6 +72,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 					await releaseRename.promise;
 					await fs.rename(from, to);
 				},
+				readFile: fs.readFile,
 				rm: fs.rm,
 			},
 		});
@@ -186,7 +187,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 		try {
 			const first = await transport.start();
 			const stopPromise = transport.stop();
-			await Bun.sleep(0);
+			for (let attempt = 0; attempt < 100 && !stopEntered; attempt += 1) await Bun.sleep(1);
 			expect(stopEntered).toBe(true);
 			let secondResolved = false;
 			const secondPromise = transport.start().then(endpoint => {
@@ -227,6 +228,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 					throw Object.assign(new Error("chmod injected failure"), { code: "EACCES" });
 				},
 				rename: real.rename,
+				readFile: real.readFile,
 				rm: real.rm,
 			},
 		};
@@ -244,6 +246,85 @@ describe("SDK WebSocket transport lifecycle", () => {
 		await fs.rm(stateRoot, { recursive: true, force: true });
 	});
 
+	test("failed duplicate startup preserves a canonical endpoint it did not publish", async () => {
+		const stateRoot = await tempStateRoot();
+		const endpointPath = path.join(stateRoot, "sdk", "duplicate-cleanup.json");
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		const canonicalEndpoint = JSON.stringify({
+			version: 1,
+			sessionId: "duplicate-cleanup",
+			url: "ws://127.0.0.1:12345/",
+			token: "canonical-token",
+			pid: process.pid,
+		});
+		await fs.writeFile(endpointPath, canonicalEndpoint, { mode: 0o600 });
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "duplicate-cleanup",
+			stateRoot,
+			token: "duplicate-token",
+			filesystem: {
+				mkdir: fs.mkdir,
+				writeFile: async () => {
+					throw Object.assign(new Error("duplicate startup failed"), { code: "EIO" });
+				},
+				chmod: fs.chmod,
+				rename: fs.rename,
+				readFile: fs.readFile,
+				rm: fs.rm,
+			},
+		});
+		try {
+			await expect(transport.start()).rejects.toMatchObject({ code: "endpoint_write_failed" });
+			expect(await fs.readFile(endpointPath, "utf8")).toBe(canonicalEndpoint);
+		} finally {
+			await transport.stop();
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	});
+
+	test("serializes a successor publication behind an owner endpoint cleanup", async () => {
+		const stateRoot = await tempStateRoot();
+		const sessionId = "serialized-cleanup";
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const readEntered = Promise.withResolvers<void>();
+		const releaseRead = Promise.withResolvers<void>();
+		const owner = await createSdkWebSocketTransport({
+			sessionId,
+			stateRoot,
+			token: "owner-token",
+			filesystem: {
+				mkdir: fs.mkdir,
+				writeFile: fs.writeFile,
+				chmod: fs.chmod,
+				rename: fs.rename,
+				readFile: (async (...args: Parameters<typeof fs.readFile>) => {
+					readEntered.resolve();
+					await releaseRead.promise;
+					return await fs.readFile(...args);
+				}) as typeof fs.readFile,
+				rm: fs.rm,
+			},
+		});
+		const successor = await createSdkWebSocketTransport({ sessionId, stateRoot, token: "successor-token" });
+		try {
+			await owner.start();
+			const stop = owner.stop();
+			await readEntered.promise;
+			const start = successor.start();
+			await Bun.sleep(20);
+			expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({ token: "owner-token" });
+			releaseRead.resolve();
+			await stop;
+			await start;
+			expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({ token: "successor-token" });
+		} finally {
+			releaseRead.resolve();
+			await owner.stop().catch(() => undefined);
+			await successor.stop().catch(() => undefined);
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	});
+
 	test("endpoint removal failures are typed and do not prevent server release", async () => {
 		const stateRoot = await tempStateRoot();
 		let rmCalls = 0;
@@ -254,6 +335,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 				writeFile: real.writeFile,
 				chmod: real.chmod,
 				rename: real.rename,
+				readFile: real.readFile,
 				rm: async (...args: Parameters<typeof real.rm>) => {
 					rmCalls += 1;
 					if (rmCalls === 1) throw Object.assign(new Error("rm injected failure"), { code: "EIO" });
