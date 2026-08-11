@@ -65,7 +65,6 @@ import type {
 import type { EventBus } from "../../utils/event-bus";
 import type {
 	AgentEndEvent,
-	AgentStartEvent,
 	AutoCompactionEndEvent,
 	AutoCompactionStartEvent,
 	AutoRetryEndEvent,
@@ -89,6 +88,7 @@ import type {
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
+	AgentStartEvent as SharedAgentStartEvent,
 	TodoReminderEvent,
 	ToolCallEventResult,
 	ToolResultEventResult,
@@ -635,7 +635,12 @@ export interface BeforeAgentStartEvent {
 	systemPrompt: string[];
 }
 
-export type { AgentEndEvent, AgentStartEvent, TurnEndEvent, TurnStartEvent } from "../shared-events";
+export type { AgentEndEvent, TurnEndEvent, TurnStartEvent } from "../shared-events";
+
+/** Fired when an agent loop starts. `sdkRunToken` is an internal SDK queue-owner binding. */
+export interface AgentStartEvent extends SharedAgentStartEvent {
+	sdkRunToken?: string;
+}
 
 /** Fired when a message starts (user, assistant, or toolResult) */
 export interface MessageStartEvent {
@@ -1181,6 +1186,8 @@ export interface ExtensionAPI {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			preflightSignal?: AbortSignal;
+			/** Internal SDK correlation owner for an exact queued follow-up. */
+			sdkRunToken?: string;
 		},
 	): Promise<void>;
 
@@ -1399,6 +1406,8 @@ export type SendUserMessageHandler = (
 		onPreflightAccepted?: () => void;
 		onPreflightAcceptCommit?: () => void | Promise<void>;
 		preflightSignal?: AbortSignal;
+		/** Internal SDK correlation owner for an exact queued follow-up. */
+		sdkRunToken?: string;
 	},
 ) => void | Promise<void>;
 

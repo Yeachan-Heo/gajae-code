@@ -1678,6 +1678,9 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 		socket.addEventListener("open", () => resolve(), { once: true });
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
+	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await Bun.sleep(10);
+	expect(frames.some(frame => frame.type === "agent_start" && frame.commandId !== undefined)).toBe(false);
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -1700,8 +1703,19 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
 	});
 	if (typeof commandId !== "string" || typeof turnId !== "string") throw new Error("missing follow-up correlation");
-	expect(sent).toEqual([["queued follow-up", { deliverAs: "followUp", preflightSignal: expect.any(AbortSignal) }]]);
-	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const sentOptions = sent[0]?.[1];
+	const sdkRunToken = sentOptions && "sdkRunToken" in sentOptions ? sentOptions.sdkRunToken : undefined;
+	expect(sent).toEqual([
+		[
+			"queued follow-up",
+			{ deliverAs: "followUp", preflightSignal: expect.any(AbortSignal), sdkRunToken: expect.any(String) },
+		],
+	]);
+	if (typeof sdkRunToken !== "string") throw new Error("missing SDK follow-up run token");
+	void handlers.get("agent_end")?.({ type: "agent_end", messages: [], stopReason: "completed" }, sessionContext);
+	await Bun.sleep(10);
+	expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId)).toBe(false);
+	void handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, sessionContext);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
 		"correlated agent start",
@@ -6342,15 +6356,39 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 	});
 });
 
-test("turn.prompt_status reconciles an accepted prompt across client reconnect without duplicate execution", async () => {
+test("turn.prompt_status settles durable acceptance after disconnect before agent_start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-reconcile-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-reconcile-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
 	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
 	const deliveries: unknown[] = [];
-	const handlers = start(sessionContext, undefined, (content: unknown) => {
-		deliveries.push(content);
-	});
+	const releaseExecution = Promise.withResolvers<void>();
+	let preflightAborted = false;
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			await options?.onPreflightAcceptCommit?.();
+			deliveries.push(content);
+			const signal = options?.preflightSignal;
+			const onAbort = () => {
+				preflightAborted = true;
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				await releaseExecution.promise;
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+			}
+		},
+		true,
+	);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -6391,19 +6429,26 @@ test("turn.prompt_status reconciles an accepted prompt across client reconnect w
 	// Simulate client-process death without consuming the control response. The
 	// caller retained only its fresh clientRef, not the generated IDs.
 	await closeSocket(first.socket);
+	await Bun.sleep(20);
+	expect(preflightAborted).toBe(false);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 
 	// Reconnect: clientRef recovers the canonical generated pair, which then
 	// reconciles identically through the generated-ID selector.
 	const second = await connect();
-	const byRef = await second.request({
-		type: "query_request",
-		id: "status-ref",
-		query: "turn.prompt_status",
-		input: { clientRef: "recon-ref-1" },
-	});
+	let byRef: Record<string, unknown> | undefined;
+	for (let attempt = 0; attempt < 50; attempt++) {
+		byRef = await second.request({
+			type: "query_request",
+			id: `status-ref-${attempt}`,
+			query: "turn.prompt_status",
+			input: { clientRef: "recon-ref-1" },
+		});
+		if ((byRef.result as { status?: unknown } | undefined)?.status === "in_flight") break;
+		await Bun.sleep(20);
+	}
 	expect(byRef).toMatchObject({ ok: true, result: { status: "in_flight", clientRef: "recon-ref-1" } });
-	const { commandId, turnId } = (byRef.result ?? {}) as { commandId: string; turnId: string };
+	const { commandId, turnId } = (byRef?.result ?? {}) as { commandId: string; turnId: string };
 	expect(typeof commandId).toBe("string");
 	expect(typeof turnId).toBe("string");
 	const byPair = await second.request({
@@ -6434,13 +6479,19 @@ test("turn.prompt_status reconciles an accepted prompt across client reconnect w
 	expect(duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
 
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	const terminal = await second.request({
-		type: "query_request",
-		id: "status-terminal",
-		query: "turn.prompt_status",
-		input: { commandId, turnId },
-	});
+	let terminal: Record<string, unknown> | undefined;
+	for (let attempt = 0; attempt < 50; attempt++) {
+		terminal = await second.request({
+			type: "query_request",
+			id: `status-terminal-${attempt}`,
+			query: "turn.prompt_status",
+			input: { commandId, turnId },
+		});
+		if ((terminal.result as { status?: unknown } | undefined)?.status === "terminal_ok") break;
+		await Bun.sleep(20);
+	}
 	expect(terminal).toMatchObject({ ok: true, result: { status: "terminal_ok" } });
+	releaseExecution.resolve();
 
 	// Exactly one execution happened across the whole reconnect/reconcile flow.
 	expect(deliveries).toHaveLength(1);

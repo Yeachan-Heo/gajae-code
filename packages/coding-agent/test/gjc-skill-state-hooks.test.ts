@@ -4,7 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
-import { activeSnapshotPath, modeStatePath, sessionSpecsDir, sessionStateDir } from "../src/gjc-runtime/session-layout";
+import {
+	activeEntryPath,
+	activeSnapshotPath,
+	modeStatePath,
+	sessionSpecsDir,
+	sessionStateDir,
+} from "../src/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState } from "../src/gjc-runtime/state-runtime";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
@@ -1895,7 +1901,7 @@ disabledExtensions:
 		expect(entry?.handoff_from).toBe("deep-interview");
 	});
 
-	it("activation rollback preserves state that changed ownership after seeding", async () => {
+	it("activation rollback preserves successor mode, entry, and rebuilt snapshot state", async () => {
 		const root = await cwd();
 		const sessionId = "session-seed-owned";
 		const activation = await ensureWorkflowSkillActivationSeed({
@@ -1904,13 +1910,19 @@ disabledExtensions:
 			sessionId,
 		});
 		expect(activation.seeded).toBe(true);
+
 		const statePath = modeStatePath(root, sessionId, "deep-interview");
-		const seeded = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
-		const seededRevision = seeded.state_revision;
+		const entryPath = activeEntryPath(root, sessionId, "deep-interview");
+		const snapshotPath = activeSnapshotPath(root, sessionId);
+		const seededMode = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		const seededEntry = JSON.parse(await fs.readFile(entryPath, "utf8")) as Record<string, unknown>;
+		const seededSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as Record<string, unknown>;
+		const seededRevision = seededMode.state_revision;
 		if (typeof seededRevision !== "number") throw new Error("Expected seeded state revision");
+
 		await writeGuardedWorkflowEnvelopeAtomic(
 			statePath,
-			{ ...seeded, current_phase: "requirements", updated_at: "2099-01-01T00:00:00.000Z" },
+			{ ...seededMode, current_phase: "requirements", updated_at: "2099-01-01T00:00:00.000Z" },
 			{
 				cwd: root,
 				policy: "source",
@@ -1924,12 +1936,24 @@ disabledExtensions:
 				},
 			},
 		);
+		await writeGuardedJsonAtomic(
+			entryPath,
+			{ ...seededEntry, phase: "requirements", updated_at: "2099-01-01T00:00:00.000Z" },
+			{ cwd: root, policy: "cache", sourceRevision: seededRevision + 1 },
+		);
+		await writeGuardedJsonAtomic(
+			snapshotPath,
+			{ ...seededSnapshot, phase: "stale-snapshot", updated_at: "2099-01-01T00:00:00.000Z" },
+			{ cwd: root, policy: "cache", sourceRevision: seededRevision + 1 },
+		);
 
 		expect(await activation.rollback()).toBe(false);
-		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
-		expect(persisted.current_phase).toBe("requirements");
-		const visible = await readVisibleSkillActiveState(root, sessionId);
-		expect(visible?.active_skills?.some(entry => entry.skill === "deep-interview")).toBe(true);
+		const persistedMode = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		const persistedEntry = JSON.parse(await fs.readFile(entryPath, "utf8")) as Record<string, unknown>;
+		const rebuiltSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as Record<string, unknown>;
+		expect(persistedMode.current_phase).toBe("requirements");
+		expect(persistedEntry.phase).toBe("requirements");
+		expect(rebuiltSnapshot.phase).toBe("requirements");
 	});
 
 	it("ensureWorkflowSkillActivationState ignores non-workflow skills", async () => {

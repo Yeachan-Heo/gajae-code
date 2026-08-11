@@ -10,6 +10,7 @@ import {
 import { resolveGjcSessionForRead, SessionResolutionError } from "../gjc-runtime/session-resolution";
 import {
 	type ActiveSessionScope,
+	type GuardedWriteResult,
 	readActiveEntries,
 	rebuildActiveSnapshot,
 	removeActiveEntry,
@@ -125,6 +126,8 @@ export interface SyncSkillActiveStateOptions {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	sourceRevision?: number;
+	/** Internal seed path: retain the authoritative entry receipt if snapshot rebuilding fails. */
+	bestEffortSnapshot?: boolean;
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -847,19 +850,19 @@ async function persistActiveEntry(
 	cwd: string,
 	sessionScope: ActiveSessionScope | undefined,
 	entry: SkillActiveEntry,
-): Promise<void> {
+): Promise<GuardedWriteResult | undefined> {
 	if (entry.active === false) {
 		await removeActiveEntry(cwd, sessionScope, entry.skill, {
 			cwd,
 			audit: activeStateWriterAudit("remove-active-entry", sessionScope),
 			sourceRevision: entry.source_state_revision,
 		});
-	} else {
-		await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
-			cwd,
-			audit: activeStateWriterAudit("write-active-entry", sessionScope),
-		});
+		return undefined;
 	}
+	return await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
+		cwd,
+		audit: activeStateWriterAudit("write-active-entry", sessionScope),
+	});
 }
 
 async function writeHandoffEntry(
@@ -908,8 +911,10 @@ async function activeSubskillsForExistingEntry(
 	return existing?.active_subskills;
 }
 
-export async function syncSkillActiveState(options: SyncSkillActiveStateOptions): Promise<void> {
-	if (!options.sessionId) return;
+export async function syncSkillActiveState(
+	options: SyncSkillActiveStateOptions,
+): Promise<GuardedWriteResult | undefined> {
+	if (!options.sessionId) return undefined;
 	const preservedActiveSubskills =
 		options.active_subskills === undefined
 			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
@@ -939,8 +944,13 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 	};
 	const sessionScope = { sessionId: options.sessionId };
 	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);
-	await persistActiveEntry(options.cwd, sessionScope, entry);
-	await rebuildActiveState(options.cwd, sessionScope);
+	const entryWrite = await persistActiveEntry(options.cwd, sessionScope, entry);
+	try {
+		await rebuildActiveState(options.cwd, sessionScope);
+	} catch (error) {
+		if (!options.bestEffortSnapshot) throw error;
+	}
+	return entryWrite;
 }
 
 export interface ApplyHandoffOptions {

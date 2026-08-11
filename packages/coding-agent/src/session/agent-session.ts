@@ -1515,6 +1515,7 @@ function extractPermissionLocations(
  *  stable edit id while the display arrays preserve delivery order. */
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number };
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
+type QueuedFollowUpOwner = { cancel(): boolean };
 export type QueuedMessageEditMode = "steer" | "followUp";
 
 export interface QueuedMessageEditEntry {
@@ -1941,6 +1942,8 @@ export class AgentSession {
 	/** Tracks pending follow-up messages for UI display. Removed when delivered.
 	 *  See `#steeringMessages` for entry shape. */
 	#followUpMessages: QueuedDisplayEntry[] = [];
+	/** SDK-owned follow-ups held outside Agent's live queue until the active run ends. */
+	#deferredSdkFollowUps: AgentMessage[] = [];
 	#queuedDisplaySequence = 0;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
@@ -2111,6 +2114,9 @@ export class AgentSession {
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
+	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
+	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#attemptAuthority!: AttemptScopeAuthority;
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
@@ -4645,6 +4651,13 @@ export class AgentSession {
 			}
 		}
 
+		if (
+			event.type === "agent_end" &&
+			!(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted")
+		) {
+			this.#releaseDeferredSdkFollowUps();
+		}
+
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
 			// Cooperative mid-run maintenance interruption (issue #2035). The loop
@@ -5012,6 +5025,10 @@ export class AgentSession {
 						const continueQueued = options?.continueQueuedOnly
 							? this.agent.continueQueuedMessages.bind(this.agent)
 							: this.agent.continue.bind(this.agent);
+						const queuedMessagesBeforeContinue = [
+							...this.agent.snapshotSteering(),
+							...this.agent.snapshotFollowUp(),
+						];
 						try {
 							await continueQueued({
 								...this.#managedFallbackPromptOptions(),
@@ -5020,6 +5037,18 @@ export class AgentSession {
 								// continuations retain predecessor accounting, and resetAttemptBudget keeps
 								// the sticky fallback cursor unchanged.
 								onRunAccepted: (handle: AttemptRunHandle) => {
+									const queuedMessagesAfterContinue = new Set([
+										...this.agent.snapshotSteering(),
+										...this.agent.snapshotFollowUp(),
+									]);
+									for (const message of queuedMessagesBeforeContinue) {
+										if (queuedMessagesAfterContinue.has(message)) continue;
+										const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
+										if (sdkRunToken) {
+											this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+											break;
+										}
+									}
 									this.#acceptRunHandle(handle);
 									settleLease();
 									releasePredecessor();
@@ -6027,7 +6056,16 @@ export class AgentSession {
 		try {
 			if (event.type === "agent_start") {
 				this.#turnIndex = 0;
-				await this.#extensionRunner.emit({ type: "agent_start" }, undefined, deliveryScope);
+				await this.#extensionRunner.emit(
+					{
+						type: "agent_start",
+						...(deliveryScope
+							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
+							: {}),
+					},
+					undefined,
+					deliveryScope,
+				);
 			} else if (event.type === "agent_end") {
 				await this.#extensionRunner.emit(
 					{
@@ -8785,6 +8823,7 @@ export class AgentSession {
 	async #syncSkillPromptActiveState(
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
+		persistActiveState = true,
 	): Promise<void> {
 		if (message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return;
 		const details = message.details;
@@ -8808,7 +8847,7 @@ export class AgentSession {
 		// initial mode-state + active row only when the skill is not already
 		// active, so the mutation guard and Stop hook engage immediately instead
 		// of relying on the skill prompt to run its own state-init steps.
-		if (active) {
+		if (active && persistActiveState) {
 			await ensureWorkflowSkillActivationState({
 				cwd: this.sessionManager.getCwd(),
 				skill,
@@ -8847,9 +8886,10 @@ export class AgentSession {
 	async #syncSkillPromptActiveStateSafely(
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
+		persistActiveState = true,
 	): Promise<void> {
 		try {
-			await this.#syncSkillPromptActiveState(message, active);
+			await this.#syncSkillPromptActiveState(message, active, persistActiveState);
 		} catch {
 			// Skill HUD state is observational; a filesystem write failure must not
 			// interrupt the prompt turn it is visualizing. The native Stop hook still
@@ -8866,10 +8906,20 @@ export class AgentSession {
 		const name = (details as { name?: unknown }).name;
 		if (typeof name !== "string" || !name.trim()) return undefined;
 		try {
+			const subskillDetails = details as {
+				subskillActivation?: LoadedSubskillActivation;
+				subskillActivationSet?: LoadedSubskillActivation[];
+			};
+			const activations = subskillDetails.subskillActivationSet?.length
+				? subskillDetails.subskillActivationSet
+				: subskillDetails.subskillActivation
+					? [subskillDetails.subskillActivation]
+					: [];
 			return await ensureWorkflowSkillActivationSeed({
 				cwd: this.sessionManager.getCwd(),
 				skill: name.trim(),
 				sessionId: this.sessionManager.getSessionId(),
+				activeSubskills: activations.length ? activations.map(toActiveSubskillEntry) : undefined,
 			});
 		} catch {
 			return undefined;
@@ -8937,11 +8987,18 @@ export class AgentSession {
 					this.#deepInterviewGenuineUserMessageEpochs.set(customMessage, deepInterviewUserIntentEpoch);
 
 				let activationSeed: WorkflowSkillActivationSeed | undefined;
+				let preflightCancelled = false;
+				let durableAcceptanceCompleted = false;
 				const commitAcceptance = async () => {
+					activationSeed = await this.#seedSkillPromptActiveStateSafely(customMessage);
+					await this.#syncSkillPromptActiveStateSafely(customMessage, true, activationSeed?.seeded !== true);
+					if (options?.preflightSignal?.aborted) {
+						await activationSeed?.rollback();
+						throw promptPreflightCancelledError();
+					}
 					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 					else options?.onPreflightAccepted?.();
-					activationSeed = await this.#seedSkillPromptActiveStateSafely(customMessage);
-					await this.#syncSkillPromptActiveStateSafely(customMessage, true);
+					durableAcceptanceCompleted = true;
 					if (options?.preflightSignal?.aborted) {
 						await activationSeed?.rollback();
 						throw promptPreflightCancelledError();
@@ -8956,10 +9013,13 @@ export class AgentSession {
 						resetRetryReplaySafety: true,
 					});
 				} catch (error) {
-					if (isPromptPreflightCancelledError(error)) await activationSeed?.rollback();
+					if (isPromptPreflightCancelledError(error) || !durableAcceptanceCompleted) {
+						preflightCancelled = true;
+						await activationSeed?.rollback();
+					}
 					throw error;
 				} finally {
-					await this.#syncSkillPromptActiveStateSafely(customMessage, false);
+					if (!preflightCancelled) await this.#syncSkillPromptActiveStateSafely(customMessage, false);
 				}
 			},
 			options?.preflightSignal,
@@ -9602,12 +9662,14 @@ export class AgentSession {
 	async #queueFollowUp(
 		text: string,
 		images?: ImageContent[],
-		options?: { forceOneAtATime?: boolean; claimsGenuineUserIntent?: boolean },
-	): Promise<void> {
+		options?: { forceOneAtATime?: boolean; claimsGenuineUserIntent?: boolean; sdkRunToken?: string },
+	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
+		const queueWasEmpty = !this.agent.hasQueuedMessages();
+		const displayEntry = this.#createQueuedDisplayEntry(displayText);
+		this.#followUpMessages.push(displayEntry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
@@ -9615,16 +9677,59 @@ export class AgentSession {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
-		this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
-		// When fully idle AND the session is in a resumable assistant-ended state,
-		// schedule an immediate continue so the queued follow-up is delivered
-		// without waiting for the next user turn. We gate on isStreaming (model
-		// actively producing), isRetrying (auto-retry backoff is sleeping between
-		// attempts, #retryPromise set), and the last message being assistant —
-		// agent.continue() only dequeues follow-ups from an assistant-ended state;
-		// resuming from user/toolResult state runs an extra model call on the
-		// stale prompt before draining the queue.
-		this.#scheduleQueuedFollowUpContinuation();
+		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
+		if (options?.sdkRunToken && this.agent.state.isStreaming) {
+			this.#deferredSdkFollowUps.push(message);
+		} else {
+			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		}
+		// When this is the first queued message and the session is in a resumable
+		// assistant-ended state, schedule an immediate continue so it is delivered
+		// without waiting for the next user turn. A later accepted follow-up must
+		// not start unrelated queued work ahead of it, because that work has a
+		// different cancellation and terminal owner.
+		if (queueWasEmpty)
+			this.#scheduleQueuedFollowUpContinuation(() =>
+				this.agent.snapshotFollowUp().some(candidate => candidate === message),
+			);
+		return {
+			cancel: () => {
+				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
+				let removed = false;
+				if (deferredIndex !== -1) {
+					this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+					removed = true;
+				} else {
+					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
+				}
+				if (removed) {
+					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
+					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
+					this.#sdkRunTokensByQueuedMessage.delete(message);
+				}
+				return removed;
+			},
+		};
+	}
+	#releaseDeferredSdkFollowUps(): void {
+		const message = this.#deferredSdkFollowUps.shift();
+		if (!message) return;
+		this.agent.followUp(message, { forceOneAtATime: true });
+		this.#scheduleAgentContinue({
+			shouldContinue: () => this.#canStartDeferredSdkFollowUp() && this.agent.hasQueuedMessages(),
+			continueQueuedOnly: true,
+			rescheduleOnBusy: true,
+		});
+	}
+	#canStartDeferredSdkFollowUp(): boolean {
+		if (this.agent.state.isStreaming) return false;
+		if (this.isCompacting) return false;
+		if (this.isBashRunning) return false;
+		if (this.isEvalRunning) return false;
+		if (this.isRetrying) return false;
+		const messages = this.agent.state.messages;
+		const last = messages[messages.length - 1];
+		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
 	}
 
 	/**
@@ -9640,10 +9745,16 @@ export class AgentSession {
 		const last = messages[messages.length - 1];
 		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
 	}
-	#scheduleQueuedFollowUpContinuation(): void {
-		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
+	#scheduleQueuedFollowUpContinuation(ownsQueuedMessage: (() => boolean) | undefined = undefined): void {
+		if (
+			!this.#cancelAndSubmitInProgress &&
+			this.#canAutoContinueForFollowUp() &&
+			this.agent.hasQueuedMessages() &&
+			(ownsQueuedMessage?.() ?? true)
+		) {
 			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+				shouldContinue: () =>
+					this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages() && (ownsQueuedMessage?.() ?? true),
 				continueQueuedOnly: true,
 			});
 		}
@@ -9937,6 +10048,7 @@ export class AgentSession {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			preflightSignal?: AbortSignal;
+			sdkRunToken?: string;
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
@@ -9963,7 +10075,14 @@ export class AgentSession {
 
 		if (options?.deliverAs === "followUp") {
 			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			await this.#queueFollowUp(text, images, { claimsGenuineUserIntent: true });
+			const queuedFollowUp = await this.#queueFollowUp(text, images, {
+				claimsGenuineUserIntent: true,
+				forceOneAtATime: Boolean(options.preflightSignal),
+				sdkRunToken: options.sdkRunToken,
+			});
+			const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
+			options.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
+			if (options.preflightSignal?.aborted) cancelQueuedFollowUp();
 			options.onPreflightAccepted?.();
 			return;
 		}
@@ -10005,6 +10124,7 @@ export class AgentSession {
 		const followUp = this.#followUpMessages.map(e => e.text);
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
+		this.#deferredSdkFollowUps = [];
 		this.agent.clearAllQueues();
 		return { steering, followUp };
 	}

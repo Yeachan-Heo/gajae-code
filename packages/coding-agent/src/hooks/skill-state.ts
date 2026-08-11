@@ -8,7 +8,10 @@ import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
 import {
 	deleteIfOwned,
-	readExistingStateForMutation,
+	type GuardedStateWriteReceipt,
+	guardedStateWriteReceipt,
+	matchesGuardedStateWriteReceipt,
+	rebuildActiveSnapshot,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "../gjc-runtime/state-writer";
@@ -361,6 +364,14 @@ interface SeedSkillActivationStateInput {
 	turnId?: string;
 	nowIso?: string;
 	stateDir?: string;
+	activeSubskills?: SkillActiveEntry["active_subskills"];
+}
+
+interface SeedSkillActivationWrite {
+	state: SkillActiveState;
+	modeWrite: GuardedStateWriteReceipt;
+	activeEntryWrite: GuardedStateWriteReceipt;
+	activeStateWrite?: GuardedStateWriteReceipt;
 }
 
 async function seedSkillActivationState(
@@ -368,7 +379,7 @@ async function seedSkillActivationState(
 	keyword: string,
 	source: string,
 	input: SeedSkillActivationStateInput,
-): Promise<SkillActiveState> {
+): Promise<SeedSkillActivationWrite> {
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const nowIso = input.nowIso ?? new Date().toISOString();
 	const phase = initialPhaseForSkill(skill);
@@ -382,6 +393,7 @@ async function seedSkillActivationState(
 		session_id: resolvedSessionId,
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
+		...(input.activeSubskills ? { active_subskills: input.activeSubskills } : {}),
 	};
 	const state: SkillActiveState = {
 		version: 1,
@@ -398,6 +410,7 @@ async function seedSkillActivationState(
 		initialized_mode: skill,
 		initialized_state_path: initializedStatePath,
 		active_skills: [entry],
+		...(input.activeSubskills ? { active_subskills: input.activeSubskills } : {}),
 	};
 	const modeState: ModeState = {
 		active: true,
@@ -415,57 +428,54 @@ async function seedSkillActivationState(
 		modeState.threshold_source = "default";
 	}
 
-	await readExistingStateForMutation(initializedStatePath);
-	const expectedRevision = 0;
-	await writeGuardedWorkflowEnvelopeAtomic(initializedStatePath, modeState, {
+	const modeWrite = guardedStateWriteReceipt(
+		await writeGuardedWorkflowEnvelopeAtomic(initializedStatePath, modeState, {
+			cwd: input.cwd,
+			policy: "source",
+			expectedRevision: 0,
+			receipt: {
+				cwd: input.cwd,
+				skill,
+				owner: "gjc-hook",
+				command: source,
+				sessionId: resolvedSessionId,
+			},
+			audit: { category: "state", verb: "write", owner: "gjc-hook", skill, sessionId: resolvedSessionId },
+		}),
+	);
+	if (!modeWrite) throw new Error(`Workflow activation mode write was not persisted: ${initializedStatePath}`);
+	const activeEntryResult = await syncSkillActiveState({
 		cwd: input.cwd,
-		policy: "source",
-		expectedRevision,
-		receipt: {
-			cwd: input.cwd,
-			skill,
-			owner: "gjc-hook",
-			command: source,
-			sessionId: resolvedSessionId,
-		},
-		audit: { category: "state", verb: "write", owner: "gjc-hook", skill, sessionId: resolvedSessionId },
+		skill,
+		active: true,
+		phase,
+		sessionId: resolvedSessionId,
+		threadId: input.threadId,
+		turnId: input.turnId,
+		active_subskills: input.activeSubskills,
+		source,
+		receipt: undefined,
+		sourceRevision: modeWrite.revision,
+		nowIso,
+		bestEffortSnapshot: true,
 	});
-	const persistedModeState =
-		(await readValidatedJsonFile<ModeState>(initializedStatePath, "mode-state", ModeStateSchema)) ?? modeState;
-	const sourceRevision =
-		typeof persistedModeState.state_revision === "number" && Number.isFinite(persistedModeState.state_revision)
-			? persistedModeState.state_revision
-			: undefined;
-
+	const activeEntryWrite = activeEntryResult ? guardedStateWriteReceipt(activeEntryResult) : undefined;
+	if (!activeEntryWrite) throw new Error(`Workflow activation entry write was not persisted: ${skill}`);
+	let activeStateWrite: GuardedStateWriteReceipt | undefined;
 	try {
-		await syncSkillActiveState({
-			cwd: input.cwd,
-			skill,
-			active: true,
-			phase,
-			sessionId: resolvedSessionId,
-			threadId: input.threadId,
-			turnId: input.turnId,
-			source,
-			receipt: undefined,
-			sourceRevision,
-			nowIso,
-		});
-	} catch {
-		// Derived active-state/HUD writes are best-effort during activation; source mode-state already persisted.
-	}
-	try {
-		await writeGuardedJsonAtomic(skillStatePath(input.cwd, resolvedSessionId), state, {
-			cwd: input.cwd,
-			policy: "cache",
-			sourceRevision: (sourceRevision ?? 0) + 1,
-			receipt: undefined,
-			audit: { category: "state", verb: "write", owner: "gjc-hook", sessionId: resolvedSessionId },
-		});
+		activeStateWrite = guardedStateWriteReceipt(
+			await writeGuardedJsonAtomic(skillStatePath(input.cwd, resolvedSessionId), state, {
+				cwd: input.cwd,
+				policy: "cache",
+				sourceRevision: modeWrite.revision + 1,
+				receipt: undefined,
+				audit: { category: "state", verb: "write", owner: "gjc-hook", sessionId: resolvedSessionId },
+			}),
+		);
 	} catch {
 		// Corrupt derived active-state is reported by recovery diagnostics; activation remains fail-open.
 	}
-	return state;
+	return { state, modeWrite, activeEntryWrite, activeStateWrite };
 }
 
 // Fallback for native-hook prompts when SkillPromptDetails.subskillActivation is absent;
@@ -473,7 +483,7 @@ async function seedSkillActivationState(
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
 	const match = detectPrimarySkillKeyword(input.text);
 	if (!match) return null;
-	return await seedSkillActivationState(match.skill, match.keyword, "gjc-skill-state-hook", input);
+	return (await seedSkillActivationState(match.skill, match.keyword, "gjc-skill-state-hook", input)).state;
 }
 
 export interface EnsureWorkflowSkillActivationInput {
@@ -484,6 +494,7 @@ export interface EnsureWorkflowSkillActivationInput {
 	turnId?: string;
 	nowIso?: string;
 	stateDir?: string;
+	activeSubskills?: SkillActiveEntry["active_subskills"];
 }
 
 export interface WorkflowSkillActivationSeed {
@@ -517,58 +528,41 @@ export async function ensureWorkflowSkillActivationSeed(
 			(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
 	);
 	if (alreadyActive) return { state: existing, seeded: false, rollback: noRollback };
-	const state = await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
+	const seed = await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
 		cwd: input.cwd,
 		sessionId: resolvedSessionId,
 		threadId: input.threadId,
 		turnId: input.turnId,
 		nowIso: input.nowIso,
 		stateDir: input.stateDir,
+		activeSubskills: input.activeSubskills,
 	});
-	if (!state?.initialized_state_path) return { state, seeded: false, rollback: noRollback };
-	const initializedStatePath = state.initialized_state_path;
-	const persistedModeState = await readValidatedJsonFile<ModeState>(
-		initializedStatePath,
-		"mode-state",
-		ModeStateSchema,
-	);
-	const sourceRevision =
-		typeof persistedModeState?.state_revision === "number" && Number.isFinite(persistedModeState.state_revision)
-			? persistedModeState.state_revision
-			: undefined;
-	const seededUpdatedAt = persistedModeState?.updated_at;
-	if (sourceRevision === undefined || typeof seededUpdatedAt !== "string")
-		return { state, seeded: false, rollback: noRollback };
-
+	const state = seed.state;
 	return {
 		state,
 		seeded: true,
 		rollback: async () => {
-			const removed = await deleteIfOwned(initializedStatePath, {
+			const modeRemoved = await deleteIfOwned(seed.modeWrite.path, {
 				cwd: input.cwd,
-				predicate: current => {
-					if (!current || typeof current !== "object" || Array.isArray(current)) return false;
-					const record = current as Record<string, unknown>;
-					return (
-						record.state_revision === sourceRevision &&
-						record.updated_at === seededUpdatedAt &&
-						record.skill === skill &&
-						record.session_id === resolvedSessionId &&
-						record.active === true
-					);
-				},
+				predicate: current => matchesGuardedStateWriteReceipt(current, seed.modeWrite),
 			});
-			if (!removed.deleted) return false;
-			await syncSkillActiveState({
+			if (!modeRemoved.deleted) {
+				await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
+				return false;
+			}
+			const entryRemoved = await deleteIfOwned(seed.activeEntryWrite.path, {
 				cwd: input.cwd,
-				skill,
-				active: false,
-				sessionId: resolvedSessionId,
-				threadId: input.threadId,
-				turnId: input.turnId,
-				sourceRevision,
+				predicate: current => matchesGuardedStateWriteReceipt(current, seed.activeEntryWrite),
 			});
-			return true;
+			if (seed.activeStateWrite) {
+				const activeStateWrite = seed.activeStateWrite;
+				await deleteIfOwned(activeStateWrite.path, {
+					cwd: input.cwd,
+					predicate: current => matchesGuardedStateWriteReceipt(current, activeStateWrite),
+				});
+			}
+			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
+			return entryRemoved.deleted;
 		},
 	};
 }

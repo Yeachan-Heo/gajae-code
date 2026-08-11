@@ -102,6 +102,16 @@ export type GuardedWriteResult =
 	| { path: string; written: true; revision: number; stamped: unknown }
 	| { path: string; written: false; reason: "stale-skip"; revision: number };
 
+export interface GuardedStateWriteReceipt {
+	path: string;
+	revision: number;
+	stamped: unknown;
+}
+
+export function guardedStateWriteReceipt(result: GuardedWriteResult): GuardedStateWriteReceipt | undefined {
+	return result.written ? { path: result.path, revision: result.revision, stamped: result.stamped } : undefined;
+}
+
 export interface StateWriterOptions {
 	cwd?: string;
 	receipt?: StateWriterReceiptContext;
@@ -441,6 +451,12 @@ function stampStateRevision(value: unknown, stateRevision: number, sourceRevisio
 		...(sourceRevision === undefined ? {} : { source_state_revision: sourceRevision }),
 		state_revision: stateRevision,
 	};
+}
+export function matchesGuardedStateWriteReceipt(current: unknown, receipt: GuardedStateWriteReceipt): boolean {
+	return (
+		persistedStateRevision(current) === receipt.revision &&
+		JSON.stringify(current) === JSON.stringify(receipt.stamped)
+	);
 }
 
 function withWorkflowReceipt(value: unknown, receipt: WorkflowStateReceipt | undefined): unknown {
@@ -993,20 +1009,19 @@ export async function writeActiveEntry(
 	skill: string,
 	entry: SkillActiveEntry,
 	options?: StateWriterOptions,
-): Promise<string> {
+): Promise<GuardedWriteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	await writeGuardedResolvedJsonAtomic(
+	const result = await writeGuardedResolvedJsonAtomic(
 		filePath,
 		{ ...entry, skill },
 		{
 			...options,
 			policy: "cache",
-			sourceRevision:
-				persistedSourceRevision(entry) || persistedSourceRevision(await readJsonIfPresent(filePath)) + 1,
+			sourceRevision: persistedSourceRevision(entry) || 1,
 		},
 	);
 	invalidateActiveStateCacheForScope(cwd, sessionScope);
-	return filePath;
+	return result;
 }
 
 export async function removeActiveEntry(
@@ -1088,9 +1103,9 @@ export async function mergeActiveState(
 	entry: SkillActiveEntry,
 	options?: StateWriterOptions,
 ): Promise<ActiveEntryWriteResult> {
-	const entryPath = await writeActiveEntry(cwd, sessionScope, skill, entry, options);
+	const entryWrite = await writeActiveEntry(cwd, sessionScope, skill, entry, options);
 	const snapshotPath = await rebuildActiveSnapshot(cwd, sessionScope, options);
-	return { entryPath, snapshotPath };
+	return { entryPath: entryWrite.path, snapshotPath };
 }
 
 export async function writeArtifact(
