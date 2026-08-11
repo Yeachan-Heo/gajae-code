@@ -18584,7 +18584,7 @@ export class SessionManager {
 			const authority = nativeSessionManager().openRecoveryFsRoot(projectGjcDir);
 			try {
 				const observed = authority.stat(relativePath);
-				if (!observed.ok || !observed.identity || !observed.identity.sha256)
+				if (!observed.ok || !observed.identity?.sha256)
 					throw new Error("Project session is no longer an authorized candidate.");
 				const removed = authority.removeManaged(
 					relativePath,
