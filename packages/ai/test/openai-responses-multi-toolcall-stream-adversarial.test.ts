@@ -587,4 +587,214 @@ describe("Adversarial Responses stream red-team", () => {
 		expect((preTool.arguments as Record<string, unknown>).text).toBeUndefined();
 		expect((postTool.arguments as Record<string, unknown>).text).toBeUndefined();
 	});
+
+	// -----------------------------------------------------------------------
+	// Issue #4274: five fail-open identity/lifecycle shapes that must now
+	// fail closed. Each was verified to reproduce on the exact base before fix.
+	// -----------------------------------------------------------------------
+
+	test("#4274-1: duplicate call_id fails closed for both items", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_a", call_id: "dup", name: "alpha_tool", arguments: "" },
+			},
+			{
+				type: "response.output_item.added",
+				output_index: 1,
+				item: { type: "function_call", id: "fc_b", call_id: "dup", name: "beta_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_a", output_index: 0, delta: '{"x":1}' },
+			{ type: "response.function_call_arguments.delta", item_id: "fc_b", output_index: 1, delta: '{"y":2}' },
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_a", call_id: "dup", name: "alpha_tool", arguments: '{"x":1}' },
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 1,
+				item: { type: "function_call", id: "fc_b", call_id: "dup", name: "beta_tool", arguments: '{"y":2}' },
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const blocks = toolBlocks(output);
+		expect(blocks).toHaveLength(2);
+		// Both must be fail-closed — ambiguous identity means neither is executable.
+		for (const block of blocks) {
+			expect(block.incompleteArguments).toBe(true);
+			expect(block.incompleteArgumentsReason).toBe("ambiguous");
+		}
+		const ends = toolCallEnds(emitted);
+		expect(ends).toHaveLength(2);
+		for (const end of ends) {
+			expect(end.toolCall.incompleteArguments).toBe(true);
+			expect(end.toolCall.incompleteArgumentsReason).toBe("ambiguous");
+		}
+	});
+
+	test("#4274-2: item_id/call_id namespace collision fails closed", async () => {
+		// item A has id "shared"; item B has call_id "shared". A delta keyed on
+		// "shared" is ambiguous — it matches A's id and B's call_id.
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "shared", call_id: "call_a", name: "alpha_tool", arguments: "" },
+			},
+			{
+				type: "response.output_item.added",
+				output_index: 1,
+				item: { type: "function_call", id: "fc_b", call_id: "shared", name: "beta_tool", arguments: "" },
+			},
+			// Ambiguous delta: item_id "shared" resolves to both A (by id) and B (by call_id).
+			{ type: "response.function_call_arguments.delta", item_id: "shared", delta: '{"poison":true}' },
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "function_call", id: "shared", call_id: "call_a", name: "alpha_tool", arguments: "" },
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 1,
+				item: { type: "function_call", id: "fc_b", call_id: "shared", name: "beta_tool", arguments: "{}" },
+			},
+		];
+		const output = makeOutput();
+		const { stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const blocks = toolBlocks(output);
+		expect(blocks).toHaveLength(2);
+		// At least the colliding items must be fail-closed (ambiguous identity).
+		const ambiguous = blocks.filter(b => b.incompleteArgumentsReason === "ambiguous");
+		expect(ambiguous.length).toBeGreaterThanOrEqual(1);
+		// No poison leaked into either block's arguments.
+		for (const block of blocks) {
+			expect((block.arguments as Record<string, unknown>).poison).toBeUndefined();
+		}
+	});
+
+	test("#4274-3: duplicate output_item.done does not emit a second toolcall_end", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_x", call_id: "call_x", name: "alpha_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_x", output_index: 0, delta: '{"a":1}' },
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_x", call_id: "call_x", name: "alpha_tool", arguments: '{"a":1}' },
+			},
+			// Duplicate terminal event for the same item.
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_x", call_id: "call_x", name: "alpha_tool", arguments: '{"a":1}' },
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const ends = toolCallEnds(emitted);
+		// Exactly one toolcall_end — the duplicate is ignored.
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.contentIndex).toBe(0);
+		expect(ends[0]?.toolCall.arguments).toEqual({ a: 1 });
+	});
+
+	test("#4274-4: orphan output_item.done emits no phantom toolcall_end", async () => {
+		// No output_item.added precedes this terminal event — it is an orphan.
+		const events = [
+			{
+				type: "response.output_item.done",
+				output_index: 99,
+				item: {
+					type: "function_call",
+					id: "fc_orphan",
+					call_id: "call_orphan",
+					name: "alpha_tool",
+					arguments: '{"a":1}',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const ends = toolCallEnds(emitted);
+		// No phantom toolcall_end at contentIndex -1, no synthesized block.
+		expect(ends).toHaveLength(0);
+		expect(output.content).toHaveLength(0);
+	});
+
+	test("#4274-5: two active items sharing output_index preserve custom-tool live input delta", async () => {
+		// Both items share output_index 0 (a relay defect). The custom tool must
+		// still receive its live streaming delta even when idx:0 is shared.
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "custom_tool_call", id: "ctc", call_id: "c_custom", name: "apply_patch", input: "" },
+			},
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc", call_id: "c_fn", name: "alpha_tool", arguments: "" },
+			},
+			// Custom-tool delta keyed on output_index 0 (no item_id) — must reach the custom tool.
+			{ type: "response.custom_tool_call_input.delta", output_index: 0, delta: "*** Begin Patch ***" },
+			// Function-call delta keyed on output_index 0 — must reach the function tool.
+			{ type: "response.function_call_arguments.delta", output_index: 0, delta: '{"command":"go"}' },
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "custom_tool_call",
+					id: "ctc",
+					call_id: "c_custom",
+					name: "apply_patch",
+					input: "*** Begin Patch ***",
+				},
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc",
+					call_id: "c_fn",
+					name: "alpha_tool",
+					arguments: '{"command":"go"}',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const blocks = toolBlocks(output);
+		expect(blocks).toHaveLength(2);
+		const custom = blocks.find(b => b.name === "apply_patch");
+		const fn = blocks.find(b => b.name === "alpha_tool");
+		expect(custom?.arguments).toEqual({ input: "*** Begin Patch ***" });
+		expect(fn?.arguments).toEqual({ command: "go" });
+		// The custom tool's live streaming delta is preserved (previously lost when
+		// the second item stole the shared idx alias). The function-call delta
+		// routed by output_index alone is inherently ambiguous when two items share
+		// the index; it is dropped rather than mis-attributed, but the function call
+		// still receives its terminal arguments from output_item.done above.
+		const deltas = emitted.filter(e => e.type === "toolcall_delta");
+		expect(deltas.length).toBe(1);
+		const customDelta = deltas[0] as { contentIndex: number };
+		expect(customDelta.contentIndex).toBe(custom ? output.content.indexOf(custom) : -1);
+		expect(customDelta.contentIndex).toBeGreaterThanOrEqual(0);
+	});
 });

@@ -94,3 +94,125 @@ describe("agentLoop: truncated tool-call guard", () => {
 		expect(executed).toEqual([{ path: "a.ts" }]);
 	});
 });
+
+describe("agentLoop: reason-specific incompleteArguments guidance", () => {
+	function identityConverter(messages: AgentMessage[]): Message[] {
+		return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
+	}
+
+	async function runWithReason(reason: "truncated" | "malformed" | "conflicting" | "ambiguous"): Promise<string> {
+		const toolSchema = z.object({ path: z.string(), content: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "write_file",
+			label: "Write",
+			description: "Write a file",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "wrote" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-1",
+							name: "write_file",
+							arguments: { path: "a.ts", content: "partial" },
+							incompleteArguments: true,
+							incompleteArgumentsReason: reason,
+						},
+					],
+					stopReason: "length",
+				},
+				{ content: ["recovered"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, fallbackManaged: true };
+		const toolResults: Array<{ isError?: boolean; text: string }> = [];
+		const stream = agentLoop([createUserMessage("write the file")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].isError).toBe(true);
+		return toolResults[0].text;
+	}
+
+	it("gives malformed-specific guidance (not truncation) for malformed terminal arguments", async () => {
+		const text = await runWithReason("malformed");
+		expect(text).toContain("did not decode to a valid JSON object");
+		expect(text).not.toContain("cut off");
+		expect(text.toLowerCase()).toContain("re-issue");
+	});
+
+	it("gives conflicting-specific guidance for streamed/terminal payload disagreement", async () => {
+		const text = await runWithReason("conflicting");
+		expect(text).toContain("disagree");
+		expect(text).not.toContain("cut off");
+		expect(text.toLowerCase()).toContain("re-issue");
+	});
+
+	it("gives ambiguous-identity guidance for duplicate call_id / id collision", async () => {
+		const text = await runWithReason("ambiguous");
+		expect(text).toContain("ambiguous");
+		expect(text).toContain("call id");
+		expect(text.toLowerCase()).toContain("re-issue");
+	});
+
+	it("still gives truncation guidance when reason is truncated", async () => {
+		const text = await runWithReason("truncated");
+		expect(text).toContain("cut off");
+		expect(text.toLowerCase()).toContain("re-issue");
+	});
+
+	it("falls back to truncation guidance when reason is absent but boolean is set", async () => {
+		const toolSchema = z.object({ path: z.string(), content: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "write_file",
+			label: "Write",
+			description: "Write a file",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "wrote" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-1",
+							name: "write_file",
+							arguments: { path: "a.ts", content: "partial" },
+							incompleteArguments: true,
+							// No reason — backward-compatible callers.
+						},
+					],
+					stopReason: "length",
+				},
+				{ content: ["recovered"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, fallbackManaged: true };
+		const toolResults: Array<{ isError?: boolean; text: string }> = [];
+		const stream = agentLoop([createUserMessage("write the file")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].isError).toBe(true);
+		expect(toolResults[0].text).toContain("cut off");
+		expect(toolResults[0].text.toLowerCase()).toContain("re-issue");
+	});
+});

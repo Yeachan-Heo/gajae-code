@@ -557,7 +557,9 @@ describe("Responses multi-tool-call stream correlation", () => {
 		const block = toolBlocks(output)[0];
 		expect(block?.arguments).toEqual({});
 		expect(block?.incompleteArguments).toBe(true);
+		expect(block?.incompleteArgumentsReason).toBe("conflicting");
 		expect(toolCallEnds(emitted)[0]?.toolCall.incompleteArguments).toBe(true);
+		expect(toolCallEnds(emitted)[0]?.toolCall.incompleteArgumentsReason).toBe("conflicting");
 	});
 
 	test("accepts a re-serialized terminal payload that matches the streamed arguments", async () => {
@@ -623,6 +625,7 @@ describe("Responses multi-tool-call stream correlation", () => {
 		const block = toolBlocks(output)[0];
 		expect(block?.arguments).toEqual({});
 		expect(block?.incompleteArguments).toBe(true);
+		expect(block?.incompleteArgumentsReason).toBe("malformed");
 	});
 
 	test("falls back to added-item arguments when neither deltas nor terminal arguments carry them", async () => {

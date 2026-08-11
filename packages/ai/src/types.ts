@@ -577,13 +577,27 @@ export interface ToolCall {
 	 */
 	customWireName?: string;
 	/**
-	 * Set when the provider detected the argument JSON was truncated — the model
-	 * hit its output-token limit (or the response was otherwise cut short) before
-	 * emitting a complete arguments object. The `arguments` field then holds a
-	 * best-effort partial parse and must not be executed as-is; the agent loop
-	 * rejects the call with a retryable error instead.
+	 * Set when the provider detected the argument JSON was not safely executable —
+	 * the model hit its output-token limit (or the response was otherwise cut short)
+	 * before emitting a complete arguments object, the terminal payload was malformed,
+	 * the streamed and terminal payloads conflicted, or the tool-call identity was
+	 * ambiguous on the wire. The `arguments` field then holds a best-effort partial
+	 * parse and must not be executed as-is; the agent loop rejects the call with a
+	 * retryable, reason-specific error instead.
 	 */
 	incompleteArguments?: boolean;
+	/**
+	 * When `incompleteArguments` is set, the typed cause so the agent loop can give
+	 * reason-specific recovery guidance:
+	 *  - `"truncated"`: the response was cut short mid-arguments (output-token limit).
+	 *  - `"malformed"`: the terminal arguments did not decode to a valid JSON object.
+	 *  - `"conflicting"`: the streamed and terminal argument payloads disagree.
+	 *  - `"ambiguous"`: the tool-call identity could not be unambiguously resolved
+	 *    (duplicate `call_id`, id/call_id collision, etc.), so attribution is unsafe.
+	 * Absent when `incompleteArguments` is not set. Existing callers that read only
+	 * `incompleteArguments` continue to work.
+	 */
+	incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 }
 
 export interface Usage {

@@ -75,8 +75,9 @@ export type MockContent =
 			arguments: Record<string, unknown> | string;
 			/** Simulate a provider-flagged truncated call (cut off mid-arguments). */
 			incompleteArguments?: boolean;
+			/** Typed reason matching `ToolCall.incompleteArgumentsReason`. Defaults to `"truncated"`. */
+			incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 	  };
-
 /** One scripted response. */
 export interface MockResponse {
 	/** Content blocks to emit, in order. Strings become text blocks. */
@@ -422,7 +423,9 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 			id: input.id ?? generateToolCallId(state),
 			name: input.name,
 			arguments: typeof input.arguments === "string" ? input.arguments : { ...input.arguments },
-			...(input.incompleteArguments ? { incompleteArguments: true } : {}),
+			...(input.incompleteArguments
+				? { incompleteArguments: true, incompleteArgumentsReason: input.incompleteArgumentsReason ?? "truncated" }
+				: {}),
 		} as ToolCall;
 	}
 	return input;

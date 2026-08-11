@@ -85,6 +85,7 @@ describe("Responses provider: truncated tool-call detection", () => {
 		expect(tools).toHaveLength(1);
 		expect(tools[0].name).toBe("write_file");
 		expect(tools[0].incompleteArguments).toBe(true);
+		expect(tools[0].incompleteArgumentsReason).toBe("truncated");
 	});
 
 	test("does NOT flag a completed tool call even if the turn later truncates", async () => {
