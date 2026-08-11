@@ -362,6 +362,12 @@ async function ensureWorkspaceManagedVenv(
 	lifecycle?: PythonRuntimeLifecycleOptions,
 ): Promise<void> {
 	const venvPath = resolveWorkspaceManagedPythonCandidate(cwd).venvPath;
+	const lockSignal =
+		lifecycle?.deadlineMs === undefined
+			? lifecycle?.signal
+			: lifecycle.signal
+				? AbortSignal.any([lifecycle.signal, AbortSignal.timeout(Math.max(0, lifecycle.deadlineMs - Date.now()))])
+				: AbortSignal.timeout(Math.max(0, lifecycle.deadlineMs - Date.now()));
 	const provisioning = withFileLock(
 		venvPath,
 		async () => {
@@ -370,7 +376,7 @@ async function ensureWorkspaceManagedVenv(
 				throw createRuntimeCancellationError(true);
 			await ensureWorkspaceManagedVenvInner(cwd, baseEnv, seedPackages, lifecycle);
 		},
-		{ retries: 600 },
+		{ retries: Number.POSITIVE_INFINITY, signal: lockSignal },
 	);
 	return await waitForRuntimeLifecycle(provisioning, lifecycle);
 }

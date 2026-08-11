@@ -8,11 +8,12 @@ export interface FileLockOptions {
 	staleMs?: number;
 	retries?: number;
 	retryDelayMs?: number;
+	signal?: AbortSignal;
 	/** Stable host identity required to safely reclaim locks on a shared volume. */
 	ownerHostId?: string;
 }
 
-const DEFAULT_OPTIONS: Required<Omit<FileLockOptions, "ownerHostId">> = {
+const DEFAULT_OPTIONS: Required<Omit<FileLockOptions, "ownerHostId" | "signal">> = {
 	staleMs: 10_000,
 	retries: 50,
 	retryDelayMs: 100,
@@ -308,12 +309,24 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	const lockPath = getLockPath(filePath);
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
+		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const owner = await tryAcquireLock(lockPath, opts.ownerHostId);
 		if (owner) return () => releaseLock(lockPath, owner);
-
 		const stale = await staleLockSnapshot(lockPath, opts.staleMs, opts.ownerHostId, contentionStartTimes);
 		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
-		await Bun.sleep(opts.retryDelayMs);
+		if (!opts.signal) {
+			await Bun.sleep(opts.retryDelayMs);
+			continue;
+		}
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const onAbort = (): void => reject(opts.signal?.reason ?? new Error("File lock acquisition aborted"));
+		opts.signal.addEventListener("abort", onAbort, { once: true });
+		void Bun.sleep(opts.retryDelayMs).then(resolve);
+		try {
+			await promise;
+		} finally {
+			opts.signal.removeEventListener("abort", onAbort);
+		}
 	}
 	throw new Error(`Failed to acquire lock for ${filePath} after ${opts.retries} attempts`);
 }
