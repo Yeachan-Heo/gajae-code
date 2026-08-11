@@ -14,6 +14,13 @@ const model: Model<"anthropic-messages"> = {
 	contextWindow: 200_000,
 	reasoning: true,
 };
+const deepseekModel: Model<"anthropic-messages"> = {
+	...model,
+	provider: "deepseek",
+	id: "deepseek-chat",
+	name: "DeepSeek Chat",
+	baseUrl: "https://api.deepseek.com",
+};
 
 function abortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -22,10 +29,13 @@ function abortedSignal(): AbortSignal {
 }
 
 /** Build the request the provider would send, without letting it leave the process. */
-function capturePayload(messages: Message[]): Promise<{ messages: unknown[] }> {
+function capturePayload(
+	messages: Message[],
+	activeModel: Model<"anthropic-messages"> = model,
+): Promise<{ messages: unknown[] }> {
 	const context: Context = { systemPrompt: ["Stay concise."], messages };
 	const { promise, resolve } = Promise.withResolvers<{ messages: unknown[] }>();
-	streamAnthropic(model, context, {
+	streamAnthropic(activeModel, context, {
 		apiKey: "sk-ant-oat-test",
 		isOAuth: true,
 		thinkingEnabled: true,
@@ -44,13 +54,17 @@ const usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-function assistantTurn(content: AssistantMessage["content"], toolId: string): AssistantMessage {
+function assistantTurn(
+	content: AssistantMessage["content"],
+	toolId: string,
+	activeModel: Model<"anthropic-messages"> = model,
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [...content, { type: "toolCall", id: toolId, name: "bash", arguments: { command: "echo hi" } }],
 		api: "anthropic-messages",
-		provider: "anthropic",
-		model: model.id,
+		provider: activeModel.provider,
+		model: activeModel.id,
 		usage,
 		stopReason: "toolUse",
 		timestamp: Date.now(),
@@ -74,6 +88,8 @@ const user: UserMessage = { role: "user", content: "go", timestamp: Date.now() }
 const HOLLOW_THINKING = { type: "thinking" as const, thinking: "", thinkingSignature: "" };
 const SIGNED_EARLY = { type: "thinking" as const, thinking: "early reasoning", thinkingSignature: "sig_early" };
 const SIGNED_LATE = { type: "thinking" as const, thinking: "late reasoning", thinkingSignature: "sig_late" };
+/** A block with empty text but a valid signature — natively replayable via the signed-thinking path. */
+const SIGNED_EMPTY = { type: "thinking" as const, thinking: "", thinkingSignature: "sig_empty" };
 
 function nativeThinkingCount(payload: { messages: unknown[] }): number {
 	let count = 0;
@@ -133,5 +149,40 @@ describe("Anthropic unreplayable latest-assistant thinking", () => {
 		// output, so an older hollow block must not cost the rest of the replay.
 		expect(JSON.stringify(payload.messages)).toContain("sig_late");
 		expect(nativeThinkingCount(payload)).toBe(1);
+	});
+
+	it("does not degrade a non-signing endpoint whose latest turn has hollow thinking", async () => {
+		const payload = await capturePayload(
+			[
+				user,
+				assistantTurn([SIGNED_EARLY], "toolu_a", deepseekModel),
+				toolResult("toolu_a"),
+				{ ...user, content: "again", timestamp: Date.now() + 1 },
+				assistantTurn([HOLLOW_THINKING], "toolu_b", deepseekModel),
+				toolResult("toolu_b"),
+			],
+			deepseekModel,
+		);
+
+		// DeepSeek never signs thinking and does not validate thinking presence, so
+		// a hollow latest block is harmless and earlier reasoning must survive.
+		expect(JSON.stringify(payload.messages)).toContain("sig_early");
+	});
+
+	it("does not degrade when the latest turn has signed-but-empty thinking", async () => {
+		const payload = await capturePayload([
+			user,
+			assistantTurn([SIGNED_EARLY], "toolu_a"),
+			toolResult("toolu_a"),
+			{ ...user, content: "again", timestamp: Date.now() + 1 },
+			assistantTurn([SIGNED_EMPTY], "toolu_b"),
+			toolResult("toolu_b"),
+		]);
+
+		// A block with empty text but a valid signature is natively replayable —
+		// convertAnthropicMessages forwards it via the signed-thinking path — so
+		// both signed blocks are preserved.
+		expect(nativeThinkingCount(payload)).toBe(2);
+		expect(JSON.stringify(payload.messages)).toContain("sig_empty");
 	});
 });
