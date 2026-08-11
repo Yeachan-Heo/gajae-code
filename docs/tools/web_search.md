@@ -2,7 +2,7 @@
 
 > Run one web query through the first available search provider and return LLM-formatted answer, source URLs, and optional citations.
 
-> Note: `insane-search` is **not** a `web_search` provider and does not affect search-provider selection. It is an opt-in fallback for the `read` tool's URL fetch path (`web.insaneFallback`); see `docs/tools/read.md`.
+> Note: the selectable, keyless `insane` provider uses native safe public routes for supported platforms. It is separate from the vendored `insane-search` compatibility path in `read`; that fallback is production-disabled even when `web.insaneFallback` is enabled. See `docs/tools/read.md`.
 
 ## Source
 - Entry: `packages/coding-agent/src/web/search/index.ts`
