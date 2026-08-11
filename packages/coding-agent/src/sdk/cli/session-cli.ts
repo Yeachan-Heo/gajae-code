@@ -62,6 +62,10 @@ export interface SdkSessionCliArgs {
 type JsonRecord = Record<string, unknown>;
 type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.list">;
 type TailExitReason = "idle" | "close";
+export interface RetainedTranscriptTailReader {
+	readonly size: number;
+	readRange(start: number, end: number): Promise<Uint8Array>;
+}
 
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 const SDK_SESSION_CLI_LIFECYCLE_ACTOR = { id: "gjc-sdk-session-cli", namespace: "sdk:session-cli" } as const;
@@ -69,6 +73,12 @@ const ROUTER_START_TIMEOUT_MS = 10_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
 const TAIL_STATUS_POLL_MS = 100;
 const TAIL_OFFLINE_MAX_ENTRIES = 200;
+const TAIL_OFFLINE_SCAN_CHUNK_BYTES = 64 * 1024;
+const TAIL_OFFLINE_MAX_SCAN_BYTES = 4 * 1024 * 1024;
+const TAIL_OFFLINE_MAX_SCANNED_LINES = 4_096;
+const TAIL_OFFLINE_MAX_LINE_BYTES = 256 * 1024;
+const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
+
 const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end", "agent_failed"]);
 const CLOSE_EVENT_KINDS = new Set(["session_closed", "session_terminated"]);
 const DEFAULT_TAIL_KINDS = new Set([
@@ -89,6 +99,15 @@ class SdkSessionCliError extends Error {
 		message: string,
 		readonly exitCode: 1 | 2,
 		readonly details?: unknown,
+	) {
+		super(message);
+	}
+}
+
+class RetainedTranscriptTailError extends Error {
+	constructor(
+		readonly reason: "unavailable" | "corrupt" | "line_limit" | "scan_limit" | "changed",
+		message: string,
 	) {
 		super(message);
 	}
@@ -426,7 +445,7 @@ async function waitForTerminalStatus(
 ): Promise<{ terminal: boolean; status: string; detail: unknown }> {
 	const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
 	for (;;) {
-		const response = await requestQuery(router, sessionId, "turn.prompt_status", { clientRef }, {});
+		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef }, {});
 		const result = resultObject(response) ?? {};
 		const status = typeof result.status === "string" ? result.status : "unknown";
 		if (status === "terminal_ok" || status === "failed") return { terminal: true, status, detail: result };
@@ -483,7 +502,7 @@ async function runStatus(
 	assertClientRef(opRef);
 	await ensureBroker({ agentDir });
 	return await withRouter(agentDir, async router => {
-		const response = await requestQuery(router, sessionId, "turn.prompt_status", { clientRef: opRef }, args);
+		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef: opRef }, args);
 		const status = resultObject(response) ?? {};
 		const raw = typeof status.status === "string" ? status.status : "unknown";
 		return {
@@ -600,6 +619,135 @@ function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | und
 	);
 }
 
+function retainedTranscriptUnavailable(): RetainedTranscriptTailError {
+	return new RetainedTranscriptTailError("unavailable", "Retained transcript history is unavailable.");
+}
+
+function retainedTranscriptCorrupt(): RetainedTranscriptTailError {
+	return new RetainedTranscriptTailError(
+		"corrupt",
+		"Retained transcript history contains unparseable entries; refusing to replay corrupted history.",
+	);
+}
+
+export async function scanRetainedTranscriptTail(reader: RetainedTranscriptTailReader): Promise<unknown[]> {
+	if (!Number.isSafeInteger(reader.size) || reader.size < 0) throw retainedTranscriptUnavailable();
+	const entries: unknown[] = [];
+	let position = reader.size;
+	let scannedBytes = 0;
+	let scannedLines = 0;
+	let trailingFragment = new Uint8Array();
+	while (position > 0 && entries.length < TAIL_OFFLINE_MAX_ENTRIES) {
+		const remainingBytes = TAIL_OFFLINE_MAX_SCAN_BYTES - scannedBytes;
+		if (remainingBytes <= 0)
+			throw new RetainedTranscriptTailError(
+				"scan_limit",
+				"Retained transcript history exceeds the bounded tail replay limit.",
+			);
+		const length = Math.min(TAIL_OFFLINE_SCAN_CHUNK_BYTES, position, remainingBytes);
+		const start = position - length;
+		let chunk: Uint8Array;
+		try {
+			chunk = await reader.readRange(start, position);
+		} catch {
+			throw retainedTranscriptUnavailable();
+		}
+		if (chunk.byteLength !== length) throw retainedTranscriptUnavailable();
+		scannedBytes += chunk.byteLength;
+		const combined = new Uint8Array(chunk.byteLength + trailingFragment.byteLength);
+		combined.set(chunk);
+		combined.set(trailingFragment, chunk.byteLength);
+
+		let complete = combined;
+		let partial = new Uint8Array();
+		if (start > 0) {
+			const firstNewline = combined.indexOf(0x0a);
+			if (firstNewline === -1) {
+				if (combined.byteLength > TAIL_OFFLINE_MAX_LINE_BYTES)
+					throw new RetainedTranscriptTailError(
+						"line_limit",
+						"Retained transcript history exceeds the bounded tail replay limit.",
+					);
+				trailingFragment = combined;
+				position = start;
+				continue;
+			}
+			partial = combined.subarray(0, firstNewline);
+			complete = combined.subarray(firstNewline + 1);
+		}
+
+		let lineEnd = complete.byteLength;
+		while (lineEnd > 0 && entries.length < TAIL_OFFLINE_MAX_ENTRIES) {
+			const newline = complete.lastIndexOf(0x0a, lineEnd - 1);
+			const lineStart = newline < 0 ? 0 : newline + 1;
+			const line = complete.subarray(lineStart, lineEnd);
+			lineEnd = newline < 0 ? 0 : newline;
+			scannedLines++;
+			if (scannedLines > TAIL_OFFLINE_MAX_SCANNED_LINES)
+				throw new RetainedTranscriptTailError(
+					"scan_limit",
+					"Retained transcript history exceeds the bounded tail replay limit.",
+				);
+			if (line.byteLength === 0) continue;
+			if (line.byteLength > TAIL_OFFLINE_MAX_LINE_BYTES)
+				throw new RetainedTranscriptTailError(
+					"line_limit",
+					"Retained transcript history exceeds the bounded tail replay limit.",
+				);
+			try {
+				entries.push(JSON.parse(transcriptDecoder.decode(line)));
+			} catch {
+				throw retainedTranscriptCorrupt();
+			}
+		}
+		if (entries.length === TAIL_OFFLINE_MAX_ENTRIES) break;
+		if (start > 0) {
+			if (partial.byteLength > TAIL_OFFLINE_MAX_LINE_BYTES)
+				throw new RetainedTranscriptTailError(
+					"line_limit",
+					"Retained transcript history exceeds the bounded tail replay limit.",
+				);
+			trailingFragment = partial;
+		}
+		position = start;
+	}
+	return entries.reverse();
+}
+
+async function readRetainedTranscriptTail(savedPath: string): Promise<unknown[]> {
+	let descriptor: fs.FileHandle | undefined;
+	try {
+		descriptor = await fs.open(savedPath, "r");
+		const before = await descriptor.stat({ bigint: true });
+		if (!before.isFile() || before.size > BigInt(Number.MAX_SAFE_INTEGER)) throw retainedTranscriptUnavailable();
+		// Bind every range read to the opened descriptor so a later pathname replacement
+		// cannot change the retained history selected by the lifecycle lookup.
+		const file = Bun.file(descriptor.fd);
+		const entries = await scanRetainedTranscriptTail({
+			size: Number(before.size),
+			readRange: async (start, end) => new Uint8Array(await file.slice(start, end).arrayBuffer()),
+		});
+		const after = await descriptor.stat({ bigint: true });
+		if (
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeNs !== after.mtimeNs ||
+			before.ctimeNs !== after.ctimeNs
+		)
+			throw new RetainedTranscriptTailError(
+				"changed",
+				"Retained transcript history changed while reading; refusing to replay it.",
+			);
+		return entries;
+	} catch (error) {
+		if (error instanceof RetainedTranscriptTailError) throw error;
+		throw retainedTranscriptUnavailable();
+	} finally {
+		if (descriptor !== undefined) await descriptor.close().catch(() => {});
+	}
+}
+
 async function offlineTailReplay(
 	repo: string,
 	agentDir: string,
@@ -621,38 +769,23 @@ async function offlineTailReplay(
 			`Session ${sessionId} is stopped and has no retained transcript replay.`,
 			1,
 		);
-	let text: string;
+	let entries: unknown[];
 	try {
-		text = await Bun.file(savedPath).text();
-	} catch {
-		throw new SdkSessionCliError("retention_gap", "Retained transcript history is unavailable.", 1);
+		entries = await readRetainedTranscriptTail(savedPath);
+	} catch (error) {
+		const retained = error instanceof RetainedTranscriptTailError ? error : retainedTranscriptUnavailable();
+		throw new SdkSessionCliError("retention_gap", retained.message, 1, {
+			code: "retention_gap",
+			reason: retained.reason,
+		});
 	}
-	const entries: unknown[] = [];
-	const malformed: number[] = [];
-	for (const [index, line] of text.split("\n").entries()) {
-		if (!line) continue;
-		try {
-			entries.push(JSON.parse(line));
-		} catch {
-			malformed.push(index);
-		}
-	}
-	if (malformed.length > 0)
-		throw new SdkSessionCliError(
-			"retention_gap",
-			"Retained transcript history contains unparseable entries; refusing to replay corrupted history.",
-			1,
-			{ code: "retention_gap", lines: malformed },
-		);
 	return {
 		ok: true,
 		result: {
 			version: SESSION_ROWS_VERSION,
 			source: "offline",
 			session: row,
-			items: entries
-				.slice(-TAIL_OFFLINE_MAX_ENTRIES)
-				.map((entry, index) => toTailItemV1(entry, { kind: "transcript", seq: index })),
+			items: entries.map((entry, index) => toTailItemV1(entry, { kind: "transcript", seq: index })),
 			terminal: true,
 		},
 	};

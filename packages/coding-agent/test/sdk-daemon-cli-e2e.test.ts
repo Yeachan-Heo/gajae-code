@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
@@ -141,7 +142,7 @@ describe("SDK session CLI", () => {
 							);
 							return;
 						}
-						if (frame.query === "turn.prompt_status") {
+						if (frame.query === "turn.result") {
 							const input = frame.input as Record<string, unknown> | undefined;
 							const clientRef = typeof input?.clientRef === "string" ? input.clientRef : undefined;
 							socket.send(
@@ -306,6 +307,46 @@ describe("SDK session CLI", () => {
 			result: { source: "session", terminal: true, items: [expect.objectContaining({ kind: "turn_end", seq: 1 })] },
 		});
 	}, 60_000);
+
+	it("bounds offline retained-transcript tail reads for a synthetic 300 MiB history", async () => {
+		const encoder = new TextEncoder();
+		const retainedTail = encoder.encode(
+			Array.from({ length: 240 }, (_, index) =>
+				JSON.stringify({ id: `tail-${index}`, payload: "x".repeat(32) }),
+			).join("\n") + "\n",
+		);
+		const prefixBytes = 300 * 1024 * 1024;
+		const size = prefixBytes + retainedTail.byteLength;
+		const reads: Array<{ start: number; end: number }> = [];
+		const entries = await scanRetainedTranscriptTail({
+			size,
+			readRange: async (start, end) => {
+				reads.push({ start, end });
+				const result = new Uint8Array(end - start);
+				const overlapStart = Math.max(start, prefixBytes);
+				const overlapEnd = Math.min(end, size);
+				if (overlapStart < overlapEnd)
+					result.set(
+						retainedTail.subarray(overlapStart - prefixBytes, overlapEnd - prefixBytes),
+						overlapStart - start,
+					);
+				return result;
+			},
+		});
+		expect(entries).toHaveLength(200);
+		expect(entries[0]).toMatchObject({ id: "tail-40" });
+		expect(entries.at(-1)).toMatchObject({ id: "tail-239" });
+		expect(reads.reduce((total, read) => total + read.end - read.start, 0)).toBeLessThan(1024 * 1024);
+		expect(reads.every(read => read.start >= prefixBytes - 1024 * 1024)).toBe(true);
+
+		const corrupt = encoder.encode('{"id":"valid"}\nnot-json\n');
+		await expect(
+			scanRetainedTranscriptTail({
+				size: corrupt.byteLength,
+				readRange: async (start, end) => corrupt.slice(start, end),
+			}),
+		).rejects.toThrow("Retained transcript history contains unparseable entries");
+	});
 
 	it("drains SDK session CLI session.list continuation pages before returning sessions", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);

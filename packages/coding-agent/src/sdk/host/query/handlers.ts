@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
+import { TURN_RESULT_PROMPT_ALIAS } from "../../protocol/operation-registry.js";
 import type { ActiveProviderDescriptor } from "../../providers.js";
 import { ActiveProviderResolutionError } from "../../providers.js";
+
 import {
 	assertCursorSelector,
 	type CursorEnvelope,
@@ -201,7 +203,8 @@ export class QueryHandlers {
 					);
 				return await this.#turnResult(request);
 			}
-			if (request.query === "turn.prompt_status") return await this.#promptTurnResult(request);
+			if (request.query === TURN_RESULT_PROMPT_ALIAS) return await this.#promptTurnResult(request);
+
 			if (request.query === "skill.invoke_status") return await this.#skillTurnResult(request);
 
 			const query = request.query.startsWith("Q")
@@ -584,7 +587,8 @@ export class QueryHandlers {
 		// unreachable: the bounded content cap is well under both RESPONSE_CEILING_BYTES
 		// and TARGET_PAGE_BYTES, so no revision is ever created. Reject cursors
 		// upfront instead of advertising a continuation path that can never fire.
-		if (request.cursor) return this.#error(request, "invalid_cursor", false, "turn.result does not support cursors.");
+		if (request.cursor !== undefined)
+			return this.#error(request, "invalid_request", false, "turn.result does not support cursors.");
 		if (typeof this.surface.getTurnResult !== "function") return this.#error(request, "unavailable");
 		const result = await this.surface.getTurnResult({
 			kind,

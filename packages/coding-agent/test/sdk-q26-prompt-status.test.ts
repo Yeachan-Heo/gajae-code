@@ -500,7 +500,7 @@ describe("turn.result query handler and retained aliases", () => {
 			cursor: "any-cursor",
 			connectionId: "c",
 		});
-		expect(response).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 	});
 
 	it("gates on installedQueries", async () => {

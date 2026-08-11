@@ -1,10 +1,10 @@
 # Long-Running Session Stress Analysis and Optimization Handoff
 
-**Date:** 2026-08-10  
-**Repository:** `gajae-code`  
-**Worktree:** `research/stress-test`  
-**Evidence commit:** `3e902206b3961144980411839b4797b2cf48eb74`  
-**Evidence host:** Apple M5 Max, Darwin arm64, Bun 1.3.14  
+**Date:** 2026-08-10
+**Repository:** `gajae-code`
+**Worktree:** `research/stress-test`
+**Evidence commit:** `3e902206b3961144980411839b4797b2cf48eb74`
+**Evidence host:** Apple M5 Max, Darwin arm64, Bun 1.3.14
 **Status:** Capacity and bounded-memory behavior verified through 2048 MiB. Cold first-open latency remains the main optimization target. No CPU self-time claim has been established because no profiler artifact has yet been captured.
 
 ---
@@ -630,7 +630,7 @@ The current matrix needs to be split into distinct operation classes.
 
 ### Fixture A — raw cold first-open
 
-Input: transcript with no sidecar.  
+Input: transcript with no sidecar.
 Measures: discovery, sidecar build, publish, context initialization.
 
 Required phase metrics:
@@ -649,14 +649,14 @@ Required phase metrics:
 
 ### Fixture B — exact authenticated reopen
 
-Input: transcript plus valid sidecar from fixture A, opened in a fresh process.  
+Input: transcript plus valid sidecar from fixture A, opened in a fresh process.
 Measures: commit parse, descriptor proof, hash verification, hot tail load, context build.
 
 This is the operation most users will experience after the first large-session resume.
 
 ### Fixture C — transcript-ahead reopen
 
-Input: valid sidecar plus bounded new transcript tail.  
+Input: valid sidecar plus bounded new transcript tail.
 Measures: recovery classification and incremental reconciliation.
 
 ### Fixture D — repeated lifecycle

@@ -3,7 +3,13 @@ import { CHAT_OPERATION_POLICY, sendAuthorizedChatOperation } from "../src/sdk/b
 import { dispatchControl } from "../src/sdk/host/control/dispatch.js";
 import type { ControlSurface } from "../src/sdk/host/control/operations.js";
 import { createSdkSurfacePolicy } from "../src/sdk/host/surface-policy.js";
-import { ADAPTERS, type AdapterDisposition, OPERATIONS } from "../src/sdk/protocol/operation-registry.js";
+import {
+	ADAPTERS,
+	type AdapterDisposition,
+	findOperation,
+	OPERATIONS,
+	TURN_RESULT_PROMPT_ALIAS,
+} from "../src/sdk/protocol/operation-registry.js";
 
 type InventoryRow = {
 	sourceId: string;
@@ -161,6 +167,17 @@ describe("SDK operation matrix", () => {
 			expect(operation.continuityClass).toBeDefined();
 		for (const [id, disposition] of Object.entries(expectedDispositions))
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual(disposition);
+	});
+	it("resolves the prompt-status alias to canonical Q26 and its error table", () => {
+		const canonical = findOperation("query", "turn.result");
+		const alias = findOperation("query", TURN_RESULT_PROMPT_ALIAS);
+		expect(alias).toBe(canonical);
+		expect(alias).toMatchObject({
+			id: "Q26",
+			sdkId: "turn.result",
+			aliases: [TURN_RESULT_PROMPT_ALIAS],
+			errorCodes: ["invalid_request", "resource_gone"],
+		});
 	});
 
 	it("gives every generated operation an explicit reviewed Discord and Slack chat disposition", () => {

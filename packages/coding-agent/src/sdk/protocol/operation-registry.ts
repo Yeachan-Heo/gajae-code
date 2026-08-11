@@ -6,6 +6,9 @@ export type OperationKind = "control" | "global" | "query" | "reverse";
 export type Idempotency = "idempotent" | "ordered" | "fast_lane";
 export type QueryContinuityClass = "stable_prefix" | "retained_revision" | "scalar_snapshot" | "content_addressed";
 
+/** Legacy prompt-only selector for canonical Q26 `turn.result`. */
+export const TURN_RESULT_PROMPT_ALIAS = "turn.prompt_status";
+
 export interface Operation {
 	id: string;
 	sdkId: string;
@@ -15,13 +18,17 @@ export interface Operation {
 	errorCodes: string[];
 	revisionResource?: string;
 	continuityClass?: QueryContinuityClass;
+	/** Non-canonical request IDs that resolve to this operation's contract. */
+	aliases?: readonly string[];
 
 	adapterDispositions: Record<Adapter, AdapterDisposition>;
 	testIds: string[];
 }
 
 export function findOperation(kind: OperationKind, sdkId: string): Operation | undefined {
-	return OPERATIONS.find(operation => operation.kind === kind && operation.sdkId === sdkId);
+	return OPERATIONS.find(
+		operation => operation.kind === kind && (operation.sdkId === sdkId || operation.aliases?.includes(sdkId)),
+	);
 }
 
 export function adapterDispositionError(
@@ -163,6 +170,10 @@ const queries = [
 	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
 	["turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
 ] as const;
+
+const queryAliases: Readonly<Record<string, readonly string[]>> = {
+	Q26: [TURN_RESULT_PROMPT_ALIAS],
+};
 
 const reverse = [
 	["terminal.create/output/release/wait", "Direct terminal lifecycle requests."],
@@ -320,6 +331,7 @@ export const OPERATIONS: readonly Operation[] = [
 						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
 						: ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
+			...(queryAliases[id] === undefined ? {} : { aliases: queryAliases[id] }),
 			adapterDispositions: queryDisposition(id),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
