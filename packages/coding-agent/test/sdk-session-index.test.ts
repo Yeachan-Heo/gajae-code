@@ -314,6 +314,33 @@ describe("SDK session index", () => {
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
+	it("publishes the snapshot without fsyncing a read-only temp handle (Windows EPERM, #4250)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-readonly-fsync-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("windows"));
+		// Windows refuses FlushFileBuffers on a handle opened read-only with EPERM.
+		// Any read-only open of the snapshot temp must fail exactly like the reported
+		// crash, and publication must still land through a writable handle.
+		const open = fs.open.bind(fs);
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+			if (rest[0] === "r" && file.endsWith(".tmp"))
+				(handle as unknown as { sync: () => Promise<void> }).sync = async () => {
+					throw Object.assign(new Error("operation not permitted, fsync"), { code: "EPERM" });
+				};
+			return handle;
+		}) as typeof fs.open);
+		try {
+			await index.snapshot();
+		} finally {
+			spy.mockRestore();
+		}
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.events.map((item: SessionIndexEvent) => item.sessionId)).toEqual(["windows"]);
+		// Publication must not leave the temp artifact behind.
+		const entries = await fs.readdir(path.join(dir, "sdk", "sessions"));
+		expect(entries.filter(name => name.endsWith(".tmp"))).toEqual([]);
+	});
 	it("accepts EBADF when closing a successfully written and synced append handle", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-close-ebadf-"));
 		const index = await new SessionIndex(dir).open();

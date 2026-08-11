@@ -1090,26 +1090,14 @@ export class SessionIndex {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
 		}
 		if (isValidSnapshot(current) && current.indexSeq > this.indexSeq) return;
-		const tmp = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(
-			tmp,
+		await replaceAtomically(
+			file,
 			JSON.stringify({
 				version: SESSION_INDEX_SNAPSHOT_VERSION,
 				indexSeq: this.indexSeq,
 				events: compactEvents(this.#events, this.#policy),
 			}),
-			{
-				mode: 0o600,
-			},
 		);
-		const h = await fs.open(tmp, "r");
-		try {
-			await h.sync();
-		} finally {
-			await h.close();
-		}
-		await fs.rename(tmp, file);
-		await syncDirectory(file);
 	}
 	/**
 	 * Broker-scheduled compaction (C3), independent of rotation size: applies the

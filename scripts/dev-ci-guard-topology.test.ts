@@ -224,6 +224,19 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		}
 		expect(offenders).toEqual([]);
 	});
+	test("every workflow bun test invocation is guarded by its own exit-code check", async () => {
+		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
+		const lines = source.split(/\r?\n/).map(line => line.trim());
+		const offenders: string[] = [];
+		for (let index = 0; index < lines.length; index++) {
+			if (!lines[index]!.startsWith("bun test ")) continue;
+			const next = lines[index + 1] ?? "";
+			// A `pwsh` run block must check $LASTEXITCODE right after each bun test;
+			// otherwise a failure is masked by the next invocation overwriting it.
+			if (next !== "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") offenders.push(lines[index]!);
+		}
+		expect(offenders).toEqual([]);
+	});
 	test("virtual integration serializes every merge candidate without cancellation", async () => {
 		const d = await workflow();
 		const virtual = requiredJob(d, "virtual-integration");
