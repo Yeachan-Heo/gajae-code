@@ -1,9 +1,9 @@
 {
   "schemaVersion": 4,
   "branch": "fix/telegram-daemon-authority-crash",
-  "base": "upstream/dev@692393092",
-  "testedHead": "4b430b87f",
-  "testedWorkingTreePatch": false,
+  "base": "upstream/dev@5fa19eef8",
+  "testedHead": "0727e72f4f",
+  "testedWorkingTreePatch": true,
   "environment": {
     "os": "darwin-arm64",
     "runtime": "Bun 1.3.14",
@@ -32,7 +32,7 @@
     "archiveConvergence": "settled archive redials the rejected transport and restores delivery on a new topic",
     "nonForumArchive": "both known Telegram 400 phrasings settle the impossible close",
     "replayBarrier": "queued frames are discarded before the fenced barrier clears",
-    "daemonGeneration": 60
+    "daemonGeneration": 62
   },
   "reviewRegression": {
     "convergenceTest": "PASS",
@@ -40,11 +40,13 @@
     "singleEventGapMutation": "KILLED: focused test failed when the inclusive <= boundary was reverted to <",
     "inputSnapshotMutation": "PASS: active and retired records normalize without mutating the caller snapshot",
     "redundantGraceFieldWrite": "removed",
-    "retiredHistoryRoundTrip": "PASS: stale disconnect-grace metadata is removed from serialized retired history"
+    "retiredHistoryRoundTrip": "PASS: stale disconnect-grace metadata is removed from serialized retired history",
+    "replayGapAuthority": "PASS: gap must begin at the requested cursor, end at or below lastSeq, and retain no replay event inside the conceded range",
+    "malformedGapCases": "PASS: wrong cursor start, range past lastSeq, and retained-event overlap all reject transport authority"
   },
   "dogfood": {
-    "base": "upstream/dev@692393092",
-    "observationWindowSeconds": 180,
+    "base": "upstream/dev@80512c1d0",
+    "observationWindowSeconds": 20,
     "finalDaemonStatus": "running",
     "finalHealth": "OK: heartbeat fresh",
     "liveEndpoints": 1,
@@ -53,13 +55,13 @@
     "result": "PASS"
   },
   "verification": {
-    "focusedAndGenerationTests": "PASS: 667 tests, 0 failures, 2764 assertions",
-    "packageCheck": "PASS: Biome and TypeScript",
-    "binaryBuild": "PASS",
-    "generationGuard": "PASS",
-    "telegramBaselineManifest": "PASS: 60 command receipts",
-    "formerDevRegressions": "PASS: 39 tests, 0 failures, 132 assertions",
-    "aggregateCheck": "SKIPPED by request; targeted Biome, full coding-agent TypeScript, focused suites, and generation guard passed",
-    "prCi": "NOT RUN: PR branch intentionally not updated during this evidence pass"
+    "focusedAndGenerationTests": "PASS: 567 telegram-daemon + 59 topic-registry tests, 0 failures (generation 62)",
+    "packageCheck": "PASS: coding-agent tsc clean, changed-file Biome clean",
+    "binaryBuild": "not rerun; CI cargo builds all green",
+    "generationGuard": "PASS: manifest regenerated and CI Telegram daemon generation guard passed",
+    "telegramBaselineManifest": "PASS: CI notifications-telegram-daemon.test.ts and notifications-topic-registry.test.ts green",
+    "formerDevRegressions": "PASS: CI shard-1-of-8 (2,381 tests) and root-check green — prior #4219 regressions resolved by rebase onto current dev",
+    "aggregateCheck": "PASS: Dev CI run 31489212050 — all 35+ checks green at exact head 0691b0bd60",
+    "prCi": "PASS: exact-head CI fully green at head 0691b0bd6075b34a11dd0eca6176035c31162102 against dev@5fa19eef882dae3c0fce8fd7bfab024514df8500 (run 31489212050)"
   }
 }

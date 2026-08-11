@@ -624,7 +624,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generation 61 at serving epoch 5", () => {
+test("publishes generation 62 at serving epoch 5", () => {
 	// Generation 55: shared-topic-authority outage hardening (#3974).
 	// Generation 56: lazy native authority for startup-cost cut (#3846).
 	// Generation 57: parser-valid archive transitions after disconnect grace.
@@ -633,7 +633,8 @@ test("publishes generation 61 at serving epoch 5", () => {
 	// Generation 60: transient heartbeat-sidecar publication failures are
 	// contained instead of crashing the daemon (#4200).
 	// Generation 61: fenced same-session transport recovery.
-	expect(DAEMON_GENERATION).toBe(61);
+	// Generation 62: replay-gap authority validation.
+	expect(DAEMON_GENERATION).toBe(62);
 	expect(SERVING_EPOCH).toBe(5);
 });
 test("archives pending topics into retained inactive records", async () => {

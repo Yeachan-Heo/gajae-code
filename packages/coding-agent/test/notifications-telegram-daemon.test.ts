@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
@@ -3129,7 +3130,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 61 fenced transport recovery", () => {
+	test("keeps wire protocol 3 through generation 62 replay-gap authority validation", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3163,8 +3164,9 @@ describe("telegram daemon", () => {
 		// Generation 59 publishes the attached OPEN-socket count in the heartbeat sidecar (#4128).
 		// Generation 60 contains transient heartbeat-sidecar publication failures
 		// under the ownership-lock fence instead of crashing the daemon (#4200).
-		// Generation 61 keeps fenced same-session transports attached.
-		expect(DAEMON_GENERATION).toBe(61);
+		// Generation 61 keeps fenced same-session transports attached; generation 62
+		// validates replay-gap claims against the requested cursor and retained suffix.
+		expect(DAEMON_GENERATION).toBe(62);
 	});
 	test.each([
 		"1",
@@ -19301,14 +19303,14 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const cwd = path.join(agentDir, "repo");
 		await registerNotificationRoot({ settings: daemonSettings, cwd, sessionId: "S" });
 		const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
-		fs.mkdirSync(endpointDir, { recursive: true });
-		fs.writeFileSync(
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		await Bun.write(
 			path.join(endpointDir, "S.json"),
 			JSON.stringify({ url: "ws://successor", token: "successor-token" }),
 		);
 		const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
-		fs.mkdirSync(path.dirname(topicsPath), { recursive: true });
-		fs.writeFileSync(
+		await fsPromises.mkdir(path.dirname(topicsPath), { recursive: true });
+		await Bun.write(
 			topicsPath,
 			JSON.stringify({
 				version: 2,
@@ -19337,7 +19339,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
-			WebSocketImpl: FakeWs as any,
+			WebSocketImpl: FakeWs as never,
 		});
 		await daemon.loadTopics();
 		daemon.connectSession("S", "ws://successor", "successor-token");
@@ -20976,9 +20978,10 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			id: session.replayId,
 			generation: 1,
 			lastSeq: 10,
-			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 1, resyncQueries: ["Q01"] },
+			gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 2, resyncQueries: ["Q01"] },
 			events: [
 				{
+					seq: 3,
 					payload: {
 						type: "identity_header",
 						sessionId: "S",
@@ -21001,6 +21004,55 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			replayGeneration: 1,
 			replaySeq: 10,
 		});
+	});
+	test.each([
+		[
+			"gap starts after the requested cursor",
+			{
+				lastSeq: 10,
+				gap: { kind: "sequence_gap", fromSeq: 3, toSeq: 3, resyncQueries: ["Q01"] },
+				events: [{ seq: 4, payload: { type: "identity_header", sessionId: "S" } }],
+			},
+		],
+		[
+			"gap extends past lastSeq",
+			{
+				lastSeq: 2,
+				gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 3, resyncQueries: ["Q01"] },
+				events: [{ seq: 4, payload: { type: "identity_header", sessionId: "S" } }],
+			},
+		],
+		[
+			"retained event overlaps the conceded gap",
+			{
+				lastSeq: 3,
+				gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 2, resyncQueries: ["Q01"] },
+				events: [{ seq: 2, payload: { type: "identity_header", sessionId: "S" } }],
+			},
+		],
+	] as const)("%s cannot authorize recovery", async (_name, proof) => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "S", "S", { generation: 1 });
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		restarted.connectSession("S", "ws://canonical", "canonical-token");
+		const session = restarted.sessions.get("S")!;
+		session.ws.dispatchEvent(new Event("open"));
+		await restarted.handleSessionMessage(session, {
+			type: "event_replay_result",
+			ok: true,
+			id: session.replayId,
+			generation: 2,
+			...proof,
+		});
+
+		expect(restarted.sessions.has("S")).toBe(false);
+		expect(session.logicalSessionIdTrusted).toBe(false);
+		expect(session.hostGeneration).toBe(0);
 	});
 	test.each([
 		[

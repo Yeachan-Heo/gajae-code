@@ -4818,6 +4818,8 @@ interface SessionSocket {
 	pingTimer: ReturnType<typeof setInterval> | undefined;
 	/** Correlation id for the startup replay barrier. */
 	replayId: string;
+	/** Sequence cursor sent by the current startup replay request. */
+	replaySinceSeq: number;
 	/** Queues live frames until startup replay is applied. */
 	replayPending: boolean;
 	replayQueue: Record<string, unknown>[];
@@ -6323,6 +6325,7 @@ export class TelegramNotificationDaemon {
 			awaitingNonce: undefined,
 			pingTimer: undefined,
 			replayId: `telegram-startup-replay:${sessionId}`,
+			replaySinceSeq: 0,
 			replayPending: false,
 			replayQueue: [],
 		};
@@ -6341,6 +6344,7 @@ export class TelegramNotificationDaemon {
 			const persistedTopic = this.topics.get(sessionId);
 			const replayCursor =
 				persistedTopic?.endpointDigest === session.endpointDigest ? this.topics.replayCursor(sessionId) : undefined;
+			session.replaySinceSeq = replayCursor?.seq ?? 0;
 			if (session.ws.readyState === WebSocket.OPEN) {
 				try {
 					session.ws.send(
@@ -10023,6 +10027,18 @@ export class TelegramNotificationDaemon {
 				frame => typeof frame.sessionId !== "string" || !frame.sessionId.trim(),
 			);
 			const identityConflict = new Set(identities).size > 1;
+			const retainedAtOrBelowGap =
+				msg.gap !== null &&
+				typeof msg.gap === "object" &&
+				!Array.isArray(msg.gap) &&
+				Number.isSafeInteger(msg.gap.toSeq) &&
+				Array.isArray(msg.events) &&
+				(msg.events as Record<string, unknown>[]).some(
+					event =>
+						Number.isSafeInteger(event.seq) &&
+						(event.seq as number) >= 1 &&
+						(event.seq as number) <= msg.gap.toSeq,
+				);
 			const sequenceGapWithIdentityProof =
 				msg.gap !== null &&
 				typeof msg.gap === "object" &&
@@ -10030,7 +10046,10 @@ export class TelegramNotificationDaemon {
 				msg.gap.kind === "sequence_gap" &&
 				Number.isSafeInteger(msg.gap.fromSeq) &&
 				Number.isSafeInteger(msg.gap.toSeq) &&
+				msg.gap.fromSeq === session.replaySinceSeq + 1 &&
 				msg.gap.fromSeq <= msg.gap.toSeq &&
+				msg.gap.toSeq <= msg.lastSeq &&
+				!retainedAtOrBelowGap &&
 				Array.isArray(msg.gap.resyncQueries) &&
 				msg.gap.resyncQueries.every((query: unknown) => typeof query === "string") &&
 				identityFrames.length > 0;
