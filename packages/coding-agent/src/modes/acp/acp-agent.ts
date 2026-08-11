@@ -123,6 +123,9 @@ interface PromptWaiter {
 	activity: PromptActivity;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
+	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
+	 *  a later failed attempt must not erase an earlier success (review thread P2). */
+	cancelAcknowledged?: boolean;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -1668,7 +1671,16 @@ export class AcpAgent implements Agent {
 		const scope = resolveAcpAbortScope(params._meta, process.env);
 		const waiter = record.activePrompt;
 		const cancelAttempt = waiter ? Promise.withResolvers<boolean>() : undefined;
-		if (waiter && cancelAttempt) waiter.cancelAttempt = cancelAttempt.promise;
+		if (waiter && cancelAttempt) {
+			// Overlapping cancels must not lose an earlier successful
+			// acknowledgement: keep the waiter's attempt promise CUMULATIVE —
+			// it resolves true when ANY attempt acknowledged, so the second
+			// attempt's failure cannot rewrite the first's success (review
+			// thread P2).
+			waiter.cancelAttempt = waiter.cancelAttempt
+				? waiter.cancelAttempt.then(prior => prior || cancelAttempt.promise)
+				: cancelAttempt.promise;
+		}
 		try {
 			const acknowledgement = await record.adapter.cancel(scope);
 			const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
@@ -1677,6 +1689,7 @@ export class AcpAgent implements Agent {
 					"abort_unacknowledged",
 					"SDK did not acknowledge cancellation of the active prompt.",
 				);
+			if (waiter) waiter.cancelAcknowledged = true;
 			if (
 				result?.disposition === "preflight_cancelled" &&
 				waiter &&
@@ -1696,7 +1709,12 @@ export class AcpAgent implements Agent {
 			}
 			cancelAttempt?.resolve(true);
 		} catch (error) {
-			record.cancelRequested = false;
+			// A failing attempt must not erase a cancellation the client already
+			// requested AND an overlapping attempt already acknowledged (e.g.
+			// the first abort stopped the turn and the second got
+			// no_active_turn): the prompt-rejection path still settles as
+			// cancelled (review thread P2).
+			if (!waiter?.cancelAcknowledged) record.cancelRequested = false;
 			cancelAttempt?.resolve(false);
 			throw error;
 		}

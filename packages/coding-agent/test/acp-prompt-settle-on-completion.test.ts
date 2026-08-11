@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
+import type {
+	AgentSideConnection,
+	CancelNotification,
+	PromptRequest,
+	SessionNotification,
+} from "@agentclientprotocol/sdk";
 import { TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -99,9 +104,20 @@ function phaseUpdates(updates: SessionNotification[], phase: string): number {
  * reproducing a host that stops producing the moment it publishes its terminal frame.
  */
 async function createFixture(
-	options: { silentQueries?: string[]; terminalBeforeAcknowledgement?: boolean; rejectFinalTextUpdate?: boolean } = {},
+	options: {
+		silentQueries?: string[];
+		terminalBeforeAcknowledgement?: boolean;
+		rejectFinalTextUpdate?: boolean;
+		/** Deferred per-turn.prompt response (default: accepted); awaited before answering. */
+		promptResponse?: () => unknown | Promise<unknown>;
+		/** Queue of per-turn.abort responses; falls back to { aborted: true }. */
+		abortResponses?: unknown[];
+		/** Overrides the post-acknowledgement cancel settlement grace. */
+		cancelSettlementGraceMs?: number;
+	} = {},
 ): Promise<Fixture> {
 	const silent = new Set(options.silentQueries ?? []);
+	const abortResponseQueue = [...(options.abortResponses ?? [])];
 	const tempDir = TempDir.createSync("@acp-prompt-settle-");
 	const agentDir = path.join(tempDir.path(), "agent");
 	const cwd = path.join(tempDir.path(), "workspace");
@@ -227,16 +243,22 @@ async function createFixture(
 							},
 						}),
 					);
+				const promptReply =
+					frame.operation === "turn.prompt"
+						? options.promptResponse
+							? await options.promptResponse()
+							: { ok: true, result: { commandId, turnId, accepted: true } }
+						: undefined;
 				socket.send(
 					JSON.stringify({
 						type: "control_response",
 						id: frame.id,
-						ok: true,
+						ok: promptReply === undefined ? true : (promptReply as { ok?: boolean }).ok !== false,
 						result:
-							frame.operation === "turn.prompt"
-								? { commandId, turnId, accepted: true }
+							promptReply !== undefined
+								? (promptReply as { result?: unknown }).result
 								: frame.operation === "turn.abort"
-									? { aborted: true }
+									? (abortResponseQueue.shift() ?? { aborted: true })
 									: {},
 					}),
 				);
@@ -272,7 +294,11 @@ async function createFixture(
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
-		{ agentDir, promptWatchdogClock: clock },
+		{
+			agentDir,
+			promptWatchdogClock: clock,
+			cancelSettlementGraceMs: options.cancelSettlementGraceMs ?? 5_000,
+		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");
 	await waitFor(() => phaseUpdates(updates, "idle") > 0, "bootstrap update");
@@ -415,6 +441,62 @@ test("a producer that never publishes a terminal is still settled by the inactiv
 		expect(await bounded(settled, "watchdog settlement")).toMatchObject({
 			rejected: { code: "prompt_abandoned" },
 		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("an acknowledged cancel survives a second overlapping cancel that fails", async () => {
+	// Review thread P2: two overlapping ACP cancel notifications each replace
+	// waiter.cancelAttempt; when the first abort stops the turn but the second
+	// consequently receives no_active_turn, the second attempt must not erase
+	// the cancellation the client already requested and the first attempt
+	// already acknowledged — a concurrent prompt-preflight rejection settles
+	// the turn as cancelled instead of surfacing a spurious error.
+	let promptFrameArrived: () => void = () => {};
+	const promptFrameSeen = new Promise<void>(resolve => {
+		promptFrameArrived = resolve;
+	});
+	const promptGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		promptResponse: async () => {
+			promptFrameArrived();
+			await promptGate.promise;
+			return { ok: false, error: { code: "busy", message: "preflight busy" } };
+		},
+		abortResponses: [
+			// First cancel: acknowledged (legacy aborted:true).
+			{ ok: true, result: { aborted: true } },
+			// Second cancel: the turn is already stopped -> no_active_turn,
+			// which is NOT an acknowledgement.
+			{ ok: true, result: { turn: "no_active_turn", terminal: "terminal_no_effect" } },
+		],
+		cancelSettlementGraceMs: 60_000,
+	});
+	try {
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000001",
+			prompt: [{ type: "text", text: "hold the turn" }],
+		} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+		const settled = pending.then(
+			resolved => ({ resolved }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		// Wait until the SDK turn.prompt frame reached the server, then run the
+		// overlapping cancels while the prompt acknowledgement is still pending.
+		await bounded(promptFrameSeen, "prompt frame arrival");
+		// First cancel acknowledges; the waiter's attempt resolves true.
+		await fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification);
+		// Second overlapping cancel fails (abort_unacknowledged).
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification)).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		// The concurrent prompt-preflight rejection now settles: the failed
+		// second attempt must not have cleared the acknowledged cancellation.
+		promptGate.resolve();
+		const outcome = await bounded(settled, "prompt settlement after overlapping cancels");
+		expect("resolved" in outcome ? outcome.resolved?.stopReason : outcome.rejected?.code).toBe("cancelled");
 	} finally {
 		fixture.dispose();
 	}
