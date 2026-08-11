@@ -529,7 +529,30 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Proxy Provider",
 			description:
-				"Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) that built-in model preset selectors are routed through when the preset's direct provider is not configured. Only selectors for presets whose direct provider is unauthenticated are rewritten to <proxy>/<model>. Leave unset to keep direct provider endpoints.",
+				"Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints.",
+		},
+	},
+	"modelProfile.proxyMode": {
+		type: "enum",
+		values: ["fallback", "always"] as const,
+		default: "fallback",
+		ui: {
+			tab: "model",
+			label: "Proxy Routing Mode",
+			description:
+				"fallback routes only selectors whose direct provider lacks credentials; always routes every proxy-routable built-in preset selector through the configured proxy.",
+			options: [
+				{
+					value: "fallback",
+					label: "Fallback",
+					description: "Use the proxy only when direct provider credentials are unavailable",
+				},
+				{
+					value: "always",
+					label: "Always",
+					description: "Route proxy-routable built-in preset selectors through the proxy",
+				},
+			],
 		},
 	},
 	"session.resumeModelBehavior": {

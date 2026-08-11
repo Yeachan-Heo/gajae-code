@@ -408,9 +408,10 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 /**
  * Providers that built-in model presets pin via qualified `<provider>/<model>`
  * selectors. When `modelProfile.proxyProvider` is set, selectors for these
- * providers are rewritten to `<proxy>/<model>` at activation time unless the
- * direct provider is itself authenticated. Bare-alias (open-weights) profiles
- * are not included: they already resolve through any authenticated provider,
+ * providers are rewritten to `<proxy>/<model>` at activation time when their
+ * direct provider is unauthenticated, or unconditionally when
+ * `modelProfile.proxyMode` is `always`. Bare-alias (open-weights) profiles are
+ * not included: they already resolve through any authenticated provider,
  * including a configured proxy.
  */
 export const PROXY_ROUTABLE_PROVIDER_IDS: ReadonlySet<string> = new Set(

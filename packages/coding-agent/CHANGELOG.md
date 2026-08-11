@@ -21,7 +21,7 @@
 
 ### Added
 - `gjc setup provider` now ships parameterized proxy presets: `--preset litellm` and `--preset openai-compatible-proxy` (aliases `litellm-proxy`, `openai-proxy`, `compatible-proxy`, `custom-proxy`) with a required `--base-url`, configurable `--api-key-env`, and live model discovery (#4123).
-- New `modelProfile.proxyProvider` setting routes built-in model-preset selectors through an authenticated OpenAI-compatible proxy (e.g. `xai/grok-4.3` → `litellm/xai/grok-4.3`) when the preset's direct provider is unauthenticated. Routing is limited to built-in presets, fails closed when the proxy is unauthenticated, and never overrides a directly-authenticated provider (#4123).
+- New `modelProfile.proxyProvider` and `modelProfile.proxyMode` settings route built-in model-preset selectors through an authenticated OpenAI-compatible proxy (e.g. `xai/grok-4.3` → `litellm/xai/grok-4.3`). `fallback` preserves directly authenticated providers by default; `always` forces every proxy-routable built-in selector through the configured gateway. Routing fails closed for unconfigured or unauthenticated proxies and missing or ambiguous proxy models (#4123).
 ## [0.12.21] - 2026-08-09
 
 ### Fixed

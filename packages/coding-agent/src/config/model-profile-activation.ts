@@ -98,6 +98,7 @@ export interface PrepareModelProfileActivationOptions {
 				| "seedCanonicalVariant"
 				| "getSessionCanonicalVariant"
 				| "restoreSessionCanonicalVariant"
+				| "getConfiguredProviderIds"
 			>
 		> & {
 			getError?: ModelRegistry["getError"];
@@ -544,46 +545,71 @@ function resolveProxyProviderId(settings: Pick<Settings, "get" | "getGlobal" | "
 	return id;
 }
 
+function resolveProxyMode(settings: Pick<Settings, "get" | "getGlobal" | "getOverride">): "fallback" | "always" {
+	const value = settings.get("modelProfile.proxyMode");
+	if (value === undefined || value === "fallback" || value === "always") return value ?? "fallback";
+	throw new Error(`modelProfile.proxyMode must be "fallback" or "always" (got "${String(value)}")`);
+}
+
 /**
  * Rewrite a qualified provider selector so its model is served through the
  * configured proxy. The proxy catalog uses sub-provider-prefixed model ids
- * (e.g. `xiaomi/mimo-v2.5-pro` under `litellm`), so we resolve the proxy model
- * whose last id segment matches the preset's model id and re-emit the full
- * `<proxy>/<prefixedId>` selector. Directly-authenticated providers and bare
- * aliases are left untouched; when no proxy model matches, the selector is
- * left unchanged so the existing resolution error surfaces instead of a
- * misroute.
+ * (e.g. `xiaomi/mimo-v2.5-pro` under `litellm`). Exact provider-prefixed
+ * matches win; a unique final-segment match is accepted for gateways that do
+ * not retain the upstream provider prefix. Missing or ambiguous matches fail
+ * closed rather than leaving an unauthenticated role selector behind.
  */
 function rewriteSelectorForProxy(
 	selector: string,
 	proxyProvider: string,
+	proxyMode: "fallback" | "always",
 	allModels: Model<Api>[],
 	directlyAuthenticated: ReadonlySet<string>,
 ): string {
 	const suffix = splitSelectorThinkingSuffix(selector);
 	const baseSelector = suffix.selector;
 	const slash = baseSelector.indexOf("/");
-	if (slash < 0) return selector;
+	const proxyModels = allModels.filter(model => model.provider === proxyProvider);
+	if (slash < 0) {
+		if (proxyMode === "fallback") return selector;
+		const matches = proxyModels.filter(model => model.id === baseSelector);
+		if (matches.length !== 1) {
+			throw new Error(
+				`Configured proxy "${proxyProvider}" does not expose an unambiguous model for "${baseSelector}"`,
+			);
+		}
+		const rewritten = `${proxyProvider}/${matches[0]!.id}`;
+		return suffix.thinkingLevel ? formatModelSelectorValue(rewritten, suffix.thinkingLevel) : rewritten;
+	}
 	const directProvider = baseSelector.substring(0, slash);
-	if (directlyAuthenticated.has(directProvider)) return selector;
+	if (proxyMode === "fallback" && directlyAuthenticated.has(directProvider)) return selector;
 	if (!PROXY_ROUTABLE_PROVIDER_IDS.has(directProvider)) return selector;
+	if (proxyProvider === directProvider) {
+		throw new Error(`Configured proxy "${proxyProvider}" cannot route its own direct selector "${baseSelector}"`);
+	}
 	const directModelId = baseSelector.substring(slash + 1);
-	const proxyMatch = allModels.find(
-		model => model.provider === proxyProvider && model.id.slice(model.id.lastIndexOf("/") + 1) === directModelId,
-	);
-	if (!proxyMatch) return selector;
-	const rewritten = `${proxyProvider}/${proxyMatch.id}`;
+	const exactMatches = proxyModels.filter(model => model.id === `${directProvider}/${directModelId}`);
+	const flatMatches = proxyModels.filter(model => model.id === directModelId);
+	const matches = exactMatches.length > 0 ? exactMatches : flatMatches;
+	if (matches.length === 0) {
+		throw new Error(`Configured proxy "${proxyProvider}" does not expose a model for "${baseSelector}"`);
+	}
+	if (matches.length > 1) {
+		throw new Error(`Configured proxy "${proxyProvider}" has ambiguous models for "${baseSelector}"`);
+	}
+	const rewritten = `${proxyProvider}/${matches[0]!.id}`;
 	return suffix.thinkingLevel ? formatModelSelectorValue(rewritten, suffix.thinkingLevel) : rewritten;
 }
 
 function rewriteSelectorValueForProxy(
 	selectorValue: ModelSelectorValue,
 	proxyProvider: string,
+	proxyMode: "fallback" | "always",
 	allModels: Model<Api>[],
 	directlyAuthenticated: ReadonlySet<string>,
 ): ModelSelectorValue {
 	const selectors = normalizeModelSelectorValue(selectorValue).map(selector =>
-		rewriteSelectorForProxy(selector, proxyProvider, allModels, directlyAuthenticated),
+		rewriteSelectorForProxy(selector, proxyProvider, proxyMode, allModels, directlyAuthenticated),
 	);
 	return selectors.length === 1 && typeof selectorValue === "string" ? selectors[0] : selectors;
 }
@@ -595,6 +621,7 @@ function rewriteBindingsForProxy(
 		agentModelOverrides: Record<string, ModelSelectorValue>;
 	},
 	proxyProvider: string,
+	proxyMode: "fallback" | "always",
 	allModels: Model<Api>[],
 	directlyAuthenticated: ReadonlySet<string>,
 ): {
@@ -604,18 +631,24 @@ function rewriteBindingsForProxy(
 } {
 	return {
 		defaultSelector: bindings.defaultSelector
-			? rewriteSelectorValueForProxy(bindings.defaultSelector, proxyProvider, allModels, directlyAuthenticated)
+			? rewriteSelectorValueForProxy(
+					bindings.defaultSelector,
+					proxyProvider,
+					proxyMode,
+					allModels,
+					directlyAuthenticated,
+				)
 			: undefined,
 		modelRoles: Object.fromEntries(
 			Object.entries(bindings.modelRoles).map(([role, selector]) => [
 				role,
-				rewriteSelectorValueForProxy(selector, proxyProvider, allModels, directlyAuthenticated),
+				rewriteSelectorValueForProxy(selector, proxyProvider, proxyMode, allModels, directlyAuthenticated),
 			]),
 		),
 		agentModelOverrides: Object.fromEntries(
 			Object.entries(bindings.agentModelOverrides).map(([role, selector]) => [
 				role,
-				rewriteSelectorValueForProxy(selector, proxyProvider, allModels, directlyAuthenticated),
+				rewriteSelectorValueForProxy(selector, proxyProvider, proxyMode, allModels, directlyAuthenticated),
 			]),
 		),
 	};
@@ -867,6 +900,18 @@ export async function prepareModelProfileActivation(
 		// OpenAI-compatible proxy when that proxy is itself authenticated; otherwise
 		// we fail closed pointing at the proxy (or the provider when none is set).
 		const proxyProvider = profile.source === "builtin" ? resolveProxyProviderId(options.settings) : undefined;
+		const proxyMode = profile.source === "builtin" ? resolveProxyMode(options.settings) : "fallback";
+		if (proxyMode === "always" && proxyProvider === undefined) {
+			throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
+		}
+		if (proxyProvider !== undefined) {
+			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
+			if (!configuredProxyProviders?.includes(proxyProvider)) {
+				throw new Error(
+					`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
+				);
+			}
+		}
 		const proxyApiKey =
 			proxyProvider === undefined
 				? undefined
@@ -875,6 +920,9 @@ export async function prepareModelProfileActivation(
 			proxyProvider !== undefined &&
 			proxyApiKey !== undefined &&
 			(proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
+		if (proxyMode === "always" && !proxyAuthenticated) {
+			throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
+		}
 
 		const strictMissing = missingProviders.filter(
 			provider => !PROXY_ROUTABLE_PROVIDER_IDS.has(provider) && !alternativeSet.has(provider),
@@ -907,11 +955,17 @@ export async function prepareModelProfileActivation(
 		if (missingProviders.length > 0 && alternativeGroups.length > 0) {
 			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
 		}
-		// Built-in preset selectors whose direct provider is unauthenticated are
-		// routed through the configured proxy (catalog-aware rewrite, applied as
-		// session-scoped activation only — never persisted to models.yml).
+		// Built-in preset selectors are routed through a configured authenticated
+		// proxy according to the selected mode. This session-scoped rewrite is never
+		// persisted to models.yml.
 		if (proxyProvider !== undefined && proxyAuthenticated && profile.source === "builtin") {
-			bindings = rewriteBindingsForProxy(bindings, proxyProvider, availableModels, new Set(authenticatedProviders));
+			bindings = rewriteBindingsForProxy(
+				bindings,
+				proxyProvider,
+				proxyMode,
+				availableModels,
+				new Set(authenticatedProviders),
+			);
 		}
 		const defaultSelectors = bindings.defaultSelector ? normalizeModelSelectorValue(bindings.defaultSelector) : [];
 		const defaultChain =

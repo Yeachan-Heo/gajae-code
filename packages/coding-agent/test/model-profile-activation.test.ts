@@ -2118,6 +2118,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 					maxLevel: ThinkingLevel.XHigh,
 				}),
 			],
+			getConfiguredProviderIds: () => ["litellm"],
 			getApiKeyForProvider: async (provider: string) => {
 				if (provider === "litellm") {
 					// Explicit undefined means "proxy not authenticated"; the default
@@ -2157,6 +2158,43 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		expect(prepared.defaultModel?.id).toBe("grok-4.3");
 		expect(prepared.defaultChain).toEqual(["xai/grok-4.3:medium"]);
 		expect(prepared.agentModelOverrides.executor).toBe("xai/grok-4.3:high");
+	});
+
+	test("routes builtin preset selectors through the proxy in always mode despite direct credentials", async () => {
+		const settings = Settings.isolated({
+			"modelProfile.proxyProvider": "litellm",
+			"modelProfile.proxyMode": "always",
+		});
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: proxyRegistry({ profiles: [grokProfile] }) as unknown as ModelRegistry,
+			settings,
+			profileName: grokProfile.name,
+		});
+
+		expect(prepared.defaultModel?.provider).toBe("litellm");
+		expect(prepared.defaultChain).toEqual(["litellm/xai/grok-4.3:medium"]);
+		expect(prepared.agentModelOverrides.executor).toBe("litellm/xai/grok-4.3:high");
+	});
+
+	test("routes provider-agnostic builtin aliases through an exact proxy model in always mode", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "open-weights-grok",
+			requiredProviders: [],
+			modelMapping: { default: "grok-4.3:medium" },
+			source: "builtin",
+		};
+		const registry = proxyRegistry({ profiles: [profile] });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: {
+				...registry,
+				getAll: () => [...registry.getAll(), proxyModel("grok-4.3")],
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
+			profileName: profile.name,
+		});
+		expect(prepared.defaultChain).toEqual(["litellm/grok-4.3:medium"]);
 	});
 
 	test("fails closed pointing at the proxy when a routable provider is missing and the proxy is unauthenticated", async () => {
@@ -2270,6 +2308,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		const registry = {
 			...base,
 			getAll: () => [...base.getAll(), proxyModel("acme-private/alpha")],
+			getConfiguredProviderIds: () => ["litellm"],
 			getApiKeyForProvider: async (provider: string) =>
 				provider === "litellm" ? "key-litellm" : base.getApiKeyForProvider(provider),
 		};
@@ -2286,7 +2325,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		});
 	});
 
-	test("rejects an invalid proxy provider id with a config error", async () => {
+	test("rejects an invalid or unconfigured proxy provider id with a config error", async () => {
 		await expect(
 			prepareModelProfileActivation({
 				session: fakeSession(),
@@ -2295,24 +2334,83 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 				profileName: grokProfile.name,
 			}),
 		).rejects.toThrow(/proxyProvider must be a lowercase provider id/);
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: proxyRegistry({ profiles: [grokProfile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "litelm" }),
+				profileName: grokProfile.name,
+			}),
+		).rejects.toThrow(/proxyProvider "litelm" is not configured/);
 	});
 
-	test("leaves selectors unchanged when the proxy catalog has no matching model", async () => {
-		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
-		// No litellm model carrying a grok-4.3 last segment in this registry.
-		const base = fakeRegistry({ missingProviders: ["xai"], profiles: [grokProfile] });
-		const registry = {
-			...base,
-			getApiKeyForProvider: async (provider: string) =>
-				provider === "litellm" ? "key-litellm" : base.getApiKeyForProvider(provider),
+	test("fails closed when any proxy-routed preset binding has no proxy model", async () => {
+		const profile: ModelProfileDefinition = {
+			...grokProfile,
+			modelMapping: {
+				default: "xai/grok-4.3:medium",
+				executor: "xai/grok-4.4:high",
+			},
 		};
 		await expect(
 			prepareModelProfileActivation({
 				session: fakeSession(),
-				modelRegistry: registry as unknown as ModelRegistry,
-				settings,
+				modelRegistry: proxyRegistry({ missing: ["xai"], profiles: [profile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(/does not expose a model for "xai\/grok-4.4"/);
+	});
+
+	test("uses an exact upstream-prefixed proxy model instead of ambiguous suffix matches", async () => {
+		const profile: ModelProfileDefinition = {
+			...grokProfile,
+			modelMapping: { default: "xai/grok-4.3:medium" },
+		};
+		const registry = proxyRegistry({ missing: ["xai"], profiles: [profile] });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: {
+				...registry,
+				getAll: () => [...registry.getAll(), proxyModel("other/grok-4.3")],
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
+			profileName: profile.name,
+		});
+		expect(prepared.defaultChain).toEqual(["litellm/xai/grok-4.3:medium"]);
+	});
+
+	test("rejects differently prefixed proxy model matches", async () => {
+		const profile: ModelProfileDefinition = {
+			...grokProfile,
+			modelMapping: { default: "xai/grok-4.4:medium" },
+		};
+		const registry = proxyRegistry({ missing: ["xai"], profiles: [profile] });
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: {
+					...registry,
+					getAll: () => [...registry.getAll(), proxyModel("foo/grok-4.4"), proxyModel("bar/grok-4.4")],
+				} as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(/does not expose a model for "xai\/grok-4.4"/);
+	});
+
+	test("rejects a direct provider configured as its own always-mode proxy", async () => {
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: {
+					...proxyRegistry({ profiles: [grokProfile] }),
+					getConfiguredProviderIds: () => ["xai"],
+					getApiKeyForProvider: async () => "key-xai",
+				} as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "xai", "modelProfile.proxyMode": "always" }),
 				profileName: grokProfile.name,
 			}),
-		).rejects.toThrow(/did not resolve/);
+		).rejects.toThrow(/cannot route its own direct selector/);
 	});
 });

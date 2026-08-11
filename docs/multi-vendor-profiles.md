@@ -135,6 +135,7 @@ When a single gateway (LiteLLM, OpenRouter, or a custom proxy) fronts several ve
 ```yaml
 modelProfile:
   proxyProvider: litellm
+  proxyMode: always # route all supported built-in preset selectors through the gateway
 ```
 
-For **built-in** presets whose direct provider is unauthenticated, activation then rewrites that preset's selectors through the proxy (for example `xai/grok-4.3` → `litellm/xai/grok-4.3`), so a `grok-*` tier activates on your gateway's grok entry rather than hard-blocking. Directly authenticated providers keep their direct endpoints; the proxy is a fallback, never an override. User-defined profiles are never rewritten — set their selectors to `litellm/…` explicitly if you want them proxied. Routing and fail-closed behavior are documented in [Routing built-in presets through a proxy](./models.md#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider).
+`proxyMode: fallback` is the default and uses the gateway only when the direct provider is unauthenticated. Set `proxyMode: always` when the gateway must be the single audit, quota, or spend-control surface: it routes all proxy-routable **built-in** preset selectors through the proxy even when direct credentials exist. The configured proxy must be authenticated and expose every routed model; activation fails closed for missing or ambiguous models. User-defined profiles are never rewritten — set their selectors to `litellm/…` explicitly if you want them proxied. Routing and fail-closed behavior are documented in [Routing built-in presets through a proxy](./models.md#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider).
