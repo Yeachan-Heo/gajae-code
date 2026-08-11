@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import {
 	extractPrintableText,
 	isKeyId,
+	isKeyRelease,
+	isKeyRepeat,
 	matchesKey,
 	parseKey,
 	parseKeyId,
@@ -53,6 +55,26 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[127u", "backspace")).toBe(true);
 		expect(matchesKey("\x1b[127;1:2u", "backspace")).toBe(true);
 		expect(matchesKey("\x1b[127;1:3u", "backspace")).toBe(false);
+		setKittyProtocolActive(false);
+	});
+	it("filters Kitty release and repeat events for CSI letter finals", () => {
+		setKittyProtocolActive(true);
+		for (const final of ["E", "P", "Q", "R", "S"]) {
+			const release = `\x1b[1;1:3${final}`;
+			const repeat = `\x1b[1;1:2${final}`;
+			expect(isKeyRelease(release)).toBe(true);
+			expect(isKeyRepeat(repeat)).toBe(true);
+			expect(matchesKey(release, "f1")).toBe(false);
+			expect(parseKey(release)).toBeUndefined();
+		}
+		setKittyProtocolActive(false);
+	});
+	it("rejects unknown Kitty event types", () => {
+		setKittyProtocolActive(true);
+		for (const sequence of ["\x1b[112;1:0u", "\x1b[112;1:4u", "\x1b[1;1:4P", "\x1b[15;1:4~"]) {
+			expect(parseKey(sequence)).toBeUndefined();
+			expect(matchesKey(sequence, "p")).toBe(false);
+		}
 		setKittyProtocolActive(false);
 	});
 
@@ -134,6 +156,14 @@ describe("matchesKey", () => {
 		expect(parseKeyId("cmd+p")?.keyId).toBe("super+p");
 		expect(isKeyId("option+q")).toBe(false);
 		expect(isKeyId("command+p")).toBe(false);
+	});
+	it("rejects duplicate and inherited modifier aliases", () => {
+		for (const value of ["ctrl+ctrl+p", "option+alt+p", "meta+option+p", "command+super+p"]) {
+			expect(parseKeyId(value)).toBeUndefined();
+		}
+		for (const value of ["constructor+p", "toString+p", "__proto__+p"]) {
+			expect(parseKeyId(value)).toBeUndefined();
+		}
 	});
 });
 describe.each([

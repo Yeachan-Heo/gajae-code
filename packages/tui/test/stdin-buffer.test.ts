@@ -232,6 +232,23 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b\x1b[5~", "\x1b\x1bOP", "\x1b\x1b[3~", "\x1b\x1b[1;2A"]);
 			expect(emittedSequences.map(parseKey)).toEqual(["alt+pageUp", "alt+f1", "alt+delete", "alt+shift+up"]);
 		});
+		it("keeps direct control-string prefixes atomic when split or adjacent", () => {
+			const cases = [
+				["\x1b[A", ["\x1b", "[A"]],
+				["\x1b]0;title\x07", ["\x1b", "]0;title\x07"]],
+				["\x1bP1\x1b\\", ["\x1b", "P1", "\x1b\\"]],
+				["\x1b_Gf=24\x1b\\", ["\x1b", "_Gf=24", "\x1b\\"]],
+				["\x1bOP", ["\x1b", "OP"]],
+			] as const;
+
+			for (const [expected, chunks] of cases) {
+				buffer = new StdinBuffer({ timeout: 10 });
+				emittedSequences = [];
+				buffer.on("data", sequence => emittedSequences.push(sequence));
+				for (const chunk of chunks) processInput(chunk);
+				expect(emittedSequences).toEqual([expected]);
+			}
+		});
 	});
 	describe.each([
 		{ chunks: ["\x1bi"], expected: ["\x1bi"], parsed: ["alt+i"] },

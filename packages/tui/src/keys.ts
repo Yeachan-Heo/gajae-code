@@ -301,7 +301,9 @@ export function parseKeyId(value: string): ParsedKeyId | undefined {
 					.map(part => part.trim());
 	const modifiers: KeyModifier[] = [];
 	for (const part of modifierParts) {
-		const modifier = KEY_MODIFIER_ALIASES[part];
+		const modifier = Object.prototype.hasOwnProperty.call(KEY_MODIFIER_ALIASES, part)
+			? KEY_MODIFIER_ALIASES[part]
+			: undefined;
 		if (!modifier || modifiers.includes(modifier)) return undefined;
 		modifiers.push(modifier);
 	}
@@ -427,9 +429,9 @@ interface ParsedKittySequence {
 
 // Regex for Kitty protocol event type detection
 // Matches CSI sequences with :2 (repeat) or :3 (release) event type
-// Format: \x1b[...;modifier:event_type<terminator> where terminator is u, ~, or A-F/H
-const KITTY_RELEASE_PATTERN = /^\x1b\[[\d:;]*:3[u~ABCDHF]$/;
-const KITTY_REPEAT_PATTERN = /^\x1b\[[\d:;]*:2[u~ABCDHF]$/;
+// Format: \x1b[...;modifier:event_type<terminator> where terminator is u, ~, navigation, or function-key finals
+const KITTY_RELEASE_PATTERN = /^\x1b\[[\d:;]*:3[u~ABCDEFHPQRS]$/;
+const KITTY_REPEAT_PATTERN = /^\x1b\[[\d:;]*:2[u~ABCDEFHPQRS]$/;
 const KITTY_CSI_U_PATTERN = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?(?:;([\d:]*))?u$/;
 const KITTY_MOD_SHIFT = 1;
 const KITTY_MOD_ALT = 2;
