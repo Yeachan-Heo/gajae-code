@@ -48,13 +48,26 @@ const ALIBABA_IMAGE_GENERATION_URL = `${ALIBABA_TOKEN_PLAN_HOST}/api/v1/services
 const IMAGE_SYSTEM_INSTRUCTION =
 	"You are an AI image generator. Generate images based on user descriptions. Focus on creating high-quality, visually appealing images that match the user's request.";
 
-type ImageProvider = "alibaba" | "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter" | (string & {});
+type ImageProvider = "alibaba" | "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter";
 interface ImageApiKey {
 	provider: ImageProvider;
 	apiKey: string;
 	projectId?: string;
 	model?: Model;
 	authCredentialType?: "api_key" | "oauth";
+}
+
+export class UnsupportedImageProviderError extends Error {
+	readonly code = "unsupported_image_provider" as const;
+
+	constructor(
+		readonly provider: string,
+		readonly modelId: string,
+		readonly api: Model["api"],
+	) {
+		super(`Image generation is not supported for provider "${provider}" with transport "${api}".`);
+		this.name = "UnsupportedImageProviderError";
+	}
 }
 
 const responseModalitySchema = z.enum(["IMAGE", "TEXT"] as const);
@@ -786,8 +799,9 @@ async function findImageApiKey(
 }
 
 /**
- * Map a resolved image model to its provider credentials. Each provider
- * branch mirrors the original credential-resolution path.
+ * Map a resolved image model to its provider credentials. Transport and image
+ * capability are validated before any credential lookup; unsupported models
+ * fail without forwarding their provider credential to another endpoint.
  */
 async function resolveCredentialsForImageModel(
 	model: Model,
@@ -809,19 +823,23 @@ async function resolveCredentialsForImageModel(
 		};
 	}
 
-	if (provider === "antigravity" || provider === "google-antigravity") {
+	if (
+		(provider === "antigravity" || provider === "google-antigravity") &&
+		model.api === "google-gemini-cli" &&
+		model.output?.includes("image")
+	) {
 		return await findAntigravityCredentials(modelRegistry, sessionId);
 	}
-	if (provider === "alibaba" || provider === "alibaba-token-plan") {
+	if ((provider === "alibaba" || provider === "alibaba-token-plan") && model.output?.includes("image")) {
 		return await findAlibabaImageCredentials(modelRegistry, sessionId);
 	}
-	if (provider === "openrouter") {
+	if (provider === "openrouter" && model.output?.includes("image")) {
 		const openRouterKey = await modelRegistry.getApiKey(model, sessionId);
 		if (isAuthenticated(openRouterKey)) return { provider: "openrouter", apiKey: openRouterKey };
 		const envKey = getEnvApiKey("openrouter");
 		return envKey ? { provider: "openrouter", apiKey: envKey } : null;
 	}
-	if (provider === "gemini" || provider === "google") {
+	if (provider === "google" && model.api === "google-generative-ai" && model.output?.includes("image")) {
 		const googleKey = await modelRegistry.getApiKey(model, sessionId);
 		if (isAuthenticated(googleKey)) return { provider: "gemini", apiKey: googleKey };
 		const envKey = getEnvApiKey("google");
@@ -830,14 +848,7 @@ async function resolveCredentialsForImageModel(
 		return fallbackKey ? { provider: "gemini", apiKey: fallbackKey } : null;
 	}
 
-	// Fallback: try the model's own API key via the registry.
-	const apiKey = await modelRegistry.getApiKey(model, sessionId);
-	if (!isAuthenticated(apiKey)) return null;
-	return {
-		provider: provider as ImageProvider,
-		apiKey,
-		model,
-	};
+	throw new UnsupportedImageProviderError(model.provider, model.id, model.api);
 }
 
 async function loadImageFromPath(imagePath: string, cwd: string): Promise<InlineImageData> {
@@ -936,7 +947,7 @@ function collectInlineImages(parts: GeminiPart[]): InlineImageData[] {
 	return images;
 }
 
-export function isOpenAIHostedImageModel(model: Model | undefined): model is Model {
+export function isOpenAIHostedImageModel(model: Model | undefined): boolean {
 	if (!model) return false;
 	// The hosted image_generation tool is only available over the Responses API.
 	if (model.api !== "openai-responses" && model.api !== "openai-codex-responses") return false;

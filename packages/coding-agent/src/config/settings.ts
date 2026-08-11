@@ -373,6 +373,13 @@ function rawSettingsRecord(value: unknown): RawSettings | undefined {
 	return value as RawSettings;
 }
 
+const LEGACY_CUSTOM_IMAGE_PROVIDER_DIAGNOSTIC =
+	"Legacy custom image settings cannot be migrated automatically. Move the endpoint and credential to models.yml, configure an image-capable OpenAI Responses model, and then set modelRoles.image. The legacy settings were retained unchanged.";
+
+function hasLegacyCustomImageProvider(raw: RawSettings): boolean {
+	return rawSettingsRecord(raw.providers)?.image === "custom";
+}
+
 function shallowModelSelectorRecord(value: unknown): Record<string, ModelSelectorValue> {
 	const record = rawSettingsRecord(value);
 	if (!record) return {};
@@ -512,6 +519,9 @@ export class Settings implements NotificationSettingsReader {
 	/** Legacy fallback migration warnings emitted once per settings instance. */
 	#legacyFallbackMigrationWarnings = 0;
 	#legacyFallbackMigrationGlobalFingerprint: string | undefined;
+	/** Legacy custom-image migration error emitted once per settings instance. */
+	#legacyCustomImageProviderDiagnosticLogged = false;
+
 	#schemaReport: SettingsSchemaReport = { issues: [], valid: true };
 	#schemaMigrationPending = false;
 	/** A newer config schema must never be rewritten by legacy migrations. */
@@ -1435,6 +1445,22 @@ export class Settings implements NotificationSettingsReader {
 		}
 		const migrated = this.#migrateRawSettings(parsedRaw);
 		const reconciled = reconcileSettingsSchema(migrated);
+		if (filePath === this.#configPath && hasLegacyCustomImageProvider(parsedRaw)) {
+			reconciled.report.issues.push({
+				path: "providers.image",
+				kind: "invalid",
+				detail: LEGACY_CUSTOM_IMAGE_PROVIDER_DIAGNOSTIC,
+			});
+			reconciled.report.valid = false;
+			if (!this.#legacyCustomImageProviderDiagnosticLogged) {
+				this.#legacyCustomImageProviderDiagnosticLogged = true;
+				logger.error("Settings: legacy custom image provider requires manual migration", {
+					configPath: filePath,
+					modelsPath: path.join(this.#agentDir, "models.yml"),
+				});
+			}
+		}
+
 		if (typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION) {
 			reconciled.report.issues.push({
 				path: "configSchemaVersion",
@@ -5434,35 +5460,28 @@ export class Settings implements NotificationSettingsReader {
 		// Migrate legacy providers.image* settings into modelRoles.image.
 		// The image-generation model is now selected via the model-role system
 		// (/model image <selector>) instead of a separate provider config dialog.
-		const providersObj = raw.providers as Record<string, unknown> | undefined;
+		const providersObj = rawSettingsRecord(raw.providers);
 		if (providersObj && typeof providersObj.image === "string") {
-			const imageProvider = providersObj.image as string;
+			const imageProvider = providersObj.image;
 			const imageModel = typeof providersObj.imageModel === "string" ? providersObj.imageModel : undefined;
-			const imageCustomUrl =
-				typeof providersObj.imageCustomUrl === "string" ? providersObj.imageCustomUrl : undefined;
 
-			if (imageProvider !== "auto") {
-				const roles = rawSettingsRecord(raw.modelRoles) ?? {};
-				if (!roles.image) {
-					if (imageProvider === "custom" && imageCustomUrl) {
-						// Custom providers are registered as first-class OpenAI-compatible providers;
-						// the migration produces a provider/model selector.
-						const customProviderId = "image-custom";
-						roles.image = `${customProviderId}/${imageModel ?? "gpt-image-2"}`;
-					} else if (imageModel) {
-						roles.image = `${imageProvider}/${imageModel}`;
-					} else {
-						roles.image = imageProvider;
+			// A custom endpoint belongs in models.yml. Retain the complete legacy
+			// configuration rather than creating an unresolvable image-custom selector.
+			if (imageProvider !== "custom") {
+				if (imageProvider !== "auto") {
+					const roles = rawSettingsRecord(raw.modelRoles) ?? {};
+					if (!roles.image) {
+						roles.image = imageModel ? `${imageProvider}/${imageModel}` : imageProvider;
+						raw.modelRoles = roles;
 					}
-					raw.modelRoles = roles;
 				}
-			}
 
-			delete providersObj.image;
-			delete providersObj.imageModel;
-			delete providersObj.imageCustomUrl;
-			delete providersObj.imageCustomKey;
-			delete providersObj.imageCustomKeyEnv;
+				delete providersObj.image;
+				delete providersObj.imageModel;
+				delete providersObj.imageCustomUrl;
+				delete providersObj.imageCustomKey;
+				delete providersObj.imageCustomKeyEnv;
+			}
 		}
 
 		raw.configSchemaVersion = CONFIG_SCHEMA_VERSION;

@@ -3,7 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
+import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { resolveImageRoleModel } from "@gajae-code/coding-agent/tools/image-gen";
 import {
 	getCustomThemesDir,
 	getDefaultTabWidth,
@@ -15,6 +17,8 @@ import {
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
+
+const emptyModelRegistry = { getAvailable: () => [] } as unknown as ModelRegistry;
 
 describe("Settings", () => {
 	let testDir: string;
@@ -393,6 +397,107 @@ describe("Settings", () => {
 
 			settings = await Settings.init({ cwd: projectDir, agentDir });
 			expect(settings.get("theme.light")).toBe("light");
+		});
+
+		it("retains legacy custom image literal credentials and reports a manual migration error", async () => {
+			const literalKey = "legacy-custom-image-literal-key";
+			const providers = {
+				image: "custom",
+				imageModel: "gpt-image-2",
+				imageCustomUrl: "https://images.example/v1",
+				imageCustomKey: literalKey,
+			};
+			const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+			try {
+				await writeSettings({ providers });
+				const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+				expect(settings.getModelRole("image")).toBeUndefined();
+				expect(resolveImageRoleModel(settings, emptyModelRegistry)).toBeUndefined();
+
+				expect(settings.getSchemaReport().valid).toBe(false);
+				expect(settings.getSchemaReport().issues).toContainEqual(
+					expect.objectContaining({
+						path: "providers.image",
+						kind: "invalid",
+						detail: expect.stringContaining("cannot be migrated"),
+					}),
+				);
+
+				settings.set("theme.dark", "red-claw");
+				await settings.flush();
+				expect((await readSettings()).providers).toEqual(providers);
+				expect(error).toHaveBeenCalledWith(
+					"Settings: legacy custom image provider requires manual migration",
+					expect.objectContaining({
+						configPath: getConfigPath(),
+						modelsPath: path.join(agentDir, "models.yml"),
+					}),
+				);
+				expect(JSON.stringify(error.mock.calls)).not.toContain(literalKey);
+
+				const errorCountBeforeReload = error.mock.calls.length;
+				resetSettingsForTest();
+
+				const reloaded = await Settings.init({ cwd: projectDir, agentDir });
+				expect(reloaded.getModelRole("image")).toBeUndefined();
+				expect(resolveImageRoleModel(reloaded, emptyModelRegistry)).toBeUndefined();
+
+				expect(reloaded.getSchemaReport().valid).toBe(false);
+				expect(error.mock.calls.length).toBeGreaterThan(errorCountBeforeReload);
+
+				expect((await readSettings()).providers).toEqual(providers);
+			} finally {
+				error.mockRestore();
+			}
+		});
+
+		it("retains legacy custom image environment credentials and reports a manual migration error", async () => {
+			const providers = {
+				image: "custom",
+				imageModel: "gpt-image-2",
+				imageCustomUrl: "https://images.example/v1",
+				imageCustomKeyEnv: "LEGACY_IMAGE_CUSTOM_KEY",
+			};
+			const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+			try {
+				await writeSettings({ providers });
+				const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+				expect(settings.getModelRole("image")).toBeUndefined();
+				expect(resolveImageRoleModel(settings, emptyModelRegistry)).toBeUndefined();
+
+				expect(settings.getSchemaReport().valid).toBe(false);
+				expect(settings.getSchemaReport().issues).toContainEqual(
+					expect.objectContaining({
+						path: "providers.image",
+						kind: "invalid",
+						detail: expect.stringContaining("cannot be migrated"),
+					}),
+				);
+				settings.set("theme.light", "blue-crab");
+				await settings.flush();
+				expect((await readSettings()).providers).toEqual(providers);
+
+				const errorCountBeforeReload = error.mock.calls.length;
+				resetSettingsForTest();
+
+				const reloaded = await Settings.init({ cwd: projectDir, agentDir });
+				expect(reloaded.getModelRole("image")).toBeUndefined();
+				expect(resolveImageRoleModel(reloaded, emptyModelRegistry)).toBeUndefined();
+				expect(reloaded.getSchemaReport().valid).toBe(false);
+				expect(error.mock.calls.length).toBeGreaterThan(errorCountBeforeReload);
+				expect((await readSettings()).providers).toEqual(providers);
+				expect(error).toHaveBeenCalledWith(
+					"Settings: legacy custom image provider requires manual migration",
+					expect.objectContaining({
+						configPath: getConfigPath(),
+						modelsPath: path.join(agentDir, "models.yml"),
+					}),
+				);
+			} finally {
+				error.mockRestore();
+			}
 		});
 	});
 
