@@ -94,8 +94,8 @@ export function groupLeaderIdentityMatches(
  * the owned process cannot control. Teardown must not wait on an external
  * reaper, so disposal considers a group terminated once every member is dead
  * or a zombie. On Linux this inspects `/proc`; elsewhere it conservatively
- * falls back to {@link groupAlive} (zombies count as alive), but group signals
- * are refused because the leader's spawn-time identity cannot be verified.
+ * falls back to {@link groupAlive} (zombies count as alive), so teardown there
+ * relies on the bounded SIGTERM/SIGKILL windows rather than zombie detection.
  */
 function groupHasRunningMembers(pgid: number): boolean {
 	if (!groupAlive(pgid)) return false;
@@ -247,8 +247,14 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 		removeAbort();
 	};
 
+	// Identity verification exists to stop a recycled pgid from being signalled.
+	// It is only decidable where the leader's spawn-time identity is readable
+	// (`/proc`). Elsewhere the group id is still ours for the lifetime of the
+	// owned child, so an unverifiable probe must not be reported as a mismatch —
+	// doing so skips SIGTERM/SIGKILL entirely and leaks the whole child tree.
 	const groupIdentityMatches = (): boolean => {
-		if (pgid === undefined || process.platform !== "linux") return false;
+		if (pgid === undefined) return false;
+		if (process.platform !== "linux") return true;
 		const leader = probeLinuxProcPidSync(pgid);
 		// Once the original leader has exited, its group can still own descendants.
 		// A replacement group has a leader at this pid, whose start time must match.

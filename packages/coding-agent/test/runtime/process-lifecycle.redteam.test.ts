@@ -221,6 +221,28 @@ time.sleep(100)
 		expect(groupLeaderIdentityMatches("100", { kind: "unverifiable", reason: "permission_denied" })).toBe(false);
 	});
 
+	test.skipIf(!isPosix)(
+		"signals and terminates an owned group on platforms whose leader identity is unverifiable",
+		async () => {
+			// Identity verification is only decidable on Linux. Treating an unverifiable
+			// probe as a mismatch made dispose() return `identity_unverified` before it
+			// sent any signal, leaving the whole child tree alive on macOS/BSD.
+			const before = liveOwnedProcessCount();
+			const owner = spawnOwnedProcess(["sh", "-c", "sleep 30"], {
+				name: "redteam-unverifiable-identity-dispose",
+				gracefulMs: 200,
+			});
+			const pid = owner.pid;
+			expect(pid).toBeDefined();
+			if (pid === undefined) throw new Error("expected an owned pid");
+
+			await expect(owner.dispose()).resolves.toEqual({ status: "terminated" });
+			expect((await owner.awaitExit({ timeoutMs: 2_000 })).exited).toBe(true);
+			await waitFor(() => processGroupGone(pid), 2_000, "owned group reaped after dispose");
+			await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline");
+		},
+	);
+
 	test("double and concurrent dispose share one settled result and issue one terminating signal", async () => {
 		const before = liveOwnedProcessCount();
 		const tmp = `/tmp/gjc-process-lifecycle-${process.pid}-${Date.now()}`;
