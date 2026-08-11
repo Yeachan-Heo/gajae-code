@@ -161,23 +161,33 @@ async function withStalledWebSocket<T>(run: () => Promise<T>): Promise<T> {
 }
 
 async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstreamFrame?: (frame: string) => boolean) {
-	const fake = upstream();
-	const input = new PassThrough();
-	const output = new PassThrough();
-	const received: Buffer[] = [];
-	output.on("data", chunk => received.push(Buffer.from(chunk)));
-	const errors: TransportError[] = [];
-	const pair = await startRelayPair({
-		url: fake.url,
-		token,
-		pendingCeilingBytes,
-		downstream: input,
-		downstreamSink: output,
-		onTransportError: error => errors.push(error),
-		validateDownstreamFrame,
-	});
-	await waitFor(() => fake.connections[0], "upstream connection");
-	return { fake, input, output, received, errors, pair };
+	// Under heavy parallel suite load the very first localhost WebSocket open can
+	// transiently fail before the fake upstream accepts; one bounded retry keeps
+	// the fixture deterministic without masking real relay failures.
+	for (let attempt = 0; ; attempt++) {
+		const fake = upstream();
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const received: Buffer[] = [];
+		output.on("data", chunk => received.push(Buffer.from(chunk)));
+		const errors: TransportError[] = [];
+		try {
+			const pair = await startRelayPair({
+				url: fake.url,
+				token,
+				pendingCeilingBytes,
+				downstream: input,
+				downstreamSink: output,
+				onTransportError: error => errors.push(error),
+				validateDownstreamFrame,
+			});
+			await waitFor(() => fake.connections[0], "upstream connection");
+			return { fake, input, output, received, errors, pair };
+		} catch (error) {
+			fake.stop();
+			if (attempt >= 1 || !(error instanceof Error) || error.message !== "upstream_error") throw error;
+		}
+	}
 }
 
 describe("SDK serve raw relay", () => {
