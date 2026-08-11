@@ -1422,6 +1422,8 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 });
 
 it("matches eager replay-metadata sanitation on bounded first open and exact reopen", async () => {
+	const missingImageRef = `blob:sha256:${"a".repeat(64)}`;
+
 	const records = [
 		{ type: "session", version: 5, id: "replay-sanitize", timestamp: "0", cwd: "/cwd" },
 		{
@@ -1431,7 +1433,11 @@ it("matches eager replay-metadata sanitation on bounded first open and exact reo
 			timestamp: "0",
 			message: {
 				role: "assistant",
-				content: [{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" }],
+				content: [
+					{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
+					{ type: "image", data: missingImageRef, mimeType: "image/png" },
+				],
+
 				provider: "openai",
 				model: "test",
 				timestamp: 0,
@@ -1483,6 +1489,9 @@ it("matches eager replay-metadata sanitation on bounded first open and exact reo
 	enabled.visitEntriesForExport(entry => coldExportEntries.push(entry));
 	expect(JSON.stringify(coldExportEntries)).not.toContain("stale-signature");
 	expect(JSON.stringify(coldExportEntries)).not.toContain("openaiResponsesHistory");
+	expect(JSON.stringify(coldExportEntries)).not.toContain(missingImageRef);
+	expect(JSON.stringify(coldExportEntries)).not.toContain("__gjcResidentBlob");
+	expect(JSON.stringify(coldExportEntries)).toContain("[Session resident imageData blob missing:");
 	expect(enabled.buildSessionContext()).toEqual(expected);
 	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("stale-signature");
 	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("openaiResponsesHistory");
