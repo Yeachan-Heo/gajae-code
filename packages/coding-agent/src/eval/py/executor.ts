@@ -321,9 +321,23 @@ function attachOwner(session: PythonSession, sessionId: string, ownerId: string 
 async function acquireSession(sessionId: string, cwd: string, options: PythonExecutorOptions): Promise<PythonSession> {
 	const existing = sessions.get(sessionId);
 	if (existing) {
-		const session = isInitializingSession(existing)
-			? await waitForPromiseWithCancellation(existing.promise, options)
-			: existing;
+		let session: PythonSession;
+		if (isInitializingSession(existing)) {
+			try {
+				session = await waitForPromiseWithCancellation(existing.promise, options);
+			} catch (error) {
+				const remainingMs = getRemainingTimeoutMs(options.deadlineMs);
+				if (
+					isCancellationError(error) &&
+					!options.signal?.aborted &&
+					(remainingMs === undefined || remainingMs > 0)
+				)
+					return await acquireSession(sessionId, cwd, options);
+				throw error;
+			}
+		} else {
+			session = existing;
+		}
 		attachOwner(session, sessionId, options.kernelOwnerId);
 		ensurePythonResourceCleanup();
 		return session;
