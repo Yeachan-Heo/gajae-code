@@ -19,7 +19,6 @@ export type ControlInput = Record<string, unknown>;
  * AgentSession and its controllers without exposing those concrete types here.
  */
 export interface ControlSurface {
-	authorizeElevationClaim?(sdkId: string, input: ControlInput, capability: string): boolean;
 	prompt(text: string, images?: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
 	steer(text: string, clientRef?: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
@@ -33,14 +32,8 @@ export interface ControlSurface {
 		response: ControlValue,
 		expectedSessionId?: string,
 		idempotencyKey?: string,
-		elevationRequestId?: string,
 	): Promise<ControlValue> | ControlValue;
-	approvePlan(
-		id: string,
-		choice: ControlValue,
-		expectedSessionId?: string,
-		elevationRequestId?: string,
-	): Promise<ControlValue> | ControlValue;
+	approvePlan(id: string, choice: ControlValue, expectedSessionId?: string): Promise<ControlValue> | ControlValue;
 	invokeSkill(name: string, args: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;

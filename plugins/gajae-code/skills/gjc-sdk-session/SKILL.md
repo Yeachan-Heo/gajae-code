@@ -1,6 +1,6 @@
 ---
 name: gjc-sdk-session
-description: Operate GJC SDK sessions from the CLI (`gjc sdk session list|inspect|send|status|tail|elevate|raw` plus the explicit raw control|query|global hatch). Advisory reference: broker-bound, credential-free output; mutating verbs run only when explicitly invoked.
+description: Operate GJC SDK sessions from the CLI (`gjc sdk session list|inspect|send|status|tail|raw` plus the explicit raw control|query|global hatch). Advisory reference: broker-bound, credential-free output; mutating verbs run only when explicitly invoked.
 ---
 
 # GJC SDK session CLI (advisory)
@@ -37,7 +37,6 @@ never prints. `--agent-dir` selects the broker state directory.
   closed on retention gaps, `--until-idle` exits at a terminal turn state,
   `--all-events` widens the emitted event kinds, and `--cursor` resumes from a
   saved checkpoint token that is re-minted per connection.
-- `gjc sdk session elevate <sessionId> --kind <control|global> --op <operation> --json-input ... --confirm` — creates an exact-digest grant request and, only on an attended TTY, submits a private 0600 operator directive consumed by the broker. The returned request id is passed to an allowlisted raw control with `--elevation-request-id`.
 
 ## Raw hatch
 
@@ -59,12 +58,3 @@ as a retry mechanism.
 `tail` reports a `retention_gap` with the missing sequence range and a
 `resync` checkpoint when retained history or the event ring dropped entries;
 `--strict` turns any gap into exit code 1.
-
-## Elevation behavior
-
-Elevation-gated operations are dispatched only behind broker-owned single-use
-grants whose digest binds the exact operation and input. `elevate` is the
-attended operator surface: it writes a private directive consumed inside the
-broker; there is no public `elevation.answer` operation. A crash between claim
-and dispatch is recorded truthfully as `consumed`/`uncertain` and requires a
-new grant. Default SDK scope stays grant-free.
