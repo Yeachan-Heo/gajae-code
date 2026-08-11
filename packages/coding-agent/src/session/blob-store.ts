@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { exactUnlink } from "@gajae-code/natives";
 import { isEnoent, logger, postmortem } from "@gajae-code/utils";
 
 const BLOB_PREFIX = "blob:sha256:";
@@ -1618,8 +1619,10 @@ export interface CanonicalBlobEntry {
 	readonly path: string;
 	readonly bytes: number;
 	readonly mtimeMs: number;
-	readonly dev: number;
-	readonly ino: number;
+	readonly mtimeNs: bigint;
+	readonly dev: bigint;
+	readonly ino: bigint;
+	readonly nlink: bigint;
 }
 
 const CANONICAL_BLOB_NAME = /^[0-9a-f]{64}$/;
@@ -1651,20 +1654,22 @@ export async function listCanonicalBlobs(dir: string): Promise<CanonicalBlobEntr
 	for (const name of names) {
 		if (!CANONICAL_BLOB_NAME.test(name)) continue;
 		const blobPath = path.join(dir, name);
-		let stat: fs.Stats;
+		let stat: fs.BigIntStats;
 		try {
-			stat = await fsp.lstat(blobPath);
+			stat = await fsp.lstat(blobPath, { bigint: true });
 		} catch {
 			continue;
 		}
-		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) continue;
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) continue;
 		entries.push({
 			hash: name,
 			path: blobPath,
-			bytes: stat.size,
-			mtimeMs: stat.mtimeMs,
+			bytes: Number(stat.size),
+			mtimeMs: Number(stat.mtimeMs),
+			mtimeNs: stat.mtimeNs,
 			dev: stat.dev,
 			ino: stat.ino,
+			nlink: stat.nlink,
 		});
 	}
 	return entries;
@@ -1687,32 +1692,45 @@ export async function removeCanonicalBlob(
 	entry: CanonicalBlobEntry,
 	options: { beforeUnlink?: () => Promise<boolean> } = {},
 ): Promise<{ removed: true } | { removed: false; reason: string; failed?: true }> {
-	let stat: fs.Stats;
+	let stat: fs.BigIntStats;
 	try {
-		stat = await fsp.lstat(entry.path);
+		stat = await fsp.lstat(entry.path, { bigint: true });
 	} catch (error) {
 		if (isEnoent(error)) return { removed: false, reason: "blob_disappeared" };
 		return { removed: false, reason: `blob_unverifiable: ${String(error)}`, failed: true };
 	}
-	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) {
 		return { removed: false, reason: "blob_not_plain_file" };
 	}
 	if (
 		stat.dev !== entry.dev ||
 		stat.ino !== entry.ino ||
-		stat.size !== entry.bytes ||
-		stat.mtimeMs !== entry.mtimeMs
+		stat.size !== BigInt(entry.bytes) ||
+		stat.mtimeNs !== entry.mtimeNs
 	) {
 		return { removed: false, reason: "blob_changed" };
 	}
 	if (options.beforeUnlink && !(await options.beforeUnlink())) {
 		return { removed: false, reason: "blob_reference_evidence_changed" };
 	}
-	try {
-		await fsp.unlink(entry.path);
-		return { removed: true };
-	} catch (error) {
-		if (isEnoent(error)) return { removed: false, reason: "blob_disappeared" };
-		return { removed: false, reason: `blob_unlink_failed: ${String(error)}`, failed: true };
+	const removed = exactUnlink(entry.path, {
+		dev: entry.dev,
+		ino: entry.ino,
+		nlink: entry.nlink,
+		size: BigInt(entry.bytes),
+		mtimeNs: entry.mtimeNs,
+		sha256: entry.hash,
+		quarantineName: `.gjc-gc-blob-${entry.hash}`,
+	});
+	if (removed.ok) return { removed: true };
+	if (removed.code === "cleanup_pending" && removed.detachedPath) {
+		try {
+			await fsp.unlink(removed.detachedPath);
+			return { removed: true };
+		} catch (error) {
+			return { removed: false, reason: `blob_cleanup_failed: ${String(error)}`, failed: true };
+		}
 	}
+	if (removed.code === "not_found") return { removed: false, reason: "blob_disappeared" };
+	return { removed: false, reason: `blob_unlink_failed: ${removed.code ?? "unknown"}`, failed: true };
 }
