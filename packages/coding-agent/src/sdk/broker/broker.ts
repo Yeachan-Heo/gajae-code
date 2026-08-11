@@ -1475,16 +1475,19 @@ export class Broker {
 			if (!entry) return error("not_found", "lifecycle operation was not found");
 			if (entry.fingerprint !== fingerprint)
 				return error("idempotency_conflict", "lifecycle request fingerprint differs");
-			return {
-				ok: true,
-				result: {
-					operation: requestedOperation,
-					state: entry.state,
-					reconciliation: { operation: requestedOperation },
-					response: entry.response,
-					durableEffects: entry.durableEffects,
-				},
-			};
+			if (entry.state === "terminal_uncertain")
+				return {
+					ok: false,
+					error: { code: "terminal_uncertain", message: "lifecycle outcome is still uncertain" },
+				};
+			// Reconcile to the terminal original response contract: callers expect
+			// the BrokerResponse they would have received, not a lookup envelope.
+			return (
+				(entry.response as BrokerResponse) ?? {
+					ok: false,
+					error: { code: "terminal_uncertain", message: "lifecycle outcome has no recorded response" },
+				}
+			);
 		}
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
 		// Elevation gate (F1.3): allowlisted raw operations execute only behind a

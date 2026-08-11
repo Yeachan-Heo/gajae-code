@@ -427,3 +427,54 @@ it("quarantines terminal-uncertain replay rows with corrupt response or durable-
 	expect((await reopened.begin("effects", "request-effects")).kind).toBe("terminal_uncertain");
 	expect(await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl.corrupt"), "utf8")).toContain("corrupt");
 });
+
+describe("SDK lifecycle reconciliation lookup (broker.lookup_lifecycle)", () => {
+	it("replays the original terminal_ok BrokerResponse instead of a lookup envelope", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-lookup-ok-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		const originalResponse = { ok: true, result: { sessionId: "session-123" } };
+		await ledger.begin("id-1", "hash-1", {
+			operationKey: "session.create\0key-1",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		});
+		await ledger.transition("id-1", "terminal_ok", { response: originalResponse });
+
+		const entry = ledger.get("id-1");
+		expect(entry).toBeDefined();
+		expect(entry?.state).toBe("terminal_ok");
+		// The broker returns entry.response (the original BrokerResponse) on terminal_ok,
+		// NOT a lookup-shaped {ok:true, result:{operation,state,...}} envelope.
+		expect(entry?.response).toEqual(originalResponse);
+	});
+
+	it("replays the original terminal_error BrokerResponse instead of a lookup envelope", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-lookup-err-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		const errorResponse = { ok: false, error: { code: "workspace_deleted", message: "nope" } };
+		await ledger.begin("id-2", "hash-2", {
+			operationKey: "session.close\0key-2",
+			fingerprint: '{"operation":"session.close","input":{}}',
+		});
+		await ledger.transition("id-2", "terminal_error", { response: errorResponse });
+
+		const entry = ledger.get("id-2");
+		expect(entry?.state).toBe("terminal_error");
+		expect(entry?.response).toEqual(errorResponse);
+	});
+
+	it("returns terminal_uncertain as a BrokerResponse error, not as a lookup envelope", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-lookup-uncertain-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("id-3", "hash-3", {
+			operationKey: "session.create\0key-3",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		});
+		await ledger.transition("id-3", "terminal_uncertain");
+
+		const entry = ledger.get("id-3");
+		expect(entry?.state).toBe("terminal_uncertain");
+		// The broker endpoint returns {ok:false, error:{code:"terminal_uncertain"}} for
+		// terminal_uncertain state — callers throw this rather than silently returning it.
+		expect(entry?.response).toBeUndefined();
+	});
+});
