@@ -11,6 +11,7 @@
 - Terminal.app Meta-prefix decoding now covers legacy Option shortcuts for printable symbols, digits, spaces, and Ctrl+Option symbol chords while preserving enhanced Kitty and modifyOtherKeys Super/Command matching.
 - Kitty and modifyOtherKeys function-key sequences now match consistently for F1–F12, including unmodified CSI forms.
 - Kitty protocol release/repeat and modifyOtherKeys lock-mask handling now fail closed and stay symmetric across native and TypeScript key matching, including duplicate macOS modifier aliases.
+- TypeScript Kitty and modifyOtherKeys printable decoding now rejects surrogate and out-of-range Unicode code points before text extraction.
 
 ## [0.12.21] - 2026-08-09
 
