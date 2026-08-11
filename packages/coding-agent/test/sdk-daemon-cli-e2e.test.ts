@@ -5,6 +5,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
+import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
@@ -206,6 +207,48 @@ describe("SDK session CLI", () => {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
+	type OfflineSession = { id: string; path: string };
+
+	async function createStoppedSavedSession(): Promise<OfflineSession> {
+		const session = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
+		await session.ensureOnDisk();
+		const id = session.getSessionId();
+		const savedPath = session.getSessionFile();
+		if (!savedPath) throw new Error("Expected a retained managed session path.");
+		const registration = {
+			type: "host_registered" as const,
+			sessionId: id,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(path.join(stateRoot, "sdk", "live.json"))).mtimeMs,
+		};
+		await broker.index.append(registration);
+		await broker.index.append({ ...registration, type: "host_unregistered" as const });
+		return { id, path: savedPath };
+	}
+
+	async function tailAfterBrokerSelectsOfflineSession(
+		mutate: (session: OfflineSession) => Promise<void>,
+	): Promise<{ result: CliResult; selections: number }> {
+		const session = await createStoppedSavedSession();
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		let selections = 0;
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			const response = await originalHandleRequest(operation, input, idempotencyKey);
+			if (operation === "session.list" && input.resolveSessionId === session.id && selections === 0) {
+				selections++;
+				await mutate(session);
+			}
+			return response;
+		};
+		try {
+			return { result: await runCli(root, agentDir, ["tail", session.id]), selections };
+		} finally {
+			broker.handleRequest = originalHandleRequest;
+		}
+	}
+
 	it("uses the broker and Router-owned session attachments without leaking credentials", async () => {
 		const list = await runCli(root, agentDir, ["list"]);
 		expect(list.exitCode).toBe(0);
@@ -347,6 +390,59 @@ describe("SDK session CLI", () => {
 			}),
 		).rejects.toThrow("Retained transcript history contains unparseable entries");
 	});
+
+	it("replays an unchanged Broker-identified offline transcript", async () => {
+		const session = await createStoppedSavedSession();
+		const result = await runCli(root, agentDir, ["tail", session.id]);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			ok: true,
+			result: { source: "offline", session: { sessionId: session.id }, terminal: true },
+		});
+	}, 60_000);
+
+	it("fails closed when the Broker-selected offline transcript is replaced before open", async () => {
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(async session => {
+			const replacement = path.join(root, "attacker-replacement.jsonl");
+			await fs.writeFile(replacement, '{"type":"session","id":"attacker"}\n{"marker":"attacker"}\n');
+			await fs.rename(replacement, session.path);
+		});
+		expect(selections).toBe(1);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			ok: false,
+			error: { code: "retention_gap", details: { code: "retention_gap", reason: "changed" } },
+		});
+		expect(result.stdout).not.toContain("attacker");
+	}, 60_000);
+
+	it("rejects a symlink substituted for the Broker-selected offline transcript", async () => {
+		if (process.platform === "win32") return;
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(async session => {
+			const target = path.join(root, "attacker-symlink-target.jsonl");
+			await fs.writeFile(target, '{"type":"session","id":"attacker"}\n{"marker":"attacker"}\n');
+			await fs.unlink(session.path);
+			await fs.symlink(target, session.path);
+		});
+		expect(selections).toBe(1);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+		expect(result.stdout).not.toContain("attacker");
+	}, 60_000);
+
+	it("rejects a FIFO substituted for the Broker-selected offline transcript without blocking", async () => {
+		if (process.platform === "win32") return;
+		const startedAt = Date.now();
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(async session => {
+			await fs.unlink(session.path);
+			const fifo = Bun.spawn(["mkfifo", session.path], { stdout: "ignore", stderr: "ignore" });
+			expect(await fifo.exited).toBe(0);
+		});
+		expect(selections).toBe(1);
+		expect(Date.now() - startedAt).toBeLessThan(10_000);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+	}, 60_000);
 
 	it("drains SDK session CLI session.list continuation pages before returning sessions", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);

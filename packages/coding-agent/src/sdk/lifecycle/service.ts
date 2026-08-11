@@ -47,6 +47,12 @@ export interface SessionLifecycleTranscriptIdentity {
 	readonly sha256: string;
 }
 
+export interface SessionLifecycleSavedSession {
+	readonly id: string;
+	readonly path: string;
+	readonly identity: SessionLifecycleTranscriptIdentity;
+}
+
 export interface SessionLifecycleCoordinatorTarget {
 	readonly coordinatorStateDir?: string;
 	readonly coordinatorSessionId?: string;
@@ -164,7 +170,7 @@ export interface SessionLifecycleListResult {
 	readonly indexSeq: number;
 	readonly sessions: readonly SessionLifecycleListEntry[];
 	readonly warnings: readonly string[];
-	readonly savedSession?: { readonly id: string; readonly path: string };
+	readonly savedSession?: SessionLifecycleSavedSession;
 }
 
 export interface SessionCreateResult {
@@ -416,6 +422,37 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 	return result;
 }
 
+function transcriptIdentity(value: unknown): SessionLifecycleTranscriptIdentity | undefined {
+	if (!isRecord(value)) return undefined;
+	const { dev, ino, size, mtimeMs, mtimeNs, sha256 } = value;
+	if (
+		typeof dev !== "string" ||
+		!/^\d+$/.test(dev) ||
+		typeof ino !== "string" ||
+		!/^\d+$/.test(ino) ||
+		typeof size !== "number" ||
+		!Number.isSafeInteger(size) ||
+		size < 0 ||
+		typeof mtimeMs !== "number" ||
+		!Number.isFinite(mtimeMs) ||
+		mtimeMs < 0 ||
+		typeof mtimeNs !== "string" ||
+		!/^\d+$/.test(mtimeNs) ||
+		typeof sha256 !== "string" ||
+		!/^[a-f0-9]{64}$/.test(sha256)
+	)
+		return undefined;
+	return { dev, ino, size, mtimeMs, mtimeNs, sha256 };
+}
+
+function savedSessionFromResult(value: unknown): SessionLifecycleSavedSession | undefined {
+	if (!isRecord(value)) return undefined;
+	const identity = transcriptIdentity(value.identity);
+	if (typeof value.id !== "string" || typeof value.path !== "string" || value.path.length === 0 || !identity)
+		return undefined;
+	return { id: value.id, path: value.path, identity };
+}
+
 function listResult(value: unknown): SessionLifecycleListResult | undefined {
 	if (!isRecord(value) || !Array.isArray(value.sessions)) return undefined;
 	const indexSeq = value.indexSeq;
@@ -447,11 +484,7 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 		if (typeof warning !== "string") return undefined;
 		warnings.push(warning);
 	}
-	const savedSession = isRecord(value.savedSession)
-		? typeof value.savedSession.id === "string" && typeof value.savedSession.path === "string"
-			? { id: value.savedSession.id, path: value.savedSession.path }
-			: undefined
-		: undefined;
+	const savedSession = savedSessionFromResult(value.savedSession);
 	return { indexSeq, sessions, warnings, ...(savedSession ? { savedSession } : {}) };
 }
 type LifecycleListPage = {

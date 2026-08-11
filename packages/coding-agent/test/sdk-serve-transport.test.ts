@@ -161,10 +161,10 @@ async function withStalledWebSocket<T>(run: () => Promise<T>): Promise<T> {
 }
 
 async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstreamFrame?: (frame: string) => boolean) {
-	// Under heavy parallel suite load the very first localhost WebSocket open can
-	// transiently fail before the fake upstream accepts; one bounded retry keeps
-	// the fixture deterministic without masking real relay failures.
-	for (let attempt = 0; ; attempt++) {
+	// Under heavy parallel suite load the first localhost WebSocket open can fail
+	// before the fake upstream accepts. Retry only that pre-acceptance failure.
+	let retryCount = 0;
+	for (;;) {
 		const fake = upstream();
 		const input = new PassThrough();
 		const output = new PassThrough();
@@ -182,10 +182,17 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstream
 				validateDownstreamFrame,
 			});
 			await waitFor(() => fake.connections[0], "upstream connection");
+			expect(retryCount).toBeLessThanOrEqual(1);
 			return { fake, input, output, received, errors, pair };
 		} catch (error) {
+			const retryable =
+				retryCount === 0 &&
+				fake.connections.length === 0 &&
+				error instanceof Error &&
+				error.message === "upstream_error";
 			fake.stop();
-			if (attempt >= 1 || !(error instanceof Error) || error.message !== "upstream_error") throw error;
+			if (!retryable) throw error;
+			retryCount++;
 		}
 	}
 }

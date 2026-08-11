@@ -41,6 +41,14 @@ class FakeLifecycleClient implements SessionLifecycleClient {
 
 const actor = { id: "operator-1", namespace: "telegram:account-1" } as const;
 const target = { cwd: "/repo" } as const;
+const savedTranscriptIdentity = {
+	dev: "1",
+	ino: "2",
+	size: 3,
+	mtimeMs: 4,
+	mtimeNs: "4000000",
+	sha256: "a".repeat(64),
+} as const;
 
 function serviceWith(response: unknown = { ok: true, result: { sessionId: "session-1" } }): {
 	service: SessionLifecycleService;
@@ -141,7 +149,7 @@ describe("SessionLifecycleService", () => {
 					indexSeq: 7,
 					sessions: [{ sessionId: "first", live: true }],
 					warnings: ["first-page-warning"],
-					savedSession: { id: "saved", path: "/saved.jsonl" },
+					savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
 					continuationCursor: "page-2",
 				},
 			},
@@ -167,7 +175,7 @@ describe("SessionLifecycleService", () => {
 					{ sessionId: "second", repo: "/workspace" },
 				],
 				warnings: ["first-page-warning"],
-				savedSession: { id: "saved", path: "/saved.jsonl" },
+				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
 			},
 		});
 		expect(client.calls).toEqual([

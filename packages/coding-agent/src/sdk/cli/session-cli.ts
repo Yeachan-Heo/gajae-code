@@ -1,11 +1,17 @@
 import { randomBytes } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
-import type { SessionLifecycleMutationRequest, SessionLifecycleOperation } from "../lifecycle/service";
+import type {
+	SessionLifecycleMutationRequest,
+	SessionLifecycleOperation,
+	SessionLifecycleSavedSession,
+	SessionLifecycleTranscriptIdentity,
+} from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
@@ -623,6 +629,39 @@ function retainedTranscriptUnavailable(): RetainedTranscriptTailError {
 	return new RetainedTranscriptTailError("unavailable", "Retained transcript history is unavailable.");
 }
 
+function retainedTranscriptOpenFlags(): number {
+	const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
+	if (process.platform !== "win32" && !noFollow) throw retainedTranscriptUnavailable();
+	return (
+		fsSync.constants.O_RDONLY | noFollow | (process.platform === "win32" ? 0 : (fsSync.constants.O_NONBLOCK ?? 0))
+	);
+}
+
+function retainedTranscriptIdentityMismatch(): RetainedTranscriptTailError {
+	return new RetainedTranscriptTailError(
+		"changed",
+		"Retained transcript history no longer matches the Broker-selected identity; refusing to replay it.",
+	);
+}
+
+function matchesRetainedTranscriptIdentity(
+	identity: SessionLifecycleTranscriptIdentity,
+	descriptor: fsSync.BigIntStats,
+): boolean {
+	try {
+		return (
+			descriptor.isFile() &&
+			descriptor.dev === BigInt(identity.dev) &&
+			descriptor.ino === BigInt(identity.ino) &&
+			descriptor.size === BigInt(identity.size) &&
+			descriptor.mtimeMs === BigInt(identity.mtimeMs) &&
+			descriptor.mtimeNs === BigInt(identity.mtimeNs)
+		);
+	} catch {
+		return false;
+	}
+}
+
 function retainedTranscriptCorrupt(): RetainedTranscriptTailError {
 	return new RetainedTranscriptTailError(
 		"corrupt",
@@ -714,12 +753,13 @@ export async function scanRetainedTranscriptTail(reader: RetainedTranscriptTailR
 	return entries.reverse();
 }
 
-async function readRetainedTranscriptTail(savedPath: string): Promise<unknown[]> {
+async function readRetainedTranscriptTail(savedSession: SessionLifecycleSavedSession): Promise<unknown[]> {
 	let descriptor: fs.FileHandle | undefined;
 	try {
-		descriptor = await fs.open(savedPath, "r");
+		descriptor = await fs.open(savedSession.path, retainedTranscriptOpenFlags());
 		const before = await descriptor.stat({ bigint: true });
-		if (!before.isFile() || before.size > BigInt(Number.MAX_SAFE_INTEGER)) throw retainedTranscriptUnavailable();
+		if (!matchesRetainedTranscriptIdentity(savedSession.identity, before)) throw retainedTranscriptIdentityMismatch();
+		if (before.size > BigInt(Number.MAX_SAFE_INTEGER)) throw retainedTranscriptUnavailable();
 		// Bind every range read to the opened descriptor so a later pathname replacement
 		// cannot change the retained history selected by the lifecycle lookup.
 		const file = Bun.file(descriptor.fd);
@@ -729,6 +769,7 @@ async function readRetainedTranscriptTail(savedPath: string): Promise<unknown[]>
 		});
 		const after = await descriptor.stat({ bigint: true });
 		if (
+			!matchesRetainedTranscriptIdentity(savedSession.identity, after) ||
 			before.dev !== after.dev ||
 			before.ino !== after.ino ||
 			before.size !== after.size ||
@@ -762,8 +803,8 @@ async function offlineTailReplay(
 	});
 	if (!outcome.ok)
 		throw new SdkSessionCliError(outcome.error.code, outcome.error.message, 1, { certainty: outcome.certainty });
-	const savedPath = outcome.result.savedSession?.path;
-	if (!savedPath)
+	const savedSession = outcome.result.savedSession;
+	if (!savedSession)
 		throw new SdkSessionCliError(
 			"session_unavailable",
 			`Session ${sessionId} is stopped and has no retained transcript replay.`,
@@ -771,7 +812,7 @@ async function offlineTailReplay(
 		);
 	let entries: unknown[];
 	try {
-		entries = await readRetainedTranscriptTail(savedPath);
+		entries = await readRetainedTranscriptTail(savedSession);
 	} catch (error) {
 		const retained = error instanceof RetainedTranscriptTailError ? error : retainedTranscriptUnavailable();
 		throw new SdkSessionCliError("retention_gap", retained.message, 1, {
