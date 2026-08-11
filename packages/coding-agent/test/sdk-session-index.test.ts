@@ -794,6 +794,41 @@ describe("SDK session index", () => {
 		}
 		expect(replacementChecks).toBe(2);
 	});
+	it("repairs a long history into a retention-bounded snapshot other clients can lock promptly", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-repair-bound-"));
+		const maxRows = 50;
+		const policy = { maxRows };
+		const seed = await new SessionIndex(dir, policy).open();
+		// History that never reached a rotation boundary: the log alone carries every
+		// event, so repair is what decides whether the republished snapshot is bounded.
+		for (let i = 0; i < 400; i++) await seed.append(event(`session-${i}`));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const log = path.join(sessionsDir, "index.jsonl");
+		const before = await fs.readFile(log);
+		await fs.appendFile(log, "broken\n");
+
+		const repair = await new SessionIndex(dir, policy).repair();
+		expect(repair).toMatchObject({ status: "corrupt", repaired: true });
+		expect(await fs.readFile(path.join(repair.quarantinePath!, "index.jsonl"))).toEqual(
+			Buffer.concat([before, Buffer.from("broken\n")]),
+		);
+		// A repair republishes history as the snapshot; without retention it restores an
+		// unbounded snapshot that every later locked transaction must re-parse, which is
+		// how one broker starved every other client of the index lock.
+		const snapshot = JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8")) as {
+			events: SessionIndexEvent[];
+		};
+		expect(snapshot.events.length).toBeLessThanOrEqual(maxRows);
+
+		// A second client must still take the shared index lock while the repaired index
+		// is in normal use, within a bound far below the 60s launch budget.
+		const holder = await new SessionIndex(dir, policy).open();
+		const contender = await new SessionIndex(dir, policy).open();
+		await holder.append(event("post-repair"));
+		const started = Date.now();
+		await contender.withLocked(async () => undefined);
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
 	it("serializes repair with a racing writer and resumes after the retained prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const seed = await new SessionIndex(dir).open();

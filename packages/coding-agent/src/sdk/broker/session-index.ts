@@ -868,7 +868,13 @@ export class SessionIndex {
 					await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
 				if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
 				await syncDirectory(path.join(quarantinePath, "index.jsonl"));
-				const events = [...scan.snapshotEvents, ...scan.validLogEvents];
+				// Repair republishes the surviving history as the new snapshot, so it must
+				// apply the same retention the ordinary snapshot path applies. Writing the
+				// raw survivor set instead let one repair of a long-lived index restore an
+				// unbounded snapshot, and every later locked transaction then re-parsed that
+				// whole history while holding the index lock — the broker burns CPU and
+				// unrelated launches time out waiting for the lock.
+				const events = compactEvents([...scan.snapshotEvents, ...scan.validLogEvents], this.#policy);
 				const snapshot = JSON.stringify({
 					version: SESSION_INDEX_SNAPSHOT_VERSION,
 					indexSeq: scan.diagnosis.validPrefixSeq,
