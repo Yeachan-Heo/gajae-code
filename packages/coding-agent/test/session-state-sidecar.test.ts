@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
+
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -223,6 +225,75 @@ describe("coordinator runtime state sidecar", () => {
 		const payload = await readJson(stateFile);
 		expect(payload.activity).toMatchObject({ sequence: 9, active_tool_count: 9 });
 		expect(payload.active_tools).toHaveLength(8);
+	});
+	it("bounds unmatched tool-call correlations and records evictions", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-tool-call-correlations";
+		const firstStartedAt = Date.parse("2026-01-01T00:00:00.000Z");
+		try {
+			for (let index = 0; index < 65; index++) {
+				setSystemTime(new Date(firstStartedAt + index));
+				await persistCoordinatorRuntimeStateFromEvent(
+					{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				);
+			}
+
+			const payload = await readJson(stateFile);
+			const activeToolCalls = payload.active_tool_calls as Record<string, unknown>;
+			expect(Object.keys(activeToolCalls)).toHaveLength(64);
+			expect(payload).toMatchObject({
+				activity: { sequence: 65, active_tool_count: 65 },
+				active_tool_calls_overflow_count: 1,
+			});
+			expect(payload.active_tools).toHaveLength(8);
+			expect(activeToolCalls[createHash("sha256").update("tool-0").digest("hex")]).toBeUndefined();
+			expect(activeToolCalls[createHash("sha256").update("tool-64").digest("hex")]).toEqual({
+				tool_name: "read",
+				started_at: "2026-01-01T00:00:00.064Z",
+			});
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("refuses malformed and oversized persisted tool-call correlation tables", async () => {
+		const root = await tempRoot();
+		const invalidToolCalls: unknown[] = [
+			{ "not-a-tool-call-digest": { tool_name: "read", started_at: "2026-01-01T00:00:00.000Z" } },
+			Object.fromEntries(
+				Array.from({ length: 65 }, (_, index) => [
+					createHash("sha256").update(`tool-${index}`).digest("hex"),
+					{ tool_name: "read", started_at: "2026-01-01T00:00:00.000Z" },
+				]),
+			),
+		];
+		for (const [index, activeToolCalls] of invalidToolCalls.entries()) {
+			const sessionId = `invalid-tool-call-correlations-${index}`;
+			const stateFile = path.join(root, `${sessionId}.json`);
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			const evidence = JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				active_tool_calls: activeToolCalls,
+			});
+			await Bun.write(stateFile, evidence);
+
+			await expect(
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "tool_execution_start", toolCallId: "tool-next", toolName: "read" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				),
+			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+			expect(await Bun.file(stateFile).text()).toBe(evidence);
+		}
 	});
 
 	it("saturates an exhausted activity sequence without wrapping", async () => {

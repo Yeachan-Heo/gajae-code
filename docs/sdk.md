@@ -296,10 +296,11 @@ its asynchronous preflight accepts the prompt. That receipt is a durable,
 later finalizes that claim with exactly one `SdkPromptTerminalOutcome`; cleanup
 may follow only after the claim is durable.
 
-The authoritative public reconciliation query is `Q26` /
-`turn.prompt_status`, scoped to the same live session runtime. Its `outcome`
+The authoritative public reconciliation query is `Q26` / `turn.result`, scoped
+to the same live session runtime. Callers supply `kind: "prompt"`; its `outcome`
 field is exposed only after finalization. A pending claim is never represented
-or exposed as a terminal outcome.
+or exposed as a terminal outcome. `turn.prompt_status` remains a legacy
+prompt-only alias that injects the same `kind`.
 
 Every prompt and skill status response includes `receiptState`: active records are `absent`; terminal records are `present`, `missing`, or `unknown`; unknown lookup is `unknown`. Ordinary success requires `status: "terminal_ok"`, `receiptState: "present"`, and readable non-empty text or an artifact path. A failed execution may retain a partial `present` receipt. Legacy version-1 reconciliation records without this additive field remain readable and project `unknown` rather than optimistic success.
 
@@ -308,12 +309,12 @@ Callers that must recover from a lost acknowledgement should assign one fresh
 logical prompt, then reconcile through the broker-bound CLI:
 
 ```sh
-gjc sdk session raw query <sessionId> --query turn.prompt_status \
-  --json-input '{"clientRef":"request-018f"}'
+gjc sdk session raw query <sessionId> --query turn.result \
+  --json-input '{"kind":"prompt","clientRef":"request-018f"}'
 ```
 
-The alternate selector uses the same command with
-`{"commandId":"command-id","turnId":"turn-id"}` as its JSON input.
+The alternate selector uses the same `kind` with
+`{"kind":"prompt","commandId":"command-id","turnId":"turn-id"}` as its JSON input.
 
 The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
 `unknown`. Known records include `acceptedAt`; in-flight and terminal records add
@@ -344,14 +345,15 @@ grace period, which is not configurable. A controlled terminal failure reaches A
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
 
-## Skill invoke reconciliation (Q28)
+## Skill invoke reconciliation
 
 `skill.invoke` accepts optional `clientRef` and returns an early accepted receipt
 `{ accepted: true, commandId, turnId, clientRef?, name, path, lineCount?, args? }` after
 durable/preflight accept (SDK control path), not after skill completion. Query prior
-status with `Q28` / `skill.invoke_status` using the same selectors as Q26. Kind-scoped
-indexes mean prompt and skill `clientRef` values never collide. Skill records use the
-same capacity/TTL limits, but an active skill record at restart settles with
+status with `Q26` / `turn.result` and `kind: "skill"`. `skill.invoke_status`
+remains a legacy skill-only alias that injects the same `kind`. Kind-scoped indexes
+mean prompt and skill `clientRef` values never collide. Skill records use the same
+capacity/TTL limits, but an active skill record at restart settles with
 `error.code = process_restart`.
 
 ## Correlated steer acknowledgement (Q30)

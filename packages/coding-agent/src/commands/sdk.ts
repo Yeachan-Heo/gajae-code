@@ -773,7 +773,7 @@ class SdkSessionHelp extends Command {
 		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
 		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
 		wait: Flags.boolean({
-			description: "send --wait: poll turn.prompt_status until terminal or the wait window elapses",
+			description: "send --wait: poll turn.result with kind=prompt until terminal or the wait window elapses",
 		}),
 		"timeout-ms": Flags.string({ description: "Wait window for send --wait, status, and live tail follow" }),
 		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),

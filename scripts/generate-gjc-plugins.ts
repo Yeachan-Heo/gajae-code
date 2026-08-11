@@ -207,10 +207,11 @@ never prints. \`--agent-dir\` selects the broker state directory.
   endpoint discovery record.
 - \`gjc sdk session send <sessionId> --text <prompt>\` — ordered \`turn.prompt\`
   carrying a caller-chosen operation reference (ULID). \`--wait\` polls
-  \`turn.prompt_status\` until terminal or the wait window elapses; it never
-  cancels a running turn.
-- \`gjc sdk session status <sessionId> <opRef>\` — lossless \`turn.prompt_status\`
-  for a previously submitted operation reference.
+  \`turn.result\` with \`kind: "prompt"\` until terminal or the wait window elapses;
+  it never cancels a running turn.
+- \`gjc sdk session status <sessionId> <opRef>\` — lossless \`turn.result\` with
+  \`kind: "prompt"\` for a previously submitted operation reference.
+
 - \`gjc sdk session tail <sessionId>\` — retained transcript replay from the
   durable checkpoint followed by live event-ring frames. \`--strict\` fails
   closed on retention gaps, \`--until-idle\` exits at a terminal turn state,
@@ -225,12 +226,13 @@ globals require \`--idempotency-key\`; destructive control operations accept
 \`--confirm\`. Endpoint-disclosure operations are refused by default and stay
 refused by this skill.
 
-## Lossless prompt statuses
+## Lossless prompt results
 
-\`turn.prompt_status\` reports \`accepted\`, \`in_flight\`, \`terminal_ok\`, or
-\`failed\`; only retained-record eviction yields \`unknown\`, which means
-uncertainty, never proof of non-execution. Never reuse an operation reference
-as a retry mechanism.
+\`turn.result\` with \`kind: "prompt"\` reports \`accepted\`, \`in_flight\`,
+\`terminal_ok\`, or \`failed\`; only retained-record eviction yields \`unknown\`,
+which means uncertainty, never proof of non-execution. \`turn.prompt_status\`
+remains a legacy prompt-only alias. Never reuse an operation reference as a retry
+mechanism.
 
 ## Checkpoint gaps
 

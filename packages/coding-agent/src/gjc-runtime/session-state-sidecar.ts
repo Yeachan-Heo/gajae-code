@@ -47,7 +47,9 @@ type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
 const HEARTBEAT_MS = 1000;
 const MAX_PUBLIC_ACTIVE_TOOLS = 8;
+const MAX_ACTIVE_TOOL_CALLS = 64;
 const SAFE_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const ACTIVE_TOOL_CALL_KEY = /^[a-f0-9]{64}$/;
 
 type LastPayloadCacheEntry = { mtimeMs: number; size: number; payload: Record<string, unknown> };
 const lastPayloadByStateFile = new Map<string, LastPayloadCacheEntry>();
@@ -382,12 +384,14 @@ function safeToolName(value: unknown): string {
 	return typeof value === "string" && SAFE_TOOL_NAME.test(value) ? value : "custom";
 }
 
-function toolActivityForEvent(
-	event: RuntimeStateEvent,
-):
+type ToolActivityEvent =
 	| { phase: "started"; toolCallKey: string; toolName: string }
-	| { phase: "finished"; toolCallKey: string; toolName: string; outcome: "succeeded" | "failed" }
-	| null {
+	| { phase: "finished"; toolCallKey: string; toolName: string; outcome: "succeeded" | "failed" };
+
+type ActiveToolCall = { tool_name: string; started_at: string };
+type ActiveToolCalls = Record<string, ActiveToolCall>;
+
+function toolActivityForEvent(event: RuntimeStateEvent): ToolActivityEvent | null {
 	if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return null;
 	if (typeof event.toolCallId !== "string") return null;
 	const toolCallKey = createHash("sha256").update(event.toolCallId).digest("hex");
@@ -411,27 +415,77 @@ function runtimeStateFromPrevious(value: unknown): RuntimeState {
 		: "running";
 }
 
+function validActiveToolCall(value: unknown): value is ActiveToolCall {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const entry = value as Record<string, unknown>;
+	return (
+		Object.keys(entry).length === 2 &&
+		Object.hasOwn(entry, "tool_name") &&
+		Object.hasOwn(entry, "started_at") &&
+		typeof entry.tool_name === "string" &&
+		SAFE_TOOL_NAME.test(entry.tool_name) &&
+		typeof entry.started_at === "string" &&
+		Number.isFinite(Date.parse(entry.started_at))
+	);
+}
+
+function validActiveToolCalls(value: unknown): value is ActiveToolCalls {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const entries = Object.entries(value);
+	return (
+		entries.length <= MAX_ACTIVE_TOOL_CALLS &&
+		entries.every(([key, entry]) => ACTIVE_TOOL_CALL_KEY.test(key) && validActiveToolCall(entry))
+	);
+}
+
+function validActiveToolCallsOverflowCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function activeToolCallsOverflowCount(previous: Record<string, unknown>): number {
+	return validActiveToolCallsOverflowCount(previous.active_tool_calls_overflow_count)
+		? previous.active_tool_calls_overflow_count
+		: 0;
+}
+
+function evictOldestActiveToolCall(activeToolCalls: ActiveToolCalls): boolean {
+	let oldestKey: string | undefined;
+	let oldestStartedAt = Number.POSITIVE_INFINITY;
+	for (const [key, entry] of Object.entries(activeToolCalls)) {
+		const startedAt = Date.parse(entry.started_at);
+		if (startedAt < oldestStartedAt) {
+			oldestKey = key;
+			oldestStartedAt = startedAt;
+		}
+	}
+	if (!oldestKey) return false;
+	delete activeToolCalls[oldestKey];
+	return true;
+}
+
 function activityFieldsForEvent(
 	previous: Record<string, unknown>,
-	activityEvent: NonNullable<ReturnType<typeof toolActivityForEvent>>,
+	activityEvent: ToolActivityEvent,
 	now: string,
 	nowMs: number,
 ): Record<string, unknown> {
-	const activeToolCalls: Record<string, { tool_name: string; started_at: string }> = {};
-	const existing = previous.active_tool_calls;
-	if (existing && typeof existing === "object" && !Array.isArray(existing)) {
-		for (const [key, value] of Object.entries(existing)) {
-			if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-			const entry = value as Record<string, unknown>;
-			if (typeof entry.tool_name !== "string" || typeof entry.started_at !== "string") continue;
-			if (!Number.isFinite(Date.parse(entry.started_at))) continue;
-			activeToolCalls[key] = { tool_name: safeToolName(entry.tool_name), started_at: entry.started_at };
-		}
-	}
+	const activeToolCalls: ActiveToolCalls = validActiveToolCalls(previous.active_tool_calls)
+		? { ...previous.active_tool_calls }
+		: {};
+	let overflowCount = activeToolCallsOverflowCount(previous);
 	const prior = activeToolCalls[activityEvent.toolCallKey];
-	if (activityEvent.phase === "started")
+	if (activityEvent.phase === "started") {
+		if (
+			!prior &&
+			Object.keys(activeToolCalls).length >= MAX_ACTIVE_TOOL_CALLS &&
+			evictOldestActiveToolCall(activeToolCalls)
+		)
+			overflowCount = Math.min(Number.MAX_SAFE_INTEGER, overflowCount + 1);
 		activeToolCalls[activityEvent.toolCallKey] = { tool_name: activityEvent.toolName, started_at: now };
-	else delete activeToolCalls[activityEvent.toolCallKey];
+	} else {
+		delete activeToolCalls[activityEvent.toolCallKey];
+		if (!prior && overflowCount > 0) overflowCount--;
+	}
 	const previousActivity =
 		previous.activity && typeof previous.activity === "object" && !Array.isArray(previous.activity)
 			? (previous.activity as Record<string, unknown>)
@@ -444,7 +498,7 @@ function activityFieldsForEvent(
 			? Math.min(Number.MAX_SAFE_INTEGER, previousActivity.sequence + 1)
 			: 1;
 	const activeTools = Object.values(activeToolCalls)
-		.sort((left, right) => left.started_at.localeCompare(right.started_at))
+		.sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at))
 		.slice(0, MAX_PUBLIC_ACTIVE_TOOLS);
 	const startedAt = activityEvent.phase === "started" ? now : prior?.started_at;
 	const elapsedMs = startedAt ? Math.max(0, nowMs - Date.parse(startedAt)) : undefined;
@@ -459,10 +513,11 @@ function activityFieldsForEvent(
 			...(startedAt ? { started_at: startedAt } : {}),
 			...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
 			...(activityEvent.phase === "finished" ? { outcome: activityEvent.outcome } : {}),
-			active_tool_count: Object.keys(activeToolCalls).length,
+			active_tool_count: Math.min(Number.MAX_SAFE_INTEGER, Object.keys(activeToolCalls).length + overflowCount),
 		},
 		active_tools: activeTools,
 		active_tool_calls: activeToolCalls,
+		active_tool_calls_overflow_count: overflowCount,
 	};
 }
 
@@ -518,6 +573,12 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 	if (
 		payload.updated_at !== undefined &&
 		(typeof payload.updated_at !== "string" || !Number.isFinite(Date.parse(payload.updated_at)))
+	)
+		return false;
+	if (
+		(Object.hasOwn(payload, "active_tool_calls") && !validActiveToolCalls(payload.active_tool_calls)) ||
+		(Object.hasOwn(payload, "active_tool_calls_overflow_count") &&
+			!validActiveToolCallsOverflowCount(payload.active_tool_calls_overflow_count))
 	)
 		return false;
 	if (payload.ready_for_input !== undefined) {
@@ -685,8 +746,11 @@ function basePayload(input: {
 			? { activity: input.previous.activity }
 			: {}),
 		...(Array.isArray(input.previous.active_tools) ? { active_tools: input.previous.active_tools } : {}),
-		...(input.previous.active_tool_calls && typeof input.previous.active_tool_calls === "object"
+		...(validActiveToolCalls(input.previous.active_tool_calls)
 			? { active_tool_calls: input.previous.active_tool_calls }
+			: {}),
+		...(validActiveToolCallsOverflowCount(input.previous.active_tool_calls_overflow_count)
+			? { active_tool_calls_overflow_count: input.previous.active_tool_calls_overflow_count }
 			: {}),
 		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
 	};

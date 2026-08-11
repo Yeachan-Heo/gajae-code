@@ -456,6 +456,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z", tool_call_id: "private-tool-id" },
 				],
 				active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+				active_tool_calls_overflow_count: 1,
 			}),
 		);
 		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
@@ -503,6 +504,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			activity: { sequence: 4, active_tool_count: 9 },
 			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
 			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+			active_tool_calls_overflow_count: 1,
 		});
 		const sent = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -534,6 +536,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			activity: { sequence: 4, active_tool_count: 9 },
 			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
 			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+			active_tool_calls_overflow_count: 1,
 		});
 	});
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {

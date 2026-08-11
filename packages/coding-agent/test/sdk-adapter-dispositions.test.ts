@@ -36,7 +36,7 @@ const parityRows = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRows).toHaveLength(588);
+expect(parityRows).toHaveLength(582);
 const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
 	discord: "D",
@@ -115,7 +115,6 @@ const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"auth.login": "operation_not_session_owned",
 	"skill.invoke": "invalid_input",
 	"turn.result": "invalid_request",
-	"skill.invoke_status": "invalid_request",
 	"mode.plan.set": "unavailable",
 	"model.profile.set": "invalid_input",
 };

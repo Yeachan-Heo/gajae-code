@@ -52,20 +52,22 @@ broker fails closed rather than exposing endpoint authority outside SDK core.
 or `--op-ref`). The result envelope reports `accepted` with the receipt and the
 operation reference used for later reconciliation.
 
-- `--wait` polls `turn.prompt_status` until the prompt reaches a terminal state
-  or the wait window (`--timeout-ms`, default 30s) elapses. `send --wait` never
-  cancels a running turn; a window that elapses before a terminal state is
-  reported as `wait_timeout` with the last observed status.
+- `--wait` polls `turn.result` with `kind: "prompt"` until the prompt reaches a
+  terminal state or the wait window (`--timeout-ms`, default 30s) elapses.
+  `send --wait` never cancels a running turn; a window that elapses before a
+  terminal state is reported as `wait_timeout` with the last observed status.
+
 - `--text` and the JSON input sources (`--json-input`,
   `--json-input-file` — which must be a `0600` regular file —
   `--json-input-stdin`) are mutually exclusive for the prompt body.
 
 ### status
 
-`gjc sdk session status <sessionId> <opRef>` performs a lossless
-`turn.prompt_status` lookup for a previously submitted operation reference and
+`gjc sdk session status <sessionId> <opRef>` performs a lossless `turn.result`
+lookup with `kind: "prompt"` for a previously submitted operation reference and
 returns the full reconciliation record plus a `summary.completed` flag.
-See [lossless prompt statuses](#lossless-prompt-statuses).
+See [lossless prompt results](#lossless-prompt-results).
+
 
 ### tail
 
@@ -108,13 +110,14 @@ operation and returns the broker/host response:
 an SDK-core implementation detail. The raw hatch validates operation names and
 adapter dispositions up front and never renders endpoint-disclosure results.
 
-## Lossless prompt statuses
+## Lossless prompt results
 
-`turn.prompt_status` reports `accepted`, `in_flight`, `terminal_ok`, or
-`failed`; only retained-record TTL/capacity eviction yields `unknown`. A
-prompt that is active at process restart is finalized from its durable pending
-outcome (or `prompt_failed` when it has none), so it never reports as
-`unknown` while a record exists.
+`turn.result` with `kind: "prompt"` reports `accepted`, `in_flight`,
+`terminal_ok`, or `failed`; only retained-record TTL/capacity eviction yields
+`unknown`. `turn.prompt_status` remains a legacy prompt-only alias. A prompt
+that is active at process restart is finalized from its durable pending outcome
+(or `prompt_failed` when it has none), so it never reports as `unknown` while a
+record exists.
 
 `unknown` means uncertainty, never proof of non-execution: do not reuse an
 operation reference as a retry mechanism (`client_ref_conflict` while the

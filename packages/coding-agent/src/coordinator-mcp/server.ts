@@ -279,6 +279,7 @@ interface CoordinatorSessionState {
 	activity?: unknown;
 	active_tools?: unknown;
 	active_tool_calls?: unknown;
+	active_tool_calls_overflow_count?: unknown;
 }
 
 type CoordinatorEventKind =
@@ -1910,6 +1911,11 @@ async function writeSessionStateUnlocked(
 		...(Array.isArray(existing?.active_tools) ? { active_tools: existing.active_tools } : {}),
 		...(existing?.active_tool_calls && typeof existing.active_tool_calls === "object"
 			? { active_tool_calls: existing.active_tool_calls }
+			: {}),
+		...(typeof existing?.active_tool_calls_overflow_count === "number" &&
+		Number.isSafeInteger(existing.active_tool_calls_overflow_count) &&
+		existing.active_tool_calls_overflow_count >= 0
+			? { active_tool_calls_overflow_count: existing.active_tool_calls_overflow_count }
 			: {}),
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
