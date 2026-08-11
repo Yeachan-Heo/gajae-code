@@ -235,8 +235,24 @@ async function runRuntimeCommand(
 		callback();
 	};
 	let cancellation: { timedOut: boolean } | undefined;
+	let windowsTermination: Promise<void> | undefined;
+	const terminateWindowsProcessTree = (): void => {
+		if (windowsTermination) return;
+		const taskkill = Bun.spawn(["taskkill", "/pid", String(proc.pid), "/t", "/f"], {
+			stdout: "ignore",
+			stderr: "ignore",
+			windowsHide: true,
+		});
+		windowsTermination = taskkill.exited.then(
+			() => undefined,
+			() => undefined,
+		);
+	};
 	const waitForProcessTreeExit = async (): Promise<void> => {
-		if (process.platform === "win32") return;
+		if (process.platform === "win32") {
+			await windowsTermination;
+			return;
+		}
 		while (true) {
 			try {
 				process.kill(-proc.pid, 0);
@@ -252,7 +268,7 @@ async function runRuntimeCommand(
 		const signalProcessTree = (signal: NodeJS.Signals): void => {
 			try {
 				if (process.platform === "win32") {
-					proc.kill(signal);
+					terminateWindowsProcessTree();
 				} else {
 					process.kill(-proc.pid, signal);
 				}
