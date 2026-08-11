@@ -744,11 +744,20 @@ export async function executePythonWithKernel(
 export async function executePython(code: string, options?: PythonExecutorOptions): Promise<PythonResult> {
 	const cwd = options?.cwd ?? getProjectDir();
 	const deadlineMs = getExecutionDeadlineMs(options);
+	const deadlineController =
+		deadlineMs !== undefined && options?.signal === undefined ? new AbortController() : undefined;
+	const signal = deadlineController ?? options?.signal;
+	const remainingMs = getRemainingTimeoutMs(deadlineMs);
+	const deadlineTimer =
+		deadlineController && remainingMs !== undefined
+			? setTimeout(() => deadlineController.abort(new PythonExecutionCancelledError(true)), Math.max(0, remainingMs))
+			: undefined;
+	deadlineTimer?.unref();
 	const executionOptions: PythonExecutorOptions = {
 		...(options ?? {}),
+		signal,
 		deadlineMs,
 	};
-
 	try {
 		requireRemainingTimeoutMs(deadlineMs);
 		if (executionOptions.signal?.aborted) {
@@ -769,5 +778,7 @@ export async function executePython(code: string, options?: PythonExecutorOption
 			return createCancelledPythonResult(isTimedOutCancellation(err, executionOptions.signal));
 		}
 		throw err;
+	} finally {
+		if (deadlineTimer) clearTimeout(deadlineTimer);
 	}
 }

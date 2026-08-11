@@ -334,13 +334,18 @@ async function ensureWorkspaceManagedVenv(
 			$which("python", { PATH: baseEnv.PATH, cache: WhichCachePolicy.Bypass });
 		if (!basePython) throw new Error("Python executable not found on PATH");
 		await fs.promises.mkdir(path.dirname(managed.venvPath), { recursive: true });
-		await runRuntimeCommand(
-			[basePython, "-m", "venv", managed.venvPath],
-			cwd,
-			baseEnv,
-			"Managed Python venv creation",
-			lifecycle,
-		);
+		try {
+			await runRuntimeCommand(
+				[basePython, "-m", "venv", managed.venvPath],
+				cwd,
+				baseEnv,
+				"Managed Python venv creation",
+				lifecycle,
+			);
+		} catch (error) {
+			await fs.promises.rm(managed.venvPath, { recursive: true, force: true });
+			throw error;
+		}
 	}
 	if (seedPackages.length === 0) return;
 	const markerPath = path.join(managed.venvPath, ".gjc-seeded.json");
