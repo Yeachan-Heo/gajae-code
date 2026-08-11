@@ -29,7 +29,7 @@ Gajae-Code packages the runtime as a reusable component:
 - **A managed machine interface is available.** Top-level sessions host an internal
   loopback endpoint, while SDK-core `SessionRouter` retains its discovery record,
   credentials, replay cursor, and exact attachment authority. Applications use
-  Coordinator MCP, the daemon-session CLI, or a configured managed adapter rather
+  Coordinator MCP, the SDK session CLI, or a configured managed adapter rather
   than opening that endpoint directly.
 - **Many subscribers, one session.** In-process subscribers and configured managed
   adapters can observe the same session without sharing endpoint credentials.
@@ -42,7 +42,7 @@ Gajae-Code packages the runtime as a reusable component:
 
 | | Embedding SDK (in-process) | Managed external control |
 | --- | --- | --- |
-| What it is | Import `@gajae-code/coding-agent` as a library | Use Coordinator MCP, daemon-session CLI, or a configured Telegram/Discord/Slack adapter |
+| What it is | Import `@gajae-code/coding-agent` as a library | Use Coordinator MCP, SDK session CLI, or a configured Telegram/Discord/Slack adapter |
 | Language | TypeScript / Bun (Node-compatible) | Any client capable of the selected MCP/CLI/provider interface |
 | Telemetry | Full token deltas, tool events, and session events | Curated provider-neutral frames and queries |
 | Trust model | Your process hosts the runtime | SDK core retains endpoint credentials and issues exact opaque attachments |
@@ -164,7 +164,7 @@ status. See [Model profiles as synthetic models](./sdk.md#model-profiles-as-synt
 
 Embedding creates a session directly with `createAgentSession()`. For an
 external controller that needs lifecycle operations, use Coordinator MCP or the
-public daemon-session CLI. A lifecycle CLI request names the `global` action,
+SDK session CLI. A lifecycle CLI request names the `global` action,
 provides its operation and JSON input, and supplies a caller-chosen idempotency
 key:
 
@@ -206,7 +206,7 @@ Destructive operations (`session.delete`, `context.clear`) require
 ## FAQ
 
 **Is embedding a subprocess?** No — it is a library import; the agent loop runs
-in your process. Process-isolated control uses Coordinator MCP, daemon-session CLI,
+in your process. Process-isolated control uses Coordinator MCP, SDK session CLI,
 or a configured managed adapter.
 
 **Can multiple consumers watch one session?** Yes. In-process subscribers and

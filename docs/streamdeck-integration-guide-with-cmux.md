@@ -26,7 +26,7 @@ level: 2
 
 ## Purpose
 
-Build a Stream Deck control surface that treats cmux as the terminal host, GJC as the interactive coding runtime, and the GJC SDK as the authoritative machine interface for pending questions.
+Build a Stream Deck control surface that treats cmux as the terminal host, GJC as the interactive coding runtime, and `gjc sdk session` as the credential-free machine interface for bounded status and controls. Interactive questions remain in the native GJC UI or a configured managed adapter.
 
 The control surface should:
 
@@ -36,7 +36,7 @@ The control surface should:
 - change the model profile of the focused GJC session;
 - invoke common GJC skills without submitting them prematurely;
 - send precise keyboard controls such as `Shift+Tab`, `Esc`, and `Enter`;
-- render and answer the focused session's SDK questions;
+- surface native or managed-adapter question state without answering it directly;
 - open and close native cmux terminal surfaces;
 - reuse existing Chrome or Safari tabs for ordinary web shortcuts;
 - use distinct, readable mascot artwork for each operation;
@@ -46,9 +46,9 @@ The control surface should:
 
 - cmux is not the terminal host;
 - the Stream Deck application or hardware is unavailable;
-- the target GJC session has SDK hosting disabled with `GJC_SDK_DISABLE=1` and SDK question answering is required;
+- the operator requires direct question answering from Stream Deck; use the native GJC UI or a configured managed adapter instead;
 - the requested action would overwrite a shared checkout containing unrelated work;
-- the operator expects generic UI automation instead of deterministic cmux and SDK commands.
+- the operator expects generic UI automation instead of deterministic cmux and broker-bound SDK commands.
 
 ## Safety invariants
 
@@ -57,12 +57,12 @@ The control surface should:
 3. Never log or commit SDK tokens, provider API keys, browser credentials, or endpoint discovery files.
 4. Resolve the focused cmux surface with `cmux identify --no-caller`; do not infer focus only from tree decorations.
 5. Send GJC-only controls only when the focused surface title starts with `GJC:`.
-6. Use `action_needed.id` as the only authority for a generic SDK question reply.
-7. Do not answer stale, resolved, hidden, non-focused, free-text, or unsupported multi-select questions from fixed answer keys.
+6. Do not attempt generic SDK question replies from Stream Deck; native GJC UI or a managed adapter owns the current presentation.
+7. Do not synthesize answers from stale, resolved, hidden, non-focused, free-text, or unsupported multi-select questions.
 8. Send `Shift+Tab` as one atomic key event. Do not emulate it with separately delivered `Esc`-prefixed text.
 9. Do not create duplicate browser tabs when an existing Chrome or Safari tab matches.
 10. Reuse a focused non-GJC terminal when the operator explicitly wants an in-place worktree launch.
-11. Keep Stream Deck profiles, local plugin installations, generated artwork, and SDK state outside version control. Repository-local `.gjc/state/` is gitignored and is the authoritative SDK discovery location; do not move, delete, or copy it elsewhere.
+11. Keep Stream Deck profiles, local plugin installations, and generated artwork outside version control. Private SDK-core state remains product-owned; do not inspect, move, delete, or copy endpoint discovery records.
 
 ## Reference environment
 
@@ -85,12 +85,12 @@ Stream Deck hardware
   -> Elgato Stream Deck application
      -> native Stream Deck plugin
         -> cmux CLI / socket RPC
-        -> GJC SDK WebSocket endpoints
+        -> broker-bound `gjc sdk session` CLI / managed adapter presentation surface
         -> local launch helpers
         -> generated key images
 ```
 
-Use a native Stream Deck plugin instead of a collection of shell-command actions. The plugin provides dynamic titles, per-key settings, hold/tap handling, SDK subscriptions, focused-session guards, question-state rendering, deterministic cmux routing, and success/error feedback.
+Use a native Stream Deck plugin instead of a collection of shell-command actions. The plugin provides dynamic titles, per-key settings, hold/tap handling, broker-bound status invocations, managed-adapter presentation integration, focused-session guards, deterministic cmux routing, and success/error feedback.
 
 A representative local installation is:
 
@@ -313,61 +313,22 @@ ABORT: Esc -> wait 100 ms -> Esc
 
 Keep these as distinct controls. The abort control should not require a hold unless the operator explicitly requests one.
 
-## SDK question answer pad
+## SDK question presentation boundary
 
-Every top-level GJC session publishes a loopback SDK discovery file:
+A Stream Deck profile must not implement a standalone GJC session attachment. Do
+not scan `.gjc/state/sdk`, parse discovery records, read credentials, or open a
+raw per-session WebSocket.
 
-```text
-<repo>/.gjc/state/sdk/<sessionId>.json
-```
+Use the native GJC UI for interactive questions. A configured managed adapter
+receives the opaque `SessionRouter` attachment required to render and answer a
+current presentation; the Stream Deck can control only the adapter's documented
+presentation surface. For credential-free local status, invoke `gjc sdk session
+inspect <sessionId>` from the selected repository. For broader orchestration,
+use Coordinator MCP.
 
-The file contains the session WebSocket URL and token. Connect with the token as a query parameter and never persist or log it elsewhere.
-
-When the focused session emits:
-
-```json
-{
-  "type": "action_needed",
-  "id": "act_9e31",
-  "kind": "ask",
-  "sessionId": "sess-1",
-  "question": "Choose a target",
-  "options": ["A", "B"],
-  "recommendedIndex": 1
-}
-```
-
-temporarily replace the four profile keys with:
-
-```text
-ANSWER 1 | ANSWER 2 | ANSWER 3 | ANSWER 4
-```
-
-Render the real option labels with bounded wrapping. Highlight the valid recommended index, but never decorate or modify the submitted answer value.
-
-Reply with the exact active presentation ID:
-
-```json
-{
-  "type": "reply",
-  "id": "act_9e31",
-  "answer": 1,
-  "token": "<session token>",
-  "idempotencyKey": "streamdeck-act_9e31-1"
-}
-```
-
-Return to the ordinary profile controls only when `action_resolved` arrives for the **same presentation ID currently displayed**; an `action_resolved` for a different session can arrive while another question's pad is still active, so match the frame `id` against the displayed presentation before clearing it. If `reply_rejected` arrives, show an error and do not guess from question text, option text, workflow IDs, or earlier presentations.
-
-Only display the fixed answer pad when:
-
-- the question belongs to the focused GJC session;
-- the session-to-surface mapping is exact;
-- the action is still active;
-- the question has one to four scalar options;
-- the action has no negotiated `controls` (multi-select and other controlled asks are not safe for a fixed numeric reply).
-
-Leave free-text, multi-select, controlled, and larger option sets to the native GJC UI.
+Do not synthesize question replies from profile keys, cached action IDs, question
+text, option labels, workflow IDs, or historical presentations. A stale or
+ambiguous presentation must remain unanswered rather than being guessed.
 
 ## Mascot artwork
 
@@ -439,16 +400,13 @@ Use temporary surfaces and restore the original focus after each test:
 
 ### SDK behavior
 
-Use a temporary token-authenticated SDK WebSocket server and a temporary GJC-titled cmux surface to prove:
+Use a temporary broker-bound CLI fixture and a temporary GJC-titled cmux surface to prove:
 
-- discovery;
+- credential-free session inspection;
 - focused session mapping;
-- `action_needed` rendering;
-- option wrapping;
-- recommended-option highlighting;
-- exact zero-based reply;
-- `action_resolved` restoration;
-- stale/rejected reply handling.
+- native or managed-adapter question presentation;
+- no discovery-file, credential, or raw transport access;
+- stale or rejected presentation handling that never guesses a reply.
 
 ### Stream Deck restart
 
@@ -478,14 +436,10 @@ The integration is probably sending escape-prefixed text. Replace it with atomic
 
 ### Question options do not appear
 
-Check:
-
-- SDK hosting is enabled;
-- the endpoint PID is alive;
-- the token-authenticated WebSocket connected;
-- the focused surface maps to the endpoint TTY;
-- the focused session was retained even when the session inventory is capped;
-- the question has no more than four scalar options.
+Question presentation belongs to the native GJC UI or a configured managed
+adapter. Confirm the managed adapter has the exact current session mapping and
+that `gjc sdk session inspect <sessionId>` reports the session through the
+Broker. The Stream Deck must not diagnose or attach to the private transport.
 
 ### A browser shortcut creates duplicates
 

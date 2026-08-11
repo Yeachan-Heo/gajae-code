@@ -20,7 +20,7 @@ There is no MCP config discovery or merge, reload while the session runs, subage
 | --- | --- | --- |
 | User trusts one MCP config for one standalone session | `gjc --mcp-config /absolute/path/to/mcp.json` | Exact-file, top-level, tools-only opt-in; GJC owns cleanup. |
 | External bot or multi-session controller | [Coordinator MCP](./hermes-mcp-bridge.md) | Coordinator MCP exposes GJC lifecycle and coordination tools. |
-| External session control | [SDK machine interface](./sdk.md) | The SDK WebSocket protocol is the only external control interface. |
+| External session control | [SDK session CLI](./sdk-session-cli.md) or a managed adapter | Broker-bound controls and opaque Router attachments; no direct endpoint transport. |
 | Editor/ACP client owns MCP servers | ACP via `gjc --mode acp` or `gjc acp` | ACP remains a stdio editor protocol. |
 | Codex / Claude Code delegation plugin | [Canonical gajae-code plugin](./hermes-mcp-bridge.md) | Installs Coordinator MCP plus GJC delegation commands. |
 
@@ -28,7 +28,7 @@ There is no MCP config discovery or merge, reload while the session runs, subage
 
 Standalone GJC does not inherit arbitrary MCP server configurations from Claude Code, Codex, OpenCode, or other tools. MCP servers often carry credentials, filesystem reach, browser state, approval semantics, and lifecycle that belong to the configuring host.
 
-`--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. Do not use the former RPC host-tool protocol to connect an MCP server; use the [SDK machine interface](./sdk.md) for supported external session control.
+`--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` have been removed. Do not use the former RPC host-tool protocol to connect an MCP server; use Coordinator MCP, the [SDK session CLI](./sdk-session-cli.md), or a managed adapter for supported external control.
 
 ## Related docs
 

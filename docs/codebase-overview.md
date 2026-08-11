@@ -28,14 +28,14 @@ Main `gjc` CLI and product runtime.
 
 - `packages/coding-agent/package.json` exposes the `gjc` binary at `src/cli.ts` and the SDK/barrel entrypoint at `src/index.ts`.
 - `packages/coding-agent/src/cli.ts` is the executable bootstrap. It registers CLI commands such as `setup`, `deep-interview`, `ralplan`, `ultragoal`, `team`, and the default launch path.
-- `packages/coding-agent/src/main.ts` adapts CLI options into session creation and dispatches interactive, print, and ACP modes; external machine clients use the SDK WebSocket interface.
+- `packages/coding-agent/src/main.ts` adapts CLI options into session creation and dispatches interactive, print, and ACP modes; process-isolated clients use the broker-bound session CLI, Coordinator MCP, or managed adapters.
 - `packages/coding-agent/src/sdk/session.ts` assembles settings, model registry, auth, workspace/context discovery, skills, rules, tools, system prompt, and the underlying `@gajae-code/agent-core` agent.
 - `packages/coding-agent/src/tools/index.ts` is the built-in tool registry for file/code/runtime tools such as read, bash, edit, AST tools, eval, find/search, LSP, browser, task/subagent, recipe, IRC, todo, web search, and write. Memory backends are private integrations, not public coding-harness tools.
 - `packages/coding-agent/src/defaults/gjc-defaults.ts` embeds and installs the default workflow skills.
 - `packages/coding-agent/src/task/agents.ts` embeds bundled task-agent prompts. The public contract is `executor`, `architect`, `planner`, and `critic`; other bundled prompts are internal/runtime utilities.
 - `packages/coding-agent/src/coordinator/contract.ts` defines the transport-neutral third-party coordinator contract used by `gjc mcp-serve coordinator`, `gjc coordinator`, and `gjc setup hermes`.
 - `packages/coding-agent/src/coordinator-mcp/server.ts` implements the outward MCP adapter for bot/coordinator integrations, including session start/register, turn state, question answering, status reports, and artifact reads.
-- `docs/external-control-readiness.md` classifies the public external-control surfaces: SDK WebSocket for live session control, Coordinator MCP for multi-session control planes, and ACP for editor/ACP clients. `docs/bot-integration.md` is the end-to-end guide for external controller authors.
+- `docs/external-control-readiness.md` classifies the public external-control surfaces: broker-bound SDK session CLI, Coordinator MCP, managed adapters, and ACP. `docs/bot-integration.md` is the end-to-end guide for external controller authors.
 
 ### `packages/ai/`
 
@@ -104,13 +104,13 @@ Private benchmark package for TypeScript edit tasks.
 
 ### External machine interfaces
 
-External machine clients use the SDK WebSocket interface documented in `docs/sdk.md`. Coordinator MCP supplies multi-session orchestration, while ACP remains the stdio editor protocol. The former Python RPC client and bot integration paths were removed with the RPC ingress mode.
+Process-isolated machine clients use the broker-bound session CLI, Coordinator MCP, or managed adapters documented in `docs/sdk.md`. ACP remains the stdio editor protocol. The former Python RPC client and bot integration paths were removed with the RPC ingress mode.
 
 ## Runtime flow
 
 A normal CLI session starts in `packages/coding-agent/src/cli.ts`, routes through command handling, then reaches `packages/coding-agent/src/main.ts`. `main.ts` converts CLI/runtime settings into `CreateAgentSessionOptions` and calls `createAgentSession()` in `packages/coding-agent/src/sdk/session.ts`.
 
-The SDK builds the session context, loads the default skills, creates built-in tools, resolves model/auth state through `@gajae-code/ai`, constructs the system prompt, and instantiates `@gajae-code/agent-core`. The agent loop streams model events, executes tools, records tool results, and hands state back to the selected interactive TUI, print, or ACP mode while exposing external control through the SDK WebSocket interface.
+The SDK builds the session context, loads the default skills, creates built-in tools, resolves model/auth state through `@gajae-code/ai`, constructs the system prompt, and instantiates `@gajae-code/agent-core`. The agent loop streams model events, executes tools, records tool results, and hands state back to the selected interactive TUI, print, or ACP mode; process-isolated control remains behind broker-bound or managed SDK-core surfaces.
 
 ## Verification and gates
 
