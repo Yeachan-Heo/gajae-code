@@ -9,7 +9,7 @@ In **Settings → Profiles → Keys → General** for the profile you use:
 - Left Option Key: `+Esc`
 - Right Option Key: `+Esc`
 
-A verified live configuration sets `Option Key Sends = 1` and `Right Option Key Sends = 1` for both the `Default` and `tmux` profiles. `+Esc` delivers `Option+Q` as `ESC q` and `Option+I` as `ESC i`.
+A verified live configuration sets `Option Key Sends = 2` and `Right Option Key Sends = 2` for both the `Default` and `tmux` profiles. iTerm2's `+Esc` setting (`OPTION_KEY_ESC = 2`) prepends ESC to Option input, delivering `Option+Q` as `ESC q` and `Option+I` as `ESC i`. Value `1` is Meta mode and is not an ESC prefix.
 
 In **Settings → Profiles → Keys → Key Mappings**, remove any `Send Text`, `Send Escape Sequence`, or other mappings that intercept `Option+Q` or `Option+I`, then open a new session for each profile after changing settings.
 
