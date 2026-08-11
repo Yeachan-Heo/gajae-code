@@ -746,7 +746,7 @@ export async function executePython(code: string, options?: PythonExecutorOption
 	const deadlineMs = getExecutionDeadlineMs(options);
 	const deadlineController =
 		deadlineMs !== undefined && options?.signal === undefined ? new AbortController() : undefined;
-	const signal = deadlineController ?? options?.signal;
+	const signal = deadlineController?.signal ?? options?.signal;
 	const remainingMs = getRemainingTimeoutMs(deadlineMs);
 	const deadlineTimer =
 		deadlineController && remainingMs !== undefined
