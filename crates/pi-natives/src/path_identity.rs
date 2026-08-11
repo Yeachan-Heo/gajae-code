@@ -147,6 +147,9 @@ pub struct NativeExactFileIdentity {
 	/// SHA-256 of regular-file bytes. Required for regular-file deletion and
 	/// verified from the detached object before unlinking it.
 	pub sha256:          Option<String>,
+	/// Permit removing exactly this authorized pathname when the inode has other
+	/// hard links. Remaining links are retained after exact quarantine cleanup.
+	pub allow_hard_link: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -162,6 +165,7 @@ struct ExactFileIdentity {
 	detach_only:     bool,
 	quarantine_name: Option<String>,
 	sha256:          Option<[u8; 32]>,
+	allow_hard_link: bool,
 }
 /// Typed result of an identity-bound regular-file deletion or directory detach.
 #[napi(object)]
@@ -412,19 +416,6 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
-	#[cfg(unix)]
-	fn detached_failure_with_successor(code: &str, path: String, successor_path: String) -> Self {
-		Self {
-			ok: false,
-			code: Some(code.to_owned()),
-			payload_durable: None,
-			detached_path: Some(path),
-			retained_successor_path: Some(successor_path),
-			retained_placeholder_path: None,
-			retained_unknown_path: None,
-		}
-	}
-
 	#[cfg(windows)]
 	fn detached_failure_with_successor_and_placeholder(
 		code: &str,
@@ -441,18 +432,6 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 		}
-	}
-
-	#[cfg(unix)]
-	fn with_retained_successor(mut self, successor_path: String, unknown_path: String) -> Self {
-		self.retained_successor_path = Some(successor_path);
-		if self.detached_path.is_none()
-			&& self.retained_placeholder_path.is_none()
-			&& self.retained_unknown_path.is_none()
-		{
-			self.retained_unknown_path = Some(unknown_path);
-		}
-		self
 	}
 
 	#[cfg(unix)]
@@ -648,6 +627,7 @@ fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileId
 		detach_only: identity.detach_only.unwrap_or(false),
 		quarantine_name,
 		sha256,
+		allow_hard_link: identity.allow_hard_link.unwrap_or(false),
 	})
 }
 impl NativeCanonicalDirectoryIdentity {
@@ -3354,6 +3334,7 @@ pub(crate) mod platform {
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 		if !identity.directory
+			&& !identity.allow_hard_link
 			&& (named.st_nlink != 1 || identity.nlink.is_some_and(|nlink| nlink != 1))
 		{
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
@@ -3522,6 +3503,49 @@ pub(crate) mod platform {
 			};
 			return result;
 		}
+		if identity.allow_hard_link {
+			if !matches!(exact_regular_matches(parent_fd, &quarantine, identity), Ok(true)) {
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path);
+			}
+			// SAFETY: parent_fd and the private quarantine name remain live and
+			// identity-verified.
+			let unlinked = unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), 0) } == 0;
+			// SAFETY: parent_fd remains live and binds the mutated quarantine namespace.
+			let synced = unsafe { libc::fsync(parent_fd) } == 0;
+			if !unlinked || !synced {
+				return NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path);
+			}
+			return match remove_exchange_placeholder(parent_fd, &name, placeholder) {
+				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
+				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
+					NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+						code,
+						detached_path,
+						path
+							.parent()
+							.unwrap_or_else(|| Path::new("."))
+							.join(retained_name.to_string_lossy().as_ref())
+							.to_string_lossy()
+							.into_owned(),
+					)
+				},
+				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
+					NativeExactUnlinkResult::detached_failure_with_durable_payload_and_unknown(
+						"cleanup_pending",
+						detached_path,
+						path
+							.parent()
+							.unwrap_or_else(|| Path::new("."))
+							.join(retained_name.to_string_lossy().as_ref())
+							.to_string_lossy()
+							.into_owned(),
+					)
+				},
+				ExchangePlaceholderRemoval::Failed => {
+					NativeExactUnlinkResult::failure("cleanup_pending")
+				},
+			};
+		}
 		// POSIX cannot descriptor-unlink, but it can descriptor-scrub the exact
 		// detached regular file. Durable zero-length retained entries are then
 		// reconciled as internal placeholders without preserving transcript bytes.
@@ -3650,6 +3674,102 @@ pub(crate) mod platform {
 		Ok((parent_fd, name))
 	}
 
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "owned descriptors remain live through validation and close exactly once on every \
+		          branch"
+	)]
+	fn open_publication_source(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<(libc::c_int, libc::stat), &'static str> {
+		let fd = unsafe {
+			libc::openat(
+				parent_fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			)
+		};
+		if fd < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFREG
+		{
+			unsafe { libc::close(fd) };
+			return Err("identity_mismatch");
+		}
+		Ok((fd, stat))
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent descriptor and writable stat buffer remain live for the full \
+		          probe"
+	)]
+	fn published_matches_open_source(
+		parent_fd: libc::c_int,
+		name: &CString,
+		source: &libc::stat,
+	) -> bool {
+		let mut current: libc::stat = unsafe { std::mem::zeroed() };
+		(unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW) })
+			== 0 && current.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& current.st_dev == source.st_dev
+			&& current.st_ino == source.st_ino
+			&& current.st_size == source.st_size
+			&& stat_mtime_ns(&current) == stat_mtime_ns(source)
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent descriptor and exact identity remain live through quarantine \
+		          cleanup"
+	)]
+	fn cleanup_substituted_publication(
+		parent_fd: libc::c_int,
+		name: &CString,
+		path: &Path,
+	) -> NativeExactUnlinkResult {
+		let mut current: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0 || current.st_mode & libc::S_IFMT != libc::S_IFREG
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let Ok(digest) = digest_openat(parent_fd, name) else {
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		};
+		let mut parent: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(parent_fd, &mut parent) } != 0 {
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let identity = ExactFileIdentity {
+			dev:             current.st_dev as u64,
+			ino:             current.st_ino as u64,
+			nlink:           Some(current.st_nlink as u64),
+			parent_dev:      Some(parent.st_dev as u64),
+			parent_ino:      Some(parent.st_ino as u64),
+			size:            current.st_size as u64,
+			mtime_ns:        stat_mtime_ns(&current) as i64,
+			directory:       false,
+			detach_only:     false,
+			quarantine_name: Some(format!(
+				".gjc-substitution-cleanup-{:x}-{:x}-{:x}",
+				current.st_dev,
+				current.st_ino,
+				std::process::id(),
+			)),
+			sha256:          Some(digest),
+			allow_hard_link: true,
+		};
+		exact_unlink_at(parent_fd, name.clone(), path, &identity)
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "publication descriptors are owned here and closed exactly once on every branch"
+	)]
 	pub(super) fn rename_path_no_replace(
 		source_path: &Path,
 		destination_path: &Path,
@@ -3658,29 +3778,91 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return *result,
 		};
+		let mut source_named: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe {
+			libc::fstatat(
+				source_parent,
+				source_name.as_ptr(),
+				&mut source_named,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		} != 0
+		{
+			unsafe { libc::close(source_parent) };
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if source_named.st_mode & libc::S_IFMT == libc::S_IFDIR {
+			let (destination_parent, destination_name) = match open_parent_no_follow(destination_path)
+			{
+				Ok(value) => value,
+				Err(result) => {
+					unsafe { libc::close(source_parent) };
+					return *result;
+				},
+			};
+			let result =
+				rename_no_replace(source_parent, destination_parent, &source_name, &destination_name);
+			unsafe {
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return match result {
+				Ok(()) => NativeExactUnlinkResult::success(),
+				Err(code) => NativeExactUnlinkResult::failure(code),
+			};
+		}
+		let (source_fd, source_stat) = match open_publication_source(source_parent, &source_name) {
+			Ok(value) => value,
+			Err(code) => {
+				unsafe { libc::close(source_parent) };
+				return NativeExactUnlinkResult::failure(code);
+			},
+		};
 		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
 			Ok(value) => value,
 			Err(result) => {
 				// SAFETY: open_parent_no_follow returned this owned, live descriptor; this
 				// error branch transfers it nowhere and closes it exactly once before
 				// returning.
-				unsafe { libc::close(source_parent) };
+				unsafe {
+					libc::close(source_fd);
+					libc::close(source_parent);
+				}
 				return *result;
 			},
 		};
 		let result =
 			rename_no_replace(source_parent, destination_parent, &source_name, &destination_name);
-		// SAFETY: both descriptors are owned by this function, remained live through
-		// the renameat2/renameatx_np call, and are each closed exactly once after the
-		// syscall.
+		let outcome = match result {
+			Ok(())
+				if published_matches_open_source(
+					destination_parent,
+					&destination_name,
+					&source_stat,
+				) =>
+			{
+				NativeExactUnlinkResult::success()
+			},
+			Ok(()) => {
+				let cleanup = cleanup_substituted_publication(
+					destination_parent,
+					&destination_name,
+					destination_path,
+				);
+				if cleanup.ok {
+					NativeExactUnlinkResult::failure("identity_mismatch")
+				} else {
+					cleanup
+				}
+			},
+			Err(code) => NativeExactUnlinkResult::failure(code),
+		};
 		unsafe {
+			libc::close(source_fd);
 			libc::close(source_parent);
 			libc::close(destination_parent);
 		}
-		match result {
-			Ok(()) => NativeExactUnlinkResult::success(),
-			Err(code) => NativeExactUnlinkResult::failure(code),
-		}
+		outcome
 	}
 
 	/// No-overwrite publish of a regular file for filesystems that implement no
@@ -3704,6 +3886,10 @@ pub(crate) mod platform {
 	/// Directories are rejected before the syscall: `linkat` cannot hard-link a
 	/// directory, and reporting that as an identity violation keeps a directory
 	/// publish from silently degrading into a partial one.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "publication descriptors are owned here and closed exactly once on every branch"
+	)]
 	pub(super) fn link_path_no_replace(
 		source_path: &Path,
 		destination_path: &Path,
@@ -3712,13 +3898,23 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return *result,
 		};
+		let (source_fd, source_stat) = match open_publication_source(source_parent, &source_name) {
+			Ok(value) => value,
+			Err(code) => {
+				unsafe { libc::close(source_parent) };
+				return NativeExactUnlinkResult::failure(code);
+			},
+		};
 		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
 			Ok(value) => value,
 			Err(result) => {
 				// SAFETY: open_parent_no_follow returned this owned, live descriptor; this
 				// error branch transfers it nowhere and closes it exactly once before
 				// returning.
-				unsafe { libc::close(source_parent) };
+				unsafe {
+					libc::close(source_fd);
+					libc::close(source_parent);
+				}
 				return *result;
 			},
 		};
@@ -3728,16 +3924,36 @@ pub(crate) mod platform {
 			destination_parent,
 			&destination_name,
 		);
-		// SAFETY: both descriptors are owned by this function, remained live through
-		// the fstatat/linkat calls, and are each closed exactly once after them.
+		let outcome = match result {
+			Ok(())
+				if published_matches_open_source(
+					destination_parent,
+					&destination_name,
+					&source_stat,
+				) =>
+			{
+				NativeExactUnlinkResult::success()
+			},
+			Ok(()) => {
+				let cleanup = cleanup_substituted_publication(
+					destination_parent,
+					&destination_name,
+					destination_path,
+				);
+				if cleanup.ok {
+					NativeExactUnlinkResult::failure("identity_mismatch")
+				} else {
+					cleanup
+				}
+			},
+			Err(code) => NativeExactUnlinkResult::failure(code),
+		};
 		unsafe {
+			libc::close(source_fd);
 			libc::close(source_parent);
 			libc::close(destination_parent);
 		}
-		match result {
-			Ok(()) => NativeExactUnlinkResult::success(),
-			Err(code) => NativeExactUnlinkResult::failure(code),
-		}
+		outcome
 	}
 
 	fn link_no_replace(
@@ -3832,8 +4048,11 @@ pub(crate) mod platform {
 				&& opened.st_ino as u64 == identity.ino
 				&& opened.st_size as u64 == identity.size
 				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
-				&& opened.st_nlink == 1
-				&& identity.nlink.is_none_or(|nlink| nlink == 1)
+				&& (identity.allow_hard_link
+					|| (opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)))
+				&& identity
+					.nlink
+					.is_none_or(|nlink| nlink == opened.st_nlink as u64)
 				&& identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
@@ -3844,6 +4063,11 @@ pub(crate) mod platform {
 		result
 	}
 
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the exact transaction retains all parent and file descriptors until terminal \
+		          verification"
+	)]
 	pub(super) fn exact_replace_path(
 		source_path: &Path,
 		destination_path: &Path,
@@ -3866,174 +4090,167 @@ pub(crate) mod platform {
 		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
 			Ok(value) => value,
 			Err(result) => {
-				// SAFETY: this branch owns source_parent exactly once.
 				unsafe { libc::close(source_parent) };
 				return *result;
 			},
 		};
-		// Serialize checked replacements on the destination object itself. Without this
-		// advisory lock, two publishers can both pass the preflight and then exchange
-		// the same pathname in sequence, defeating the expected-destination CAS.
-		// SAFETY: destination_parent is a live directory descriptor and
-		// destination_name is NUL-terminated.
 		let destination_lock = unsafe {
 			libc::openat(
 				destination_parent,
 				destination_name.as_ptr(),
-				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
 			)
 		};
-		// SAFETY: destination_lock is either an open descriptor or negative; flock does
-		// not dereference it.
 		if destination_lock < 0 || unsafe { libc::flock(destination_lock, libc::LOCK_EX) } != 0 {
 			if destination_lock >= 0 {
-				// SAFETY: this branch owns destination_lock exactly once.
 				unsafe { libc::close(destination_lock) };
 			}
-			// SAFETY: this branch owns source_parent and destination_parent exactly once.
 			unsafe {
 				libc::close(source_parent);
 				libc::close(destination_parent);
 			}
 			return NativeExactUnlinkResult::failure("lock_failed");
 		}
-		let preflight = (|| {
+		let result = (|| {
 			for (parent, identity) in
 				[(source_parent, expected_source), (destination_parent, expected_destination)]
 			{
 				let Some((dev, ino)) = identity.parent_dev.zip(identity.parent_ino) else {
-					return Err("parent_mismatch");
+					return NativeExactUnlinkResult::failure("parent_mismatch");
 				};
-				// SAFETY: zero is a valid initialized representation for fstat output.
 				let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-				// SAFETY: parent is a retained live descriptor and stat is writable.
 				if unsafe { libc::fstat(parent, &mut stat) } != 0
 					|| stat.st_dev as u64 != dev
 					|| stat.st_ino as u64 != ino
 				{
-					return Err("parent_mismatch");
+					return NativeExactUnlinkResult::failure("parent_mismatch");
 				}
 			}
-			if !exact_regular_matches(source_parent, &source_name, expected_source)?
-				|| !exact_regular_matches(destination_parent, &destination_name, expected_destination)?
-			{
-				return Err("identity_mismatch");
+			if !matches!(exact_regular_matches(source_parent, &source_name, expected_source), Ok(true))
+				|| !matches!(
+					exact_regular_matches(destination_parent, &destination_name, expected_destination),
+					Ok(true)
+				) {
+				return NativeExactUnlinkResult::failure("identity_mismatch");
 			}
-			// Revalidate immediately before the atomic exchange. There is no
-			// delete-then-rename publication gap.
-			if !exact_regular_matches(source_parent, &source_name, expected_source)?
-				|| !exact_regular_matches(destination_parent, &destination_name, expected_destination)?
-			{
-				return Err("identity_mismatch");
+			let (source_fd, source_stat) = match open_publication_source(source_parent, &source_name) {
+				Ok(value) => value,
+				Err(code) => return NativeExactUnlinkResult::failure(code),
+			};
+			let private_name = CString::new(format!(
+				".gjc-exact-replace-source-{:x}-{:x}-{:x}",
+				expected_source.dev,
+				expected_source.ino,
+				std::process::id(),
+			))
+			.expect("private exact replacement name contains no NUL");
+			let private_path = source_path.with_file_name(private_name.to_string_lossy().as_ref());
+			let mut pinned_source_identity = expected_source.clone();
+			pinned_source_identity.nlink = None;
+			pinned_source_identity.allow_hard_link = true;
+			let link_result =
+				link_no_replace(source_parent, &source_name, source_parent, &private_name);
+			let pinned = matches!(link_result, Ok(()))
+				&& published_matches_open_source(source_parent, &private_name, &source_stat)
+				&& matches!(
+					exact_regular_matches(source_parent, &private_name, &pinned_source_identity),
+					Ok(true)
+				);
+			unsafe { libc::close(source_fd) };
+			if !pinned {
+				if link_result.is_ok() {
+					let _ = cleanup_substituted_publication(source_parent, &private_name, &private_path);
+				}
+				return NativeExactUnlinkResult::failure("identity_mismatch");
 			}
 			#[cfg(test)]
 			pause_before_exchange_for_test();
-			rename_exchange(source_parent, destination_parent, &source_name, &destination_name)?;
+			if let Err(code) =
+				rename_exchange(source_parent, destination_parent, &private_name, &destination_name)
+			{
+				let _ = cleanup_substituted_publication(source_parent, &private_name, &private_path);
+				return NativeExactUnlinkResult::failure(code);
+			}
 			#[cfg(test)]
 			pause_exact_replace_after_exchange_for_test();
-			Ok(())
-		})();
-		let result = if let Err(code) = preflight {
-			NativeExactUnlinkResult::failure(code)
-		} else {
-			let successor_matches =
-				exact_regular_matches(destination_parent, &destination_name, expected_source);
-			let predecessor_matches =
-				exact_regular_matches(source_parent, &source_name, expected_destination);
-			match (matches!(successor_matches, Ok(true)), matches!(predecessor_matches, Ok(true))) {
-				(true, false) => NativeExactUnlinkResult::retained_unknown_failure(
+			if !matches!(
+				exact_regular_matches(destination_parent, &destination_name, &pinned_source_identity),
+				Ok(true)
+			) || !matches!(
+				exact_regular_matches(source_parent, &private_name, expected_destination),
+				Ok(true)
+			) {
+				return NativeExactUnlinkResult::detached_failure_with_unknown(
 					"identity_mismatch",
-					source_path.to_string_lossy().into_owned(),
-				)
-				.with_retained_successor(
+					private_path.to_string_lossy().into_owned(),
 					destination_path.to_string_lossy().into_owned(),
-					source_path.to_string_lossy().into_owned(),
-				),
-				(false, _) => NativeExactUnlinkResult::detached_failure_with_unknown(
-					"identity_mismatch",
-					source_path.to_string_lossy().into_owned(),
-					destination_path.to_string_lossy().into_owned(),
-				),
-				(true, true) => {
-					if fsync_root_parent(source_parent).is_err() {
-						NativeExactUnlinkResult::detached_failure_with_successor(
-							"durability_failed",
-							source_path.to_string_lossy().into_owned(),
-							destination_path.to_string_lossy().into_owned(),
-						)
-					} else {
-						let predecessor_name = format!(
-							".gjc-exact-replace-destination-{:x}-{:x}",
-							expected_destination.dev, expected_destination.ino
-						);
-						let predecessor_path = source_path.with_file_name(&predecessor_name);
-						let mut cleanup_identity = expected_destination.clone();
-						cleanup_identity.quarantine_name = Some(predecessor_name);
-						let cleanup = exact_unlink_at(
-							source_parent,
-							source_name.clone(),
-							source_path,
-							&cleanup_identity,
-						);
-						let securely_retired = cleanup.ok
-							|| (cleanup.code.as_deref() == Some("cleanup_pending")
-								&& cleanup.payload_durable == Some(true)
-								&& cleanup.detached_path.as_deref()
-									== Some(predecessor_path.to_string_lossy().as_ref())
-								&& cleanup.retained_placeholder_path.is_some()
-								&& cleanup.retained_successor_path.is_none()
-								&& cleanup.retained_unknown_path.is_none());
-						if securely_retired {
-							#[cfg(test)]
-							pause_exact_replace_before_final_verify_for_test();
-							let successor_still_matches = matches!(
-								exact_regular_matches(
-									destination_parent,
-									&destination_name,
-									expected_source,
-								),
-								Ok(true)
-							);
-							if successor_still_matches {
-								if fsync_root_parent(source_parent).is_err() {
-									NativeExactUnlinkResult::retained_successor_failure(
-										"durability_failed",
-										destination_path.to_string_lossy().into_owned(),
-									)
-								} else if matches!(
-									exact_regular_matches(
-										destination_parent,
-										&destination_name,
-										expected_source,
-									),
-									Ok(true)
-								) {
-									NativeExactUnlinkResult::success()
-								} else {
-									NativeExactUnlinkResult::detached_failure_with_unknown(
-										"identity_mismatch",
-										source_path.to_string_lossy().into_owned(),
-										destination_path.to_string_lossy().into_owned(),
-									)
-								}
-							} else {
-								NativeExactUnlinkResult::detached_failure_with_unknown(
-									"identity_mismatch",
-									source_path.to_string_lossy().into_owned(),
-									destination_path.to_string_lossy().into_owned(),
-								)
-							}
-						} else {
-							cleanup.with_retained_successor_and_expected_detached(
-								destination_path.to_string_lossy().into_owned(),
-								source_path.to_string_lossy().into_owned(),
-							)
-						}
-					}
-				},
+				);
 			}
-		};
-		// SAFETY: this function owns all retained descriptors exactly once.
+			let mut source_cleanup_identity = expected_source.clone();
+			source_cleanup_identity.nlink = None;
+			source_cleanup_identity.allow_hard_link = true;
+			source_cleanup_identity.quarantine_name = Some(format!(
+				".gjc-exact-replace-source-cleanup-{:x}-{:x}",
+				expected_source.ino,
+				std::process::id(),
+			));
+			let source_cleanup = exact_unlink_at(
+				source_parent,
+				source_name.clone(),
+				source_path,
+				&source_cleanup_identity,
+			);
+			let mut destination_cleanup_identity = expected_destination.clone();
+			destination_cleanup_identity.quarantine_name = Some(format!(
+				".gjc-exact-replace-destination-{:x}-{:x}",
+				expected_destination.ino,
+				std::process::id(),
+			));
+			let destination_cleanup = exact_unlink_at(
+				source_parent,
+				private_name,
+				&private_path,
+				&destination_cleanup_identity,
+			);
+			let cleanup_accepted = |cleanup: &NativeExactUnlinkResult| {
+				cleanup.ok
+					|| (cleanup.code.as_deref() == Some("cleanup_pending")
+						&& cleanup.payload_durable == Some(true)
+						&& cleanup.retained_successor_path.is_none()
+						&& cleanup.retained_unknown_path.is_none())
+			};
+			if !cleanup_accepted(&destination_cleanup) {
+				return destination_cleanup.with_retained_successor_and_expected_detached(
+					destination_path.to_string_lossy().into_owned(),
+					private_path.to_string_lossy().into_owned(),
+				);
+			}
+			if !cleanup_accepted(&source_cleanup) {
+				return NativeExactUnlinkResult::retained_successor_failure(
+					"identity_mismatch",
+					destination_path.to_string_lossy().into_owned(),
+				);
+			}
+			#[cfg(test)]
+			pause_exact_replace_before_final_verify_for_test();
+			if fsync_root_parent(source_parent).is_err() {
+				return NativeExactUnlinkResult::retained_successor_failure(
+					"durability_failed",
+					destination_path.to_string_lossy().into_owned(),
+				);
+			}
+			if !matches!(
+				exact_regular_matches(destination_parent, &destination_name, expected_source),
+				Ok(true)
+			) {
+				return NativeExactUnlinkResult::detached_failure_with_unknown(
+					"identity_mismatch",
+					source_path.to_string_lossy().into_owned(),
+					destination_path.to_string_lossy().into_owned(),
+				);
+			}
+			NativeExactUnlinkResult::success()
+		})();
 		unsafe {
 			libc::close(destination_lock);
 			libc::close(source_parent);
@@ -6130,7 +6347,7 @@ mod platform {
 		if !handle_identity_matches(&information, identity) {
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
-		if !identity.directory && information.nNumberOfLinks != 1 {
+		if !identity.directory && !identity.allow_hard_link && information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
 		if !identity.directory
@@ -8013,6 +8230,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          Some(sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8082,6 +8300,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8158,6 +8377,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8238,6 +8458,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8311,6 +8532,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256: Some(sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -8410,6 +8632,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          Some(sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -9194,6 +9417,7 @@ mod exact_replace_path_tests {
 			detach_only:     false,
 			quarantine_name: None,
 			sha256:          Some(sha256(bytes)),
+			allow_hard_link: false,
 		}
 	}
 
@@ -9226,7 +9450,7 @@ mod exact_replace_path_tests {
 			.map(|entry| entry.path())
 			.filter(|path| path != &destination)
 			.collect::<Vec<_>>();
-		assert_eq!(retained.len(), 2, "only scrubbed internal placeholders may remain");
+		assert_eq!(retained.len(), 3, "only scrubbed internal placeholders may remain");
 		for path in retained {
 			assert_eq!(fs::read(path).expect("read scrubbed placeholder"), b"");
 		}
@@ -9302,13 +9526,21 @@ mod exact_replace_path_tests {
 
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
-		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		let detached = result
+			.detached_path
+			.as_deref()
+			.expect("retained private predecessor path");
+		assert!(detached.contains(".gjc-exact-replace-source-"));
 		assert_eq!(
 			result.retained_unknown_path.as_deref(),
 			Some(destination.to_string_lossy().as_ref())
 		);
-		assert_eq!(fs::read(&destination).expect("read mutated destination"), b"attacker-source");
-		assert_eq!(fs::read(&source).expect("read mutated source"), b"attacker-destination");
+		assert_eq!(fs::read(&destination).expect("read committed destination"), b"successor");
+		assert_eq!(fs::read(&source).expect("read substituted source"), b"attacker-source");
+		assert_eq!(
+			fs::read(detached).expect("read retained private predecessor"),
+			b"attacker-destination"
+		);
 		assert_eq!(fs::read(&retained_source).expect("read retained successor"), b"successor");
 		assert_eq!(
 			fs::read(&retained_destination).expect("read retained predecessor"),
@@ -9356,9 +9588,9 @@ mod exact_replace_path_tests {
 			result.retained_successor_path.as_deref(),
 			Some(destination.to_string_lossy().as_ref())
 		);
-		assert_eq!(result.retained_unknown_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(result.retained_unknown_path, None);
 		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
-		assert_eq!(fs::read(&predecessor).expect("read retained predecessor"), b"predecessor");
+		assert_eq!(fs::read(&predecessor).expect("read retained source link"), b"successor");
 		assert_eq!(fs::read(&source).expect("read substituted source"), b"attacker");
 	}
 
@@ -9399,14 +9631,18 @@ mod exact_replace_path_tests {
 
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
-		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		let detached = result
+			.detached_path
+			.as_deref()
+			.expect("retained private predecessor path");
 		assert_eq!(
 			result.retained_unknown_path.as_deref(),
 			Some(destination.to_string_lossy().as_ref())
 		);
 		assert_eq!(result.retained_successor_path, None);
 		assert_eq!(fs::read(&successor).expect("read retained successor"), b"successor");
-		assert_eq!(fs::read(&source).expect("read retained predecessor"), b"predecessor");
+		assert_eq!(fs::read(&source).expect("read retained source link"), b"successor");
+		assert_eq!(fs::read(detached).expect("read retained predecessor"), b"predecessor");
 		assert_eq!(fs::read(&destination).expect("read substituted destination"), b"attacker");
 	}
 
@@ -9532,18 +9768,13 @@ mod exact_replace_path_tests {
 		platform::inject_rename_exchange_failure(0);
 
 		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("cleanup_failed"));
-		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path, None);
 		assert_eq!(
 			result.retained_successor_path.as_deref(),
 			Some(destination.to_string_lossy().as_ref())
 		);
-		let retained_placeholder = result
-			.retained_placeholder_path
-			.as_deref()
-			.expect("retained cleanup helper path");
-		assert!(Path::new(retained_placeholder).exists());
-		assert_eq!(fs::read(&source).expect("read retained predecessor"), b"predecessor");
+		assert_eq!(fs::read(&source).expect("read retained source link"), b"successor");
 		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
 	}
 	#[test]
@@ -9570,12 +9801,12 @@ mod exact_replace_path_tests {
 
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("durability_failed"));
-		assert_eq!(result.detached_path.as_deref(), Some(source.to_string_lossy().as_ref()));
+		assert_eq!(result.detached_path, None);
 		assert_eq!(
 			result.retained_successor_path.as_deref(),
 			Some(destination.to_string_lossy().as_ref())
 		);
-		assert_eq!(fs::read(&source).expect("read retained predecessor"), b"predecessor");
+		assert!(!source.exists());
 		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
 	}
 
@@ -9591,7 +9822,7 @@ mod exact_replace_path_tests {
 		fs::write(&destination, b"predecessor").expect("seed destination predecessor");
 		let expected_source = identity(&source, &temporary.0, b"successor");
 		let expected_destination = identity(&destination, &temporary.0, b"predecessor");
-		platform::inject_root_parent_fsync_failure(2);
+		platform::inject_root_parent_fsync_failure(1);
 
 		let result = platform::exact_replace_path(
 			&source,

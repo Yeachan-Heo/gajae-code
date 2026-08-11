@@ -10891,15 +10891,13 @@ export class AgentSession {
 			await this.sessionManager.flush();
 
 			const boundedColdForkEligible =
-				this.sessionManager.getSessionMemoryStats().coldRetirementActive &&
-				!this.sessionManager.isManagedDestination() &&
-				previousSessionFile !== undefined;
+				this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined;
 			if (boundedColdForkEligible) {
 				const previousManager = this.sessionManager;
 				const forkedManager = await SessionManager.forkFrom(
 					previousSessionFile,
 					previousManager.getCwd(),
-					SessionManager.explicitDestination(previousManager.getSessionDir()),
+					previousManager.getDestinationForFork(),
 					undefined,
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
@@ -10907,8 +10905,8 @@ export class AgentSession {
 				try {
 					await initializeLocalRoot({
 						getArtifactsDir: () => forkedManager.getArtifactsDir(),
-						isManagedDestination: () => false,
-						getManagedLegacyLocalMigrationSource: () => null,
+						isManagedDestination: () => forkedManager.isManagedDestination(),
+						getManagedLegacyLocalMigrationSource: () => forkedManager.getManagedLegacyLocalMigrationSource(),
 						getSessionId: () => forkedManager.getSessionId(),
 					});
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
@@ -13114,7 +13112,7 @@ export class AgentSession {
 			// and the generated handoff document is preserved for copy/retry.
 			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
-			const rollbackSessionState = this.sessionManager.captureState();
+			const rollbackSessionState = await this.sessionManager.captureRollbackState();
 			const rollbackAgentMessages = [...this.agent.state.messages];
 			const rollbackSteeringMessages = [...this.#steeringMessages];
 			const rollbackFollowUpMessages = [...this.#followUpMessages];
@@ -13226,7 +13224,7 @@ export class AgentSession {
 				// failure is non-destructive. Predecessor gate emitter, provider
 				// sessions, async jobs, IRC/plan bookkeeping, and injection signatures
 				// were never mutated before commit, so they survive intact.
-				this.sessionManager.restoreState(rollbackSessionState);
+				await this.sessionManager.restoreRollbackState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				this.agent.replaceMessages(rollbackAgentMessages, {
@@ -13658,7 +13656,10 @@ export class AgentSession {
 			imageBytes,
 			sessionResidentImageBytes: this.sessionManager.getResidentImageBytes(),
 			materializedResidentBytes:
-				this.#streamingEditFileCache.totalBytes + sessionMemory.hotRegionBytes + sessionMemory.metaDescriptorBytes,
+				this.#streamingEditFileCache.totalBytes +
+				sessionMemory.allocatedCacheBytes +
+				sessionMemory.hotResidentBytes +
+				sessionMemory.metadataResidentBytes,
 			tuiChatChildren: retainedMemory.tuiChatChildren ?? 0,
 			tuiCachedRenderBytes: retainedMemory.tuiCachedRenderBytes ?? 0,
 		};
@@ -17603,7 +17604,7 @@ export class AgentSession {
 			this.#disconnectFromAgent();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flush();
-			const previousSessionState = this.sessionManager.captureState();
+			const previousSessionState = await this.sessionManager.captureRollbackState();
 			const previousSessionContext = this.buildDisplaySessionContext();
 			// switchSession replaces these arrays wholesale during load/rollback, so retaining
 			// the existing message objects is sufficient and avoids structured-clone failures for
@@ -17834,7 +17835,7 @@ export class AgentSession {
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
-				this.sessionManager.restoreState(previousSessionState);
+				await this.sessionManager.restoreRollbackState(previousSessionState);
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.#activeModelProfile = previousActiveModelProfile;

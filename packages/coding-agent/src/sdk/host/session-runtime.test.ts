@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "../../extensibility/extensions";
+import { Broker } from "../broker/broker";
 import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
@@ -263,6 +264,7 @@ describe("SessionSdkSessionRuntime", () => {
 		} as any;
 		const transports: Array<{ starts: number; stops: number }> = [];
 		createSdkSessionRuntimeExtension(api, {
+			agentDir: path.join(cwd, ".gjc", "agent"),
 			createTransport: async ({ sessionId, stateRoot, token }) => {
 				const stats = { starts: 0, stops: 0 };
 				const failFirstStop = transports.length === 0;
@@ -281,6 +283,9 @@ describe("SessionSdkSessionRuntime", () => {
 					sendFrame: () => {},
 					start: async () => {
 						stats.starts += 1;
+						const endpoint = path.join(stateRoot, "sdk", `${sessionId}.json`);
+						await mkdir(path.dirname(endpoint), { recursive: true });
+						await writeFile(endpoint, JSON.stringify({ sessionId, token, pid: process.pid }));
 						return { url: `ws://127.0.0.1:${30_000 + stats.starts}` };
 					},
 					stop: async () => {
@@ -312,6 +317,95 @@ describe("SessionSdkSessionRuntime", () => {
 			expect(transports[1]?.starts).toBe(1);
 			await handlers.get("session_shutdown")?.({}, firstContext);
 			expect(transports[1]?.stops).toBe(1);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("keeps a local SDK-only host alive through broker failure and registers after recovery", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-broker-recovery-"));
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		await mkdir(path.dirname(agentDir), { recursive: true });
+		await writeFile(agentDir, "blocked");
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		const sessionId = "broker-recovery";
+		createSdkSessionRuntimeExtension(api, {
+			agentDir,
+			createTransport: async ({ stateRoot, token }) => ({
+				sessionId,
+				stateRoot,
+				token,
+				onFrame: () => undefined,
+				sendFrame: () => {},
+				start: async () => {
+					const endpoint = path.join(stateRoot, "sdk", `${sessionId}.json`);
+					await mkdir(path.dirname(endpoint), { recursive: true });
+					await writeFile(endpoint, JSON.stringify({ sessionId, token, pid: process.pid }));
+					return { url: "ws://127.0.0.1:1" };
+				},
+				stop: async () => {},
+			}),
+		});
+		const context = extensionContext(sessionId, cwd);
+		let broker: Broker | undefined;
+		try {
+			await handlers.get("session_start")?.({}, context);
+			await rm(agentDir);
+			await mkdir(agentDir, { recursive: true });
+			broker = new Broker({ agentDir });
+			await broker.start();
+			await handlers.get("turn_start")?.({}, context);
+			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
+				{
+					ok: true,
+					result: { sessionId, token: expect.any(String) },
+				},
+			);
+			await handlers.get("session_shutdown")?.({}, context);
+			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
+				{
+					ok: false,
+					error: { code: "endpoint_stale", message: "session endpoint is stale" },
+				},
+			);
+		} finally {
+			await broker?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects lifecycle-required SDK-only startup when broker registration fails", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-broker-required-"));
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		await mkdir(path.dirname(agentDir), { recursive: true });
+		await writeFile(agentDir, "blocked");
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		createSdkSessionRuntimeExtension(api, {
+			agentDir,
+			brokerRegistrationRequired: true,
+			createTransport: async ({ sessionId, stateRoot, token }) => ({
+				sessionId,
+				stateRoot,
+				token,
+				onFrame: () => undefined,
+				sendFrame: () => {},
+				start: async () => ({ url: "ws://127.0.0.1:1" }),
+				stop: async () => {},
+			}),
+		});
+		try {
+			await expect(
+				handlers.get("session_start")?.({}, extensionContext("broker-required", cwd)),
+			).rejects.toBeDefined();
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
@@ -359,6 +453,7 @@ async function invocationHarness(
 		sendUserMessage: hooks.sendUserMessage ?? (async () => {}),
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
 			stateRoot,

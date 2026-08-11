@@ -395,12 +395,12 @@ export class ReducerBudget {
 
 const SPILL_SEGMENT = ".spill.";
 const DERIVED_SUFFIXES = new Set(["idx", "tail", "commit", "buckets"]);
-const DERIVED_PREFIXES = ["dict-", "capture-", "fork-", "overlay-", "parent-", "metadata-"];
+const DERIVED_PREFIXES = ["build-", "dict-", "capture-", "fork-", "overlay-", "parent-", "metadata-"];
 
 /**
  * Single source of truth for every sidecar artifact and temp: `*.spill.idx`,
  * `*.spill.tail`, `*.spill.commit`, `*.spill.buckets`, `*.spill.dict-*`,
- * `*.spill.capture-*`, `*.spill.fork-*`, `*.spill.overlay-*`,
+ * `*.spill.capture-*`, `*.spill.fork-*`, `*.spill.overlay-*`, `*.spill.build-lock`,
  * `*.spill.parent-*` (persistent parent→children buckets),
  * `*.spill.metadata-*` (persistent metadata-delta section), and any
  * `*.spill.*.tmp`. Used at every fork/delete/sweep/Memory-parity callsite so
@@ -921,11 +921,14 @@ export function validateCommit(
 	if (commit.terminalChecksum !== computedTerminal) return { kind: "invalid", reason: "terminal_checksum_mismatch" };
 	const expectedTerminalSeq = records.length === 0 ? -1 : records[records.length - 1].seq;
 	if (commit.terminalSeq !== expectedTerminalSeq) return { kind: "invalid", reason: "terminal_seq_mismatch" };
-	const expectedSize =
+	const tailTerminalEnd =
 		records.length === 0
 			? commit.base.baseEndOffset
 			: records[records.length - 1].byteOffset + records[records.length - 1].byteLength;
-	if (commit.transcriptSize !== expectedSize) return { kind: "invalid", reason: "transcript_size_mismatch" };
+	// Adoption is valid only when the commit marker, the validated tail's
+	// terminal byte, and the authoritative transcript descriptor all agree.
+	if (commit.transcriptSize !== tailTerminalEnd || commit.transcriptSize !== observed.descriptor.size)
+		return { kind: "invalid", reason: "transcript_size_mismatch" };
 	if (!sameDescriptor(commit.descriptor, observed.descriptor))
 		return { kind: "invalid", reason: "descriptor_mismatch" };
 	if (!observed.terminalMarkerValid) return { kind: "invalid", reason: "terminal_marker_mismatch" };
@@ -1706,13 +1709,12 @@ export interface DictionaryIdDetector {
 }
 
 /**
- * Bounded duplicate-id oracle. Small transcripts stay in a tiny exact set;
- * larger transcripts promote once to the fixed-capacity 48-bit hash table.
- * A hash collision can only produce a spurious duplicate (fail closed), never
- * miss a true duplicate.
+ * Bounded duplicate-id oracle. The fixed-capacity 48-bit hash table is allocated
+ * on the first record, so no attacker-controlled id string is retained by the
+ * detector. A hash collision can only produce a spurious duplicate (fail
+ * closed), never miss a true duplicate.
  */
 export class BoundedDictionaryIdSet implements DictionaryIdDetector {
-	#small: Set<string> | undefined = new Set();
 	#high: Uint16Array | undefined;
 	#low: Uint32Array | undefined;
 	#size = 0;
@@ -1731,6 +1733,12 @@ export class BoundedDictionaryIdSet implements DictionaryIdDetector {
 		const low = this.#hash(value, 0x9e3779b9);
 		if (high === 0 && low === 0) high = 1;
 		return [high, low];
+	}
+
+	#ensureHashTable(): void {
+		if (this.#high !== undefined) return;
+		this.#high = new Uint16Array(DICTIONARY_ID_SET_CAPACITY);
+		this.#low = new Uint32Array(DICTIONARY_ID_SET_CAPACITY);
 	}
 
 	#insertHash(high: number, low: number): "added" | "duplicate" | "full" {
@@ -1752,18 +1760,8 @@ export class BoundedDictionaryIdSet implements DictionaryIdDetector {
 		return "full";
 	}
 
-	#promote(): void {
-		this.#high = new Uint16Array(DICTIONARY_ID_SET_CAPACITY);
-		this.#low = new Uint32Array(DICTIONARY_ID_SET_CAPACITY);
-		for (const value of this.#small!) {
-			const [high, low] = this.#hashPair(value);
-			this.#insertHash(high, low);
-		}
-		this.#small = undefined;
-	}
-
 	has(value: string): boolean {
-		if (this.#small) return this.#small.has(value);
+		if (this.#high === undefined) return false;
 		const [high, low] = this.#hashPair(value);
 		const highs = this.#high!;
 		const lows = this.#low!;
@@ -1781,15 +1779,7 @@ export class BoundedDictionaryIdSet implements DictionaryIdDetector {
 
 	add(value: string): "added" | "duplicate" | "full" {
 		if (this.#size >= DICTIONARY_ID_SET_MAX_RECORDS) return "full";
-		if (this.#small) {
-			if (this.#small.has(value)) return "duplicate";
-			if (this.#small.size < 4096) {
-				this.#small.add(value);
-				this.#size++;
-				return "added";
-			}
-			this.#promote();
-		}
+		this.#ensureHashTable();
 		const [high, low] = this.#hashPair(value);
 		const result = this.#insertHash(high, low);
 		if (result === "added") this.#size++;

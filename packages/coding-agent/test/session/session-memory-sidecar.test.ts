@@ -19,6 +19,7 @@ import {
 	BoundedParentArtifactBuilder,
 	BoundedParentChildrenIndex,
 	type CommitMarkerContents,
+	type CommittedTail,
 	classifyReopen,
 	coldBranchOrdinalRunWithinPrefetchBounds,
 	computeLineDigest,
@@ -338,7 +339,7 @@ describe("BoundedDictionaryBuilder", () => {
 describe("anchored base digest + rolling tail chain tamper detection", () => {
 	const base: BaseAnchor = { baseDigest: "abc123", baseEndOffset: 100 };
 
-	function couple(): { records: TailRecordInput[]; tail: ReturnType<RollingTailChainBuilder["build"]> } {
+	function couple(): { records: TailRecordInput[]; tail: CommittedTail } {
 		const records: TailRecordInput[] = [
 			{
 				seq: 0,
@@ -425,7 +426,7 @@ describe("commit validation", () => {
 
 	function consistentCommit(): {
 		commit: CommitMarkerContents;
-		records: ReturnType<RollingTailChainBuilder["build"]>["records"];
+		records: CommittedTail["records"];
 	} {
 		const builder = new RollingTailChainBuilder(base);
 		builder.append({
@@ -474,11 +475,22 @@ describe("commit validation", () => {
 		});
 		expect(result.kind).toBe("valid");
 	});
+	it("rejects a transcript-ahead prefix marker even when its descriptor is rewritten", () => {
+		const { commit, records } = consistentCommit();
+		const aheadDescriptor: DescriptorSnapshot = { ...descriptor, size: descriptor.size + 64 };
+		const result = validateCommit({ ...commit, descriptor: aheadDescriptor }, records, {
+			descriptor: aheadDescriptor,
+			baseValid: true,
+			tailValid: true,
+			terminalMarkerValid: true,
+		});
+		expect(result).toMatchObject({ kind: "invalid", reason: "transcript_size_mismatch" });
+	});
 
-	it("flags a descriptor mismatch", () => {
+	it("flags a descriptor identity mismatch", () => {
 		const { commit, records } = consistentCommit();
 		const result = validateCommit(commit, records, {
-			descriptor: { ...descriptor, size: 999 },
+			descriptor: { ...descriptor, ino: 999n },
 			baseValid: true,
 			tailValid: true,
 			terminalMarkerValid: true,
@@ -953,13 +965,22 @@ describe("BoundedDictionaryArtifactBuilder", () => {
 		entryType: "message",
 	});
 
-	it("preserves exact duplicate detection after promoting the small-id set", () => {
+	it("uses fixed-size hashes from the first record", () => {
 		const detector = new BoundedDictionaryIdSet();
 		for (let index = 0; index < 5_000; index++) {
 			if (detector.add(`entry-${index}`) !== "added") throw new Error(`unexpected duplicate at ${index}`);
 		}
 		expect(detector.has("entry-4999")).toBe(true);
 		expect(detector.add("entry-4999")).toBe("duplicate");
+		expect(detector.has("missing")).toBe(false);
+	});
+	it("does not retain a hostile long id in the duplicate detector", () => {
+		const detector = new BoundedDictionaryIdSet();
+		const hostileId = "x".repeat(1024 * 1024);
+		expect(detector.add(hostileId)).toBe("added");
+		expect(detector.has(hostileId)).toBe(true);
+		expect(detector.add(hostileId)).toBe("duplicate");
+		expect(detector.add("after-hostile")).toBe("added");
 		expect(detector.has("missing")).toBe(false);
 	});
 	it("builds deterministic partitions within the 20 MiB build peak", () => {

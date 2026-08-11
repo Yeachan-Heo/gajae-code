@@ -40,7 +40,7 @@ import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../sessio
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
-import { SessionManager } from "../session/session-manager";
+import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
@@ -296,7 +296,7 @@ export class ManagedTaskPersistence {
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
-	async openSession(cwd: string, sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow"): Promise<SessionManager> {
+	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
 		const store = this.#artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
 		this.#artifacts.assertManagedBinding();

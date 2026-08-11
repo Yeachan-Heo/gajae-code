@@ -7,6 +7,7 @@
 - Code summarization now runs on the native blocking-work pool and returns a promise, keeping the JavaScript render and input loop responsive while tree-sitter parses source.
 - The macOS computer batch controller is now warning-free under the workspace's strict Clippy configuration, with infallible result construction represented directly instead of wrapped in redundant `Result` values.
 - macOS Terminal.app Meta-wrapped escape sequences such as Option+Arrow are now recognized by the native key matcher and parser.
+- POSIX checked file publication now retains an open source descriptor across no-replace rename/link validation, pins exact replacements behind a verified private source link, and can retire one explicitly authorized staging hard-link name without touching the remaining published alias.
 
 ## [0.12.21] - 2026-08-09
 

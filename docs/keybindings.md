@@ -19,7 +19,7 @@ Chord names are case-insensitive. New configuration should use canonical textual
 Configuration uses portable canonical key IDs, not the labels printed by a particular host: use `ctrl`, `alt`, `shift`, and `super` with a key name, for example `ctrl+p`, `alt+enter`, `shift+tab`, and `super+c`. macOS aliases `option`/`meta` normalize to `alt`, and `command`/`cmd` normalize to `super`; canonical names are recommended for portable files.
 
 Runtime UI labels are platform-native. On macOS, `Ctrl`, `Alt`, `Shift`, and `Super` display as `⌃`, `⌥`, `⇧`, and `⌘`; MacBook keycaps such as Return, Escape, Tab, Delete, and the arrow keys display as `↩`, `⎋`, `⇥`, `⌫`/`⌦`, and arrows. These glyphs are display labels only: configure `super+c`, not `⌘C`, and `alt+enter`, not `⌥↩`.
-On macOS, both left and right Option keys use the same terminal Meta/Esc path. Option shortcuts therefore require the terminal profile to forward Option as Meta/Esc or to use an enhanced keyboard protocol. In Apple Terminal, enable **Settings > Profiles > Keyboard > Use Option as Meta key** for the profile used by GJC; this setting covers both physical Option keys. The parser also accepts legacy Meta-wrapped arrows, paging, function keys, and other escape sequences.
+On macOS, both left and right Option keys use the same terminal Meta/Esc path. Option shortcuts therefore require the terminal profile to forward Option as Meta/Esc or to use an enhanced keyboard protocol. In Apple Terminal, enable **Settings > Profiles > Keyboard > Use Option as Meta key** for the profile used by GJC; this setting covers both physical Option keys. In Ghostty, set `macos-option-as-alt = true` in `~/.config/ghostty/config`, then reload its configuration or restart it. The parser also accepts legacy Meta-wrapped arrows, paging, function keys, and other escape sequences.
 Apple Terminal reserves most Command shortcuts for its own menus, so those key events never enter the PTY and cannot be recovered by GJC. `super+...` bindings work when the terminal sends a Super modifier through Kitty/modifyOtherKeys or an explicit profile key mapping; map the desired Command chord under **Profiles > Keyboard > Key list** when using Terminal.app. Text produced by an Option key as composed Unicode cannot be reverse-inferred as an Option chord.
 For example, to bind Command+P, set the GJC action to `super+p` (or `command+p`, which is normalized), then add a Terminal.app profile mapping for Command+P that sends Kitty `CSI 112;9u` (`Send Escape Sequence` value `[112;9u`, or the equivalent hex bytes including the leading `ESC`). The mapping is required because no PTY application can recover a Command event that Terminal.app consumed.
 For terminals that do not forward Option, remap the queue actions to canonical Control chords (choose unclaimed chords appropriate for your terminal), for example:
@@ -64,6 +64,8 @@ Set an action to an empty array to disable it:
 | `app.clipboard.copyPrompt` | `alt+shift+c` | Copy the whole prompt |
 | `app.stt.toggle` | `alt+h` | Toggle speech-to-text recording |
 | `app.irc.sidebar.toggle` | `alt+i` | Toggle IRC sidebar |
+
+For setup, microphone permissions, first-use behavior, and troubleshooting, see [Speech-to-text](./speech-to-text.md).
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 

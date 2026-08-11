@@ -297,7 +297,7 @@ describe("ModelSelector canonical model selection", () => {
 		installTestTheme();
 
 		selector.handleInput("\n");
-		for (let i = 0; i < 5; i++) selector.handleInput("\x1b[B");
+		for (let i = 0; i < 6; i++) selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
 		// Batch assignment of a reasoning model requires an explicit effort choice.
@@ -326,7 +326,7 @@ describe("ModelSelector canonical model selection", () => {
 		installTestTheme();
 
 		selector.handleInput("\n");
-		for (let i = 0; i < 6; i++) selector.handleInput("\x1b[B");
+		for (let i = 0; i < 7; i++) selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
 		// Batch assignment of a reasoning model requires an explicit effort choice.
@@ -337,7 +337,7 @@ describe("ModelSelector canonical model selection", () => {
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected all-targets selection");
 		expect(selectedAfterEnter.role).toBe("default");
-		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic"]);
+		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic", "image"]);
 		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
 	});

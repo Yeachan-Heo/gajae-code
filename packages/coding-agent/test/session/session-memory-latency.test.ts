@@ -22,7 +22,7 @@ describe.skipIf(!enabled)("session memory latency / I-O (AC11)", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-latency-worker.ts");
 		const result = Bun.spawnSync({
 			cmd: [process.execPath, worker],
-			env: process.env,
+			env: { ...process.env, GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled" },
 			stdout: "pipe",
 			stderr: "pipe",
 		});

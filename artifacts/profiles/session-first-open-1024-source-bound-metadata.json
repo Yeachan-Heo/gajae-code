@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "kind": "cpu-profile-source-receipt",
+  "sourceCommit": "b41feb2ad",
+  "sourceTree": "db03b6e7c0eca42772332afe8ec78bf2cdacf293",
+  "cumulativeDiffSha256": "c477d6e40799ef03ff5e3ce3361a3818d0f70978ae5736667a4e642b39504041",
+  "command": [
+    "bun",
+    "--cpu-prof",
+    "--cpu-prof-md",
+    "--cpu-prof-name=session-first-open-1024-source-bound.md",
+    "--cpu-prof-dir=artifacts/profiles",
+    "--cpu-prof-interval=1000",
+    "packages/coding-agent/bench/session-scenario-matrix.ts",
+    "--worker",
+    "linear-resume",
+    "1024",
+    "raw-cold-first-open",
+    "enabled",
+    "pressure",
+    "off",
+    "1",
+    "1"
+  ],
+  "environment": {
+    "GJC_SESSION_MEMORY_GC_STRATEGY": "pressure",
+    "GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE": "disabled"
+  },
+  "artifacts": {
+    "cpuProfile": "artifacts/profiles/session-first-open-1024-source-bound.cpuprofile",
+    "markdownProfile": "artifacts/profiles/session-first-open-1024-source-bound.md.md",
+    "run": "artifacts/session-first-open-1024-source-bound-run.json",
+    "markdownRun": "artifacts/session-first-open-1024-source-bound-run-md.json"
+  },
+  "observed": {
+    "firstOpenMs": 953.46725,
+    "operationRssGrowthBytes": 105627648,
+    "gcRequests": 5,
+    "gcElapsedMs": 18.895084,
+    "warmRangeReads": 0,
+    "topSelfTime": [
+      { "function": "update", "percent": 43.9 },
+      { "function": "write", "percent": 10.6 },
+      { "function": "stringify", "percent": 6.0 },
+      { "function": "byteLength", "percent": 5.6 },
+      { "function": "gc", "percent": 4.4 },
+      { "function": "parse", "percent": 4.0 },
+      { "function": "readSync", "percent": 3.9 }
+    ]
+  }
+}

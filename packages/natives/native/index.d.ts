@@ -1786,6 +1786,11 @@ export interface NativeExactFileIdentity {
    * verified from the detached object before unlinking it.
    */
   sha256?: string
+  /**
+   * Permit removing exactly this authorized pathname when the inode has other
+   * hard links. Remaining links are retained after exact quarantine cleanup.
+   */
+  allowHardLink?: boolean
 }
 
 /** Typed result of an identity-bound regular-file deletion or directory detach. */

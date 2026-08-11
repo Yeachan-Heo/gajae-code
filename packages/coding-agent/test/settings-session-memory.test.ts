@@ -8,11 +8,11 @@ import {
 } from "../src/config/settings-schema";
 
 describe("sessionMemory settings", () => {
-	it("defines the mode enum with off/shadow/enabled and defaults to shadow", () => {
+	it("defines automatic size routing alongside explicit modes and defaults to auto", () => {
 		const definition = SETTINGS_SCHEMA["sessionMemory.mode"];
 		expect(definition.type).toBe("enum");
-		expect(getEnumValues("sessionMemory.mode")).toEqual(["off", "shadow", "enabled"]);
-		expect(getDefault("sessionMemory.mode")).toBe("shadow");
+		expect(getEnumValues("sessionMemory.mode")).toEqual(["off", "shadow", "enabled", "auto"]);
+		expect(getDefault("sessionMemory.mode")).toBe("auto");
 	});
 
 	it("defaults context overflow recovery to on (preserves the current safe posture)", () => {
@@ -22,13 +22,13 @@ describe("sessionMemory settings", () => {
 	});
 
 	it("exposes typed defaults through the schema helpers", () => {
-		const mode: SettingValue<"sessionMemory.mode"> = "shadow";
+		const mode: SettingValue<"sessionMemory.mode"> = "auto";
 		const recovery: SettingValue<"sessionMemory.contextOverflowRecovery"> = true;
 		expect(getDefault("sessionMemory.mode")).toBe(mode);
 		expect(getDefault("sessionMemory.contextOverflowRecovery")).toBe(recovery);
 	});
 
-	it.each(["off", "shadow", "enabled"] as const)("accepts mode %s and an explicit recovery off", mode => {
+	it.each(["off", "shadow", "enabled", "auto"] as const)("accepts mode %s and an explicit recovery off", mode => {
 		const reconciled = reconcileSettingsSchema({
 			sessionMemory: { mode, contextOverflowRecovery: false },
 		});

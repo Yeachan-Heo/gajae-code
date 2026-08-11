@@ -33,6 +33,11 @@ async function renderSessionInfo(costBreakdown?: Usage["cost"], model?: Model): 
 					hotRegionBytes: 1024,
 					metaDescriptorBytes: 2048,
 					totalAccountedBytes: 4096,
+					reservedBudgetBytes: 4096,
+					allocatedCacheBytes: 512,
+					hotResidentBytes: 1024,
+					metadataResidentBytes: 2048,
+					sidecarFileBytes: 8192,
 					lastReopenTransition: undefined,
 					currentCommitTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
 					lazyReopenAttempted: true,
@@ -107,9 +112,12 @@ describe("/session command", () => {
 	it("renders live cold-session memory health", async () => {
 		const output = await renderSessionInfo();
 		expect(output).toContain("Session Memory\nCold Retirement: active");
-		expect(output).toContain("Hot Region: 1.0KB");
-		expect(output).toContain("Metadata: 2.0KB");
-		expect(output).toContain("Accounted: 4.0KB");
+		expect(output).toContain("Hot Resident: 1.0KB");
+		expect(output).toContain("Metadata Resident: 2.0KB");
+		expect(output).toContain("Allocated Caches: 512B");
+		expect(output).toContain("Reserved Budget: 4.0KB");
+		expect(output).toContain("Sidecar Files: 8.0KB");
+		expect(output).toContain("Budget Accounted: 4.0KB");
 		expect(output).toContain("Lazy Reopen: exact");
 	});
 

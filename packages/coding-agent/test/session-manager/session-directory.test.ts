@@ -2782,7 +2782,10 @@ describe("managed session write protocol", () => {
 				await expect(prepareManagedSessionScopeForWrite(restarted.scope)).resolves.toMatchObject({
 					kind: "error",
 					code: "durability_failed",
-					cause: { classification: "binding_invalid" },
+					// Since #4185 the operator-visible classification mirrors the
+					// recognized error code instead of falling back to a false
+					// `binding_invalid` corruption report (#4184).
+					cause: { classification: "durability_failed" },
 				});
 			} finally {
 				FileSessionStorage.prototype.deleteSessionVerified = originalDelete;

@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="960" viewBox="0 0 1280 960">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="76" y="32" font-family="system-ui,sans-serif" font-size="22" font-weight="700">Synthetic session scenario matrix</text>
+<text x="76" y="51" font-family="system-ui,sans-serif" font-size="12" fill="#475569">darwin arm64 · Bun 1.3.14 · 1-point available sweep</text>
+<text x="76" y="77" font-family="system-ui,sans-serif" font-size="15" font-weight="650">Operation latency (ms)</text>
+<line x1="76" y1="424" x2="644" y2="424" stroke="#94a3b8"/>
+<line x1="76" y1="88" x2="76" y2="424" stroke="#94a3b8"/>
+<line x1="76" y1="424" x2="644" y2="424" stroke="#e2e8f0"/>
+<text x="69" y="428" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0</text>
+<line x1="76" y1="340" x2="644" y2="340" stroke="#e2e8f0"/>
+<text x="69" y="344" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">169</text>
+<line x1="76" y1="256" x2="644" y2="256" stroke="#e2e8f0"/>
+<text x="69" y="260" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">338</text>
+<line x1="76" y1="172" x2="644" y2="172" stroke="#e2e8f0"/>
+<text x="69" y="176" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">507</text>
+<line x1="76" y1="88" x2="644" y2="88" stroke="#e2e8f0"/>
+<text x="69" y="92" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">675</text>
+<text x="76" y="441" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
+<circle cx="76" cy="112.88888888888891" r="3.5" fill="#9333ea"/>
+<text x="684" y="77" font-family="system-ui,sans-serif" font-size="15" font-weight="650">Operation RSS growth (MiB)</text>
+<line x1="684" y1="424" x2="1252" y2="424" stroke="#94a3b8"/>
+<line x1="684" y1="88" x2="684" y2="424" stroke="#94a3b8"/>
+<line x1="684" y1="424" x2="1252" y2="424" stroke="#e2e8f0"/>
+<text x="677" y="428" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0.0</text>
+<line x1="684" y1="340" x2="1252" y2="340" stroke="#e2e8f0"/>
+<text x="677" y="344" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">19.6</text>
+<line x1="684" y1="256" x2="1252" y2="256" stroke="#e2e8f0"/>
+<text x="677" y="260" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">39.2</text>
+<line x1="684" y1="172" x2="1252" y2="172" stroke="#e2e8f0"/>
+<text x="677" y="176" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">58.7</text>
+<line x1="684" y1="88" x2="1252" y2="88" stroke="#e2e8f0"/>
+<text x="677" y="92" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">78.3</text>
+<text x="684" y="441" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
+<circle cx="684" cy="112.88888888888891" r="3.5" fill="#9333ea"/>
+<text x="76" y="523" font-family="system-ui,sans-serif" font-size="15" font-weight="650">Operation throughput (MiB/s)</text>
+<line x1="76" y1="870" x2="644" y2="870" stroke="#94a3b8"/>
+<line x1="76" y1="534" x2="76" y2="870" stroke="#94a3b8"/>
+<line x1="76" y1="870" x2="644" y2="870" stroke="#e2e8f0"/>
+<text x="69" y="874" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0</text>
+<line x1="76" y1="786" x2="644" y2="786" stroke="#e2e8f0"/>
+<text x="69" y="790" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">221</text>
+<line x1="76" y1="702" x2="644" y2="702" stroke="#e2e8f0"/>
+<text x="69" y="706" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">442</text>
+<line x1="76" y1="618" x2="644" y2="618" stroke="#e2e8f0"/>
+<text x="69" y="622" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">663</text>
+<line x1="76" y1="534" x2="644" y2="534" stroke="#e2e8f0"/>
+<text x="69" y="538" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">884</text>
+<text x="76" y="887" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
+<circle cx="76" cy="558.8888888888889" r="3.5" fill="#9333ea"/>
+<text x="684" y="523" font-family="system-ui,sans-serif" font-size="15" font-weight="650">Cold lookup p95 (ms)</text>
+<line x1="684" y1="870" x2="1252" y2="870" stroke="#94a3b8"/>
+<line x1="684" y1="534" x2="684" y2="870" stroke="#94a3b8"/>
+<line x1="684" y1="870" x2="1252" y2="870" stroke="#e2e8f0"/>
+<text x="677" y="874" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0.0</text>
+<line x1="684" y1="786" x2="1252" y2="786" stroke="#e2e8f0"/>
+<text x="677" y="790" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0.3</text>
+<line x1="684" y1="702" x2="1252" y2="702" stroke="#e2e8f0"/>
+<text x="677" y="706" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0.5</text>
+<line x1="684" y1="618" x2="1252" y2="618" stroke="#e2e8f0"/>
+<text x="677" y="622" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0.8</text>
+<line x1="684" y1="534" x2="1252" y2="534" stroke="#e2e8f0"/>
+<text x="677" y="538" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">1.1</text>
+<text x="684" y="887" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
+<circle cx="684" cy="633.6722222221781" r="3.5" fill="#9333ea"/>
+<line x1="76" y1="938" x2="98" y2="938" stroke="#9333ea" stroke-width="3" stroke-dasharray="4 2"/>
+<text x="104" y="942" font-family="system-ui,sans-serif" font-size="10" fill="#334155">subagent-tree · raw cold first-open · auto</text>
+</svg>

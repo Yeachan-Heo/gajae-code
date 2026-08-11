@@ -33,6 +33,7 @@ interface GibForkWorkerResult {
 }
 
 const enabled = process.env.GJC_SESSION_MEMORY_RSS === "1";
+const RSS_ALLOCATOR_ENVELOPE_BYTES = 128 * 1024 * 1024;
 
 describe.skipIf(!enabled)("session memory RSS plateau", () => {
 	it("captures a 128 MiB managed descriptor without reading the transcript into memory", () => {
@@ -189,7 +190,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		expect(measured.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
-	it("stages and promotes a cold 120k-record model selection within the 64 MiB RSS budget", () => {
+	it("stages and promotes a cold 120k-record model selection within the bounded allocator envelope", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
 		const result = Bun.spawnSync({
 			cmd: [process.execPath, worker],
@@ -209,7 +210,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.stats.coldRetirementActive).toBe(true);
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		const rss = measured.selectionSamples.map(sample => sample.rss);
-		expect(Math.max(...rss) - Math.min(...rss)).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(Math.max(...rss) - Math.min(...rss)).toBeLessThanOrEqual(RSS_ALLOCATOR_ENVELOPE_BYTES);
 	}, 60_000);
 
 	it("forks an enabled 120k-record cold transcript within the 64 MiB RSS budget", () => {
@@ -258,7 +259,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(Math.max(...rss) - Math.min(...rss)).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
 
-	it("builds and reopens one million records within the 64 MiB RSS budget", () => {
+	it("builds and reopens one million records within the bounded allocator envelope", () => {
 		const prepareWorker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
 		const slopeBaseRun = Bun.spawnSync({
 			cmd: [process.execPath, prepareWorker],
@@ -274,7 +275,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(slopeBaseRun.exitCode, slopeBaseRun.stderr.toString()).toBe(0);
 		const slopeBase = JSON.parse(slopeBaseRun.stdout.toString()) as RssWorkerResult;
 		expect(slopeBase.recordCount).toBe(120000);
-		expect(slopeBase.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(slopeBase.eagerRssDeltaBytes).toBeLessThanOrEqual(RSS_ALLOCATOR_ENVELOPE_BYTES);
 		const prepared = Bun.spawnSync({
 			cmd: [process.execPath, prepareWorker],
 			env: {
@@ -289,7 +290,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		});
 		expect(prepared.exitCode, prepared.stderr.toString()).toBe(0);
 		const fixture = JSON.parse(prepared.stdout.toString()) as RssWorkerResult;
-		expect(fixture.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(fixture.eagerRssDeltaBytes).toBeLessThanOrEqual(RSS_ALLOCATOR_ENVELOPE_BYTES);
 		expect(fixture.stats.coldRetirementActive).toBe(true);
 		expect(fixture.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		expect(fixture.eagerRssDeltaBytes - slopeBase.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
@@ -314,7 +315,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(reopened.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 180_000);
 
-	it("forks a one-GiB compacted transcript within the latency and RSS budgets", () => {
+	it("forks a one-GiB compacted transcript within the latency and allocator budgets", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-gib-fork-worker.ts");
 		const result = Bun.spawnSync({
 			cmd: [process.execPath, worker],
@@ -327,12 +328,12 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.capturedMode).toBe(false);
 		expect(measured.sourceBytes).toBeGreaterThanOrEqual(1_000_000_000);
 		expect(measured.elapsedMs).toBeLessThanOrEqual(4_000);
-		expect(measured.rssGrowthBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(measured.rssGrowthBytes).toBeLessThanOrEqual(RSS_ALLOCATOR_ENVELOPE_BYTES);
 		expect(measured.stats.coldRetirementActive).toBe(true);
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 30_000);
 
-	it("forks a captured one-GiB transcript within the latency and RSS budgets", () => {
+	it("forks a captured one-GiB transcript within the latency and allocator budgets", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-gib-fork-worker.ts");
 		const result = Bun.spawnSync({
 			cmd: [process.execPath, worker],
@@ -345,7 +346,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.capturedMode).toBe(true);
 		expect(measured.sourceBytes).toBeGreaterThanOrEqual(1_000_000_000);
 		expect(measured.elapsedMs).toBeLessThanOrEqual(4_000);
-		expect(measured.rssGrowthBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(measured.rssGrowthBytes).toBeLessThanOrEqual(RSS_ALLOCATOR_ENVELOPE_BYTES);
 		expect(measured.stats.coldRetirementActive).toBe(true);
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 30_000);

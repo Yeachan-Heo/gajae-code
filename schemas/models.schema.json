@@ -1268,7 +1268,8 @@
 								"executor",
 								"architect",
 								"planner",
-								"critic"
+								"critic",
+								"image"
 							]
 						},
 						"additionalProperties": {

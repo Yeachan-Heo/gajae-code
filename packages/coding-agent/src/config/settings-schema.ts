@@ -2121,15 +2121,14 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	// Bounded-memory cold-session offloading (rollout knobs; budgets are fixed
-	// implementation constants in the sidecar primitives, not user-tunable
-	// fields). "shadow" (default) measures and offloads without changing
-	// observable behavior; canary/default-on are release-channel states, not
-	// user-facing enum values.
+	// Bounded-memory cold-session offloading. Budgets are fixed implementation
+	// constants in the sidecar primitives, not user-tunable fields. Auto keeps
+	// ordinary sessions on the eager path and routes transcripts above the eager
+	// admission limit through bounded cold-session state.
 	"sessionMemory.mode": {
 		type: "enum",
-		values: ["off", "shadow", "enabled"] as const,
-		default: "shadow",
+		values: ["off", "shadow", "enabled", "auto"] as const,
+		default: "auto",
 	},
 	// Independent runtime switch for AgentSession's async compact-once overflow
 	// recovery. The synchronous bounded context preflight stays always on.
@@ -3599,74 +3598,6 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.image": {
-		type: "enum",
-		values: ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"] as const,
-		default: "auto",
-		ui: {
-			tab: "providers",
-			label: "Image Generation",
-			description: "Provider and model for image generation tool",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini > Alibaba",
-				},
-				{ value: "openai", label: "OpenAI", description: "Uses gpt-image-2 via OpenAI Responses/Codex" },
-				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
-				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
-				{ value: "antigravity", label: "Antigravity", description: "Requires login with google-antigravity" },
-				{
-					value: "alibaba",
-					label: "Alibaba Bailian",
-					description: "Requires ALIBABA_TOKEN_PLAN_API_KEY (wan2.7-image via Token Plan)",
-				},
-				{
-					value: "custom",
-					label: "Custom",
-					description: "OpenAI-compatible endpoint (set providers.imageCustomUrl)",
-				},
-			],
-		},
-	},
-	"providers.imageModel": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Model",
-			description: "Override the default image generation model for the selected provider",
-		},
-	},
-	"providers.imageCustomUrl": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom URL",
-			description: "Base URL for custom OpenAI-compatible image endpoint",
-		},
-	},
-	"providers.imageCustomKey": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key",
-			description: "API key for custom OpenAI-compatible image endpoint",
-		},
-	},
-	"providers.imageCustomKeyEnv": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key Env",
-			description: "Environment variable name holding the API key for custom image endpoint",
-		},
-	},
-
 	"providers.kimiApiFormat": {
 		type: "enum",
 		values: ["openai", "anthropic"] as const,
@@ -4216,7 +4147,7 @@ export interface ShellMinimizerSettings {
 }
 
 export interface SessionMemorySettings {
-	mode: "off" | "shadow" | "enabled";
+	mode: "off" | "shadow" | "enabled" | "auto";
 	contextOverflowRecovery: boolean;
 }
 

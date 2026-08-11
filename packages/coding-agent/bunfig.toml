@@ -1,0 +1,8 @@
+# Package-cwd `bun test` (the CI shard invocation: `bun test --shard=N/8` with
+# cwd packages/coding-agent) does not read the repository-root bunfig.toml, so
+# without this file the shared test preload — macOS TMPDIR canonicalization and
+# the 64 MiB session-context budget pin that keeps the overflow fixtures in
+# session-context-overflow.test.ts and goal-mode-request.test.ts deterministic
+# under the 512 MiB production default (#4196) — silently never runs.
+[test]
+preload = ["../../scripts/test-preload.ts"]

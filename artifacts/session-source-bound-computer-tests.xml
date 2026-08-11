@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="1" assertions="10" failures="0" skipped="0" time="1.174045">
+  <testsuite name="src/tools/computer.enforcement.test.ts" file="src/tools/computer.enforcement.test.ts" tests="1" assertions="10" failures="0" skipped="0" time="0" hostname="MacBook-Pro.local">
+    <testsuite name="computer enforcement red-team probes" file="src/tools/computer.enforcement.test.ts" line="56" tests="1" assertions="10" failures="0" skipped="0" time="1.007" hostname="MacBook-Pro.local">
+      <testcase name="probes all seven mandatory enforcement cases and writes evidence" classname="computer enforcement red-team probes" time="1.007491" file="src/tools/computer.enforcement.test.ts" line="57" assertions="10" />
+    </testsuite>
+  </testsuite>
+</testsuites>

@@ -496,7 +496,7 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 }
 
 async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
-	const { checkDependencies, formatDependencyStatus } = await import("../stt/setup");
+	const { checkDependencies, formatDependencyStatus, formatSTTUsage } = await import("../stt/setup");
 	const status = await checkDependencies();
 
 	if (flags.json) {
@@ -509,6 +509,7 @@ async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promi
 
 	if (status.recorder.available && status.python.available && status.whisper.available) {
 		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
+		console.log(`\n${formatSTTUsage()}`);
 		return;
 	}
 
@@ -542,6 +543,7 @@ async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promi
 	const recheck = await checkDependencies();
 	if (recheck.recorder.available && recheck.python.available && recheck.whisper.available) {
 		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
+		console.log(`\n${formatSTTUsage()}`);
 	} else {
 		console.error(chalk.red(`\n${theme.status.error} Setup incomplete`));
 		console.log(formatDependencyStatus(recheck));

@@ -1000,8 +1000,14 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, sessionDestination(), undefined, migrationPolicy);
-		if (manager.getEntries().length > 0) {
+		const manager = await SessionManager.continueRecent(
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
+		if (manager.hasHistoryEntries()) {
 			parsed.continue = true;
 		}
 		return manager;

@@ -478,9 +478,12 @@ export class CommandController {
 			const retirement = memory.coldRetirementActive ? theme.fg("success", "active") : theme.fg("dim", "inactive");
 			info += `\n${theme.bold("Session Memory")}\n`;
 			info += `${theme.fg("dim", "Cold Retirement:")} ${retirement}\n`;
-			info += `${theme.fg("dim", "Hot Region:")} ${formatBytes(memory.hotRegionBytes)}\n`;
-			info += `${theme.fg("dim", "Metadata:")} ${formatBytes(memory.metaDescriptorBytes)}\n`;
-			info += `${theme.fg("dim", "Accounted:")} ${formatBytes(memory.totalAccountedBytes)}\n`;
+			info += `${theme.fg("dim", "Hot Resident:")} ${formatBytes(memory.hotResidentBytes)}\n`;
+			info += `${theme.fg("dim", "Metadata Resident:")} ${formatBytes(memory.metadataResidentBytes)}\n`;
+			info += `${theme.fg("dim", "Allocated Caches:")} ${formatBytes(memory.allocatedCacheBytes)}\n`;
+			info += `${theme.fg("dim", "Reserved Budget:")} ${formatBytes(memory.reservedBudgetBytes)}\n`;
+			info += `${theme.fg("dim", "Sidecar Files:")} ${formatBytes(memory.sidecarFileBytes)}\n`;
+			info += `${theme.fg("dim", "Budget Accounted:")} ${formatBytes(memory.totalAccountedBytes)}\n`;
 			if (memory.coldIndexBytes > 0 || memory.coldIndexBlockCacheBytes > 0 || memory.coldEntryCacheBytes > 0) {
 				info += `${theme.fg("dim", "Cold Index/Caches:")} ${formatBytes(memory.coldIndexBytes)} / ${formatBytes(memory.coldIndexBlockCacheBytes)} / ${formatBytes(memory.coldEntryCacheBytes)}\n`;
 			}
