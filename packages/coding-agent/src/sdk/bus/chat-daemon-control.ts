@@ -112,10 +112,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 56 / Slack generation 62 fence durable provider-post and thread-effect recovery by attachment identity.
  * Discord generation 57 removes missing-authority wildcard behavior from durable binding checks.
  * Discord generation 58 preserves exact authority through unarchive replacement fallback.
+ * Discord generation 59 / Slack generation 63 derive attachment authority ids from one Router function so persisted provider bindings and live attachments cannot drift apart.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 58,
-	slack: 62,
+	discord: 59,
+	slack: 63,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
